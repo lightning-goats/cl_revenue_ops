@@ -1873,6 +1873,23 @@ class FeeController:
 
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
+
+        # PERF: per-channel memo of the persisted shared fields
+        # (last_gossip_refresh / last_broadcast_at / dynamic_htlcmin_baseline_msat).
+        # Lets _build_merged_fee_strategy_row skip the full-row DB re-read
+        # (SELECT * + 20-40KB v2_state_json json.loads) when both in-memory
+        # states are warm. Refreshed on every persisted-row load and updated
+        # with the canonical values on every save.
+        self._persisted_shared_fields: Dict[str, Dict[str, Any]] = {}
+
+        # PERF: batched fee-strategy persistence for adjust_all_fees cycles.
+        # While a cycle is active (flag set under _state_lock), the two save
+        # helpers enqueue merged rows here (last write per channel wins) and
+        # a single flush at cycle end persists them. Saves made OUTSIDE a
+        # cycle (manual RPC, set_initial_fee, hook threads) still persist
+        # immediately.
+        self._cycle_batch_active: bool = False
+        self._pending_fee_strategy_rows: Dict[str, Dict[str, Any]] = {}
         try:
             self._our_node_id: str = self.data_service.get_node_id() if self.data_service else self.plugin.rpc.getinfo().get("id", "")
         except Exception:
@@ -2313,6 +2330,39 @@ class FeeController:
             self._our_node_id = self.data_service.get_node_id() if self.data_service else self.plugin.rpc.getinfo().get("id", "")
         return self._our_node_id
 
+    # Gossip channel fields actually read by the neighbor-fee consumers
+    # (_get_neighbor_fee_median/_percentile/_min, _get_competitive_undercut_pct,
+    # _is_cln_default_fee). Stored entries are trimmed to these keys so the
+    # cache holds a few small dicts per channel instead of full gossip dicts.
+    _GOSSIP_CHANNEL_FIELDS = (
+        "source",
+        "active",
+        "fee_per_millionth",
+        "satoshis",
+        "amount_msat",
+        "last_update",
+        "base_fee_millisatoshi",
+        "fee_base_msat",
+    )
+
+    def _gossip_cache_ttl_seconds(self, cfg: Optional[Any] = None) -> int:
+        """TTL for the neighbor gossip cache used by fee-cycle consumers.
+
+        The fee cycle runs every ~fee_interval seconds (with jitter); a TTL
+        equal to the interval expires almost every cycle, re-issuing ~N
+        serial listchannels RPCs under _state_lock. Gossip fees are
+        minutes-stale by nature, so cover ~2 cycles instead.
+        """
+        try:
+            if cfg is None:
+                cfg = self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
+            interval = int(getattr(cfg, "fee_interval", 0) or 0)
+        except Exception:
+            interval = 0
+        if interval > 0:
+            return max(2 * interval, 3900)
+        return 3900
+
     def _get_peer_inbound_channels(
         self,
         peer_id: str,
@@ -2335,7 +2385,13 @@ class FeeController:
 
         try:
             channels = self.data_service.get_channels(destination=peer_id)
-            result = channels.get("channels", [])
+            # Keep only the fields consumers read — full gossip channel dicts
+            # are much larger and would sit in the cache for the whole TTL.
+            result = [
+                {k: ch[k] for k in self._GOSSIP_CHANNEL_FIELDS if k in ch}
+                for ch in channels.get("channels", [])
+                if isinstance(ch, dict)
+            ]
         except Exception:
             result = []
 
@@ -2448,7 +2504,7 @@ class FeeController:
 
         return candidate_fee_ppm, info
 
-    def _get_neighbor_fee_median(self, peer_id: str) -> int | None:
+    def _get_neighbor_fee_median(self, peer_id: str, cfg: Optional[Any] = None) -> int | None:
         """Get median fee charged by other nodes to the same peer.
 
         Uses gossip-based listchannels data only. Hive optimal-fee estimates are
@@ -2478,7 +2534,9 @@ class FeeController:
         try:
             now = time.time()
             our_id = self._get_our_id()
-            peer_channels = self._get_peer_inbound_channels(peer_id)
+            peer_channels = self._get_peer_inbound_channels(
+                peer_id, ttl_seconds=self._gossip_cache_ttl_seconds(cfg)
+            )
 
             # Collect fee + weight pairs (weight = capacity * recency)
             weighted_fees = []
@@ -2504,7 +2562,8 @@ class FeeController:
             result = None
             min_competitors = 3
             try:
-                cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+                if cfg is None:
+                    cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
                 min_competitors = int(getattr(cfg, 'neighbor_median_min_competitors', 3) or 3)
             except Exception:
                 pass
@@ -2549,7 +2608,7 @@ class FeeController:
             base = ch.get("fee_base_msat")
         return base == 1000
 
-    def _get_neighbor_fee_percentile(self, peer_id: str, pct: float) -> int | None:
+    def _get_neighbor_fee_percentile(self, peer_id: str, pct: float, cfg: Optional[Any] = None) -> int | None:
         """Return the `pct`-th percentile of competitor fees for this peer.
 
         Phase D.1 (2026-04-23): competition_aware originally preserved DTS
@@ -2569,7 +2628,9 @@ class FeeController:
 
         try:
             our_id = self._get_our_id()
-            peer_channels = self._get_peer_inbound_channels(peer_id)
+            peer_channels = self._get_peer_inbound_channels(
+                peer_id, ttl_seconds=self._gossip_cache_ttl_seconds(cfg)
+            )
             fees = []
             for ch in peer_channels:
                 if ch.get("source") == our_id:
@@ -2585,7 +2646,8 @@ class FeeController:
 
             min_competitors = 3
             try:
-                cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+                if cfg is None:
+                    cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
                 min_competitors = int(getattr(cfg, 'neighbor_median_min_competitors', 3) or 3)
             except Exception:
                 pass
@@ -2601,7 +2663,7 @@ class FeeController:
         except Exception:
             return None
 
-    def _get_neighbor_fee_min(self, peer_id: str) -> int | None:
+    def _get_neighbor_fee_min(self, peer_id: str, cfg: Optional[Any] = None) -> int | None:
         """Get the cheapest competitor fee for the same peer.
 
         Used by `competition_aware` market_fee_mode to decide whether
@@ -2621,7 +2683,9 @@ class FeeController:
 
         try:
             our_id = self._get_our_id()
-            peer_channels = self._get_peer_inbound_channels(peer_id)
+            peer_channels = self._get_peer_inbound_channels(
+                peer_id, ttl_seconds=self._gossip_cache_ttl_seconds(cfg)
+            )
             fees = []
             for ch in peer_channels:
                 if ch.get("source") == our_id:
@@ -2637,7 +2701,8 @@ class FeeController:
 
             min_competitors = 3
             try:
-                cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+                if cfg is None:
+                    cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
                 min_competitors = int(getattr(cfg, 'neighbor_median_min_competitors', 3) or 3)
             except Exception:
                 pass
@@ -2647,7 +2712,9 @@ class FeeController:
         except Exception:
             return None
 
-    def _get_competitive_undercut_pct(self, peer_id: str, channel_id: str, neighbor_median: int | None = None) -> float:
+    def _get_competitive_undercut_pct(self, peer_id: str, channel_id: str,
+                                      neighbor_median: int | None = None,
+                                      cfg: Optional[Any] = None) -> float:
         """Calculate intelligent undercut percentage based on competitive position.
 
         Considers our channel capacity vs competitors:
@@ -2662,7 +2729,9 @@ class FeeController:
         """
         try:
             our_id = self._get_our_id()
-            all_channels = self._get_peer_inbound_channels(peer_id)
+            all_channels = self._get_peer_inbound_channels(
+                peer_id, ttl_seconds=self._gossip_cache_ttl_seconds(cfg)
+            )
 
             # Find our capacity and competitor capacities
             our_capacity = 0
@@ -2691,7 +2760,7 @@ class FeeController:
 
             # Corridor value adjustment
             if neighbor_median is None:
-                neighbor_median = self._get_neighbor_fee_median(peer_id)
+                neighbor_median = self._get_neighbor_fee_median(peer_id, cfg=cfg)
             if neighbor_median is not None:
                 if neighbor_median > 300:
                     base_undercut += 0.05  # High-fee corridor, undercut more aggressively
@@ -2901,6 +2970,15 @@ class FeeController:
             v2_data = json.loads(v2_json_str) if v2_json_str else {}
         except json.JSONDecodeError:
             v2_data = {}
+        # PERF: memoize the shared fields so later merges with warm in-memory
+        # states can skip the full-row re-read.
+        self._persisted_shared_fields[channel_id] = {
+            "last_gossip_refresh": v2_data.get("last_gossip_refresh", 0),
+            "last_broadcast_at": v2_data.get(
+                "last_broadcast_at", (db_state or {}).get("last_update", 0)
+            ),
+            "dynamic_htlcmin_baseline_msat": v2_data.get("dynamic_htlcmin_baseline_msat"),
+        }
         return db_state, v2_data
 
     @staticmethod
@@ -3004,9 +3082,21 @@ class FeeController:
         timestamp resets while still letting untouched shared fields fall back
         to the cached or persisted counterpart state.
         """
-        db_state, v2_data = self._load_persisted_fee_strategy_row(channel_id)
         cycle_source = cycle_state or self._cycle_states.get(channel_id)
         fee_source = fee_state or self._channel_fee_states.get(channel_id)
+
+        # PERF: when both in-memory states are warm the persisted row is only
+        # needed for the shared-field fallback, which is memoized from the
+        # last load/save of this channel's row — skip the full-row DB re-read
+        # (SELECT * + json.loads of a 20-40KB blob) in that case.
+        shared_memo = self._persisted_shared_fields.get(channel_id)
+        if cycle_source is not None and fee_source is not None and shared_memo is not None:
+            db_state: Dict[str, Any] = {}
+            v2_data: Dict[str, Any] = {}
+            persisted_shared = shared_memo
+        else:
+            db_state, v2_data = self._load_persisted_fee_strategy_row(channel_id)
+            persisted_shared = self._persisted_shared_fields[channel_id]
 
         cycle_payload = (
             self._serialize_cycle_state_payload(cycle_source)
@@ -3035,16 +3125,25 @@ class FeeController:
 
         canonical_last_gossip_refresh = _resolve_shared_field(
             "last_gossip_refresh",
-            v2_data.get("last_gossip_refresh", 0),
+            persisted_shared["last_gossip_refresh"],
         )
         canonical_last_broadcast_at = _resolve_shared_field(
             "last_broadcast_at",
-            v2_data.get("last_broadcast_at", db_state.get("last_update", 0)),
+            persisted_shared["last_broadcast_at"],
         )
         canonical_htlcmin_baseline_msat = _resolve_shared_field(
             "dynamic_htlcmin_baseline_msat",
-            v2_data.get("dynamic_htlcmin_baseline_msat"),
+            persisted_shared["dynamic_htlcmin_baseline_msat"],
         )
+
+        # The merged row is about to be persisted (immediately or at the
+        # cycle-end batch flush) — keep the memo in sync with what the
+        # persisted row will contain.
+        self._persisted_shared_fields[channel_id] = {
+            "last_gossip_refresh": canonical_last_gossip_refresh,
+            "last_broadcast_at": canonical_last_broadcast_at,
+            "dynamic_htlcmin_baseline_msat": canonical_htlcmin_baseline_msat,
+        }
 
         cycle_payload["last_gossip_refresh"] = canonical_last_gossip_refresh
         cycle_payload["last_broadcast_at"] = canonical_last_broadcast_at
@@ -3171,34 +3270,87 @@ class FeeController:
         self._channel_fee_states[channel_id] = state
         return state
 
+    def _build_fee_strategy_row_kwargs(
+        self,
+        channel_id: str,
+        *,
+        cycle_state: Optional[ChannelCycleState] = None,
+        fee_state: Optional[ChannelFeeState] = None,
+    ) -> Dict[str, Any]:
+        """Build the exact update_fee_strategy_state kwargs for a merged row."""
+        row_fields, v2_data = self._build_merged_fee_strategy_row(
+            channel_id,
+            cycle_state=cycle_state,
+            fee_state=fee_state,
+        )
+        return {
+            "channel_id": channel_id,
+            "last_revenue_rate": row_fields["last_revenue_rate"],
+            "last_fee_ppm": row_fields["last_fee_ppm"],
+            "trend_direction": row_fields["trend_direction"],
+            "step_ppm": row_fields["step_ppm"],
+            "consecutive_same_direction": row_fields["consecutive_same_direction"],
+            "last_broadcast_fee_ppm": row_fields["last_broadcast_fee_ppm"],
+            "last_state": row_fields["last_state"],
+            "is_sleeping": row_fields["is_sleeping"],
+            "sleep_until": row_fields["sleep_until"],
+            "stable_cycles": row_fields["stable_cycles"],
+            "forward_count_since_update": row_fields["forward_count_since_update"],
+            "last_volume_sats": row_fields["last_volume_sats"],
+            "v2_state_json": json.dumps(v2_data),
+            "last_update": row_fields["last_update"],
+        }
+
+    def _persist_fee_strategy_row(self, row_kwargs: Dict[str, Any]) -> None:
+        """Persist a merged fee strategy row.
+
+        Inside an adjust_all_fees cycle the row is enqueued (last write per
+        channel wins) and flushed once at cycle end. Outside a cycle the row
+        is written immediately, preserving durability for manual RPC paths,
+        set_initial_fee, and hook threads.
+        """
+        if self._cycle_batch_active:
+            self._pending_fee_strategy_rows[row_kwargs["channel_id"]] = row_kwargs
+            return
+        self.database.update_fee_strategy_state(**row_kwargs)
+
+    def _flush_pending_fee_strategy_rows(self) -> None:
+        """Flush rows deferred during an adjust_all_fees cycle in one batch."""
+        pending = self._pending_fee_strategy_rows
+        if not pending:
+            return
+        self._pending_fee_strategy_rows = {}
+        rows = list(pending.values())
+
+        batch_writer = getattr(self.database, "update_fee_strategy_states_batch", None)
+        if callable(batch_writer):
+            try:
+                batch_writer(rows)
+                return
+            except Exception as e:
+                self.plugin.log(
+                    f"FEE_BATCH: batch persist of {len(rows)} rows failed ({e}); "
+                    f"falling back to per-row writes",
+                    level='warn'
+                )
+
+        for row in rows:
+            try:
+                self.database.update_fee_strategy_state(**row)
+            except Exception as e:
+                self.plugin.log(
+                    f"FEE_BATCH: failed to persist fee strategy state for "
+                    f"{str(row.get('channel_id', '?'))[:16]}: {e}",
+                    level='warn'
+                )
+
     def _save_channel_fee_state(self, channel_id: str, state: ChannelFeeState) -> None:
         """Save channel fee state to cache and database."""
         with self._state_lock:
             self._channel_fee_states[channel_id] = state
 
-        row_fields, v2_data = self._build_merged_fee_strategy_row(
-            channel_id,
-            fee_state=state,
-        )
-        v2_json_str = json.dumps(v2_data)
-
-        self.database.update_fee_strategy_state(
-            channel_id=channel_id,
-            last_revenue_rate=row_fields["last_revenue_rate"],
-            last_fee_ppm=row_fields["last_fee_ppm"],
-            trend_direction=row_fields["trend_direction"],
-            step_ppm=row_fields["step_ppm"],
-            consecutive_same_direction=row_fields["consecutive_same_direction"],
-            last_broadcast_fee_ppm=row_fields["last_broadcast_fee_ppm"],
-            last_state=row_fields["last_state"],
-            is_sleeping=row_fields["is_sleeping"],
-            sleep_until=row_fields["sleep_until"],
-            stable_cycles=row_fields["stable_cycles"],
-            forward_count_since_update=row_fields["forward_count_since_update"],
-            last_volume_sats=row_fields["last_volume_sats"],
-            v2_state_json=v2_json_str,
-            last_update=row_fields["last_update"],
-        )
+        row_kwargs = self._build_fee_strategy_row_kwargs(channel_id, fee_state=state)
+        self._persist_fee_strategy_row(row_kwargs)
         state.clear_explicit_shared_fields()
 
     def _get_or_create_channel_fee_state(self, channel_id: str) -> ChannelFeeState:
@@ -3393,23 +3545,33 @@ class FeeController:
         stale_keys = [k for k in self._cycle_states.keys() if k not in active_channel_ids]
         for key in stale_keys:
             del self._cycle_states[key]
+            self._persisted_shared_fields.pop(key, None)
             pruned += 1
 
         # Prune channel fee states from memory
         stale_fee_state_keys = [k for k in self._channel_fee_states.keys() if k not in active_channel_ids]
         for key in stale_fee_state_keys:
             del self._channel_fee_states[key]
+            self._persisted_shared_fields.pop(key, None)
             pruned += 1
 
-        # Also prune from database to prevent stale entries in debug output
-        # Get all fee states from database and remove those for closed channels
+        # Also prune from database to prevent stale entries in debug output.
+        # PERF: only the channel ids are needed here — prefer the cheap
+        # id-only query over deserializing every 20-40KB v2_state_json blob.
         try:
-            db_states = self.database.get_all_fee_strategy_states()
+            ids_getter = getattr(self.database, "get_all_fee_strategy_channel_ids", None)
+            if callable(ids_getter):
+                db_channel_ids = list(ids_getter())
+            else:
+                db_channel_ids = [
+                    s.get("channel_id", "")
+                    for s in self.database.get_all_fee_strategy_states()
+                ]
             db_pruned = 0
-            for state in db_states:
-                channel_id = state.get("channel_id", "")
+            for channel_id in db_channel_ids:
                 if channel_id and channel_id not in active_channel_ids:
                     self.database.reset_fee_strategy_state(channel_id)
+                    self._persisted_shared_fields.pop(channel_id, None)
                     db_pruned += 1
             if db_pruned > 0:
                 self.plugin.log(
@@ -3529,6 +3691,24 @@ class FeeController:
         Returns:
             List of FeeAdjustment records for channels that were adjusted
         """
+        # PERF: warm the profitability cache BEFORE acquiring _state_lock.
+        # The first in-lock get_profitability call would otherwise trigger a
+        # full analyze_all_channels under the lock (its short cache TTL is
+        # always expired at fee-cycle intervals), stalling hook threads for
+        # the whole analysis.
+        try:
+            pre_cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+            pre_paused = bool(getattr(pre_cfg, "paused", False))
+        except Exception:
+            pre_paused = False
+        if not pre_paused and self.profitability is not None:
+            warm = getattr(self.profitability, "analyze_all_channels", None)
+            if callable(warm):
+                try:
+                    warm()
+                except Exception as e:
+                    self.plugin.log(f"Profitability warm-up failed: {e}", level='debug')
+
         # H-2: Non-blocking concurrency guard - only one fee adjustment cycle at a time
         if not self._state_lock.acquire(blocking=False):
             self._set_last_decision_summary(
@@ -3609,143 +3789,24 @@ class FeeController:
                     level='info'
                 )
         
-        for state in channel_states:
-            channel_id = state.get("channel_id")
-            peer_id = state.get("peer_id")
-            
-            if not channel_id or not peer_id:
-                continue
-
-            if self.temporary_fee_overlay_active is not None:
-                try:
-                    if self.temporary_fee_overlay_active(channel_id):
-                        skip_reasons["temporary_overlay"] += 1
-                        continue
-                except Exception as e:
-                    self.plugin.log(
-                        f"TEMP_OVERLAY: Failed to query overlay state for {channel_id}: {e}",
-                        level='debug'
-                    )
-            
-            # Check policy for this peer (v1.4: Policy-Driven Architecture)
-            if self.policy_manager:
-                policy = self.policy_manager.get_policy(peer_id)
-                
-                # Skip PASSIVE strategy (equivalent to old is_peer_ignored)
-                if policy.strategy == FeeStrategy.PASSIVE:
-                    skip_reasons["policy_passive"] += 1
-                    continue
-                
-                # Handle STATIC strategy: apply fixed fee
-                if policy.strategy == FeeStrategy.STATIC and policy.fee_ppm_target is not None:
-                    channel_info = channels.get(channel_id)
-                    if channel_info:
-                        current_fee = channel_info.get("fee_proportional_millionths", 0)
-                        requested_static_fee = int(policy.fee_ppm_target)
-                        effective_static_fee = max(
-                            cfg.min_fee_ppm,
-                            min(cfg.max_fee_ppm, requested_static_fee),
-                        )
-                        if current_fee != effective_static_fee:
-                            try:
-                                result = self.set_channel_fee(
-                                    channel_id,
-                                    requested_static_fee,
-                                    reason="Policy: STATIC",
-                                    reason_code=FeeReasonCode.POLICY_STATIC.value
-                                )
-                                if not result.get("success"):
-                                    self.plugin.log(
-                                        f"Error setting static fee for {channel_id}: "
-                                        f"{result.get('message', 'unknown error')}",
-                                        level='error'
-                                    )
-                                    skip_reasons["error"] += 1
-                                    continue
-                                applied_fee_ppm = int(result.get("fee_ppm", effective_static_fee))
-                                adjustments.append(FeeAdjustment(
-                                    channel_id=channel_id,
-                                    peer_id=peer_id,
-                                    old_fee_ppm=current_fee,
-                                    new_fee_ppm=applied_fee_ppm,
-                                    reason="Policy: STATIC fee override",
-                                    algorithm_values={
-                                        "policy": "static",
-                                        "requested_fee_ppm": requested_static_fee,
-                                        "effective_fee_ppm": applied_fee_ppm,
-                                    },
-                                    reason_code=FeeReasonCode.POLICY_STATIC.value,
-                                ))
-                            except Exception as e:
-                                self.plugin.log(f"Error setting static fee for {channel_id}: {e}", level='error')
-                                skip_reasons["error"] += 1
-                        else:
-                            skip_reasons["policy_static"] += 1
-                    continue
-
-                # DYNAMIC strategy continues to normal fee optimization below
-
-            # Hive membership is advisory: keep DTS/PID active while using
-            # hive hints for priors, market boundary estimates, and bias.
-            self._check_hive_member_fee(peer_id)
-
-            # Get channel info
-            channel_info = channels.get(channel_id)
-            if not channel_info:
-                continue
-            
-            try:
-                # Check cycle state before adjustment to track skip reasons
-                # Issue #32: pass actual fee for desync detection
-                actual_fee = channel_info.get("fee_proportional_millionths", 0)
-                cycle = self._get_cycle_state(channel_id, actual_fee_ppm=actual_fee)
-                now = int(time.time())
-                pre_is_sleeping = cycle.is_sleeping
-                pre_last_update = cycle.last_update
-                pre_last_broadcast_fee = cycle.last_broadcast_fee_ppm
-                pre_forward_count = 0
-                pre_hours_elapsed = 0.0
-                if pre_last_update > 0:
-                    pre_hours_elapsed = (now - pre_last_update) / 3600.0
-                    pre_forward_count = self.database.get_forward_count_since(
-                        channel_id, pre_last_update
-                    )
-
-                force_reprice_reason = None
-                if self._consume_hive_member_release(peer_id):
-                    force_reprice_reason = "hive_unavailable"
-                elif self._consume_hive_member_advisory(peer_id):
-                    force_reprice_reason = "hive_member_advisory"
-
-                adjustment = self._adjust_channel_fee(
-                    channel_id=channel_id,
-                    peer_id=peer_id,
-                    state=state,
-                    channel_info=channel_info,
-                    chain_costs=chain_costs,
-                    cfg=cfg,
-                    force_reprice_reason=force_reprice_reason,
-                )
-
-                if adjustment:
-                    adjustments.append(adjustment)
-                else:
-                    skip_reason = self._classify_no_adjustment_skip_reason(
-                        cycle=cycle,
-                        now=now,
-                        pre_is_sleeping=pre_is_sleeping,
-                        pre_last_update=pre_last_update,
-                        pre_hours_elapsed=pre_hours_elapsed,
-                        pre_forward_count=pre_forward_count,
-                        actual_fee_ppm=actual_fee,
-                        pre_last_broadcast_fee_ppm=pre_last_broadcast_fee,
-                        cfg=cfg,
-                    )
-                    skip_reasons[skip_reason] += 1
-
-            except Exception as e:
-                self.plugin.log(f"Error adjusting fee for {channel_id}: {e}", level='error')
-                skip_reasons["error"] += 1
+        # PERF: defer fee-strategy row persistence for the whole cycle and
+        # flush once at the end (single batch write instead of ~2 full-row
+        # writes per channel). Losing one cycle's posterior updates on a
+        # mid-cycle crash is acceptable.
+        self._cycle_batch_active = True
+        self._pending_fee_strategy_rows.clear()
+        try:
+            self._adjust_all_fees_channel_loop(
+                channel_states=channel_states,
+                channels=channels,
+                chain_costs=chain_costs,
+                cfg=cfg,
+                adjustments=adjustments,
+                skip_reasons=skip_reasons,
+            )
+        finally:
+            self._cycle_batch_active = False
+            self._flush_pending_fee_strategy_rows()
 
         # Garbage Collection: Prune state for closed channels (TODO #18)
         # SAFETY: Only prune when we have a meaningful channel list.
@@ -3809,6 +3870,161 @@ class FeeController:
             )
 
         return adjustments
+
+    def _adjust_all_fees_channel_loop(
+        self,
+        *,
+        channel_states: List[Dict[str, Any]],
+        channels: Dict[str, Dict[str, Any]],
+        chain_costs: Optional[Dict[str, int]],
+        cfg: 'ConfigSnapshot',
+        adjustments: List[FeeAdjustment],
+        skip_reasons: Dict[str, int],
+    ) -> None:
+        """Per-channel body of the fee cycle (runs with batched persistence)."""
+        for state in channel_states:
+            channel_id = state.get("channel_id")
+            peer_id = state.get("peer_id")
+
+            if not channel_id or not peer_id:
+                continue
+
+            if self.temporary_fee_overlay_active is not None:
+                try:
+                    if self.temporary_fee_overlay_active(channel_id):
+                        skip_reasons["temporary_overlay"] += 1
+                        continue
+                except Exception as e:
+                    self.plugin.log(
+                        f"TEMP_OVERLAY: Failed to query overlay state for {channel_id}: {e}",
+                        level='debug'
+                    )
+
+            # Check policy for this peer (v1.4: Policy-Driven Architecture)
+            if self.policy_manager:
+                policy = self.policy_manager.get_policy(peer_id)
+
+                # Skip PASSIVE strategy (equivalent to old is_peer_ignored)
+                if policy.strategy == FeeStrategy.PASSIVE:
+                    skip_reasons["policy_passive"] += 1
+                    continue
+
+                # Handle STATIC strategy: apply fixed fee
+                if policy.strategy == FeeStrategy.STATIC and policy.fee_ppm_target is not None:
+                    channel_info = channels.get(channel_id)
+                    if channel_info:
+                        current_fee = channel_info.get("fee_proportional_millionths", 0)
+                        requested_static_fee = int(policy.fee_ppm_target)
+                        effective_static_fee = max(
+                            cfg.min_fee_ppm,
+                            min(cfg.max_fee_ppm, requested_static_fee),
+                        )
+                        if current_fee != effective_static_fee:
+                            try:
+                                result = self.set_channel_fee(
+                                    channel_id,
+                                    requested_static_fee,
+                                    reason="Policy: STATIC",
+                                    reason_code=FeeReasonCode.POLICY_STATIC.value
+                                )
+                                if not result.get("success"):
+                                    self.plugin.log(
+                                        f"Error setting static fee for {channel_id}: "
+                                        f"{result.get('message', 'unknown error')}",
+                                        level='error'
+                                    )
+                                    skip_reasons["error"] += 1
+                                    continue
+                                applied_fee_ppm = int(result.get("fee_ppm", effective_static_fee))
+                                adjustments.append(FeeAdjustment(
+                                    channel_id=channel_id,
+                                    peer_id=peer_id,
+                                    old_fee_ppm=current_fee,
+                                    new_fee_ppm=applied_fee_ppm,
+                                    reason="Policy: STATIC fee override",
+                                    algorithm_values={
+                                        "policy": "static",
+                                        "requested_fee_ppm": requested_static_fee,
+                                        "effective_fee_ppm": applied_fee_ppm,
+                                    },
+                                    reason_code=FeeReasonCode.POLICY_STATIC.value,
+                                ))
+                            except Exception as e:
+                                self.plugin.log(f"Error setting static fee for {channel_id}: {e}", level='error')
+                                skip_reasons["error"] += 1
+                        else:
+                            skip_reasons["policy_static"] += 1
+                    continue
+
+                # DYNAMIC strategy continues to normal fee optimization below
+
+            # Hive membership is advisory: keep DTS/PID active while using
+            # hive hints for priors, market boundary estimates, and bias.
+            self._check_hive_member_fee(peer_id)
+
+            # Get channel info
+            channel_info = channels.get(channel_id)
+            if not channel_info:
+                continue
+
+            try:
+                # Check cycle state before adjustment to track skip reasons
+                # Issue #32: pass actual fee for desync detection
+                actual_fee = channel_info.get("fee_proportional_millionths", 0)
+                cycle = self._get_cycle_state(channel_id, actual_fee_ppm=actual_fee)
+                now = int(time.time())
+                pre_is_sleeping = cycle.is_sleeping
+                pre_last_update = cycle.last_update
+                pre_last_broadcast_fee = cycle.last_broadcast_fee_ppm
+                pre_forward_count = 0
+                pre_hours_elapsed = 0.0
+                forward_count_hint = None
+                if pre_last_update > 0:
+                    pre_hours_elapsed = (now - pre_last_update) / 3600.0
+                    pre_forward_count = self.database.get_forward_count_since(
+                        channel_id, pre_last_update
+                    )
+                    # PERF: reuse this count inside _adjust_channel_fee instead
+                    # of issuing the identical query a second time.
+                    forward_count_hint = pre_forward_count
+
+                force_reprice_reason = None
+                if self._consume_hive_member_release(peer_id):
+                    force_reprice_reason = "hive_unavailable"
+                elif self._consume_hive_member_advisory(peer_id):
+                    force_reprice_reason = "hive_member_advisory"
+
+                adjustment = self._adjust_channel_fee(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    state=state,
+                    channel_info=channel_info,
+                    chain_costs=chain_costs,
+                    cfg=cfg,
+                    force_reprice_reason=force_reprice_reason,
+                    forward_count_hint=forward_count_hint,
+                    forward_count_hint_since=pre_last_update,
+                )
+
+                if adjustment:
+                    adjustments.append(adjustment)
+                else:
+                    skip_reason = self._classify_no_adjustment_skip_reason(
+                        cycle=cycle,
+                        now=now,
+                        pre_is_sleeping=pre_is_sleeping,
+                        pre_last_update=pre_last_update,
+                        pre_hours_elapsed=pre_hours_elapsed,
+                        pre_forward_count=pre_forward_count,
+                        actual_fee_ppm=actual_fee,
+                        pre_last_broadcast_fee_ppm=pre_last_broadcast_fee,
+                        cfg=cfg,
+                    )
+                    skip_reasons[skip_reason] += 1
+
+            except Exception as e:
+                self.plugin.log(f"Error adjusting fee for {channel_id}: {e}", level='error')
+                skip_reasons["error"] += 1
 
     def _classify_no_adjustment_skip_reason(
         self,
@@ -4215,7 +4431,9 @@ class FeeController:
                            channel_info: Dict[str, Any],
                            chain_costs: Optional[Dict[str, int]] = None,
                            cfg: Optional['ConfigSnapshot'] = None,
-                           force_reprice_reason: Optional[str] = None) -> Optional[FeeAdjustment]:
+                           force_reprice_reason: Optional[str] = None,
+                           forward_count_hint: Optional[int] = None,
+                           forward_count_hint_since: Optional[int] = None) -> Optional[FeeAdjustment]:
         """
         Adjust fee for a single channel.
 
@@ -4420,7 +4638,16 @@ class FeeController:
         # - MIN_OBSERVATION_HOURS: Hard floor prevents burst manipulation
         # - MIN_FORWARDS_FOR_SIGNAL: Statistical significance requirement
         # =====================================================================
-        forward_count = self.database.get_forward_count_since(channel_id, cycle.last_update)
+        # PERF: the cycle loop already ran this exact query for skip
+        # classification — reuse the result when the observation cursor is
+        # unchanged instead of issuing the identical query again.
+        if (
+            forward_count_hint is not None
+            and forward_count_hint_since == cycle.last_update
+        ):
+            forward_count = forward_count_hint
+        else:
+            forward_count = self.database.get_forward_count_since(channel_id, cycle.last_update)
         cycle.forward_count_since_update = forward_count
 
         if cycle.last_update > 0:
@@ -4802,7 +5029,10 @@ class FeeController:
             # =====================================================================
             expected_demand = 0.5  # healthy baseline
             try:
-                ch_state = self.database.get_channel_state(channel_id)
+                # PERF: the caller already holds this channel's row from
+                # get_all_channel_states() (same table, same columns incl.
+                # kalman_flow_ratio / kalman_velocity) — no need to re-query.
+                ch_state = state if isinstance(state, dict) else None
                 if ch_state is not None:
                     kr = ch_state.get("kalman_flow_ratio", ch_state.get("flow_ratio", 0.0))
                     kv = ch_state.get("kalman_velocity", 0.0)
@@ -4894,8 +5124,9 @@ class FeeController:
             # DTS+PID PATH: PID multiplier for balance management
             # =============================================================
             try:
-                ch_state_data = self.database.get_channel_state(channel_id)
-                flow_state_str = (ch_state_data or {}).get("state", "balanced")
+                # PERF: reuse the in-hand channel_states row instead of
+                # re-querying the same table row for the flow state.
+                flow_state_str = state.get("state", "balanced") if isinstance(state, dict) else "balanced"
             except Exception:
                 flow_state_str = "balanced"
 
@@ -4916,7 +5147,7 @@ class FeeController:
                 post_pid_target_ppm = int(post_pid_target_ppm * temporal_adj)
             # Neighbor fee context: soft attraction toward market median
             # Only pull DOWN toward market, never up — being cheaper is fine.
-            neighbor_median = self._get_neighbor_fee_median(peer_id)
+            neighbor_median = self._get_neighbor_fee_median(peer_id, cfg=cfg)
             neighbor_market_usable = False
             if neighbor_median is not None:
                 try:
@@ -4954,7 +5185,7 @@ class FeeController:
             # used in inelastic markets where hive coordination means we retain
             # volume at higher margins (added 2026-04-21 to close vs-clboss gap).
             if neighbor_market_usable:
-                undercut_pct = self._get_competitive_undercut_pct(peer_id, channel_id, neighbor_median)
+                undercut_pct = self._get_competitive_undercut_pct(peer_id, channel_id, neighbor_median, cfg=cfg)
                 mode = getattr(cfg, 'market_fee_mode', 'undercut') if cfg else 'undercut'
 
                 if mode == 'premium':
@@ -5003,7 +5234,7 @@ class FeeController:
                     # "cheaper than cheapest" (brittle, almost-never-fires)
                     # to "cheaper than p25" (robust, fires when we have
                     # real competitive margin).
-                    preserve_threshold = self._get_neighbor_fee_percentile(peer_id, 0.25)
+                    preserve_threshold = self._get_neighbor_fee_percentile(peer_id, 0.25, cfg=cfg)
                     undercut_target = int(neighbor_median * (1.0 - undercut_pct))
                     exploring = (
                         ts_state and ts_state.thompson and
@@ -6509,29 +6740,8 @@ class FeeController:
 
         self._cycle_states[channel_id] = state
 
-        row_fields, v2_data = self._build_merged_fee_strategy_row(
-            channel_id,
-            cycle_state=state,
-        )
-        v2_json_str = json.dumps(v2_data)
-
-        self.database.update_fee_strategy_state(
-            channel_id=channel_id,
-            last_revenue_rate=row_fields["last_revenue_rate"],
-            last_fee_ppm=row_fields["last_fee_ppm"],
-            trend_direction=row_fields["trend_direction"],
-            step_ppm=row_fields["step_ppm"],
-            consecutive_same_direction=row_fields["consecutive_same_direction"],
-            last_broadcast_fee_ppm=row_fields["last_broadcast_fee_ppm"],
-            last_state=row_fields["last_state"],
-            is_sleeping=row_fields["is_sleeping"],
-            sleep_until=row_fields["sleep_until"],
-            stable_cycles=row_fields["stable_cycles"],
-            forward_count_since_update=row_fields["forward_count_since_update"],
-            last_volume_sats=row_fields["last_volume_sats"],
-            v2_state_json=v2_json_str,
-            last_update=row_fields["last_update"],
-        )
+        row_kwargs = self._build_fee_strategy_row_kwargs(channel_id, cycle_state=state)
+        self._persist_fee_strategy_row(row_kwargs)
         state.clear_explicit_shared_fields()
     
     # =========================================================================
