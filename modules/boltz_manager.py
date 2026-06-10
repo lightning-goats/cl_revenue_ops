@@ -1177,6 +1177,15 @@ class BoltzCliManager:
                         channel_id=trigger_ch,
                         source=f"boltz_manager:{source}",
                         metadata={"attribution": attribution},
+                        # Structural swaps (executed on the inbound-scarcity
+                        # credit) are partitioned so the daily structural
+                        # envelope can sum them; same boltz:{id} event, so
+                        # the unified boltz category never double-counts.
+                        subcategory=(
+                            "structural"
+                            if (metadata or {}).get("structural")
+                            else "swap_fee"
+                        ),
                     )
                 except Exception as e:
                     try:
@@ -1401,7 +1410,7 @@ class BoltzCliManager:
 
     def loop_out(self, amount_sats: int, address: Optional[str] = None, channel_id: Optional[str] = None,
                  peer_id: Optional[str] = None, currency: Optional[str] = None,
-                 routing_fee_limit_ppm: Optional[int] = None) -> Dict[str, Any]:
+                 routing_fee_limit_ppm: Optional[int] = None, structural: bool = False) -> Dict[str, Any]:
         amount_sats = int(amount_sats)
         if amount_sats <= 0:
             raise BoltzCliError("amount_sats must be > 0")
@@ -1409,11 +1418,12 @@ class BoltzCliManager:
 
         # P0-1 FIX: Serialize budget-check + swap-create to prevent TOCTOU race
         with self._swap_creation_lock:
-            return self._loop_out_locked(amount_sats, address, channel_id, peer_id, currency, target_cur, routing_fee_limit_ppm)
+            return self._loop_out_locked(amount_sats, address, channel_id, peer_id, currency, target_cur,
+                                         routing_fee_limit_ppm, structural=structural)
 
     def _loop_out_locked(self, amount_sats: int, address: Optional[str], channel_id: Optional[str],
                          peer_id: Optional[str], currency: Optional[str], target_cur: str,
-                         routing_fee_limit_ppm: Optional[int] = None) -> Dict[str, Any]:
+                         routing_fee_limit_ppm: Optional[int] = None, structural: bool = False) -> Dict[str, Any]:
         quote = self.quote(amount_sats=amount_sats, swap_type="reverse", currency=target_cur)
         budget_check = self._enforce_budget_for_quote(quote.get("quote", {}))
         if not budget_check["allowed"]:
@@ -1490,7 +1500,12 @@ class BoltzCliManager:
             self._record_swap_result(
                 result,
                 source="loop_out_external_create",
-                metadata={"peer_id": resolved_peer, "requested_channel_ids": [resolved_channel] if resolved_channel else None},
+                metadata={
+                    "peer_id": resolved_peer,
+                    "requested_channel_ids": [resolved_channel] if resolved_channel else None,
+                    # None (not False) so the journal-merge None-filter drops it
+                    "structural": True if structural else None,
+                },
             )
             invoice = self._extract_reverse_swap_invoice(result)
             if not invoice:
@@ -1658,7 +1673,12 @@ class BoltzCliManager:
         self._record_swap_result(
             result,
             source="loop_out",
-            metadata={"peer_id": target_peer_id, "requested_channel_ids": chan_ids or None},
+            metadata={
+                "peer_id": target_peer_id,
+                "requested_channel_ids": chan_ids or None,
+                # None (not False) so the journal-merge None-filter drops it
+                "structural": True if structural else None,
+            },
         )
         primary = self._primary_swap_entry(result)
         status = "accepted"

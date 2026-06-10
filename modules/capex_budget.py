@@ -306,6 +306,7 @@ class CapexBudgetEngine:
         channel_id: Optional[str] = None,
         source: Optional[str] = None,
         metadata: Optional[Dict] = None,
+        subcategory: str = "swap_fee",
     ) -> bool:
         """Record an executed Boltz swap fee in the generic spend ledger.
 
@@ -314,6 +315,11 @@ class CapexBudgetEngine:
         when channel_id is set, per-channel capex via spend_events).
         Keyed by swap id, so repeated journal updates for the same swap are
         idempotent (INSERT OR REPLACE in the database layer).
+
+        subcategory partitions the unified boltz category: "structural"
+        swaps (executed only because of the inbound-scarcity credit) are
+        summed by the daily structural envelope gate, while the tactical
+        budget keeps counting the whole category exactly once.
         """
         sid = str(swap_id or "").strip()
         if not sid:
@@ -329,7 +335,7 @@ class CapexBudgetEngine:
                 event_id=f"boltz:{sid}",
                 category="boltz",
                 amount_sats=fee,
-                subcategory="swap_fee",
+                subcategory=str(subcategory or "swap_fee"),
                 reference_id=sid,
                 channel_id=str(channel_id).replace(':', 'x') if channel_id else None,
                 source=source or "boltz_manager",

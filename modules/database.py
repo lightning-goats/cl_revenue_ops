@@ -2654,12 +2654,16 @@ class Database:
         total_fees_msat = int(row['total_fees_msat'] or 0) if row else 0
         return base_to_sats_ceil(total_fees_msat)
 
-    def get_node_realized_fee_ppm(self, window_days: int = 7) -> int:
+    def get_node_realized_fee_ppm(self, window_days: int = 7,
+                                  min_volume_sats: int = 0) -> int:
         """Node-wide realized earn rate: SUM(fee) / SUM(volume) in ppm.
 
         Used to price the value of new inbound capacity when the node is
         receivable-starved. Returns 0 when there is no settled volume in
-        the window (caller treats 0 as "no credit").
+        the window (caller treats 0 as "no credit"). When min_volume_sats
+        is set, also returns 0 if the settled outbound volume is below it —
+        a thin window's ppm is statistically unrepresentative and must not
+        price the structural credit.
 
         Note: the forwards table retains ~8 days of raw rows before pruning
         into daily aggregates; windows larger than the retention period will
@@ -2675,6 +2679,8 @@ class Database:
         ).fetchone()
         fee_msat, out_msat = int(row['fee_msat']), int(row['out_msat'])
         if out_msat <= 0:
+            return 0
+        if min_volume_sats > 0 and (out_msat // 1000) < int(min_volume_sats):
             return 0
         return (fee_msat * 1_000_000) // out_msat
 

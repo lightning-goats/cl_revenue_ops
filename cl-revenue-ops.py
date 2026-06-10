@@ -6727,6 +6727,13 @@ def _build_boltz_expansion_treasury_plan(
     return filtered
 
 
+# Minimum settled outbound volume (sats) in the 7d window before the node's
+# realized fee ppm is trusted to price the structural inbound credit. Below
+# this floor a handful of lucky high-fee forwards would set a wildly
+# unrepresentative rate, so the credit is disabled instead.
+STRUCTURAL_MIN_VOLUME_SATS = 1_000_000
+
+
 def _build_boltz_balance_plan(
     *,
     low_trigger_pct: float = 40.0,
@@ -6801,7 +6808,9 @@ def _build_boltz_balance_plan(
             structural_scarcity = 0.0
         if structural_scarcity > 0.0:
             try:
-                structural_realized_ppm = int(database.get_node_realized_fee_ppm(window_days=7) or 0)
+                # Volume floor: a thin 7d window must not price the credit.
+                structural_realized_ppm = int(database.get_node_realized_fee_ppm(
+                    window_days=7, min_volume_sats=STRUCTURAL_MIN_VOLUME_SATS) or 0)
             except Exception:
                 structural_realized_ppm = 0
 
@@ -7121,8 +7130,12 @@ def _build_boltz_balance_plan(
                 "profit_margin_factor": effective_profit_margin,
                 "passes_profit_guard": bool(passes_profit_guard),
                 "structural_uplift_sats": structural_uplift_sats,
+                # True only when the pass actually DEPENDED on the credit:
+                # with require_profitable=False every candidate passes anyway,
+                # so nothing is structural (the envelope must not be charged).
                 "structural": bool(
-                    passes_profit_guard
+                    require_profitable
+                    and passes_profit_guard
                     and structural_uplift_sats > 0
                     and not passes_without_credit
                 ),
@@ -7377,6 +7390,35 @@ def _execute_boltz_balance_cycle(
             })
             continue
 
+        # Structural envelope gate: candidates that only pass the profit guard
+        # because of the inbound-scarcity credit spend from a dedicated daily
+        # envelope (boltz_structural_budget_sats_per_day) on top of the
+        # tactical budget gate above. The 24h sum is fed by structural swap
+        # fees recorded under category="boltz"/subcategory="structural".
+        if econ.get("structural"):
+            envelope = int(getattr(config, "boltz_structural_budget_sats_per_day", 0) or 0)
+            spent_24h = None
+            if envelope > 0:
+                try:
+                    spent_24h = int(database.get_category_spend_sats(
+                        "boltz", subcategory="structural",
+                        since_timestamp=now - 86400,
+                    ) or 0)
+                except Exception:
+                    # Fail closed: unknown spend means no structural execution.
+                    spent_24h = None
+            if envelope <= 0 or spent_24h is None or spent_24h + est_fee > envelope:
+                skipped_exec.append({
+                    "channel_id": ch_id,
+                    "peer_id": peer_id,
+                    "reason": "structural_envelope_exhausted",
+                    "envelope_sats": envelope,
+                    "spent_24h_sats": spent_24h,
+                    "estimated_fee_sats": est_fee,
+                    "recommendation": rec,
+                })
+                continue
+
         rec_hints = rec.get("execution_hints", {}) if isinstance(rec.get("execution_hints"), dict) else {}
         rec_cooldown_hours = rec_hints.get("recommended_cooldown_hours")
         rec_cooldown_seconds = cooldown_seconds
@@ -7447,7 +7489,16 @@ def _execute_boltz_balance_cycle(
                             )
                     except Exception:
                         pass  # Fall back to original channel selection
-                res = bm.loop_out(amount_sats=amount_sats, channel_id=exec_ch_id, peer_id=exec_peer_id, currency=currency)
+                # structural=True routes the swap fee into the dedicated
+                # "structural" spend subcategory so the envelope gate's 24h
+                # sum advances with each structural execution.
+                res = bm.loop_out(
+                    amount_sats=amount_sats,
+                    channel_id=exec_ch_id,
+                    peer_id=exec_peer_id,
+                    currency=currency,
+                    structural=bool(econ.get("structural")),
+                )
             else:
                 raise BoltzCliError(f"Unknown direction: {direction}")
 

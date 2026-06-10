@@ -359,3 +359,200 @@ def test_db_and_status_called_once_not_per_candidate():
     assert len(plan["recommendations"]) == 2
     assert mod.database.get_node_realized_fee_ppm.call_count == 1
     assert status_calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 9 part C: volume floor, require_profitable gating, Task 8 gap tests
+# ---------------------------------------------------------------------------
+
+def test_realized_ppm_query_uses_volume_floor():
+    """The hoist must request the realized ppm with the 1M-sat volume floor so
+    a handful of lucky high-fee forwards cannot price the structural credit."""
+    mod = _structural_module(scarcity=1.0)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    mod.database.get_node_realized_fee_ppm.assert_called_once_with(
+        window_days=7, min_volume_sats=1_000_000
+    )
+
+
+def test_structural_flag_false_when_require_profitable_disabled():
+    """require_profitable=False: every candidate passes the guard regardless of
+    the credit, so the pass never DEPENDED on it — structural must be False."""
+    mod = _structural_module(scarcity=1.0)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=False)
+
+    assert "error" not in plan
+    recs = plan["recommendations"]
+    assert len(recs) == 1
+    econ = recs[0]["economics"]
+    assert econ["structural_uplift_sats"] > 0  # credit is still reported
+    assert econ["structural"] is False
+
+
+def test_loop_in_candidate_gets_zero_structural_credit():
+    """Starved node, loop-in direction: the credit is loop-out only (loop-in
+    consumes receivable instead of creating it)."""
+    mod = _structural_module(scarcity=1.0)
+    # 10% local => loop_in direction (low trigger default 40%)
+    mod.fee_controller._get_channels_info.return_value = {
+        "100x1x0": {
+            "peer_id": "02" + "b" * 64,
+            "capacity": 10_000_000,
+            "spendable_msat": 1_000_000_000,
+            "receivable_msat": 9_000_000_000,
+        }
+    }
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    recs = plan["recommendations"]
+    assert len(recs) == 1
+    assert recs[0]["direction"] == "loop_in"
+    econ = recs[0]["economics"]
+    assert econ["structural_uplift_sats"] == 0
+    assert econ["structural"] is False
+
+
+def test_candidate_passing_without_credit_not_structural():
+    """A loop-out whose historical contribution alone clears the guard is NOT
+    structural even when the starved node grants a positive credit."""
+    mod = _structural_module(scarcity=1.0)
+    prof = _make_prof_mock()
+    # 30k sats over 30 days => 1000 sats/day; with horizon 3d and severity
+    # ~0.85 the historical uplift (~2550) clears the 120-sat threshold alone.
+    prof.revenue.total_contribution_sats = 30_000
+    mod.profitability_analyzer.get_profitability.return_value = prof
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    econ = plan["recommendations"][0]["economics"]
+    assert econ["passes_profit_guard"] is True
+    assert econ["structural_uplift_sats"] > 0
+    assert econ["structural"] is False
+
+
+# ---------------------------------------------------------------------------
+# Task 9 parts A+B: execution-time envelope gate + structural spend recording
+# ---------------------------------------------------------------------------
+
+CYCLE_PEER = "02" + "b" * 64
+
+
+def _cycle_plan(structural=True, est_fee=100):
+    """Minimal precomputed balance plan with one loop-out recommendation."""
+    return {
+        "generated_at": 1,
+        "pending_swap_count": 0,
+        "budget": {"remaining_24h_sats_estimate": 100_000},
+        "recommendations": [
+            {
+                "channel_id": "100x1x0",
+                "peer_id": CYCLE_PEER,
+                "direction": "loop_out",
+                "amount_sats": 200_000,
+                "economics": {
+                    "passes_profit_guard": True,
+                    "estimated_swap_fee_sats": est_fee,
+                    "structural_uplift_sats": 500 if structural else 0,
+                    "structural": structural,
+                },
+            }
+        ],
+        "total_candidates": 1,
+        "skipped_count": 0,
+        "skipped_examples": [],
+    }
+
+
+def _cycle_module(envelope=1000, spent=0):
+    mod = load_plugin_module()
+    mod.plugin.log = MagicMock()
+    from modules.config import Config
+    mod.config = Config(boltz_structural_budget_sats_per_day=envelope)
+    mod.database = MagicMock()
+    mod.database.get_category_spend_sats.return_value = spent
+    mod.hive_router = None
+    bm = MagicMock()
+    bm.loop_out.return_value = {"status": "accepted"}
+    mod._require_boltz_manager = MagicMock(return_value=bm)
+    return mod, bm
+
+
+def test_structural_candidate_blocked_when_envelope_spent():
+    """100 already spent + 100 estimated > 150 envelope: skip, never swap."""
+    mod, bm = _cycle_module(envelope=150, spent=100)
+
+    result = mod._execute_boltz_balance_cycle(
+        dry_run=False, precomputed_plan=_cycle_plan(est_fee=100)
+    )
+
+    assert result["executed"] == []
+    skip = result["skipped"][0]
+    assert skip["reason"] == "structural_envelope_exhausted"
+    assert skip["envelope_sats"] == 150
+    assert skip["spent_24h_sats"] == 100
+    assert skip["estimated_fee_sats"] == 100
+    bm.loop_out.assert_not_called()
+
+
+def test_structural_candidate_executes_within_envelope():
+    mod, bm = _cycle_module(envelope=1000, spent=0)
+
+    result = mod._execute_boltz_balance_cycle(
+        dry_run=False, precomputed_plan=_cycle_plan(est_fee=100)
+    )
+
+    assert len(result["executed"]) == 1
+    assert result["executed"][0]["status"] == "accepted"
+    # The gate consulted the 24h structural spend exactly once.
+    mod.database.get_category_spend_sats.assert_called_once()
+    kwargs = mod.database.get_category_spend_sats.call_args.kwargs
+    assert kwargs["subcategory"] == "structural"
+
+
+def test_structural_spend_recorded_after_execution():
+    """Structural execution must flow structural=True into boltz_manager so
+    record_boltz_spend writes the fee under subcategory='structural' (the
+    same boltz:{swap_id} event the tactical budget already counts once)."""
+    mod, bm = _cycle_module(envelope=1000, spent=0)
+
+    result = mod._execute_boltz_balance_cycle(
+        dry_run=False, precomputed_plan=_cycle_plan(est_fee=100)
+    )
+
+    assert len(result["executed"]) == 1
+    assert bm.loop_out.call_args.kwargs["structural"] is True
+
+
+def test_non_structural_candidate_ignores_envelope():
+    """A candidate that passes without the credit executes even when the
+    structural envelope is exhausted (or disabled) — and never queries it."""
+    mod, bm = _cycle_module(envelope=0, spent=10_000)
+
+    result = mod._execute_boltz_balance_cycle(
+        dry_run=False, precomputed_plan=_cycle_plan(structural=False)
+    )
+
+    assert len(result["executed"]) == 1
+    mod.database.get_category_spend_sats.assert_not_called()
+    assert bm.loop_out.call_args.kwargs["structural"] is False
+
+
+def test_gate_fails_closed_on_spend_query_error():
+    """Unknown 24h spend => assume the envelope is exhausted."""
+    mod, bm = _cycle_module(envelope=1000)
+    mod.database.get_category_spend_sats.side_effect = RuntimeError("db down")
+
+    result = mod._execute_boltz_balance_cycle(
+        dry_run=False, precomputed_plan=_cycle_plan(est_fee=100)
+    )
+
+    assert result["executed"] == []
+    assert result["skipped"][0]["reason"] == "structural_envelope_exhausted"
+    bm.loop_out.assert_not_called()

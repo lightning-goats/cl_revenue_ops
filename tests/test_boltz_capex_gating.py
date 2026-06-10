@@ -228,6 +228,28 @@ class TestBoltzSpendRecording:
         )
         engine.record_boltz_spend.assert_not_called()
 
+    def test_structural_metadata_records_structural_subcategory(self):
+        """loop_out(structural=True) tags metadata; the spend event must land
+        under subcategory='structural' so the daily envelope gate sees it."""
+        mgr, engine = self._make_recording_manager()
+        mgr._record_swap_result(
+            {"swaps": [{"id": "swapG", "boltzFee": 80}]},
+            source="loop_out",
+            metadata={"requested_channel_ids": ["200x2x0"], "structural": True},
+        )
+        kwargs = engine.record_boltz_spend.call_args.kwargs
+        assert kwargs["subcategory"] == "structural"
+
+    def test_default_recording_uses_swap_fee_subcategory(self):
+        mgr, engine = self._make_recording_manager()
+        mgr._record_swap_result(
+            {"swaps": [{"id": "swapH", "boltzFee": 80}]},
+            source="loop_out",
+            metadata={"requested_channel_ids": ["200x2x0"]},
+        )
+        kwargs = engine.record_boltz_spend.call_args.kwargs
+        assert kwargs["subcategory"] == "swap_fee"
+
     def test_no_engine_does_not_crash(self):
         mgr = _make_manager()
         mgr._load_swap_journal = MagicMock(return_value=[])
@@ -261,6 +283,13 @@ class TestRecordBoltzSpendEngine:
             source="boltz_manager:loop_in",
             metadata=None,
         )
+
+    def test_subcategory_structural_passes_through(self):
+        engine, db = self._make_engine()
+        ok = engine.record_boltz_spend("s1b", 150, subcategory="structural")
+        assert ok is True
+        assert db.record_spend_event.call_args.kwargs["subcategory"] == "structural"
+        assert db.record_spend_event.call_args.kwargs["event_id"] == "boltz:s1b"
 
     def test_normalizes_colon_channel_id(self):
         engine, db = self._make_engine()

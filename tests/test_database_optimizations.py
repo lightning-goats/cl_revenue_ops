@@ -614,6 +614,36 @@ class TestNodeRealizedFeePpm:
         )
         assert db.get_node_realized_fee_ppm(window_days=7) == 0
 
+    def test_realized_ppm_zero_below_volume_floor(self, tmp_path):
+        """1M msat settled (= 1000 sats) is below a 1M-sat floor: return 0 so
+        a few lucky high-fee forwards cannot price the structural credit."""
+        db = self._db(tmp_path)
+        conn = db._get_connection()
+        now = int(time.time())
+        # Two forwards totalling 1_000_000 msat out (1000 sats) at 1000 ppm.
+        for offset in range(2):
+            conn.execute(
+                "INSERT INTO forwards (in_channel, out_channel, in_msat, out_msat,"
+                " fee_msat, timestamp) VALUES ('1x1x1','2x2x2',?,500000,500,?)",
+                (500500 + offset, now - 3600),
+            )
+        assert db.get_node_realized_fee_ppm(window_days=7, min_volume_sats=1_000_000) == 0
+        # Floor disabled (default) keeps the old behavior.
+        assert db.get_node_realized_fee_ppm(window_days=7) == 1000
+
+    def test_realized_ppm_returned_at_or_above_volume_floor(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = db._get_connection()
+        now = int(time.time())
+        # 2 forwards x 500_000_000 msat = 1_000_000 sats settled, exactly at floor.
+        for offset in range(2):
+            conn.execute(
+                "INSERT INTO forwards (in_channel, out_channel, in_msat, out_msat,"
+                " fee_msat, timestamp) VALUES ('1x1x1','2x2x2',?,500000000,500000,?)",
+                (500500000 + offset, now - 3600),
+            )
+        assert db.get_node_realized_fee_ppm(window_days=7, min_volume_sats=1_000_000) == 1000
+
 
 class TestCategorySpendSats:
     def _db(self, tmp_path):
