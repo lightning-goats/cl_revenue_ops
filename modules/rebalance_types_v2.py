@@ -63,8 +63,36 @@ class SkipRecord:
 
 
 @dataclass
+class DrainDemandEntry:
+    """One over-local channel the planner could not pair this cycle."""
+
+    channel_id: str
+    peer_id: str
+    excess_sats: int        # sats above the target band high-water mark
+    drain_score: float      # rebalance_state_v2._drain_score for ordering
+    value_class: str = "neutral"
+
+
+@dataclass
+class DrainDemand:
+    """Residual drain demand after circular pairing.
+
+    This is the ONLY input that may earn the Boltz structural credit:
+    the circular rebalancer keeps first claim on anything it can place
+    internally (it is cheaper and conserves node capital); only the
+    unplaceable residual justifies boundary-crossing swap costs.
+    """
+
+    entries: List[DrainDemandEntry] = field(default_factory=list)
+    total_excess_sats: int = 0
+    over_local_count: int = 0
+    paired_count: int = 0
+
+
+@dataclass
 class PlanResult:
     """Output of the v2 rebalance planner for one cycle."""
 
     selected: List[PairCandidate] = field(default_factory=list)
     skipped: List[SkipRecord] = field(default_factory=list)
+    drain_demand: Optional[DrainDemand] = None
