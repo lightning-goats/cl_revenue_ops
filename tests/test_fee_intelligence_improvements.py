@@ -137,33 +137,104 @@ class TestRebalanceCostFloor:
 
 
 class TestFailedForwardObservation:
-    def test_failed_forward_adjusts_posterior(self, mock_plugin, mock_config, mock_database):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+    """Audit DTS-4: the failed-forward nudge is only valid for failures
+    that implicate OUR fee on the OUT channel (WIRE_FEE_INSUFFICIENT
+    family). Liquidity/downstream failures — and failures with no usable
+    failcode at all — must produce NO nudge: a misdirected systematic
+    signal is worse than none. Callers are responsible for passing the
+    OUTGOING channel id (BOLT 7: our advertised fee applies to HTLCs we
+    forward OUT through a channel)."""
+
+    WIRE_FEE_INSUFFICIENT = 0x1000 | 12  # 4108
+    WIRE_TEMPORARY_CHANNEL_FAILURE = 0x1000 | 7  # 4103 (liquidity)
+
+    def _seed_channel(self, fc, channel_id="123x1x0"):
         state = GaussianThompsonState()
         state.posterior_mean = 500.0
         state.posterior_std = 50.0
-        cfs = ChannelFeeState(thompson=state)
-        fc._channel_fee_states["123x1x0"] = cfs
+        fc._channel_fee_states[channel_id] = ChannelFeeState(thompson=state)
+        return state
+
+    def test_fee_failcode_adjusts_posterior(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        state = self._seed_channel(fc)
 
         original_mean = state.posterior_mean
-        fc.record_failed_forward("123x1x0", 500)
+        fc.record_failed_forward(
+            "123x1x0", 500,
+            failcode=self.WIRE_FEE_INSUFFICIENT,
+            failreason="WIRE_FEE_INSUFFICIENT",
+        )
 
         # Should pull mean down slightly (toward 80% of 500 = 400)
         assert state.posterior_mean < original_mean
         assert state.posterior_mean > 400  # But not all the way to 400
 
+    def test_fee_failreason_string_alone_adjusts_posterior(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        """Some payloads carry only the symbolic failreason."""
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        state = self._seed_channel(fc)
+
+        original_mean = state.posterior_mean
+        fc.record_failed_forward("123x1x0", 500, failreason="WIRE_FEE_INSUFFICIENT")
+
+        assert state.posterior_mean < original_mean
+
+    def test_liquidity_failcode_produces_no_nudge(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        """A liquidity failure says nothing about our fee — the sender
+        already chose our edge."""
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        state = self._seed_channel(fc)
+
+        original_mean = state.posterior_mean
+        fc.record_failed_forward(
+            "123x1x0", 500,
+            failcode=self.WIRE_TEMPORARY_CHANNEL_FAILURE,
+            failreason="WIRE_TEMPORARY_CHANNEL_FAILURE",
+        )
+
+        assert state.posterior_mean == original_mean
+        assert state.posterior_bias == []
+
+    def test_missing_failcode_produces_no_nudge(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        """No usable failure reason at all (CLN's plain 'failed' status):
+        drop the nudge entirely."""
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        state = self._seed_channel(fc)
+
+        original_mean = state.posterior_mean
+        fc.record_failed_forward("123x1x0", 500)
+
+        assert state.posterior_mean == original_mean
+        assert state.posterior_bias == []
+
     def test_failed_forward_no_crash_missing_state(self, mock_plugin, mock_config, mock_database):
         fc = FeeController(mock_plugin, mock_config, mock_database)
         # No state for this channel — should not crash
-        fc.record_failed_forward("999x1x0", 500)
+        fc.record_failed_forward("999x1x0", 500, failcode=self.WIRE_FEE_INSUFFICIENT)
 
     def test_failed_forward_no_crash_zero_fee(self, mock_plugin, mock_config, mock_database):
         fc = FeeController(mock_plugin, mock_config, mock_database)
-        fc.record_failed_forward("123x1x0", 0)  # Should not crash
+        # Should not crash
+        fc.record_failed_forward("123x1x0", 0, failcode=self.WIRE_FEE_INSUFFICIENT)
 
     def test_failed_forward_no_crash_empty_channel_id(self, mock_plugin, mock_config, mock_database):
         fc = FeeController(mock_plugin, mock_config, mock_database)
-        fc.record_failed_forward("", 500)  # Should not crash
+        # Should not crash
+        fc.record_failed_forward("", 500, failcode=self.WIRE_FEE_INSUFFICIENT)
+
+    def test_failed_forward_no_crash_garbage_failcode(self, mock_plugin, mock_config, mock_database):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        state = self._seed_channel(fc)
+        original_mean = state.posterior_mean
+        fc.record_failed_forward("123x1x0", 500, failcode="not-a-number")
+        assert state.posterior_mean == original_mean
 
     def test_failed_forward_preserves_min_std(self, mock_plugin, mock_config, mock_database):
         fc = FeeController(mock_plugin, mock_config, mock_database)
@@ -173,7 +244,9 @@ class TestFailedForwardObservation:
         cfs = ChannelFeeState(thompson=state)
         fc._channel_fee_states["123x1x0"] = cfs
 
-        fc.record_failed_forward("123x1x0", 500)
+        fc.record_failed_forward(
+            "123x1x0", 500, failcode=self.WIRE_FEE_INSUFFICIENT
+        )
 
         # Std should never drop below MIN_STD
         assert state.posterior_std >= GaussianThompsonState.MIN_STD

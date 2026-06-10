@@ -5151,33 +5151,58 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
             # e.g. insufficient outbound balance — the sender did nothing wrong).
             database.update_peer_reputation(peer_id, is_success=False)
 
-    # Record failed forward as weak negative DTS signal (amount-weighted)
-    if status == "failed" and in_channel and fee_controller is not None:
-        try:
-            # _channel_fee_states is mutated by the fee loop under _state_lock,
-            # which adjust_all_fees holds across the ENTIRE fee cycle (including
-            # dozens of setchannel RPCs). pyln dispatches all notifications and
-            # RPC handlers on a single thread, so a blocking acquire here would
-            # freeze the whole plugin until the cycle ends. Use a bounded
-            # acquire and drop the nudge under contention — it is advisory
-            # negative feedback, so losing one is harmless.
-            if fee_controller._state_lock.acquire(timeout=FORWARD_EVENT_LOCK_TIMEOUT_SECS):
-                try:
-                    cfs = fee_controller._channel_fee_states.get(in_channel)
-                    current_fee = cfs.last_fee_ppm if cfs else 0
-                    if current_fee > 0:
-                        failed_in_msat = _parse_msat(forward_event.get("in_msat", forward_event.get("in_msatoshi", 0)))
-                        fee_controller.record_failed_forward(in_channel, current_fee, amount_msat=failed_in_msat)
-                finally:
-                    fee_controller._state_lock.release()
-            else:
-                plugin.log(
-                    "forward_event: fee state lock busy (fee cycle in progress); "
-                    "skipping failed-forward nudge",
-                    level='debug'
-                )
-        except Exception:
-            pass
+    # Record fee-relevant failed forwards as a weak negative DTS signal
+    # (amount-weighted), keyed to the OUT channel.
+    #
+    # Audit DTS-4:
+    # (a) Per BOLT 7 the fee a sender pays for traversing our node is OUR
+    #     advertised policy on the OUTGOING channel — the in_channel's fee
+    #     is set by our peer, so the old in_channel nudge was systematically
+    #     training the wrong channel's posterior.
+    # (b) CLN's forward_event carries failcode/failreason ONLY when status
+    #     is "local_failed" (our node rejected the HTLC, e.g.
+    #     WIRE_FEE_INSUFFICIENT when the offered fee no longer covers our
+    #     out-channel policy after a fee raise). A plain "failed" is a
+    #     downstream error inside an onion we cannot decrypt: no usable
+    #     failure reason exists, and most such failures are liquidity
+    #     failures that say nothing about our fee, so the nudge is DROPPED
+    #     entirely — a misdirected systematic signal is worse than none.
+    if status in ("failed", "local_failed") and fee_controller is not None:
+        out_scid = forward_event.get("out_channel")
+        out_scid = normalize_scid(out_scid) if out_scid else None
+        failcode = forward_event.get("failcode")
+        failreason = forward_event.get("failreason")
+        if out_scid and fee_controller.is_fee_relevant_failure(failcode, failreason):
+            try:
+                # _channel_fee_states is mutated by the fee loop under _state_lock,
+                # which adjust_all_fees holds across the ENTIRE fee cycle (including
+                # dozens of setchannel RPCs). pyln dispatches all notifications and
+                # RPC handlers on a single thread, so a blocking acquire here would
+                # freeze the whole plugin until the cycle ends. Use a bounded
+                # acquire and drop the nudge under contention — it is advisory
+                # negative feedback, so losing one is harmless.
+                if fee_controller._state_lock.acquire(timeout=FORWARD_EVENT_LOCK_TIMEOUT_SECS):
+                    try:
+                        cfs = fee_controller._channel_fee_states.get(out_scid)
+                        current_fee = cfs.last_fee_ppm if cfs else 0
+                        if current_fee > 0:
+                            failed_in_msat = _parse_msat(forward_event.get("in_msat", forward_event.get("in_msatoshi", 0)))
+                            fee_controller.record_failed_forward(
+                                out_scid, current_fee,
+                                amount_msat=failed_in_msat,
+                                failcode=failcode,
+                                failreason=failreason,
+                            )
+                    finally:
+                        fee_controller._state_lock.release()
+                else:
+                    plugin.log(
+                        "forward_event: fee state lock busy (fee cycle in progress); "
+                        "skipping failed-forward nudge",
+                        level='debug'
+                    )
+            except Exception:
+                pass
 
     # Record successful forwards for flow metrics
     if status == "settled":

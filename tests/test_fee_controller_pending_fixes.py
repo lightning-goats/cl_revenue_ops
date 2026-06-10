@@ -131,8 +131,12 @@ class TestDurablePosteriorNudges:
         control = copy.deepcopy(state)
         fc._channel_fee_states[channel_id] = ChannelFeeState(thompson=state)
 
-        # Large failed forward (5M sats) => strong advisory negative signal
-        fc.record_failed_forward(channel_id, 500, amount_msat=5_000_000_000)
+        # Large failed forward (5M sats) => strong advisory negative signal.
+        # DTS-4: must carry a fee-relevant failcode or the nudge is dropped.
+        fc.record_failed_forward(
+            channel_id, 500, amount_msat=5_000_000_000,
+            failcode=0x1000 | 12, failreason="WIRE_FEE_INSUFFICIENT",
+        )
         assert state.posterior_mean < control.posterior_mean
 
         # Next fee cycle: update_posterior runs BEFORE sampling
@@ -393,8 +397,13 @@ class TestForwardEventLockContention:
         done = threading.Event()
 
         def dispatch():
+            # DTS-4: the nudge is keyed to out_channel and requires a
+            # fee-relevant failcode (only present on local_failed).
             mod._on_forward_event_impl(
-                {"status": "failed", "in_channel": channel_id,
+                {"status": "local_failed", "in_channel": "999x9x9",
+                 "out_channel": channel_id,
+                 "failcode": 0x1000 | 12,
+                 "failreason": "WIRE_FEE_INSUFFICIENT",
                  "in_msat": "1000000msat"},
                 MagicMock(),
             )
@@ -426,13 +435,107 @@ class TestForwardEventLockContention:
         original_mean = state.posterior_mean
 
         mod._on_forward_event_impl(
-            {"status": "failed", "in_channel": channel_id,
+            {"status": "local_failed", "in_channel": "999x9x9",
+             "out_channel": channel_id,
+             "failcode": 0x1000 | 12,
+             "failreason": "WIRE_FEE_INSUFFICIENT",
              "in_msat": "1000000msat"},
             MagicMock(),
         )
 
         assert state.posterior_mean < original_mean, \
             "Nudge should apply normally when the lock is uncontended"
+
+
+# =============================================================================
+# Audit DTS-4: failed-forward nudge must target the OUT channel and fire
+# only on fee-relevant failures
+# =============================================================================
+
+class TestFailedForwardRekeying:
+    """The fee a sender pays for traversing our node is set by OUR policy
+    on the OUT channel (BOLT 7), so a fee-related failure is evidence about
+    out_channel — the old handler nudged in_channel. And CLN's forward_event
+    only carries failcode/failreason for status=local_failed; a plain
+    'failed' (downstream onion error) has no usable failure reason, so the
+    nudge must be dropped entirely rather than fed in misdirected."""
+
+    IN_CHANNEL = "111x1x0"
+    OUT_CHANNEL = "222x2x0"
+    WIRE_FEE_INSUFFICIENT = 0x1000 | 12   # 4108
+    WIRE_TEMPORARY_CHANNEL_FAILURE = 0x1000 | 7  # 4103
+
+    def _setup_module(self, mock_plugin, mock_database):
+        mod = load_plugin_module()
+        fc = _make_fc(mock_plugin, mock_database)
+        mod.database = MagicMock()
+        mod.fee_controller = fc
+        mod._resolve_scid_to_peer = lambda scid: None
+
+        states = {}
+        for channel_id in (self.IN_CHANNEL, self.OUT_CHANNEL):
+            state = GaussianThompsonState()
+            state.posterior_mean = 500.0
+            state.posterior_std = 50.0
+            fc._channel_fee_states[channel_id] = ChannelFeeState(
+                thompson=state, last_fee_ppm=500,
+            )
+            states[channel_id] = state
+        return mod, fc, states
+
+    def _dispatch(self, mod, status, failcode=None, failreason=None):
+        payload = {
+            "status": status,
+            "in_channel": self.IN_CHANNEL,
+            "out_channel": self.OUT_CHANNEL,
+            "in_msat": "1000000msat",
+        }
+        if failcode is not None:
+            payload["failcode"] = failcode
+        if failreason is not None:
+            payload["failreason"] = failreason
+        mod._on_forward_event_impl(payload, MagicMock())
+
+    def test_fee_failure_nudges_out_channel_not_in_channel(
+        self, mock_plugin, mock_database
+    ):
+        mod, fc, states = self._setup_module(mock_plugin, mock_database)
+
+        self._dispatch(
+            mod, "local_failed",
+            failcode=self.WIRE_FEE_INSUFFICIENT,
+            failreason="WIRE_FEE_INSUFFICIENT",
+        )
+
+        assert states[self.OUT_CHANNEL].posterior_mean < 500.0, \
+            "Fee-relevant failure must nudge the OUT channel's posterior"
+        assert states[self.IN_CHANNEL].posterior_mean == 500.0, \
+            "The IN channel's fee is our peer's policy, not ours — no nudge"
+
+    def test_liquidity_failcode_produces_no_nudge(
+        self, mock_plugin, mock_database
+    ):
+        mod, fc, states = self._setup_module(mock_plugin, mock_database)
+
+        self._dispatch(
+            mod, "local_failed",
+            failcode=self.WIRE_TEMPORARY_CHANNEL_FAILURE,
+            failreason="WIRE_TEMPORARY_CHANNEL_FAILURE",
+        )
+
+        assert states[self.OUT_CHANNEL].posterior_mean == 500.0
+        assert states[self.IN_CHANNEL].posterior_mean == 500.0
+
+    def test_downstream_failed_without_failcode_produces_no_nudge(
+        self, mock_plugin, mock_database
+    ):
+        """CLN's 'failed' status carries no failcode: drop the nudge."""
+        mod, fc, states = self._setup_module(mock_plugin, mock_database)
+
+        self._dispatch(mod, "failed")
+
+        assert states[self.OUT_CHANNEL].posterior_mean == 500.0
+        assert states[self.IN_CHANNEL].posterior_mean == 500.0
 
 
 # =============================================================================

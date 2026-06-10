@@ -7596,19 +7596,65 @@ class FeeController:
     # -----------------------------------------------------------------
     # Failed-forward DTS observation
     # -----------------------------------------------------------------
-    def record_failed_forward(self, channel_id: str, current_fee_ppm: int,
-                              amount_msat: int = 0) -> None:
-        """Record a failed forward as a weak negative fee observation.
 
-        A forward offered to our channel but not settled suggests the fee
-        may be too high relative to alternatives. Larger failed forwards
-        carry more weight — someone trying to route 5M sats through us
-        is a stronger signal than a 1000 sat probe.
+    # BOLT 4 failure codes that implicate OUR advertised fee on the
+    # outgoing channel. WIRE_FEE_INSUFFICIENT = UPDATE|12 (0x100C, 4108):
+    # the HTLC offered to us did not cover fee_base_msat /
+    # fee_proportional_millionths of the channel we were asked to forward
+    # out through (typically the sender routed on stale gossip after we
+    # raised the fee).
+    FEE_RELEVANT_FAILCODES = frozenset({0x1000 | 12})
+
+    @staticmethod
+    def is_fee_relevant_failure(failcode: Optional[int] = None,
+                                failreason: Optional[str] = None) -> bool:
+        """True when a forward failure is evidence about OUR fee.
+
+        Audit DTS-4: most forward failures are liquidity or downstream
+        failures that say nothing about our fee — the sender had already
+        chosen our edge at our advertised price. Only the
+        WIRE_FEE_INSUFFICIENT family means "the fee on our outgoing
+        channel was not met". When the payload carries NO usable failure
+        reason at all (CLN's plain "failed" status — a downstream onion
+        error we cannot decrypt), this returns False so the caller drops
+        the nudge entirely: a misdirected systematic signal is worse
+        than none.
+        """
+        if failcode is not None:
+            try:
+                return int(failcode) in FeeController.FEE_RELEVANT_FAILCODES
+            except (TypeError, ValueError):
+                pass
+        if isinstance(failreason, str) and "FEE_INSUFFICIENT" in failreason.upper():
+            return True
+        return False
+
+    def record_failed_forward(self, channel_id: str, current_fee_ppm: int,
+                              amount_msat: int = 0,
+                              failcode: Optional[int] = None,
+                              failreason: Optional[str] = None) -> None:
+        """Record a fee-relevant failed forward as a weak negative signal.
+
+        Audit DTS-4 — two corrections to the original design:
+        (a) channel_id must be the OUTGOING channel: per BOLT 7 the fee a
+            sender pays for traversing our node is OUR policy on the OUT
+            channel (the IN channel's fee is set by our peer), so a
+            fee-related failure is evidence about out_channel only.
+        (b) The nudge fires only for fee-relevant failures
+            (WIRE_FEE_INSUFFICIENT family). Liquidity/downstream failures
+            — and payloads with no usable failcode/failreason — are
+            dropped (see is_fee_relevant_failure).
+
+        Larger failed forwards carry more weight — someone trying to
+        route 5M sats through us is a stronger signal than a 1000 sat
+        probe.
 
         Base weight: 10% of a settled forward.
         Amount boost: up to 3x for large forwards (>1M sats).
         """
         if not channel_id or current_fee_ppm <= 0:
+            return
+        if not self.is_fee_relevant_failure(failcode, failreason):
             return
         # Called from the forward_event hook thread; the fee loop mutates the
         # same Thompson state under _state_lock.
