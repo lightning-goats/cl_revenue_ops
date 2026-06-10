@@ -112,25 +112,71 @@ def _priority_score(entry: dict) -> float:
     return max(0.0, min(MAX_HINT_PRIORITY_SCORE, value))
 
 
-def _find_channel(
+def _resolve_endpoint(
     channels: Iterable[ChannelState],
     *,
     scid: str,
     peer_id: str,
     viability_check,
     ranking,
-) -> Optional[ChannelState]:
+) -> tuple[Optional[ChannelState], bool]:
+    """Resolve one hint endpoint to a local channel.
+
+    Returns ``(channel, unresolvable)``. A hint endpoint binds locally only
+    via an SCID that names one of our channels or a non-empty peer id with a
+    matching local channel. An SCID we do not have means the hint targets a
+    different node's channel; falling through to a wildcard pool would let
+    foreign-fleet hints fabricate pairs between unrelated local channels.
+    """
     if scid:
         for channel in channels:
             if channel.channel_id == scid:
-                return channel if viability_check(channel) else None
+                return (channel if viability_check(channel) else None), False
+        # SCID given but unknown locally: never rebind to another channel.
+        return None, True
 
-    candidates = [channel for channel in channels if (not peer_id or channel.peer_id == peer_id)]
+    if not peer_id:
+        # No SCID and no peer: nothing to bind to. Skip, do not wildcard.
+        return None, True
+
+    candidates = [channel for channel in channels if channel.peer_id == peer_id]
     candidates = [channel for channel in candidates if viability_check(channel)]
     if not candidates:
-        return None
+        return None, False
     candidates.sort(key=ranking, reverse=True)
-    return candidates[0]
+    return candidates[0], False
+
+
+def _executor_gate_skip(
+    entry: dict,
+    *,
+    our_node_id: str,
+    hint_id: str,
+    fallback_channel_id: str,
+) -> Optional[SkipRecord]:
+    """Return a SkipRecord when another member is the designated executor.
+
+    Missing/empty executor fields mean no gating (back-compat with hints
+    that predate executor designation).
+    """
+    primary = str(entry.get("primary_executor_member_id") or "").strip()
+    if not primary:
+        return None
+    our_id = str(our_node_id or "").strip()
+    if primary == our_id:
+        return None
+    raw_fallbacks = entry.get("fallback_executor_member_ids") or []
+    if not isinstance(raw_fallbacks, (list, tuple, set)):
+        raw_fallbacks = []
+    fallback_ids = {str(item or "").strip() for item in raw_fallbacks} - {""}
+    if our_id and our_id in fallback_ids:
+        return None
+    return SkipRecord(
+        channel_id=fallback_channel_id,
+        reason="not_designated_executor",
+        value_class="valuable",
+        detail=f"hint_id={hint_id} primary_executor={primary}",
+    )
 
 
 def _build_pair_from_entry(
@@ -156,20 +202,45 @@ def _build_pair_from_entry(
     ).strip()
     hint_id = _hint_id(entry, hint_type) or "unknown"
 
-    source = _find_channel(
+    executor_skip = _executor_gate_skip(
+        entry,
+        our_node_id=our_node_id,
+        hint_id=hint_id,
+        fallback_channel_id=sink_scid or source_scid or hint_id,
+    )
+    if executor_skip is not None:
+        return None, executor_skip
+
+    source, source_unresolvable = _resolve_endpoint(
         snapshot.channels,
         scid=source_scid,
         peer_id=source_peer,
         viability_check=lambda channel: _is_viable_source(channel, target_band_high),
         ranking=lambda channel: (_channel_excess_sats(channel, target_band_high), channel.local_ratio),
     )
-    sink = _find_channel(
+    sink, sink_unresolvable = _resolve_endpoint(
         snapshot.channels,
         scid=sink_scid,
         peer_id=dest_peer,
         viability_check=lambda channel: _is_viable_sink(channel, target_band_low),
         ranking=lambda channel: (_channel_need_sats(channel, target_band_low), 1.0 - channel.local_ratio),
     )
+
+    if source_unresolvable or sink_unresolvable:
+        roles = ",".join(
+            role
+            for role, unresolvable in (
+                ("source", source_unresolvable),
+                ("sink", sink_unresolvable),
+            )
+            if unresolvable
+        )
+        return None, SkipRecord(
+            channel_id=sink_scid or source_scid or hint_id,
+            reason="coordination_unresolvable_endpoint",
+            value_class="valuable",
+            detail=f"hint_id={hint_id} unresolvable_roles={roles}",
+        )
 
     if source is None or sink is None:
         return None, SkipRecord(

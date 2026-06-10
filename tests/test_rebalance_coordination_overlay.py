@@ -251,6 +251,213 @@ def test_overlay_applies_segment_score_bias_to_coordinated_pair():
 
 
 # -----------------------------------------------------------------------------
+# Endpoint binding: hints must resolve to local channels explicitly.
+# A foreign-fleet hint (unknown SCID, no peer ids) must never wildcard-bind
+# to unrelated local channels.
+# -----------------------------------------------------------------------------
+
+def test_overlay_skips_foreign_scid_hint_with_empty_peers():
+    from modules.rebalance_coordination_overlay import build_coordination_overlay
+
+    snapshot = _make_snapshot()
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-foreign",
+                "source_scid": "999x9x9",
+                "sink_scid": "888x8x8",
+                "amount_sats": 120_000,
+                "route_policy": "hive_only",
+                "priority_score": 90.0,
+            }
+        ]
+    )
+
+    result = build_coordination_overlay(
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    assert result.selected == []
+    assert len(result.skipped) == 1
+    assert result.skipped[0].reason == "coordination_unresolvable_endpoint"
+    assert "rec-foreign" in (result.skipped[0].detail or "")
+
+
+def test_overlay_skips_hint_with_no_endpoints_at_all():
+    """A recommendation with neither SCIDs nor peer ids must skip, not
+    fabricate a pair from the best local source/sink wildcard pool."""
+    from modules.rebalance_coordination_overlay import build_coordination_overlay
+
+    snapshot = _make_snapshot()
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-empty",
+                "amount_sats": 120_000,
+                "route_policy": "hive_only",
+            }
+        ]
+    )
+
+    result = build_coordination_overlay(
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    assert result.selected == []
+    assert result.skipped[0].reason == "coordination_unresolvable_endpoint"
+
+
+def test_overlay_skips_campaign_without_endpoints_or_active_chunk():
+    from modules.rebalance_coordination_overlay import build_coordination_overlay
+
+    snapshot = _make_snapshot()
+    hints = FakeHiveHints(
+        campaigns=[
+            {
+                "campaign_id": "camp-1",
+                "status": "active",
+                "amount_sats": 100_000,
+            }
+        ]
+    )
+
+    result = build_coordination_overlay(
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    assert result.selected == []
+    assert result.skipped[0].reason == "coordination_unresolvable_endpoint"
+
+
+def test_overlay_resolves_endpoint_by_peer_when_scid_missing():
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+
+    snapshot = _make_snapshot()
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-peer",
+                "source_peer_id": "02" + "1" * 64,
+                "destination_peer_id": "02" + "2" * 64,
+                "amount_sats": 120_000,
+            }
+        ]
+    )
+
+    candidates = build_coordination_pairs(
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].source_channel_id == "100x1x0"
+    assert candidates[0].dest_channel_id == "200x1x0"
+
+
+def test_overlay_does_not_wildcard_when_scid_unknown_but_peer_given():
+    """An SCID that names a channel we do not have means the hint targets a
+    different node; do not silently rebind it to another local channel."""
+    from modules.rebalance_coordination_overlay import build_coordination_overlay
+
+    snapshot = _make_snapshot()
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-mismatch",
+                "source_scid": "999x9x9",
+                "source_peer_id": "02" + "1" * 64,
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+            }
+        ]
+    )
+
+    result = build_coordination_overlay(
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    assert result.selected == []
+    assert result.skipped[0].reason == "coordination_unresolvable_endpoint"
+
+
+# -----------------------------------------------------------------------------
+# Executor gating: hints designating another member as executor must not run
+# here unless we appear in the fallback list.
+# -----------------------------------------------------------------------------
+
+def test_overlay_skips_hint_designating_another_executor():
+    from modules.rebalance_coordination_overlay import build_coordination_overlay
+
+    snapshot = _make_snapshot()
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-exec",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+                "primary_executor_member_id": "02someoneelse",
+                "fallback_executor_member_ids": ["02notus"],
+            }
+        ]
+    )
+
+    result = build_coordination_overlay(
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    assert result.selected == []
+    assert result.skipped[0].reason == "not_designated_executor"
+
+
+def test_overlay_allows_fallback_executor():
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+
+    snapshot = _make_snapshot()
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-fallback",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+                "primary_executor_member_id": "02someoneelse",
+                "fallback_executor_member_ids": ["02ours"],
+            }
+        ]
+    )
+
+    candidates = build_coordination_pairs(
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    assert len(candidates) == 1
+
+
+def test_overlay_no_executor_gating_when_fields_missing():
+    """Back-compat: hints without executor fields are open to any member."""
+    from modules.rebalance_coordination_overlay import build_coordination_pairs
+
+    snapshot = _make_snapshot()
+    hints = FakeHiveHints(
+        recommendations=[
+            {
+                "recommendation_id": "rec-open",
+                "source_scid": "100x1x0",
+                "sink_scid": "200x1x0",
+                "amount_sats": 120_000,
+                "primary_executor_member_id": "",
+            }
+        ]
+    )
+
+    candidates = build_coordination_pairs(
+        snapshot, hive_hints=hints, our_node_id="02ours"
+    )
+
+    assert len(candidates) == 1
+
+
+# -----------------------------------------------------------------------------
 # Phase B.f (2026-04-23): reserved coordination slots bypass max_pairs cap.
 # -----------------------------------------------------------------------------
 
