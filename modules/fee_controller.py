@@ -5456,21 +5456,30 @@ class FeeController:
             # =====================================================================
             # THOMPSON SAMPLING: Update Posterior and Sample Fee
             # =====================================================================
-            # Update DTS posterior with demand-adjusted observation
-            ts_state.thompson.update_posterior(
-                fee=current_fee_ppm,
-                revenue_rate=adjusted_revenue_rate,
-                hours=hours_elapsed,
-                time_bucket=time_bucket
-            )
+            # Update DTS posterior with demand-adjusted observation.
+            # P7 fix (2026-06-10): attribute the observation to the TRUE
+            # on-chain fee. current_fee_ppm is seeded to min_fee_ppm when the
+            # chain reports 0, so using it recorded (min_fee, revenue-of-0-fee)
+            # pairs that bent the revenue curve at min_fee. A 0-fee window has
+            # no revenue-curve meaning under this model (revenue is identically
+            # 0 regardless of demand), so it is skipped entirely.
+            # Invariant: every posterior observation pairs a fee that was
+            # actually advertised with the revenue it actually produced.
+            if raw_chain_fee > 0:
+                ts_state.thompson.update_posterior(
+                    fee=raw_chain_fee,
+                    revenue_rate=adjusted_revenue_rate,
+                    hours=hours_elapsed,
+                    time_bucket=time_bucket
+                )
 
-            # Update contextual posterior (time-aware weighting)
-            ts_state.thompson.update_contextual(
-                context_key=context_key,
-                fee=current_fee_ppm,
-                revenue_rate=adjusted_revenue_rate,
-                time_bucket=time_bucket
-            )
+                # Update contextual posterior (time-aware weighting)
+                ts_state.thompson.update_contextual(
+                    context_key=context_key,
+                    fee=raw_chain_fee,
+                    revenue_rate=adjusted_revenue_rate,
+                    time_bucket=time_bucket
+                )
 
             # =====================================================================
             # DTS: Apply discount factor before sampling (posterior forgetting)

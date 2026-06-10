@@ -260,3 +260,62 @@ class TestKalmanDemandFactorClamp:
     def test_clamp_constants(self):
         assert FeeController.KALMAN_DEMAND_FACTOR_MIN == 0.5
         assert FeeController.KALMAN_DEMAND_FACTOR_MAX == 2.0
+
+
+# =============================================================================
+# P7: 0-fee channels must not attribute observations to min_fee
+# =============================================================================
+
+class TestZeroFeeObservationAttribution:
+
+    def test_zero_chain_fee_skips_observation(self, mock_plugin, mock_database):
+        """raw_chain_fee == 0: no posterior observation at all (the seeded
+        min_fee must not be paired with revenue earned at 0 ppm)."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        fc.config.dry_run = False
+        fc.config.base_fee_msat = 0
+        fc.data_service = MagicMock()
+        fc.data_service.set_channel.return_value = {}
+
+        ts_state = _prepare_dts_stubs(fc, chain_fee=0, sampled_fee=400)
+        calls = []
+        ts_state.thompson.update_posterior = lambda *a, **k: calls.append(("posterior", a, k))
+        ts_state.thompson.update_contextual = lambda *a, **k: calls.append(("contextual", a, k))
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(0), cfg=cfg,
+        )
+
+        assert calls == [], "0-fee window must contribute no posterior observation"
+        # The zero-fee recovery itself must still happen
+        assert result is not None
+        assert result.new_fee_ppm > 0
+
+    def test_nonzero_chain_fee_attributes_true_fee(self, mock_plugin, mock_database):
+        """raw_chain_fee > 0: the observation must carry the raw chain fee."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+        ts_state = _prepare_dts_stubs(fc, chain_fee=150, sampled_fee=400)
+
+        captured = {}
+
+        def spy_posterior(fee, revenue_rate, hours=1.0, time_bucket="normal"):
+            captured["posterior_fee"] = fee
+
+        def spy_contextual(context_key, fee, revenue_rate, time_bucket="normal"):
+            captured["contextual_fee"] = fee
+
+        ts_state.thompson.update_posterior = spy_posterior
+        ts_state.thompson.update_contextual = spy_contextual
+
+        fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(150), cfg=cfg,
+        )
+
+        assert captured.get("posterior_fee") == 150
+        assert captured.get("contextual_fee") == 150
