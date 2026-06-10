@@ -500,7 +500,9 @@ class RebalanceEngine:
                 buckets["source_inside_band"] += 1
         return buckets
 
-    def get_drain_demand(self):
+    # DrainDemand lives in rebalance_types_v2; string-annotated (PEP 563 is in
+    # effect here) so we avoid a runtime import used only for typing.
+    def get_drain_demand(self) -> Optional["DrainDemand"]:
         """Residual over-local demand from the last planning pass, or None.
 
         Consumed by the Boltz structural loop-out path. Read-only snapshot;

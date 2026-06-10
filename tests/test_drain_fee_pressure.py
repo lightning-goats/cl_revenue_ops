@@ -181,9 +181,16 @@ def _make_drain_fc(mock_plugin, mock_database, *, discount_max):
 
 
 def _run_cycle_target(fc):
-    """Run a real fee cycle; return (post-bias target ppm, applied fee ppm)."""
-    random.seed(20260610)  # identical DTS sampling across runs
-    adjustments = fc.adjust_all_fees()
+    """Run a real fee cycle; return (post-bias target ppm, applied fee ppm).
+
+    Global RNG state is saved and restored so the deterministic seed used
+    for DTS sampling cannot leak into other tests in the session."""
+    rng_state = random.getstate()
+    try:
+        random.seed(20260610)  # identical DTS sampling across runs
+        adjustments = fc.adjust_all_fees()
+    finally:
+        random.setstate(rng_state)
     assert adjustments, "cycle should produce an adjustment for the channel"
     adj = adjustments[0]
     return adj.algorithm_values["post_pid_target_ppm"], adj.new_fee_ppm

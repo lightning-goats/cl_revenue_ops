@@ -575,6 +575,64 @@ def test_treasury_cycle_executes_non_structural_candidates():
     bm.loop_out.assert_called_once()
 
 
+def _two_candidate_plan(est_fee=100):
+    """Precomputed plan with TWO structural loop-out candidates on distinct
+    channels/peers (distinct so the per-channel cooldown pre-claim cannot
+    interfere with the second candidate)."""
+    import copy
+
+    plan = _cycle_plan(est_fee=est_fee)
+    rec2 = copy.deepcopy(plan["recommendations"][0])
+    rec2["channel_id"] = "101x1x0"
+    rec2["peer_id"] = "02" + "c" * 64
+    plan["recommendations"].append(rec2)
+    plan["total_candidates"] = 2
+    return plan
+
+
+def test_envelope_accumulates_across_candidates_in_one_cycle():
+    """Two structural candidates, envelope 150, each fee 100, max_actions=2:
+    the gate must re-query the recorded 24h structural spend PER CANDIDATE,
+    so the first execution (which records 100) exhausts the envelope for the
+    second (100 + 100 > 150). Exactly one executes; the second is skipped.
+
+    This pins the in-cycle race protection: if someone hoists the spend
+    query out of the candidate loop, both candidates see spent=0 and both
+    execute — and this test must fail."""
+    mod, bm = _cycle_module(envelope=150, spent=0)
+
+    # Stateful fakes: get_category_spend_sats returns the running sum of the
+    # fees recorded so far; each accepted loop_out records a 100-sat fee.
+    recorded_fees = []
+    mod.database.get_category_spend_sats.side_effect = (
+        lambda *a, **kw: sum(recorded_fees)
+    )
+
+    def _loop_out_records_spend(**kwargs):
+        recorded_fees.append(100)
+        return {"status": "accepted"}
+
+    bm.loop_out.side_effect = _loop_out_records_spend
+
+    result = mod._execute_boltz_balance_cycle(
+        dry_run=False,
+        max_actions=2,
+        precomputed_plan=_two_candidate_plan(est_fee=100),
+    )
+
+    assert len(result["executed"]) == 1
+    assert result["executed"][0]["status"] == "accepted"
+    assert bm.loop_out.call_count == 1
+    skips = [s for s in result["skipped"]
+             if s["reason"] == "structural_envelope_exhausted"]
+    assert len(skips) == 1
+    assert skips[0]["spent_24h_sats"] == 100
+    assert skips[0]["estimated_fee_sats"] == 100
+    assert skips[0]["envelope_sats"] == 150
+    # The gate consulted the spend once per structural candidate.
+    assert mod.database.get_category_spend_sats.call_count == 2
+
+
 def test_gate_fails_closed_on_spend_query_error():
     """Unknown 24h spend => assume the envelope is exhausted."""
     mod, bm = _cycle_module(envelope=1000)
@@ -675,6 +733,24 @@ def test_missing_engine_neutralizes():
 
     assert "error" not in plan
     for rec in plan["recommendations"]:
+        assert rec["score"]["in_drain_demand"] is False
+
+
+def test_drain_demand_fetch_error_neutralizes():
+    """get_drain_demand raising must not crash the plan build; every
+    candidate simply scores with in_drain_demand False."""
+    mod = _drain_module()
+    mod.rebalancer = MagicMock()
+    mod.rebalancer.rebalance_engine_v2.get_drain_demand.side_effect = (
+        RuntimeError("engine exploded")
+    )
+
+    plan = mod._build_boltz_balance_plan(require_profitable=False)
+
+    assert "error" not in plan
+    recs = plan["recommendations"]
+    assert len(recs) == 2
+    for rec in recs:
         assert rec["score"]["in_drain_demand"] is False
 
 

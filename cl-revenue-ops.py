@@ -3138,21 +3138,23 @@ def revenue_rebalance_debug(
         except Exception as e:
             result["last_cycle"] = {"error": str(e)}
 
-    drain = None
-    engine = getattr(rebalancer, "rebalance_engine_v2", None) if rebalancer else None
-    demand = engine.get_drain_demand() if engine is not None and hasattr(engine, "get_drain_demand") else None
-    if demand is not None:
-        drain = {
-            "total_excess_sats": demand.total_excess_sats,
-            "over_local_count": demand.over_local_count,
-            "paired_count": demand.paired_count,
-            "top_entries": [
-                {"channel_id": e.channel_id, "excess_sats": e.excess_sats,
-                 "drain_score": e.drain_score, "value_class": e.value_class}
-                for e in demand.entries[:10]
-            ],
-        }
-    result["drain_demand"] = drain
+    try:
+        drain = None
+        demand = engine.get_drain_demand() if engine is not None and hasattr(engine, "get_drain_demand") else None
+        if demand is not None:
+            drain = {
+                "total_excess_sats": demand.total_excess_sats,
+                "over_local_count": demand.over_local_count,
+                "paired_count": demand.paired_count,
+                "top_entries": [
+                    {"channel_id": entry.channel_id, "excess_sats": entry.excess_sats,
+                     "drain_score": entry.drain_score, "value_class": entry.value_class}
+                    for entry in demand.entries[:10]
+                ],
+            }
+        result["drain_demand"] = drain
+    except Exception as e:
+        result["drain_demand"] = {"error": str(e)}
 
     return result
 
@@ -7090,6 +7092,7 @@ def _build_boltz_balance_plan(
         #   - planner_bonus: capacity planner needs on-chain funds for a channel open
         #   - route_bonus: loop-out through inbound revenue legs creates headroom for more inbound traffic
         #   - hive_bonus: hive rebalance bias compounds with route-pair signal
+        #   - drain_bonus: channels the circular rebalancer reported unplaceable drain first
         multi_goal_value = 0.0
         if direction == "loop_out":
             excess_ratio = max(0.0, min(1.0, (local_pct - 50.0) / 50.0))

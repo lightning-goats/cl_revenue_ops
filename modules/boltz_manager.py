@@ -1337,6 +1337,13 @@ class BoltzCliManager:
 
     def loop_in(self, amount_sats: int, channel_id: Optional[str] = None, peer_id: Optional[str] = None,
                 currency: Optional[str] = None) -> Dict[str, Any]:
+        """Create a submarine (loop-in) swap: on-chain funds in, local balance up.
+
+        channel_id/peer_id are trigger metadata only — boltzcli v2.11.0 cannot
+        pin submarine swaps to a channel. Budget gates (swap quote, tactical,
+        per-channel capex) run under the swap-creation lock and may reject the
+        swap before any subprocess call.
+        """
         amount_sats = int(amount_sats)
         if amount_sats <= 0:
             raise BoltzCliError("amount_sats must be > 0")
@@ -1411,6 +1418,14 @@ class BoltzCliManager:
     def loop_out(self, amount_sats: int, address: Optional[str] = None, channel_id: Optional[str] = None,
                  peer_id: Optional[str] = None, currency: Optional[str] = None,
                  routing_fee_limit_ppm: Optional[int] = None, structural: bool = False) -> Dict[str, Any]:
+        """Create a reverse (loop-out) swap: local balance out, on-chain funds in.
+
+        `structural` is True when the candidate's profit-guard pass depended on
+        the inbound-scarcity credit; it routes the recorded fee into the
+        boltz/structural envelope partition (category="boltz",
+        subcategory="structural") so the daily structural envelope gate can
+        account for it. Budget gates run under the swap-creation lock.
+        """
         amount_sats = int(amount_sats)
         if amount_sats <= 0:
             raise BoltzCliError("amount_sats must be > 0")

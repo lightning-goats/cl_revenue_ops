@@ -5163,10 +5163,12 @@ class FeeController:
             # Drain pressure: bounded discount for stagnant over-local channels
             # ("sell what you're long"). Bias only — min_fee_ppm rails still
             # clamp downstream. Off by default (drain_fee_discount_max=0.0).
+            # outbound_ratio (spendable/capacity) is deliberately used here:
+            # conservative vs spendable/(spendable+receivable).
             drain_multiplier = self._drain_fee_multiplier(
                 local_ratio=outbound_ratio,
                 forward_count=forward_count,
-                high_threshold=float(getattr(cfg, "high_liquidity_threshold", 0.8)),
+                high_threshold=float(getattr(cfg, "high_liquidity_threshold", 0.7)),
                 discount_max=float(getattr(cfg, "drain_fee_discount_max", 0.0)),
             )
             if drain_multiplier != 1.0:

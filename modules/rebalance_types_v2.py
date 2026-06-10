@@ -81,6 +81,9 @@ class DrainDemand:
     the circular rebalancer keeps first claim on anything it can place
     internally (it is cheaper and conserves node capital); only the
     unplaceable residual justifies boundary-crossing swap costs.
+
+    over_local_count counts source-ELIGIBLE over-local channels only
+    (cooldown-filtered channels are excluded upstream).
     """
 
     entries: List[DrainDemandEntry] = field(default_factory=list)
