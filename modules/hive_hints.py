@@ -149,6 +149,23 @@ SEGMENT_BUCKETS = (
 )
 
 
+def _reject_nonfinite_json_constant(constant: str):
+    """json.loads parse_constant hook: refuse Infinity/-Infinity/NaN literals.
+
+    The hint snapshot is producer-controlled. Python's json module accepts
+    these non-standard literals by default, and a single non-finite
+    generated_at/ttl_seconds poisons every downstream int() conversion.
+    Raising here makes the whole payload decode fail, which the transport
+    layer already treats as "missing" (neutral).
+    """
+    raise ValueError(f"non-finite JSON constant rejected: {constant}")
+
+
+def _json_loads_strict(text: str):
+    """Parse untrusted snapshot JSON, rejecting Infinity/-Infinity/NaN."""
+    return json.loads(text, parse_constant=_reject_nonfinite_json_constant)
+
+
 class HiveHintAdapter:
     """Adapter that reads cl_hive fleet hints and exposes bounded bias lookups."""
 
@@ -162,6 +179,12 @@ class HiveHintAdapter:
     HINT_MAX_TTL_SECONDS = 86400
     # Total bitcoin supply in sats — an upper sanity bound for any fleet value.
     MAX_FLEET_CAPACITY_SATS = 21_000_000 * 100_000_000
+    # Sanity ceiling for fleet_fee_median (ppm). Mirrors the gossip-prior
+    # filter in fee_controller (1 <= fee_ppm <= 10000). Unlike capped
+    # multiplicative biases, this hint is consumed as an *absolute* Thompson
+    # prior mean for new channels, so an out-of-range value is rejected
+    # outright (None) rather than clamped.
+    MAX_FLEET_FEE_PRIOR_PPM = 10_000
 
     def __init__(
         self,
@@ -210,12 +233,12 @@ class HiveHintAdapter:
                 info["available"] = True
                 info["encoding"] = "string"
                 info["reason"] = ""
-                return json.loads(data_str), info
+                return _json_loads_strict(data_str), info
             if data_hex:
                 info["available"] = True
                 info["encoding"] = "hex"
                 info["reason"] = ""
-                return json.loads(bytes.fromhex(data_hex).decode()), info
+                return _json_loads_strict(bytes.fromhex(data_hex).decode()), info
             info["reason"] = "empty_payload"
             return None, info
         except Exception as e:
@@ -346,10 +369,29 @@ class HiveHintAdapter:
         )
 
     @staticmethod
+    def _finite_number(value) -> float | None:
+        """Return float(value) when value is a real, finite number.
+
+        Returns None for bools, non-numerics, and NaN/Inf so untrusted hint
+        numerics can be guarded before any int() conversion or comparison
+        (int(inf) raises OverflowError, int(nan) raises ValueError, and NaN
+        comparisons are always False, which inverts <=-style guards).
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        return value if math.isfinite(value) else None
+
+    @staticmethod
     def _validate_snapshot(raw) -> bool:
         if not isinstance(raw, dict):
             return False
-        if not isinstance(raw.get("generated_at"), (int, float)):
+        if HiveHintAdapter._finite_number(raw.get("generated_at")) is None:
+            return False
+        # ttl_seconds is optional, but a numeric non-finite value would crash
+        # the int() conversions used by every freshness check downstream.
+        ttl = raw.get("ttl_seconds")
+        if isinstance(ttl, float) and not math.isfinite(ttl):
             return False
         if not isinstance(raw.get("hints"), dict):
             return False
@@ -378,11 +420,12 @@ class HiveHintAdapter:
     def _effective_ttl_for(self, snapshot: dict | None) -> int:
         if self._ttl_override > 0:
             return min(self._ttl_override, self.HINT_MAX_TTL_SECONDS)
-        if snapshot and isinstance(snapshot.get("ttl_seconds"), (int, float)):
-            ttl = int(snapshot["ttl_seconds"])
-            # Clamp untrusted ttl into a sane window so a huge value cannot
-            # keep a stale snapshot alive forever.
-            return max(0, min(ttl, self.HINT_MAX_TTL_SECONDS))
+        if snapshot:
+            ttl = self._finite_number(snapshot.get("ttl_seconds"))
+            if ttl is not None:
+                # Clamp untrusted ttl into a sane window so a huge value cannot
+                # keep a stale snapshot alive forever.
+                return max(0, min(int(ttl), self.HINT_MAX_TTL_SECONDS))
         return 900
 
     def _age_is_fresh(self, age: int, ttl: int) -> bool:
@@ -397,7 +440,10 @@ class HiveHintAdapter:
     def _snapshot_is_fresh(self, snapshot: dict | None) -> bool:
         if snapshot is None:
             return False
-        age = int(time.time()) - int(snapshot.get("generated_at", 0))
+        generated_at = self._finite_number(snapshot.get("generated_at", 0))
+        if generated_at is None:
+            return False
+        age = int(time.time()) - int(generated_at)
         return self._age_is_fresh(age, self._effective_ttl_for(snapshot))
 
     def is_fresh(self) -> bool:
@@ -407,7 +453,10 @@ class HiveHintAdapter:
     def _snapshot_is_recent_enough_for_fallback(self, snapshot: dict | None) -> bool:
         if snapshot is None:
             return False
-        age = int(time.time()) - int(snapshot.get("generated_at", 0))
+        generated_at = self._finite_number(snapshot.get("generated_at", 0))
+        if generated_at is None:
+            return False
+        age = int(time.time()) - int(generated_at)
         if age < -self.HINT_CLOCK_SKEW_SECONDS:
             # Far-future timestamp: refuse to treat as a usable fallback.
             return False
@@ -760,8 +809,8 @@ class HiveHintAdapter:
         """Return detailed membership/freshness state without changing adapter state."""
         with self._lock:
             snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
-            generated_at = snapshot.get("generated_at") if snapshot else None
-            generated_at = int(generated_at) if isinstance(generated_at, (int, float)) else None
+            generated_at = self._finite_number(snapshot.get("generated_at")) if snapshot else None
+            generated_at = int(generated_at) if generated_at is not None else None
             age = int(time.time()) - generated_at if generated_at is not None else None
             fresh = self._snapshot_is_fresh(snapshot)
             usable = fresh or self._using_stale_fallback
@@ -796,7 +845,9 @@ class HiveHintAdapter:
             return 1.0
 
         confidence = hint.get("traffic_confidence")
-        if not isinstance(confidence, (int, float)) or confidence <= 0:
+        # NaN inverts the <= guard (NaN <= 0 is False) and then poisons the
+        # clamp into returning the positive cap; require a finite value.
+        if not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or confidence <= 0:
             return 1.0
         confidence = min(confidence, 1.0)
 
@@ -822,7 +873,9 @@ class HiveHintAdapter:
             return 1.0
 
         confidence = hint.get("traffic_confidence")
-        if not isinstance(confidence, (int, float)) or confidence <= 0:
+        # NaN inverts the <= guard (NaN <= 0 is False) and then poisons the
+        # clamp into returning the positive cap; require a finite value.
+        if not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or confidence <= 0:
             return 1.0
         confidence = min(confidence, 1.0)
 
@@ -835,7 +888,7 @@ class HiveHintAdapter:
             bias -= FEE_CORRIDOR_WEIGHT
 
         comp = hint.get("competition_bias")
-        if isinstance(comp, (int, float)):
+        if isinstance(comp, (int, float)) and math.isfinite(comp):
             comp = max(-1.0, min(1.0, comp))
             bias += comp * FEE_COMPETITION_WEIGHT
 
@@ -854,7 +907,9 @@ class HiveHintAdapter:
             return 1.0
 
         confidence = hint.get("traffic_confidence")
-        if not isinstance(confidence, (int, float)) or confidence <= 0:
+        # NaN inverts the <= guard (NaN <= 0 is False) and then poisons the
+        # clamp into returning the positive cap; require a finite value.
+        if not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or confidence <= 0:
             return 1.0
         confidence = min(confidence, 1.0)
 
@@ -867,7 +922,7 @@ class HiveHintAdapter:
             bias -= REBAL_PREFERENCE_WEIGHT
 
         quality = hint.get("peer_quality_score")
-        if isinstance(quality, (int, float)):
+        if isinstance(quality, (int, float)) and math.isfinite(quality):
             quality = max(0.0, min(1.0, quality))
             bias += (quality - 0.5) * 2.0 * REBAL_QUALITY_WEIGHT
 
@@ -878,33 +933,33 @@ class HiveHintAdapter:
     def get_peer_quality_score(self, peer_id: str) -> float:
         """Return peer quality score in [0.0, 1.0], or 0.5 when unavailable."""
         hint = self._get_peer_hint(peer_id, "peer_quality_score")
-        val = hint.get("peer_quality_score")
-        if isinstance(val, (int, float)):
-            return max(0.0, min(1.0, float(val)))
+        val = self._finite_number(hint.get("peer_quality_score"))
+        if val is not None:
+            return max(0.0, min(1.0, val))
         return 0.5
 
     def get_centrality(self, peer_id: str) -> float:
         """Return external centrality for peer (0.0 if unavailable)."""
         hint = self._get_peer_hint(peer_id, "external_centrality")
-        val = hint.get("external_centrality")
-        if isinstance(val, (int, float)):
-            return max(0.0, min(1.0, float(val)))
+        val = self._finite_number(hint.get("external_centrality"))
+        if val is not None:
+            return max(0.0, min(1.0, val))
         return 0.0
 
     def get_reputation_score(self, peer_id: str) -> int:
         """Return fleet-aggregated reputation score (50 if unavailable)."""
         hint = self._get_peer_hint(peer_id, "reputation_score")
-        val = hint.get("reputation_score")
-        if isinstance(val, (int, float)):
+        val = self._finite_number(hint.get("reputation_score"))
+        if val is not None:
             return max(0, min(100, int(val)))
         return 50
 
     def get_traffic_confidence(self, peer_id: str) -> float:
         """Return traffic confidence score in [0.0, 1.0] (0.0 if unavailable)."""
         hint = self._get_peer_hint(peer_id, "traffic_confidence")
-        val = hint.get("traffic_confidence")
-        if isinstance(val, (int, float)):
-            return max(0.0, min(1.0, float(val)))
+        val = self._finite_number(hint.get("traffic_confidence"))
+        if val is not None:
+            return max(0.0, min(1.0, val))
         return 0.0
 
     def get_peak_hours(self, peer_id: str) -> list:
@@ -931,16 +986,16 @@ class HiveHintAdapter:
     def get_fee_elasticity(self, peer_id: str) -> float:
         """Return estimated price elasticity (0.0 if unavailable)."""
         hint = self._get_peer_hint(peer_id, "fee_elasticity")
-        val = hint.get("fee_elasticity")
-        if isinstance(val, (int, float)):
-            return float(val)
+        val = self._finite_number(hint.get("fee_elasticity"))
+        if val is not None:
+            return val
         return 0.0
 
     def get_optimal_fee_estimate(self, peer_id: str) -> int:
         """Return fleet-estimated optimal fee PPM (0 if unavailable)."""
         hint = self._get_peer_hint(peer_id, "optimal_fee_estimate_ppm")
-        val = hint.get("optimal_fee_estimate_ppm")
-        if isinstance(val, (int, float)) and val > 0:
+        val = self._finite_number(hint.get("optimal_fee_estimate_ppm"))
+        if val is not None and val > 0:
             return int(val)
         return 0
 
@@ -1325,9 +1380,9 @@ class HiveHintAdapter:
         pref = raw.get("open_preference")
         if pref in self.VALID_OPEN_PREFS:
             result["open_preference"] = pref
-        conf = raw.get("topology_confidence")
-        if isinstance(conf, (int, float)):
-            result["topology_confidence"] = max(0.0, min(1.0, float(conf)))
+        conf = self._finite_number(raw.get("topology_confidence"))
+        if conf is not None:
+            result["topology_confidence"] = max(0.0, min(1.0, conf))
         bucket = raw.get("suggested_size_bucket")
         if bucket in self.VALID_SIZE_BUCKETS:
             result["suggested_size_bucket"] = bucket
@@ -1409,10 +1464,14 @@ class HiveHintAdapter:
 
     @staticmethod
     def _metabolic_ttl_for(payload: dict, snapshot: dict | None) -> int:
-        if isinstance(payload, dict) and isinstance(payload.get("ttl_seconds"), (int, float)):
-            return max(0, int(payload.get("ttl_seconds") or 0))
-        if isinstance(snapshot, dict) and isinstance(snapshot.get("ttl_seconds"), (int, float)):
-            return max(0, int(snapshot.get("ttl_seconds") or 0))
+        if isinstance(payload, dict):
+            ttl = HiveHintAdapter._finite_number(payload.get("ttl_seconds"))
+            if ttl is not None:
+                return max(0, int(ttl))
+        if isinstance(snapshot, dict):
+            ttl = HiveHintAdapter._finite_number(snapshot.get("ttl_seconds"))
+            if ttl is not None:
+                return max(0, int(ttl))
         return 300
 
     def _metabolic_peer_in_scope(self, peer_id: str, snapshot: dict | None, scope: str) -> bool:
@@ -1474,8 +1533,8 @@ class HiveHintAdapter:
         peer_effects = peer_effects_raw if isinstance(peer_effects_raw, dict) else {}
         global_effects_raw = raw.get("global_effects")
         global_effects_malformed = global_effects_raw is not None and not isinstance(global_effects_raw, dict)
-        generated_at = raw.get("generated_at")
-        generated_at = int(generated_at) if isinstance(generated_at, (int, float)) else None
+        generated_at = self._finite_number(raw.get("generated_at"))
+        generated_at = int(generated_at) if generated_at is not None else None
         ttl = self._metabolic_ttl_for(raw, snapshot)
         age = int(time.time()) - generated_at if generated_at is not None else None
         fresh = bool(generated_at is not None and ttl > 0 and age is not None
@@ -1675,8 +1734,8 @@ class HiveHintAdapter:
         peer_effects = peer_effects_raw if isinstance(peer_effects_raw, dict) else {}
         global_effects_raw = raw.get("global_effects")
         global_effects_malformed = global_effects_raw is not None and not isinstance(global_effects_raw, dict)
-        generated_at = raw.get("generated_at")
-        generated_at = int(generated_at) if isinstance(generated_at, (int, float)) else None
+        generated_at = self._finite_number(raw.get("generated_at"))
+        generated_at = int(generated_at) if generated_at is not None else None
         ttl = self._metabolic_ttl_for(raw, snapshot)
         age = int(time.time()) - generated_at if generated_at is not None else None
         fresh = bool(generated_at is not None and ttl > 0 and age is not None
@@ -1855,12 +1914,17 @@ class HiveHintAdapter:
     # ------------------------------------------------------------------
 
     def get_fleet_fee_prior(self, peer_id: str) -> int | None:
-        """Return fleet-observed fee median for a peer, or None."""
+        """Return fleet-observed fee median for a peer, or None.
+
+        Untrusted absolute value: must be a finite number in
+        [1, MAX_FLEET_FEE_PRIOR_PPM]. Anything else neutralizes to None so a
+        poisoned hint cannot pin an absurd initial fee on a new channel.
+        """
         hint = self._get_peer_hint(peer_id, "fleet_fee_prior")
         if not hint:
             return None
-        fee = hint.get("fleet_fee_median")
-        if isinstance(fee, (int, float)) and fee > 0:
+        fee = self._finite_number(hint.get("fleet_fee_median"))
+        if fee is not None and 1 <= fee <= self.MAX_FLEET_FEE_PRIOR_PPM:
             return int(fee)
         return None
 
@@ -1870,12 +1934,16 @@ class HiveHintAdapter:
 
     @staticmethod
     def _snapshot_generation(raw) -> int | str | None:
+        def coerce(value):
+            number = HiveHintAdapter._finite_number(value)
+            return int(number) if number is not None else str(value)
+
         if not isinstance(raw, dict):
             return None
         for key in ("generation", "refresh_generation", "hint_generation"):
             value = raw.get(key)
             if value not in (None, ""):
-                return int(value) if isinstance(value, (int, float)) else str(value)
+                return coerce(value)
         for section_key in ("runtime", "metadata", "diagnostics"):
             section = raw.get(section_key)
             if not isinstance(section, dict):
@@ -1883,14 +1951,14 @@ class HiveHintAdapter:
             for key in ("generation", "refresh_generation", "hint_generation"):
                 value = section.get(key)
                 if value not in (None, ""):
-                    return int(value) if isinstance(value, (int, float)) else str(value)
+                    return coerce(value)
         return None
 
     def _snapshot_debug_view(self, raw, source: str, transport_info: dict | None = None) -> dict:
         info = dict(transport_info or {})
         available = bool(info.get("available", raw is not None))
-        generated_at = raw.get("generated_at") if isinstance(raw, dict) else None
-        generated_at = int(generated_at) if isinstance(generated_at, (int, float)) else None
+        generated_at = self._finite_number(raw.get("generated_at")) if isinstance(raw, dict) else None
+        generated_at = int(generated_at) if generated_at is not None else None
         ttl = self._effective_ttl_for(raw if isinstance(raw, dict) else None)
         age = int(time.time()) - generated_at if generated_at is not None else None
         hints = raw.get("hints") if isinstance(raw, dict) else None

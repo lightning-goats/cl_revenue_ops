@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Iterable, List, Optional
 
 from .rebalance_route_policy import (
+    MAX_HINT_PRIORITY_SCORE,
     _entry_amount_sats,
     _entry_segments,
     _entry_view,
@@ -102,9 +104,12 @@ def _hint_id(entry: dict, hint_type: str) -> str:
 
 def _priority_score(entry: dict) -> float:
     try:
-        return max(0.0, float(entry.get("priority_score", 0.0) or 0.0))
+        value = float(entry.get("priority_score", 0.0) or 0.0)
     except Exception:
         return 0.0
+    if not math.isfinite(value):
+        return 0.0
+    return max(0.0, min(MAX_HINT_PRIORITY_SCORE, value))
 
 
 def _find_channel(

@@ -8,9 +8,15 @@ behavior.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable
+
+# Untrusted producer-supplied priority scores are clamped into this range so
+# an absurd or non-finite value cannot permanently sort first and preempt
+# planner pairs via reserved coordination slots.
+MAX_HINT_PRIORITY_SCORE = 100.0
 
 
 class RoutePolicy(Enum):
@@ -174,9 +180,12 @@ def _entry_amount_sats(entry: dict) -> int:
 
 def _priority_score(entry: dict) -> float:
     try:
-        return max(0.0, float(_entry_view(entry).get("priority_score", 0.0) or 0.0))
+        value = float(_entry_view(entry).get("priority_score", 0.0) or 0.0)
     except Exception:
         return 0.0
+    if not math.isfinite(value):
+        return 0.0
+    return max(0.0, min(MAX_HINT_PRIORITY_SCORE, value))
 
 
 def _match_entry(pair: Any, entries: Iterable[dict]) -> dict:
