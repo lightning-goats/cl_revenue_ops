@@ -208,7 +208,11 @@ class TestContextualPosteriorUpdates:
         ctx = ts.contextual_posteriors["balanced:peak:S"]
         assert len(ctx) == 4
         assert ctx[0] > 0
-        expected_precision = 1.0 / max((80.0 * ts.SECONDARY_EXPLORE_BOOST) ** 2, ts.MIN_STD ** 2)
+        # Hierarchical init from the global posterior (with the secondary
+        # exploration boost), then one per-update precision decay step.
+        expected_precision = (
+            1.0 / max((80.0 * ts.SECONDARY_EXPLORE_BOOST) ** 2, ts.MIN_STD ** 2)
+        ) * ts.CTX_PRECISION_DECAY
         assert ctx[1] == pytest.approx(expected_precision, rel=1e-9)
         assert ctx[2] >= 1
 

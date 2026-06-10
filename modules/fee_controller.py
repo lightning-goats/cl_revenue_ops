@@ -156,6 +156,15 @@ class GaussianThompsonState:
     BIAS_DECAY_HOURS = 24.0         # Advisory nudges fade with a 1-day half-life
     BIAS_MIN_WEIGHT = 1e-3          # Below this decayed weight a nudge is pruned
 
+    # Contextual sampling is advisory, not absorbing: the polynomial revenue
+    # learner stays the base sampler and the context only applies a bounded
+    # offset. (A contextual posterior is a precision-weighted mean of CHARGED
+    # fees — "where have I been" — not a revenue maximizer, so letting it
+    # override the polynomial forever pinned fees at historical levels.)
+    CTX_OFFSET_CAP_FRAC = 0.20      # Context can shift a sample by at most ±20%
+    CTX_CONFIDENCE_COUNT = 10.0     # Half-saturation obs count for ctx confidence
+    CTX_PRECISION_DECAY = 0.98      # Per-update ctx precision decay (re-learnable)
+
     # Prior parameters
     prior_mean_fee: int = 200       # Default prior mean: 200 ppm
     prior_std_fee: int = 100        # Default prior uncertainty: 100 ppm
@@ -197,6 +206,13 @@ class GaussianThompsonState:
     # here are re-applied after every recompute, with time decay, so the
     # advisory signal actually shifts the next cycle's sampled distribution.
     posterior_bias: List[Tuple[float, float, int]] = field(default_factory=list)
+
+    # Weighted mean of CHARGED fees across all observations (updated on every
+    # posterior recompute). Used as the reference point for contextual offsets:
+    # a context only shifts samples by how much ITS charged-fee history differs
+    # from the overall charged-fee history, so in a single-regime world the
+    # offset vanishes instead of creating an inertia equilibrium.
+    charged_fee_mean: float = 0.0
 
     # Tracking
     last_sampled_fee: int = 0
@@ -339,11 +355,16 @@ class GaussianThompsonState:
 
     def sample_fee_contextual(self, context_key: str, floor: int, ceiling: int) -> int:
         """
-        Sample fee using context-specific posterior if available.
+        Sample fee from the global posterior with a bounded contextual offset.
 
         Context keys encode balance state, time bucket, and corridor role.
-        This allows learning different optimal fees for different market
-        conditions.
+        The polynomial revenue-curve posterior remains the base sampler; the
+        context-specific posterior contributes only a confidence-weighted,
+        bounded additive offset. This keeps contextual learning advisory
+        rather than absorbing: a mature context can shade the sample toward
+        its own mean, but can never permanently override the revenue learner
+        (which previously pinned fees at whatever the context had charged
+        historically).
 
         Args:
             context_key: Context identifier (e.g., "low:normal:P")
@@ -353,28 +374,42 @@ class GaussianThompsonState:
         Returns:
             Sampled fee in ppm
         """
-        if context_key in self.contextual_posteriors:
-            ctx = self.contextual_posteriors[context_key]
+        # Base draw from the global (polynomial-first) posterior
+        base = self.sample_fee(floor, ceiling)
 
-            # Handle both 3-tuple (legacy: mean, std, count) and
-            # 4-tuple (stored: mean, precision, count, last_update) formats
-            if len(ctx) == 4:
-                ctx_mean, ctx_precision, ctx_count, _ = ctx
-                ctx_std = 1.0 / math.sqrt(max(ctx_precision, 1e-6))
-            else:
-                ctx_mean, ctx_std, ctx_count = ctx[:3]
+        ctx = self.contextual_posteriors.get(context_key)
+        if not ctx:
+            return base
 
-            if ctx_count >= self.MIN_OBSERVATIONS:
-                # Use contextual posterior
-                modulated_std = max(self.MIN_STD, ctx_std)
-                sampled = random.gauss(ctx_mean, modulated_std)
-                sampled_fee = int(max(floor, min(ceiling, sampled)))
-                self.last_sampled_fee = sampled_fee
-                self.last_sample_time = int(time.time())
-                return sampled_fee
+        # Handle both 3-tuple (legacy: mean, std, count) and
+        # 4-tuple (stored: mean, precision, count, last_update) formats
+        if len(ctx) == 4:
+            ctx_mean, _ctx_precision, ctx_count, _ = ctx
+        else:
+            ctx_mean, _ctx_std, ctx_count = ctx[:3]
 
-        # Fall back to global posterior
-        return self.sample_fee(floor, ceiling)
+        if ctx_count < self.MIN_OBSERVATIONS:
+            return base
+        if not math.isfinite(ctx_mean):
+            return base
+
+        # Confidence saturates smoothly with observation count
+        confidence = ctx_count / (ctx_count + self.CTX_CONFIDENCE_COUNT)
+
+        # Offset = how this context's charged-fee history differs from the
+        # overall charged-fee history, clamped to ±CTX_OFFSET_CAP_FRAC of
+        # this draw. Both means track charged fees, so in a single-regime
+        # world the offset decays to ~0 (no inertia equilibrium); only a
+        # genuine cross-context difference shades the sample.
+        reference = self.charged_fee_mean if self.charged_fee_mean > 0 else self.posterior_mean
+        offset = ctx_mean - reference
+        cap = self.CTX_OFFSET_CAP_FRAC * abs(base)
+        offset = max(-cap, min(cap, offset)) * confidence
+
+        sampled_fee = int(max(floor, min(ceiling, base + offset)))
+        self.last_sampled_fee = sampled_fee
+        self.last_sample_time = int(time.time())
+        return sampled_fee
 
     def _sample_from_polynomial_posterior(
         self, floor: int, ceiling: int
@@ -559,6 +594,11 @@ class GaussianThompsonState:
             age_hours = (now - ctx_last_update) / 3600.0
             decay = math.pow(0.5, age_hours / self.DECAY_HOURS)
             ctx_precision *= decay
+
+        # Per-update precision decay: bounds accumulated precision so a
+        # busy context can keep re-learning instead of freezing at the
+        # first regime it observed (precision was previously monotone).
+        ctx_precision *= self.CTX_PRECISION_DECAY
 
         # Ensure minimum precision (corresponds to max std of ~200)
         ctx_precision = max(ctx_precision, 1.0 / (200.0 ** 2))
@@ -753,6 +793,7 @@ class GaussianThompsonState:
         if not self.observations:
             self.posterior_mean = float(self.prior_mean_fee)
             self.posterior_std = float(self.prior_std_fee)
+            self.charged_fee_mean = 0.0
             return
 
         # Collect weighted observations with time decay
@@ -774,6 +815,11 @@ class GaussianThompsonState:
             weighted_obs.append((float(fee), float(revenue_rate), weight))
             fee_min = min(fee_min, float(fee))
             fee_max = max(fee_max, float(fee))
+
+        # Track the weighted mean of charged fees (contextual offset reference)
+        total_w = sum(w for _, _, w in weighted_obs)
+        if total_w > 0:
+            self.charged_fee_mean = sum(f * w for f, _, w in weighted_obs) / total_w
 
         if len(weighted_obs) < 3:
             # Need at least 3 points for a 3-parameter polynomial fit
@@ -1081,6 +1127,7 @@ class GaussianThompsonState:
             "_last_fee_max": self._last_fee_max,
             "contextual_posteriors": self.contextual_posteriors,
             "posterior_bias": self.posterior_bias,
+            "charged_fee_mean": self.charged_fee_mean,
             "last_sampled_fee": self.last_sampled_fee,
             "last_sample_time": self.last_sample_time
         }
@@ -1172,6 +1219,14 @@ class GaussianThompsonState:
                         and weight > 0 and target_fee >= 0):
                     restored_bias.append((target_fee, weight, ts))
         state.posterior_bias = restored_bias
+
+        # Charged-fee mean (legacy dicts: 0.0 → sampler falls back to posterior_mean)
+        try:
+            state.charged_fee_mean = float(d.get("charged_fee_mean", 0.0))
+        except (TypeError, ValueError):
+            state.charged_fee_mean = 0.0
+        if not math.isfinite(state.charged_fee_mean) or state.charged_fee_mean < 0:
+            state.charged_fee_mean = 0.0
 
         state.last_sampled_fee = d.get("last_sampled_fee", 0)
         state.last_sample_time = d.get("last_sample_time", 0)
