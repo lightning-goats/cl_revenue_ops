@@ -1111,6 +1111,22 @@ class PolicyManager:
                         tags=["corridor_owner", "auto_corridor"],
                     )
                     applied += 1
+                else:
+                    # Role loss reconciliation: the peer is neither a fleet
+                    # member nor a corridor owner anymore. Remove only the
+                    # policy this automation created (tagged auto_corridor);
+                    # operator-owned policies are never touched ('manual'
+                    # tagged policies were already skipped above).
+                    current_tags = set(current.tags or [])
+                    has_stored_policy = int(current.updated_at or 0) > 0
+                    if has_stored_policy and "auto_corridor" in current_tags:
+                        if self.delete_policy(peer_id):
+                            applied += 1
+                            self.plugin.log(
+                                f"PolicyManager: Removed auto_corridor policy "
+                                f"for {peer_id[:12]}... (corridor role lost)",
+                                level='info',
+                            )
 
         except Exception as e:
             self.plugin.log(f"PolicyManager: Corridor policy error: {e}", level='warn')

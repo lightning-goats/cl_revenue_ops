@@ -367,6 +367,84 @@ class TestCorridorAutoPolicies:
         assert applied == 0
         mock_database.set_policy.assert_not_called()
 
+    def test_corridor_role_loss_deletes_auto_corridor_policy(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        """When the hint role drops to 'none', the auto_corridor policy this
+        automation created must be reconciled away, not left forever."""
+        peer_id = sample_peer_ids[0]
+        pm = self._corridor_pm(mock_database, mock_plugin, peer_id)
+        pm.set_policy(
+            peer_id,
+            strategy="dynamic",
+            tags=["corridor_owner", "auto_corridor"],
+        )
+        mock_database.set_policy.reset_mock()
+        mock_database.delete_policy.return_value = True
+        pm.hive_hints.get_corridor_role.return_value = "none"
+
+        applied = pm.apply_corridor_policies()
+
+        assert applied == 1
+        mock_database.delete_policy.assert_called_once_with(peer_id)
+        mock_database.set_policy.assert_not_called()
+
+    def test_corridor_role_loss_spares_operator_policy(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        """Operator-owned policies (no auto_corridor tag) are never deleted
+        by role-loss reconciliation."""
+        peer_id = sample_peer_ids[0]
+        pm = self._corridor_pm(mock_database, mock_plugin, peer_id)
+        pm.set_policy(
+            peer_id,
+            strategy="static",
+            fee_ppm_target=250,
+            rebalance_mode="disabled",
+            tags=["protect", "no_close"],
+        )
+        mock_database.set_policy.reset_mock()
+        pm.hive_hints.get_corridor_role.return_value = "none"
+
+        applied = pm.apply_corridor_policies()
+
+        assert applied == 0
+        mock_database.delete_policy.assert_not_called()
+        policy = pm.get_policy(peer_id)
+        assert policy.tags == ["protect", "no_close"]
+
+    def test_corridor_role_loss_spares_manual_auto_corridor_policy(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        """A 'manual' tag always wins, even alongside auto_corridor."""
+        peer_id = sample_peer_ids[0]
+        pm = self._corridor_pm(mock_database, mock_plugin, peer_id)
+        pm.set_policy(
+            peer_id,
+            strategy="dynamic",
+            tags=["auto_corridor", "manual"],
+        )
+        mock_database.set_policy.reset_mock()
+        pm.hive_hints.get_corridor_role.return_value = "none"
+
+        applied = pm.apply_corridor_policies()
+
+        assert applied == 0
+        mock_database.delete_policy.assert_not_called()
+
+    def test_corridor_role_loss_without_stored_policy_is_noop(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        peer_id = sample_peer_ids[0]
+        pm = self._corridor_pm(mock_database, mock_plugin, peer_id)
+        pm.hive_hints.get_corridor_role.return_value = "none"
+
+        applied = pm.apply_corridor_policies()
+
+        assert applied == 0
+        mock_database.delete_policy.assert_not_called()
+        mock_database.set_policy.assert_not_called()
+
 
 class TestRateLimiting:
     """Test policy change rate limiting."""
