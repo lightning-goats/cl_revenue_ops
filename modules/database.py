@@ -2653,7 +2653,26 @@ class Database:
 
         total_fees_msat = int(row['total_fees_msat'] or 0) if row else 0
         return base_to_sats_ceil(total_fees_msat)
-    
+
+    def get_node_realized_fee_ppm(self, window_days: int = 7) -> int:
+        """Node-wide realized earn rate: SUM(fee) / SUM(volume) in ppm.
+
+        Used to price the value of new inbound capacity when the node is
+        receivable-starved. Returns 0 when there is no settled volume in
+        the window (caller treats 0 as "no credit").
+        """
+        conn = self._get_connection()
+        since = int(time.time()) - max(1, int(window_days)) * 86400
+        row = conn.execute(
+            "SELECT COALESCE(SUM(fee_msat), 0), COALESCE(SUM(out_msat), 0) "
+            "FROM forwards WHERE timestamp >= ?",
+            (since,),
+        ).fetchone()
+        fee_msat, out_msat = int(row[0]), int(row[1])
+        if out_msat <= 0:
+            return 0
+        return (fee_msat * 1_000_000) // out_msat
+
     def get_total_routing_revenue(self, since_timestamp: int) -> int:
         """
         Get total routing revenue (fees earned) since a given timestamp.

@@ -575,3 +575,41 @@ class TestRecordForwardAndReputation:
             db.record_forward_and_reputation(fwd, self.PEER, True)
         count = conn.execute("SELECT COUNT(*) FROM forwards").fetchone()[0]
         assert count == 0
+
+
+class TestNodeRealizedFeePpm:
+    def _db(self, tmp_path):
+        from modules.database import Database
+        plugin = MagicMock()
+        db = Database(str(tmp_path / "ppm.db"), plugin)
+        db.initialize()
+        return db
+
+    def test_realized_ppm_from_forwards(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = db._get_connection()
+        now = int(time.time())
+        # 2 forwards: vary in_msat to avoid unique-index collision
+        # Each row: out_msat=500000, fee_msat=500 => 1000 ppm
+        for offset in range(2):
+            conn.execute(
+                "INSERT INTO forwards (in_channel, out_channel, in_msat, out_msat,"
+                " fee_msat, timestamp) VALUES ('1x1x1','2x2x2',?,500000,500,?)",
+                (500500 + offset, now - 3600),
+            )
+        assert db.get_node_realized_fee_ppm(window_days=7) == 1000
+
+    def test_realized_ppm_zero_when_no_forwards(self, tmp_path):
+        db = self._db(tmp_path)
+        assert db.get_node_realized_fee_ppm(window_days=7) == 0
+
+    def test_realized_ppm_excludes_old_forwards(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = db._get_connection()
+        old = int(time.time()) - 10 * 86400
+        conn.execute(
+            "INSERT INTO forwards (in_channel, out_channel, in_msat, out_msat,"
+            " fee_msat, timestamp) VALUES ('1x1x1','2x2x2',500500,500000,500,?)",
+            (old,),
+        )
+        assert db.get_node_realized_fee_ppm(window_days=7) == 0
