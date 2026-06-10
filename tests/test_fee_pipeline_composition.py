@@ -368,3 +368,60 @@ class TestCompositeHintBiasClamp:
     def test_clamp_constants(self):
         assert FeeController.HIVE_HINT_TOTAL_BIAS_MIN == 0.9
         assert FeeController.HIVE_HINT_TOTAL_BIAS_MAX == 1.1
+
+
+# =============================================================================
+# P10: window-wait path must not do dead market-boundary work
+# =============================================================================
+
+class TestWindowWaitShortCircuit:
+
+    def test_waiting_channel_skips_boundary_and_floor_work(self, mock_plugin, mock_database):
+        """A channel still inside its observation window must not call the
+        deprecated market-boundary stub nor compute a floor (DB latency
+        query) just for explainability."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+
+        # Window NOT yet satisfied: recent update, too few forwards
+        now = int(time.time())
+        mock_database.get_fee_strategy_state.return_value = {
+            **mock_database.get_fee_strategy_state.return_value,
+            "last_update": now - 60,  # 1 minute ago (< min_observation_hours)
+        }
+        mock_database.get_forward_count_since.return_value = 0
+
+        boundary_calls = []
+        floor_calls = []
+        fc._get_market_boundary_fee = lambda *a, **k: boundary_calls.append(1)
+        fc._calculate_floor = lambda *a, **k: floor_calls.append(1) or 100
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 0},
+            _channel_info(150), cfg=cfg,
+        )
+
+        assert result is None, "waiting channel must not adjust"
+        assert boundary_calls == [], "wait path must not query the boundary stub"
+        assert floor_calls == [], "wait path must not run floor computation"
+
+    def test_ready_channel_still_does_pricing_work(self, mock_plugin, mock_database):
+        """Control: once the window closes, the normal pipeline (including
+        floor computation) still runs."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+        _prepare_dts_stubs(fc, chain_fee=150, sampled_fee=400)
+
+        floor_calls = []
+        original_floor = fc._calculate_floor
+        fc._calculate_floor = lambda *a, **k: floor_calls.append(1) or 20
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(150), cfg=cfg,
+        )
+
+        assert result is not None
+        assert len(floor_calls) >= 1

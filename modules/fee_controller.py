@@ -5071,89 +5071,27 @@ class FeeController:
                     level='debug'
                 )
             else:
-                # Neither condition met yet. Usually we wait for more time or
-                # data, but do not let the observation window trap a channel
-                # above a visible market boundary after route flow has left.
-                window_boundary_info = self._get_market_boundary_fee(
-                    peer_id,
-                    cfg=cfg,
-                    force_refresh=True,
-                )
-                if window_boundary_info is not None:
-                    window_capacity = channel_info.get("capacity") or base_to_sats_floor(
-                        parse_msat(channel_info.get("total_msat", 0))
-                    ) or 2_000_000
-                    try:
-                        window_capacity = int(window_capacity)
-                    except (TypeError, ValueError):
-                        window_capacity = 2_000_000
-                    window_floor_ppm = self._calculate_floor(
-                        window_capacity,
-                        chain_costs=chain_costs,
-                        peer_id=peer_id,
-                        opener=channel_info.get("opener", "local"),
-                    )
-                    window_floor_ppm = max(window_floor_ppm, cfg.min_fee_ppm)
-                    window_flow_state = state.get("state", "balanced") if isinstance(state, dict) else "balanced"
-                    if window_flow_state == "source":
-                        window_floor_ppm = int(window_floor_ppm * 1.10)
-                    elif window_flow_state == "sink":
-                        window_floor_ppm = int(window_floor_ppm * 0.75)
-                    window_floor_ppm = max(window_floor_ppm, cfg.min_fee_ppm)
-                    boundary_target_ppm, boundary_margin_ppm = self._get_market_boundary_target(
-                        int(window_boundary_info["boundary_ppm"]),
-                        window_floor_ppm,
-                        cfg=cfg,
-                    )
-                    if not self._market_boundary_has_room(
-                        int(window_boundary_info["boundary_ppm"]),
-                        window_floor_ppm,
-                        boundary_margin_ppm,
-                    ):
-                        self.plugin.log(
-                            f"DYNAMIC_WINDOW: {channel_id[:12]}... market boundary ignored "
-                            f"(competitor={window_boundary_info['boundary_ppm']}ppm, "
-                            f"floor={window_floor_ppm}ppm, margin={boundary_margin_ppm}ppm)",
-                            level='debug'
-                        )
-                        window_boundary_info = None
-                    elif current_fee_ppm > boundary_target_ppm:
-                        market_boundary_window_bypass_info = {
-                            "applied": True,
-                            "boundary_ppm": int(window_boundary_info["boundary_ppm"]),
-                            "target_ppm": int(boundary_target_ppm),
-                            "margin_ppm": int(boundary_margin_ppm),
-                            "floor_ppm": int(window_floor_ppm),
-                            "current_fee_ppm": int(current_fee_ppm),
-                            "forwards_since_update": int(forward_count),
-                            "hours_since_update": float(hours_elapsed),
-                        }
-                        self.plugin.log(
-                            f"DYNAMIC_WINDOW: {channel_id[:12]}... bypassing wait for "
-                            f"market boundary downshift ({current_fee_ppm}->{boundary_target_ppm}ppm, "
-                            f"competitor={window_boundary_info['boundary_ppm']}ppm, "
-                            f"{forward_count}/{fee_profile.min_forwards_for_signal} forwards, "
-                            f"{hours_elapsed:.1f}/{fee_profile.min_observation_hours}h)",
-                            level='debug'
-                        )
-                    else:
-                        window_boundary_info = None
-
-                if not market_boundary_window_bypass_info.get("applied"):
-                    # Neither condition met yet - wait for more time or data
-                    self.plugin.log(
-                        f"DYNAMIC_WINDOW: {channel_id[:12]}... waiting "
-                        f"({forward_count}/{fee_profile.min_forwards_for_signal} forwards, "
-                        f"{hours_elapsed:.1f}/{fee_profile.min_observation_hours}h, "
-                        f"profile={fee_profile_name})",
-                        level='debug'
-                    )
-                    return None
-
+                # Neither condition met yet - wait for more time or data.
+                #
+                # P10 fix (2026-06-10): the old wait path called
+                # _get_market_boundary_fee(force_refresh=True) plus a full
+                # _calculate_floor (DB latency query) for EVERY waiting
+                # channel on EVERY cycle, purely to populate explainability
+                # fields. Both boundary getters are deprecated hard-None
+                # stubs (see _get_market_boundary_fee), so the bypass could
+                # never fire — it was pure per-cycle latency. The boundary
+                # scaffolding itself is kept (documented deprecated);
+                # market_boundary_window_bypass_info keeps its shape with the
+                # default not-applied value. Invariant: the wait path does no
+                # market-boundary work while the boundary stubs return None.
                 self.plugin.log(
-                    f"DYNAMIC_WINDOW: {channel_id[:12]}... proceeding via market boundary bypass",
+                    f"DYNAMIC_WINDOW: {channel_id[:12]}... waiting "
+                    f"({forward_count}/{fee_profile.min_forwards_for_signal} forwards, "
+                    f"{hours_elapsed:.1f}/{fee_profile.min_observation_hours}h, "
+                    f"profile={fee_profile_name})",
                     level='debug'
                 )
+                return None
 
         # First run initialization
         if hours_elapsed <= 0:
