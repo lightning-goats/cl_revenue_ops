@@ -652,6 +652,26 @@ class RebalanceEngine:
             except Exception as e:
                 self._log(f"Capex allocation failed: {e}", level="warn")
 
+        # Cooldown inputs are loop-invariant: resolve them once. Prefer the
+        # batched last-rebalance-time query (one GROUP BY statement for all
+        # channels) over a point query per channel when the database exposes
+        # it; fall back to per-channel lookups otherwise.
+        cooldown_hours = getattr(cfg, 'rebalance_cooldown_hours', 24)
+        cooldown_secs = int(cooldown_hours * 3600)
+        last_rebalance_times: Optional[Dict[str, int]] = None
+        if self.database is not None and cooldown_secs > 0:
+            batch_getter = getattr(self.database, "get_last_rebalance_times", None)
+            if callable(batch_getter):
+                try:
+                    fetched = batch_getter()
+                    if isinstance(fetched, dict):
+                        last_rebalance_times = fetched
+                except Exception as e:
+                    self._log(
+                        f"batch last-rebalance-time lookup failed: {e}",
+                        level="debug",
+                    )
+
         # Normalize channel inputs
         normalized = []
         for ch in channels_raw:
@@ -705,11 +725,12 @@ class RebalanceEngine:
 
             # Cooldown: skip if rebalanced recently (default 1 hour)
             cooldown = False
-            cooldown_hours = getattr(cfg, 'rebalance_cooldown_hours', 24)
-            cooldown_secs = int(cooldown_hours * 3600)
             if self.database and cooldown_secs > 0:
                 try:
-                    last_ts = self.database.get_last_rebalance_time(scid)
+                    if last_rebalance_times is not None:
+                        last_ts = last_rebalance_times.get(scid)
+                    else:
+                        last_ts = self.database.get_last_rebalance_time(scid)
                     if last_ts and (int(time.time()) - last_ts) < cooldown_secs:
                         cooldown = True
                 except Exception:
@@ -1030,6 +1051,9 @@ class RebalanceEngine:
             router = self._cycle_router
             priced = []
             hive_router = self._hive_router
+            router_begin = getattr(router, "begin_cycle", None)
+            if callable(router_begin):
+                router_begin()
             if hive_router is not None:
                 hive_router.begin_cycle()
             try:
@@ -1060,6 +1084,41 @@ class RebalanceEngine:
                                 f"kind={cooldown['failure_kind']} "
                                 f"count={cooldown['failure_count']} "
                                 f"cooldown_until={cooldown['cooldown_until']}"
+                            ),
+                        ))
+                        continue
+                    # In-memory futility filter, applied BEFORE route pricing.
+                    # run_cycle keeps the same check as a post-pricing backstop,
+                    # but pricing a pair that is guaranteed to be discarded
+                    # wastes the full router RPC budget for that pair.
+                    if self._is_pair_in_futility(
+                        pair.source_channel_id, pair.dest_channel_id
+                    ):
+                        fresh = self._pair_failures.get(
+                            (pair.source_channel_id, pair.dest_channel_id), []
+                        )
+                        self._update_pair_score_decomposition(
+                            pair,
+                            rejection_reason="pair_futility",
+                            route_status="pair_futility",
+                        )
+                        if debug_pair is not None:
+                            self._update_pair_score_decomposition(
+                                debug_pair,
+                                rejection_reason="pair_futility",
+                                route_status="pair_futility",
+                            )
+                        plan.skipped.append(SkipRecord(
+                            channel_id=pair.dest_channel_id,
+                            reason="pair_futility",
+                            value_class="valuable",
+                            remaining_budget_sats=int(
+                                getattr(pair, "pair_budget_sats", 0) or 0
+                            ),
+                            detail=(
+                                f"src={pair.source_channel_id} "
+                                f"failures={len(fresh)} in window "
+                                f"{int(self._futility_window_sec)}s"
                             ),
                         ))
                         continue
@@ -1213,6 +1272,9 @@ class RebalanceEngine:
             finally:
                 if hive_router is not None:
                     hive_router.end_cycle()
+                router_end = getattr(router, "end_cycle", None)
+                if callable(router_end):
+                    router_end()
 
             plan.selected = priced
 
@@ -1492,6 +1554,18 @@ class RebalanceEngine:
                 exclude,
                 market_only_layers=True,
             ), "market"
+
+        if (
+            decision.policy is RoutePolicy.HYBRID
+            and getattr(hive_result, "success", False)
+            and int(getattr(hive_result, "route_cost_sats", 0) or 0) == 0
+            and bool(getattr(decision, "prefer_hive_on_tie", True))
+        ):
+            # Free hive route (typical intra-fleet). A market quote cannot
+            # beat zero cost, and prefer_hive_on_tie would pick the hive
+            # route even on a 0-cost tie, so the market pricing pass is
+            # provably redundant — skip its RPCs entirely.
+            return hive_result, "hive"
 
         market_result = self._market_price_pair(
             router,
@@ -1840,6 +1914,10 @@ class RebalanceEngine:
             self.plugin,
             self.database,
             observation_store=self._segment_observation_store,
+            # Inject the engine's cached node id so executor.is_available()
+            # does not pay a getinfo RPC every cycle. Falls back to the
+            # executor's own lazy getinfo when the engine has no id yet.
+            our_id=self._get_our_id(),
         )
 
     def _executor_unavailable_reason(self) -> tuple[str, str]:
@@ -2375,9 +2453,21 @@ class RebalanceEngine:
             self._log(f"pending settlement query failed: {exc}", level="warn")
             return 0
         resolved = 0
+        # Build the SCID -> peer map at most once per sweep (lazily, only
+        # when a settled row actually needs cost attribution) instead of one
+        # listpeerchannels RPC per settled row.
+        peer_map_cache: Dict[str, Dict[str, str]] = {}
+
+        def scid_peer_map() -> Dict[str, str]:
+            if "map" not in peer_map_cache:
+                peer_map_cache["map"] = self._build_scid_peer_map()
+            return peer_map_cache["map"]
+
         for row in rows:
             try:
-                if self._reconcile_pending_row(row):
+                if self._reconcile_pending_row(
+                    row, scid_peer_map_provider=scid_peer_map
+                ):
                     resolved += 1
             except Exception as exc:
                 self._log(
@@ -2386,7 +2476,11 @@ class RebalanceEngine:
                 )
         return resolved
 
-    def _reconcile_pending_row(self, row: Dict[str, Any]) -> bool:
+    def _reconcile_pending_row(
+        self,
+        row: Dict[str, Any],
+        scid_peer_map_provider: Optional[Any] = None,
+    ) -> bool:
         rebalance_id = int(row.get("id") or 0)
         payment_hash = str(row.get("payment_hash") or "")
         if rebalance_id <= 0 or not payment_hash:
@@ -2416,7 +2510,9 @@ class RebalanceEngine:
             if fee_msat > 0:
                 self.database.record_rebalance_cost(
                     channel_id=dest_channel,
-                    peer_id=self._peer_id_for_channel(dest_channel),
+                    peer_id=self._peer_id_for_channel(
+                        dest_channel, scid_peer_map_provider
+                    ),
                     cost_sats=fee_sats,
                     cost_msat=fee_msat,
                     amount_sats=int(row.get("amount_sats") or 0),
@@ -2447,23 +2543,48 @@ class RebalanceEngine:
             pass
         return True
 
-    def _peer_id_for_channel(self, channel_id: str) -> str:
-        """Best-effort SCID -> peer id lookup for cost attribution."""
+    def _build_scid_peer_map(self) -> Dict[str, str]:
+        """Build a SCID -> peer id map from a single listpeerchannels call."""
+        mapping: Dict[str, str] = {}
         try:
-            channels = self.plugin.rpc.listpeerchannels().get("channels", [])
+            if self._data_service is not None:
+                channels = self._data_service.get_peer_channels().get("channels", [])
+            else:
+                channels = self.plugin.rpc.listpeerchannels().get("channels", [])
             for channel in channels:
                 if not isinstance(channel, dict):
                     continue
                 scid = str(
                     channel.get("short_channel_id")
-                    or channel.get("alias", {}).get("local", "")
+                    or (channel.get("alias") or {}).get("local", "")
                     or ""
                 )
-                if scid == channel_id:
-                    return str(channel.get("peer_id") or "")
+                if scid and scid not in mapping:
+                    mapping[scid] = str(channel.get("peer_id") or "")
         except Exception:
             pass
-        return ""
+        return mapping
+
+    def _peer_id_for_channel(
+        self,
+        channel_id: str,
+        scid_peer_map_provider: Optional[Any] = None,
+    ) -> str:
+        """Best-effort SCID -> peer id lookup for cost attribution.
+
+        ``scid_peer_map_provider``: optional zero-arg callable returning a
+        prebuilt SCID -> peer map (the reconcile sweep shares one map across
+        all rows). When absent, a fresh single-call map is built — same RPC
+        cost as the old per-call scan.
+        """
+        try:
+            if callable(scid_peer_map_provider):
+                mapping = scid_peer_map_provider()
+            else:
+                mapping = self._build_scid_peer_map()
+            return str(mapping.get(channel_id, "") or "")
+        except Exception:
+            return ""
 
     def _segment_observation_direction(self, peer_id: str) -> int:
         """Return the directional edge for inbound-to-local liquidity on dest channel."""
@@ -2575,6 +2696,9 @@ class RebalanceEngine:
         pair.route_decision = getattr(candidate, "route_decision", None)
 
         hive_router = self._hive_router
+        router_begin = getattr(self._cycle_router, "begin_cycle", None)
+        if callable(router_begin):
+            router_begin()
         if hive_router is not None:
             hive_router.begin_cycle()
         try:
@@ -2608,6 +2732,9 @@ class RebalanceEngine:
         finally:
             if hive_router is not None:
                 hive_router.end_cycle()
+            router_end = getattr(self._cycle_router, "end_cycle", None)
+            if callable(router_end):
+                router_end()
 
         decision = self._route_decision_for_pair(pair)
         if route_result is not None and not route_result.success and self._fail_closed_on_route_failure(decision):

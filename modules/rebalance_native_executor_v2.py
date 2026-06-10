@@ -19,11 +19,15 @@ class NativeRouteExecutor:
     INVOICE_EXPIRY_SEC = 300
     SENDPAY_TIMEOUT_SEC = 60
 
-    def __init__(self, plugin, database=None, observation_store=None):
+    def __init__(self, plugin, database=None, observation_store=None, our_id=None):
         self.plugin = plugin
         self.database = database
         self.observation_store = observation_store
-        self._our_id: Optional[str] = None
+        # Callers that already know the node id (the engine caches it) can
+        # inject it to skip the per-instantiation getinfo RPC issued by
+        # is_available()/_get_our_id(). Default None preserves the lazy
+        # getinfo lookup.
+        self._our_id: Optional[str] = str(our_id) if our_id else None
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:

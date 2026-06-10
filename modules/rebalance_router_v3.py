@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -193,6 +194,12 @@ class RebalanceRouterV3:
         self.layer_names = list(layer_names)
         self.log = log
         self.data_service = data_service
+        # Cycle-scoped cache of live askrene layer names. Thread-local (same
+        # pattern as RebalanceHiveRouter) so a manual pricing call on an RPC
+        # thread can never serve or clobber the background cycle's cache.
+        # When no cycle is active behavior is unchanged: every price_pair
+        # re-probes askrene-listlayers.
+        self._cycle_state = threading.local()
         self.found_layers: List[str] = self._probe_layers()
         # Reuse v2's fee and CLTV lookup helpers. Constructing a v2 instance
         # here is cheap (no RPC until a method is called) and avoids duplicating
@@ -202,6 +209,47 @@ class RebalanceRouterV3:
             our_node_id,
             data_service=data_service,
         )
+
+    # ------------------------------------------------------------------
+    # Cycle-scoped layer cache
+    # ------------------------------------------------------------------
+
+    def begin_cycle(self) -> None:
+        """Enter a pricing cycle: cache askrene-listlayers across price_pair calls.
+
+        Within a cycle the live-layer probe is served from a single
+        askrene-listlayers call instead of one per pricing call. The cache is
+        invalidated on 'Unknown layer' getroutes errors so a layer removed
+        mid-cycle triggers a re-probe on the next call. end_cycle() drops it.
+        """
+        self._cycle_state.active = True
+        self._cycle_state.live_layer_names = None
+
+    def end_cycle(self) -> None:
+        self._cycle_state.active = False
+        self._cycle_state.live_layer_names = None
+
+    def _cycle_active(self) -> bool:
+        return bool(getattr(self._cycle_state, "active", False))
+
+    def invalidate_layer_cache(self) -> None:
+        """Drop the cycle's cached layer list so the next probe re-fetches."""
+        self._cycle_state.live_layer_names = None
+
+    def _live_layer_names(self) -> List[str]:
+        """Return live askrene layer names, cached for the active cycle."""
+        if self._cycle_active():
+            cached = getattr(self._cycle_state, "live_layer_names", None)
+            if cached is not None:
+                return list(cached)
+        if self.data_service is not None:
+            result = self.data_service.get_askrene_layers()
+        else:
+            result = self.plugin.rpc.call("askrene-listlayers", {})
+        live_names = [layer.get("layer", "") for layer in result.get("layers", [])]
+        if self._cycle_active():
+            self._cycle_state.live_layer_names = list(live_names)
+        return live_names
 
     # ------------------------------------------------------------------
     # Init helpers
@@ -221,15 +269,11 @@ class RebalanceRouterV3:
         names from getroutes calls, so this is never a hard failure.
         """
         try:
-            if self.data_service is not None:
-                result = self.data_service.get_askrene_layers()
-            else:
-                result = self.plugin.rpc.call("askrene-listlayers", {})
+            live_names = self._live_layer_names()
         except Exception as e:
             self.log(f"[router-v3] askrene-listlayers failed: {e}", "warn")
             return []
 
-        live_names = [layer.get("layer", "") for layer in result.get("layers", [])]
         requested = list(self.layer_names if layer_names is None else layer_names)
         if (
             include_observed_liquidity
@@ -283,7 +327,15 @@ class RebalanceRouterV3:
             )
         final_hop_fee_ppm = int(final_hop_policy["fee_ppm"])
         final_hop_fee_base_msat = int(final_hop_policy.get("fee_base_msat", 0) or 0)
-        dest_cltv = self._v2_helpers._get_dest_channel_cltv(dest_peer_id, dest_channel_id)
+        # The final-hop policy lookup already returned the dest peer's
+        # cltv_delta; a separate _get_dest_channel_cltv call would repeat the
+        # identical listpeerchannels RPC. Only fall back when the policy did
+        # not carry a usable delta.
+        dest_cltv = int(final_hop_policy.get("cltv_delta", 0) or 0)
+        if dest_cltv <= 0:
+            dest_cltv = self._v2_helpers._get_dest_channel_cltv(
+                dest_peer_id, dest_channel_id
+            )
         invoice_final_cltv = self._v2_helpers._get_invoice_final_cltv()
         required_final_cltv = dest_cltv + invoice_final_cltv
         final_hop_fee_sats = self._v2_helpers._compute_final_hop_fee_sats(
@@ -375,6 +427,11 @@ class RebalanceRouterV3:
                 result = self.plugin.rpc.getroutes(**route_kwargs)
         except Exception as e:
             reason, detail = _translate_getroutes_error(str(e))
+            if reason == "unknown_layer":
+                # A cached layer list referenced a layer that no longer
+                # exists; drop the cycle cache so the next pricing call
+                # re-probes live layers instead of failing the whole cycle.
+                self.invalidate_layer_cache()
             return RouteResult(success=False, error=f"{reason}: {detail}")
 
         routes = result.get("routes", [])

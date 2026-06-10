@@ -1189,12 +1189,10 @@ class EVRebalancer:
         # Thread-safe config snapshot for this rebalance cycle
         cfg = self.config.snapshot()
 
-        # Compute capex allocations for this cycle (engine does all budget math)
-        if self._capex_engine:
-            try:
-                self._capex_engine.compute_allocations()
-            except Exception as e:
-                self.plugin.log(f"Capex engine allocation failed: {e}", level='warn')
+        # Capex allocations are computed once per cycle by the v2 engine's
+        # _build_snapshot (engine.find_candidates/run_cycle below). Calling
+        # compute_allocations here as well doubled the full flow-analysis
+        # pass (~100 DB writes) every cycle for a result that was discarded.
 
         # Issue #24: Clean up stale reservations before each rebalance cycle
         # This prevents budget leakage from crashed jobs

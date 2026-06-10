@@ -1763,7 +1763,7 @@ def test_engine_execute_candidate_exports_failure_snapshot(mock_plugin, mock_dat
     )
 
     class FakeExecutor:
-        def __init__(self, plugin, database, observation_store=None):
+        def __init__(self, plugin, database, observation_store=None, our_id=None):
             self._store = observation_store
 
         def execute(self, **kwargs):
