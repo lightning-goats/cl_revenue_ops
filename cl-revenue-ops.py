@@ -6239,8 +6239,8 @@ def _node_receivable_status() -> Dict[str, Any]:
         total_cap = 0
         total_recv = 0
         for ch in channels.values():
-            spend = parse_msat(ch.get("spendable_msat", 0)) // 1000
-            recv = parse_msat(ch.get("receivable_msat", 0)) // 1000
+            spend = max(0, parse_msat(ch.get("spendable_msat", 0)) // 1000)
+            recv = max(0, parse_msat(ch.get("receivable_msat", 0)) // 1000)
             total_cap += spend + recv
             total_recv += recv
         if total_cap <= 0:

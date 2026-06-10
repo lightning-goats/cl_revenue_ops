@@ -1011,6 +1011,11 @@ class ConfigSnapshot:
     capex_cost_efficiency_weight: float = 0.5
     capex_drain_benefit_weight: float = 0.5
     capex_probability_budget_bonus: float = 0.0
+    # Structural loop-out / drain-demand fields
+    receivable_ratio_target: float = 0.30
+    receivable_ratio_floor: float = 0.20
+    boltz_structural_budget_sats_per_day: int = 0
+    drain_fee_discount_max: float = 0.0
     # Version tracking
     version: int = 0
     
