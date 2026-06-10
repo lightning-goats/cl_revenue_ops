@@ -46,6 +46,15 @@ PUBLIC_RUNTIME_KEYS = (
     # Exposed so operators running the askrene router can enable the
     # reliability-weighted budget bonus without editing code or the database.
     'capex_probability_budget_bonus',
+    # Source-heavy drain rollout knobs. Plugin options in the config file
+    # only load at lightningd startup; these are exposed at runtime so the
+    # drain can be enabled and tuned via revenue-config without a daemon
+    # restart. All default to off/neutral.
+    'boltz_auto_cycle_enabled',
+    'boltz_structural_budget_sats_per_day',
+    'receivable_ratio_target',
+    'receivable_ratio_floor',
+    'drain_fee_discount_max',
 )
 
 # Type mapping for config fields (for validation)
@@ -797,6 +806,12 @@ class Config:
                 return {"error": f"sink_threshold ({typed_value}) must be less than source_threshold ({self.source_threshold})"}
             if key == 'source_threshold' and typed_value <= self.sink_threshold:
                 return {"error": f"source_threshold ({typed_value}) must be greater than sink_threshold ({self.sink_threshold})"}
+            # Receivable objective: floor must never exceed target (mirrors
+            # the __post_init__ invariant for construction-time values).
+            if key == 'receivable_ratio_floor' and typed_value > self.receivable_ratio_target:
+                return {"error": f"receivable_ratio_floor ({typed_value}) cannot exceed receivable_ratio_target ({self.receivable_ratio_target})"}
+            if key == 'receivable_ratio_target' and typed_value < self.receivable_ratio_floor:
+                return {"error": f"receivable_ratio_target ({typed_value}) cannot be less than receivable_ratio_floor ({self.receivable_ratio_floor})"}
 
             old_value = getattr(self, key)
 

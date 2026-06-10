@@ -149,6 +149,11 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "planner_max_closes_per_cycle",
         "planner_min_annual_roi_pct",
         "capex_probability_budget_bonus",
+        "boltz_auto_cycle_enabled",
+        "boltz_structural_budget_sats_per_day",
+        "receivable_ratio_target",
+        "receivable_ratio_floor",
+        "drain_fee_discount_max",
     ]
     assert result["operator_controls"]["values"] == {
         "paused": False,
@@ -169,6 +174,11 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "planner_max_closes_per_cycle": 0,
         "planner_min_annual_roi_pct": 1.0,
         "capex_probability_budget_bonus": 0.0,
+        "boltz_auto_cycle_enabled": False,
+        "boltz_structural_budget_sats_per_day": 0,
+        "receivable_ratio_target": 0.3,
+        "receivable_ratio_floor": 0.2,
+        "drain_fee_discount_max": 0.0,
     }
     assert "config" not in result
 

@@ -768,3 +768,71 @@ def test_drain_demand_fetched_once():
     assert "error" not in plan
     assert len(plan["recommendations"]) == 2
     mod.rebalancer.rebalance_engine_v2.get_drain_demand.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Runtime mutability: drain knobs and the Boltz auto-cycle toggle must be
+# settable via revenue-config without a lightningd restart (config-file
+# edits for plugin options only load at daemon startup).
+# ---------------------------------------------------------------------------
+
+
+def _runtime_db():
+    db = MagicMock()
+    store = {}
+    db.set_config_override.side_effect = lambda k, v: store.update({k: v}) or 1
+    db.get_config_override.side_effect = lambda k: store.get(k)
+    return db
+
+
+def test_drain_knobs_are_public_runtime_keys():
+    from modules.config import PUBLIC_RUNTIME_KEYS
+    for key in (
+        "boltz_auto_cycle_enabled",
+        "boltz_structural_budget_sats_per_day",
+        "receivable_ratio_target",
+        "receivable_ratio_floor",
+        "drain_fee_discount_max",
+    ):
+        assert key in PUBLIC_RUNTIME_KEYS, key
+
+
+def test_update_runtime_enables_auto_cycle():
+    from modules.config import Config
+    cfg = Config()
+    result = cfg.update_runtime(_runtime_db(), "boltz_auto_cycle_enabled", "true")
+    assert result.get("status") == "success"
+    assert cfg.boltz_auto_cycle_enabled is True
+
+
+def test_update_runtime_sets_structural_budget():
+    from modules.config import Config
+    cfg = Config()
+    result = cfg.update_runtime(
+        _runtime_db(), "boltz_structural_budget_sats_per_day", "200")
+    assert result.get("status") == "success"
+    assert cfg.boltz_structural_budget_sats_per_day == 200
+
+
+def test_update_runtime_rejects_floor_above_target():
+    from modules.config import Config
+    cfg = Config()  # target 0.30
+    result = cfg.update_runtime(_runtime_db(), "receivable_ratio_floor", "0.4")
+    assert "error" in result
+    assert cfg.receivable_ratio_floor == 0.20
+
+
+def test_update_runtime_rejects_target_below_floor():
+    from modules.config import Config
+    cfg = Config()  # floor 0.20
+    result = cfg.update_runtime(_runtime_db(), "receivable_ratio_target", "0.1")
+    assert "error" in result
+    assert cfg.receivable_ratio_target == 0.30
+
+
+def test_update_runtime_rejects_out_of_range_budget():
+    from modules.config import Config
+    cfg = Config()
+    result = cfg.update_runtime(
+        _runtime_db(), "boltz_structural_budget_sats_per_day", "2000000")
+    assert "error" in result
