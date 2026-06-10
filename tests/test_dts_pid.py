@@ -171,15 +171,68 @@ class TestDTSDiscountFactor:
         max_std = math.sqrt(1.0 / GaussianThompsonState.MIN_PRECISION)
         assert ts.posterior_std <= max_std + 0.01
 
-    def test_repeated_discount_converges(self):
+    def test_repeated_discount_converges(self, monkeypatch):
+        """Discounts interleaved with posterior updates (the real production
+        cycle: update -> discount -> sample) must still produce monotonically
+        increasing uncertainty for a stagnant channel. Previously
+        update_posterior's full rebuild restored undecayed observation
+        weights, so apply_dts_discount was a pure no-op past the next cycle."""
+        import copy
+        import random as _random
+
+        import modules.fee_controller as fc_mod
+
+        class FakeTime:
+            t = 1_750_000_000.0
+
+            @classmethod
+            def time(cls):
+                return cls.t
+
+            @staticmethod
+            def strftime(fmt):
+                return "12"
+
+        monkeypatch.setattr(fc_mod, "time", FakeTime)
+
+        # Established history around 300 ppm with real revenue
         ts = GaussianThompsonState()
-        ts.posterior_mean = 300.0
-        ts.posterior_std = 20.0
-        for _ in range(100):
-            ts.apply_dts_discount(gamma=0.95)
-        assert ts.posterior_std > 100.0
+        rng = _random.Random(9)
+        now = int(FakeTime.t)
+        for i in range(30):
+            ts.observations.append(
+                (300 + rng.randint(-40, 40), 30.0, 0.8, now - (30 - i) * 3600, "normal")
+            )
+        ts._recompute_posterior()
+        control = copy.deepcopy(ts)
+
+        # Channel goes stagnant: 6h zero-revenue windows + sparse-gamma discount
+        stds = []
+        for _ in range(80):
+            FakeTime.t += 6 * 3600.0
+            ts.update_posterior(fee=300, revenue_rate=0.0, hours=6.0)
+            control.update_posterior(fee=300, revenue_rate=0.0, hours=6.0)
+            ts.apply_dts_discount(gamma=0.992)
+            stds.append(ts.posterior_std)
+
+        # Monotonically increasing uncertainty after a short settling window
+        # (the polynomial fit may flip concave/non-concave once early on)
+        settled = stds[5:]
+        assert all(b >= a - 0.01 for a, b in zip(settled, settled[1:])), (
+            "uncertainty must grow monotonically on a stagnant channel"
+        )
+        assert settled[-1] > settled[0] * 1.5
+
+        # The discount must contribute forgetting BEYOND plain time decay,
+        # and survive every interleaved recompute (it used to be erased)
+        assert ts.posterior_std > control.posterior_std * 1.05, (
+            f"discount erased by recomputes: {ts.posterior_std:.2f} vs "
+            f"control {control.posterior_std:.2f}"
+        )
+
+        # And remain capped by MIN_PRECISION
         max_std = math.sqrt(1.0 / GaussianThompsonState.MIN_PRECISION)
-        assert ts.posterior_std <= max_std + 0.01
+        assert all(s <= max_std + 0.01 for s in stds)
 
 
 class TestContextualPosteriorUpdates:

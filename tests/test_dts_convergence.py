@@ -194,3 +194,59 @@ class TestContextualNonAbsorbing:
     def test_legacy_dict_defaults_charged_fee_mean(self):
         st = GaussianThompsonState.from_dict({"posterior_mean": 250.0})
         assert st.charged_fee_mean == 0.0
+
+
+# =============================================================================
+# Fix #4: apply_dts_discount must survive the next posterior recompute
+# =============================================================================
+
+class TestDiscountPersistence:
+
+    def _seeded(self, rng):
+        st = GaussianThompsonState()
+        for _ in range(30):
+            FakeTime.advance(1.0)
+            f = 300 + rng.randint(-50, 50)
+            st.update_posterior(fee=f, revenue_rate=revenue_rate(f, rng=rng), hours=6.0)
+        return st
+
+    def test_discount_survives_next_recompute(self, fake_time):
+        """Audit defect 4: std 23.5 -> discount -> 33.2 -> next update ->
+        exactly 23.5 again. Discounting must decay the stored observation
+        weights so the next rebuild reflects genuine forgetting."""
+        import copy
+        rng = random.Random(17)
+        st = self._seeded(rng)
+        control = copy.deepcopy(st)
+
+        for _ in range(5):
+            st.apply_dts_discount(gamma=0.5)
+
+        FakeTime.advance(1.0)
+        rr = revenue_rate(300, rng=rng)
+        st.update_posterior(fee=300, revenue_rate=rr, hours=1.0)
+        control.update_posterior(fee=300, revenue_rate=rr, hours=1.0)
+
+        assert st.posterior_std > control.posterior_std * 1.05, (
+            f"discount erased by recompute: discounted std {st.posterior_std:.2f} "
+            f"vs control {control.posterior_std:.2f}"
+        )
+
+    def test_observation_weights_decay_with_floor(self, fake_time):
+        st = GaussianThompsonState()
+        FakeTime.advance(1.0)
+        st.update_posterior(fee=300, revenue_rate=50.0, hours=6.0)
+        w0 = st.observations[0][2]
+        for _ in range(500):
+            st.apply_dts_discount(gamma=0.9)
+        w_final = st.observations[0][2]
+        assert w_final < w0
+        assert w_final >= GaussianThompsonState.DISCOUNT_WEIGHT_FLOOR - 1e-12
+
+    def test_discount_never_raises_tiny_weights(self, fake_time):
+        """Weights already below the floor must not be pulled UP to it."""
+        st = GaussianThompsonState()
+        now = int(FakeTime.t)
+        st.observations.append((300, 0.0, 0.01, now, "normal"))
+        st.apply_dts_discount(gamma=0.9)
+        assert st.observations[0][2] <= 0.01 + 1e-12

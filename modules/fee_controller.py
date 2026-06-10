@@ -919,9 +919,21 @@ class GaussianThompsonState:
             # Un-normalize the variance
             self.posterior_std = max(self.MIN_STD, math.sqrt(max(0.0, var_fstar)) * fee_range)
         else:
-            # Non-concave fallback: use observation spread
+            # Non-concave fallback: observation spread, inflated as the total
+            # observation mass decays. The raw spread is weight-insensitive,
+            # which made apply_dts_discount a no-op in this branch (the next
+            # rebuild always restored the same spread-based std). Inflating
+            # by sqrt(n / total_weight) leaves fresh full-weight data
+            # unchanged but genuinely widens uncertainty once discounting
+            # has decayed the stored weights.
             fees = [o[0] for o in weighted_obs]
-            self.posterior_std = max(self.MIN_STD, (max(fees) - min(fees)) / 4.0)
+            spread_std = (max(fees) - min(fees)) / 4.0
+            total_w = sum(w for _, _, w in weighted_obs)
+            inflation = math.sqrt(len(weighted_obs) / max(total_w, 1e-6))
+            max_std = math.sqrt(1.0 / self.MIN_PRECISION)
+            self.posterior_std = max(
+                self.MIN_STD, min(max_std, spread_std * inflation)
+            )
 
     def _recompute_posterior_legacy(
         self, weighted_obs: Optional[List[Tuple[float, float, float]]] = None
@@ -1080,6 +1092,13 @@ class GaussianThompsonState:
     # Corresponds to max std ≈ 200 ppm.
     MIN_PRECISION = 0.000025
 
+    # Discounting decays stored observation base-weights so forgetting is
+    # PERSISTENT: without this, the next _recompute_posterior rebuilt the
+    # posterior from undecayed weights and erased the discount entirely.
+    # The floor keeps old observations as weak anchors instead of deleting
+    # their evidence outright (time decay still prunes them eventually).
+    DISCOUNT_WEIGHT_FLOOR = 0.05
+
     def apply_dts_discount(self, gamma: float = 0.95) -> None:
         """Apply Discounted Thompson Sampling decay to both posteriors.
 
@@ -1109,6 +1128,25 @@ class GaussianThompsonState:
             for i in range(3):
                 for j in range(3):
                     self.posterior_precision[i][j] *= gamma
+
+        # Persistent forgetting: decay each stored observation's base weight
+        # so the NEXT posterior rebuild also reflects the discount (the
+        # in-place std/precision widening above only survives until the next
+        # _recompute_posterior). Never decay below DISCOUNT_WEIGHT_FLOOR and
+        # never raise a weight that is already below the floor.
+        if self.observations:
+            decayed_obs = []
+            for obs in self.observations:
+                if len(obs) >= 4:
+                    base_weight = obs[2]
+                    new_weight = max(
+                        min(float(base_weight), self.DISCOUNT_WEIGHT_FLOOR),
+                        float(base_weight) * gamma,
+                    )
+                    decayed_obs.append(obs[:2] + (new_weight,) + obs[3:])
+                else:
+                    decayed_obs.append(obs)
+            self.observations = decayed_obs
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state to dict for database storage."""
