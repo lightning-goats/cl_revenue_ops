@@ -2660,15 +2660,20 @@ class Database:
         Used to price the value of new inbound capacity when the node is
         receivable-starved. Returns 0 when there is no settled volume in
         the window (caller treats 0 as "no credit").
+
+        Note: the forwards table retains ~8 days of raw rows before pruning
+        into daily aggregates; windows larger than the retention period will
+        undercount because pruned rows are not included in this query.
         """
         conn = self._get_connection()
         since = int(time.time()) - max(1, int(window_days)) * 86400
         row = conn.execute(
-            "SELECT COALESCE(SUM(fee_msat), 0), COALESCE(SUM(out_msat), 0) "
-            "FROM forwards WHERE timestamp >= ?",
+            "SELECT COALESCE(SUM(fee_msat), 0) AS fee_msat,"
+            " COALESCE(SUM(out_msat), 0) AS out_msat"
+            " FROM forwards WHERE timestamp >= ?",
             (since,),
         ).fetchone()
-        fee_msat, out_msat = int(row[0]), int(row[1])
+        fee_msat, out_msat = int(row['fee_msat']), int(row['out_msat'])
         if out_msat <= 0:
             return 0
         return (fee_msat * 1_000_000) // out_msat
@@ -3734,19 +3739,21 @@ class Database:
                                 since_timestamp: int = 0) -> int:
         """Sum of spend_events sats for a category (optionally subcategory)."""
         conn = self._get_connection()
+        # Normalize identically to record_spend_event so "Boltz"/" boltz" match.
+        cat = str(category or "").strip().lower()
         if subcategory is None:
             row = conn.execute(
-                "SELECT COALESCE(SUM(amount_sats), 0) FROM spend_events "
+                "SELECT COALESCE(SUM(amount_sats), 0) AS total FROM spend_events "
                 "WHERE category = ? AND timestamp >= ?",
-                (str(category), int(since_timestamp)),
+                (cat, int(since_timestamp)),
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT COALESCE(SUM(amount_sats), 0) FROM spend_events "
+                "SELECT COALESCE(SUM(amount_sats), 0) AS total FROM spend_events "
                 "WHERE category = ? AND subcategory = ? AND timestamp >= ?",
-                (str(category), str(subcategory), int(since_timestamp)),
+                (cat, str(subcategory), int(since_timestamp)),
             ).fetchone()
-        return int(row[0])
+        return int(row['total'])
 
     def cleanup_stale_spend_reservations(self, max_age_seconds: int = 86400, category: Optional[str] = None) -> int:
         conn = self._get_connection()

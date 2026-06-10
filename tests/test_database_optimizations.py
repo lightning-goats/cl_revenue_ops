@@ -647,3 +647,19 @@ class TestCategorySpendSats:
                               subcategory="structural", timestamp=now - 100)
         assert db.get_category_spend_sats("boltz",
                                           since_timestamp=now - 86400) == 30
+
+    def test_category_lookup_normalizes_case_and_whitespace(self, tmp_path):
+        """Getter must match category regardless of case/whitespace, like the writer."""
+        db = self._db(tmp_path)
+        now = int(time.time())
+        db.record_spend_event(event_id="n1", amount_sats=75, category="boltz",
+                              timestamp=now - 100)
+        # Querying with title-case and with surrounding whitespace must both hit
+        # the same row that was written with normalized "boltz".
+        assert db.get_category_spend_sats("Boltz", since_timestamp=0) == 75
+        assert db.get_category_spend_sats(" boltz ", since_timestamp=0) == 75
+
+    def test_empty_table_returns_zero(self, tmp_path):
+        """get_category_spend_sats on an empty table returns 0, not an error."""
+        db = self._db(tmp_path)
+        assert db.get_category_spend_sats("boltz", since_timestamp=0) == 0
