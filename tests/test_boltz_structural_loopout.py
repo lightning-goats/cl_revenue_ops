@@ -261,13 +261,15 @@ def _structural_module(scarcity, realized_ppm=500, structural_budget=1000):
 
 
 def test_starved_node_loopout_earns_structural_credit():
-    """Fully starved node: the structural credit alone (250 sats vs 120 sats
+    """Fully starved node: the structural credit alone (2500 sats vs 120 sats
     threshold) carries the loop-out past the profit guard.
 
-    Arithmetic (marginal, per-horizon credit): amount 1M sats x 0.5 turnover
+    Arithmetic (marginal, amortized credit): amount 1M sats x 0.5 turnover
     per horizon x scarcity 1.0 x (realized 500ppm - channel posterior 0ppm)
-    / 1e6 = 250. No xhorizon_days multiplier: the 0.5 turnover IS the
-    per-horizon volume assumption."""
+    / 1e6 x STRUCTURAL_AMORTIZATION_HORIZONS (10) = 2500. The freed inbound
+    keeps working beyond one ~3-day horizon; pricing only one horizon made
+    the guard unflippable against real reverse-swap costs (~1000-2500 ppm).
+    Spend stays bounded by the daily envelope, not by this estimate."""
     mod = _structural_module(scarcity=1.0)
 
     plan = mod._build_boltz_balance_plan(require_profitable=True)
@@ -276,9 +278,50 @@ def test_starved_node_loopout_earns_structural_credit():
     recs = plan["recommendations"]
     assert len(recs) == 1
     econ = recs[0]["economics"]
-    assert econ["structural_uplift_sats"] == 250
+    assert econ["structural_uplift_sats"] == 2500
     assert econ["passes_profit_guard"] is True
     assert econ["structural"] is True
+
+
+def test_worked_example_starved_node_clears_realistic_swap_fee():
+    """Calibration worked example: 1M amount, scarcity 1.0, realized 500 ppm,
+    no posterior, swap fee 200 sats. Credit = 1M x 0.5 x 1.0 x 500/1e6 x 10
+    = 2500 sats vs threshold 200 x 1.2 = 240 — passes comfortably. Before
+    amortization the credit was 250, leaving essentially no room against
+    real reverse-swap costs."""
+    mod = _structural_module(scarcity=1.0, realized_ppm=500)
+    bm = mod._require_boltz_manager()
+    bm.quote.return_value = {"estimated_total_fee_sats": 200}
+
+    plan = mod._build_boltz_balance_plan(
+        require_profitable=True, profit_margin_factor=1.2
+    )
+
+    assert "error" not in plan
+    econ = plan["recommendations"][0]["economics"]
+    assert econ["estimated_swap_fee_sats"] == 200
+    assert econ["structural_uplift_sats"] == 2500
+    assert econ["passes_profit_guard"] is True
+    assert econ["structural"] is True
+
+
+def test_worked_example_healthy_node_still_exactly_zero():
+    """Healthy node (scarcity 0) under the same realistic 200-sat fee: the
+    amortization multiplier must not leak any credit — exactly 0."""
+    mod = _structural_module(scarcity=0.0, realized_ppm=500)
+    bm = mod._require_boltz_manager()
+    bm.quote.return_value = {"estimated_total_fee_sats": 200}
+
+    plan = mod._build_boltz_balance_plan(
+        require_profitable=True, profit_margin_factor=1.2
+    )
+
+    assert "error" not in plan
+    for rec in plan["recommendations"]:
+        econ = rec["economics"]
+        assert econ["structural_uplift_sats"] == 0
+        assert econ["structural"] is False
+        assert econ["passes_profit_guard"] is False
 
 
 def test_structural_credit_is_marginal_over_channel_posterior():
@@ -302,7 +345,8 @@ def test_structural_credit_is_marginal_over_channel_posterior():
 
 def test_structural_credit_pays_only_node_premium_over_posterior():
     """Realized 800ppm, tight channel posterior 300ppm: the credit prices
-    only the 500ppm premium: 1M x 0.5 x 1.0 x (800-300)/1e6 = 250."""
+    only the 500ppm premium, amortized:
+    1M x 0.5 x 1.0 x (800-300)/1e6 x 10 = 2500."""
     mod = _structural_module(scarcity=1.0, realized_ppm=800)
     mod.fee_controller.get_dts_summary.return_value = {
         "broadcast_fee_ppm": 0,
@@ -314,7 +358,7 @@ def test_structural_credit_pays_only_node_premium_over_posterior():
 
     assert "error" not in plan
     econ = plan["recommendations"][0]["economics"]
-    assert econ["structural_uplift_sats"] == 250
+    assert econ["structural_uplift_sats"] == 2500
 
 
 def test_loose_posterior_credits_full_realized_rate():
@@ -331,13 +375,15 @@ def test_loose_posterior_credits_full_realized_rate():
 
     assert "error" not in plan
     econ = plan["recommendations"][0]["economics"]
-    assert econ["structural_uplift_sats"] == 250  # 1M x 0.5 x 1.0 x 500/1e6
+    # 1M x 0.5 x 1.0 x 500/1e6 x 10 horizons
+    assert econ["structural_uplift_sats"] == 2500
 
 
-def test_uplifts_have_no_horizon_multiplier():
-    """F3b horizon honesty: the 0.5 turnover is PER HORIZON, so neither the
-    DTS uplift nor the structural credit may scale with expected_horizon_days
-    (code now matches the '50% of the amount ... over the horizon' comment)."""
+def test_uplifts_independent_of_expected_horizon_days():
+    """Neither uplift may scale with the caller's expected_horizon_days: the
+    DTS uplift prices one horizon's turnover; the structural credit amortizes
+    over the FIXED STRUCTURAL_AMORTIZATION_HORIZONS constant (not a caller
+    knob), so changing expected_horizon_days must move neither."""
     mod3 = _structural_module(scarcity=1.0)
     mod3.fee_controller.get_dts_summary.return_value = {
         "broadcast_fee_ppm": 0, "posterior_mean": 400, "posterior_std": 50,
@@ -355,8 +401,9 @@ def test_uplifts_have_no_horizon_multiplier():
     # DTS uplift: 1M x 0.5 x 400/1e6 = 200, horizon-independent.
     assert econ3["dts_uplift_sats"] == 200
     assert econ6["dts_uplift_sats"] == econ3["dts_uplift_sats"]
-    # Structural: 1M x 0.5 x 1.0 x (500-400)/1e6 = 50, horizon-independent.
-    assert econ3["structural_uplift_sats"] == 50
+    # Structural: 1M x 0.5 x 1.0 x (500-400)/1e6 x 10 = 500, independent of
+    # expected_horizon_days (the x10 is the fixed amortization constant).
+    assert econ3["structural_uplift_sats"] == 500
     assert econ6["structural_uplift_sats"] == econ3["structural_uplift_sats"]
 
 

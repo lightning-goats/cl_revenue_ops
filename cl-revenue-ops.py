@@ -6931,6 +6931,15 @@ STRUCTURAL_MIN_VOLUME_SATS = 1_000_000
 # window would have priced the credit instead), so take them at half value.
 OWN_POLICY_HAIRCUT = 0.5
 
+# How many ~3-day turnover horizons of value the structural inbound credit
+# amortizes over (10 ≈ 30 days of the structural asset working). One horizon
+# priced only ~0.5x amount of freed-inbound turnover, while real reverse-swap
+# costs run ~1000-2500 ppm — the profit guard could essentially never flip.
+# The freed inbound keeps earning beyond one horizon, and actual spend is
+# bounded by the daily structural envelope, not by this estimate; the credit
+# prices a month of the structural asset.
+STRUCTURAL_AMORTIZATION_HORIZONS = 10
+
 
 def _policy_derived_fee_ppm(channels: Dict[str, Dict[str, Any]]) -> int:
     """Capacity-weighted mean of our own out-fee policies, haircut applied.
@@ -7351,9 +7360,15 @@ def _build_boltz_balance_plan(
             )
             premium_ppm = max(0.0, float(structural_realized_ppm) - channel_posterior_ppm)
             # Mirror the conservative DTS-uplift volume model: half the freed
-            # inbound turns over per horizon. F3b: no xhorizon_days multiplier
-            # — the 0.5 turnover is already the per-horizon assumption.
-            projected_volume = amount_sats * 0.5 * structural_scarcity
+            # inbound turns over per horizon — then amortize over
+            # STRUCTURAL_AMORTIZATION_HORIZONS, because the freed inbound
+            # keeps working long past one ~3-day horizon. Spend is bounded
+            # by the daily structural envelope, not this estimate; the
+            # credit prices a month of the structural asset.
+            projected_volume = (
+                amount_sats * 0.5 * structural_scarcity
+                * STRUCTURAL_AMORTIZATION_HORIZONS
+            )
             structural_uplift_sats = int(projected_volume * premium_ppm / 1_000_000)
         passes_without_credit = expected_gross_uplift_sats >= required_profit_threshold_sats
         expected_gross_uplift_sats += structural_uplift_sats
