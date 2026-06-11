@@ -892,17 +892,25 @@ class RebalanceEngine:
             # Actual inbound fee from peer's remote updates, and our OWN
             # outbound fee from the local updates (sats-EV gate input).
             inbound_fee_ppm = 0
-            local_out_fee_ppm = 0
             updates = ch.get("updates", {})
             if updates:
                 remote = updates.get("remote", {})
                 if remote:
                     inbound_fee_ppm = remote.get("fee_proportional_millionths", 0)
-                local_update = updates.get("local", {})
-                if local_update:
-                    local_out_fee_ppm = local_update.get(
-                        "fee_proportional_millionths", 0
-                    )
+            # Our outbound fee: prefer updates.local, fall back to the
+            # top-level field — the same fallback
+            # fee_controller._get_channels_info uses. New channels have no
+            # gossip updates yet; without the fallback their pairs were
+            # silently EV-zeroed (local_out_fee_ppm 0 kills the sats-EV gate).
+            local_update = updates.get("local", {}) if updates else {}
+            local_fee_val = (
+                local_update.get("fee_proportional_millionths")
+                if local_update else None
+            )
+            local_out_fee_ppm = (
+                local_fee_val if local_fee_val is not None
+                else ch.get("fee_proportional_millionths", 0)
+            )
 
             # Hive membership check
             is_hive = False

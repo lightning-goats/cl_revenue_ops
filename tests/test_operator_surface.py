@@ -639,11 +639,12 @@ def test_rebalance_tuning_setconfig_rejects_out_of_range_values():
     mod = load_plugin_module()
     mod.config = SimpleNamespace(rebalance_hold_margin=0.0)
 
-    with pytest.raises(ValueError, match="<= 1.0"):
+    # final_score is sats-denominated; the hold margin admits up to 1000 sats.
+    with pytest.raises(ValueError, match="<= 1000.0"):
         mod._on_rebalance_tuning_change(
             mod.plugin,
             "revenue-ops-rebalance-hold-margin",
-            "1.25",
+            "1500",
         )
 
 

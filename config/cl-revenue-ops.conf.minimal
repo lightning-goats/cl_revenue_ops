@@ -25,7 +25,6 @@ revenue-ops-weekly-budget-sats=25000
 
 # Risk management
 revenue-ops-enable-kelly=true
-revenue-ops-kelly-fraction=0.5
 revenue-ops-enable-reputation=true
 
 # Hot-channel protection

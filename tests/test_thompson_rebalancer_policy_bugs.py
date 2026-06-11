@@ -309,13 +309,13 @@ class TestConfigOverrideRangeValidation:
     def test_apply_override_rejects_out_of_range_float(self):
         """_apply_override should reject float values outside range."""
         config = self._make_config()
-        original_kelly = config.kelly_fraction
+        original_decay = config.reputation_decay
 
-        # kelly_fraction range is (0.0, 1.0)
-        config._apply_override('kelly_fraction', '5.0')
+        # reputation_decay range is (0.0, 1.0)
+        config._apply_override('reputation_decay', '5.0')
 
-        assert config.kelly_fraction == original_kelly, \
-            f"Expected {original_kelly}, got {config.kelly_fraction}"
+        assert config.reputation_decay == original_decay, \
+            f"Expected {original_decay}, got {config.reputation_decay}"
 
     def test_apply_override_accepts_in_range_value(self):
         """_apply_override should accept values within CONFIG_FIELD_RANGES."""

@@ -104,7 +104,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'htlc_congestion_threshold': float,
     'enable_reputation': bool,
     'enable_kelly': bool,
-    'kelly_fraction': float,
     'reputation_decay': float,
     'max_concurrent_jobs': int,
     'askrene_layer': str,
@@ -221,7 +220,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'high_liquidity_threshold': (0.0, 1.0),
     'htlc_congestion_threshold': (0.0, 1.0),
     'reputation_decay': (0.0, 1.0),
-    'kelly_fraction': (0.0, 1.0),
     'vegas_decay_rate': (0.0, 1.0),
     'rebalance_min_profit_ppm': (0, 100000),
     'rpc_timeout_seconds': (1, 300),
@@ -267,7 +265,10 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_cooldown_hours': (1, 168),
     'rebalance_emergency_local_ratio': (0.0, 1.0),
     'rebalance_drift_override_ratio': (0.0, 1.0),
-    'rebalance_hold_margin': (0.0, 1.0),
+    # final_score is denominated in SATS of expected net value since the
+    # sats-EV scoring change (not a 0-1 normalized score), so the hold margin
+    # must admit sat-scale bars; 1000 sats is already a very aggressive hold.
+    'rebalance_hold_margin': (0.0, 1000.0),
     'pair_fee_cap_ppm': (0, 100000),
     'hive_equalization_low_pct': (0.0, 1.0),
     'hive_equalization_high_pct': (0.0, 1.0),
@@ -447,8 +448,10 @@ class Config:
     rebalance_drift_override_ratio: float = 0.30
     # Phase 4.3 do_nothing hold gate: priced pairs with engine final_score
     # at or below this margin are rejected with reason='below_hold_margin'.
-    # 0 leaves the legacy "any positive score" behavior. Use a small positive
-    # value to require pairs to clear a meaningful EV bar before executing.
+    # final_score is denominated in SATS of expected net value (sats-EV
+    # scoring), so this is a sats bar. 0 leaves the legacy "any positive
+    # score" behavior; a small positive value requires pairs to clear a
+    # meaningful EV bar before executing.
     rebalance_hold_margin: float = 0.0
     # Iter1 pair fee budget: layered on top of the destination's capex
     # bootstrap budget so a small/new channel can still pay enough route
@@ -509,10 +512,9 @@ class Config:
                                      # 0.98^24 ≈ 0.61, meaning old data loses ~40% weight daily
 
     # Kelly Criterion Position Sizing
+    # (kelly_fraction knob removed 2026-06: it had zero consumers — only the
+    # enable_kelly flag is read.)
     enable_kelly: bool = False       # If True, scale rebalance budget by Kelly fraction (opt-in)
-    kelly_fraction: float = 0.5      # Multiplier for Kelly fraction (0.5 = Half Kelly)
-                                      # Full Kelly (1.0) maximizes growth but has high volatility
-                                      # Half Kelly (0.5) reduces volatility drag significantly
     
     # Async Job Queue
     max_concurrent_jobs: int = 5              # Max number of concurrent rebalance jobs
@@ -957,7 +959,6 @@ class ConfigSnapshot:
 
     # Kelly Criterion Position Sizing
     enable_kelly: bool
-    kelly_fraction: float
     
     # Async Job Queue
     max_concurrent_jobs: int

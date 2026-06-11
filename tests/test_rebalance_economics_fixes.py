@@ -686,6 +686,76 @@ def test_snapshot_builder_reads_our_outbound_fee(mock_plugin, mock_database):
     assert channel.actual_inbound_fee_ppm == 90
 
 
+def test_snapshot_builder_falls_back_to_top_level_fee(mock_plugin, mock_database):
+    """New channels often have no gossip updates yet (updates.local absent):
+    the snapshot builder must fall back to the top-level
+    fee_proportional_millionths — the same fallback
+    fee_controller._get_channels_info uses — otherwise new-channel pairs are
+    silently EV-zeroed (local_out_fee_ppm 0 kills the sats-EV gate)."""
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._build_snapshot = type(engine)._build_snapshot.__get__(engine)
+    mock_database.get_last_rebalance_times.return_value = {}
+    mock_plugin.rpc.listpeerchannels.return_value = {
+        "channels": [
+            {   # No updates at all (brand new channel)
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "02" + "1" * 64,
+                "short_channel_id": "100x1x0",
+                "total_msat": 1_000_000_000,
+                "our_amount_msat": 800_000_000,
+                "fee_proportional_millionths": 1_234,
+            },
+            {   # updates present but local missing (remote gossip only)
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "02" + "2" * 64,
+                "short_channel_id": "200x1x0",
+                "total_msat": 1_000_000_000,
+                "our_amount_msat": 800_000_000,
+                "fee_proportional_millionths": 555,
+                "updates": {
+                    "remote": {"fee_proportional_millionths": 90},
+                },
+            },
+        ]
+    }
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot is not None
+    by_id = {c.channel_id: c for c in snapshot.channels}
+    assert by_id["100x1x0"].local_out_fee_ppm == 1_234
+    assert by_id["200x1x0"].local_out_fee_ppm == 555
+    assert by_id["200x1x0"].actual_inbound_fee_ppm == 90
+
+
+def test_snapshot_builder_prefers_updates_local_over_top_level(
+    mock_plugin, mock_database
+):
+    """When updates.local is present it wins over a stale top-level field."""
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._build_snapshot = type(engine)._build_snapshot.__get__(engine)
+    mock_database.get_last_rebalance_times.return_value = {}
+    mock_plugin.rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "02" + "1" * 64,
+                "short_channel_id": "100x1x0",
+                "total_msat": 1_000_000_000,
+                "our_amount_msat": 800_000_000,
+                "fee_proportional_millionths": 999,
+                "updates": {
+                    "local": {"fee_proportional_millionths": 1_750},
+                },
+            }
+        ]
+    }
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot.channels[0].local_out_fee_ppm == 1_750
+
+
 def test_planner_threads_outbound_fees_to_pair():
     from modules.rebalance_planner_v2 import RebalancePlanner
     from modules.rebalance_state_v2 import build_state_snapshot

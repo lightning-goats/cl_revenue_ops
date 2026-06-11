@@ -14,7 +14,6 @@ diagnostic RPCs and cl-revenue-ops.py.
 import math
 import time
 import threading
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING
 from enum import Enum
@@ -1175,13 +1174,10 @@ class EVRebalancer:
         - Uses ephemeral fee cache for listchannels calls
         """
         candidates = []
-        channels: Dict[str, Dict[str, Any]] = {}
+        # Kept (always empty) only as _report_hive_liquidity_state inputs on
+        # the early-suppression paths; the v2 engine owns real selection.
         depleted_channels: List[Tuple[str, Dict[str, Any], float]] = []
         source_channels: List[Tuple[str, Dict[str, Any], float]] = []
-        hive_low_channels: List[Tuple[str, Dict[str, Any], float]] = []
-        hive_high_channels: List[Tuple[str, Dict[str, Any], float]] = []
-        pure_hive_skip_reasons: Counter[str] = Counter()
-        pure_hive_selected = 0
 
         # Initialize ephemeral fee cache for this run (cleared at end)
         self._fee_cache: Dict[Tuple[str, int], Optional[int]] = {}
@@ -1202,11 +1198,6 @@ class EVRebalancer:
             self.plugin.log(f"Cleaned {cleaned} stale budget reservations before rebalance cycle")
 
         try:
-            coordination_leases: List[Dict[str, Any]] = []
-            coordination_recommendations: List[Dict[str, Any]] = []
-            coordination_campaigns: List[Dict[str, Any]] = []
-            our_node_id: Optional[str] = None
-
             # Slot check (legacy async job monitoring removed; stubs always allow)
             available_slots = self.job_manager.slots_available()
             if available_slots <= 0:

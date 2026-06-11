@@ -691,7 +691,8 @@ plugin.add_option(
 def _on_rebalance_tuning_change(plugin_: Plugin, option_name: str, new_value: Any) -> None:
     """Apply rebalance tuning changes from lightning-cli setconfig at runtime."""
     tuning_map = {
-        'revenue-ops-rebalance-hold-margin': ('rebalance_hold_margin', float, 0.0, 1.0),
+        # final_score is in SATS of expected net value; match CONFIG_FIELD_RANGES.
+        'revenue-ops-rebalance-hold-margin': ('rebalance_hold_margin', float, 0.0, 1000.0),
         'revenue-ops-pair-fee-cap-ppm': ('pair_fee_cap_ppm', int, 0, None),
         'revenue-ops-hive-rebalance-bootstrap-budget-sats': (
             'hive_rebalance_bootstrap_budget_sats',
@@ -728,7 +729,7 @@ def _on_rebalance_tuning_change(plugin_: Plugin, option_name: str, new_value: An
 plugin.add_option(
     name='revenue-ops-rebalance-hold-margin',
     default='0.0',
-    description='Minimum final_score a priced pair must clear or it is rejected as below_hold_margin (Phase 4, default: 0.0)',
+    description='Minimum final_score in SATS of expected net value a priced pair must clear or it is rejected as below_hold_margin (Phase 4, default: 0.0)',
     dynamic=True,
     on_change=_on_rebalance_tuning_change,
 )
@@ -822,12 +823,6 @@ plugin.add_option(
     name='revenue-ops-enable-kelly',
     default='false',
     description='If true, scale rebalance budget using Kelly Criterion based on peer reputation (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-kelly-fraction',
-    default='0.5',
-    description='Multiplier for Kelly fraction (default: 0.5 = Half Kelly). Full Kelly (1.0) maximizes growth but has high volatility.'
 )
 
 # Vegas Reflex options
@@ -1733,7 +1728,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         enable_reputation=options['revenue-ops-enable-reputation'].lower() == 'true',
         reputation_decay=_safe_float('revenue-ops-reputation-decay'),
         enable_kelly=options['revenue-ops-enable-kelly'].lower() == 'true',
-        kelly_fraction=_safe_float('revenue-ops-kelly-fraction'),
         # Vegas Reflex options
         enable_vegas_reflex=options['revenue-ops-vegas-reflex'].lower() == 'true',
         vegas_decay_rate=_safe_float('revenue-ops-vegas-decay'),

@@ -122,9 +122,6 @@
 # Scale rebalance budget based on historical success rate
 #revenue-ops-enable-kelly=false
 
-# Kelly fraction multiplier (0.5 = Half Kelly = conservative)
-# RECOMMENDATION: 0.5 for stable nodes, 0.3 for conservative
-#revenue-ops-kelly-fraction=0.5
 
 # ============================================================================
 # TRAFFIC INTELLIGENCE (Reputation System)
@@ -168,7 +165,6 @@
 # revenue-ops-max-fee-ppm=1500
 # revenue-ops-fee-interval=1800
 # revenue-ops-enable-kelly=true
-# revenue-ops-kelly-fraction=0.6
 
 # --- CONSERVATIVE ROUTING NODE ---
 # Prioritize profitability over volume
@@ -179,4 +175,3 @@
 # revenue-ops-fee-interval=3600
 # revenue-ops-daily-budget-sats=2000
 # revenue-ops-enable-kelly=true
-# revenue-ops-kelly-fraction=0.3
