@@ -1381,7 +1381,14 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
             _planner_coord["rebalancer_exhausted"] = _rebalancer_coord.get("rebalancer_exhausted", False)
             _planner_coord["rebalancer_depleted_count"] = _rebalancer_coord.get("depleted_count", 0)
 
+        # One pending-swap listswaps subprocess for the whole cycle: every
+        # plan build below (treasury, balance, fall-through) reuses this
+        # count instead of paying its own boltzcli call. None = no treasury
+        # involvement; the balance build then resolves it itself.
+        pending_swaps: Optional[int] = None
+
         if bool(getattr(cfg, 'expansion_treasury_enabled', False)) if cfg else False:
+            pending_swaps = _boltz_pending_swap_count()
             treasury_plan = _build_boltz_expansion_treasury_plan(
                 onchain_target_sats=int(getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000),
                 min_deficit_sats=int(getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000),
@@ -1390,6 +1397,7 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                 min_source_local_pct=float(getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0),
                 exclude_protected=bool(getattr(cfg, 'expansion_treasury_exclude_protected', True)) if cfg else True,
                 planner_coordination=_planner_coord,
+                pending_swap_count=pending_swaps,
             )
             if isinstance(treasury_plan, dict) and 'error' in treasury_plan:
                 result = dict(treasury_plan)
@@ -1411,6 +1419,7 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                 loop_in_currency='auto',
                 loop_out_currency='auto',
                 planner_coordination=_planner_coord,
+                pending_swap_count=pending_swaps,
             )
             if isinstance(balance_plan, dict) and 'error' in balance_plan:
                 result = balance_plan
@@ -1463,11 +1472,14 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                         'reason': reason,
                     }
         else:
-            result = revenue_boltz_expansion_treasury_cycle(
-                plugin=plugin,
+            # Reuse the selection-time treasury plan — rebuilding it inside
+            # the cycle would repeat the nested balance-plan build (quotes,
+            # budget, listswaps subprocesses) a second time per cycle.
+            result = _execute_boltz_expansion_treasury_cycle(
                 dry_run=False,
                 max_actions=treasury_max_actions,
                 allow_concurrent_swaps=False,
+                precomputed_plan=treasury_plan,
             )
             # F1 fall-through: when treasury mode executed nothing (every
             # candidate was skipped at execution time), run the balance
@@ -1477,16 +1489,22 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
             _treasury_status = str(result.get('status') or '') if isinstance(result, dict) else ''
             _treasury_executed = int(result.get('executed_count', 0) or 0) if isinstance(result, dict) else 0
             if _treasury_status == 'executed' and _treasury_executed == 0:
-                fallback_plan = _build_boltz_balance_plan(
-                    max_candidates=max(max(5, int(max_actions) * 5), 20),
-                    require_profitable=True,
-                    min_marginal_roi=0.0,
-                    profit_margin_factor=1.2,
-                    expected_horizon_days=3.0,
-                    loop_in_currency='auto',
-                    loop_out_currency='auto',
-                    planner_coordination=_planner_coord,
-                )
+                # Reuse the selection-time balance plan when one exists;
+                # otherwise build it once (and only once) for the fall-through.
+                if isinstance(balance_plan, dict) and 'error' not in balance_plan:
+                    fallback_plan = balance_plan
+                else:
+                    fallback_plan = _build_boltz_balance_plan(
+                        max_candidates=max(max(5, int(max_actions) * 5), 20),
+                        require_profitable=True,
+                        min_marginal_roi=0.0,
+                        profit_margin_factor=1.2,
+                        expected_horizon_days=3.0,
+                        loop_in_currency='auto',
+                        loop_out_currency='auto',
+                        planner_coordination=_planner_coord,
+                        pending_swap_count=pending_swaps,
+                    )
                 if isinstance(fallback_plan, dict) and 'error' not in fallback_plan:
                     fallback_selection = _select_boltz_auto_cycle_mode(
                         treasury_plan=None, balance_plan=fallback_plan,
@@ -6839,6 +6857,7 @@ def _build_boltz_expansion_treasury_plan(
     max_amount_sats: int = 1_500_000,
     min_amount_sats: int = 100_000,
     planner_coordination: Optional[Dict[str, Any]] = None,
+    pending_swap_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     bm = _require_boltz_manager()
     onchain_confirmed_sats = _get_confirmed_onchain_sats()
@@ -6892,7 +6911,9 @@ def _build_boltz_expansion_treasury_plan(
             "skipped_count": 0,
             "skipped_examples": [],
             "budget": bm.budget(),
-            "pending_swap_count": _boltz_pending_swap_count(),
+            "pending_swap_count": (
+                int(pending_swap_count) if pending_swap_count is not None else _boltz_pending_swap_count()
+            ),
         }
 
     max_amt = max(int(min_amount_sats), min(int(max_amount_sats), int(max(deficit, min_amount_sats))))
@@ -6911,6 +6932,7 @@ def _build_boltz_expansion_treasury_plan(
         loop_out_currency=str(preferred_currency).upper(),
         loop_in_currency="LBTC",
         planner_coordination=planner_coordination,
+        pending_swap_count=pending_swap_count,
     )
     if "error" in base_plan:
         base_plan["treasury"] = treasury
@@ -8053,9 +8075,8 @@ def revenue_boltz_expansion_treasury_recommendations(
         return {'error': str(e)}
 
 
-@plugin.method("revenue-boltz-expansion-treasury-cycle")
-def revenue_boltz_expansion_treasury_cycle(
-    plugin: Plugin,
+def _execute_boltz_expansion_treasury_cycle(
+    *,
     dry_run: bool = True,
     max_actions: int = None,
     onchain_target_sats: int = None,
@@ -8071,26 +8092,37 @@ def revenue_boltz_expansion_treasury_cycle(
     max_amount_sats: int = 1_500_000,
     cooldown_hours: float = 4.0,
     allow_concurrent_swaps: bool = False,
+    precomputed_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run a treasury-funding reverse-swap cycle (LN -> on-chain) for expansion reserve."""
+    """Internal treasury-funding cycle executor.
+
+    precomputed_plan lets internal callers (the auto-cycle scheduler) reuse the
+    treasury plan they already built for mode selection instead of rebuilding it
+    (each build nests a full balance-plan build: per-candidate boltzcli quotes
+    plus budget/listswaps subprocesses). It is NOT an RPC argument — the
+    revenue-boltz-expansion-treasury-cycle method never exposes it.
+    """
     cfg = config.snapshot() if config else None
-    try:
-        plan = _build_boltz_expansion_treasury_plan(
-            onchain_target_sats=int(onchain_target_sats if onchain_target_sats is not None else (getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000)),
-            min_deficit_sats=int(min_deficit_sats if min_deficit_sats is not None else (getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000)),
-            preferred_currency=str(preferred_currency if preferred_currency is not None else (getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC')).upper(),
-            max_actions=int(max_actions if max_actions is not None else (getattr(cfg, 'expansion_treasury_max_actions', 1) if cfg else 1)),
-            min_source_local_pct=float(min_source_local_pct if min_source_local_pct is not None else (getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0)),
-            exclude_protected=bool(exclude_protected if exclude_protected is not None else (getattr(cfg, 'expansion_treasury_exclude_protected', True) if cfg else True)),
-            require_profitable=bool(require_profitable),
-            min_marginal_roi=float(min_marginal_roi),
-            profit_margin_factor=float(profit_margin_factor),
-            expected_horizon_days=float(expected_horizon_days),
-            min_amount_sats=int(min_amount_sats),
-            max_amount_sats=int(max_amount_sats),
-        )
-    except Exception as e:
-        return {'error': str(e)}
+    if isinstance(precomputed_plan, dict):
+        plan = precomputed_plan
+    else:
+        try:
+            plan = _build_boltz_expansion_treasury_plan(
+                onchain_target_sats=int(onchain_target_sats if onchain_target_sats is not None else (getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000)),
+                min_deficit_sats=int(min_deficit_sats if min_deficit_sats is not None else (getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000)),
+                preferred_currency=str(preferred_currency if preferred_currency is not None else (getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC')).upper(),
+                max_actions=int(max_actions if max_actions is not None else (getattr(cfg, 'expansion_treasury_max_actions', 1) if cfg else 1)),
+                min_source_local_pct=float(min_source_local_pct if min_source_local_pct is not None else (getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0)),
+                exclude_protected=bool(exclude_protected if exclude_protected is not None else (getattr(cfg, 'expansion_treasury_exclude_protected', True) if cfg else True)),
+                require_profitable=bool(require_profitable),
+                min_marginal_roi=float(min_marginal_roi),
+                profit_margin_factor=float(profit_margin_factor),
+                expected_horizon_days=float(expected_horizon_days),
+                min_amount_sats=int(min_amount_sats),
+                max_amount_sats=int(max_amount_sats),
+            )
+        except Exception as e:
+            return {'error': str(e)}
 
     if 'error' in plan:
         return plan
@@ -8209,6 +8241,45 @@ def revenue_boltz_expansion_treasury_cycle(
             'Reverse swaps on CLN are not channel-pinnable via chanIds; exact path control uses external-pay + first-hop constrained CLN pay when available',
         ],
     }
+
+
+@plugin.method("revenue-boltz-expansion-treasury-cycle")
+def revenue_boltz_expansion_treasury_cycle(
+    plugin: Plugin,
+    dry_run: bool = True,
+    max_actions: int = None,
+    onchain_target_sats: int = None,
+    min_deficit_sats: int = None,
+    preferred_currency: str = None,
+    min_source_local_pct: float = None,
+    exclude_protected: bool = None,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    min_amount_sats: int = 100_000,
+    max_amount_sats: int = 1_500_000,
+    cooldown_hours: float = 4.0,
+    allow_concurrent_swaps: bool = False,
+) -> Dict[str, Any]:
+    """Run a treasury-funding reverse-swap cycle (LN -> on-chain) for expansion reserve."""
+    return _execute_boltz_expansion_treasury_cycle(
+        dry_run=dry_run,
+        max_actions=max_actions,
+        onchain_target_sats=onchain_target_sats,
+        min_deficit_sats=min_deficit_sats,
+        preferred_currency=preferred_currency,
+        min_source_local_pct=min_source_local_pct,
+        exclude_protected=exclude_protected,
+        require_profitable=require_profitable,
+        min_marginal_roi=min_marginal_roi,
+        profit_margin_factor=profit_margin_factor,
+        expected_horizon_days=expected_horizon_days,
+        min_amount_sats=min_amount_sats,
+        max_amount_sats=max_amount_sats,
+        cooldown_hours=cooldown_hours,
+        allow_concurrent_swaps=allow_concurrent_swaps,
+    )
 
 
 # =============================================================================

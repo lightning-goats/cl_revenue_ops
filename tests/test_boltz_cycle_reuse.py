@@ -202,3 +202,149 @@ class TestBalancePlanFilterOrdering:
 
         assert plan["pending_swap_count"] == 5
         mod._boltz_pending_swap_count.assert_not_called()
+
+
+def _treasury_plan(deficit=900_000, remaining_budget=100_000, pending=0):
+    return {
+        "generated_at": 1,
+        "status": "ok",
+        "pending_swap_count": pending,
+        "budget": {"remaining_24h_sats_estimate": remaining_budget},
+        "treasury": {
+            "deficit_sats": deficit,
+            "min_deficit_sats": 250_000,
+            "preferred_currency": "BTC",
+        },
+        "recommendations": [
+            {
+                "channel_id": "100x1x0",
+                "peer_id": PEER,
+                "direction": "loop_out",
+                "amount_sats": 300_000,
+                "quote": {"receiveAmount": 295_000},
+                "economics": {
+                    "passes_profit_guard": True,
+                    "structural": False,
+                    "estimated_swap_fee_sats": 500,
+                },
+            }
+        ],
+        "total_candidates": 1,
+        "skipped_count": 0,
+        "skipped_examples": [],
+    }
+
+
+class TestTreasuryCyclePlanReuse:
+    """The treasury cycle must reuse the auto-cycle's selection-time plan
+    instead of rebuilding it (each treasury build nests a full balance-plan
+    build: 2 listswaps + one quote per imbalanced channel)."""
+
+    def _make_module(self):
+        mod = load_plugin_module()
+        mod.plugin.log = MagicMock()
+        mod.boltz_manager = MagicMock(enabled=True)
+        mod.capacity_planner = None
+        mod.rebalancer = None
+        mod.database = MagicMock()
+        mod.config = MagicMock()
+        mod.config.snapshot.return_value = SimpleNamespace(
+            boltz_auto_cycle_enabled=True,
+            boltz_auto_cycle_max_actions=1,
+            expansion_treasury_enabled=True,
+            expansion_treasury_onchain_target_sats=5_000_000,
+            expansion_treasury_min_deficit_sats=250_000,
+            expansion_treasury_preferred_currency="BTC",
+            expansion_treasury_max_actions=1,
+            expansion_treasury_min_source_local_pct=80.0,
+            expansion_treasury_exclude_protected=True,
+        )
+        mod._boltz_pending_swap_count = MagicMock(return_value=0)
+        return mod
+
+    def test_auto_cycle_treasury_mode_builds_exactly_one_treasury_plan(self):
+        mod = self._make_module()
+        plan = _treasury_plan()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value=plan)
+        mod._build_boltz_balance_plan = MagicMock()
+        bm = MagicMock()
+        bm.loop_out.return_value = {"status": "accepted"}
+        mod._require_boltz_manager = MagicMock(return_value=bm)
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        assert mod._build_boltz_expansion_treasury_plan.call_count == 1
+        mod._build_boltz_balance_plan.assert_not_called()
+        assert result["mode"] == "treasury"
+        assert result["status"] == "executed"
+        assert result["executed_count"] == 1
+        bm.loop_out.assert_called_once()
+        # The executed plan IS the selection-time plan.
+        assert result["plan"] is plan
+
+    def test_fall_through_cycle_builds_one_treasury_and_one_balance_plan(self):
+        # Treasury wins selection but executes 0 (budget too small for the
+        # rec) -> fall-through runs the balance cycle in the same run.
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(
+            return_value=_treasury_plan(remaining_budget=0)
+        )
+        balance_plan = _balance_plan()
+        mod._build_boltz_balance_plan = MagicMock(return_value=balance_plan)
+        bm = MagicMock()
+        mod._require_boltz_manager = MagicMock(return_value=bm)
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        assert mod._build_boltz_expansion_treasury_plan.call_count == 1
+        assert mod._build_boltz_balance_plan.call_count == 1
+        bm.loop_out.assert_not_called()
+        assert result["mode"] == "balance"
+        assert result["selection_reason"] == "treasury_executed_zero_fallback_to_balance"
+        # The fall-through executor reused the plan built for fall-through
+        # selection (its only rec fails the profit guard -> 0 executed).
+        assert result["plan"] is balance_plan
+
+    def test_treasury_rpc_method_delegates_without_precomputed_plan(self):
+        mod = self._make_module()
+        mod._execute_boltz_expansion_treasury_cycle = MagicMock(
+            return_value={"status": "dry_run"}
+        )
+
+        result = mod.revenue_boltz_expansion_treasury_cycle(
+            mod.plugin, dry_run=True, max_actions=2
+        )
+
+        assert result == {"status": "dry_run"}
+        kwargs = mod._execute_boltz_expansion_treasury_cycle.call_args.kwargs
+        assert kwargs["dry_run"] is True
+        assert kwargs["max_actions"] == 2
+        # precomputed_plan is internal-only: the RPC wrapper never sets it.
+        assert "precomputed_plan" not in kwargs
+
+    def test_auto_cycle_threads_one_pending_swap_count_into_all_builds(self):
+        # Treasury at target -> balance mode: both plan builds receive the
+        # single pending-swap count computed by the auto-cycle (exactly one
+        # listswaps subprocess for the whole cycle).
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "status": "at_target",
+            "recommendations": [],
+            "treasury": {"deficit_sats": 0, "min_deficit_sats": 250_000},
+        })
+        mod._build_boltz_balance_plan = MagicMock(return_value=_balance_plan())
+        mod._require_boltz_manager = MagicMock(return_value=MagicMock())
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        assert mod._boltz_pending_swap_count.call_count == 1
+        assert (
+            mod._build_boltz_expansion_treasury_plan.call_args.kwargs[
+                "pending_swap_count"
+            ]
+            == 0
+        )
+        assert (
+            mod._build_boltz_balance_plan.call_args.kwargs["pending_swap_count"] == 0
+        )
+        assert result["mode"] == "balance"

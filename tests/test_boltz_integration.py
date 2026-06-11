@@ -179,7 +179,7 @@ class TestBoltzAutoCycleScheduler:
             "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
         })
         mod._build_boltz_balance_plan = MagicMock()
-        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+        mod._execute_boltz_expansion_treasury_cycle = MagicMock(return_value={
             "status": "executed",
             "executed_count": 1,
         })
@@ -194,7 +194,12 @@ class TestBoltzAutoCycleScheduler:
         assert result["selection_reason"] == "standing_onchain_reserve_below_target"
         assert result["reserve_deficit_sats"] == 900000
         assert result["trigger"] == "scheduler"
-        mod.revenue_boltz_expansion_treasury_cycle.assert_called_once()
+        mod._execute_boltz_expansion_treasury_cycle.assert_called_once()
+        # The executor reuses the selection-time plan instead of rebuilding.
+        assert (
+            mod._execute_boltz_expansion_treasury_cycle.call_args.kwargs["precomputed_plan"]
+            is mod._build_boltz_expansion_treasury_plan.return_value
+        )
         mod.revenue_boltz_balance_cycle.assert_not_called()
         mod._build_boltz_balance_plan.assert_not_called()
 
@@ -288,7 +293,7 @@ class TestBoltzAutoCycleScheduler:
             "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
         })
         mod._build_boltz_balance_plan = MagicMock()
-        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+        mod._execute_boltz_expansion_treasury_cycle = MagicMock(return_value={
             "status": "executed",
             "executed_count": 1,
         })
@@ -296,8 +301,8 @@ class TestBoltzAutoCycleScheduler:
 
         mod._run_boltz_auto_cycle_once(trigger="scheduler")
 
-        mod.revenue_boltz_expansion_treasury_cycle.assert_called_once()
-        kwargs = mod.revenue_boltz_expansion_treasury_cycle.call_args.kwargs
+        mod._execute_boltz_expansion_treasury_cycle.assert_called_once()
+        kwargs = mod._execute_boltz_expansion_treasury_cycle.call_args.kwargs
         assert kwargs["max_actions"] == 3
         mod.revenue_boltz_balance_cycle.assert_not_called()
 
@@ -366,7 +371,7 @@ class TestBoltzAutoCycleScheduler:
             "recommendations": [_executable_rec()],
             "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
         })
-        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+        mod._execute_boltz_expansion_treasury_cycle = MagicMock(return_value={
             "status": "executed",
             "executed_count": 0,
             "skipped_count": 1,
@@ -384,7 +389,7 @@ class TestBoltzAutoCycleScheduler:
 
         result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
 
-        mod.revenue_boltz_expansion_treasury_cycle.assert_called_once()
+        mod._execute_boltz_expansion_treasury_cycle.assert_called_once()
         mod._execute_boltz_balance_cycle.assert_called_once()
         assert (
             mod._execute_boltz_balance_cycle.call_args.kwargs["precomputed_plan"]
@@ -403,7 +408,7 @@ class TestBoltzAutoCycleScheduler:
             "recommendations": [_executable_rec()],
             "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
         })
-        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+        mod._execute_boltz_expansion_treasury_cycle = MagicMock(return_value={
             "status": "blocked",
             "reason": "1 pending Boltz swap(s) detected",
             "executed_count": 0,
