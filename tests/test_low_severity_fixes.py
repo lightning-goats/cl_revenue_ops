@@ -188,6 +188,9 @@ def test_exclude_layer_names_unique_across_threads():
         router = RebalanceRouterV3.__new__(RebalanceRouterV3)
         router.plugin = MagicMock()
         router.data_service = None
+        # __init__ is bypassed; _exclude_layer consults the cycle state to
+        # decide between cached and per-call layer lifetimes.
+        router._cycle_state = threading.local()
         return router
 
     def worker():

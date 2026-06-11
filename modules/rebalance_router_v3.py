@@ -218,23 +218,56 @@ class RebalanceRouterV3:
         """Enter a pricing cycle: cache askrene-listlayers across price_pair calls.
 
         Within a cycle the live-layer probe is served from a single
-        askrene-listlayers call instead of one per pricing call. The cache is
-        invalidated on 'Unknown layer' getroutes errors so a layer removed
-        mid-cycle triggers a re-probe on the next call. end_cycle() drops it.
+        askrene-listlayers call instead of one per pricing call, and
+        identical exclude sets share one throwaway exclude layer (keyed by
+        frozenset) instead of paying create + updates + remove per pricing
+        call. Both caches are invalidated on 'Unknown layer' getroutes
+        errors so a layer removed mid-cycle triggers a rebuild on the next
+        call. end_cycle() drops the layer-name cache and tears down the
+        cached exclude layers.
+
+        The cycle window is thread-local: execution-worker retries (and
+        manual RPC-thread pricings) run outside it by design and keep the
+        per-call create/remove semantics.
         """
         self._cycle_state.active = True
         self._cycle_state.live_layer_names = None
+        self._cycle_state.exclude_layers = {}
 
     def end_cycle(self) -> None:
+        self._teardown_cycle_exclude_layers()
         self._cycle_state.active = False
         self._cycle_state.live_layer_names = None
 
     def _cycle_active(self) -> bool:
         return bool(getattr(self._cycle_state, "active", False))
 
+    def _cycle_exclude_layers(self) -> Dict[frozenset, str]:
+        layers = getattr(self._cycle_state, "exclude_layers", None)
+        if layers is None:
+            layers = {}
+            self._cycle_state.exclude_layers = layers
+        return layers
+
+    def _teardown_cycle_exclude_layers(self) -> None:
+        """Best-effort removal of every cycle-cached exclude layer."""
+        layers = self._cycle_exclude_layers()
+        to_remove = list(layers.values())
+        layers.clear()
+        for layer_name in to_remove:
+            self._remove_exclude_layer(layer_name)
+
     def invalidate_layer_cache(self) -> None:
-        """Drop the cycle's cached layer list so the next probe re-fetches."""
+        """Drop the cycle's cached layer state so the next call re-fetches.
+
+        Covers both the listlayers probe cache and the cycle's cached
+        exclude layers: an 'Unknown layer' error means some layer in our
+        last getroutes call no longer exists, and a cached exclude layer
+        may be the casualty. The cached layers are removed (best-effort)
+        so dropping the references never leaks live askrene layers.
+        """
         self._cycle_state.live_layer_names = None
+        self._teardown_cycle_exclude_layers()
 
     def _live_layer_names(self) -> List[str]:
         """Return live askrene layer names, cached for the active cycle."""
@@ -554,20 +587,13 @@ class RebalanceRouterV3:
         delivered = _parse_msat(route.get("amount_msat", 0))
         return max(0, first_amt - delivered)
 
-    @contextmanager
-    def _exclude_layer(
-        self, failed_channel_ids: List[str]
-    ) -> Iterator[Optional[str]]:
+    def _build_exclude_layer(self, failed_channel_ids: List[str]) -> str:
         """Create a throwaway layer disabling the given channels.
 
-        Yields the layer name (or None when the input is empty) and removes
-        the layer on context exit — even on exception. Ephemeral
-        (persistent=false) so the datastore never grows.
+        Returns the new layer's name. On partial failure the half-built
+        layer is removed (best-effort) before the error propagates, so no
+        caller ever leaks a live layer.
         """
-        if not failed_channel_ids:
-            yield None
-            return
-
         # next() on itertools.count is atomic under the GIL; a plain class
         # attribute increment is not, and two execution workers minting the
         # same layer name leads to one removing the other's live layer.
@@ -621,15 +647,58 @@ class RebalanceRouterV3:
                                     "enabled": False,
                                 },
                             )
+        except Exception:
+            self._remove_exclude_layer(layer_name)
+            raise
+        return layer_name
+
+    def _remove_exclude_layer(self, layer_name: str) -> None:
+        """Best-effort removal of a throwaway exclude layer."""
+        try:
+            if self.data_service is not None:
+                self.data_service.askrene_remove_layer(layer_name)
+            else:
+                self.plugin.rpc.call("askrene-remove-layer", {"layer": layer_name})
+        except Exception as e:
+            self.log(
+                f"[router-v3] failed to remove exclude layer {layer_name}: {e}",
+                "warn",
+            )
+
+    @contextmanager
+    def _exclude_layer(
+        self, failed_channel_ids: List[str]
+    ) -> Iterator[Optional[str]]:
+        """Yield a layer name disabling the given channels (None when empty).
+
+        Within an active pricing cycle, identical exclude sets share one
+        cached layer (the per-pair middle excludes are always non-empty —
+        source + dest SCIDs — so this turns N x (create + updates + remove)
+        into one such batch per unique exclude set per cycle). Cached
+        layers live until end_cycle() or an unknown-layer invalidation.
+
+        Outside a cycle (execution-worker retries, manual pricings on RPC
+        threads) the layer is ephemeral: created for the call and removed
+        on context exit — even on exception.
+        """
+        if not failed_channel_ids:
+            yield None
+            return
+
+        if self._cycle_active():
+            key = frozenset(failed_channel_ids)
+            cycle_layers = self._cycle_exclude_layers()
+            cached = cycle_layers.get(key)
+            if cached is not None:
+                yield cached
+                return
+            layer_name = self._build_exclude_layer(failed_channel_ids)
+            cycle_layers[key] = layer_name
+            yield layer_name
+            return
+
+        layer_name = self._build_exclude_layer(failed_channel_ids)
+        try:
             yield layer_name
         finally:
-            try:
-                if self.data_service is not None:
-                    self.data_service.askrene_remove_layer(layer_name)
-                else:
-                    self.plugin.rpc.call("askrene-remove-layer", {"layer": layer_name})
-            except Exception as e:
-                self.log(
-                    f"[router-v3] failed to remove exclude layer {layer_name}: {e}",
-                    "warn",
-                )
+            self._remove_exclude_layer(layer_name)

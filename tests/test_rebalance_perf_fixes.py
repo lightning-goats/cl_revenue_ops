@@ -128,3 +128,173 @@ def test_build_snapshot_no_anchor_query_when_not_cooled(mock_plugin):
 
     assert snapshot is not None
     assert db.anchor_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# 2. v3 cycle-scoped exclude-layer cache
+# ---------------------------------------------------------------------------
+
+
+def _make_v3_plugin():
+    plugin = MagicMock()
+    plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+    plugin.rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "peer_id": DST_PEER,
+                "short_channel_id": "200x2x0",
+                "updates": {
+                    "remote": {
+                        "fee_proportional_millionths": 0,
+                        "fee_base_msat": 0,
+                        "cltv_expiry_delta": 40,
+                    }
+                },
+            }
+        ]
+    }
+    plugin.rpc.listchannels.return_value = {
+        "channels": [
+            {
+                "short_channel_id": "111x1x1",
+                "source": SRC_PEER,
+                "destination": DST_PEER,
+                "fee_per_millionth": 0,
+                "base_fee_millisatoshi": 0,
+                "delay": 0,
+            }
+        ]
+    }
+    plugin.rpc.getroutes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [
+            {
+                "probability_ppm": 990000,
+                "amount_msat": 100000,
+                "final_cltv": 40,
+                "path": [
+                    {
+                        "short_channel_id_dir": "111x1x1/0",
+                        "next_node_id": DST_PEER,
+                        "amount_msat": 100000,
+                        "delay": 40,
+                    },
+                ],
+            }
+        ],
+    }
+    return plugin
+
+
+def _make_v3_router(plugin):
+    from modules.rebalance_router_v3 import RebalanceRouterV3
+
+    return RebalanceRouterV3(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        layer_names=["hive-fleet"],
+        log=lambda m, l: None,
+    )
+
+
+def _count_rpc(plugin, method) -> int:
+    return sum(
+        1
+        for call in plugin.rpc.call.call_args_list
+        if call.args and call.args[0] == method
+    )
+
+
+def _v3_price(router):
+    return router.price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100,
+    )
+
+
+def test_v3_router_reuses_exclude_layer_within_cycle():
+    """Two pricings with identical exclude sets in one cycle build the
+    throwaway layer once (create + updates), not once per call."""
+    plugin = _make_v3_plugin()
+    router = _make_v3_router(plugin)
+
+    router.begin_cycle()
+    try:
+        for _ in range(2):
+            result = _v3_price(router)
+            assert result.success is True, result.error
+        # Layer alive for the whole cycle: no remove yet.
+        assert _count_rpc(plugin, "askrene-create-layer") == 1
+        assert _count_rpc(plugin, "askrene-remove-layer") == 0
+    finally:
+        router.end_cycle()
+
+    assert _count_rpc(plugin, "askrene-remove-layer") == 1
+
+
+def test_v3_router_distinct_exclude_sets_get_distinct_layers():
+    plugin = _make_v3_plugin()
+    router = _make_v3_router(plugin)
+
+    router.begin_cycle()
+    try:
+        assert _v3_price(router).success is True
+        result = router.price_pair(
+            source_channel_id="100x1x0",
+            dest_channel_id="200x2x0",
+            source_peer_id=SRC_PEER,
+            dest_peer_id=DST_PEER,
+            amount_sats=100,
+            exclude=["333x3x0/1"],
+        )
+        assert result.success is True, result.error
+        assert _count_rpc(plugin, "askrene-create-layer") == 2
+    finally:
+        router.end_cycle()
+
+    assert _count_rpc(plugin, "askrene-remove-layer") == 2
+
+
+def test_v3_router_exclude_layer_per_call_outside_cycle():
+    """No active cycle (e.g. worker-thread retries): create/remove per call."""
+    plugin = _make_v3_plugin()
+    router = _make_v3_router(plugin)
+
+    for _ in range(2):
+        result = _v3_price(router)
+        assert result.success is True, result.error
+
+    assert _count_rpc(plugin, "askrene-create-layer") == 2
+    assert _count_rpc(plugin, "askrene-remove-layer") == 2
+
+
+def test_v3_router_unknown_layer_error_drops_cached_exclude_layers():
+    plugin = _make_v3_plugin()
+    router = _make_v3_router(plugin)
+    good_routes = plugin.rpc.getroutes.return_value
+    plugin.rpc.getroutes.side_effect = [
+        good_routes,
+        Exception("Unknown layer hive-fleet"),
+        good_routes,
+    ]
+
+    router.begin_cycle()
+    try:
+        assert _v3_price(router).success is True
+        failed = _v3_price(router)
+        assert failed.success is False
+        assert "unknown_layer" in failed.error
+        # The cached exclude layer was torn down with the cache...
+        assert _count_rpc(plugin, "askrene-remove-layer") == 1
+        # ...and the next pricing rebuilds a fresh one and succeeds.
+        retried = _v3_price(router)
+        assert retried.success is True, retried.error
+        assert _count_rpc(plugin, "askrene-create-layer") == 2
+    finally:
+        router.end_cycle()
