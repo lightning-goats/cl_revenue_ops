@@ -7147,7 +7147,13 @@ def _build_boltz_balance_plan(
         # Conservative expected uplift model (heuristic): daily contribution * imbalance severity * horizon.
         # This is intentionally cautious and is only used as a profit guard/ranking signal.
         severity_factor = max(0.1, min(1.0, severity))
-        expected_gross_uplift_sats = int(max(0.0, daily_contrib_est) * float(expected_horizon_days) * severity_factor)
+        # F4 amount-proportionality: the heuristic estimates the value of
+        # closing the FULL gap (raw_amount); a cap-bound partial swap only
+        # earns the pro-rata share of it.
+        amount_fraction = min(1.0, amount_sats / max(1, raw_amount))
+        expected_gross_uplift_sats = int(
+            max(0.0, daily_contrib_est) * float(expected_horizon_days) * severity_factor * amount_fraction
+        )
 
         # DTS posterior uplift: if the channel has a proven high fee (tight posterior),
         # use the posterior mean to estimate potential revenue even if recent history is thin.
