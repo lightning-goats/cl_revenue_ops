@@ -6871,7 +6871,9 @@ def _build_boltz_expansion_treasury_plan(
     planner_coordination: Optional[Dict[str, Any]] = None,
     pending_swap_count: Optional[int] = None,
 ) -> Dict[str, Any]:
-    bm = _require_boltz_manager()
+    # Fail fast when Boltz is unavailable; the budget/pending reads moved to
+    # the post-deficit-check path (F4), so only the guard remains here.
+    _require_boltz_manager()
     onchain_confirmed_sats = _get_confirmed_onchain_sats()
     target = max(0, int(onchain_target_sats))
     if onchain_confirmed_sats is None:
