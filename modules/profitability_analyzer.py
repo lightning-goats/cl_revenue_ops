@@ -1503,7 +1503,13 @@ class ChannelProfitabilityAnalyzer:
 
         A Bleeder is a channel where:
         - Net P&L < 0 (rebalance costs exceed total contribution value)
-        - Has activity (either as exit or entry channel)
+
+        Audit F7: the previous `total_activity > 0` filter hid PURE bleeders
+        (channels we paid to fill that never routed at all) from the
+        dashboard and policy suggestions, while identify_bleeders_v2 still
+        classified them hard. Zero-activity bleeders are now included and
+        marked with `zero_activity: True` so v1 output is a superset of
+        v2's hard set on the same window.
 
         Total contribution includes:
         - Direct fees (earned as exit channel)
@@ -1543,10 +1549,12 @@ class ChannelProfitabilityAnalyzer:
                     # Total activity = exit forwards + sourced forwards
                     total_activity = pnl.get('direct_forward_count', 0) + pnl.get('sourced_forward_count', 0)
 
-                    # Check for bleeder condition: net < 0 AND has activity
-                    # Now uses total_contribution which includes sourced fee value
+                    # Check for bleeder condition: net < 0.
+                    # Uses total_contribution which includes sourced fee value.
+                    # Audit F7: no activity filter — pure bleeders (negative
+                    # P&L with zero forwards) must be visible too.
                     net_pnl_sats = pnl.get('net_pnl_sats', base_to_sats_floor(pnl.get('net_pnl_msat', 0)))
-                    if net_pnl_sats < 0 and total_activity > 0:
+                    if net_pnl_sats < 0:
                         bleeders.append({
                             'channel_id': channel_id,
                             'short_channel_id': channel_id,
@@ -1564,6 +1572,9 @@ class ChannelProfitabilityAnalyzer:
                             'direct_forward_count': pnl.get('direct_forward_count', 0),
                             'sourced_forward_count': pnl.get('sourced_forward_count', 0),
                             'total_forward_count': total_activity,
+                            # Audit F7: marker for pure bleeders (paid to
+                            # fill, never routed in the window)
+                            'zero_activity': total_activity == 0,
                             'loss_per_forward': round(abs(net_pnl_sats) / max(total_activity, 1)),
                             # Legacy fields for backward compatibility
                             'revenue_sats': pnl.get('direct_revenue_sats', 0),

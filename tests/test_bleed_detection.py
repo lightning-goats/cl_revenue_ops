@@ -424,3 +424,54 @@ class TestHardBleederHysteresis:
         assert self._verdict(analyzer).classification == "hard"
         state["30"] = _pnl(net_sats=-500, cost_sats=500)
         assert self._verdict(analyzer).classification == "hard"
+
+
+class TestZeroActivityBleederVisibility:
+    """Audit F7: v1 hid pure bleeders (paid to fill, never routed) behind a
+    total_activity > 0 filter, so the dashboard/policy suggestions never saw
+    the channels v2 classifies as hard. v1 must be a superset of v2's hard
+    set on the same window."""
+
+    def test_zero_activity_negative_pnl_channel_appears_in_v1(self):
+        analyzer, _ = _make_live_analyzer(
+            _pnl(net_sats=-1500, cost_sats=1500, revenue_sats=0, forwards=0),
+            _pnl(net_sats=-300, cost_sats=300, revenue_sats=0, forwards=0),
+        )
+        bleeders = analyzer.identify_bleeders(window_days=30)
+        assert len(bleeders) == 1
+        b = bleeders[0]
+        assert b['channel_id'] == "100x1x0"
+        assert b['net_pnl_sats'] == -1500
+        assert b['total_forward_count'] == 0
+        assert b['zero_activity'] is True
+
+    def test_active_bleeder_marked_non_zero_activity(self):
+        analyzer, _ = _make_live_analyzer(
+            _pnl(net_sats=-1500, cost_sats=1500, revenue_sats=0, forwards=4),
+            _pnl(net_sats=-300, cost_sats=300, revenue_sats=0, forwards=1),
+        )
+        bleeders = analyzer.identify_bleeders(window_days=30)
+        assert len(bleeders) == 1
+        assert bleeders[0]['zero_activity'] is False
+
+    def test_positive_pnl_zero_activity_channel_not_reported(self):
+        analyzer, _ = _make_live_analyzer(
+            _pnl(net_sats=0, cost_sats=0, revenue_sats=0, forwards=0),
+            _pnl(net_sats=0, cost_sats=0, revenue_sats=0, forwards=0),
+        )
+        assert analyzer.identify_bleeders(window_days=30) == []
+
+    def test_v1_superset_of_v2_hard_set(self):
+        """Every v2 hard bleeder must appear in v1 output (same window)."""
+        analyzer, _ = _make_live_analyzer(
+            _pnl(net_sats=-2000, cost_sats=2000, revenue_sats=0, forwards=0),
+            _pnl(net_sats=-400, cost_sats=400, revenue_sats=0, forwards=0),
+        )
+        hard_ids = {
+            c.channel_id for c in analyzer.identify_bleeders_v2(window_days=30)
+            if c.is_hard_bleeder
+        }
+        v1_ids = {b['channel_id']
+                  for b in analyzer.identify_bleeders(window_days=30)}
+        assert hard_ids, "expected the seeded channel to be hard"
+        assert hard_ids <= v1_ids
