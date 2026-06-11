@@ -138,6 +138,63 @@ SOURCE_EXIT_OUTBOUND_RATIO = 0.28   # stop being SOURCE when outbound ratio rise
 # SOURCE. The structural label must never contradict a measured flow trend.
 KALMAN_BALANCE_VETO_RATIO = 0.05
 
+# F2: drain estimates at or below this are indistinguishable from noise —
+# estimate_depletion_hours() returns None rather than an absurd horizon.
+DEPLETION_MIN_DRAIN_SATS_PER_DAY = 1.0
+
+
+def estimate_depletion_hours(
+    local_sats: float,
+    capacity_sats: float,
+    kalman_ratio: float,
+    kalman_velocity: float = 0.0,
+) -> Optional[float]:
+    """Estimate hours until local liquidity depletes at the current drain rate.
+
+    F2 (2026-06 audit): the previous consumer-side formula was off by ~6.7x
+    because it treated kalman_ratio as sats/hour-like. The correct units:
+
+    - ``kalman_ratio``: net flow per DAY as a fraction of capacity
+      (positive = draining, e.g. 0.12 on a 10M channel = 1.2M sats/day out)
+    - ``kalman_velocity``: ratio change per HOUR (Kalman state units)
+
+    Formula::
+
+        net_drain_sats_per_day = max(0, kalman_ratio) * capacity
+                                 + kalman_velocity * 24 * capacity / 2
+        # velocity term = average extra drain over the next day assuming a
+        # linear trend; the total is clamped >= 0
+        hours = local_sats / net_drain_sats_per_day * 24
+
+    Example (audit table): 10M capacity, ratio 0.12, 5M local
+    -> 1.2M sats/day drain -> ~100 hours (not 667).
+
+    Returns:
+        Hours until depletion, or None when inputs are invalid or net drain
+        is at/below DEPLETION_MIN_DRAIN_SATS_PER_DAY (no depletion in sight).
+    """
+    try:
+        local = float(local_sats)
+        capacity = float(capacity_sats)
+        ratio = float(kalman_ratio)
+        velocity = float(kalman_velocity)
+    except (TypeError, ValueError):
+        return None
+
+    if not all(math.isfinite(v) for v in (local, capacity, ratio, velocity)):
+        return None
+    if capacity <= 0 or local < 0:
+        return None
+
+    net_drain_sats_per_day = max(0.0, ratio) * capacity
+    net_drain_sats_per_day += velocity * 24.0 * capacity / 2.0
+    net_drain_sats_per_day = max(0.0, net_drain_sats_per_day)
+
+    if net_drain_sats_per_day <= DEPLETION_MIN_DRAIN_SATS_PER_DAY:
+        return None
+
+    return (local / net_drain_sats_per_day) * 24.0
+
 
 @dataclass
 class KalmanFlowState:

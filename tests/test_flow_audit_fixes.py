@@ -304,3 +304,80 @@ class TestF1RegimeChangeResponsiveness:
         assert all(s == ChannelState.SINK for s in states), (
             f"class flapped: {[s.value for s in states]}"
         )
+
+
+# =========================================================================
+# F2: estimate_depletion_hours — correct units
+# =========================================================================
+
+class TestF2DepletionHours:
+    """The audit found predicted_depletion_hours off by ~6.7x (unit error).
+
+    kalman_ratio is net drain per DAY as a fraction of capacity, so
+    drain_sats_per_day = ratio * capacity and hours = local/drain * 24.
+    """
+
+    def test_audit_table_case(self):
+        """10M cap, ratio 0.12 → 1.2M sats/day drain; 5M local → 100h."""
+        from modules.flow_analysis import estimate_depletion_hours
+
+        hours = estimate_depletion_hours(
+            local_sats=5_000_000,
+            capacity_sats=10_000_000,
+            kalman_ratio=0.12,
+            kalman_velocity=0.0,
+        )
+        assert hours == pytest.approx(100.0)
+        # Regression guard against the old 667h figure
+        assert hours < 200.0
+
+    def test_full_local_balance(self):
+        """10M local at 1.2M/day → 200h."""
+        from modules.flow_analysis import estimate_depletion_hours
+
+        hours = estimate_depletion_hours(10_000_000, 10_000_000, 0.12, 0.0)
+        assert hours == pytest.approx(200.0)
+
+    def test_no_drain_returns_none(self):
+        from modules.flow_analysis import estimate_depletion_hours
+
+        assert estimate_depletion_hours(5_000_000, 10_000_000, 0.0, 0.0) is None
+
+    def test_filling_channel_returns_none(self):
+        """Negative ratio = filling; no depletion forecast."""
+        from modules.flow_analysis import estimate_depletion_hours
+
+        assert estimate_depletion_hours(5_000_000, 10_000_000, -0.2, 0.0) is None
+
+    def test_velocity_term_accelerates_depletion(self):
+        """Positive velocity (drain accelerating) shortens the estimate."""
+        from modules.flow_analysis import estimate_depletion_hours
+
+        base = estimate_depletion_hours(5_000_000, 10_000_000, 0.10, 0.0)
+        accel = estimate_depletion_hours(5_000_000, 10_000_000, 0.10, 0.01)
+        # drain = 1M + 0.01*24*10M/2 = 1M + 1.2M = 2.2M/day → 5/2.2*24 ≈ 54.5h
+        assert accel == pytest.approx(5_000_000 / 2_200_000 * 24.0)
+        assert accel < base
+
+    def test_negative_velocity_clamps_drain_at_zero(self):
+        """Strong deceleration cannot produce a negative drain (→ None)."""
+        from modules.flow_analysis import estimate_depletion_hours
+
+        assert estimate_depletion_hours(
+            5_000_000, 10_000_000, 0.01, -0.05
+        ) is None
+
+    def test_invalid_inputs_return_none(self):
+        from modules.flow_analysis import estimate_depletion_hours
+
+        assert estimate_depletion_hours(5_000_000, 0, 0.1, 0.0) is None
+        assert estimate_depletion_hours(-1, 10_000_000, 0.1, 0.0) is None
+        assert estimate_depletion_hours(
+            5_000_000, 10_000_000, float("nan"), 0.0
+        ) is None
+
+    def test_zero_local_depletes_immediately(self):
+        from modules.flow_analysis import estimate_depletion_hours
+
+        hours = estimate_depletion_hours(0, 10_000_000, 0.12, 0.0)
+        assert hours == pytest.approx(0.0)
