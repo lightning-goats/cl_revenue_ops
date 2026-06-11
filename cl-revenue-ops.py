@@ -6736,7 +6736,13 @@ def _get_confirmed_onchain_sats() -> int:
     return int(total)
 
 
-def _filter_boltz_treasury_recommendations(plan: Dict[str, Any], *, deficit_sats: int, exclude_protected: bool = True) -> Dict[str, Any]:
+def _filter_boltz_treasury_recommendations(
+    plan: Dict[str, Any],
+    *,
+    deficit_sats: int,
+    exclude_protected: bool = True,
+    min_source_local_pct: Optional[float] = None,
+) -> Dict[str, Any]:
     """Filter a balance plan down to treasury-appropriate reverse swaps."""
     recs = list(plan.get("recommendations", [])) if isinstance(plan, dict) else []
     filtered = []
@@ -6747,6 +6753,22 @@ def _filter_boltz_treasury_recommendations(plan: Dict[str, Any], *, deficit_sats
         if direction != "loop_out":
             skipped.append({"channel_id": rec.get("channel_id"), "reason": "not_loop_out"})
             continue
+        # F6: hard floor on source local balance. The treasury plan passes
+        # min_source_local_pct as the balance plan's high_trigger_pct, but
+        # dynamic tuning may lower the effective trigger by up to 15pp —
+        # letting under-floor channels into the plan. Enforce the floor here
+        # regardless of tuning.
+        if min_source_local_pct is not None:
+            local_pct = float(rec.get("local_balance_pct", 0.0) or 0.0)
+            if local_pct < float(min_source_local_pct):
+                skipped.append({
+                    "channel_id": rec.get("channel_id"),
+                    "peer_id": rec.get("peer_id"),
+                    "reason": "below_min_source_local_pct",
+                    "local_balance_pct": local_pct,
+                    "min_source_local_pct": float(min_source_local_pct),
+                })
+                continue
         tuning = rec.get("dynamic_tuning", {}) if isinstance(rec.get("dynamic_tuning"), dict) else {}
         hints = rec.get("execution_hints", {}) if isinstance(rec.get("execution_hints"), dict) else {}
         if exclude_protected and (bool(hints.get("prioritize_channel_protection")) or float(tuning.get("protection_score", 0.0) or 0.0) >= 0.6):
@@ -6839,7 +6861,12 @@ def _build_boltz_expansion_treasury_plan(
     if "error" in base_plan:
         base_plan["treasury"] = treasury
         return base_plan
-    filtered = _filter_boltz_treasury_recommendations(base_plan, deficit_sats=deficit, exclude_protected=bool(exclude_protected))
+    filtered = _filter_boltz_treasury_recommendations(
+        base_plan,
+        deficit_sats=deficit,
+        exclude_protected=bool(exclude_protected),
+        min_source_local_pct=float(min_source_local_pct),
+    )
     filtered["treasury"] = treasury
     filtered["status"] = "ok"
     return filtered
