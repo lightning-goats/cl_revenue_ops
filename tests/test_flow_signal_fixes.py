@@ -505,7 +505,10 @@ class TestFix4BalancedActive:
         assert metrics.state == ChannelState.SINK
 
     def test_ema_balanced_and_balanced_position_stays_balanced(self):
-        """When EMA ratio and balance position are both moderate, stay BALANCED."""
+        """When EMA ratio and balance position are both moderate, stay in the
+        balanced family. F6 (2026-06 audit): with turnover < 1%/day and no
+        Kalman net-flow trend this channel is now honestly labelled DORMANT
+        rather than BALANCED."""
         from modules.flow_analysis import FlowAnalyzer, ChannelState
 
         plugin = MagicMock()
@@ -532,7 +535,8 @@ class TestFix4BalancedActive:
             last_forward_ts=int(time.time()),
         )
 
-        assert metrics.state == ChannelState.BALANCED
+        # 200k volume / 7 days on 10M capacity = 0.29%/day turnover -> DORMANT
+        assert metrics.state == ChannelState.DORMANT
 
 
 # =========================================================================

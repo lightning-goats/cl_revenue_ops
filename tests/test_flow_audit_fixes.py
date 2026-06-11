@@ -122,7 +122,8 @@ class TestF1BalanceHysteresis:
         states = self._run_cycles(
             analyzer, [0.50, 0.80, 0.75, 0.70], initial_state="balanced"
         )
-        assert states[0].is_balanced
+        # (DORMANT is acceptable here — weak flow at 50% balance; F6)
+        assert states[0] not in (ChannelState.SINK, ChannelState.SOURCE)
         assert states[1] == ChannelState.SINK
         assert states[2] == ChannelState.SINK  # hysteresis hold
         assert states[3] != ChannelState.SINK
@@ -381,3 +382,160 @@ class TestF2DepletionHours:
 
         hours = estimate_depletion_hours(0, 10_000_000, 0.12, 0.0)
         assert hours == pytest.approx(0.0)
+
+
+# =========================================================================
+# F6: 'dormant' vocabulary actually emitted by the classifier
+# =========================================================================
+
+class TestF6DormantVocabulary:
+    """fee_controller branches on flow_state 'dormant' (rebalance-cost floor
+    exemption, context role) but the producer never emitted it — such
+    channels landed BALANCED and the branches were dead."""
+
+    def test_dormant_enum_roundtrip(self):
+        from modules.flow_analysis import ChannelState
+
+        assert ChannelState.DORMANT.value == "dormant"
+        assert ChannelState("dormant") == ChannelState.DORMANT
+        assert ChannelState.DORMANT.is_balanced is False
+
+    def test_classifier_emits_dormant(self):
+        """turnover < 1%/day AND |kalman_ratio| < 0.01 -> DORMANT."""
+        from modules.flow_analysis import ChannelState
+
+        analyzer, _ = _make_analyzer()
+        state = analyzer._classify_balance_position(
+            outbound_ratio=0.5, previous_state="balanced",
+            kalman_ratio=0.005, turnover=0.005,
+        )
+        assert state == ChannelState.DORMANT
+
+    def test_net_flow_blocks_dormant(self):
+        """|kalman_ratio| >= 0.01 keeps the channel BALANCED."""
+        from modules.flow_analysis import ChannelState
+
+        analyzer, _ = _make_analyzer()
+        state = analyzer._classify_balance_position(
+            outbound_ratio=0.5, previous_state="balanced",
+            kalman_ratio=0.02, turnover=0.005,
+        )
+        assert state == ChannelState.BALANCED
+
+    def test_turnover_blocks_dormant(self):
+        """Busy two-way channels stay BALANCED_ACTIVE."""
+        from modules.flow_analysis import ChannelState
+
+        analyzer, _ = _make_analyzer()
+        state = analyzer._classify_balance_position(
+            outbound_ratio=0.5, previous_state="balanced",
+            kalman_ratio=0.0, turnover=0.02,
+        )
+        assert state == ChannelState.BALANCED_ACTIVE
+
+    def test_calculate_metrics_emits_dormant(self):
+        """A 50%-balanced channel with negligible turnover is DORMANT."""
+        from modules.flow_analysis import ChannelState
+
+        analyzer, _ = _make_analyzer()
+        capacity = 10_000_000
+        metrics = analyzer._calculate_metrics(
+            channel_id="100x1x0",
+            peer_id="peer1",
+            sats_in=10_000,
+            sats_out=10_000,
+            capacity=capacity,
+            ema_in=10_000 / 7.0,
+            ema_out=10_000 / 7.0,
+            our_balance=5_000_000,
+            forward_count=3,
+            last_forward_ts=int(time.time()),
+            previous_state="balanced",
+            previous_kalman_ratio=0.0,
+        )
+        assert metrics.state == ChannelState.DORMANT
+
+    def test_fee_side_rebalance_floor_exemption_activates(self):
+        """The dormant rebalance-cost floor exemption short-circuits before
+        any cost-history lookup (no flow to amortize costs against)."""
+        from modules.fee_controller import FeeController
+        from modules.config import Config
+
+        plugin = MagicMock()
+        config = MagicMock(spec=Config)
+        db = MagicMock()
+        fc = FeeController(plugin, config, db)
+
+        assert fc._get_rebalance_cost_floor("100x1x0", "peer", "dormant") is None
+        db.get_channel_cost_history.assert_not_called()
+
+    def test_pid_target_ratio_defined_for_dormant(self):
+        from modules.fee_controller import _PID_TARGET_RATIOS
+
+        assert _PID_TARGET_RATIOS["dormant"] == pytest.approx(0.5)
+
+
+# =========================================================================
+# F7: no-flow fallback unified with hysteresis bands, no synthetic ratio
+# =========================================================================
+
+class TestF7NoFlowFallback:
+    """The no-flow branch used 0.30/0.70 cutoffs (vs 0.25/0.75 with-flow)
+    and wrote synthetic flow_ratio ±0.6 that contaminated EMA velocity."""
+
+    def _metrics(self, analyzer, balance_ratio, previous_state="balanced",
+                 capacity=10_000_000):
+        return analyzer._calculate_metrics(
+            channel_id="100x1x0",
+            peer_id="peer1",
+            sats_in=0,
+            sats_out=0,
+            capacity=capacity,
+            ema_in=0.0,
+            ema_out=0.0,
+            our_balance=int(capacity * balance_ratio),
+            forward_count=0,
+            last_forward_ts=0,
+            previous_state=previous_state,
+            previous_kalman_ratio=0.0,
+        )
+
+    def test_no_flow_uses_unified_hysteresis_bands(self):
+        """0.75 outbound with no flow was SINK under the old 0.70 cutoff;
+        the unified bands require >0.78 to enter SINK."""
+        from modules.flow_analysis import ChannelState
+
+        analyzer, _ = _make_analyzer()
+        assert self._metrics(analyzer, 0.75).state != ChannelState.SINK
+        assert self._metrics(analyzer, 0.80).state == ChannelState.SINK
+        assert self._metrics(analyzer, 0.25).state != ChannelState.SOURCE
+        assert self._metrics(analyzer, 0.20).state == ChannelState.SOURCE
+
+    def test_no_flow_does_not_write_synthetic_flow_ratio(self):
+        """flow_ratio stays 0.0 — synthetic ±0.6 polluted the persisted
+        history and the EMA velocity calculation."""
+        analyzer, _ = _make_analyzer()
+        for balance_ratio in (0.10, 0.50, 0.90):
+            metrics = self._metrics(analyzer, balance_ratio)
+            assert metrics.flow_ratio == pytest.approx(0.0), (
+                f"synthetic flow_ratio at balance {balance_ratio}"
+            )
+
+    def test_no_flow_hysteresis_holds_class(self):
+        """No-flow channel hovering around 0.75 holds its class."""
+        analyzer, _ = _make_analyzer()
+        prev = "sink"
+        states = []
+        for i in range(20):
+            m = self._metrics(analyzer, 0.75 + (0.02 if i % 2 else -0.02),
+                              previous_state=prev)
+            states.append(m.state)
+            prev = m.state.value
+        assert len(set(states)) == 1
+
+    def test_no_flow_midrange_is_dormant(self):
+        """An idle 50% channel with no flow at all is DORMANT (F6)."""
+        from modules.flow_analysis import ChannelState
+
+        analyzer, _ = _make_analyzer()
+        assert self._metrics(analyzer, 0.50).state == ChannelState.DORMANT

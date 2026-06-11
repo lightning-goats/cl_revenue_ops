@@ -1539,11 +1539,14 @@ class GaussianThompsonState:
 # =============================================================================
 
 # Dynamic target ratios by flow state
+# Note: 'router' is reserved vocabulary — the flow classifier does not emit
+# it yet; lookups fall back to 0.5 via .get(flow_state, 0.5).
 _PID_TARGET_RATIOS = {
     "source": 0.7,
     "sink": 0.3,
     "balanced": 0.5,
     "balanced_active": 0.5,
+    "dormant": 0.5,  # F6: emitted since 2026-06 — idle channel, neutral target
     "congested": 0.5,
     "unknown": 0.5,
 }
@@ -3892,6 +3895,9 @@ class FeeController:
 
         # Skip channels that don't pay rebalance costs: sinks fill from inbound,
         # dormant channels have no flow to amortize costs against.
+        # F6: 'dormant' is now actually emitted by the flow classifier, so this
+        # exemption is live. 'router' (which keeps the floor) remains reserved
+        # vocabulary — the classifier does not emit it yet.
         if flow_state in ("sink", "dormant"):
             return None
 

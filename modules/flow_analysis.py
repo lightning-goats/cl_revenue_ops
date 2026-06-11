@@ -118,6 +118,13 @@ KALMAN_MIN_OBSERVATIONS = 5  # Minimum observation count before Kalman can overr
 # BALANCED_ACTIVE classification: distinguish busy two-way channels from dormant ones
 BALANCED_ACTIVE_TURNOVER_THRESHOLD = 0.01  # 1% of capacity per day
 
+# F6 (2026-06 audit): DORMANT vocabulary. The fee controller has 'dormant'
+# branches (rebalance-cost floor exemption — no flow to amortize costs
+# against) that never activated because the classifier never emitted the
+# state. A channel is DORMANT when turnover < 1%/day AND the Kalman net-flow
+# estimate is below this threshold.
+DORMANT_KALMAN_RATIO_THRESHOLD = 0.01
+
 # =============================================================================
 # F1 (2026-06 audit): Balance-position hysteresis + Kalman direction veto
 # =============================================================================
@@ -620,13 +627,18 @@ class ChannelState(Enum):
     SINK: Net inflow - channel is filling
     BALANCED: Roughly equal flow - ideal state
     BALANCED_ACTIVE: High-turnover two-way channel (balanced but busy)
+    DORMANT: Essentially no flow at all (turnover < 1%/day, no net trend)
     UNKNOWN: Not enough data to classify
     CONGESTED: HTLC slots near exhaustion (>80% used)
+
+    Note: the fee controller also recognizes 'router' as a flow_state, but
+    this classifier does not emit it yet — those branches are reserved.
     """
     SOURCE = "source"
     SINK = "sink"
     BALANCED = "balanced"
     BALANCED_ACTIVE = "balanced_active"
+    DORMANT = "dormant"
     UNKNOWN = "unknown"
     CONGESTED = "congested"
 
@@ -1794,6 +1806,11 @@ class FlowAnalyzer:
 
         if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
             return ChannelState.BALANCED_ACTIVE
+        # F6: turnover <= 1%/day here; with no measurable net trend either,
+        # the channel is DORMANT (activates the fee controller's dormant
+        # branches, e.g. the rebalance-cost floor exemption).
+        if abs(kalman_ratio) < DORMANT_KALMAN_RATIO_THRESHOLD:
+            return ChannelState.DORMANT
         return ChannelState.BALANCED
 
     def _calculate_metrics(
@@ -1869,18 +1886,17 @@ class FlowAnalyzer:
                     turnover,
                 )
         else:
-            # FALLBACK: Infer from current balance (no flow data at all)
+            # FALLBACK: Infer from current balance (no flow data at all).
+            # F7: cutoffs unified with the F1 hysteresis bands (the old
+            # 0.30/0.70 disagreed with the 0.25/0.75 with-flow fallback, so
+            # a channel could flip class purely by gaining/losing its first
+            # forward). flow_ratio stays at its EMA-derived value (0.0 here)
+            # instead of the old synthetic ±0.6, which contaminated the EMA
+            # velocity calculation and the persisted flow history.
             outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
-
-            if outbound_ratio < 0.30:
-                state = ChannelState.SOURCE
-                flow_ratio = 0.6
-            elif outbound_ratio > 0.70:
-                state = ChannelState.SINK
-                flow_ratio = -0.6
-            else:
-                state = ChannelState.BALANCED
-                flow_ratio = 0.0
+            state = self._classify_balance_position(
+                outbound_ratio, previous_state, previous_kalman_ratio, 0.0
+            )
 
         # v2.0: Calculate confidence score
         confidence = self._calculate_confidence(forward_count, last_forward_ts)
