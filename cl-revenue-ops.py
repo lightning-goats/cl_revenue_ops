@@ -6970,6 +6970,16 @@ OWN_POLICY_HAIRCUT = 0.5
 # prices a month of the structural asset.
 STRUCTURAL_AMORTIZATION_HORIZONS = 10
 
+# Quote-subprocess budget for _build_boltz_balance_plan: only the top
+# QUOTE_CANDIDATE_MULTIPLIER x max_candidates trigger-passing candidates
+# (ranked by severity, then estimated daily contribution) pay a boltzcli
+# quote; the rest are skipped as quote_budget_exceeded. The margin above
+# max_candidates is deliberate — the profit guard needs the quote, so some
+# quoted candidates fail post-quote and a 1x budget could starve the final
+# slice; 3x bounds the worst case while leaving room for guard failures and
+# the post-quote multi-goal re-ranking.
+QUOTE_CANDIDATE_MULTIPLIER = 3
+
 
 def _policy_derived_fee_ppm(channels: Dict[str, Dict[str, Any]]) -> int:
     """Capacity-weighted mean of our own out-fee policies, haircut applied.
@@ -7160,6 +7170,9 @@ def _build_boltz_balance_plan(
 
     candidates: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
+    # Phase 1 output: quote-ready candidates (passed triggers, policy, and
+    # amount gates) that have NOT paid a quote subprocess yet.
+    pending_quotes: List[Dict[str, Any]] = []
 
     for channel_id, ch in channels.items():
         peer_id = str(ch.get("peer_id") or "")
@@ -7336,6 +7349,94 @@ def _build_boltz_balance_plan(
                 "direction": direction,
             })
             continue
+
+        # Quote deferred to phase 2: only the best-ranked candidates pay the
+        # boltzcli quote subprocess. Capture everything phase 2 needs.
+        pending_quotes.append({
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "direction": direction,
+            "target_currency": target_currency,
+            "target_pct": target_pct,
+            "severity": severity,
+            "amount_sats": amount_sats,
+            "raw_amount": raw_amount,
+            "dynamic_amount_cap": dynamic_amount_cap,
+            "daily_contrib_est": daily_contrib_est,
+            "marginal_roi": marginal_roi,
+            "prof": prof,
+            "prof_class": prof_class,
+            "posterior_mean": posterior_mean,
+            "posterior_std": posterior_std,
+            "broadcast_fee_ppm": broadcast_fee_ppm,
+            "rebalance_impossible": rebalance_impossible,
+            "hive_rebal_bias": hive_rebal_bias,
+            "flow_state": flow_state,
+            "local_pct": local_pct,
+            "scid_display": scid_display,
+            "tuning": tuning,
+            "hints": hints,
+            "eff_low_trigger_pct": eff_low_trigger_pct,
+            "eff_high_trigger_pct": eff_high_trigger_pct,
+            "capacity_sats": capacity_sats,
+            "local_sats": local_sats,
+            "receivable_sats": receivable_sats,
+            "policy_reason": policy_reason,
+            "predicted_depletion_hours": predicted_depletion_hours,
+        })
+
+    # --- Phase 2: bounded quoting. Every quote is a boltzcli subprocess, but
+    # only max_candidates recommendations survive the final slice — so rank
+    # quote-ready candidates by (severity, daily_contrib_est) and quote only
+    # the top QUOTE_CANDIDATE_MULTIPLIER x max_candidates. The multiplier
+    # margin matters: the profit guard needs the quote, so some quoted
+    # candidates fail post-quote and a 1x budget could starve the slice.
+    quote_budget = max(0, int(max_candidates)) * QUOTE_CANDIDATE_MULTIPLIER
+    pending_quotes.sort(
+        key=lambda p: (float(p["severity"]), int(p["daily_contrib_est"])),
+        reverse=True,
+    )
+    for p in pending_quotes[quote_budget:]:
+        skipped.append({
+            "channel_id": p["channel_id"],
+            "peer_id": p["peer_id"],
+            "direction": p["direction"],
+            "reason": "quote_budget_exceeded",
+            "severity": round(float(p["severity"]), 4),
+            "quote_budget": quote_budget,
+        })
+
+    for p in pending_quotes[:quote_budget]:
+        channel_id = p["channel_id"]
+        peer_id = p["peer_id"]
+        direction = p["direction"]
+        target_currency = p["target_currency"]
+        target_pct = p["target_pct"]
+        severity = p["severity"]
+        amount_sats = p["amount_sats"]
+        raw_amount = p["raw_amount"]
+        dynamic_amount_cap = p["dynamic_amount_cap"]
+        daily_contrib_est = p["daily_contrib_est"]
+        marginal_roi = p["marginal_roi"]
+        prof = p["prof"]
+        prof_class = p["prof_class"]
+        posterior_mean = p["posterior_mean"]
+        posterior_std = p["posterior_std"]
+        broadcast_fee_ppm = p["broadcast_fee_ppm"]
+        rebalance_impossible = p["rebalance_impossible"]
+        hive_rebal_bias = p["hive_rebal_bias"]
+        flow_state = p["flow_state"]
+        local_pct = p["local_pct"]
+        scid_display = p["scid_display"]
+        tuning = p["tuning"]
+        hints = p["hints"]
+        eff_low_trigger_pct = p["eff_low_trigger_pct"]
+        eff_high_trigger_pct = p["eff_high_trigger_pct"]
+        capacity_sats = p["capacity_sats"]
+        local_sats = p["local_sats"]
+        receivable_sats = p["receivable_sats"]
+        policy_reason = p["policy_reason"]
+        predicted_depletion_hours = p["predicted_depletion_hours"]
 
         target_currency = _plan_currency(direction, target_currency, amount_sats)
         try:
