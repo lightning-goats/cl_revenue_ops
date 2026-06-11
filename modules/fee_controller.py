@@ -3010,15 +3010,19 @@ class FeeController:
         Returns None if insufficient data (need >= 3 neighbors for gossip).
         Result is cached for 30 minutes to avoid expensive calls.
         """
-        # Evict stale entries when cache grows large
+        # Evict stale entries when cache grows large.
+        # NOTE: iterate a snapshot — a concurrent adjust_all_fees caller may
+        # be running its pre-lock gossip prefetch (writes to this dict happen
+        # outside _state_lock by design), and mutating during items() would
+        # raise RuntimeError.
         if len(self._neighbor_fee_cache) > 500:
             now = time.time()
             stale_keys = [
-                k for k, v in self._neighbor_fee_cache.items()
+                k for k, v in list(self._neighbor_fee_cache.items())
                 if (now - v["ts"]) > 3600
             ]
             for k in stale_keys:
-                del self._neighbor_fee_cache[k]
+                self._neighbor_fee_cache.pop(k, None)
 
         # Check cache first
         cache_key = f"neighbor_fee_{peer_id}"
@@ -4231,6 +4235,21 @@ class FeeController:
                 except Exception as e:
                     self.plugin.log(f"Profitability warm-up failed: {e}", level='debug')
 
+        # PERF: fetch channel info and warm the per-peer gossip cache BEFORE
+        # acquiring _state_lock. Both are pure RPC + parsing (no guarded
+        # state). With the ~3900s gossip TTL roughly half the peers expire
+        # each cycle; without the prefetch the per-channel loop re-issued
+        # those listchannels RPCs serially UNDER the lock (18-41 lock-held
+        # RPCs, 0.2-4s of hook-thread stall). In-loop lookups now hit warm
+        # cache.
+        prefetched_channels: Optional[Dict[str, Dict[str, Any]]] = None
+        if not pre_paused:
+            try:
+                prefetched_channels = self._get_channels_info()
+                self._prefetch_neighbor_gossip(prefetched_channels, cfg=pre_cfg)
+            except Exception as e:
+                self.plugin.log(f"Gossip prefetch failed: {e}", level='debug')
+
         # H-2: Non-blocking concurrency guard - only one fee adjustment cycle at a time
         if not self._state_lock.acquire(blocking=False):
             self._set_last_decision_summary(
@@ -4252,11 +4271,55 @@ class FeeController:
                 )
                 self.plugin.log("Fee adjustment suppressed: revenue-ops is paused", level='info')
                 return []
-            return self._adjust_all_fees_inner()
+            return self._adjust_all_fees_inner(prefetched_channels=prefetched_channels)
         finally:
             self._state_lock.release()
 
-    def _adjust_all_fees_inner(self) -> List[FeeAdjustment]:
+    def _prefetch_neighbor_gossip(
+        self,
+        channels: Dict[str, Dict[str, Any]],
+        cfg: Optional[Any] = None,
+    ) -> None:
+        """Warm gossip_channels_{peer} cache entries that are absent/expired.
+
+        Called BEFORE _state_lock is acquired so the per-channel loop's
+        neighbor-fee lookups never issue listchannels RPCs under the lock.
+        Only touches _neighbor_fee_cache (single-writer: the fee cycle
+        thread; concurrent cycles are excluded by the non-blocking lock
+        guard right after the prefetch, and a racing duplicate prefetch
+        would only overwrite an entry with equally fresh data).
+
+        PASSIVE peers are skipped: the loop never reaches the gossip lookup
+        for them, so prefetching would ADD RPCs instead of moving them.
+        """
+        if self.data_service is None or not channels:
+            return
+        ttl_seconds = self._gossip_cache_ttl_seconds(cfg)
+        now = time.time()
+        seen_peers: set = set()
+        for info in channels.values():
+            peer_id = info.get("peer_id")
+            if not peer_id or peer_id in seen_peers:
+                continue
+            seen_peers.add(peer_id)
+            if self.policy_manager is not None:
+                try:
+                    if self.policy_manager.get_policy(peer_id).strategy == FeeStrategy.PASSIVE:
+                        continue
+                except Exception:
+                    pass
+            cached = self._neighbor_fee_cache.get(f"gossip_channels_{peer_id}")
+            if cached and (now - cached["ts"]) < ttl_seconds:
+                continue
+            try:
+                self._get_peer_inbound_channels(peer_id, ttl_seconds=ttl_seconds)
+            except Exception:
+                continue
+
+    def _adjust_all_fees_inner(
+        self,
+        prefetched_channels: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> List[FeeAdjustment]:
         """Inner implementation of adjust_all_fees, called under _state_lock."""
         adjustments = []
 
@@ -4288,9 +4351,12 @@ class FeeController:
             self.plugin.log("No channel state data for fee adjustment", level='debug')
             return adjustments
         
-        # Get current channel info for capacity and balance
-        channels = self._get_channels_info()
-        
+        # Get current channel info for capacity and balance.
+        # PERF: normally fetched (and gossip-prefetched against) BEFORE the
+        # lock by adjust_all_fees; the in-lock fetch is a fallback for direct
+        # callers and for a failed/empty pre-lock fetch.
+        channels = prefetched_channels or self._get_channels_info()
+
         # OPTIMIZATION: Hoist feerates RPC call outside the loop
         # This reduces N RPC calls to 1 per adjust_all_fees cycle
         chain_costs = self._get_dynamic_chain_costs()

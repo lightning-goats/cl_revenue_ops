@@ -525,6 +525,141 @@ class _RecordingLock:
         return False
 
 
+class TestGossipPrefetch:
+    """Item: gossip prefetch pre-lock.
+
+    The per-channel loop used to issue listchannels RPCs serially INSIDE
+    _state_lock whenever a peer's gossip cache entry had expired (~46% of
+    peers per cycle at the 3900s TTL = 18-41 lock-held RPCs). The prefetch
+    warms the gossip cache for every peer about to be processed BEFORE the
+    lock is acquired, so in-loop lookups always hit warm cache.
+    """
+
+    def _wire_gossip(self, fc, events):
+        fc.data_service = MagicMock()
+
+        def _get_channels(destination=None, **kwargs):
+            events.append(("gossip_fetch", destination))
+            return {"channels": []}
+
+        fc.data_service.get_channels.side_effect = _get_channels
+        fc.data_service.get_node_id.return_value = "02our_node_id"
+        return fc
+
+    def test_cold_cache_gossip_fetches_all_happen_before_lock(
+        self, mock_plugin, mock_database
+    ):
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        events = []
+        fc._state_lock = _RecordingLock(events)
+        self._wire_gossip(fc, events)
+
+        fc.adjust_all_fees()
+
+        fetch_indices = [
+            i for i, e in enumerate(events)
+            if isinstance(e, tuple) and e[0] == "gossip_fetch"
+        ]
+        assert fetch_indices, "Cold cache must trigger gossip prefetch"
+        lock_idx = events.index("lock_acquired")
+        late = [events[i] for i in fetch_indices if i >= lock_idx]
+        assert not late, \
+            f"Gossip RPCs ran under _state_lock: {late}"
+
+        prefetched_peers = {
+            e[1] for e in events if isinstance(e, tuple) and e[0] == "gossip_fetch"
+        }
+        assert prefetched_peers == set(PEER_IDS), \
+            "Every peer about to be processed must be prefetched"
+
+    def test_warm_cache_skips_prefetch_rpcs(self, mock_plugin, mock_database):
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        events = []
+        self._wire_gossip(fc, events)
+
+        fc.adjust_all_fees()
+        first_cycle_fetches = len(events)
+        assert first_cycle_fetches > 0
+
+        # Second cycle inside the TTL: cache is warm, no new RPCs.
+        fc.adjust_all_fees()
+        assert len(events) == first_cycle_fetches, \
+            "Warm gossip cache must not be refetched by the prefetch"
+
+    def test_expired_entries_are_refreshed_by_prefetch(
+        self, mock_plugin, mock_database
+    ):
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        events = []
+        self._wire_gossip(fc, events)
+
+        fc.adjust_all_fees()
+        # Age one peer's gossip entry past the TTL (3900s at 1800s interval)
+        key = f"gossip_channels_{PEER_IDS[0]}"
+        fc._neighbor_fee_cache[key]["ts"] = time.time() - 4000
+        before = len(events)
+
+        fc.adjust_all_fees()
+
+        new_fetches = [e for e in events[before:] if e[0] == "gossip_fetch"]
+        assert [e[1] for e in new_fetches] == [PEER_IDS[0]], \
+            "Only the expired peer should be refetched"
+
+    def test_prefetch_skips_passive_peers(self, mock_plugin, mock_database):
+        from modules.policy_manager import FeeStrategy
+
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        events = []
+        self._wire_gossip(fc, events)
+
+        passive_policy = MagicMock()
+        passive_policy.strategy = FeeStrategy.PASSIVE
+        dynamic_policy = MagicMock()
+        dynamic_policy.strategy = FeeStrategy.DYNAMIC
+        dynamic_policy.fee_ppm_target = None
+        fc.policy_manager = MagicMock()
+        fc.policy_manager.get_policy.side_effect = (
+            lambda pid: passive_policy if pid == PEER_IDS[0] else dynamic_policy
+        )
+
+        fc.adjust_all_fees()
+
+        fetched = {e[1] for e in events if e[0] == "gossip_fetch"}
+        assert PEER_IDS[0] not in fetched, \
+            "PASSIVE peers never reach the gossip lookup; don't prefetch them"
+        assert fetched == set(PEER_IDS[1:])
+
+    def test_prefetch_errors_do_not_break_cycle(self, mock_plugin, mock_database):
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        fc.data_service = MagicMock()
+        fc.data_service.get_channels.side_effect = RuntimeError("rpc down")
+        fc.data_service.get_node_id.return_value = "02our_node_id"
+
+        result = fc.adjust_all_fees()  # must not raise
+        assert isinstance(result, list)
+
+    def test_channel_info_fetched_once_before_lock(self, mock_plugin, mock_database):
+        """_get_channels_info is itself an RPC — it must run pre-lock and the
+        cycle must reuse the result instead of fetching twice."""
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        events = []
+        fc._state_lock = _RecordingLock(events)
+        base_channels_info = fc._get_channels_info()
+
+        def _recording_get_channels_info():
+            events.append("channels_info_fetch")
+            return base_channels_info
+
+        fc._get_channels_info = _recording_get_channels_info
+
+        fc.adjust_all_fees()
+
+        assert events.count("channels_info_fetch") == 1, \
+            "Channel info must be fetched exactly once per cycle"
+        assert events.index("channels_info_fetch") < events.index("lock_acquired"), \
+            "Channel info fetch must happen before _state_lock is acquired"
+
+
 class TestProfitabilityWarmup:
 
     def test_warmup_runs_before_lock_acquisition(self, mock_plugin, mock_database):
