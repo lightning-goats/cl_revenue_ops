@@ -32,6 +32,7 @@ from pyln.client import Plugin, RpcError
 
 # Import our modules
 from modules.flow_analysis import FlowAnalyzer, ChannelState
+from modules import flow_analysis as flow_analysis_mod
 from modules.fee_controller import FeeController
 from modules.rebalancer import EVRebalancer
 from modules.config import Config
@@ -7091,18 +7092,30 @@ def _build_boltz_balance_plan(
         posterior_mean = float((dts_summary or {}).get("posterior_mean", 0) or 0)
         posterior_std = float((dts_summary or {}).get("posterior_std", 200) or 200)
 
-        # Predicted depletion hours from Kalman velocity
+        # Predicted depletion hours from Kalman flow state.
         predicted_depletion_hours = None
         kalman_velocity = float(state_row.get('kalman_velocity', 0.0) or 0.0)
         kalman_ratio = float(state_row.get('kalman_flow_ratio', 0.0) or 0.0)
-        # Source channels (positive ratio = draining local): estimate hours until depleted
-        if kalman_ratio > 0.1 and local_sats > 0 and capacity_sats > 0:
-            # Velocity is flow_ratio change per hour; translate to approximate drain rate
-            # A flow_ratio of 0.5 means ~75% outbound; net drain ≈ ratio * throughput
-            # Use daily_contrib as a proxy: revenue = volume * fee_ppm / 1e6
-            # So volume ≈ revenue * 1e6 / fee_ppm (when fee > 0)
-            est_fee = max(broadcast_fee_ppm, 50)  # floor at 50 to avoid division issues
-            if daily_contrib_est > 0:
+        # Source channels (positive ratio = draining local): estimate hours
+        # until depleted. Gate lowered from 0.1 to 0.02 so mild but
+        # persistent drains are anticipated too.
+        if kalman_ratio > 0.02 and local_sats > 0 and capacity_sats > 0:
+            # Preferred: flow_analysis.estimate_depletion_hours, the pure
+            # helper with correct day-fraction units (kalman_ratio is net
+            # flow per day as a fraction of capacity). The old in-plan
+            # contrib/fee proxy below was ~7-8x off.
+            _estimate_depletion = getattr(flow_analysis_mod, "estimate_depletion_hours", None)
+            if callable(_estimate_depletion):
+                try:
+                    predicted_depletion_hours = _estimate_depletion(
+                        local_sats, capacity_sats, kalman_ratio, kalman_velocity
+                    )
+                except Exception:
+                    predicted_depletion_hours = None
+            elif daily_contrib_est > 0:
+                # Legacy proxy (helper absent): back volume out of revenue.
+                # revenue = volume * fee_ppm / 1e6 => volume ≈ revenue * 1e6 / fee_ppm
+                est_fee = max(broadcast_fee_ppm, 50)  # floor at 50 to avoid division issues
                 daily_volume_est = daily_contrib_est * 1_000_000 / est_fee
                 net_drain_sats_per_day = daily_volume_est * min(1.0, kalman_ratio)
                 if net_drain_sats_per_day > 0:
