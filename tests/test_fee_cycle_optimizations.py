@@ -823,6 +823,91 @@ class TestPeerLatencyMemo:
             "Out-of-cycle floor calculations must keep querying directly"
 
 
+class TestDtsSummaryBoundedLock:
+    """Item: get_dts_summary races the fee loop.
+
+    Called from Boltz plan builds on another thread while the fee cycle
+    holds _state_lock for the whole loop. The read must take the lock
+    (7caf3dd discipline) but with a bounded acquire so a plan build is
+    never stalled for a multi-second cycle: on contention it returns the
+    last-known snapshot (or None when there has never been one).
+    """
+
+    def test_returns_fresh_summary_under_lock(self, mock_plugin, mock_database):
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        ts = fc._get_channel_fee_state(CHANNEL_IDS[0], PEER_IDS[0])
+        ts.last_broadcast_fee_ppm = 321
+
+        summary = fc.get_dts_summary(CHANNEL_IDS[0])
+
+        assert summary is not None
+        assert summary["broadcast_fee_ppm"] == 321
+
+    def test_contended_lock_returns_last_known_snapshot(
+        self, mock_plugin, mock_database, monkeypatch
+    ):
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        monkeypatch.setattr(fc, "DTS_SUMMARY_LOCK_TIMEOUT_SECONDS", 0.05)
+        ts = fc._get_channel_fee_state(CHANNEL_IDS[0], PEER_IDS[0])
+        ts.last_broadcast_fee_ppm = 321
+        warm = fc.get_dts_summary(CHANNEL_IDS[0])  # populate the snapshot
+        assert warm["broadcast_fee_ppm"] == 321
+
+        results = {}
+        hold = threading.Event()
+        release = threading.Event()
+
+        def cycle_holder():
+            with fc._state_lock:
+                hold.set()
+                release.wait(timeout=5)
+
+        t = threading.Thread(target=cycle_holder)
+        t.start()
+        try:
+            assert hold.wait(timeout=5)
+            start = time.monotonic()
+            results["summary"] = fc.get_dts_summary(CHANNEL_IDS[0])
+            results["elapsed"] = time.monotonic() - start
+        finally:
+            release.set()
+            t.join(timeout=5)
+
+        assert results["elapsed"] < 1.0, \
+            "Contended read must not block for the whole fee cycle"
+        assert results["summary"] is not None, \
+            "Contention must serve the last-known snapshot"
+        assert results["summary"]["broadcast_fee_ppm"] == 321
+
+    def test_contended_lock_with_no_snapshot_returns_none_quickly(
+        self, mock_plugin, mock_database, monkeypatch
+    ):
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        monkeypatch.setattr(fc, "DTS_SUMMARY_LOCK_TIMEOUT_SECONDS", 0.05)
+
+        hold = threading.Event()
+        release = threading.Event()
+
+        def cycle_holder():
+            with fc._state_lock:
+                hold.set()
+                release.wait(timeout=5)
+
+        t = threading.Thread(target=cycle_holder)
+        t.start()
+        try:
+            assert hold.wait(timeout=5)
+            start = time.monotonic()
+            summary = fc.get_dts_summary(CHANNEL_IDS[0])
+            elapsed = time.monotonic() - start
+        finally:
+            release.set()
+            t.join(timeout=5)
+
+        assert summary is None
+        assert elapsed < 1.0
+
+
 class TestProfitabilityWarmup:
 
     def test_warmup_runs_before_lock_acquisition(self, mock_plugin, mock_database):

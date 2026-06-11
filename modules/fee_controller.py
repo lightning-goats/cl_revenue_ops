@@ -2372,6 +2372,11 @@ class FeeController:
         # channels to one peer pay once per cycle. Cleared at cycle start;
         # out-of-cycle floor calculations bypass it entirely.
         self._cycle_peer_latency_memo: Dict[str, Dict[str, Any]] = {}
+
+        # Last-known DTS summaries served by get_dts_summary when its
+        # bounded _state_lock acquire times out (written under the lock,
+        # read lock-free — dict.get is atomic under the GIL).
+        self._last_dts_summaries: Dict[str, Dict[str, Any]] = {}
         try:
             self._our_node_id: str = self.data_service.get_node_id() if self.data_service else self.plugin.rpc.getinfo().get("id", "")
         except Exception:
@@ -4095,6 +4100,11 @@ class FeeController:
             self._persisted_shared_fields.pop(key, None)
             pruned += 1
 
+        # Drop contention-fallback DTS snapshots for closed channels
+        for key in list(self._last_dts_summaries.keys()):
+            if key not in active_channel_ids:
+                self._last_dts_summaries.pop(key, None)
+
         # Also prune from database to prevent stale entries in debug output.
         # PERF: only the channel ids are needed here — prefer the cheap
         # id-only query over deserializing every 20-40KB v2_state_json blob.
@@ -4856,28 +4866,45 @@ class FeeController:
             reason_code=FeeReasonCode.GOSSIP_REFRESH.value
         )
 
+    # Bounded lock acquire for cross-thread DTS summary reads (seconds).
+    DTS_SUMMARY_LOCK_TIMEOUT_SECONDS = 1.0
+
     def get_dts_summary(self, channel_id: str) -> Optional[Dict[str, Any]]:
         """Return DTS posterior and cycle state summary for external consumers (e.g. Boltz planner).
 
         Returns None if no state exists for the channel.
+
+        Called from Boltz plan builds on another thread while the fee cycle
+        may hold _state_lock for the whole channel loop. Reads shared state
+        under the lock (7caf3dd discipline) but with a bounded acquire: on
+        contention the last-known snapshot is returned (None if there has
+        never been one) instead of stalling the plan build.
         """
-        fee_state = self._channel_fee_states.get(channel_id)
-        cycle_state = self._cycle_states.get(channel_id)
-        if fee_state is None and cycle_state is None:
-            return None
-        ts = fee_state.thompson if fee_state else None
-        broadcast_fee = 0
-        if fee_state:
-            broadcast_fee = fee_state.last_broadcast_fee_ppm
-        elif cycle_state:
-            broadcast_fee = cycle_state.last_broadcast_fee_ppm
-        return {
-            "posterior_mean": ts.posterior_mean if ts else None,
-            "posterior_std": ts.posterior_std if ts else None,
-            "broadcast_fee_ppm": broadcast_fee,
-            "forward_count": (fee_state.forward_count_since_update if fee_state
-                              else cycle_state.forward_count_since_update if cycle_state else 0),
-        }
+        acquired = self._state_lock.acquire(timeout=self.DTS_SUMMARY_LOCK_TIMEOUT_SECONDS)
+        if not acquired:
+            return self._last_dts_summaries.get(channel_id)
+        try:
+            fee_state = self._channel_fee_states.get(channel_id)
+            cycle_state = self._cycle_states.get(channel_id)
+            if fee_state is None and cycle_state is None:
+                return None
+            ts = fee_state.thompson if fee_state else None
+            broadcast_fee = 0
+            if fee_state:
+                broadcast_fee = fee_state.last_broadcast_fee_ppm
+            elif cycle_state:
+                broadcast_fee = cycle_state.last_broadcast_fee_ppm
+            summary = {
+                "posterior_mean": ts.posterior_mean if ts else None,
+                "posterior_std": ts.posterior_std if ts else None,
+                "broadcast_fee_ppm": broadcast_fee,
+                "forward_count": (fee_state.forward_count_since_update if fee_state
+                                  else cycle_state.forward_count_since_update if cycle_state else 0),
+            }
+            self._last_dts_summaries[channel_id] = summary
+            return summary
+        finally:
+            self._state_lock.release()
 
     def _get_fee_step_cap(
         self,
