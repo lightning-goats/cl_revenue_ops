@@ -4945,6 +4945,51 @@ class FeeController:
             "wake_damping_applied": woke_from_sleep,
         }
     
+    def _detect_congestion(self, state: Optional[Dict[str, Any]],
+                           channel_info: Optional[Dict[str, Any]],
+                           cfg) -> bool:
+        """F4 (2026-06 audit): congestion signal for the fee cycle.
+
+        The fee cycle used to trust state='congested' from the hourly flow
+        snapshot verbatim. Two failure modes:
+        - a transient HTLC burst at the sampling instant held doubled fees
+          for up to an hour;
+        - flow-analysis RPC failures left the stale label in place
+          indefinitely (no TTL).
+
+        Resolution order:
+        (a) When the channel info in hand carries live HTLC data, recompute
+            utilization NOW, counting only our-direction (outgoing) HTLCs
+            against max_accepted_htlcs (the snapshot counted both directions,
+            overstating utilization). Live data is authoritative both ways.
+        (b) Otherwise fall back to the snapshot label, but ignore it once the
+            flow row's updated_at is older than 2x flow_interval. A row
+            without a usable timestamp is treated as fresh (the production
+            schema makes updated_at NOT NULL; only synthetic rows lack it).
+        """
+        # (a) live HTLC utilization from the channel info already in hand
+        if channel_info and channel_info.get("has_htlc_data"):
+            try:
+                max_htlcs = int(channel_info.get("max_accepted_htlcs") or 0)
+                if max_htlcs > 0:
+                    our_htlcs = int(channel_info.get("our_htlcs_in_flight") or 0)
+                    return (our_htlcs / max_htlcs) > cfg.htlc_congestion_threshold
+            except (TypeError, ValueError, AttributeError):
+                pass  # malformed live data — fall back to the snapshot
+
+        # (b) snapshot fallback with staleness TTL
+        if not state or state.get("state") != "congested":
+            return False
+        try:
+            updated_at = int(state.get("updated_at") or 0)
+            if updated_at > 0:
+                max_age = 2 * int(cfg.flow_interval)
+                if (int(time.time()) - updated_at) > max_age:
+                    return False  # stale label — flow analysis stopped updating
+        except (TypeError, ValueError, AttributeError):
+            pass  # no usable timestamp — treat as fresh
+        return True
+
     def _adjust_channel_fee(self, channel_id: str, peer_id: str,
                            state: Dict[str, Any],
                            channel_info: Dict[str, Any],
@@ -5015,8 +5060,10 @@ class FeeController:
         composite_hint_bias = 1.0
         exploration_multiplier = 1.0
 
-        # Detect critical state
-        is_congested = (state and state.get("state") == "congested")
+        # Detect critical state.
+        # F4 (2026-06 audit): live HTLC recomputation + staleness TTL instead
+        # of trusting the hourly flow snapshot's frozen 'congested' label.
+        is_congested = self._detect_congestion(state, channel_info, cfg)
 
         # =====================================================================
         # Legacy DB probe flag now means bounded low-fee exploration.
@@ -7589,6 +7636,18 @@ class FeeController:
                         channel, local_updates
                     )
 
+                    # F4: carry live HTLC slot usage for in-cycle congestion
+                    # recomputation. Only OUR-direction (outgoing) HTLCs count
+                    # against max_accepted_htlcs. has_htlc_data distinguishes
+                    # "no HTLCs in flight" from "source omitted the array".
+                    htlcs = channel.get("htlcs")
+                    has_htlc_data = isinstance(htlcs, list)
+                    our_htlcs_in_flight = (
+                        sum(1 for h in htlcs
+                            if isinstance(h, dict) and h.get("direction") == "out")
+                        if has_htlc_data else 0
+                    )
+
                     channels[canonical_channel_id] = {
                         "channel_id": canonical_channel_id,
                         "short_channel_id": short_channel_id,
@@ -7604,6 +7663,10 @@ class FeeController:
                         "htlc_maximum_msat": htlc_maximum_msat,
                         "htlc_max_msat": htlc_maximum_msat,
                         "opener": channel.get("opener", "local"),
+                        # F4: live HTLC slot usage (our direction only)
+                        "has_htlc_data": has_htlc_data,
+                        "max_accepted_htlcs": channel.get("max_accepted_htlcs", 483),
+                        "our_htlcs_in_flight": our_htlcs_in_flight,
                     }
                     
         except RpcError as e:

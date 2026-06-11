@@ -52,6 +52,8 @@ def _make_config_snapshot(**overrides):
         'min_fee_ppm': 10,
         'max_fee_ppm': 5000,
         'fee_interval': 1800,
+        'flow_interval': 3600,
+        'htlc_congestion_threshold': 0.8,
         'inbound_fee_estimate_ppm': 200,
         'thompson_prior_std_fee': 200.0,
         'routing_intelligence_enabled': False,
@@ -341,6 +343,169 @@ class TestFeePriorityChain:
         # Congestion should win over probe
         assert result.reason_code == FeeReasonCode.CONGESTION.value
         assert result.reason.startswith("CONGESTION:")
+
+
+# =============================================================================
+# F4 (2026-06 audit): congestion staleness + live HTLC recomputation
+# =============================================================================
+
+class TestF4CongestionStaleness:
+    """state='congested' from the hourly flow snapshot froze a single
+    sampling instant: a transient HTLC burst held doubled fees for up to an
+    hour, and RPC failures left stale labels in place indefinitely."""
+
+    def _make_fc_with_state(self, mock_plugin, mock_database):
+        return TestFeePriorityChain._make_fc_with_state(
+            self, mock_plugin, mock_database
+        )
+
+    def _channel_info(self, **extra):
+        info = {
+            "fee_proportional_millionths": 100,
+            "capacity": 2_000_000,
+            "spendable_msat": "1000000000msat",
+        }
+        info.update(extra)
+        return info
+
+    def test_stale_congested_row_does_not_trigger_congestion(
+            self, mock_plugin, mock_database):
+        """A congested label older than 2x flow_interval is ignored."""
+        fc, cfg = self._make_fc_with_state(mock_plugin, mock_database)
+        state = {
+            "state": "congested", "forward_count": 50,
+            "updated_at": int(time.time()) - 3 * cfg.flow_interval,
+        }
+        result = fc._adjust_channel_fee(
+            "123x456x0", "02" + "a" * 64, state, self._channel_info(), cfg=cfg
+        )
+        if result is not None:
+            assert result.reason_code != FeeReasonCode.CONGESTION.value
+
+    def test_fresh_congested_row_triggers_congestion(
+            self, mock_plugin, mock_database):
+        """A recent congested label (within 2x flow_interval) still fires."""
+        fc, cfg = self._make_fc_with_state(mock_plugin, mock_database)
+        state = {
+            "state": "congested", "forward_count": 50,
+            "updated_at": int(time.time()) - 60,
+        }
+        result = fc._adjust_channel_fee(
+            "123x456x0", "02" + "a" * 64, state, self._channel_info(), cfg=cfg
+        )
+        assert result is not None
+        assert result.reason_code == FeeReasonCode.CONGESTION.value
+
+    def test_live_htlc_data_clears_transient_burst(
+            self, mock_plugin, mock_database):
+        """Fresh congested snapshot, but live HTLC count is low: the burst
+        passed, so the congestion branch must not hold fees doubled."""
+        fc, cfg = self._make_fc_with_state(mock_plugin, mock_database)
+        state = {
+            "state": "congested", "forward_count": 50,
+            "updated_at": int(time.time()) - 60,
+        }
+        info = self._channel_info(
+            has_htlc_data=True, max_accepted_htlcs=483, our_htlcs_in_flight=3,
+        )
+        result = fc._adjust_channel_fee(
+            "123x456x0", "02" + "a" * 64, state, info, cfg=cfg
+        )
+        if result is not None:
+            assert result.reason_code != FeeReasonCode.CONGESTION.value
+
+    def test_live_htlc_data_detects_fresh_congestion(
+            self, mock_plugin, mock_database):
+        """Snapshot says balanced but the channel is congested RIGHT NOW."""
+        fc, cfg = self._make_fc_with_state(mock_plugin, mock_database)
+        state = {
+            "state": "balanced", "forward_count": 50,
+            "updated_at": int(time.time()) - 60,
+        }
+        info = self._channel_info(
+            has_htlc_data=True, max_accepted_htlcs=483, our_htlcs_in_flight=400,
+        )
+        result = fc._adjust_channel_fee(
+            "123x456x0", "02" + "a" * 64, state, info, cfg=cfg
+        )
+        assert result is not None
+        assert result.reason_code == FeeReasonCode.CONGESTION.value
+
+    def test_detect_congestion_unit(self, mock_plugin, mock_database):
+        fc, cfg = self._make_fc_with_state(mock_plugin, mock_database)
+        now = int(time.time())
+
+        # Fresh label, no live data -> congested
+        assert fc._detect_congestion(
+            {"state": "congested", "updated_at": now - 60}, {}, cfg
+        ) is True
+        # Stale label -> not congested
+        assert fc._detect_congestion(
+            {"state": "congested", "updated_at": now - 3 * cfg.flow_interval},
+            {}, cfg
+        ) is False
+        # Live data overrides fresh label downward
+        assert fc._detect_congestion(
+            {"state": "congested", "updated_at": now - 60},
+            {"has_htlc_data": True, "max_accepted_htlcs": 483,
+             "our_htlcs_in_flight": 3},
+            cfg
+        ) is False
+        # Live data overrides balanced label upward
+        assert fc._detect_congestion(
+            {"state": "balanced", "updated_at": now - 60},
+            {"has_htlc_data": True, "max_accepted_htlcs": 483,
+             "our_htlcs_in_flight": 400},
+            cfg
+        ) is True
+        # No state row at all
+        assert fc._detect_congestion(None, {}, cfg) is False
+
+    def test_get_channels_info_counts_only_our_direction_htlcs(
+            self, mock_plugin, mock_database):
+        """Only out-direction HTLCs count against max_accepted_htlcs; the
+        snapshot's both-direction count overstated utilization."""
+        fc, _ = self._make_fc_with_state(mock_plugin, mock_database)
+        fc.data_service = MagicMock()
+        fc.data_service.get_peer_channels.return_value = {
+            "channels": [{
+                "state": "CHANNELD_NORMAL",
+                "short_channel_id": "123x456x0",
+                "peer_id": "02" + "a" * 64,
+                "total_msat": 2_000_000_000,
+                "spendable_msat": 1_000_000_000,
+                "receivable_msat": 1_000_000_000,
+                "max_accepted_htlcs": 483,
+                "htlcs": [
+                    {"direction": "out"}, {"direction": "out"},
+                    {"direction": "in"}, {"direction": "in"},
+                    {"direction": "in"},
+                ],
+            }]
+        }
+        channels = fc._get_channels_info()
+        info = channels["123x456x0"]
+        assert info["has_htlc_data"] is True
+        assert info["max_accepted_htlcs"] == 483
+        assert info["our_htlcs_in_flight"] == 2
+
+    def test_get_channels_info_without_htlc_array(
+            self, mock_plugin, mock_database):
+        """No htlcs key -> live recomputation must not claim 0 utilization."""
+        fc, _ = self._make_fc_with_state(mock_plugin, mock_database)
+        fc.data_service = MagicMock()
+        fc.data_service.get_peer_channels.return_value = {
+            "channels": [{
+                "state": "CHANNELD_NORMAL",
+                "short_channel_id": "123x456x0",
+                "peer_id": "02" + "a" * 64,
+                "total_msat": 2_000_000_000,
+                "spendable_msat": 1_000_000_000,
+                "receivable_msat": 1_000_000_000,
+            }]
+        }
+        channels = fc._get_channels_info()
+        assert channels["123x456x0"]["has_htlc_data"] is False
 
 
 # =============================================================================
