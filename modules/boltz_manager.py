@@ -173,6 +173,13 @@ class BoltzCliManager:
         Uses the capex engine's attribute_boltz_cost() for the split.
         Without an engine, all cost is attributed to tactical (safe default).
 
+        NOTE (2026-06 audit): the 50/50 channel/tactical split returned by
+        attribute_boltz_cost() is INFORMATIONAL ONLY — it is dead-lettered.
+        record_boltz_spend() writes the FULL fee once into the unified
+        "boltz" spend category; the split is only persisted as journal
+        metadata (capex_attribution) and never depletes either budget
+        partially. Do not treat the split as budget accounting.
+
         Returns:
             {"channel": amount_sats, "tactical": amount_sats}
         """
