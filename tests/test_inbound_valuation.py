@@ -733,3 +733,151 @@ class TestFleetPnlMsat:
         assert summary['gross_revenue_sats'] >= 1, (
             "Sub-satoshi fees should not be truncated to 0 at fleet level"
         )
+
+
+class TestSourcedFeeDecay:
+    """Audit F2: sourced-fee close protection must decay.
+
+    The DATA side: ChannelProfitability exposes sourced_fee_30d_msat and
+    role_30d so the capacity-planner close gate can consume windowed values
+    instead of all-time aggregates that protect a channel forever.
+    """
+
+    def _make_prof(self, sourced_lifetime_sats, sourced_30d_msat,
+                   sourced_fwd_lifetime=200, sourced_fwd_30d=0,
+                   window_available=True):
+        from modules.profitability_analyzer import (
+            ChannelRevenue, ChannelProfitability, ChannelCosts,
+            ProfitabilityClass,
+        )
+        rev = ChannelRevenue(
+            channel_id="100x1x0",
+            fees_earned_msat=0,
+            volume_routed_msat=0,
+            forward_count=0,
+            sourced_volume_msat=sourced_lifetime_sats * 1_000_000,
+            sourced_fee_contribution_msat=sourced_lifetime_sats * 1000,
+            sourced_forward_count=sourced_fwd_lifetime,
+        )
+        costs = ChannelCosts(
+            channel_id="100x1x0", peer_id="02" + "a" * 64,
+            open_cost_sats=1000, rebalance_cost_sats=0,
+        )
+        return ChannelProfitability(
+            channel_id="100x1x0",
+            peer_id="02" + "a" * 64,
+            capacity_sats=2_000_000,
+            costs=costs,
+            revenue=rev,
+            net_profit_sats=0,
+            roi_percent=0.0,
+            classification=ProfitabilityClass.BREAK_EVEN,
+            cost_per_sat_routed=0.0,
+            fee_per_sat_routed=0.0,
+            days_open=800,
+            last_routed=int(time.time()) - 86400 * 700,
+            sourced_fee_30d_msat=sourced_30d_msat,
+            sourced_forward_count_30d=sourced_fwd_30d,
+            window_30d_available=window_available,
+        )
+
+    def test_ancient_sourcer_exposes_zero_30d_sourced_fees(self):
+        """5000 sats sourced two years ago, zero in 30d -> windowed field is 0."""
+        prof = self._make_prof(sourced_lifetime_sats=5000, sourced_30d_msat=0)
+        assert prof.revenue.sourced_fee_contribution_msat == 5_000_000
+        assert prof.sourced_fee_30d_msat == 0
+
+    def test_ancient_gateway_role_30d_decays_to_dormant(self):
+        """Lifetime INBOUND_GATEWAY with no 30d forwards -> role_30d DORMANT."""
+        from modules.profitability_analyzer import ChannelRole
+        prof = self._make_prof(sourced_lifetime_sats=5000, sourced_30d_msat=0)
+        assert prof.channel_role == ChannelRole.INBOUND_GATEWAY
+        assert prof.role_30d == ChannelRole.DORMANT
+
+    def test_active_gateway_role_30d_stays_gateway(self):
+        """A currently-sourcing gateway keeps INBOUND_GATEWAY in the window."""
+        from modules.profitability_analyzer import ChannelRole
+        prof = self._make_prof(
+            sourced_lifetime_sats=5000, sourced_30d_msat=120_000,
+            sourced_fwd_30d=40,
+        )
+        assert prof.role_30d == ChannelRole.INBOUND_GATEWAY
+
+    def test_role_30d_falls_back_to_lifetime_without_window(self):
+        """Objects without windowed data fall back to the lifetime role."""
+        from modules.profitability_analyzer import ChannelRole
+        prof = self._make_prof(
+            sourced_lifetime_sats=5000, sourced_30d_msat=0,
+            window_available=False,
+        )
+        assert prof.role_30d == ChannelRole.INBOUND_GATEWAY
+
+    def test_role_30d_balanced_flow(self):
+        """Mixed 30d flow classifies BALANCED in the window."""
+        from modules.profitability_analyzer import ChannelRole
+        prof = self._make_prof(
+            sourced_lifetime_sats=5000, sourced_30d_msat=50_000,
+            sourced_fwd_30d=10,
+        )
+        prof.forward_count_30d = 10
+        assert prof.role_30d == ChannelRole.BALANCED
+
+    def test_analyze_channel_exposes_windowed_sourced_fees(self):
+        """End-to-end: analyze_channel wires sourced 30d fees from the P&L."""
+        from modules.profitability_analyzer import (
+            ChannelProfitabilityAnalyzer as ProfitabilityAnalyzer, ChannelCosts,
+        )
+        mock_plugin = MagicMock()
+        mock_db = MagicMock()
+        mock_db.get_channel_revenue_totals.return_value = {
+            "fees_earned_msat": 0,
+            "volume_routed_msat": 0,
+            "forward_count": 0,
+            "sourced_volume_msat": 5_000_000_000,
+            "sourced_fee_contribution_msat": 5_000_000,  # 5000 sats lifetime
+            "sourced_forward_count": 200,
+        }
+        # Dead 30d window
+        mock_db.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 0,
+            'total_contribution_sats': 0,
+            'rebalance_cost_sats': 0,
+            'direct_revenue_msat': 0,
+            'sourced_fee_contribution_msat': 0,
+            'direct_forward_count': 0,
+            'sourced_forward_count': 0,
+        }
+        mock_db.get_last_forward_time_any_direction.return_value = (
+            int(time.time()) - 86400 * 700)
+        mock_db.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 0, "last_success_time": None,
+        }
+
+        analyzer = ProfitabilityAnalyzer.__new__(ProfitabilityAnalyzer)
+        analyzer.plugin = mock_plugin
+        analyzer.database = mock_db
+        analyzer.hive_hints = None
+        analyzer._profitability_cache = {}
+        analyzer._cache_timestamp = 0
+        analyzer._cache_ttl = 300
+        analyzer._bleeder_cache = None
+        analyzer._bleeder_cache_time = 0
+
+        peer_id = "02" + "b" * 64
+        analyzer._get_channel_costs = lambda *args, **kwargs: ChannelCosts(
+            channel_id="100x1x0", peer_id=peer_id,
+            open_cost_sats=500, rebalance_cost_sats=0,
+        )
+        channel_info = {
+            "peer_id": peer_id,
+            "capacity": 2_000_000,
+            "funding_txid": "abc123",
+            "opener": "local",
+            "open_timestamp": int(time.time()) - 86400 * 800,
+        }
+
+        result = analyzer.analyze_channel("100x1x0", channel_info=channel_info)
+        assert result is not None
+        assert result.revenue.sourced_fee_contribution_msat == 5_000_000
+        assert result.sourced_fee_30d_msat == 0
+        assert result.window_30d_available is True
