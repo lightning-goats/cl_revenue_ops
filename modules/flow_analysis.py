@@ -269,6 +269,10 @@ class KalmanFlowState:
 TEMPORAL_GRADUATION_DAYS = 7
 TEMPORAL_MIN_DAILY_FORWARDS = 10
 TEMPORAL_EMA_ALPHA = 0.3
+# F5 (2026-06 audit): the hourly histogram spans this many days; forward
+# counts summed across it must be divided by this before comparison against
+# the per-DAY graduation threshold above.
+TEMPORAL_HISTOGRAM_WINDOW_DAYS = 7
 
 
 @dataclass
@@ -288,6 +292,9 @@ class TemporalProfile:
     diurnal_strength: float = 0.0
     dominant_bucket: str = "unknown"
     observation_days: int = 0
+    # F5: epoch day (unix_ts // 86400) of the last counted observation day,
+    # so observation_days advances once per DAY, not once per hourly cycle.
+    last_observation_day: int = 0
     last_updated: int = 0
 
     @property
@@ -347,6 +354,7 @@ class TemporalProfile:
             "diurnal_strength": self.diurnal_strength,
             "dominant_bucket": self.dominant_bucket,
             "observation_days": self.observation_days,
+            "last_observation_day": self.last_observation_day,
             "last_updated": self.last_updated,
         }
 
@@ -371,6 +379,7 @@ class TemporalProfile:
         tp.diurnal_strength = d.get("diurnal_strength", 0.0)
         tp.dominant_bucket = d.get("dominant_bucket", "unknown")
         tp.observation_days = d.get("observation_days", 0)
+        tp.last_observation_day = d.get("last_observation_day", 0)
         tp.last_updated = d.get("last_updated", 0)
         return tp
 
@@ -383,7 +392,9 @@ def update_temporal_profile(existing: TemporalProfile,
     Args:
         existing: The previous TemporalProfile (may be empty/fresh)
         histogram: List of 24 dicts from _hourly_forward_histogram_sql
-        daily_forwards: Total forwards today (for graduation check)
+        daily_forwards: AVERAGE forwards per day over the histogram window
+            (F5: callers must divide window totals by the window length
+            before comparing against the per-day graduation threshold)
 
     Returns:
         Updated TemporalProfile with blended values and recomputed derived fields.
@@ -410,9 +421,17 @@ def update_temporal_profile(existing: TemporalProfile,
     # Carry forward metadata
     updated.dominant_bucket = existing.dominant_bucket
     updated.observation_days = existing.observation_days
-    if daily_forwards >= TEMPORAL_MIN_DAILY_FORWARDS:
+    updated.last_observation_day = existing.last_observation_day
+    # F5: observation_days advances at most once per calendar (epoch) DAY.
+    # It used to increment every hourly cycle, graduating profiles ~24x too
+    # fast against the TEMPORAL_GRADUATION_DAYS threshold.
+    now = int(time.time())
+    today = now // 86400
+    if (daily_forwards >= TEMPORAL_MIN_DAILY_FORWARDS
+            and today != existing.last_observation_day):
         updated.observation_days += 1
-    updated.last_updated = int(time.time())
+        updated.last_observation_day = today
+    updated.last_updated = now
 
     # Recompute derived fields
     updated._recompute_derived()
@@ -1520,7 +1539,9 @@ class FlowAnalyzer:
         )
         if callable(get_all_hist):
             try:
-                histograms_all = get_all_hist(window_days=7)
+                histograms_all = get_all_hist(
+                    window_days=TEMPORAL_HISTOGRAM_WINDOW_DAYS
+                )
             except Exception:
                 histograms_all = None
         if not isinstance(histograms_all, dict):
@@ -1595,10 +1616,17 @@ class FlowAnalyzer:
 
             # Get hourly histogram from forwards (unless prefetched)
             if histogram is None:
-                histogram = self.database.get_hourly_forward_histogram(channel_id, window_days=7)
+                histogram = self.database.get_hourly_forward_histogram(
+                    channel_id, window_days=TEMPORAL_HISTOGRAM_WINDOW_DAYS
+                )
 
-            # Average daily forwards across the histogram window for graduation check
-            avg_daily_forwards = sum(h.get("count", 0) for h in histogram)
+            # Average daily forwards across the histogram window for the
+            # graduation check. F5: this was the 7-day TOTAL compared against
+            # a per-day threshold, letting ~1.4 forwards/day graduate.
+            avg_daily_forwards = (
+                sum(h.get("count", 0) for h in histogram)
+                / float(TEMPORAL_HISTOGRAM_WINDOW_DAYS)
+            )
 
             # Load existing profile
             profile_json = self.database.load_temporal_profile(channel_id)

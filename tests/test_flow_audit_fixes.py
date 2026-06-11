@@ -539,3 +539,106 @@ class TestF7NoFlowFallback:
 
         analyzer, _ = _make_analyzer()
         assert self._metrics(analyzer, 0.50).state == ChannelState.DORMANT
+
+
+# =========================================================================
+# F5: temporal profile graduation accounting honesty
+# =========================================================================
+
+def _histogram(total_count, total_out=100_000):
+    """24-bucket histogram spreading counts/sats evenly."""
+    return [
+        {"out_sats": total_out / 24.0, "in_sats": 0, "count": total_count / 24.0}
+        for _ in range(24)
+    ]
+
+
+class TestF5TemporalAccounting:
+    """avg_daily_forwards was the 7-day TOTAL compared against a daily
+    threshold, and observation_days incremented once per HOURLY cycle —
+    profiles 'graduated' ~24x too fast on ~7x too little traffic."""
+
+    def test_avg_daily_forwards_is_daily_not_window_total(self):
+        """35 forwards over the 7-day window = 5/day < 10 threshold:
+        observation_days must NOT advance (the old total of 35 passed)."""
+        import json
+
+        analyzer, db = _make_analyzer()
+        db.load_temporal_profile.return_value = None
+        row = analyzer._update_temporal_profile(
+            "100x1x0", histogram=_histogram(35), fee_state={}, defer_save=True
+        )
+        profile = json.loads(row["profile_json"])
+        assert profile["observation_days"] == 0
+
+    def test_sufficient_daily_traffic_advances_observation_days(self):
+        """105 forwards over 7 days = 15/day >= 10 threshold."""
+        import json
+
+        analyzer, db = _make_analyzer()
+        db.load_temporal_profile.return_value = None
+        row = analyzer._update_temporal_profile(
+            "100x1x0", histogram=_histogram(105), fee_state={}, defer_save=True
+        )
+        profile = json.loads(row["profile_json"])
+        assert profile["observation_days"] == 1
+
+    def test_observation_days_increment_once_per_day(self):
+        """24 hourly cycles within the same day add at most ONE observation
+        day (the old code added 24)."""
+        from modules.flow_analysis import (
+            TemporalProfile, update_temporal_profile,
+        )
+
+        profile = TemporalProfile()
+        for _ in range(24):
+            profile = update_temporal_profile(
+                profile, _histogram(105), daily_forwards=15
+            )
+        assert profile.observation_days == 1
+
+    def test_observation_days_advance_on_new_day(self):
+        from modules.flow_analysis import (
+            TemporalProfile, update_temporal_profile,
+        )
+
+        profile = TemporalProfile()
+        profile = update_temporal_profile(
+            profile, _histogram(105), daily_forwards=15
+        )
+        assert profile.observation_days == 1
+        # Pretend the last qualifying observation was yesterday
+        profile.last_observation_day -= 1
+        profile = update_temporal_profile(
+            profile, _histogram(105), daily_forwards=15
+        )
+        assert profile.observation_days == 2
+
+    def test_last_observation_day_survives_roundtrip(self):
+        from modules.flow_analysis import TemporalProfile
+
+        profile = TemporalProfile()
+        profile.observation_days = 3
+        profile.last_observation_day = 20_000
+        restored = TemporalProfile.from_dict(profile.to_dict())
+        assert restored.observation_days == 3
+        assert restored.last_observation_day == 20_000
+
+    def test_graduation_still_requires_seven_days(self):
+        """End-to-end: 7 qualifying days graduate the profile; the hourly
+        cycle alone cannot."""
+        from modules.flow_analysis import (
+            TemporalProfile, update_temporal_profile,
+        )
+
+        profile = TemporalProfile()
+        for day in range(7):
+            # several cycles within the same day
+            for _ in range(3):
+                profile = update_temporal_profile(
+                    profile, _histogram(105), daily_forwards=15
+                )
+            assert profile.observation_days == day + 1
+            assert profile.graduated == (day + 1 >= 7)
+            profile.last_observation_day -= 1  # advance to "next day"
+        assert profile.graduated
