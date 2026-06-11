@@ -59,6 +59,10 @@ SOURCE_UTILIZATION_DISCOUNT = 0.5
 # route cost as an expected-retry penalty.
 FAILURE_COST_RATE = 0.25
 
+# Sentinel distinguishing "caller did not supply an anchor row" from "caller
+# looked the anchor up and found none" in _effective_dest_cooldown_secs.
+_ANCHOR_UNSET = object()
+
 
 @dataclass
 class CycleResult:
@@ -762,6 +766,24 @@ class RebalanceEngine:
             pass
         return self._our_id
 
+    def _get_post_rebalance_anchor(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch the channel's post-rebalance anchor row (best-effort).
+
+        One point query feeds BOTH the fill-fraction cooldown helper and the
+        drift override in _build_snapshot, so the snapshot loop fetches the
+        anchor once per cooled channel and passes it to both consumers.
+        """
+        if self.database is None:
+            return None
+        getter = getattr(self.database, "get_last_post_rebalance_state", None)
+        if not callable(getter):
+            return None
+        try:
+            anchor = getter(channel_id)
+        except Exception:
+            return None
+        return anchor if isinstance(anchor, dict) else None
+
     def _effective_dest_cooldown_secs(
         self,
         channel_id: str,
@@ -770,6 +792,7 @@ class RebalanceEngine:
         local_sats: int,
         base_cooldown_secs: int,
         target_band_low: float,
+        anchor: Any = _ANCHOR_UNSET,
     ) -> int:
         """Audit F7: scale the post-success cooldown by fill fraction.
 
@@ -788,16 +811,16 @@ class RebalanceEngine:
         A channel at/above the band floor has no remaining gap — its refill
         completed, so the full cooldown applies. Any lookup failure falls
         back to the full (conservative) cooldown.
+
+        Callers that already hold the channel's anchor row pass it via
+        ``anchor`` (None meaning "looked up, none found") to avoid a second
+        identical point query; when the kwarg is omitted the helper fetches
+        the anchor itself.
         """
-        if self.database is None or capacity_sats <= 0:
+        if capacity_sats <= 0:
             return base_cooldown_secs
-        getter = getattr(self.database, "get_last_post_rebalance_state", None)
-        if not callable(getter):
-            return base_cooldown_secs
-        try:
-            anchor = getter(channel_id)
-        except Exception:
-            return base_cooldown_secs
+        if anchor is _ANCHOR_UNSET:
+            anchor = self._get_post_rebalance_anchor(channel_id)
         if not isinstance(anchor, dict):
             return base_cooldown_secs
         try:
@@ -934,8 +957,12 @@ class RebalanceEngine:
             # Cooldown: skip if rebalanced recently. Audit F7: the effective
             # cooldown scales with the last rebalance's fill fraction so a
             # tiny partial fill does not block the destination for the full
-            # window (see _effective_dest_cooldown_secs).
+            # window (see _effective_dest_cooldown_secs). The anchor row is
+            # fetched ONCE per cooled channel and shared with the drift
+            # override below — two point queries per cooled channel doubled
+            # the snapshot's DB cost at scale.
             cooldown = False
+            anchor: Optional[Dict[str, Any]] = None
             if self.database and cooldown_secs > 0:
                 try:
                     if last_rebalance_times is not None:
@@ -943,12 +970,14 @@ class RebalanceEngine:
                     else:
                         last_ts = self.database.get_last_rebalance_time(scid)
                     if last_ts and (int(time.time()) - last_ts) < cooldown_secs:
+                        anchor = self._get_post_rebalance_anchor(scid)
                         effective_secs = self._effective_dest_cooldown_secs(
                             scid,
                             capacity_sats=capacity_sats,
                             local_sats=local_sats,
                             base_cooldown_secs=cooldown_secs,
                             target_band_low=target_band_low,
+                            anchor=anchor,
                         )
                         cooldown = (int(time.time()) - last_ts) < effective_secs
                 except Exception:
@@ -957,7 +986,8 @@ class RebalanceEngine:
             # Phase 3.3: drift override using anchor state from the last
             # successful rebalance. If the channel has dropped materially
             # below the post-rebalance local ratio, treat it as drifted and
-            # let the destination role bypass the cooldown gate.
+            # let the destination role bypass the cooldown gate. Reuses the
+            # anchor fetched for the cooldown helper above.
             cooldown_override = False
             if cooldown and self.database is not None:
                 drift_threshold_raw = getattr(
@@ -968,10 +998,6 @@ class RebalanceEngine:
                 else:
                     drift_threshold = 0.0
                 if drift_threshold > 0.0 and capacity_sats > 0:
-                    try:
-                        anchor = self.database.get_last_post_rebalance_state(scid)
-                    except Exception:
-                        anchor = None
                     if anchor and anchor.get("post_local_ratio") is not None:
                         current_ratio = local_sats / capacity_sats
                         anchor_ratio = float(anchor["post_local_ratio"])
