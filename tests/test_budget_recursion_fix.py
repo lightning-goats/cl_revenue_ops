@@ -209,3 +209,19 @@ class TestBudgetStatusMemoization:
         second = mod._total_cost_budget_status(window_hours=24)
 
         assert second["effective_budget_sats"] == 5000
+
+    def test_nested_component_mutation_does_not_poison_memo(self):
+        # dict(entry) was a SHALLOW copy: nested components/category dicts
+        # were shared with the memo, so a caller mutating its returned copy
+        # poisoned every cached read for the TTL window.
+        mod = self._module()
+
+        first = mod._total_cost_budget_status(window_hours=24)
+        clean_components = first["components"]["rebalance"].get("spent_24h_sats")
+        first["components"]["rebalance"]["spent_24h_sats"] = 999_999
+        first["actual_spent_by_category"]["rebalance"] = 999_999
+
+        second = mod._total_cost_budget_status(window_hours=24)
+
+        assert second["components"]["rebalance"]["spent_24h_sats"] == clean_components
+        assert second["actual_spent_by_category"]["rebalance"] != 999_999

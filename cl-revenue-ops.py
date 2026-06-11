@@ -16,6 +16,7 @@ Author: Lightning Goats Team
 License: MIT
 """
 
+import copy
 import os
 import time
 import json
@@ -6417,11 +6418,15 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
     wh = int(window_hours or 24)
     wh = max(1, min(168, wh))
 
-    # Fast path: fresh memoized value for this window.
+    # Fast path: fresh memoized value for this window. deepcopy, not
+    # dict(): a shallow copy shares the nested components/category dicts
+    # with the memo, so a caller mutating its copy would poison every
+    # cached read for the TTL window. The dict is small and the 30s TTL
+    # makes the copy cost irrelevant.
     with _total_cost_budget_memo_lock:
         entry = _total_cost_budget_memo.get(wh)
         if entry is not None and (time.monotonic() - entry[0]) < _TOTAL_COST_BUDGET_MEMO_TTL_SECONDS:
-            return dict(entry[1])
+            return copy.deepcopy(entry[1])
 
     # Re-entrancy guard: never recurse into a full recomputation. Prefer the
     # last known value for this window (even if stale); otherwise return a
@@ -6430,7 +6435,7 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
         with _total_cost_budget_memo_lock:
             entry = _total_cost_budget_memo.get(wh)
             if entry is not None:
-                return dict(entry[1])
+                return copy.deepcopy(entry[1])
         return {"error": "reentrant total-cost budget evaluation", "window_hours": wh}
 
     _total_cost_budget_reentry.active = True
@@ -6441,7 +6446,9 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
 
     if isinstance(result, dict) and "error" not in result:
         with _total_cost_budget_memo_lock:
-            _total_cost_budget_memo[wh] = (time.monotonic(), dict(result))
+            # deepcopy: the freshly computed result is returned to the
+            # caller, which must not share nested dicts with the memo.
+            _total_cost_budget_memo[wh] = (time.monotonic(), copy.deepcopy(result))
     return result
 
 
