@@ -1059,6 +1059,69 @@ class TestFleetTier:
         assert budget.tier == "fleet"
         assert budget.budget_msat > 0
 
+class TestMarginalRoiBudgetMultiplier:
+    """Audit F6: the success-rate discount double-penalized (v2 already
+    divides effective cost by sr) and mispredicted (failed attempts cost ~0).
+    Budgets now scale by clamp(1 + marginal_roi, 0.25, 1.5)."""
+
+    def _engine_with_sr(self, marginal_roi, sr=0.5, total=10,
+                        marginal_roi_reliable=True):
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=1_000_000,
+                    total_forward_count=50,
+                    marginal_roi=marginal_roi,
+                    marginal_roi_reliable=marginal_roi_reliable,
+                ),
+            },
+        )
+        engine._database.get_channel_rebalance_success_rate.return_value = {
+            "success_rate": sr, "total": total,
+        }
+        return engine
+
+    def test_low_sr_with_positive_marginal_roi_keeps_full_budget(self):
+        """50%-sr channel with positive marginal ROI is not halved anymore."""
+        engine = self._engine_with_sr(marginal_roi=0.30, sr=0.5)
+        alloc = engine.compute_allocations()
+        b = alloc.channel_budgets["100x1x0"]
+        # raw = 1_000_000 * 0.5 = 500_000 msat; multiplier = 1.3
+        assert b.budget_msat == 650_000
+        assert b.budget_msat >= 500_000  # at least the undiscounted budget
+
+    def test_negative_marginal_roi_cuts_budget(self):
+        engine = self._engine_with_sr(marginal_roi=-0.60, sr=0.9)
+        alloc = engine.compute_allocations()
+        b = alloc.channel_budgets["100x1x0"]
+        # multiplier = 1 - 0.6 = 0.4
+        assert b.budget_msat == 200_000
+
+    def test_multiplier_floor_quarter(self):
+        engine = self._engine_with_sr(marginal_roi=-2.0)
+        alloc = engine.compute_allocations()
+        assert alloc.channel_budgets["100x1x0"].budget_msat == 125_000  # 0.25x
+
+    def test_multiplier_cap_1_5(self):
+        engine = self._engine_with_sr(marginal_roi=4.0)
+        alloc = engine.compute_allocations()
+        assert alloc.channel_budgets["100x1x0"].budget_msat == 750_000  # 1.5x
+
+    def test_unreliable_marginal_roi_is_neutral(self):
+        """Audit F8: <100 sats of 30d spend evidence -> neutral multiplier."""
+        engine = self._engine_with_sr(
+            marginal_roi=1.0, marginal_roi_reliable=False)
+        alloc = engine.compute_allocations()
+        assert alloc.channel_budgets["100x1x0"].budget_msat == 500_000  # 1.0x
+
+    def test_success_rate_kept_for_diagnostics(self):
+        engine = self._engine_with_sr(marginal_roi=0.0, sr=0.5)
+        alloc = engine.compute_allocations()
+        b = alloc.channel_budgets["100x1x0"]
+        assert b.success_rate_30d == 0.5
+
+
 class TestWindowedCapexFunding:
     """Audit F1: budgets are funded by the trailing-30d run rate, not lifetime
     contribution, killing the bleed→block→age-out→bleed oscillation."""

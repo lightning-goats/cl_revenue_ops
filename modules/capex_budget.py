@@ -66,6 +66,10 @@ class ChannelCapexBudget:
     tier_ppm: int = 0              # Max PPM per rebalance attempt
     priority_class: str = "growth" # defensive / preservation / operational / growth
     hive_multiplier: float = 1.0   # 1.0 / 1.5 / 2.0
+    # Diagnostics (audit F6): sr no longer discounts the budget (v2 bleeder
+    # detection already divides effective cost by sr); kept for visibility.
+    success_rate_30d: Optional[float] = None
+    roi_multiplier: float = 1.0    # clamp(1 + marginal_roi, 0.25, 1.5)
 
     @property
     def budget_sats(self) -> int:
@@ -471,16 +475,31 @@ class CapexBudgetEngine:
         # that would START generating returns. The BOOTSTRAP tier handles
         # these channels with conservative budgets.
 
-        # Success rate discount
+        # Audit F6: marginal-ROI multiplier replaces the success-rate
+        # discount. Dividing by sr double-penalized (identify_bleeders_v2
+        # already inflates effective cost by sr) and mispredicted: failed
+        # rebalance attempts cost ~0 sats, so a 50% sr does not double the
+        # realized cost. Scale instead by realized 30d marginal return,
+        # clamped to [0.25, 1.5]; unreliable marginal ROI (< 100 sats of 30d
+        # spend evidence, audit F8) is treated as neutral. The success rate
+        # is still fetched and recorded for diagnostics.
         sr_data = None
         try:
             sr_data = self._database.get_channel_rebalance_success_rate(ch_id, 30)
         except Exception:
             pass
+        success_rate = None
         if sr_data and sr_data.get('total', 0) >= 3:
-            discount = max(0.1, sr_data['success_rate'])
+            try:
+                success_rate = float(sr_data['success_rate'])
+            except (TypeError, ValueError):
+                success_rate = None
+
+        roi_reliable = getattr(prof, 'marginal_roi_reliable', True)
+        if isinstance(marginal_roi, (int, float)) and roi_reliable is not False:
+            roi_mult = min(1.5, max(0.25, 1.0 + float(marginal_roi)))
         else:
-            discount = 1.0
+            roi_mult = 1.0
 
         # Proven budget (msat): 30d contribution x rate - 30d capex spent.
         # Same window on both sides (audit F1b).
@@ -522,7 +541,7 @@ class CapexBudgetEngine:
             )
 
         efficiency_mult = self._get_efficiency_multiplier(ch_id, fleet_efficiency)
-        budget_msat = int(raw_budget_msat * discount * hive_mult * efficiency_mult)
+        budget_msat = int(raw_budget_msat * roi_mult * hive_mult * efficiency_mult)
 
         return ChannelCapexBudget(
             channel_id=ch_id,
@@ -531,6 +550,8 @@ class CapexBudgetEngine:
             tier_ppm=tier_ppm,
             priority_class=priority,
             hive_multiplier=hive_mult,
+            success_rate_30d=success_rate,
+            roi_multiplier=roi_mult,
         )
 
     def _get_efficiency_multiplier(self, channel_id: str, fleet_efficiency) -> float:
