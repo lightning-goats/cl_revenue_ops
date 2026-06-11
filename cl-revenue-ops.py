@@ -6720,13 +6720,19 @@ def _boltz_dynamic_channel_tuning(*,
     }
 
 
-def _get_confirmed_onchain_sats() -> int:
-    """Return confirmed on-chain wallet outputs in sats from CLN listfunds."""
+def _get_confirmed_onchain_sats() -> Optional[int]:
+    """Return confirmed on-chain wallet outputs in sats from CLN listfunds.
+
+    F9 fail-safe: returns None on RPC failure. Returning 0 made a telemetry
+    failure look like a full reserve deficit and engaged treasury harvesting
+    — callers must treat None as 'unknown, skip treasury this cycle'
+    (mirroring the scarcity-neutralizes-on-error convention).
+    """
     try:
         lf = data_service.get_funds() if data_service else safe_plugin.rpc.listfunds()
     except Exception as e:
-        plugin.log(f"listfunds RPC failed for onchain balance: {e}", level='debug')
-        return 0
+        plugin.log(f"listfunds RPC failed for onchain balance: {e}", level='warn')
+        return None
     outputs = lf.get("outputs", []) if isinstance(lf, dict) else []
     total = 0
     for o in outputs:
@@ -6828,6 +6834,30 @@ def _build_boltz_expansion_treasury_plan(
     bm = _require_boltz_manager()
     onchain_confirmed_sats = _get_confirmed_onchain_sats()
     target = max(0, int(onchain_target_sats))
+    if onchain_confirmed_sats is None:
+        # F9: unknown on-chain balance (listfunds failed) must not read as a
+        # full deficit. Report the plan unavailable so the auto-cycle skips
+        # treasury mode this cycle instead of harvesting on bad telemetry.
+        return {
+            "generated_at": int(time.time()),
+            "treasury": {
+                "enabled": bool(getattr(config, "expansion_treasury_enabled", False)) if config else False,
+                "onchain_confirmed_sats": None,
+                "onchain_target_sats": target,
+                "deficit_sats": 0,
+                "min_deficit_sats": int(min_deficit_sats),
+                "preferred_currency": str(preferred_currency).upper(),
+                "exclude_protected": bool(exclude_protected),
+                "max_actions": int(max_actions),
+                "min_source_local_pct": float(min_source_local_pct),
+            },
+            "status": "unavailable",
+            "reason": "onchain_balance_unavailable_rpc_error",
+            "recommendations": [],
+            "total_candidates": 0,
+            "skipped_count": 0,
+            "skipped_examples": [],
+        }
     deficit = max(0, target - onchain_confirmed_sats)
 
     treasury = {
@@ -7833,14 +7863,18 @@ def revenue_boltz_expansion_treasury_status(plugin: Plugin) -> Dict[str, Any]:
         preferred = str(getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC').upper()
         target = int(getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000)
         min_deficit = int(getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000)
-        deficit = max(0, target - _get_confirmed_onchain_sats())
+        onchain = _get_confirmed_onchain_sats()
+        # F9: None means listfunds failed — report unavailable, never a
+        # fabricated full deficit.
+        deficit = max(0, target - onchain) if onchain is not None else None
         return {
             'enabled': bool(getattr(cfg, 'expansion_treasury_enabled', False)) if cfg else False,
-            'onchain_confirmed_sats': _get_confirmed_onchain_sats(),
+            'status': 'ok' if onchain is not None else 'unavailable',
+            'onchain_confirmed_sats': onchain,
             'onchain_target_sats': target,
             'deficit_sats': deficit,
             'min_deficit_sats': min_deficit,
-            'needs_harvest': bool(deficit >= min_deficit),
+            'needs_harvest': bool(deficit is not None and deficit >= min_deficit),
             'preferred_currency': preferred,
             'budget': bm.budget(),
             'pending_swap_count': _boltz_pending_swap_count(),
@@ -7927,8 +7961,8 @@ def revenue_boltz_expansion_treasury_cycle(
 
     if 'error' in plan:
         return plan
-    if str(plan.get('status') or '') == 'at_target':
-        return {'status': 'at_target', 'plan': plan, 'executed': [], 'skipped': []}
+    if str(plan.get('status') or '') in ('at_target', 'unavailable'):
+        return {'status': str(plan.get('status')), 'plan': plan, 'executed': [], 'skipped': []}
 
     pending_swaps = int(plan.get('pending_swap_count', 0) or 0)
     if pending_swaps > 0 and not allow_concurrent_swaps:
