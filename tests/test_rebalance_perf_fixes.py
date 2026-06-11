@@ -275,6 +275,174 @@ def test_v3_router_exclude_layer_per_call_outside_cycle():
 
 
 # ---------------------------------------------------------------------------
+# 4. Hive router cycle-scoped askrene-listlayers cache
+# ---------------------------------------------------------------------------
+
+
+MID_PEER = "02" + "d" * 64
+
+
+def _make_hive_data_service():
+    ds = MagicMock()
+    ds.get_askrene_layers.return_value = {
+        "layers": [{"layer": "hive-fleet"}, {"layer": "revenue-local"}]
+    }
+    ds.get_peer_channels.side_effect = lambda peer_id=None: (
+        {
+            "channels": [
+                {
+                    "short_channel_id": "100x1x0",
+                    "peer_id": SRC_PEER,
+                    "state": "CHANNELD_NORMAL",
+                },
+                {
+                    "short_channel_id": "200x1x0",
+                    "peer_id": DST_PEER,
+                    "state": "CHANNELD_NORMAL",
+                    "updates": {
+                        "remote": {
+                            "fee_base_msat": 0,
+                            "fee_proportional_millionths": 0,
+                            "cltv_expiry_delta": 6,
+                        }
+                    },
+                },
+            ]
+        }
+        if peer_id is None
+        else {"channels": []}
+    )
+    ds.get_configs.return_value = {"configs": {"cltv-final": {"value_int": 18}}}
+    ds.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [
+            {
+                "probability_ppm": 990000,
+                "amount_msat": 100000000,
+                "path": [
+                    {
+                        "short_channel_id_dir": "100x1x0/0",
+                        "next_node_id": MID_PEER,
+                        "amount_msat": 100000000,
+                        "delay": 24,
+                    },
+                    {
+                        "short_channel_id_dir": "300x1x0/0",
+                        "next_node_id": DST_PEER,
+                        "amount_msat": 100000000,
+                        "delay": 18,
+                    },
+                ],
+            }
+        ],
+    }
+    return ds
+
+
+def _make_hive_router(ds):
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    class _Hints:
+        def is_hive_member(self, peer_id):
+            return True
+
+    return RebalanceHiveRouter(
+        plugin=MagicMock(),
+        our_node_id=OUR_ID,
+        hive_hints=_Hints(),
+        data_service=ds,
+        log=lambda m, l: None,
+    )
+
+
+def _hive_pair():
+    from modules.rebalance_types_v2 import PairCandidate
+
+    return PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=100_000,
+        pair_budget_sats=100,
+    )
+
+
+def _hive_decision():
+    from modules.rebalance_route_policy import (
+        RouteDecision,
+        RoutePolicy,
+        RoutePriority,
+    )
+
+    return RouteDecision(
+        policy=RoutePolicy.HIVE_ONLY,
+        priority=RoutePriority.COORDINATED,
+        reason="coordinated_rebalance",
+        allow_market_fallback=False,
+    )
+
+
+def test_hive_router_caches_listlayers_within_cycle():
+    """5 pricings in one cycle probe askrene-listlayers exactly once."""
+    ds = _make_hive_data_service()
+    router = _make_hive_router(ds)
+
+    router.begin_cycle()
+    try:
+        for _ in range(5):
+            result = router.price_pair(_hive_pair(), _hive_decision())
+            assert result.success is True, result.error
+    finally:
+        router.end_cycle()
+
+    assert ds.get_askrene_layers.call_count == 1
+
+
+def test_hive_router_reprobes_listlayers_outside_cycle():
+    ds = _make_hive_data_service()
+    router = _make_hive_router(ds)
+
+    for _ in range(2):
+        result = router.price_pair(_hive_pair(), _hive_decision())
+        assert result.success is True, result.error
+
+    assert ds.get_askrene_layers.call_count == 2
+
+
+def test_hive_router_unknown_layer_retry_reprobes_despite_cycle_cache():
+    """The unknown-layer retry path must invalidate the cycle cache so its
+    refresh sees the live layer set, not the cached stale one."""
+    ds = _make_hive_data_service()
+    good = ds.get_routes.return_value
+    ds.get_routes.side_effect = [
+        good,
+        Exception("Unknown layer: hive-fleet"),
+        good,
+    ]
+    ds.get_askrene_layers.side_effect = [
+        {"layers": [{"layer": "hive-fleet"}, {"layer": "revenue-local"}]},
+        {"layers": [{"layer": "revenue-local"}]},
+    ]
+    router = _make_hive_router(ds)
+
+    router.begin_cycle()
+    try:
+        first = router.price_pair(_hive_pair(), _hive_decision())
+        assert first.success is True, first.error
+        second = router.price_pair(_hive_pair(), _hive_decision())
+        assert second.success is True, second.error
+    finally:
+        router.end_cycle()
+
+    assert ds.get_askrene_layers.call_count == 2
+    # The retry's getroutes call used the refreshed layer set.
+    retry_layers = ds.get_routes.call_args.kwargs["layers"]
+    assert "hive-fleet" not in retry_layers
+    assert "revenue-local" in retry_layers
+
+
+# ---------------------------------------------------------------------------
 # 3. Final-hop policy served from the broadcast listpeerchannels cache
 # ---------------------------------------------------------------------------
 

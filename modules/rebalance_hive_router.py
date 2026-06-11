@@ -115,10 +115,13 @@ class RebalanceHiveRouter:
 
         Within a cycle, identical exclude sets share a single askrene layer,
         turning N × (create + M disables + remove) RPCs into one such batch
-        per unique exclude set. end_cycle() tears them down.
+        per unique exclude set, and the askrene-listlayers probe behind
+        _current_layers is served from a single per-cycle call (mirrors the
+        v3 router's cycle cache). end_cycle() tears them down.
         """
         self.end_cycle()
         self._thread_state.active = True
+        self._thread_state.route_layers = None
 
     def _cycle_enable_dict(self) -> Dict[str, str]:
         layers = getattr(self._thread_state, "enable_layers", None)
@@ -134,6 +137,7 @@ class RebalanceHiveRouter:
         layers.clear()
         enable_layers.clear()
         self._thread_state.active = False
+        self._thread_state.route_layers = None
         for layer_name in to_remove:
             try:
                 self._remove_layer(layer_name)
@@ -225,18 +229,38 @@ class RebalanceHiveRouter:
             return False
 
     def _current_layers(self) -> List[str]:
+        """Routing layer list, served from a per-cycle cache when active.
+
+        One askrene-listlayers probe per cycle instead of one per pricing
+        call. A failed probe is never cached (the degraded layer set should
+        not stick for the whole cycle), and the unknown-layer retry path
+        invalidates the cache before refreshing so a layer rotation
+        mid-cycle is picked up. Outside a cycle every call re-probes.
+        """
+        if self._cycle_active():
+            cached = getattr(self._thread_state, "route_layers", None)
+            if cached is not None:
+                return list(cached)
         layers = ["auto.localchans"]
+        probed = False
         try:
             existing = self._get_askrene_layers()
             for layer in existing.get("layers", []):
                 name = str(layer.get("layer") or "")
                 if name in self.ROUTE_LAYER_NAMES:
                     layers.append(name)
+            probed = True
         except Exception:
             pass
         if "auto.no_mpp_support" not in layers:
             layers.append("auto.no_mpp_support")
+        if probed and self._cycle_active():
+            self._thread_state.route_layers = list(layers)
         return layers
+
+    def _invalidate_route_layer_cache(self) -> None:
+        """Drop the cycle's cached layer list so the next probe re-fetches."""
+        self._thread_state.route_layers = None
 
     @staticmethod
     def _is_unknown_layer_error(exc: Exception) -> bool:
@@ -551,6 +575,9 @@ class RebalanceHiveRouter:
                         raise
                     # Some layer rotated/vanished underneath us: refresh the
                     # hive layer set and rebuild our own layers, retry once.
+                    # Drop the cycle's listlayers cache first or the refresh
+                    # would be served the same stale set.
+                    self._invalidate_route_layer_cache()
                     refreshed_layers = self._current_layers()
                     if pinned_layers is not None and source_scidd:
                         self._invalidate_local_disable_layer()
