@@ -475,3 +475,37 @@ class TestZeroActivityBleederVisibility:
                   for b in analyzer.identify_bleeders(window_days=30)}
         assert hard_ids, "expected the seeded channel to be hard"
         assert hard_ids <= v1_ids
+
+
+class TestBleederMaterialityFloor:
+    """Audit F8: below 100 sats of 30d rebalance spend there is not enough
+    evidence to call a channel a (soft) bleeder."""
+
+    def _verdict(self, analyzer):
+        results = analyzer.identify_bleeders_v2(window_days=30)
+        return {c.channel_id: c for c in results}["100x1x0"]
+
+    def test_tiny_sustained_loss_is_not_a_bleeder(self):
+        """-80 sats on 80 sats of spend: neutral, not soft."""
+        analyzer, _ = _make_live_analyzer(
+            _pnl(net_sats=-80, cost_sats=80),
+            _pnl(net_sats=-20, cost_sats=20),
+        )
+        verdict = self._verdict(analyzer)
+        assert verdict.classification == "none"
+        assert "100" in verdict.reason  # mentions the materiality floor
+
+    def test_same_loss_ratio_with_material_spend_still_soft(self):
+        analyzer, _ = _make_live_analyzer(
+            _pnl(net_sats=-300, cost_sats=300),
+            _pnl(net_sats=-50, cost_sats=50),
+        )
+        assert self._verdict(analyzer).classification == "soft"
+
+    def test_hard_entry_unaffected_by_floor(self):
+        """Hard entries need net < -1000, implying cost >= 1000 >> floor."""
+        analyzer, _ = _make_live_analyzer(
+            _pnl(net_sats=-1500, cost_sats=1500),
+            _pnl(net_sats=-300, cost_sats=300),
+        )
+        assert self._verdict(analyzer).classification == "hard"

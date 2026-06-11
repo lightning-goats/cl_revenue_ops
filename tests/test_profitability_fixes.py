@@ -769,6 +769,48 @@ class TestMarginalRoiEdgeCases:
 
 
 # ============================================================
+# Audit F8: marginal_roi materiality floor
+# ============================================================
+
+class TestMarginalRoiReliability:
+    """marginal_roi based on <100 sats of 30d spend is statistically noise;
+    consumers must treat it as neutral."""
+
+    def test_reliable_at_100_sats_cost(self):
+        prof = _make_profitability(rebalance_cost_30d=100)
+        assert prof.marginal_roi_reliable is True
+
+    def test_unreliable_below_100_sats_cost(self):
+        prof = _make_profitability(rebalance_cost_30d=99)
+        assert prof.marginal_roi_reliable is False
+
+    def test_unreliable_at_zero_cost(self):
+        prof = _make_profitability(rebalance_cost_30d=0)
+        assert prof.marginal_roi_reliable is False
+
+    def _analyzer_with_prof(self, prof):
+        analyzer = _make_analyzer()
+        analyzer._cache_timestamp = int(time.time())
+        analyzer._profitability_cache = {"111x222x0": prof}
+        return analyzer
+
+    def test_fee_multiplier_neutral_when_unreliable(self):
+        """A -100% marginal ROI on 50 sats of spend must not raise fees."""
+        prof = _make_profitability(
+            marginal_profit_30d=-50, rebalance_cost_30d=50)
+        assert prof.marginal_roi <= -0.5  # would map to 1.15 if trusted
+        analyzer = self._analyzer_with_prof(prof)
+        assert analyzer.get_fee_multiplier("111x222x0") == 1.0
+
+    def test_fee_multiplier_applies_when_reliable(self):
+        """The same ROI on material spend still adjusts fees."""
+        prof = _make_profitability(
+            marginal_profit_30d=-600, rebalance_cost_30d=600)
+        analyzer = self._analyzer_with_prof(prof)
+        assert analyzer.get_fee_multiplier("111x222x0") > 1.0
+
+
+# ============================================================
 # Fix 7: Capacity division guards (audit confirmation)
 # ============================================================
 

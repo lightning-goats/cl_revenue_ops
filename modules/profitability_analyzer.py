@@ -1004,10 +1004,16 @@ class ChannelProfitabilityAnalyzer:
             Fee multiplier (1.0 = no change)
         """
         profitability = self.get_profitability(channel_id)
-        
+
         if not profitability:
             return 1.0  # No data, no adjustment
-        
+
+        # Audit F8: with < 100 sats of 30d rebalance spend, marginal_roi
+        # rests on sats of evidence — treat as neutral rather than letting
+        # a 50-sat blip drive a fee change.
+        if not profitability.marginal_roi_reliable:
+            return 1.0
+
         # Use MARGINAL ROI for operational decisions
         # This ignores sunk costs (open_cost_sats)
         marginal_roi = profitability.marginal_roi
@@ -1696,6 +1702,17 @@ class ChannelProfitabilityAnalyzer:
                                   f"({net_profit_30d} sats) has not recovered "
                                   f"above -500 sats")
                         recommended_action = "disable_rebalance"
+
+                    # Audit F8: materiality floor. Below 100 sats of 30d
+                    # rebalance spend there is not enough evidence to call
+                    # this channel a bleeder (hard entries are unaffected:
+                    # they require net < -1000, implying cost > 1000).
+                    elif rebalance_cost_30d < 100:
+                        classification = "none"
+                        reason = (f"Insufficient evidence: only "
+                                  f"{rebalance_cost_30d} sats of 30d rebalance "
+                                  f"spend (< 100 sats materiality floor)")
+                        recommended_action = "monitor"
 
                     # Check for SOFT BLEEDER (short-term loss, long-term gain)
                     # Condition: 7d negative AND 30d positive
