@@ -6925,6 +6925,35 @@ def _build_boltz_expansion_treasury_plan(
 # unrepresentative rate, so the credit is disabled instead.
 STRUCTURAL_MIN_VOLUME_SATS = 1_000_000
 
+# Final-stage discount applied when the structural credit is priced from our
+# OWN current out-fee policies instead of realized forwards: our asks are
+# optimistic — they have never cleared at volume (if they had, a realized
+# window would have priced the credit instead), so take them at half value.
+OWN_POLICY_HAIRCUT = 0.5
+
+
+def _policy_derived_fee_ppm(channels: Dict[str, Dict[str, Any]]) -> int:
+    """Capacity-weighted mean of our own out-fee policies, haircut applied.
+
+    Last stage of the structural-credit pricing cascade: an inbound-starved
+    node may have NO realized volume in any window (it cannot route — that
+    is exactly why it needs the drain), leaving only our advertised fee
+    policies as a price signal. Channels with a zero policy still count in
+    the denominator: a zero ask IS the policy.
+    """
+    total_cap = 0
+    weighted = 0.0
+    for ch in channels.values():
+        cap = int(ch.get("capacity", 0) or 0)
+        if cap <= 0:
+            continue
+        ppm = int(ch.get("fee_proportional_millionths", 0) or 0)
+        total_cap += cap
+        weighted += cap * max(0, ppm)
+    if total_cap <= 0:
+        return 0
+    return int((weighted / total_cap) * OWN_POLICY_HAIRCUT)
+
 
 def _build_boltz_balance_plan(
     *,
@@ -7022,18 +7051,45 @@ def _build_boltz_balance_plan(
     structural_budget_sats = int(getattr(config, "boltz_structural_budget_sats_per_day", 0) or 0)
     structural_scarcity = 0.0
     structural_realized_ppm = 0
+    structural_credit_source: Optional[str] = None
     if structural_budget_sats > 0:
         try:
             structural_scarcity = float(_node_receivable_status().get("scarcity", 0.0) or 0.0)
         except Exception:
             structural_scarcity = 0.0
         if structural_scarcity > 0.0:
+            # Pricing cascade — each stage only runs when the prior returned
+            # 0. The volume floor means an inbound-starved node frequently
+            # has NO qualifying realized window (it cannot route — that is
+            # exactly why it needs the drain), so the credit must not die
+            # with the 7d query (chicken-and-egg).
+            #   (a) 7d realized rate, 1M-sat floor (raw forwards);
+            #   (b) 30d realized rate, 1M-sat floor (daily rollups + raw);
+            #   (c) capacity-weighted mean of our OWN out-fee policies,
+            #       discounted by OWN_POLICY_HAIRCUT (asks that never
+            #       cleared at volume are optimistic).
             try:
-                # Volume floor: a thin 7d window must not price the credit.
                 structural_realized_ppm = int(database.get_node_realized_fee_ppm(
                     window_days=7, min_volume_sats=STRUCTURAL_MIN_VOLUME_SATS) or 0)
             except Exception:
                 structural_realized_ppm = 0
+            if structural_realized_ppm > 0:
+                structural_credit_source = "realized_7d"
+            else:
+                try:
+                    structural_realized_ppm = int(database.get_node_realized_fee_ppm_30d(
+                        min_volume_sats=STRUCTURAL_MIN_VOLUME_SATS) or 0)
+                except Exception:
+                    structural_realized_ppm = 0
+                if structural_realized_ppm > 0:
+                    structural_credit_source = "realized_30d"
+                else:
+                    try:
+                        structural_realized_ppm = _policy_derived_fee_ppm(channels)
+                    except Exception:
+                        structural_realized_ppm = 0
+                    if structural_realized_ppm > 0:
+                        structural_credit_source = "policy_derived"
 
     candidates: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
@@ -7459,6 +7515,14 @@ def _build_boltz_balance_plan(
         "total_candidates": len(candidates),
         "skipped_count": len(skipped),
         "skipped_examples": skipped[:20],
+        # Which cascade stage priced the structural inbound credit this plan
+        # build: "realized_7d" / "realized_30d" / "policy_derived", or None
+        # when no stage produced a positive rate (credit disabled).
+        "structural_credit": {
+            "scarcity": round(structural_scarcity, 4),
+            "realized_ppm": int(structural_realized_ppm),
+            "source": structural_credit_source,
+        },
         "planner_coordination": {
             "loser_scids_excluded": len(planner_loser_scids),
             "funding_deficit_sats": planner_funding_deficit,

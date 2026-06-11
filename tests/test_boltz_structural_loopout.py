@@ -240,6 +240,9 @@ def _structural_module(scarcity, realized_ppm=500, structural_budget=1000):
         "total_capacity_sats": 10_000_000, "total_receivable_sats": 500_000,
     }
     mod.database.get_node_realized_fee_ppm.return_value = realized_ppm
+    # Fallback cascade stages default to "no data" so each test controls
+    # exactly which source prices the credit.
+    mod.database.get_node_realized_fee_ppm_30d.return_value = 0
     # Profitability data so require_profitable=True does not skip the channel.
     pa = MagicMock()
     pa.analyze_all_channels.return_value = None
@@ -460,6 +463,130 @@ def test_realized_ppm_query_uses_volume_floor():
     mod.database.get_node_realized_fee_ppm.assert_called_once_with(
         window_days=7, min_volume_sats=1_000_000
     )
+
+
+def _set_channel_policy(mod, fee_ppm, capacity=10_000_000):
+    """Give every channel in the module's channels dict an own out-fee policy."""
+    for ch in mod.fee_controller._get_channels_info.return_value.values():
+        ch["fee_proportional_millionths"] = fee_ppm
+        ch["capacity"] = capacity
+
+
+def test_cascade_prefers_realized_7d():
+    """7d window with volume clears the floor: it prices the credit and the
+    later fallback stages are never consulted."""
+    mod = _structural_module(scarcity=1.0, realized_ppm=500)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    assert plan["structural_credit"]["source"] == "realized_7d"
+    assert plan["structural_credit"]["realized_ppm"] == 500
+    mod.database.get_node_realized_fee_ppm_30d.assert_not_called()
+    assert plan["recommendations"][0]["economics"]["structural_uplift_sats"] > 0
+
+
+def test_cascade_falls_back_to_realized_30d():
+    """Inbound-starved chicken-and-egg: the 7d window returns 0 (below the
+    volume floor), so the 30d rollup-backed rate prices the credit."""
+    mod = _structural_module(scarcity=1.0, realized_ppm=0)
+    mod.database.get_node_realized_fee_ppm_30d.return_value = 400
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    assert plan["structural_credit"]["source"] == "realized_30d"
+    assert plan["structural_credit"]["realized_ppm"] == 400
+    mod.database.get_node_realized_fee_ppm_30d.assert_called_once_with(
+        min_volume_sats=1_000_000
+    )
+    assert plan["recommendations"][0]["economics"]["structural_uplift_sats"] > 0
+
+
+def test_cascade_falls_back_to_policy_derived():
+    """Both realized windows empty (the node cannot route -- exactly why it
+    needs the drain): price the credit from our OWN out-fee policies,
+    capacity-weighted and discounted by OWN_POLICY_HAIRCUT (asks that never
+    cleared at volume are optimistic)."""
+    mod = _structural_module(scarcity=1.0, realized_ppm=0)
+    _set_channel_policy(mod, fee_ppm=1000)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    assert plan["structural_credit"]["source"] == "policy_derived"
+    # capacity-weighted mean 1000 ppm x 0.5 haircut = 500 ppm
+    assert plan["structural_credit"]["realized_ppm"] == 500
+    assert plan["recommendations"][0]["economics"]["structural_uplift_sats"] > 0
+
+
+def test_policy_derived_is_capacity_weighted():
+    """Two channels, 10M @ 1200 ppm and 5M @ 300 ppm: weighted mean is
+    (10*1200 + 5*300)/15 = 900 ppm, haircut to 450."""
+    mod = _structural_module(scarcity=1.0, realized_ppm=0)
+    mod.fee_controller._get_channels_info.return_value = {
+        "100x1x0": {
+            "peer_id": "02" + "b" * 64,
+            "capacity": 10_000_000,
+            "spendable_msat": 9_700_000_000,
+            "receivable_msat": 300_000_000,
+            "fee_proportional_millionths": 1200,
+        },
+        "101x1x0": {
+            "peer_id": "02" + "c" * 64,
+            "capacity": 5_000_000,
+            "spendable_msat": 4_850_000_000,
+            "receivable_msat": 150_000_000,
+            "fee_proportional_millionths": 300,
+        },
+    }
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    assert plan["structural_credit"]["source"] == "policy_derived"
+    assert plan["structural_credit"]["realized_ppm"] == 450
+
+
+def test_cascade_no_source_disables_credit():
+    """No realized data anywhere and zero own policies: no source can price
+    the credit, so it stays disabled (source None, uplift 0)."""
+    mod = _structural_module(scarcity=1.0, realized_ppm=0)
+    _set_channel_policy(mod, fee_ppm=0)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    assert plan["structural_credit"]["source"] is None
+    assert plan["structural_credit"]["realized_ppm"] == 0
+    for rec in plan["recommendations"]:
+        assert rec["economics"]["structural_uplift_sats"] == 0
+
+
+def test_cascade_30d_error_falls_through_to_policy():
+    """A failing 30d query must not kill the plan build -- the cascade
+    degrades to the policy-derived stage."""
+    mod = _structural_module(scarcity=1.0, realized_ppm=0)
+    mod.database.get_node_realized_fee_ppm_30d.side_effect = RuntimeError("db down")
+    _set_channel_policy(mod, fee_ppm=800)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    assert plan["structural_credit"]["source"] == "policy_derived"
+    assert plan["structural_credit"]["realized_ppm"] == 400
+
+
+def test_cascade_not_consulted_when_node_healthy():
+    """scarcity 0: no pricing source is consulted at all."""
+    mod = _structural_module(scarcity=0.0)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    mod.database.get_node_realized_fee_ppm.assert_not_called()
+    mod.database.get_node_realized_fee_ppm_30d.assert_not_called()
+    assert plan["structural_credit"]["source"] is None
 
 
 def test_structural_flag_false_when_require_profitable_disabled():

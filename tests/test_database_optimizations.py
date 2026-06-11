@@ -645,6 +645,76 @@ class TestNodeRealizedFeePpm:
         assert db.get_node_realized_fee_ppm(window_days=7, min_volume_sats=1_000_000) == 1000
 
 
+class TestNodeRealizedFeePpm30d:
+    """30d realized rate from daily rollups + recent raw forwards.
+
+    The forwards table only retains ~8 days of raw rows; cleanup_old_data
+    prunes older rows into daily_forwarding_stats. A 30d realized rate must
+    therefore combine both sources (they are disjoint by construction: a
+    rollup row is only created from forwards deleted in the same
+    transaction)."""
+
+    def _db(self, tmp_path):
+        from modules.database import Database
+        plugin = MagicMock()
+        db = Database(str(tmp_path / "ppm30.db"), plugin)
+        db.initialize()
+        return db
+
+    def _insert_rollup(self, db, days_ago, out_msat, fee_msat):
+        day = ((int(time.time()) - days_ago * 86400) // 86400) * 86400
+        db._get_connection().execute(
+            "INSERT INTO daily_forwarding_stats"
+            " (channel_id, date, total_in_msat, total_out_msat, total_fee_msat, forward_count)"
+            " VALUES ('2x2x2', ?, ?, ?, ?, 1)",
+            (day, out_msat, out_msat, fee_msat),
+        )
+
+    def _insert_forward(self, db, age_seconds, out_msat, fee_msat, salt=0):
+        db._get_connection().execute(
+            "INSERT INTO forwards (in_channel, out_channel, in_msat, out_msat,"
+            " fee_msat, timestamp) VALUES ('1x1x1','2x2x2',?,?,?,?)",
+            (out_msat + fee_msat + salt, out_msat, fee_msat,
+             int(time.time()) - age_seconds),
+        )
+
+    def test_rollups_alone_price_the_rate(self, tmp_path):
+        """Pruned history (rollups only, no raw forwards) yields the rate:
+        2B msat out at 1000 ppm across two rolled-up days."""
+        db = self._db(tmp_path)
+        self._insert_rollup(db, days_ago=20, out_msat=1_000_000_000, fee_msat=1_000_000)
+        self._insert_rollup(db, days_ago=10, out_msat=1_000_000_000, fee_msat=1_000_000)
+        assert db.get_node_realized_fee_ppm_30d() == 1000
+
+    def test_combines_rollups_and_recent_forwards(self, tmp_path):
+        """Rollup day at 500 ppm + raw forward at 1500 ppm, equal volume:
+        blended rate is 1000 ppm."""
+        db = self._db(tmp_path)
+        self._insert_rollup(db, days_ago=15, out_msat=1_000_000_000, fee_msat=500_000)
+        self._insert_forward(db, age_seconds=3600, out_msat=1_000_000_000, fee_msat=1_500_000)
+        assert db.get_node_realized_fee_ppm_30d() == 1000
+
+    def test_excludes_rollups_older_than_window(self, tmp_path):
+        db = self._db(tmp_path)
+        self._insert_rollup(db, days_ago=40, out_msat=1_000_000_000, fee_msat=2_000_000)
+        self._insert_rollup(db, days_ago=10, out_msat=1_000_000_000, fee_msat=1_000_000)
+        assert db.get_node_realized_fee_ppm_30d() == 1000
+
+    def test_zero_when_no_data(self, tmp_path):
+        db = self._db(tmp_path)
+        assert db.get_node_realized_fee_ppm_30d() == 0
+
+    def test_volume_floor_applies_to_combined_volume(self, tmp_path):
+        """Combined 30d volume below the floor returns 0 (thin window must
+        not price the structural credit); at/above the floor it prices."""
+        db = self._db(tmp_path)
+        # 600k sats from rollups + 400k sats raw = exactly 1M sats at 1000 ppm
+        self._insert_rollup(db, days_ago=12, out_msat=600_000_000, fee_msat=600_000)
+        self._insert_forward(db, age_seconds=3600, out_msat=400_000_000, fee_msat=400_000)
+        assert db.get_node_realized_fee_ppm_30d(min_volume_sats=1_000_000) == 1000
+        assert db.get_node_realized_fee_ppm_30d(min_volume_sats=1_000_001) == 0
+
+
 class TestCategorySpendSats:
     def _db(self, tmp_path):
         from modules.database import Database

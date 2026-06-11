@@ -2684,6 +2684,51 @@ class Database:
             return 0
         return (fee_msat * 1_000_000) // out_msat
 
+    def get_node_realized_fee_ppm_30d(self, min_volume_sats: int = 0) -> int:
+        """Node-wide realized earn rate over ~30 days, in ppm.
+
+        The forwards table only retains ~8 days of raw rows before
+        cleanup_old_data() prunes them into daily_forwarding_stats, so a 30d
+        realized rate must combine the daily rollups (pruned history) with
+        the recent raw forwards. The two sets are disjoint by construction:
+        a rollup row is only created from forwards rows deleted in the same
+        transaction, so summing both never double-counts.
+
+        Used as the second stage of the structural-credit pricing cascade:
+        an inbound-starved node often has too little 7d volume to clear the
+        volume floor (it cannot route — that is why it needs the drain), but
+        a month of history may still clear it.
+
+        Returns 0 when there is no settled volume, or when min_volume_sats
+        is set and the combined settled outbound volume is below it.
+        """
+        conn = self._get_connection()
+        since = int(time.time()) - 30 * 86400
+        # Day buckets at/after the window start. A bucket straddling the
+        # boundary may include a few hours older than 30d — acceptable for a
+        # rate estimate (it widens, never thins, the sample).
+        since_day = (since // 86400) * 86400
+        row = conn.execute(
+            """
+            SELECT
+                (SELECT COALESCE(SUM(fee_msat), 0) FROM forwards
+                  WHERE timestamp >= ?)
+              + (SELECT COALESCE(SUM(total_fee_msat), 0) FROM daily_forwarding_stats
+                  WHERE date >= ?) AS fee_msat,
+                (SELECT COALESCE(SUM(out_msat), 0) FROM forwards
+                  WHERE timestamp >= ?)
+              + (SELECT COALESCE(SUM(total_out_msat), 0) FROM daily_forwarding_stats
+                  WHERE date >= ?) AS out_msat
+            """,
+            (since, since_day, since, since_day),
+        ).fetchone()
+        fee_msat, out_msat = int(row['fee_msat']), int(row['out_msat'])
+        if out_msat <= 0:
+            return 0
+        if min_volume_sats > 0 and (out_msat // 1000) < int(min_volume_sats):
+            return 0
+        return (fee_msat * 1_000_000) // out_msat
+
     def get_total_routing_revenue(self, since_timestamp: int) -> int:
         """
         Get total routing revenue (fees earned) since a given timestamp.
