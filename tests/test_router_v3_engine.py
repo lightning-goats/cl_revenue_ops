@@ -295,8 +295,11 @@ def test_engine_hive_only_pairs_use_hive_router():
         dest_channel_id="200x1x0",
         source_peer_id="02" + "a" * 64,
         dest_peer_id="02" + "b" * 64,
-        amount_sats=1000,
+        amount_sats=100_000,
         pair_budget_sats=10,
+        # Sats-EV gate input: positive expected value so routing behavior
+        # (not economics) decides these router-dispatch tests.
+        dest_out_fee_ppm=1_000,
         score=10.0,
         route_decision=RouteDecision(
             policy=RoutePolicy.HIVE_ONLY,
@@ -338,8 +341,11 @@ def test_engine_hybrid_pairs_choose_cheaper_hive_route():
         dest_channel_id="200x1x0",
         source_peer_id="02" + "a" * 64,
         dest_peer_id="02" + "b" * 64,
-        amount_sats=1000,
+        amount_sats=100_000,
         pair_budget_sats=10,
+        # Sats-EV gate input: positive expected value so routing behavior
+        # (not economics) decides these router-dispatch tests.
+        dest_out_fee_ppm=1_000,
         score=10.0,
         route_decision=RouteDecision(
             policy=RoutePolicy.HYBRID,
@@ -387,8 +393,11 @@ def test_engine_hybrid_market_leg_uses_layerless_market_fallback():
         dest_channel_id="200x1x0",
         source_peer_id="02" + "a" * 64,
         dest_peer_id="02" + "b" * 64,
-        amount_sats=1000,
+        amount_sats=100_000,
         pair_budget_sats=10,
+        # Sats-EV gate input: positive expected value so routing behavior
+        # (not economics) decides these router-dispatch tests.
+        dest_out_fee_ppm=1_000,
         score=10.0,
         route_decision=RouteDecision(
             policy=RoutePolicy.HYBRID,
@@ -438,8 +447,11 @@ def test_engine_orders_pairs_by_route_priority():
         dest_channel_id="200x1x0",
         source_peer_id="02" + "a" * 64,
         dest_peer_id="02" + "b" * 64,
-        amount_sats=1000,
+        amount_sats=100_000,
         pair_budget_sats=10,
+        # Sats-EV gate input: positive expected value so routing behavior
+        # (not economics) decides these router-dispatch tests.
+        dest_out_fee_ppm=1_000,
         score=10.0,
         route_decision=RouteDecision(
             policy=RoutePolicy.MARKET_ONLY,
@@ -452,8 +464,11 @@ def test_engine_orders_pairs_by_route_priority():
         dest_channel_id="400x1x0",
         source_peer_id="02" + "c" * 64,
         dest_peer_id="02" + "d" * 64,
-        amount_sats=1000,
+        amount_sats=100_000,
         pair_budget_sats=10,
+        # Sats-EV gate input: positive expected value so routing behavior
+        # (not economics) decides these router-dispatch tests.
+        dest_out_fee_ppm=1_000,
         score=10.0,
         route_decision=RouteDecision(
             policy=RoutePolicy.HYBRID,
@@ -490,8 +505,11 @@ def test_engine_orders_coordinated_pairs_by_hint_priority_score():
         dest_channel_id="200x1x0",
         source_peer_id="02" + "a" * 64,
         dest_peer_id="02" + "b" * 64,
-        amount_sats=1000,
+        amount_sats=100_000,
         pair_budget_sats=10,
+        # Sats-EV gate input: positive expected value so routing behavior
+        # (not economics) decides these router-dispatch tests.
+        dest_out_fee_ppm=1_000,
         score=100.0,
         route_decision=RouteDecision(
             policy=RoutePolicy.HYBRID,
@@ -505,8 +523,11 @@ def test_engine_orders_coordinated_pairs_by_hint_priority_score():
         dest_channel_id="400x1x0",
         source_peer_id="02" + "c" * 64,
         dest_peer_id="02" + "d" * 64,
-        amount_sats=1000,
+        amount_sats=100_000,
         pair_budget_sats=10,
+        # Sats-EV gate input: positive expected value so routing behavior
+        # (not economics) decides these router-dispatch tests.
+        dest_out_fee_ppm=1_000,
         score=1.0,
         route_decision=RouteDecision(
             policy=RoutePolicy.HYBRID,
