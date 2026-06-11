@@ -123,9 +123,16 @@ def live_snapshot() -> dict:
         )
 
         traffic_mgr = MagicMock()
-        traffic_mgr.get_all_profiles.return_value = [{{"peer_id": PEER_TRAFFIC, "confidence": 0.73}}]
+        traffic_mgr.get_all_profiles.return_value = [
+            {{"peer_id": PEER_TRAFFIC, "confidence": 0.73}},
+            {{"peer_id": PEER_REBAL, "confidence": 0.65}},
+        ]
+        _traffic_profiles = {{
+            PEER_TRAFFIC: {{"confidence": 0.73}},
+            PEER_REBAL: {{"confidence": 0.65}},
+        }}
         traffic_mgr.get_aggregated_profile.side_effect = (
-            lambda peer_id: {{"confidence": 0.73}} if peer_id == PEER_TRAFFIC else None
+            lambda peer_id: _traffic_profiles.get(peer_id)
         )
 
         yield_mgr = MagicMock()
@@ -153,6 +160,17 @@ def live_snapshot() -> dict:
 
         fee_coordination_mgr = MagicMock(corridor_mgr=corridor_mgr)
 
+        # Provide observed fee data for PEER_SECONDARY so fleet_fee_median is
+        # populated from real fee intelligence (not the old corridor-derived
+        # constant). optimal_fee_estimate comes from the observed-fee profile.
+        _fee_profiles = {{
+            PEER_SECONDARY: {{"optimal_fee_estimate": 900}},
+        }}
+        fee_intel_mgr = MagicMock()
+        fee_intel_mgr.get_aggregated_profile.side_effect = (
+            lambda peer_id: _fee_profiles.get(peer_id)
+        )
+
         ctx = HiveContext(
             database=db,
             config=MagicMock(),
@@ -162,6 +180,7 @@ def live_snapshot() -> dict:
             traffic_intel_mgr=traffic_mgr,
             yield_metrics_mgr=yield_mgr,
             fee_coordination_mgr=fee_coordination_mgr,
+            fee_intel_mgr=fee_intel_mgr,
         )
 
         print(json.dumps(export_hints(ctx), sort_keys=True))
@@ -193,12 +212,19 @@ class TestLiveHiveContract:
         assert hints[PEER_SECONDARY]["corridor_role"] == "secondary"
 
     def test_dominant_rebalance_direction_flows_through(self, live_snapshot):
+        """Positive-path: real traffic profile (confidence 0.65) for PEER_REBAL
+        seeds traffic_confidence > 0, so the sink rebalance_preference produces
+        a multiplicative bias strictly above 1.0."""
         adapter = _build_adapter(live_snapshot)
 
         assert adapter._snapshot["hints"][PEER_REBAL]["rebalance_preference"] == "sink"
+        assert adapter._snapshot["hints"][PEER_REBAL]["traffic_confidence"] > 0.0
         assert adapter.get_rebalance_bias(PEER_REBAL) > 1.0
 
     def test_secondary_fee_prior_flows_through(self, live_snapshot):
+        """Positive-path: fee_intel_mgr supplies an observed optimal_fee_estimate
+        of 900 ppm for PEER_SECONDARY, so fleet_fee_median is emitted and the
+        consumer returns 900 as the Thompson prior seed (not None)."""
         adapter = _build_adapter(live_snapshot)
 
         assert adapter.get_corridor_role(PEER_SECONDARY) == "secondary"
