@@ -7108,6 +7108,34 @@ def _build_boltz_balance_plan(
                     if structural_realized_ppm > 0:
                         structural_credit_source = "policy_derived"
 
+    # 'auto' currency must be resolved at PLAN time: _norm_currency passes
+    # unknown strings through uppercased, so an unresolved 'auto' would reach
+    # the boltzcli quote subprocess as a literal "AUTO" currency argument.
+    # Resolution (a BTC-vs-LBTC quote comparison) runs lazily, at most once
+    # per direction per plan build, sized by the first triggered candidate's
+    # amount; resolution failure falls back to BTC.
+    _resolved_auto_currency: Dict[str, Optional[str]] = {}
+
+    def _plan_currency(direction: str, configured: str, amount_sats: int) -> str:
+        if str(configured or "").strip().lower() != "auto":
+            return configured
+        if direction not in _resolved_auto_currency:
+            try:
+                _resolved_auto_currency[direction] = _select_boltz_currency(direction, int(amount_sats))
+            except Exception:
+                _resolved_auto_currency[direction] = "BTC"
+        return _resolved_auto_currency[direction] or "BTC"
+
+    def _annotated_currency(direction: str, configured: str) -> Optional[str]:
+        """Concrete currency this plan's quotes used for `direction`.
+
+        None when 'auto' was configured but no candidate in that direction
+        ever triggered (resolution never ran).
+        """
+        if str(configured or "").strip().lower() == "auto":
+            return _resolved_auto_currency.get(direction)
+        return str(configured).upper()
+
     candidates: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
@@ -7287,6 +7315,7 @@ def _build_boltz_balance_plan(
             })
             continue
 
+        target_currency = _plan_currency(direction, target_currency, amount_sats)
         try:
             quote_resp = bm.quote(
                 amount_sats=amount_sats,
@@ -7533,6 +7562,10 @@ def _build_boltz_balance_plan(
             "min_marginal_roi": float(min_marginal_roi),
             "loop_in_currency": str(loop_in_currency).upper(),
             "loop_out_currency": str(loop_out_currency).upper(),
+            # Concrete currency the quotes used ('auto' resolves at plan
+            # time; None = 'auto' configured but direction never triggered).
+            "resolved_loop_in_currency": _annotated_currency("loop_in", loop_in_currency),
+            "resolved_loop_out_currency": _annotated_currency("loop_out", loop_out_currency),
         },
         "recommendations": candidates[: max(0, int(max_candidates))],
         "total_candidates": len(candidates),
