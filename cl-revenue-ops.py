@@ -6901,6 +6901,11 @@ def _build_boltz_expansion_treasury_plan(
     }
 
     if deficit < int(min_deficit_sats):
+        # Deliberately NO bm.budget() / pending-swap lookup here: both are
+        # boltzcli subprocess calls and nothing consumes them on an
+        # at_target plan — the treasury cycle and the auto-cycle mode
+        # selector early-return on status alone. The caller's count is
+        # echoed when provided; otherwise None means "not evaluated".
         return {
             "generated_at": int(time.time()),
             "treasury": treasury,
@@ -6910,9 +6915,9 @@ def _build_boltz_expansion_treasury_plan(
             "total_candidates": 0,
             "skipped_count": 0,
             "skipped_examples": [],
-            "budget": bm.budget(),
+            "budget": None,
             "pending_swap_count": (
-                int(pending_swap_count) if pending_swap_count is not None else _boltz_pending_swap_count()
+                int(pending_swap_count) if pending_swap_count is not None else None
             ),
         }
 

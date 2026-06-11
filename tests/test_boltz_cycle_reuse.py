@@ -348,3 +348,46 @@ class TestTreasuryCyclePlanReuse:
             mod._build_boltz_balance_plan.call_args.kwargs["pending_swap_count"] == 0
         )
         assert result["mode"] == "balance"
+
+
+class TestAtTargetTreasuryBuildIsFree:
+    """An at-target treasury build must not pay boltzcli subprocesses
+    (budget + pending listswaps) just to report 'at_target' — both are
+    deferred until the deficit >= min_deficit check passes. No consumer
+    reads budget/pending off an at_target plan (the treasury cycle and the
+    mode selector both early-return on status)."""
+
+    def _make_module(self):
+        mod = load_plugin_module()
+        mod.plugin.log = MagicMock()
+        bm = MagicMock()
+        mod._require_boltz_manager = MagicMock(return_value=bm)
+        mod._boltz_pending_swap_count = MagicMock(return_value=0)
+        mod._build_boltz_balance_plan = MagicMock()
+        mod._get_confirmed_onchain_sats = MagicMock(return_value=5_000_000)
+        return mod, bm
+
+    def test_at_target_build_performs_no_subprocess_calls(self):
+        mod, bm = self._make_module()
+
+        plan = mod._build_boltz_expansion_treasury_plan(
+            onchain_target_sats=5_000_000
+        )
+
+        assert plan["status"] == "at_target"
+        bm.budget.assert_not_called()
+        bm.quote.assert_not_called()
+        mod._boltz_pending_swap_count.assert_not_called()
+        mod._build_boltz_balance_plan.assert_not_called()
+
+    def test_at_target_reports_caller_pending_count_when_provided(self):
+        mod, bm = self._make_module()
+
+        plan = mod._build_boltz_expansion_treasury_plan(
+            onchain_target_sats=5_000_000, pending_swap_count=4
+        )
+
+        assert plan["status"] == "at_target"
+        assert plan["pending_swap_count"] == 4
+        assert plan["budget"] is None
+        mod._boltz_pending_swap_count.assert_not_called()
