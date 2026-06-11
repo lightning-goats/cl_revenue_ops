@@ -1010,14 +1010,21 @@ class CapacityPlanner:
             except Exception:
                 pass
 
-        # Kalman confidence gate -- skip closure if data unreliable
+        # Kalman confidence gate -- block closure only when the Kalman
+        # estimate is load-bearing (recent/mixed activity with low
+        # confidence). F3 (audit): zero forwards over a full window FORCES
+        # confidence to the 0.1 floor, and the dead-capital path REQUIRES
+        # zero forwards — gating on bare confidence made CLOSE unreachable
+        # (staging parked at DEFIBRILLATE forever). Zero flow over a full
+        # window on a mature channel is HIGH-confidence evidence of
+        # inactivity: the inactivity itself is the signal.
         if flow_metrics:
             confidence = getattr(flow_metrics, 'confidence', 1.0)
             # Guard against non-numeric (e.g. MagicMock) or None
             if not isinstance(confidence, (int, float)):
                 confidence = 1.0
             confidence = confidence or 1.0
-            if confidence < 0.5:
+            if confidence < 0.5 and not self._inactivity_is_signal(prof, flow_metrics):
                 return "KALMAN_LOW_CONFIDENCE"  # Don't recommend closure with unreliable data
 
         # Channel role protection -- INBOUND_GATEWAYs source volume for all
@@ -1071,6 +1078,33 @@ class CapacityPlanner:
                 return "REVENUE_ROUTE"  # Protect revenue route channels
 
         return None
+
+    def _flow_window_days(self) -> int:
+        """Resolve the flow-analysis window length in days (default 7)."""
+        for source in (self.config, getattr(self.flow, "config", None)):
+            raw = getattr(source, "flow_window_days", None)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                continue
+            if raw > 0:
+                return int(raw)
+        return 7
+
+    def _inactivity_is_signal(self, prof, flow_metrics) -> bool:
+        """True when zero observed flow IS the evidence, not missing data.
+
+        F3 (audit): a mature channel (older than the flow window plus a
+        7-day buffer) with zero forwards across the entire window is
+        confidently inactive — the Kalman confidence floor (0.1) reflects
+        "no forwards to estimate from", which for the close decision is the
+        signal itself. Channels with any in-window activity keep the
+        confidence gate: their Kalman estimate is load-bearing.
+        """
+        try:
+            forward_count = int(getattr(flow_metrics, "forward_count"))
+            days_open = int(getattr(prof, "days_open"))
+        except (TypeError, ValueError, AttributeError):
+            return False  # Unknowable data: stay conservative, keep the gate
+        return forward_count == 0 and days_open > self._flow_window_days() + 7
 
     def _build_dead_capital_loser(
         self,

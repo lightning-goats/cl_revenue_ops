@@ -82,13 +82,14 @@ def _make_prof(
     return prof
 
 
-def _make_flow(confidence=1.0):
+def _make_flow(confidence=1.0, forward_count=0):
     flow = MagicMock()
     flow.daily_volume = 0
     flow.flow_ratio = 0.0
     flow.capacity = 2_000_000
     flow.our_balance = 1_000_000
     flow.confidence = confidence
+    flow.forward_count = forward_count
     flow.kalman_regime_change = False
     return flow
 
@@ -160,13 +161,17 @@ class TestDeadCapitalCloseProtections:
         assert losers[0]["action"] == "DEFIBRILLATE"
         assert losers[0]["close_protection"] == "REVENUE_ROUTE"
 
-    def test_low_kalman_confidence_blocks_dead_capital_close(self):
+    def test_low_kalman_confidence_blocks_close_when_recently_active(self):
+        """F3: the confidence gate still protects channels with recent/mixed
+        activity, where the Kalman estimate is load-bearing."""
         planner, prof_analyzer = _make_planner()
         _set_dead_capital(planner, stage="defibrillation")
         _expired_stage(prof_analyzer, stage="defibrillation")
         prof = _make_prof(marginal_roi_percent=-80.0)
 
-        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow(confidence=0.3)})
+        losers = planner._identify_losers(
+            {SCID: prof}, {SCID: _make_flow(confidence=0.3, forward_count=3)}
+        )
 
         assert len(losers) == 1
         assert losers[0]["action"] == "DEFIBRILLATE"
@@ -230,3 +235,87 @@ class TestDeadCapitalCloseProtections:
         prof_analyzer.database.upsert_dead_capital_stage.assert_called_with(
             SCID, "defibrillation", pytest.approx(int(time.time()), abs=2)
         )
+
+
+class TestKalmanGateSemantics:
+    """F3 (audit HIGH): the Kalman-confidence gate made CLOSE unreachable.
+
+    Zero forwards in the window FORCES confidence to the 0.1 floor (< 0.5),
+    and the dead-capital path REQUIRES zero forwards — so close staging
+    permanently parked at DEFIBRILLATE. Zero flow over a full window on a
+    mature channel is HIGH-confidence evidence of inactivity, not
+    low-confidence data: the gate must only bind when the channel had recent
+    activity that makes the Kalman estimate load-bearing.
+    """
+
+    def test_real_confidence_formula_floors_at_0_1_for_zero_forwards(self):
+        """Use the REAL confidence formula (audit: prior tests always mocked
+        confidence=1.0 and never exercised the floor)."""
+        from modules.flow_analysis import FlowAnalyzer, MIN_CONFIDENCE
+
+        confidence = FlowAnalyzer._calculate_confidence(
+            MagicMock(), forward_count=0, last_forward_ts=0
+        )
+
+        assert confidence == MIN_CONFIDENCE == 0.1
+        assert confidence < 0.5  # the exact value that parked closes forever
+
+    def test_mature_zero_forward_channel_can_reach_close_staging(self):
+        """A 30-day-old channel with zero forwards in the window and no
+        other protections CAN reach close staging despite the confidence
+        floor — computed by the real formula, not a mock."""
+        from modules.flow_analysis import FlowAnalyzer
+
+        planner, prof_analyzer = _make_planner()
+        _set_dead_capital(planner, stage="defibrillation")
+        _expired_stage(prof_analyzer, stage="defibrillation")
+        # F4b: dead-capital CLOSE staging requires an executed defib attempt
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 1
+        }
+        prof = _make_prof(sourced_fee_sats=0, marginal_roi_percent=-80.0)
+        prof.days_open = 30  # mature: > flow_window (7) + 7
+
+        real_confidence = FlowAnalyzer._calculate_confidence(
+            MagicMock(), forward_count=0, last_forward_ts=0
+        )
+        flow = _make_flow(confidence=real_confidence, forward_count=0)
+
+        losers = planner._identify_losers({SCID: prof}, {SCID: flow})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "CLOSE"
+
+    def test_active_last_week_low_confidence_still_blocked(self):
+        """A channel that forwarded recently but has low confidence keeps
+        the protection — its Kalman estimate is load-bearing."""
+        planner, prof_analyzer = _make_planner()
+        _set_dead_capital(planner, stage="defibrillation")
+        _expired_stage(prof_analyzer, stage="defibrillation")
+        prof = _make_prof(sourced_fee_sats=0, marginal_roi_percent=-80.0)
+        prof.days_open = 200
+
+        losers = planner._identify_losers(
+            {SCID: prof}, {SCID: _make_flow(confidence=0.3, forward_count=2)}
+        )
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "DEFIBRILLATE"
+        assert losers[0]["close_protection"] == "KALMAN_LOW_CONFIDENCE"
+
+    def test_young_zero_forward_channel_still_blocked(self):
+        """A channel younger than flow_window + 7 days keeps the gate even
+        with zero forwards — not enough history to call it dead."""
+        planner, prof_analyzer = _make_planner()
+        _set_dead_capital(planner, stage="defibrillation")
+        _expired_stage(prof_analyzer, stage="defibrillation")
+        prof = _make_prof(sourced_fee_sats=0, marginal_roi_percent=-80.0)
+        prof.days_open = 10  # <= 7 + 7
+
+        losers = planner._identify_losers(
+            {SCID: prof}, {SCID: _make_flow(confidence=0.1, forward_count=0)}
+        )
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "DEFIBRILLATE"
+        assert losers[0]["close_protection"] == "KALMAN_LOW_CONFIDENCE"
