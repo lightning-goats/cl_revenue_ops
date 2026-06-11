@@ -4708,8 +4708,10 @@ class TestOpenEVAnchoredForecast:
 
     def test_high_earning_node_stays_positive(self):
         """A genuinely high-earning node keeps positive EV for new opens."""
-        # 16,425 ppm/year == the legacy 45 ppm/day assumption made real
-        planner = self._make_planner([16425.0, 16425.0, 16425.0], feerate_perkb=1000)
+        # 32,850 ppm/year = 90 ppm/day realized; even after the 0.5 new-peer
+        # discount the forecast hits the 45 ppm/day ceiling — the rate the
+        # legacy constant wrongly assumed for every node.
+        planner = self._make_planner([32850.0, 32850.0, 32850.0], feerate_perkb=1000)
         cfg = self._make_cfg()
 
         ev = planner._calculate_open_ev("02" + "ee" * 32, 5_000_000, cfg)
