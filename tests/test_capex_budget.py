@@ -700,6 +700,83 @@ class TestPriorityClass:
         alloc = engine.compute_allocations()
         assert alloc.priority_class == "defensive"
 
+    def test_single_small_bleeder_does_not_flip_fleet_defensive(self):
+        """Audit F4b: ONE small hard bleeder (count <= 1 and < 10% of fleet
+        capacity) must not flip the whole fleet into defensive mode."""
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    channel_id="100x1x0",
+                    contribution_msat=500_000,
+                    total_forward_count=20,
+                    capacity_sats=100_000,        # 1% of fleet capacity
+                ),
+                "200x1x0": _make_mock_profitability(
+                    channel_id="200x1x0",
+                    contribution_msat=2_000_000,
+                    fees_earned_msat=2_000_000,
+                    total_forward_count=80,
+                    capacity_sats=9_900_000,
+                ),
+            },
+            bleeders={"100x1x0": "hard"},
+        )
+        alloc = engine.compute_allocations()
+        assert alloc.priority_class == "growth"
+        # The bleeder itself is still blocked
+        assert alloc.channel_budgets["100x1x0"].tier == "blocked"
+
+    def test_two_hard_bleeders_flip_fleet_defensive(self):
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    channel_id="100x1x0",
+                    contribution_msat=500_000,
+                    total_forward_count=20,
+                    capacity_sats=100_000,
+                ),
+                "200x1x0": _make_mock_profitability(
+                    channel_id="200x1x0",
+                    contribution_msat=500_000,
+                    total_forward_count=20,
+                    capacity_sats=100_000,
+                ),
+                "300x1x0": _make_mock_profitability(
+                    channel_id="300x1x0",
+                    contribution_msat=2_000_000,
+                    fees_earned_msat=2_000_000,
+                    total_forward_count=80,
+                    capacity_sats=9_800_000,
+                ),
+            },
+            bleeders={"100x1x0": "hard", "200x1x0": "hard"},
+        )
+        alloc = engine.compute_allocations()
+        assert alloc.priority_class == "defensive"
+
+    def test_single_large_bleeder_flips_fleet_defensive(self):
+        """One bleeder holding >10% of fleet capacity is fleet-significant."""
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    channel_id="100x1x0",
+                    contribution_msat=500_000,
+                    total_forward_count=20,
+                    capacity_sats=3_000_000,      # 30% of fleet capacity
+                ),
+                "200x1x0": _make_mock_profitability(
+                    channel_id="200x1x0",
+                    contribution_msat=2_000_000,
+                    fees_earned_msat=2_000_000,
+                    total_forward_count=80,
+                    capacity_sats=7_000_000,
+                ),
+            },
+            bleeders={"100x1x0": "hard"},
+        )
+        alloc = engine.compute_allocations()
+        assert alloc.priority_class == "defensive"
+
     def test_healthy_fleet_is_growth(self):
         engine = _make_engine(
             channel_profitabilities={

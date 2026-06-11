@@ -161,10 +161,17 @@ class CapexBudgetEngine:
         # Compute per-channel budgets (all arithmetic in msat)
         channel_budgets: Dict[str, ChannelCapexBudget] = {}
         total_fleet_contribution_msat = 0
-        has_hard_bleeders = False
+        hard_bleeder_count = 0
+        hard_bleeder_capacity_sats = 0
+        total_capacity_sats = 0
         has_depleted_earners = False
 
         for ch_id, prof in all_prof.items():
+            try:
+                capacity_sats = int(getattr(prof, 'capacity_sats', 0) or 0)
+            except (TypeError, ValueError):
+                capacity_sats = 0
+            total_capacity_sats += capacity_sats
             contribution_msat = prof.revenue.total_contribution_msat
             # Audit F1(d): fleet budgets are debited by 30d spend, so they must
             # be FUNDED by 30d revenue (exit fees only), not lifetime totals.
@@ -180,7 +187,8 @@ class CapexBudgetEngine:
                 if bleeder:
                     bleeder_status = bleeder.classification
                     if bleeder_status == "hard":
-                        has_hard_bleeders = True
+                        hard_bleeder_count += 1
+                        hard_bleeder_capacity_sats += capacity_sats
             except Exception:
                 pass
 
@@ -199,6 +207,15 @@ class CapexBudgetEngine:
                 fleet_efficiency=fleet_efficiency,
             )
             channel_budgets[ch_id] = budget
+
+        # Audit F4b: a single small bleeder must not flip the WHOLE fleet
+        # into defensive mode. Fleet-significant bleeding means more than one
+        # hard bleeder, or hard-bleeder capacity above 10% of fleet capacity.
+        # (The bleeder channel itself is still individually blocked.)
+        has_hard_bleeders = hard_bleeder_count > 1 or (
+            total_capacity_sats > 0
+            and hard_bleeder_capacity_sats / total_capacity_sats > 0.10
+        )
 
         # Detect priority class
         priority_class = self._detect_priority_class(

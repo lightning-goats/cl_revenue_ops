@@ -308,3 +308,119 @@ class TestEdgeCases:
             recommended_action="monitor"
         )
         assert not bc.is_bleeder
+
+
+# ============================================================
+# Audit F4a: hard-bleeder hysteresis (enter < -1000, exit > -500)
+# ============================================================
+
+import time as _time
+from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
+
+
+def _make_live_analyzer(pnl_30d, pnl_7d):
+    """Build an analyzer whose DB serves mutable per-window P&L dicts."""
+    analyzer = ChannelProfitabilityAnalyzer.__new__(ChannelProfitabilityAnalyzer)
+    analyzer.plugin = MagicMock()
+    db = MagicMock()
+    state = {"30": dict(pnl_30d), "7": dict(pnl_7d)}
+
+    def full_pnl(channel_id, window_days=30):
+        return dict(state["30"] if window_days >= 8 else state["7"])
+
+    db.get_channel_full_pnl.side_effect = full_pnl
+    # No batch method -> per-channel fallback
+    db.get_all_channels_full_pnl = None
+    db.get_channel_rebalance_success_rate.return_value = None
+    analyzer.database = db
+    analyzer._get_all_channels = lambda: {
+        "100x1x0": {"peer_id": "02" + "a" * 64, "capacity": 2_000_000}
+    }
+    analyzer._bleeder_cache = None
+    analyzer._bleeder_cache_time = 0
+    return analyzer, state
+
+
+def _pnl(net_sats, cost_sats, revenue_sats=0, forwards=5):
+    return {
+        'total_contribution_msat': revenue_sats * 1000,
+        'total_contribution_sats': revenue_sats,
+        'rebalance_cost_sats': cost_sats,
+        'rebalance_cost_msat': cost_sats * 1000,
+        'net_pnl_msat': net_sats * 1000,
+        'net_pnl_sats': net_sats,
+        'direct_revenue_msat': revenue_sats * 1000,
+        'direct_revenue_sats': revenue_sats,
+        'direct_forward_count': forwards,
+        'sourced_forward_count': 0,
+        'sourced_fee_contribution_msat': 0,
+        'sourced_fee_contribution_sats': 0,
+        'sourced_volume_msat': 0,
+        'sourced_volume_sats': 0,
+        'revenue_sats': revenue_sats,
+        'forward_count': forwards,
+    }
+
+
+class TestHardBleederHysteresis:
+    """±2-sat oscillation around -1000 must not flap the classification."""
+
+    def _verdict(self, analyzer):
+        results = analyzer.identify_bleeders_v2(window_days=30)
+        return {c.channel_id: c for c in results}["100x1x0"]
+
+    def test_enters_hard_below_minus_1000(self):
+        analyzer, _ = _make_live_analyzer(
+            _pnl(net_sats=-1002, cost_sats=1002),
+            _pnl(net_sats=-200, cost_sats=200),
+        )
+        assert self._verdict(analyzer).classification == "hard"
+
+    def test_does_not_enter_hard_above_minus_1000(self):
+        """Fresh channel at -998 does NOT enter hard (no prior verdict)."""
+        analyzer, _ = _make_live_analyzer(
+            _pnl(net_sats=-998, cost_sats=998),
+            _pnl(net_sats=-200, cost_sats=200),
+        )
+        assert self._verdict(analyzer).classification != "hard"
+
+    def test_oscillation_around_minus_1000_holds_hard(self):
+        """-1002 -> hard; recovering to -998 keeps hard (exit is -500)."""
+        analyzer, state = _make_live_analyzer(
+            _pnl(net_sats=-1002, cost_sats=1002),
+            _pnl(net_sats=-200, cost_sats=200),
+        )
+        assert self._verdict(analyzer).classification == "hard"
+
+        # Oscillate +4 sats: still inside the hysteresis band
+        state["30"] = _pnl(net_sats=-998, cost_sats=998)
+        verdict = self._verdict(analyzer)
+        assert verdict.classification == "hard", (
+            "2-sat oscillation around -1000 must hold the hard classification"
+        )
+
+        # And back down again
+        state["30"] = _pnl(net_sats=-1001, cost_sats=1001)
+        assert self._verdict(analyzer).classification == "hard"
+
+    def test_exits_hard_above_minus_500(self):
+        analyzer, state = _make_live_analyzer(
+            _pnl(net_sats=-1002, cost_sats=1002),
+            _pnl(net_sats=-200, cost_sats=200),
+        )
+        assert self._verdict(analyzer).classification == "hard"
+
+        state["30"] = _pnl(net_sats=-400, cost_sats=400)
+        verdict = self._verdict(analyzer)
+        assert verdict.classification != "hard", (
+            "net_30d above -500 must release the hard classification"
+        )
+
+    def test_holds_hard_at_exactly_minus_500(self):
+        analyzer, state = _make_live_analyzer(
+            _pnl(net_sats=-1002, cost_sats=1002),
+            _pnl(net_sats=-200, cost_sats=200),
+        )
+        assert self._verdict(analyzer).classification == "hard"
+        state["30"] = _pnl(net_sats=-500, cost_sats=500)
+        assert self._verdict(analyzer).classification == "hard"

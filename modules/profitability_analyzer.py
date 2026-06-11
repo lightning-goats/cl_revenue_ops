@@ -1612,6 +1612,13 @@ class ChannelProfitabilityAnalyzer:
 
         classifications = []
 
+        # Audit F4a: previous verdicts for hard-bleeder hysteresis.
+        # Enter hard below -1000 sats 30d net; once hard, exit only when the
+        # 30d net recovers above -500. Without this band, a channel
+        # oscillating +/-2 sats around -1000 flaps between blocked and
+        # budgeted every cycle.
+        prev_verdicts = getattr(self, '_bleeder_cache', None) or {}
+
         try:
             # Get all active channels
             channels = self._get_all_channels()
@@ -1625,6 +1632,11 @@ class ChannelProfitabilityAnalyzer:
             for channel_id, info in channels.items():
                 try:
                     peer_id = info.get('peer_id', '')
+                    prev = prev_verdicts.get(channel_id)
+                    prev_hard = bool(
+                        prev is not None
+                        and getattr(prev, 'classification', None) == 'hard'
+                    )
 
                     # Get 30-day P&L
                     pnl_30d = all_pnl_30d.get(channel_id) if all_pnl_30d is not None else None
@@ -1662,6 +1674,16 @@ class ChannelProfitabilityAnalyzer:
                         classification = "hard"
                         reason = (f"Rebalance cost ({effective_rebalance_cost_30d} sats effective) exceeds "
                                   f"2x revenue ({revenue_30d * 2} sats), net loss {net_profit_30d} sats")
+                        recommended_action = "disable_rebalance"
+
+                    # Audit F4a: hysteresis hold. A channel already classified
+                    # hard stays hard until 30d net recovers above -500 sats,
+                    # even if it no longer meets the -1000 entry condition.
+                    elif prev_hard and net_profit_30d <= -500:
+                        classification = "hard"
+                        reason = (f"Hysteresis hold: previously hard, 30d net "
+                                  f"({net_profit_30d} sats) has not recovered "
+                                  f"above -500 sats")
                         recommended_action = "disable_rebalance"
 
                     # Check for SOFT BLEEDER (short-term loss, long-term gain)
@@ -1721,6 +1743,13 @@ class ChannelProfitabilityAnalyzer:
                     f"out of {len(classifications)} channels",
                     level='info'
                 )
+
+            # Audit F4a: remember verdicts for hysteresis on the default
+            # window (the same cache get_bleeder_status maintains). Other
+            # windows still read the cache but never overwrite it.
+            if window_days == 30 and classifications:
+                self._bleeder_cache = {c.channel_id: c for c in classifications}
+                self._bleeder_cache_time = time.time()
 
         except Exception as e:
             self.plugin.log(f"Error in identify_bleeders_v2: {e}", level='error')
