@@ -433,38 +433,50 @@ class EVRebalancer:
         self,
         depleted_channels: List[Tuple[str, Dict[str, Any], float]],
         source_channels: List[Tuple[str, Dict[str, Any], float]],
-        candidates: List[RebalanceCandidate],
+        candidates: List[Any],
     ) -> Dict[str, Any]:
-        """Build a local cl-hive liquidity-state payload from the current cycle."""
-        depleted_payload = []
-        for _channel_id, info, local_pct in depleted_channels:
-            peer_id = str(info.get("peer_id") or "").strip()
-            capacity_sats = int(info.get("capacity", 0) or 0)
-            if not peer_id:
-                continue
-            depleted_payload.append({
-                "peer_id": peer_id,
-                "local_pct": float(local_pct),
-                "capacity_sats": capacity_sats,
-            })
+        """Build a local cl-hive liquidity-state payload from the current cycle.
 
-        saturated_payload = []
-        for _channel_id, info, local_pct in source_channels:
-            peer_id = str(info.get("peer_id") or "").strip()
-            capacity_sats = int(info.get("capacity", 0) or 0)
-            if not peer_id:
-                continue
-            saturated_payload.append({
-                "peer_id": peer_id,
-                "local_pct": float(local_pct),
-                "capacity_sats": capacity_sats,
-            })
+        Channel entries carry capacity in BOTH keys: capacity_msat (primary —
+        cl-hive's liquidity_coordinator reads capacity_msat) and capacity_sats
+        (compat). ``candidates`` accepts both the legacy RebalanceCandidate
+        and the v2 engine's PairCandidate shapes.
+        """
+        def _channel_entries(
+            entries: List[Tuple[str, Dict[str, Any], float]]
+        ) -> List[Dict[str, Any]]:
+            result = []
+            for _channel_id, info, local_pct in entries:
+                peer_id = str(info.get("peer_id") or "").strip()
+                capacity_sats = int(info.get("capacity", 0) or 0)
+                if not peer_id:
+                    continue
+                result.append({
+                    "peer_id": peer_id,
+                    "local_pct": float(local_pct),
+                    "capacity_msat": capacity_sats * 1000,
+                    "capacity_sats": capacity_sats,
+                })
+            return result
+
+        depleted_payload = _channel_entries(depleted_channels)
+        saturated_payload = _channel_entries(source_channels)
 
         liquidity_needs = []
         seen_pairs = set()
         for candidate in candidates[:10]:
-            source_peer_id = str(candidate.primary_source_peer_id or "").strip()
-            destination_peer_id = str(candidate.to_peer_id or "").strip()
+            # Legacy RebalanceCandidate uses primary_source_peer_id/to_peer_id;
+            # v2 PairCandidate uses source_peer_id/dest_peer_id.
+            source_peer_id = str(
+                getattr(candidate, "primary_source_peer_id", None)
+                or getattr(candidate, "source_peer_id", None)
+                or ""
+            ).strip()
+            destination_peer_id = str(
+                getattr(candidate, "to_peer_id", None)
+                or getattr(candidate, "dest_peer_id", None)
+                or ""
+            ).strip()
             if (
                 not source_peer_id
                 or not destination_peer_id
@@ -475,13 +487,18 @@ class EVRebalancer:
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
+            amount_sats = int(getattr(candidate, "amount_sats", 0) or 0)
+            expected_profit_sats = int(
+                getattr(candidate, "expected_profit_sats", 0) or 0
+            )
             liquidity_needs.append({
                 "source_peer_id": source_peer_id,
                 "destination_peer_id": destination_peer_id,
-                "capacity_sats": int(candidate.amount_sats),
-                "priority_tier": "high" if candidate.expected_profit_sats > 0 else "medium",
-                "flow_state": candidate.dest_flow_state,
-                "expected_profit_sats": int(candidate.expected_profit_sats),
+                "capacity_msat": amount_sats * 1000,
+                "capacity_sats": amount_sats,
+                "priority_tier": "high" if expected_profit_sats > 0 else "medium",
+                "flow_state": str(getattr(candidate, "dest_flow_state", "") or ""),
+                "expected_profit_sats": expected_profit_sats,
             })
 
         return {
@@ -496,7 +513,7 @@ class EVRebalancer:
         self,
         depleted_channels: List[Tuple[str, Dict[str, Any], float]],
         source_channels: List[Tuple[str, Dict[str, Any], float]],
-        candidates: List[RebalanceCandidate],
+        candidates: List[Any],
     ) -> None:
         """Push liquidity state to CLN datastore for cl-hive to read.
 
@@ -511,6 +528,48 @@ class EVRebalancer:
 
         if self.data_service:
             self.data_service.datastore_push(["revenue", "liquidity-state"], payload)
+
+    def _report_liquidity_state_from_cycle(self, cycle_result: Any, cfg: Any) -> None:
+        """Report REAL liquidity state from a completed v2 engine cycle.
+
+        Audit fix (fleet liquidity pipeline): the liquidity-state payload was
+        previously written only on early-suppression paths with hardcoded
+        empty channel lists, so cl-hive never saw real member state.
+
+        depleted = channels below the planner band-low,
+        source   = channels above the planner band-high,
+        both derived from the engine's state snapshot;
+        candidates = the selected pair summaries from this cycle.
+        """
+        if self.data_service is None:
+            return
+        snapshot = getattr(cycle_result, "snapshot", None)
+        if snapshot is None:
+            return
+
+        def _band(name: str, default: float) -> float:
+            value = getattr(cfg, name, default)
+            return float(value) if isinstance(value, (int, float)) and value else default
+
+        band_low = _band("low_liquidity_threshold", 0.35)
+        band_high = _band("high_liquidity_threshold", 0.65)
+
+        depleted: List[Tuple[str, Dict[str, Any], float]] = []
+        source: List[Tuple[str, Dict[str, Any], float]] = []
+        for channel in getattr(snapshot, "channels", ()) or ():
+            local_ratio = float(getattr(channel, "local_ratio", 0.0) or 0.0)
+            info = {
+                "peer_id": getattr(channel, "peer_id", ""),
+                "capacity": int(getattr(channel, "capacity_sats", 0) or 0),
+            }
+            entry = (str(getattr(channel, "channel_id", "")), info, local_ratio)
+            if local_ratio < band_low:
+                depleted.append(entry)
+            elif local_ratio > band_high:
+                source.append(entry)
+
+        candidates = list(getattr(cycle_result, "candidates", []) or [])
+        self._report_hive_liquidity_state(depleted, source, candidates)
 
     def _is_hive_member(self, peer_id: str) -> bool:
         """Check hive membership from the live router first, then cached hints."""
@@ -1174,8 +1233,10 @@ class EVRebalancer:
         - Uses ephemeral fee cache for listchannels calls
         """
         candidates = []
-        # Kept (always empty) only as _report_hive_liquidity_state inputs on
-        # the early-suppression paths; the v2 engine owns real selection.
+        # Early-suppression paths (no slots / capital controls) report an
+        # empty liquidity state below — no engine snapshot exists yet on those
+        # paths. The NORMAL path reports REAL state derived from the engine
+        # cycle snapshot via _report_liquidity_state_from_cycle.
         depleted_channels: List[Tuple[str, Dict[str, Any], float]] = []
         source_channels: List[Tuple[str, Dict[str, Any], float]] = []
 
@@ -1269,6 +1330,17 @@ class EVRebalancer:
                 return []
 
             cycle_result = engine.run_cycle()
+
+            # Report REAL liquidity state to cl-hive each normal cycle
+            # (depleted/saturated from the engine snapshot, selected pairs as
+            # enriched needs). Reporting must never break the cycle itself.
+            try:
+                self._report_liquidity_state_from_cycle(cycle_result, cfg)
+            except Exception as e:
+                self.plugin.log(
+                    f"hive liquidity-state report failed: {e}", level='debug'
+                )
+
             executed = len(cycle_result.executions)
             succeeded = sum(1 for e in cycle_result.executions if e.success)
             if executed > 0:
