@@ -275,6 +275,67 @@ def test_v3_router_exclude_layer_per_call_outside_cycle():
 
 
 # ---------------------------------------------------------------------------
+# 5. Empirical dest success rate memoized per cycle
+# ---------------------------------------------------------------------------
+
+
+def _success_rate_engine(mock_plugin, mock_database):
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    mock_plugin.rpc.getinfo.return_value = {"id": OUR_ID}
+    mock_plugin.rpc.call.return_value = {"layers": []}
+    return RebalanceEngine(
+        plugin=mock_plugin, config=Config(dry_run=True), database=mock_database
+    )
+
+
+def test_dest_success_rate_queried_once_per_channel_per_cycle(
+    mock_plugin, mock_database
+):
+    mock_database.get_channel_rebalance_success_rate.return_value = {
+        "total": 5,
+        "success_rate": 0.8,
+    }
+    engine = _success_rate_engine(mock_plugin, mock_database)
+
+    for _ in range(5):
+        assert engine._empirical_dest_success_rate("200x1x0") == 0.8
+
+    assert mock_database.get_channel_rebalance_success_rate.call_count == 1
+
+
+def test_dest_success_rate_memoizes_none_results(mock_plugin, mock_database):
+    mock_database.get_channel_rebalance_success_rate.return_value = {
+        "total": 1,
+        "success_rate": 1.0,
+    }
+    engine = _success_rate_engine(mock_plugin, mock_database)
+
+    assert engine._empirical_dest_success_rate("200x1x0") is None
+    assert engine._empirical_dest_success_rate("200x1x0") is None
+
+    assert mock_database.get_channel_rebalance_success_rate.call_count == 1
+
+
+def test_dest_success_rate_memo_cleared_at_cycle_start(
+    mock_plugin, mock_database
+):
+    mock_database.get_channel_rebalance_success_rate.return_value = {
+        "total": 5,
+        "success_rate": 0.8,
+    }
+    engine = _success_rate_engine(mock_plugin, mock_database)
+    engine._build_snapshot = MagicMock(return_value=None)  # empty cycle
+
+    engine._empirical_dest_success_rate("200x1x0")
+    engine.find_candidates()  # new cycle clears the memo
+    engine._empirical_dest_success_rate("200x1x0")
+
+    assert mock_database.get_channel_rebalance_success_rate.call_count == 2
+
+
+# ---------------------------------------------------------------------------
 # 4. Hive router cycle-scoped askrene-listlayers cache
 # ---------------------------------------------------------------------------
 

@@ -126,6 +126,12 @@ class RebalanceEngine:
         self._pair_failures: Dict[Tuple[str, str], List[float]] = {}
         self._futility_threshold: int = 3
         self._futility_window_sec: float = 1800.0  # 30 minutes
+        # Per-cycle memo for the empirical dest success-rate DB aggregate
+        # (5+ identical aggregate queries per cycle on zero-probability
+        # decomposition paths, doubling on rejection paths). Cleared at
+        # cycle start (find_candidates); caches None results too so a
+        # missing/short history is not re-queried within the cycle.
+        self._dest_success_rate_memo: Dict[str, Optional[float]] = {}
         # Iter2: lower base cooldown for the most common transient failure
         # (no_route / temporary_channel_failure). Backoff multiplier in
         # record_pair_rebalance_failure already escalates repeated failures
@@ -278,6 +284,14 @@ class RebalanceEngine:
         """
         if self.database is None or not dest_channel_id:
             return None
+        if dest_channel_id in self._dest_success_rate_memo:
+            return self._dest_success_rate_memo[dest_channel_id]
+        rate = self._query_dest_success_rate(dest_channel_id)
+        self._dest_success_rate_memo[dest_channel_id] = rate
+        return rate
+
+    def _query_dest_success_rate(self, dest_channel_id: str) -> Optional[float]:
+        """Uncached DB aggregate behind _empirical_dest_success_rate."""
         getter = getattr(self.database, "get_channel_rebalance_success_rate", None)
         if not callable(getter):
             return None
@@ -1200,6 +1214,9 @@ class RebalanceEngine:
         Captures the active router at the start of the cycle so mid-cycle
         config flips do not split a cycle across two routers.
         """
+        # New cycle: drop the per-cycle dest success-rate memo so the
+        # aggregate reflects results recorded since the last cycle.
+        self._dest_success_rate_memo.clear()
         self._cycle_router = self._active_router()
         if self._cycle_router is None:
             self._log(
