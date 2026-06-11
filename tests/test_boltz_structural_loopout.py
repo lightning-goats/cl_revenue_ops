@@ -802,6 +802,17 @@ def test_non_structural_candidate_ignores_envelope():
     assert bm.loop_out.call_args.kwargs["structural"] is False
 
 
+def test_structural_envelope_provider_reads_live_config():
+    """The provider wired into BoltzCliManager must read the LIVE config at
+    call time (the envelope is runtime-mutable via revenue-config)."""
+    mod = load_plugin_module()
+    from modules.config import Config
+    mod.config = Config(boltz_structural_budget_sats_per_day=750)
+    assert mod._structural_envelope_sats_provider() == 750
+    mod.config = Config()  # envelope off by default
+    assert mod._structural_envelope_sats_provider() == 0
+
+
 def _treasury_cycle_module(structural=True):
     mod, bm = _cycle_module(envelope=1000, spent=0)
     plan = _cycle_plan(structural=structural)

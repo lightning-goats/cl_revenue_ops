@@ -59,6 +59,12 @@ class BoltzCliManager:
         self.external_liquidity_cost_provider = None
         # Optional callback returning unified budget limit info for all liquidity costs.
         self.global_budget_limit_provider = None
+        # Optional callback returning the configured daily structural envelope
+        # (boltz_structural_budget_sats_per_day) in sats. Read at call time so
+        # runtime config changes apply. When > 0, structural loop-outs skip
+        # the per-channel capex gate (the envelope + unified budget gate them
+        # instead); when absent/0/unreadable, no bypass (fail closed).
+        self.structural_envelope_provider = None
         # Capability cache: some CLN+boltzd combinations reject reverse-swap chanIds.
         self._reverse_chanids_supported: Optional[bool] = None
         self._capex_engine = None
@@ -98,6 +104,21 @@ class BoltzCliManager:
                 ),
             }
         return {"allowed": True, "reason": None}
+
+    def _structural_envelope_sats(self) -> int:
+        """Configured daily structural envelope in sats (0 = disabled).
+
+        Fail closed: no provider, a falsy value, or a provider error all
+        report 0 — structural swaps then stay behind the conservative
+        per-channel capex gate.
+        """
+        provider = self.structural_envelope_provider
+        if provider is None:
+            return 0
+        try:
+            return max(0, int(provider() or 0))
+        except Exception:
+            return 0
 
     def check_channel_capex_budget(self, estimated_fee_sats: int, channel_id=None) -> dict:
         """Gate a channel-targeted swap on the channel's remaining capex budget.
@@ -1468,18 +1489,33 @@ class BoltzCliManager:
                 "budget": budget_check.get("budget"),
             }
 
-        # Channel-targeted swaps draw on the channel's own capex budget.
-        channel_check = self.check_channel_capex_budget(
-            estimated_fee_sats=budget_check.get("estimated_fee_sats", 0),
-            channel_id=channel_id,
-        )
-        if not channel_check["allowed"]:
-            return {
-                "status": "rejected",
-                "reason": channel_check["reason"],
-                "budget": budget_check.get("budget"),
-                "channel_budget_check": channel_check,
-            }
+        # Channel-targeted swaps draw on the channel's own capex budget —
+        # EXCEPT structural drains when the daily envelope is configured.
+        # Source-heavy decayed channels carry bootstrap-scale (<=200 sat)
+        # 30d capex budgets that rejected exactly the drains the structural
+        # feature exists for; those swaps are already gated by the dedicated
+        # daily envelope (fail-closed, balance cycle) + the unified budget,
+        # which remain the binding constraints.
+        if structural and self._structural_envelope_sats() > 0:
+            try:
+                self.plugin.log(
+                    "BOLTZ: structural swap: envelope-gated, per-channel capex bypassed",
+                    level="info",
+                )
+            except Exception:
+                pass
+        else:
+            channel_check = self.check_channel_capex_budget(
+                estimated_fee_sats=budget_check.get("estimated_fee_sats", 0),
+                channel_id=channel_id,
+            )
+            if not channel_check["allowed"]:
+                return {
+                    "status": "rejected",
+                    "reason": channel_check["reason"],
+                    "budget": budget_check.get("budget"),
+                    "channel_budget_check": channel_check,
+                }
 
         target_channel_id = (str(channel_id).replace(':', 'x') if channel_id else None)
         target_peer_id = str(peer_id).strip() if peer_id else None

@@ -168,6 +168,104 @@ class TestSwapPathsConsultChannelBudget:
         engine.get_channel_budget.assert_not_called()
 
 
+class TestStructuralCapexBypass:
+    """Structural loop-outs are envelope-gated, not per-channel capex gated.
+
+    Source-heavy decayed channels carry bootstrap-scale (<=200 sat) 30d capex
+    budgets, which rejected exactly the structural drains the feature exists
+    for. Structural swaps are already gated by the dedicated daily envelope
+    (fail-closed, checked by the balance cycle) plus the unified budget, so
+    the per-channel gate is skipped — but ONLY when the envelope is actually
+    configured (> 0); otherwise the conservative gate stays."""
+
+    def _prep_quote(self, mgr, fee_sats=100):
+        mgr.quote = MagicMock(return_value={
+            "swap_type": "reverse",
+            "amount_sats": 100_000,
+            "currency": "BTC",
+            "quote": {"boltzFee": fee_sats},
+            "estimated_total_fee_sats": fee_sats,
+        })
+        mgr.get_budget_status = MagicMock(return_value={
+            "remaining_24h_sats_estimate": 10_000,
+            "daily_budget_sats": 50_000,
+        })
+        mgr._resolve_wallet_name = MagicMock(return_value="WALLET")
+        mgr._run_json = MagicMock(return_value={"id": "swapX"})
+        mgr._record_swap_result = MagicMock()
+        mgr._detect_reverse_chanids_support = MagicMock(return_value=None)
+
+    def _structural_manager(self, channel_budget_sats=50, envelope_sats=200):
+        engine = _engine_with_channel_budget(budget_sats=channel_budget_sats)
+        mgr = _make_manager(engine)
+        mgr.structural_envelope_provider = lambda: envelope_sats
+        self._prep_quote(mgr, fee_sats=100)
+        return mgr, engine
+
+    def test_structural_swap_bypasses_channel_capex_gate(self):
+        """50-sat channel budget, 200-sat envelope, 100-sat fee: executes."""
+        mgr, engine = self._structural_manager(channel_budget_sats=50, envelope_sats=200)
+
+        result = mgr.loop_out(amount_sats=100_000, channel_id=SCID, structural=True)
+
+        assert result["status"] == "accepted"
+        engine.get_channel_budget.assert_not_called()
+        # First CLI call is the swap creation (a status probe may follow).
+        assert mgr._run_json.call_args_list[0].args[0][0] == "createreverseswap"
+
+    def test_structural_bypass_logs_envelope_gating(self):
+        mgr, _ = self._structural_manager()
+
+        mgr.loop_out(amount_sats=100_000, channel_id=SCID, structural=True)
+
+        logged = " | ".join(
+            str(c.args[0]) for c in mgr.plugin.log.call_args_list if c.args
+        )
+        assert "structural swap: envelope-gated, per-channel capex bypassed" in logged
+
+    def test_non_structural_swap_still_channel_gated(self):
+        mgr, engine = self._structural_manager(channel_budget_sats=50, envelope_sats=200)
+
+        result = mgr.loop_out(amount_sats=100_000, channel_id=SCID, structural=False)
+
+        assert result["status"] == "rejected"
+        assert "channel" in result["reason"].lower()
+        engine.get_channel_budget.assert_called_once()
+        mgr._run_json.assert_not_called()
+
+    def test_envelope_zero_keeps_channel_gate_for_structural(self):
+        """Envelope disabled: structural swaps fall back to the conservative
+        per-channel gate (and the balance-cycle envelope gate blocks them
+        anyway) — nothing structural may execute on a 50-sat budget."""
+        mgr, _ = self._structural_manager(channel_budget_sats=50, envelope_sats=0)
+
+        result = mgr.loop_out(amount_sats=100_000, channel_id=SCID, structural=True)
+
+        assert result["status"] == "rejected"
+        mgr._run_json.assert_not_called()
+
+    def test_no_provider_keeps_channel_gate(self):
+        """Default manager (no provider wired): no bypass."""
+        engine = _engine_with_channel_budget(budget_sats=50)
+        mgr = _make_manager(engine)
+        self._prep_quote(mgr, fee_sats=100)
+
+        result = mgr.loop_out(amount_sats=100_000, channel_id=SCID, structural=True)
+
+        assert result["status"] == "rejected"
+
+    def test_provider_failure_fails_closed(self):
+        """An unreadable envelope must not grant the bypass."""
+        mgr, _ = self._structural_manager(channel_budget_sats=50)
+        def boom():
+            raise RuntimeError("config gone")
+        mgr.structural_envelope_provider = boom
+
+        result = mgr.loop_out(amount_sats=100_000, channel_id=SCID, structural=True)
+
+        assert result["status"] == "rejected"
+
+
 class TestBoltzSpendRecording:
     """Executed swaps record category=boltz spend events via the capex engine."""
 

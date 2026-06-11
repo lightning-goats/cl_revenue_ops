@@ -2019,6 +2019,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if boltz_manager is not None:
         boltz_manager.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
         boltz_manager.global_budget_limit_provider = _total_cost_budget_limit_provider
+        # Live envelope read (runtime-mutable config): with a configured
+        # structural envelope, structural loop-outs skip the per-channel
+        # capex gate inside the manager — the envelope + unified budget gate
+        # them instead.
+        boltz_manager.structural_envelope_provider = _structural_envelope_sats_provider
 
     # Hive Hints adapter (sole integration boundary with cl_hive)
     global hive_hints
@@ -5811,6 +5816,15 @@ def _require_boltz_manager() -> BoltzCliManager:
     if boltz_manager is None:
         raise BoltzCliError("Boltz CLI integration not initialized")
     return boltz_manager
+
+
+def _structural_envelope_sats_provider() -> int:
+    """Current daily structural envelope (sats) for the Boltz manager.
+
+    Reads the live config at call time so revenue-config runtime updates to
+    boltz_structural_budget_sats_per_day take effect without a restart.
+    """
+    return int(getattr(config, "boltz_structural_budget_sats_per_day", 0) or 0)
 
 
 @plugin.method("revenue-total-cost-budget")
