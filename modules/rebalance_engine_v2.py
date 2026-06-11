@@ -2774,14 +2774,29 @@ class RebalanceEngine:
             elif getattr(result, "payment_pending", False):
                 # Park the row for the reconciliation sweep. No cost is
                 # recorded yet — that happens once listsendpays reports a
-                # terminal state for this payment_hash.
+                # terminal state for this payment_hash. A pending row
+                # WITHOUT a payment_hash can never be matched by the sweep
+                # (it would sit parked forever), so record it as a terminal
+                # failure instead of creating a dead row.
                 failure_data = getattr(result, "failure_data", {}) or {}
-                self.database.update_rebalance_result(
-                    rebalance_id,
-                    "pending_settlement",
-                    error_message=str(getattr(result, "error", "") or ""),
-                    payment_hash=str(failure_data.get("payment_hash", "") or ""),
-                )
+                payment_hash = str(failure_data.get("payment_hash", "") or "")
+                if payment_hash:
+                    self.database.update_rebalance_result(
+                        rebalance_id,
+                        "pending_settlement",
+                        error_message=str(getattr(result, "error", "") or ""),
+                        payment_hash=payment_hash,
+                    )
+                else:
+                    error = str(getattr(result, "error", "") or "")
+                    self.database.update_rebalance_result(
+                        rebalance_id,
+                        "failed",
+                        error_message=(
+                            f"{error} (payment pending but missing "
+                            "payment_hash; not sweepable)"
+                        ).strip(),
+                    )
             else:
                 self.database.update_rebalance_result(
                     rebalance_id,

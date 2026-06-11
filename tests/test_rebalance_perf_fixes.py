@@ -275,6 +275,76 @@ def test_v3_router_exclude_layer_per_call_outside_cycle():
 
 
 # ---------------------------------------------------------------------------
+# 6. Pending settlement without payment_hash is terminal, not parked
+# ---------------------------------------------------------------------------
+
+
+def test_pending_result_without_payment_hash_records_terminal_failure(
+    mock_plugin, mock_database
+):
+    """A 'pending_settlement' row with an empty payment_hash can never be
+    matched by the listsendpays sweep — it would sit parked forever. Such
+    results must be recorded as terminal failures instead."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_execution import ExecutionResult
+
+    mock_plugin.rpc.getinfo.return_value = {"id": OUR_ID}
+    mock_plugin.rpc.call.return_value = {"layers": []}
+    engine = RebalanceEngine(
+        plugin=mock_plugin, config=Config(dry_run=True), database=mock_database
+    )
+
+    result = ExecutionResult(
+        success=False,
+        error="payment timed out",
+        amount_sats=1_000,
+        fee_sats=0,
+        fee_msat=0,
+        payment_pending=True,
+        failure_data={},  # no payment_hash captured
+    )
+
+    engine._record_rebalance_result(7, result)
+
+    call = mock_database.update_rebalance_result.call_args
+    assert call.args[0] == 7
+    assert call.args[1] == "failed"
+    assert "payment_hash" not in call.kwargs or not call.kwargs["payment_hash"]
+    assert "missing payment_hash" in call.kwargs["error_message"]
+
+
+def test_pending_result_with_payment_hash_still_parks(
+    mock_plugin, mock_database
+):
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_execution import ExecutionResult
+
+    mock_plugin.rpc.getinfo.return_value = {"id": OUR_ID}
+    mock_plugin.rpc.call.return_value = {"layers": []}
+    engine = RebalanceEngine(
+        plugin=mock_plugin, config=Config(dry_run=True), database=mock_database
+    )
+
+    result = ExecutionResult(
+        success=False,
+        error="payment timed out",
+        amount_sats=1_000,
+        fee_sats=0,
+        fee_msat=0,
+        payment_pending=True,
+        failure_data={"payment_hash": "ab" * 32},
+    )
+
+    engine._record_rebalance_result(7, result)
+
+    call = mock_database.update_rebalance_result.call_args
+    assert call.args[1] == "pending_settlement"
+    assert call.kwargs["payment_hash"] == "ab" * 32
+
+
+# ---------------------------------------------------------------------------
 # 5. Empirical dest success rate memoized per cycle
 # ---------------------------------------------------------------------------
 
