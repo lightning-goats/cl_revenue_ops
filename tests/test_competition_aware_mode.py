@@ -1,8 +1,9 @@
 """Tests for Step 4 competition_aware market_fee_mode.
 
-Covers the _get_neighbor_fee_min helper and the mode enum validation.
-The full pipeline integration is exercised by the Polar lab run; these
-tests lock down the small helper so refactors don't break it silently.
+Covers the mode enum validation and the neighbor percentile/default-fee
+helpers. (_get_neighbor_fee_min was removed as zero-caller dead code; the
+competition_aware preserve trigger uses _get_neighbor_fee_percentile.)
+The full pipeline integration is exercised by the Polar lab run.
 """
 
 import time
@@ -48,103 +49,6 @@ class TestMarketFeeModeEnum:
         assert 'premium' in valid
 
 
-class TestNeighborFeeMin:
-    def _make_channels(self, fees_from_others: list[int], include_ours: bool = False):
-        """Build a listchannels-shaped response with competitor fees."""
-        channels = []
-        our_id = "02ourid"
-        if include_ours:
-            channels.append({
-                "source": our_id,
-                "active": True,
-                "fee_per_millionth": 999,
-                "satoshis": 1_000_000,
-                "last_update": int(time.time()),
-            })
-        for i, fee in enumerate(fees_from_others):
-            channels.append({
-                "source": f"02competitor{i:02x}",
-                "active": True,
-                "fee_per_millionth": fee,
-                "satoshis": 1_000_000,
-                "last_update": int(time.time()),
-            })
-        return channels
-
-    def _setup_fc(self, mock_plugin, mock_config, mock_database, channels: list):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
-        fc._our_node_id = "02ourid"
-        fc.data_service = MagicMock()
-        fc.data_service.get_channels = MagicMock(return_value={"channels": channels})
-        fc._neighbor_fee_cache = {}
-        return fc
-
-    def test_returns_cheapest_when_enough_competitors(self, mock_plugin, mock_config, mock_database):
-        channels = self._make_channels([200, 50, 100, 300])
-        fc = self._setup_fc(mock_plugin, mock_config, mock_database, channels)
-        assert fc._get_neighbor_fee_min("02peer") == 50
-
-    def test_excludes_our_own_channel(self, mock_plugin, mock_config, mock_database):
-        # Our fee (999) should be excluded, cheapest competitor is 50.
-        channels = self._make_channels([200, 50, 100], include_ours=True)
-        fc = self._setup_fc(mock_plugin, mock_config, mock_database, channels)
-        assert fc._get_neighbor_fee_min("02peer") == 50
-
-    def test_respects_configured_threshold(self, mock_plugin, mock_config, mock_database):
-        # 2 competitors meets the default lab threshold (2).
-        channels = self._make_channels([50, 200])
-        fc = self._setup_fc(mock_plugin, mock_config, mock_database, channels)
-        assert fc._get_neighbor_fee_min("02peer") == 50
-
-    def test_returns_none_below_configured_threshold(self, mock_plugin, mock_config, mock_database):
-        # Raise threshold to 3 (prod default); 2 competitors now insufficient.
-        mock_config.neighbor_median_min_competitors = 3
-        channels = self._make_channels([50, 200])
-        fc = self._setup_fc(mock_plugin, mock_config, mock_database, channels)
-        assert fc._get_neighbor_fee_min("02peer") is None
-
-    def test_single_competitor_always_insufficient(self, mock_plugin, mock_config, mock_database):
-        # Even with threshold=2, a single competitor isn't enough.
-        channels = self._make_channels([50])
-        fc = self._setup_fc(mock_plugin, mock_config, mock_database, channels)
-        assert fc._get_neighbor_fee_min("02peer") is None
-
-    def test_skips_inactive_channels(self, mock_plugin, mock_config, mock_database):
-        channels = self._make_channels([200, 100, 300])
-        channels.append({
-            "source": "02deadpeer",
-            "active": False,
-            "fee_per_millionth": 1,  # Would be min if counted
-            "satoshis": 1_000_000,
-            "last_update": int(time.time()),
-        })
-        fc = self._setup_fc(mock_plugin, mock_config, mock_database, channels)
-        # Inactive 1ppm skipped; cheapest active is 100.
-        assert fc._get_neighbor_fee_min("02peer") == 100
-
-    def test_skips_out_of_range_fees(self, mock_plugin, mock_config, mock_database):
-        # 0 ppm (below range) and 20000 ppm (above range) should both be ignored.
-        channels = self._make_channels([0, 20000, 150, 200, 300])
-        fc = self._setup_fc(mock_plugin, mock_config, mock_database, channels)
-        assert fc._get_neighbor_fee_min("02peer") == 150
-
-    def test_cache_reuses_value(self, mock_plugin, mock_config, mock_database):
-        channels = self._make_channels([200, 50, 100])
-        fc = self._setup_fc(mock_plugin, mock_config, mock_database, channels)
-        assert fc._get_neighbor_fee_min("02peer") == 50
-        # Mutate the data_service; a cached call should still return 50.
-        fc.data_service.get_channels = MagicMock(return_value={"channels": []})
-        assert fc._get_neighbor_fee_min("02peer") == 50
-
-    def test_exception_returns_none(self, mock_plugin, mock_config, mock_database):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
-        fc._our_node_id = "02ourid"
-        fc.data_service = MagicMock()
-        fc.data_service.get_channels = MagicMock(side_effect=RuntimeError("boom"))
-        fc._neighbor_fee_cache = {}
-        assert fc._get_neighbor_fee_min("02peer") is None
-
-
 class TestClnDefaultFeeFilter:
     """Phase B.1 (2026-04-23): dormant CLN-default competitors must not
     drag down the neighbor median / min. They represent nodes that never
@@ -169,26 +73,6 @@ class TestClnDefaultFeeFilter:
     def test_missing_base_keeps_channel_conservative(self):
         ch = {"fee_per_millionth": 10}
         assert FeeController._is_cln_default_fee(ch) is False
-
-    def test_filter_applied_to_min_helper(self, mock_plugin, mock_config, mock_database):
-        """Confirm the min helper excludes default-fee channels from its pool."""
-        channels = [
-            {"source": "02comp1", "active": True,
-             "fee_per_millionth": 10, "fee_base_msat": 1000},  # CLN default — skip
-            {"source": "02comp2", "active": True,
-             "fee_per_millionth": 50, "fee_base_msat": 0},
-            {"source": "02comp3", "active": True,
-             "fee_per_millionth": 200, "fee_base_msat": 0},
-            {"source": "02comp4", "active": True,
-             "fee_per_millionth": 300, "fee_base_msat": 0},
-        ]
-        fc = FeeController(mock_plugin, mock_config, mock_database)
-        fc._our_node_id = "02ourid"
-        fc.data_service = MagicMock()
-        fc.data_service.get_channels = MagicMock(return_value={"channels": channels})
-        fc._neighbor_fee_cache = {}
-        # Default tuple at 10 would have been the min, but it's filtered.
-        assert fc._get_neighbor_fee_min("02peer") == 50
 
 
 class TestNeighborFeePercentile:

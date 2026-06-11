@@ -1158,24 +1158,23 @@ class TestMarketBoundaryGuard:
         assert info is None
         fc.data_service.get_channels.assert_not_called()
 
-    def test_deprecated_market_boundary_downshift_helper_is_not_reachable_from_lookup(
+    def test_deprecated_market_boundary_helpers_removed(
         self, mock_plugin, mock_database
     ):
+        """Only the two hard-None stub providers survive the dead-code sweep;
+        the unreachable guard/downshift/target helpers are gone."""
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
         peer_id = "02" + "5" * 64
         self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(80,))
 
+        # Stubs kept (incident rationale lives in their docstrings)
         assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
+        assert fc._get_hive_market_boundary_fee(peer_id, cfg=cfg) is None
 
-        new_fee, info = fc._apply_market_boundary_downshift(
-            current_fee_ppm=112,
-            candidate_fee_ppm=87,
-            boundary_target_ppm=75,
-            cfg=cfg,
-        )
-
-        assert info["applied"] is True
-        assert new_fee == 75
+        # Dead consumers/helpers removed
+        assert not hasattr(fc, "_apply_market_boundary_downshift")
+        assert not hasattr(fc, "_get_market_boundary_target")
+        assert not hasattr(fc, "_market_boundary_has_room")
 
     def test_base_fee_only_policy_change_bypasses_fee_hysteresis(
         self, mock_plugin, mock_database
@@ -1296,8 +1295,10 @@ class TestMarketBoundaryGuard:
 
         assert result is not None
         assert result.new_fee_ppm > 75
-        assert result.algorithm_values["market_boundary_applied"] is False
-        assert result.algorithm_values["market_boundary"] is None
+        # Inert market-boundary explainability fields were removed with the
+        # dead consumer block; their absence pins the removal.
+        assert "market_boundary_applied" not in result.algorithm_values
+        assert "market_boundary" not in result.algorithm_values
 
     def test_market_boundary_below_floor_does_not_collapse_to_floor(
         self, mock_plugin, mock_database
@@ -1441,8 +1442,8 @@ class TestMarketBoundaryGuard:
         )
 
         assert result is not None
-        assert result.algorithm_values["market_boundary"] is None
-        assert result.algorithm_values["market_boundary_applied"] is False
+        assert "market_boundary" not in result.algorithm_values
+        assert "market_boundary_applied" not in result.algorithm_values
         assert result.new_fee_ppm > 60
 
     def test_deprecated_market_boundary_does_not_support_winning_flow(
@@ -1491,8 +1492,8 @@ class TestMarketBoundaryGuard:
         )
 
         assert result is not None
-        assert result.algorithm_values["market_boundary"] is None
-        assert result.algorithm_values["market_boundary_support"]["applied"] is False
+        assert "market_boundary" not in result.algorithm_values
+        assert "market_boundary_support" not in result.algorithm_values
 
     def test_deprecated_market_boundary_does_not_raise_zero_fee_on_flow_alone(
         self, mock_plugin, mock_database
@@ -1541,8 +1542,8 @@ class TestMarketBoundaryGuard:
 
         assert result is not None
         assert result.algorithm_values["current_revenue_rate"] == 0.0
-        assert result.algorithm_values["market_boundary"] is None
-        assert result.algorithm_values["market_boundary_support"]["applied"] is False
+        assert "market_boundary" not in result.algorithm_values
+        assert "market_boundary_support" not in result.algorithm_values
 
     def test_hive_optimal_estimate_does_not_create_market_boundary_when_gossip_missing(
         self, mock_plugin, mock_database
@@ -1654,8 +1655,8 @@ class TestMarketBoundaryGuard:
         )
 
         assert result is not None
-        assert result.algorithm_values["market_boundary"] is None
-        assert result.algorithm_values["market_boundary_support"]["applied"] is False
+        assert "market_boundary" not in result.algorithm_values
+        assert "market_boundary_support" not in result.algorithm_values
 
     def test_deprecated_market_boundary_does_not_bypass_observation_window_after_losing_flow(
         self, mock_plugin, mock_database

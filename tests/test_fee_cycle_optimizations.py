@@ -450,7 +450,6 @@ class TestNeighborHelpers:
 
         fc._get_neighbor_fee_median("02peer", cfg=cfg)
         fc._get_neighbor_fee_percentile("02peer", 0.25, cfg=cfg)
-        fc._get_neighbor_fee_min("02peer", cfg=cfg)
         fc._get_competitive_undercut_pct("02peer", "chan1", 200, cfg=cfg)
 
         fc.config.snapshot.assert_not_called()

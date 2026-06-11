@@ -2336,11 +2336,6 @@ class FeeController:
         # crossing wakes sleeping channels; re-armed after decay).
         self._vegas_wake_armed: bool = True
 
-        # AskRene topology cache (for depletion checks)
-        self._askrene_cache: Dict[str, int] = {}
-        self._askrene_cache_ts: int = 0
-        self._askrene_lock = threading.Lock()
-
         # Hive hints adapter (injected by main plugin; None = disabled)
         self.hive_hints = None
         self._hive_member_set_at: Dict[str, int] = {}
@@ -2837,7 +2832,7 @@ class FeeController:
         return self._our_node_id
 
     # Gossip channel fields actually read by the neighbor-fee consumers
-    # (_get_neighbor_fee_median/_percentile/_min, _get_competitive_undercut_pct,
+    # (_get_neighbor_fee_median/_percentile, _get_competitive_undercut_pct,
     # _is_cln_default_fee). Stored entries are trimmed to these keys so the
     # cache holds a few small dicts per channel instead of full gossip dicts.
     _GOSSIP_CHANNEL_FIELDS = (
@@ -2904,42 +2899,6 @@ class FeeController:
         self._neighbor_fee_cache[cache_key] = {"value": result, "ts": time.time()}
         return result
 
-    def _get_market_boundary_target(
-        self,
-        boundary_ppm: int,
-        floor_ppm: int,
-        cfg: Optional[Any] = None,
-    ) -> Tuple[int, int]:
-        """Return the target fee and margin below a credible low competitor."""
-        try:
-            margin_ppm = int(getattr(cfg, "fee_market_boundary_margin_ppm", 5))
-        except (TypeError, ValueError):
-            margin_ppm = 5
-        try:
-            margin_ratio = float(getattr(cfg, "fee_market_boundary_margin_ratio", 0.05))
-        except (TypeError, ValueError):
-            margin_ratio = 0.05
-
-        margin_ppm = max(0, margin_ppm)
-        margin_ratio = max(0.0, min(0.50, margin_ratio))
-        computed_margin = max(margin_ppm, int(math.ceil(max(0, boundary_ppm) * margin_ratio)))
-        target_ppm = max(int(floor_ppm), int(boundary_ppm) - computed_margin)
-        return target_ppm, computed_margin
-
-    @staticmethod
-    def _market_boundary_has_room(boundary_ppm: int, floor_ppm: int, margin_ppm: int) -> bool:
-        """Return true only when a competitor boundary leaves room above our floor.
-
-        If the cheapest credible competitor is already below our economic floor,
-        treating `floor_ppm` as the market target synchronizes unrelated
-        channels around the same chain-cost floor. In that case the market is
-        not executable for us and the guard should abstain.
-        """
-        try:
-            return int(boundary_ppm) - int(margin_ppm) > int(floor_ppm)
-        except (TypeError, ValueError):
-            return False
-
     def _get_market_boundary_fee(
         self,
         peer_id: str,
@@ -2973,42 +2932,6 @@ class FeeController:
         path, but they must not create hard market floors or caps.
         """
         return None
-
-    def _apply_market_boundary_downshift(
-        self,
-        current_fee_ppm: int,
-        candidate_fee_ppm: int,
-        boundary_target_ppm: int,
-        cfg: Optional[Any] = None,
-    ) -> Tuple[int, Dict[str, Any]]:
-        """Accelerate downward correction when current price is above market."""
-        try:
-            max_downshift_ratio = float(
-                getattr(cfg, "fee_market_boundary_max_downshift_ratio", 0.35)
-            )
-        except (TypeError, ValueError):
-            max_downshift_ratio = 0.35
-        max_downshift_ratio = max(0.05, min(1.0, max_downshift_ratio))
-        max_downshift_ppm = max(1, int(math.ceil(max(0, current_fee_ppm) * max_downshift_ratio)))
-
-        info = {
-            "applied": False,
-            "max_downshift_ratio": max_downshift_ratio,
-            "max_downshift_ppm": max_downshift_ppm,
-            "pre_downshift_fee_ppm": int(candidate_fee_ppm),
-            "post_downshift_fee_ppm": int(candidate_fee_ppm),
-        }
-
-        if current_fee_ppm <= boundary_target_ppm or candidate_fee_ppm <= boundary_target_ppm:
-            return candidate_fee_ppm, info
-
-        boundary_limited_fee = max(int(boundary_target_ppm), int(current_fee_ppm) - max_downshift_ppm)
-        if boundary_limited_fee < candidate_fee_ppm:
-            info["applied"] = True
-            info["post_downshift_fee_ppm"] = boundary_limited_fee
-            return boundary_limited_fee, info
-
-        return candidate_fee_ppm, info
 
     def _get_neighbor_fee_median(self, peer_id: str, cfg: Optional[Any] = None) -> int | None:
         """Get median fee charged by other nodes to the same peer.
@@ -3173,55 +3096,6 @@ class FeeController:
         except Exception:
             return None
 
-    def _get_neighbor_fee_min(self, peer_id: str, cfg: Optional[Any] = None) -> int | None:
-        """Get the cheapest competitor fee for the same peer.
-
-        Used by `competition_aware` market_fee_mode to decide whether
-        DTS's natural target is already undercutting every competitor.
-        If it is, we skip the median-based undercut — it would only push
-        our fee lower without adding traffic (inelastic against a median
-        we're already below).
-
-        Returns None when fewer than `neighbor_median_min_competitors`
-        have valid gossip data (same threshold as the median helper),
-        to avoid being dragged around by a single cheap outlier.
-        """
-        cache_key = f"neighbor_fee_min_{peer_id}"
-        cached = self._neighbor_fee_cache.get(cache_key)
-        if cached and (time.time() - cached["ts"]) < 1800:
-            return cached["value"]
-
-        try:
-            our_id = self._get_our_id()
-            peer_channels = self._get_peer_inbound_channels(
-                peer_id, ttl_seconds=self._gossip_cache_ttl_seconds(cfg)
-            )
-            fees = []
-            for ch in peer_channels:
-                if ch.get("source") == our_id:
-                    continue
-                if not ch.get("active", False):
-                    continue
-                fee_ppm = ch.get("fee_per_millionth", 0)
-                if not (1 <= fee_ppm <= 10000):
-                    continue
-                if self._is_cln_default_fee(ch):
-                    continue
-                fees.append(fee_ppm)
-
-            min_competitors = 3
-            try:
-                if cfg is None:
-                    cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-                min_competitors = int(getattr(cfg, 'neighbor_median_min_competitors', 3) or 3)
-            except Exception:
-                pass
-            result = min(fees) if len(fees) >= min_competitors else None
-            self._neighbor_fee_cache[cache_key] = {"value": result, "ts": time.time()}
-            return result
-        except Exception:
-            return None
-
     def _get_competitive_undercut_pct(self, peer_id: str, channel_id: str,
                                       neighbor_median: int | None = None,
                                       cfg: Optional[Any] = None) -> float:
@@ -3362,55 +3236,6 @@ class FeeController:
         if peer_id in self._hive_member_advisory_peers:
             self._hive_member_advisory_peers.discard(peer_id)
             return True
-        return False
-
-    def _refresh_askrene_cache(self, cfg) -> None:
-        """Refresh AskRene constraints cache (best-effort, 30s TTL)."""
-        now = int(time.time())
-        with self._askrene_lock:
-            if self._askrene_cache_ts and (now - self._askrene_cache_ts) < 30:
-                return
-        try:
-            layer = getattr(cfg, 'askrene_layer', 'xpay')
-            max_age = getattr(cfg, 'askrene_max_age_sec', 900)
-            res = self.data_service.get_askrene_layers()
-            cache: Dict[str, int] = {}
-            for lyr in res.get("layers", []):
-                if lyr.get("layer") != layer:
-                    continue
-                for c in lyr.get("constraints", []) or []:
-                    scid_dir = c.get("short_channel_id_dir")
-                    try:
-                        ts = int(c.get("timestamp") or 0)
-                        max_msat = parse_msat(c.get("maximum_msat", 0))
-                    except (TypeError, ValueError):
-                        continue  # Skip malformed entry, keep rest of cache
-                    if not scid_dir or max_msat <= 0:
-                        continue
-                    if ts and (now - ts) > int(max_age):
-                        continue
-                    if scid_dir not in cache or max_msat < cache[scid_dir]:
-                        cache[scid_dir] = max_msat
-            with self._askrene_lock:
-                self._askrene_cache = cache
-                self._askrene_cache_ts = now
-        except Exception:
-            pass  # AskRene is optional; silent on failure
-
-    def _is_topology_depleted(self, channel_id: str, capacity_sats: int, cfg) -> bool:
-        """Check if downstream topology for a channel is depleted via AskRene.
-
-        Returns True if the tightest AskRene constraint is < 20% of capacity.
-        """
-        self._refresh_askrene_cache(cfg)
-        with self._askrene_lock:
-            cache_snapshot = dict(self._askrene_cache)
-        threshold_msat = sats_to_base(capacity_sats) * 0.20  # 20% of capacity
-        for suffix in ("/0", "/1"):
-            key = f"{channel_id}{suffix}"
-            v = cache_snapshot.get(key)
-            if v is not None and v < threshold_msat:
-                return True
         return False
 
     def _get_context_with_values(
@@ -4268,16 +4093,21 @@ class FeeController:
         Returns:
             List of FeeAdjustment records for channels that were adjusted
         """
+        # PERF: ONE ConfigSnapshot per cycle (was 3: warm-up check, post-lock
+        # paused re-check, inner-loop snapshot). The paused flag is therefore
+        # read once at cycle start; a pause toggled mid-warm-up takes effect
+        # on the next timer tick.
+        try:
+            cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+        except Exception:
+            cfg = self.config
+        pre_paused = bool(getattr(cfg, "paused", False))
+
         # PERF: warm the profitability cache BEFORE acquiring _state_lock.
         # The first in-lock get_profitability call would otherwise trigger a
         # full analyze_all_channels under the lock (its short cache TTL is
         # always expired at fee-cycle intervals), stalling hook threads for
         # the whole analysis.
-        try:
-            pre_cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-            pre_paused = bool(getattr(pre_cfg, "paused", False))
-        except Exception:
-            pre_paused = False
         if not pre_paused and self.profitability is not None:
             warm = getattr(self.profitability, "analyze_all_channels", None)
             if callable(warm):
@@ -4297,7 +4127,7 @@ class FeeController:
         if not pre_paused:
             try:
                 prefetched_channels = self._get_channels_info()
-                self._prefetch_neighbor_gossip(prefetched_channels, cfg=pre_cfg)
+                self._prefetch_neighbor_gossip(prefetched_channels, cfg=cfg)
             except Exception as e:
                 self.plugin.log(f"Gossip prefetch failed: {e}", level='debug')
 
@@ -4312,8 +4142,7 @@ class FeeController:
             self.plugin.log("Fee adjustment already in progress, skipping", level='debug')
             return []
         try:
-            cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-            if bool(getattr(cfg, "paused", False)):
+            if pre_paused:
                 self._set_last_decision_summary(
                     action="suppressed",
                     reason="paused",
@@ -4322,7 +4151,9 @@ class FeeController:
                 )
                 self.plugin.log("Fee adjustment suppressed: revenue-ops is paused", level='info')
                 return []
-            return self._adjust_all_fees_inner(prefetched_channels=prefetched_channels)
+            return self._adjust_all_fees_inner(
+                prefetched_channels=prefetched_channels, cfg=cfg
+            )
         finally:
             self._state_lock.release()
 
@@ -4370,6 +4201,7 @@ class FeeController:
     def _adjust_all_fees_inner(
         self,
         prefetched_channels: Optional[Dict[str, Dict[str, Any]]] = None,
+        cfg: Optional[Any] = None,
     ) -> List[FeeAdjustment]:
         """Inner implementation of adjust_all_fees, called under _state_lock."""
         adjustments = []
@@ -4412,9 +4244,11 @@ class FeeController:
         # This reduces N RPC calls to 1 per adjust_all_fees cycle
         chain_costs = self._get_dynamic_chain_costs()
         
-        # Take ConfigSnapshot for thread-safe reads
-        cfg = self.config.snapshot()
-        
+        # ConfigSnapshot for thread-safe reads — normally taken ONCE by
+        # adjust_all_fees and passed in; fallback for direct callers.
+        if cfg is None:
+            cfg = self.config.snapshot()
+
         # Vegas Reflex - update mempool acceleration state
         if cfg.enable_vegas_reflex and chain_costs:
             current_sat_vb = chain_costs.get("sat_per_vbyte", 1.0)
@@ -5191,11 +5025,6 @@ class FeeController:
         corridor_role = "P"
         contextual_sample_used = False
         context_observation_count = 0
-        market_boundary_info = None
-        market_boundary_applied = False
-        market_boundary_downshift_info = {"applied": False}
-        market_boundary_support_info = {"applied": False}
-        market_boundary_window_bypass_info = {"applied": False}
         hive_fee_bias = 1.0
         temporal_adj = 1.0
         composite_hint_bias = 1.0
@@ -5393,11 +5222,11 @@ class FeeController:
                 # channel on EVERY cycle, purely to populate explainability
                 # fields. Both boundary getters are deprecated hard-None
                 # stubs (see _get_market_boundary_fee), so the bypass could
-                # never fire — it was pure per-cycle latency. The boundary
-                # scaffolding itself is kept (documented deprecated);
-                # market_boundary_window_bypass_info keeps its shape with the
-                # default not-applied value. Invariant: the wait path does no
-                # market-boundary work while the boundary stubs return None.
+                # never fire — it was pure per-cycle latency. The dead
+                # consumers and inert explainability fields were removed
+                # entirely in the dead-code sweep; only the two stub
+                # providers remain (incident rationale in their docstrings).
+                # Invariant: the wait path does no market-boundary work.
                 self.plugin.log(
                     f"DYNAMIC_WINDOW: {channel_id[:12]}... waiting "
                     f"({forward_count}/{fee_profile.min_forwards_for_signal} forwards, "
@@ -5874,12 +5703,10 @@ class FeeController:
             # =============================================================
             # DTS+PID PATH: PID multiplier for balance management
             # =============================================================
-            try:
-                # PERF: reuse the in-hand channel_states row instead of
-                # re-querying the same table row for the flow state.
-                flow_state_str = state.get("state", "balanced") if isinstance(state, dict) else "balanced"
-            except Exception:
-                flow_state_str = "balanced"
+            # PERF: flow_state was already derived from the in-hand
+            # channel_states row at method entry — reuse it instead of
+            # re-deriving from the same dict.
+            flow_state_str = flow_state
 
             pid_multiplier = ts_state.pid.calculate_multiplier(
                 current_outbound_ratio=outbound_ratio,
@@ -6125,101 +5952,11 @@ class FeeController:
                     level='debug'
                 )
 
-            # Experimental market boundary guard: if credible active
-            # competitors to the same destination define a route-choice
-            # boundary, cap our target below it. This is intentionally after
-            # rebalance-cost nudging so cost recovery cannot price a channel
-            # out of the market when the guard is explicitly enabled.
-            # A ready fee cycle is a pricing decision point. Use current gossip
-            # instead of a cached market boundary so fast competitor moves do
-            # not leave us defending against a stale route-choice threshold.
-            force_boundary_refresh = True
-            market_boundary_info = self._get_market_boundary_fee(
-                peer_id,
-                cfg=cfg,
-                force_refresh=force_boundary_refresh,
-            )
-            if market_boundary_info is None:
-                market_boundary_info = self._get_hive_market_boundary_fee(peer_id, cfg=cfg)
-            if market_boundary_info is not None:
-                boundary_target_ppm, boundary_margin_ppm = self._get_market_boundary_target(
-                    int(market_boundary_info["boundary_ppm"]),
-                    floor_ppm,
-                    cfg=cfg,
-                )
-                market_boundary_info = {
-                    **market_boundary_info,
-                    "target_ppm": boundary_target_ppm,
-                    "margin_ppm": boundary_margin_ppm,
-                    "floor_ppm": floor_ppm,
-                    "pre_guard_target_ppm": post_pid_target_ppm,
-                    "current_fee_ppm": current_fee_ppm,
-                }
-                observed_market_flow = (
-                    current_revenue_rate > 0.0
-                    or int(forward_count or 0) > 0
-                    or int(volume_since_sats or 0) > 0
-                )
-                if not self._market_boundary_has_room(
-                    int(market_boundary_info["boundary_ppm"]),
-                    floor_ppm,
-                    boundary_margin_ppm,
-                ):
-                    self.plugin.log(
-                        f"FEE: {channel_id[:16]}... market boundary ignored "
-                        f"(competitor={market_boundary_info['boundary_ppm']}ppm, "
-                        f"floor={floor_ppm}ppm, margin={boundary_margin_ppm}ppm)",
-                        level='debug'
-                    )
-                    market_boundary_info = None
-                elif post_pid_target_ppm > boundary_target_ppm:
-                    pre_boundary = post_pid_target_ppm
-                    post_pid_target_ppm = boundary_target_ppm
-                    market_boundary_applied = True
-                    market_boundary_info["applied"] = True
-                    self.plugin.log(
-                        f"FEE: {channel_id[:16]}... market boundary guard: "
-                        f"{pre_boundary}->{boundary_target_ppm}ppm "
-                        f"(cheapest_competitor={market_boundary_info['boundary_ppm']}ppm, "
-                        f"margin={boundary_margin_ppm}ppm, competitors={market_boundary_info['competitor_count']})",
-                        level='debug'
-                    )
-
-                    if sparse_data_conservative and ts_state and ts_state.thompson:
-                        ts = ts_state.thompson
-                        if ts.posterior_mean > boundary_target_ppm and ts.posterior_std >= 50:
-                            # Durable nudge; survives the next posterior recompute.
-                            ts.record_posterior_nudge(float(boundary_target_ppm), 0.15)
-                elif (
-                    observed_market_flow
-                    and current_fee_ppm <= boundary_target_ppm
-                    and post_pid_target_ppm < boundary_target_ppm
-                ):
-                    # If we are already winning flow below the market boundary,
-                    # do not chase a low DTS sample further down. That gives up
-                    # revenue without improving route selection.
-                    pre_boundary = post_pid_target_ppm
-                    post_pid_target_ppm = boundary_target_ppm
-                    market_boundary_support_info = {
-                        "applied": True,
-                        "pre_support_target_ppm": int(pre_boundary),
-                        "post_support_target_ppm": int(boundary_target_ppm),
-                        "current_revenue_rate": float(current_revenue_rate),
-                        "forward_count": int(forward_count or 0),
-                        "volume_since_sats": int(volume_since_sats or 0),
-                    }
-                    market_boundary_info["applied"] = False
-                    market_boundary_info["support_applied"] = True
-                    self.plugin.log(
-                        f"FEE: {channel_id[:16]}... market boundary support: "
-                        f"{pre_boundary}->{boundary_target_ppm}ppm "
-                        f"(cheapest_competitor={market_boundary_info['boundary_ppm']}ppm, "
-                        f"revenue_rate={current_revenue_rate:.2f}sats/hr, "
-                        f"forwards={forward_count}, volume={volume_since_sats}sats)",
-                        level='debug'
-                    )
-                else:
-                    market_boundary_info["applied"] = False
+            # Market boundary guard removed: both boundary providers
+            # (_get_market_boundary_fee / _get_hive_market_boundary_fee) are
+            # deprecated hard-None stubs — see their docstrings for the
+            # incident rationale — so the guard/support/downshift consumers
+            # were unreachable dead code and have been deleted.
 
             bounded_target_ppm = max(floor_ppm, min(ceiling_ppm, post_pid_target_ppm))
             if bounded_target_ppm != post_pid_target_ppm:
@@ -6276,32 +6013,15 @@ class FeeController:
                 woke_from_sleep=woke_from_sleep,
                 cfg=cfg,
             )
-            if market_boundary_info is not None:
-                new_fee_ppm, market_boundary_downshift_info = self._apply_market_boundary_downshift(
-                    current_fee_ppm=current_fee_ppm,
-                    candidate_fee_ppm=new_fee_ppm,
-                    boundary_target_ppm=int(market_boundary_info["target_ppm"]),
-                    cfg=cfg,
-                )
             applied_target_ppm = new_fee_ppm
             delta_cap_reason = damping_info["cap_reason"]
             delta_cap_ppm = damping_info["max_delta_ppm"]
             delta_cap_applied = damping_info["cap_applied"]
-            if market_boundary_downshift_info.get("applied"):
-                delta_cap_reason = "market_boundary_downshift"
-                delta_cap_ppm = market_boundary_downshift_info["max_downshift_ppm"]
-                delta_cap_applied = True
 
             hive_tag = f", hive={hive_fee_bias:.2f}" if hive_fee_bias != 1.0 else ""
-            boundary_tag = ""
-            if market_boundary_info is not None:
-                boundary_tag = (
-                    f", boundary={market_boundary_info['boundary_ppm']}ppm"
-                    f"->{market_boundary_info['target_ppm']}ppm"
-                )
             decision_reason = (
                 f"dts_pid (dts={dts_fee}, pid={pid_multiplier:.2f}, "
-                f"flow={flow_state_str}{hive_tag}{boundary_tag})"
+                f"flow={flow_state_str}{hive_tag})"
             )
 
             # Update volume tracking
@@ -6313,9 +6033,9 @@ class FeeController:
             step_ppm = abs(new_fee_ppm - current_fee_ppm)
             original_step_ppm = step_ppm
 
-            # Build the cycle alias for end-of-method compatibility
-            # (DTS+PID state will be saved separately)
-            cycle = self._get_cycle_state(channel_id, actual_fee_ppm=raw_chain_fee)
+            # Update the cycle state already loaded at method entry (the
+            # _get_cycle_state cache returns the same object; re-fetching
+            # here was a duplicate lookup + desync re-check).
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = current_fee_ppm
             cycle.trend_direction = new_direction
@@ -6511,27 +6231,16 @@ class FeeController:
         applied_delta = int(new_fee_ppm) - int(current_fee_ppm)
         applied_dir = "up" if applied_delta > 0 else ("down" if applied_delta < 0 else "flat")
         rebal_cost_tag = f", rebal_cost_floor:{rebalance_cost_ppm}ppm" if rebalance_cost_ppm > 0 else ""
-        market_boundary_tag = ""
-        if market_boundary_info is not None:
-            market_action = "applied" if market_boundary_applied else "observed"
-            if market_boundary_downshift_info.get("applied"):
-                market_action = "downshift"
-            elif market_boundary_support_info.get("applied"):
-                market_action = "support"
-            market_boundary_tag = (
-                f", market_boundary:{market_action}:"
-                f"{market_boundary_info['boundary_ppm']}->{market_boundary_info['target_ppm']}ppm"
-            )
         target_summary = (
             f"targets=dts:{raw_dts_target_ppm}, post_pid:{post_pid_target_ppm}, "
             f"bounded:{bounded_target_ppm}, blended:{blended_target_ppm}, applied:{applied_target_ppm}, "
             f"blend:{target_blend_ratio:.2f}, bound:{bound_reason}, cap:{delta_cap_reason}({delta_cap_ppm}ppm), "
             f"wake:{wake_reason}, sparse:{sparse_data_conservative}, exploration:{exploration_mode}"
-            f"{market_boundary_tag}{rebal_cost_tag}"
+            f"{rebal_cost_tag}"
             if raw_dts_target_ppm is not None else
             f"targets=n/a, blend:{target_blend_ratio:.2f}, wake:{wake_reason}, "
             f"sparse:{sparse_data_conservative}, exploration:{exploration_mode}"
-            f"{market_boundary_tag}{rebal_cost_tag}"
+            f"{rebal_cost_tag}"
         )
 
         common_reason_suffix = (
@@ -6679,11 +6388,6 @@ class FeeController:
                     "delta_cap_reason": delta_cap_reason,
                     "delta_cap_ppm": delta_cap_ppm,
                     "delta_cap_applied": delta_cap_applied,
-                    "market_boundary": market_boundary_info,
-                    "market_boundary_applied": market_boundary_applied,
-                    "market_boundary_downshift": market_boundary_downshift_info,
-                    "market_boundary_support": market_boundary_support_info,
-                    "market_boundary_window_bypass": market_boundary_window_bypass_info,
                     "base_fee_policy_change": base_fee_policy_change,
                     "current_base_fee_msat": current_base_fee_msat,
                     "target_base_fee_msat": target_base_fee_msat,
@@ -7621,130 +7325,6 @@ class FeeController:
     # =========================================================================
     # Heuristic Helper Methods
     # =========================================================================
-
-    def _get_channel_age_days(self, channel_id: str, channel_info: Dict[str, Any]) -> int:
-        """
-        Get channel age in days.
-
-        Args:
-            channel_id: Channel short ID
-            channel_info: Channel info dict (may contain funding_txid for lookup)
-
-        Returns:
-            Channel age in days (defaults to 365 if unknown)
-        """
-        try:
-            # Check if we have open timestamp in database
-            cost_record = self.database.get_channel_cost(channel_id)
-            if cost_record and cost_record.get("opened_at"):
-                age_seconds = int(time.time()) - cost_record["opened_at"]
-                return max(0, age_seconds // 86400)
-
-            # Fallback: Try to get from channel_info if it has open timestamp
-            open_timestamp = channel_info.get("open_timestamp", 0)
-            if open_timestamp > 0:
-                age_seconds = int(time.time()) - open_timestamp
-                return max(0, age_seconds // 86400)
-
-            # If we can't determine age, assume mature channel (365 days)
-            # This prevents false positives on channels we can't date
-            return 365
-
-        except Exception as e:
-            self.plugin.log(f"Error getting channel age for {channel_id}: {e}", level='debug')
-            return 365  # Assume mature on error
-
-    def _get_fee_volatility(self, channel_id: str) -> float:
-        """
-        Calculate fee volatility as coefficient of variation (stddev/mean).
-
-        High volatility suggests unstable market conditions or poor signal quality.
-
-        Args:
-            channel_id: Channel short ID
-
-        Returns:
-            Volatility ratio (0.0 = no volatility, 1.0 = high volatility)
-        """
-        try:
-            # Get recent fee changes for this channel
-            fee_changes = self.database.get_recent_fee_changes(limit=20, channel_id=channel_id)
-
-            if len(fee_changes) < 5:
-                return 0.0  # Not enough data
-
-            # Extract fee values
-            fees = [fc.get("new_fee_ppm", 0) for fc in fee_changes]
-            fees = [f for f in fees if f > 0]
-
-            if len(fees) < 5:
-                return 0.0
-
-            # Calculate mean and standard deviation
-            mean_fee = sum(fees) / len(fees)
-            if mean_fee <= 0:
-                return 0.0
-
-            # L-9: Use sample variance (Bessel correction) since len(fees) >= 5
-            variance = sum((f - mean_fee) ** 2 for f in fees) / (len(fees) - 1)
-            std_dev = variance ** 0.5
-
-            # Coefficient of variation
-            volatility = std_dev / mean_fee
-
-            return min(2.0, volatility)  # Cap at 2.0 to prevent extreme values
-
-        except Exception as e:
-            self.plugin.log(f"Error calculating fee volatility for {channel_id}: {e}", level='debug')
-            return 0.0
-
-    def _get_channel_failure_rate(self, channel_id: str) -> float:
-        """
-        Get routing failure rate for a channel.
-
-        High failure rate suggests the channel may have reliability issues
-        that affect fee signal quality.
-
-        Args:
-            channel_id: Channel short ID
-
-        Returns:
-            Failure rate (0.0 = no failures, 1.0 = all failures)
-        """
-        try:
-            # Check if we have failure tracking
-            fail_count, last_fail = self.database.get_failure_count(channel_id)
-
-            if fail_count == 0:
-                return 0.0
-
-            # Only consider failures relevant if within the same 7-day window
-            # as the forward count. All-time failures vs 7-day forwards would
-            # produce inflated failure rates for channels with old failures.
-            seven_days_ago = int(time.time()) - 86400 * 7
-            if last_fail < seven_days_ago:
-                return 0.0  # No recent failures
-
-            # Get forward count for this channel (7-day window)
-            forward_count = self.database.get_forward_count_since(
-                channel_id,
-                seven_days_ago
-            )
-
-            if forward_count == 0:
-                # No forwards but has recent failures = high failure rate
-                # Cap at 0.5 since we can't know the real denominator
-                return 0.5 if fail_count > 0 else 0.0
-
-            # Use forward count as proxy for total attempts since fail_count
-            # is all-time. This gives a conservative rate estimate.
-            failure_rate = min(fail_count, forward_count) / (forward_count + min(fail_count, forward_count))
-
-            return min(1.0, failure_rate)
-
-        except Exception as e:
-            self.plugin.log(f"Error getting failure rate for {channel_id}: {e}", level='debug')
-            return 0.0
 
     def _get_channels_info(self) -> Dict[str, Dict[str, Any]]:
         """

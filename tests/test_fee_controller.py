@@ -770,31 +770,8 @@ class TestAuditRound8Regressions:
 
         assert percent_change == 0.0, "Zero-to-zero should not trigger wake-up"
 
-    # --- P1-6: Failure rate time window consistency ---
-
-    def test_failure_rate_ignores_old_failures(self, mock_database, mock_plugin):
-        """Failure rate should ignore failures older than 7 days."""
-        fc = self._make_fc(mock_plugin, mock_database)
-        channel_id = "123x456x0"
-
-        # 100 all-time failures, but last one was 30 days ago
-        mock_database.get_failure_count.return_value = (100, int(time.time()) - 86400 * 30)
-        mock_database.get_forward_count_since.return_value = 50
-
-        rate = fc._get_channel_failure_rate(channel_id)
-        assert rate == 0.0, f"Old failures should be ignored, got rate={rate}"
-
-    def test_failure_rate_counts_recent_failures(self, mock_database, mock_plugin):
-        """Failure rate should count recent failures against recent forwards."""
-        fc = self._make_fc(mock_plugin, mock_database)
-        channel_id = "123x456x0"
-
-        # 5 failures, last one was 1 day ago
-        mock_database.get_failure_count.return_value = (5, int(time.time()) - 86400)
-        mock_database.get_forward_count_since.return_value = 20
-
-        rate = fc._get_channel_failure_rate(channel_id)
-        assert 0.0 < rate <= 1.0, f"Recent failures should produce non-zero rate, got {rate}"
+    # --- P1-6 failure-rate tests removed: _get_channel_failure_rate was
+    # zero-caller dead code and was deleted in the dead-code sweep. ---
 
     # --- P1-7: parse_msat for _get_channels_info ---
 
