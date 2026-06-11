@@ -6585,6 +6585,18 @@ def _boltz_channel_daily_contribution_estimate_sats(prof) -> float:
         return 0.0
 
 
+# F2: minimum gap (percentage points) between the tuned loop-in target and
+# the tuned loop-out trigger. Without it, hot channels tuned to overlapping
+# bands (eff_low_target above eff_high_trigger) and ping-ponged loop-in ->
+# loop-out, burning swap fees in circles.
+BAND_SEPARATION_MARGIN_PP = 5.0
+# Maximum tuning movement of the band edges (must match the boost/cut math
+# inside _boltz_dynamic_channel_tuning): trigger_boost <= 20pp on the loop-in
+# trigger, out_adjust <= 15pp (10 hotness + 5 source) on the loop-out trigger.
+MAX_LOW_TRIGGER_BOOST_PP = 20.0
+MAX_HIGH_TRIGGER_CUT_PP = 15.0
+
+
 def _boltz_dynamic_channel_tuning(*,
     local_pct: float,
     low_trigger_pct: float,
@@ -6657,7 +6669,29 @@ def _boltz_dynamic_channel_tuning(*,
     eff_high_trigger = max(55.0, min(float(high_trigger_pct), float(high_trigger_pct) - out_adjust))
     eff_high_target = min(float(high_target_pct) + out_adjust * 0.5, float(high_target_pct) + 10.0)
 
+    # F2: enforce band ordering AFTER tuning. The loop-in target must sit at
+    # least BAND_SEPARATION_MARGIN_PP below the loop-out trigger, and the
+    # targets must stay strictly inside their triggers, or a hot channel
+    # ping-pongs loop-in <-> loop-out and burns swap fees in circles.
+    band_clamped = False
+    if eff_low_target > eff_high_trigger - BAND_SEPARATION_MARGIN_PP:
+        band_clamped = True
+        # Reduce the loop-in target first, keeping it strictly above the
+        # loop-in trigger; if that cannot create the gap, raise the loop-out
+        # trigger instead.
+        low_target_floor = eff_low_trigger + 1.0
+        eff_low_target = max(low_target_floor, eff_high_trigger - BAND_SEPARATION_MARGIN_PP)
+        if eff_low_target > eff_high_trigger - BAND_SEPARATION_MARGIN_PP:
+            eff_high_trigger = eff_low_target + BAND_SEPARATION_MARGIN_PP
+    if eff_high_target >= eff_high_trigger:
+        band_clamped = True
+        eff_high_target = eff_high_trigger - 1.0
+    if eff_low_trigger >= eff_low_target:
+        band_clamped = True
+        eff_low_trigger = max(0.0, eff_low_target - 1.0)
+
     return {
+        'band_clamped': band_clamped,
         'hotness_score': round(hotness_score, 4),
         'drain_score': round(drain_score, 4),
         'protection_score': round(protection_score, 4),
@@ -6840,6 +6874,20 @@ def _build_boltz_balance_plan(
 ) -> Dict[str, Any]:
     if fee_controller is None or database is None:
         return {"error": "Plugin not initialized"}
+
+    # F2: reject caller bases that dynamic tuning could push into overlap.
+    # Tuning may raise the loop-in trigger by up to MAX_LOW_TRIGGER_BOOST_PP
+    # and lower the loop-out trigger by up to MAX_HIGH_TRIGGER_CUT_PP; bases
+    # that collide under maximum tuning would ping-pong loop-in/loop-out.
+    if float(low_trigger_pct) + MAX_LOW_TRIGGER_BOOST_PP >= float(high_trigger_pct) - MAX_HIGH_TRIGGER_CUT_PP:
+        return {
+            "error": (
+                f"invalid trigger bands: low_trigger_pct={float(low_trigger_pct)} + "
+                f"max tuning boost ({MAX_LOW_TRIGGER_BOOST_PP}pp) overlaps "
+                f"high_trigger_pct={float(high_trigger_pct)} - max tuning cut "
+                f"({MAX_HIGH_TRIGGER_CUT_PP}pp); widen the trigger band"
+            )
+        }
 
     bm = _require_boltz_manager()
 
