@@ -3319,7 +3319,12 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             v2_state = json.loads(fs.get("v2_state_json") or "{}")
         except Exception:
             v2_state = {}
-        ts_state = v2_state.get("thompson_state") or {}
+        # Nested-first: the fee controller no longer writes the flat
+        # v2_state["thompson_state"] mirror; new rows carry it only under
+        # fee_state. Old rows keep the flat copy, so fall back for them.
+        _fee_state = v2_state.get("fee_state")
+        _fee_state = _fee_state if isinstance(_fee_state, dict) else {}
+        ts_state = _fee_state.get("thompson_state") or v2_state.get("thompson_state") or {}
 
         hours_since_update = (now - last_update) / 3600.0 if last_update > 0 else 0.0
 
