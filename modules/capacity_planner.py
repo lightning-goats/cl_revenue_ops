@@ -58,6 +58,44 @@ STRATEGY_WEIGHTS = {
     "neighbor": 0.9,
 }
 
+# F2 (audit HIGH): fixed-reference normalization anchors. The previous
+# per-group max-normalization destroyed evidence: a weak hive hint (0.03 raw)
+# rescaled to 0.9 and outranked a proven 45%-ROI winner (0.5625), a lone
+# graph node jumped to 0.8, and one unbounded winner raw crushed all other
+# winners. Git history shows the hive 0.3 ceiling was a designed advisory cap
+# (e352409) destroyed unintentionally by the normalization commit (4f1feae).
+#
+# Each anchor documents the raw-score scale of its strategy:
+#   winner:      raw = marginal_roi/100, so 1.0 ≡ 100% marginal ROI
+#                (clamped to [0, 2x] so windfalls cap at 2.0, not infinity)
+#   neighbor:    patron-derived advisory score, designed full scale 1.0
+#   demand_flow: 0.4 x confidence x rank-bonus, designed max 0.8
+#   route_pair:  0.3 base x small multipliers, designed max ~0.4
+#   hive:        0.3 x topology confidence — the designed 0.3 advisory cap,
+#                preserved by construction (raw can never exceed it honestly;
+#                poisoned input is clamped at 2x = 0.6)
+#   graph:       channel_count x sqrt(capacity_btc) "channel-units";
+#                50 units ≡ a full-scale hub (divided down onto [0, 2])
+# Anchors <= 1.0 are already on the common advisory scale and act as clamp
+# ceilings; anchors > 1.0 convert raw units onto that scale.
+SCALE_ANCHORS = {
+    "winner": 1.0,
+    "neighbor": 1.0,
+    "demand_flow": 0.8,
+    "route_pair": 0.4,
+    "hive": 0.3,
+    "graph": 50.0,
+}
+
+# F2: minimum raw evidence to participate in the candidate pool at all.
+# Below these, the signal is noise and must not be normalized upward:
+#   hive:   topology confidence >= 0.3  =>  raw = 0.3 x 0.3 = 0.09
+#   winner: marginal ROI >= 20%         =>  raw = 0.20
+RAW_SCORE_FLOORS = {
+    "hive": 0.09,
+    "winner": 0.20,
+}
+
 
 class CapacityPlanner:
     """
@@ -2229,21 +2267,39 @@ class CapacityPlanner:
             pass
 
     def _normalize_candidate_scores(self, candidates: List[Dict]) -> List[Dict]:
-        """Normalize candidate scores within each strategy to 0-1, then apply strategy weights."""
-        by_source: Dict[str, List[Dict]] = {}
+        """Fixed-reference normalization against documented SCALE_ANCHORS.
+
+        F2 (audit): no group-max rescale — a candidate's final score depends
+        only on its own raw evidence, never on who else was discovered this
+        cycle. Raw scores are clamped to [0, 2 x anchor], converted onto the
+        common advisory scale, then multiplied by the strategy weight.
+        Candidates below their strategy's raw evidence floor are dropped.
+        """
+        normalized: List[Dict] = []
         for c in candidates:
-            by_source.setdefault(c["source"], []).append(c)
-
-        for source, group in by_source.items():
-            max_score = max((c["score"] for c in group), default=0)
+            source = c.get("source", "")
+            anchor = SCALE_ANCHORS.get(source, 1.0)
             weight = STRATEGY_WEIGHTS.get(source, 1.0)
-            for c in group:
-                if max_score > 0:
-                    c["score"] = (c["score"] / max_score) * weight
-                else:
-                    c["score"] = 0.0
+            try:
+                raw = float(c.get("score", 0) or 0)
+            except (TypeError, ValueError):
+                raw = 0.0
+            if not math.isfinite(raw):
+                raw = 0.0
 
-        return candidates
+            floor = RAW_SCORE_FLOORS.get(source)
+            if floor is not None and raw < floor:
+                continue  # weak evidence must not be normalized upward
+
+            clamped = max(0.0, min(raw, 2.0 * anchor))
+            # Anchors <= 1.0: raw is already on the advisory scale (the
+            # anchor is the designed ceiling, enforced via the 2x clamp).
+            # Anchors > 1.0: convert raw units onto the advisory scale.
+            common = clamped / max(anchor, 1.0)
+            c["score"] = common * weight
+            normalized.append(c)
+
+        return normalized
 
     def _apply_pool_quotas(self, candidates: List[Dict], max_pool: int = 32) -> List[Dict]:
         """Apply reserved slot quotas per strategy, then fill remaining slots by score."""

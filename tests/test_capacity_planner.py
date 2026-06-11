@@ -2132,9 +2132,9 @@ class TestGraphDiscoveryAndScoring:
 
         winner_c = [c for c in candidates if c["peer_id"] == "winner_peer"]
         assert len(winner_c) == 1
-        # After normalization: winner strategy (only one candidate) gets weight 1.0,
-        # then uptime penalty at 50% applies -> score = 1.0 * 0.5 = 0.5
-        assert abs(winner_c[0]["score"] - 0.5) < 0.01
+        # Fixed-reference normalization (F2): winner raw 0.5 (50% ROI) stays
+        # 0.5 x weight 1.0, then uptime penalty at 50% -> score = 0.25
+        assert abs(winner_c[0]["score"] - 0.25) < 0.01
 
     def test_discover_peers_persists_to_pool(self):
         """_discover_peers calls _update_candidate_pool."""
