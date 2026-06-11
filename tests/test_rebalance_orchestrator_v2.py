@@ -21,7 +21,10 @@ def _make_engine(channels=None, capex_budgets=None):
                 "short_channel_id": "111x1x0",
                 "total_msat": 2_000_000_000,
                 "our_amount_msat": 1_800_000_000,  # 90% local
-                "updates": {"remote": {"fee_proportional_millionths": 200}},
+                "updates": {
+                    "remote": {"fee_proportional_millionths": 200},
+                    "local": {"fee_proportional_millionths": 100},
+                },
             },
             {
                 "state": "CHANNELD_NORMAL",
@@ -29,7 +32,12 @@ def _make_engine(channels=None, capex_budgets=None):
                 "short_channel_id": "222x2x0",
                 "total_msat": 2_000_000_000,
                 "our_amount_msat": 200_000_000,  # 10% local
-                "updates": {"remote": {"fee_proportional_millionths": 300}},
+                "updates": {
+                    "remote": {"fee_proportional_millionths": 300},
+                    # Sats-EV gate input: the refill destination earns our
+                    # outbound fee when the restored liquidity routes.
+                    "local": {"fee_proportional_millionths": 1_000},
+                },
             },
         ]
 

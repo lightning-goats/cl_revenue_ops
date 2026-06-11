@@ -526,6 +526,8 @@ class RebalanceEngine:
             "dest_value_class": str(getattr(pair, "dest_value_class", "") or ""),
             "source_budget_source": str(getattr(pair, "source_budget_source", "") or ""),
             "dest_budget_source": str(getattr(pair, "dest_budget_source", "") or ""),
+            "source_out_fee_ppm": int(getattr(pair, "source_out_fee_ppm", 0) or 0),
+            "dest_out_fee_ppm": int(getattr(pair, "dest_out_fee_ppm", 0) or 0),
             "hive_source_rebalance_bias": round(
                 float(getattr(pair, "hive_source_rebalance_bias", 1.0) or 1.0),
                 6,

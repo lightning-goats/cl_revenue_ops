@@ -276,6 +276,7 @@ def test_active_engine_honors_hive_only_pairs(mock_plugin, mock_database):
         dest_peer_id="03" + "c" * 64,
         amount_sats=50_000,
         pair_budget_sats=10_000,
+        dest_out_fee_ppm=1_000,  # sats-EV gate: refill earns 25 sats expected
         score=1.0,
         route_decision=SimpleNamespace(
             policy=RoutePolicy.HIVE_ONLY,
@@ -348,6 +349,7 @@ def test_engine_debug_exposes_score_decomposition_for_selected_pairs(
         pair_budget_sats=10,
         source_capacity_sats=100_000,
         dest_capacity_sats=100_000,
+        dest_out_fee_ppm=1_000,  # sats-EV: 0.75 * 25 sats - 2 sats fee > 0
         score=2.0,
         source_local_ratio=0.80,
         dest_local_ratio=0.20,
@@ -925,6 +927,7 @@ def test_polar_s9_strong_refill_beats_hold_margin(mock_plugin, mock_database):
         pair_budget_sats=1000,
         source_capacity_sats=1_000_000,
         dest_capacity_sats=1_000_000,
+        dest_out_fee_ppm=500,     # refill earns 100 sats expected vs 5 sat fee
         score=2.0,                # strong additive role-aware score
         source_local_ratio=1.0,   # 100% local source
         dest_local_ratio=0.066,   # 6.6% local dest -- emergency depleted
@@ -1406,6 +1409,7 @@ def test_c1_engine_selects_known_good_pair_with_positive_margin(
         dest_value_class="hive",
         source_budget_source="none",
         dest_budget_source="capex",
+        dest_out_fee_ppm=200,  # sats-EV: 0.9 * 25 sats - 6 sats fee > 0
         score=2.0,
         source_local_ratio=0.90,
         dest_local_ratio=0.10,
@@ -1491,7 +1495,10 @@ def test_c1_engine_rejects_route_bait_even_when_route_prices(
     assert decomposition["stage"] == "below_hold_margin"
     assert decomposition["rejection_reason"] == "below_hold_margin"
     assert decomposition["beats_do_nothing"] is False
-    assert decomposition["capital_risk_penalty"] == pytest.approx(0.9)
+    # Audit F3: no capital-risk double count at default config (the
+    # effective budget equals the raw budget, so the term is dropped).
+    assert decomposition["capital_risk_penalty"] == 0.0
+    assert decomposition["final_score_sats"] < 0.0
     assert decomposition["inputs"]["expected_fee_sats"] == 90
     skipped = {row["channel_id"]: row["reason"] for row in debug["skipped"]}
     assert skipped["201x1x0"] == "below_hold_margin"
@@ -1862,6 +1869,7 @@ def test_engine_merges_coordination_pairs_before_pair_cap(
         dest_peer_id="03" + "4" * 64,
         amount_sats=50_000,
         pair_budget_sats=10_000,
+        dest_out_fee_ppm=1_000,
         score=10.0,
     )
     coordinated_pair = PairCandidate(
@@ -1871,6 +1879,7 @@ def test_engine_merges_coordination_pairs_before_pair_cap(
         dest_peer_id="03" + "c" * 64,
         amount_sats=50_000,
         pair_budget_sats=10_000,
+        dest_out_fee_ppm=1_000,
         score=0.1,
         reason_code="coordinated_rebalance",
         coordination_hint_type="recommendation",
@@ -3043,12 +3052,14 @@ def _overlay_snapshot():
                 "peer_id": "02" + "1" * 64,
                 "capacity_sats": 1_000_000,
                 "local_sats": 900_000,
+                "local_out_fee_ppm": 50,
             },
             {
                 "channel_id": "200x1x0",
                 "peer_id": "02" + "2" * 64,
                 "capacity_sats": 1_000_000,
                 "local_sats": 100_000,
+                "local_out_fee_ppm": 500,
             },
         ],
         {"channel_budgets": {"200x1x0": {"budget_sats": 10_000}}},
@@ -3328,6 +3339,7 @@ def test_fleet_lease_owned_by_us_does_not_suppress_planner_pair(
         dest_peer_id="03" + "4" * 64,
         amount_sats=50_000,
         pair_budget_sats=10_000,
+        dest_out_fee_ppm=1_000,
         score=1.0,
     )
 
@@ -3441,6 +3453,7 @@ def test_overlay_claimed_source_removed_from_drain_demand(
         dest_peer_id="03" + "c" * 64,
         amount_sats=50_000,
         pair_budget_sats=10_000,
+        dest_out_fee_ppm=1_000,
         score=1.0,
         reason_code="coordinated_rebalance",
         coordination_hint_type="recommendation",

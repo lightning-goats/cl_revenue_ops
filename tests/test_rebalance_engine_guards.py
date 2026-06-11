@@ -292,8 +292,12 @@ def _bonus_harness(mock_plugin, mock_database, *, route_cost_sats, bonus):
 
     engine = _make_engine(mock_plugin, mock_database)
     engine.config.capex_probability_budget_bonus = bonus
-    # Disable the do_nothing hold gate so the planner score does not matter.
-    engine.config.rebalance_hold_margin = -1000.0
+    # Disable the do_nothing hold gate (now sats-denominated) so the pair's
+    # economics do not matter — this harness exercises budget mechanics only.
+    engine.config.rebalance_hold_margin = -1_000_000_000.0
+    # Disable the per-attempt ppm fee ceiling for the same reason: the routes
+    # priced here are deliberately more expensive than any sane ppm cap.
+    engine.config.pair_fee_cap_ppm = 0
 
     allocations = CapexAllocations(
         channel_budgets={
