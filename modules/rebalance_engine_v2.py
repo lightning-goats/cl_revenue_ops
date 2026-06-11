@@ -762,9 +762,71 @@ class RebalanceEngine:
             pass
         return self._our_id
 
+    def _effective_dest_cooldown_secs(
+        self,
+        channel_id: str,
+        *,
+        capacity_sats: int,
+        local_sats: int,
+        base_cooldown_secs: int,
+        target_band_low: float,
+    ) -> int:
+        """Audit F7: scale the post-success cooldown by fill fraction.
+
+        A 5k partial fill used to trigger the full 24h destination cooldown.
+        The fill fraction is reconstructed at check time from the stored
+        rebalance amount (rebalance_history anchor — no schema change) and
+        the channel's REMAINING band gap:
+
+            fill_fraction = amount / (amount + remaining_gap)
+
+        i.e. what the rebalance delivered over what was needed at the time,
+        assuming no major flow since — simple, conservative, and
+        self-correcting next cycle. Effective cooldown =
+        base * min(1, fill_fraction * 2): a >=50% fill keeps the full
+        cooldown; a 5k-on-400k-need fill cools down for minutes, not a day.
+        A channel at/above the band floor has no remaining gap — its refill
+        completed, so the full cooldown applies. Any lookup failure falls
+        back to the full (conservative) cooldown.
+        """
+        if self.database is None or capacity_sats <= 0:
+            return base_cooldown_secs
+        getter = getattr(self.database, "get_last_post_rebalance_state", None)
+        if not callable(getter):
+            return base_cooldown_secs
+        try:
+            anchor = getter(channel_id)
+        except Exception:
+            return base_cooldown_secs
+        if not isinstance(anchor, dict):
+            return base_cooldown_secs
+        try:
+            amount_sats = int(anchor.get("amount_sats") or 0)
+        except (TypeError, ValueError):
+            return base_cooldown_secs
+        if amount_sats <= 0:
+            return base_cooldown_secs
+        remaining_gap = max(
+            0, int(target_band_low * capacity_sats) - max(0, int(local_sats))
+        )
+        if remaining_gap <= 0:
+            return base_cooldown_secs
+        fill_fraction = amount_sats / float(amount_sats + remaining_gap)
+        return int(base_cooldown_secs * min(1.0, fill_fraction * 2.0))
+
     def _build_snapshot(self) -> Optional[StateSnapshot]:
         """Build a normalized state snapshot from live data."""
         cfg = self.config if not hasattr(self.config, 'snapshot') else self.config.snapshot()
+
+        def _coerce_float(name: str, default: float) -> float:
+            value = getattr(cfg, name, default)
+            if isinstance(value, (int, float)):
+                return float(value) if value else float(default if default else 0.0)
+            return float(default)
+
+        target_band_low = _coerce_float("low_liquidity_threshold", 0.35)
+        target_band_high = _coerce_float("high_liquidity_threshold", 0.65)
+        target_emergency_low = _coerce_float("rebalance_emergency_local_ratio", 0.10)
 
         try:
             if self._data_service is not None:
@@ -861,7 +923,10 @@ class RebalanceEngine:
                 except Exception:
                     pass
 
-            # Cooldown: skip if rebalanced recently (default 1 hour)
+            # Cooldown: skip if rebalanced recently. Audit F7: the effective
+            # cooldown scales with the last rebalance's fill fraction so a
+            # tiny partial fill does not block the destination for the full
+            # window (see _effective_dest_cooldown_secs).
             cooldown = False
             if self.database and cooldown_secs > 0:
                 try:
@@ -870,7 +935,14 @@ class RebalanceEngine:
                     else:
                         last_ts = self.database.get_last_rebalance_time(scid)
                     if last_ts and (int(time.time()) - last_ts) < cooldown_secs:
-                        cooldown = True
+                        effective_secs = self._effective_dest_cooldown_secs(
+                            scid,
+                            capacity_sats=capacity_sats,
+                            local_sats=local_sats,
+                            base_cooldown_secs=cooldown_secs,
+                            target_band_low=target_band_low,
+                        )
+                        cooldown = (int(time.time()) - last_ts) < effective_secs
                 except Exception:
                     pass
 
@@ -913,15 +985,6 @@ class RebalanceEngine:
                 "cooldown_override": cooldown_override,
             })
 
-        def _coerce_float(name: str, default: float) -> float:
-            value = getattr(cfg, name, default)
-            if isinstance(value, (int, float)):
-                return float(value) if value else float(default if default else 0.0)
-            return float(default)
-
-        target_band_low = _coerce_float("low_liquidity_threshold", 0.35)
-        target_band_high = _coerce_float("high_liquidity_threshold", 0.65)
-        target_emergency_low = _coerce_float("rebalance_emergency_local_ratio", 0.10)
         return build_state_snapshot(
             normalized,
             capex_allocations,

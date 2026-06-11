@@ -546,6 +546,114 @@ def test_f4_equalization_score_matches_planner_coefficients(
 
 
 # ---------------------------------------------------------------------------
+# F7 — destination cooldown scales with the last rebalance's fill fraction
+# ---------------------------------------------------------------------------
+
+
+def _f7_engine(mock_plugin, mock_database, *, local_sats, anchor, last_secs_ago):
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._build_snapshot = type(engine)._build_snapshot.__get__(engine)
+    scid = "100x1x0"
+    mock_database.get_last_rebalance_times.return_value = {
+        scid: int(time.time()) - last_secs_ago
+    }
+    mock_database.get_last_post_rebalance_state.return_value = anchor
+    mock_plugin.rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "02" + "1" * 64,
+                "short_channel_id": scid,
+                "total_msat": 1_000_000_000,  # 1M sats capacity
+                "our_amount_msat": local_sats * 1000,
+                "updates": {
+                    "local": {"fee_proportional_millionths": 1_000},
+                    "remote": {"fee_proportional_millionths": 100},
+                },
+            }
+        ]
+    }
+    return engine
+
+
+def test_f7_small_partial_fill_releases_cooldown_quickly(
+    mock_plugin, mock_database
+):
+    """A 5k fill against a ~300k remaining band gap is a ~1.6% fill: the
+    effective cooldown shrinks to minutes, so 2 hours later the dest is
+    eligible again instead of blocked for 24h."""
+    engine = _f7_engine(
+        mock_plugin,
+        mock_database,
+        local_sats=50_000,  # 5% of 1M capacity; band low 0.35 → gap 300k
+        anchor={
+            "timestamp": int(time.time()) - 2 * 3600,
+            "post_local_ratio": 0.055,
+            "amount_sats": 5_000,
+        },
+        last_secs_ago=2 * 3600,
+    )
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot.channels[0].cooldown_active is False
+
+
+def test_f7_full_fill_keeps_full_cooldown(mock_plugin, mock_database):
+    """A refill that closed the band gap keeps the full 24h cooldown."""
+    engine = _f7_engine(
+        mock_plugin,
+        mock_database,
+        local_sats=400_000,  # 40% local: at/above band low → no remaining gap
+        anchor={
+            "timestamp": int(time.time()) - 2 * 3600,
+            "post_local_ratio": 0.40,
+            "amount_sats": 400_000,
+        },
+        last_secs_ago=2 * 3600,
+    )
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot.channels[0].cooldown_active is True
+
+
+def test_f7_majority_fill_keeps_full_cooldown(mock_plugin, mock_database):
+    """A >=50% fill fraction keeps the full base cooldown (min(1, 2f))."""
+    engine = _f7_engine(
+        mock_plugin,
+        mock_database,
+        local_sats=150_000,  # gap 200k; 300k fill → fraction 0.6 → full
+        anchor={
+            "timestamp": int(time.time()) - 2 * 3600,
+            "post_local_ratio": 0.15,
+            "amount_sats": 300_000,
+        },
+        last_secs_ago=2 * 3600,
+    )
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot.channels[0].cooldown_active is True
+
+
+def test_f7_no_anchor_keeps_full_cooldown(mock_plugin, mock_database):
+    """Without a post-rebalance anchor the conservative full cooldown
+    applies (no schema change, fail-safe)."""
+    engine = _f7_engine(
+        mock_plugin,
+        mock_database,
+        local_sats=50_000,
+        anchor=None,
+        last_secs_ago=2 * 3600,
+    )
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot.channels[0].cooldown_active is True
+
+
+# ---------------------------------------------------------------------------
 # F2 plumbing — our own outbound fee threads snapshot → planner → pair
 # ---------------------------------------------------------------------------
 
