@@ -7287,7 +7287,11 @@ def _build_boltz_balance_plan(
         multi_goal_value = 0.0
         if direction == "loop_out":
             excess_ratio = max(0.0, min(1.0, (local_pct - 50.0) / 50.0))
-            roi_signal = max(0.0, min(1.0, (float(marginal_roi or 0.0)) / 25.0))
+            # F7: marginal_roi is a FRACTION (0.25 = 25%), matching the
+            # dynamic-tuning roi_score above; full signal at 25% marginal
+            # ROI. The old /25.0 treated it as a percent, capping the signal
+            # at <=0.08 and deadening 35% of the loop-out score.
+            roi_signal = max(0.0, min(1.0, (float(marginal_roi or 0.0)) / 0.25))
             fee_signal = min(1.0, broadcast_fee_ppm / 500.0) if broadcast_fee_ppm > 0 else 0.0
             flow_bonus = 1.3 if flow_state in ('source',) else 1.0
             rebalance_bonus = 1.2 if rebalance_impossible else 1.0
