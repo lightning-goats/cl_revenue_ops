@@ -540,7 +540,8 @@ class CapexBudgetEngine:
                 channel_id=ch_id, tier="blocked", hive_multiplier=hive_mult,
             )
 
-        efficiency_mult = self._get_efficiency_multiplier(ch_id, fleet_efficiency)
+        efficiency_mult = self._get_efficiency_multiplier(
+            ch_id, fleet_efficiency, prof=prof)
         budget_msat = int(raw_budget_msat * roi_mult * hive_mult * efficiency_mult)
 
         return ChannelCapexBudget(
@@ -554,7 +555,8 @@ class CapexBudgetEngine:
             roi_multiplier=roi_mult,
         )
 
-    def _get_efficiency_multiplier(self, channel_id: str, fleet_efficiency) -> float:
+    def _get_efficiency_multiplier(self, channel_id: str, fleet_efficiency,
+                                   prof=None) -> float:
         """Return the capital-efficiency multiplier for a channel budget."""
         if fleet_efficiency is None:
             return 1.0
@@ -565,6 +567,12 @@ class CapexBudgetEngine:
             return 1.0
 
         if getattr(channel_eff, "is_dead_capital", False):
+            # Audit F5: dead-capital zeroing ignored gateway protections.
+            # Quiet inbound gateways earn ~0 direct fees (RPSD sees them as
+            # dead) but source the volume other channels monetize. Floor at
+            # 0.25 when the prof shows gateway/sourced value.
+            if self._has_gateway_value(prof):
+                return 0.25
             return 0.0
 
         median_rpsd = float(getattr(fleet_efficiency, "median_rpsd", 0.0) or 0.0)
@@ -576,6 +584,23 @@ class CapexBudgetEngine:
             return 1.0 + min(0.5, (rpsd / median_rpsd - 1.0) * 0.25)
 
         return max(0.5, rpsd / median_rpsd)
+
+    @staticmethod
+    def _has_gateway_value(prof) -> bool:
+        """Whether a prof object shows inbound-gateway / sourced-fee value.
+
+        Predicate (audit F5): lifetime role == INBOUND_GATEWAY or lifetime
+        sourced_fee_contribution_msat > 100_000 (100 sats).
+        """
+        if prof is None:
+            return False
+        role = getattr(prof, 'channel_role', None)
+        role_val = getattr(role, 'value', role)
+        if role_val == "inbound_gateway":
+            return True
+        revenue = getattr(prof, 'revenue', None)
+        sourced = getattr(revenue, 'sourced_fee_contribution_msat', 0)
+        return isinstance(sourced, (int, float)) and sourced > 100_000
 
     def _detect_priority_class(
         self,

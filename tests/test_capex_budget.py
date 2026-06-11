@@ -354,6 +354,97 @@ class TestPerChannelBudget:
 
         assert alloc.channel_budgets["100x1x0"].budget_sats == 0
 
+    def test_dead_capital_inbound_gateway_keeps_quarter_budget(self):
+        """Audit F5: is_dead_capital must not zero a channel whose prof shows
+        gateway/sourced value — floor the multiplier at 0.25."""
+        efficiency = _make_efficiency_snapshot(
+            median_rpsd=100.0,
+            channel_data={
+                "100x1x0": ChannelEfficiency(
+                    channel_id="100x1x0",
+                    rpsd=0.0,
+                    efficiency_rank=0.0,
+                    forward_velocity=0.0,
+                    is_dead_capital=True,
+                    dead_capital_stage="fee_reduction",
+                ),
+            },
+        )
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=0,
+                    total_forward_count=50,
+                    channel_role="inbound_gateway",
+                ),
+            },
+            capital_efficiency=MagicMock(analyze=MagicMock(return_value=efficiency)),
+        )
+        alloc = engine.compute_allocations()
+        # raw proven budget = 1_000_000 * 0.5 = 500_000; floor 0.25 -> 125_000
+        assert alloc.channel_budgets["100x1x0"].budget_msat == 125_000
+
+    def test_dead_capital_with_sourced_value_keeps_quarter_budget(self):
+        """Sourced lifetime contribution > 100 sats also floors at 0.25."""
+        efficiency = _make_efficiency_snapshot(
+            median_rpsd=100.0,
+            channel_data={
+                "100x1x0": ChannelEfficiency(
+                    channel_id="100x1x0",
+                    rpsd=0.0,
+                    efficiency_rank=0.0,
+                    forward_velocity=0.0,
+                    is_dead_capital=True,
+                    dead_capital_stage="fee_reduction",
+                ),
+            },
+        )
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=0,
+                    total_forward_count=50,
+                    sourced_fee_msat=150_000,   # > 100_000 msat
+                    channel_role="balanced",
+                ),
+            },
+            capital_efficiency=MagicMock(analyze=MagicMock(return_value=efficiency)),
+        )
+        alloc = engine.compute_allocations()
+        assert alloc.channel_budgets["100x1x0"].budget_msat == 125_000
+
+    def test_dead_capital_without_gateway_value_still_zeroed(self):
+        """Plain dead capital (no gateway role, no sourced value) stays 0."""
+        efficiency = _make_efficiency_snapshot(
+            median_rpsd=100.0,
+            channel_data={
+                "100x1x0": ChannelEfficiency(
+                    channel_id="100x1x0",
+                    rpsd=0.0,
+                    efficiency_rank=0.0,
+                    forward_velocity=0.0,
+                    is_dead_capital=True,
+                    dead_capital_stage="fee_reduction",
+                ),
+            },
+        )
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=800_000,
+                    total_forward_count=50,
+                    sourced_fee_msat=0,
+                    channel_role="outbound_gateway",
+                ),
+            },
+            capital_efficiency=MagicMock(analyze=MagicMock(return_value=efficiency)),
+        )
+        alloc = engine.compute_allocations()
+        assert alloc.channel_budgets["100x1x0"].budget_msat == 0
+
     def test_above_median_efficiency_increases_budget(self):
         """RPSD above median should increase the computed budget."""
         efficiency = _make_efficiency_snapshot(
