@@ -222,3 +222,98 @@ class TestCapitalEfficiencyAnalyzer:
         fleet = analyzer.analyze()
 
         assert fleet.channel_efficiencies["100x1x0"].dead_capital_stage == "none"
+
+
+def _make_profitability_with_30d(channel_id, peer_id, capacity_sats,
+                                 fees_earned_sats, days_open,
+                                 marginal_profit_30d_sats):
+    prof = _make_profitability(channel_id, peer_id, capacity_sats,
+                               fees_earned_sats, days_open)
+    prof.marginal_profit_30d_sats = marginal_profit_30d_sats
+    return prof
+
+
+class TestWindowedNetBlend:
+    """F7 (audit): rpsd is lifetime-gross — a channel that earned well long
+    ago and bleeds today keeps a top rank forever. When the profitability
+    snapshot exposes marginal_profit_30d_sats, efficiency_rank blends
+    0.5 x lifetime_gross_rank + 0.5 x windowed_net_rank."""
+
+    def test_blend_ordering_demotes_stale_lifetime_leader(self):
+        profitability = {
+            # A: lifetime leader, losing money in the last 30d
+            "a": _make_profitability_with_30d("a", "peer-a", 1_000_000, 1000, 300, -500),
+            # B: modest lifetime, best current net
+            "b": _make_profitability_with_30d("b", "peer-b", 1_000_000, 500, 300, 500),
+            # C: no lifetime revenue, flat current
+            "c": _make_profitability_with_30d("c", "peer-c", 1_000_000, 0, 300, 0),
+        }
+        flow = {
+            "a": _make_flow("a", "peer-a", 1_000_000, 5, 0),
+            "b": _make_flow("b", "peer-b", 1_000_000, 5, 0),
+            "c": _make_flow("c", "peer-c", 1_000_000, 5, 0),
+        }
+        analyzer = _make_analyzer(profitability, flow)
+
+        fleet = analyzer.analyze()
+
+        rank_a = fleet.channel_efficiencies["a"].efficiency_rank
+        rank_b = fleet.channel_efficiencies["b"].efficiency_rank
+        rank_c = fleet.channel_efficiencies["c"].efficiency_rank
+
+        # lifetime ranks: a=1.0 b=0.5 c=0.0; windowed ranks: b=1.0 c=0.5 a=0.0
+        assert rank_b == pytest.approx(0.75)  # 0.5*0.5 + 0.5*1.0
+        assert rank_a == pytest.approx(0.50)  # 0.5*1.0 + 0.5*0.0
+        assert rank_c == pytest.approx(0.25)  # 0.5*0.0 + 0.5*0.5
+        assert rank_b > rank_a > rank_c
+
+    def test_windowed_net_rpsd_exposed_in_snapshot(self):
+        profitability = {
+            "a": _make_profitability_with_30d("a", "peer-a", 2_000_000, 100, 300, 1000),
+            "b": _make_profitability_with_30d("b", "peer-b", 2_000_000, 100, 300, -1000),
+        }
+        flow = {
+            "a": _make_flow("a", "peer-a", 2_000_000, 5, 0),
+            "b": _make_flow("b", "peer-b", 2_000_000, 5, 0),
+        }
+        analyzer = _make_analyzer(profitability, flow)
+
+        fleet = analyzer.analyze()
+
+        assert fleet.channel_efficiencies["a"].windowed_net_rpsd == pytest.approx(500.0)
+        assert fleet.channel_efficiencies["b"].windowed_net_rpsd == pytest.approx(-500.0)
+
+    def test_no_windowed_signal_falls_back_to_pure_lifetime_rank(self):
+        """Without marginal_profit_30d_sats on the prof objects, ranks are
+        unchanged lifetime percentiles (the blend is never synthesized)."""
+        profitability = {
+            "a": _make_profitability("a", "peer-a", 1_000_000, 1000, 300),
+            "b": _make_profitability("b", "peer-b", 1_000_000, 0, 300),
+        }
+        flow = {
+            "a": _make_flow("a", "peer-a", 1_000_000, 5, 0),
+            "b": _make_flow("b", "peer-b", 1_000_000, 5, 0),
+        }
+        analyzer = _make_analyzer(profitability, flow)
+
+        fleet = analyzer.analyze()
+
+        assert fleet.channel_efficiencies["a"].efficiency_rank == pytest.approx(1.0)
+        assert fleet.channel_efficiencies["b"].efficiency_rank == pytest.approx(0.0)
+
+    def test_dead_capital_detection_unchanged_by_blend(self):
+        profitability = {
+            "dead": _make_profitability_with_30d("dead", "peer-d", 2_000_000, 0, 30, 0),
+            "live": _make_profitability_with_30d("live", "peer-l", 2_000_000, 100, 30, 100),
+        }
+        flow = {
+            "dead": _make_flow("dead", "peer-d", 2_000_000, 0, 0),
+            "live": _make_flow("live", "peer-l", 2_000_000, 9, 100_000),
+        }
+        analyzer = _make_analyzer(profitability, flow)
+
+        fleet = analyzer.analyze()
+
+        assert fleet.channel_efficiencies["dead"].is_dead_capital is True
+        assert fleet.channel_efficiencies["live"].is_dead_capital is False
+        assert fleet.dead_capital_count == 1
