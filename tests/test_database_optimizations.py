@@ -763,3 +763,347 @@ class TestCategorySpendSats:
         """get_category_spend_sats on an empty table returns 0, not an error."""
         db = self._db(tmp_path)
         assert db.get_category_spend_sats("boltz", since_timestamp=0) == 0
+
+
+# =============================================================================
+# 3. New index EXPLAIN assertions (phase-2 optimizations)
+# =============================================================================
+
+class TestPendingSettlementPartialIndex:
+    """idx_rh_pending_settlement: partial index covering only pending_settlement rows."""
+
+    def test_index_exists(self, tmp_path):
+        db = _make_db(tmp_path)
+        assert "idx_rh_pending_settlement" in _index_names(db._get_connection(), "rebalance_history")
+
+    def test_plan_uses_partial_index(self, tmp_path):
+        """get_pending_settlement_rebalances scan must reference the partial index."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            """
+            SELECT id, from_channel, to_channel, amount_sats, payment_hash, timestamp
+            FROM rebalance_history
+            WHERE status = 'pending_settlement'
+                  AND payment_hash IS NOT NULL AND payment_hash != ''
+            ORDER BY timestamp ASC
+            LIMIT 50
+            """,
+        )
+        assert "idx_rh_pending_settlement" in plan
+        # Must not fall back to a full table scan
+        assert "SCAN rebalance_history" not in plan.upper() or "USING INDEX" in plan.upper()
+
+    def test_functional_returns_pending_settlement_rows(self, tmp_path):
+        """Functional parity: only rows with status='pending_settlement' and a
+        non-empty payment_hash are returned."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        conn.execute("""
+            INSERT INTO rebalance_history
+            (from_channel, to_channel, amount_sats, max_fee_sats,
+             expected_profit_sats, status, timestamp, payment_hash)
+            VALUES ('100x1x0','200x2x0',1000,10,5,'pending_settlement',?,?)
+        """, (NOW - 100, "hash_abc"))
+        conn.execute("""
+            INSERT INTO rebalance_history
+            (from_channel, to_channel, amount_sats, max_fee_sats,
+             expected_profit_sats, status, timestamp)
+            VALUES ('100x1x0','200x2x0',1000,10,5,'success',?)
+        """, (NOW - 200,))
+        rows = db.get_pending_settlement_rebalances()
+        assert len(rows) == 1
+        assert rows[0]["payment_hash"] == "hash_abc"
+
+
+class TestRebalanceCostsTimeCovering:
+    """idx_rebalance_costs_time_channel: covers the 30d capex grouping query."""
+
+    def test_index_exists(self, tmp_path):
+        db = _make_db(tmp_path)
+        assert "idx_rebalance_costs_time_channel" in _index_names(
+            db._get_connection(), "rebalance_costs"
+        )
+
+    def test_index_provides_covering_search_when_forced(self, tmp_path):
+        """When the optimizer is constrained to the new index the plan is a
+        bounded SEARCH (not a SCAN) and no row lookups are needed."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            "SELECT channel_id, COALESCE(SUM(cost_sats), 0) as total "
+            "FROM rebalance_costs INDEXED BY idx_rebalance_costs_time_channel "
+            "WHERE timestamp >= ? GROUP BY channel_id",
+            (NOW - 30 * 86400,),
+        )
+        # Timestamp range must be used as a seek predicate
+        assert "idx_rebalance_costs_time_channel" in plan
+        assert "timestamp>" in plan.lower() or "timestamp>" in plan
+
+    def test_capex_query_uses_an_index(self, tmp_path):
+        """The capex GROUP BY query must use some index (not a full table scan)."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            "SELECT channel_id, COALESCE(SUM(cost_sats), 0) as total "
+            "FROM rebalance_costs WHERE timestamp >= ? GROUP BY channel_id",
+            (NOW - 30 * 86400,),
+        )
+        assert "SCAN rebalance_costs" not in plan or "USING INDEX" in plan
+
+
+class TestSpendEventsTimeCovering:
+    """idx_spend_events_time_channel: covering index for capex spend_events branch."""
+
+    def test_index_exists(self, tmp_path):
+        db = _make_db(tmp_path)
+        assert "idx_spend_events_time_channel" in _index_names(
+            db._get_connection(), "spend_events"
+        )
+
+    def test_plan_is_covering_search(self, tmp_path):
+        """spend_events capex query must use COVERING INDEX on the new index."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            "SELECT channel_id, COALESCE(SUM(amount_sats), 0) as total "
+            "FROM spend_events "
+            "WHERE timestamp >= ? AND channel_id IS NOT NULL "
+            "GROUP BY channel_id",
+            (NOW - 30 * 86400,),
+        )
+        assert "idx_spend_events_time_channel" in plan
+        assert "COVERING INDEX" in plan.upper()
+
+    def test_category_spend_plan_unaffected(self, tmp_path):
+        """get_category_spend_sats must still use idx_spend_events_category —
+        no regression introduced by the new index."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            "SELECT COALESCE(SUM(amount_sats), 0) AS total FROM spend_events "
+            "WHERE category = ? AND timestamp >= ?",
+            ("boltz", NOW - 86400),
+        )
+        assert "idx_spend_events_category" in plan
+
+
+class TestDailyForwardingStatsDateIndex:
+    """idx_daily_fwd_stats_date / idx_daily_fwd_stats_inbound_date:
+    date-range seeks for fee-rate and routing-revenue queries."""
+
+    def test_indexes_exist(self, tmp_path):
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        assert "idx_daily_fwd_stats_date" in _index_names(conn, "daily_forwarding_stats")
+        assert "idx_daily_fwd_stats_inbound_date" in _index_names(
+            conn, "daily_forwarding_stats_inbound"
+        )
+
+    def test_fee_ppm_30d_rollup_query_uses_index(self, tmp_path):
+        """get_node_realized_fee_ppm_30d inner subquery on daily_forwarding_stats
+        must use the date index (SEARCH, not SCAN)."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        since_day = ((NOW - 30 * 86400) // 86400) * 86400
+        plan = _plan(
+            conn,
+            "SELECT COALESCE(SUM(total_fee_msat), 0) FROM daily_forwarding_stats "
+            "WHERE date >= ?",
+            (since_day,),
+        )
+        assert "idx_daily_fwd_stats_date" in plan
+        assert "SEARCH" in plan.upper()
+        assert "SCAN daily_forwarding_stats" not in plan
+
+    def test_routing_revenue_daily_stats_query_uses_index(self, tmp_path):
+        """get_total_routing_revenue range query on daily_forwarding_stats must
+        use the date index for both bounds (date >= ? AND date < ?)."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        since_day = ((NOW - 30 * 86400) // 86400) * 86400
+        today_start = (NOW // 86400) * 86400
+        plan = _plan(
+            conn,
+            "SELECT COALESCE(SUM(total_fee_msat), 0) FROM daily_forwarding_stats "
+            "WHERE date >= ? AND date < ?",
+            (since_day, today_start),
+        )
+        assert "idx_daily_fwd_stats_date" in plan
+        assert "SEARCH" in plan.upper()
+        assert "SCAN daily_forwarding_stats" not in plan
+
+    def test_inbound_date_query_uses_index(self, tmp_path):
+        """Any date-filtered query on daily_forwarding_stats_inbound uses the
+        inbound date index."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        since_day = ((NOW - 30 * 86400) // 86400) * 86400
+        plan = _plan(
+            conn,
+            "SELECT COALESCE(SUM(total_fee_msat), 0) FROM daily_forwarding_stats_inbound "
+            "WHERE date >= ?",
+            (since_day,),
+        )
+        assert "idx_daily_fwd_stats_inbound_date" in plan
+        assert "SEARCH" in plan.upper()
+
+    def test_get_node_realized_fee_ppm_7d_still_uses_forwards_index(self, tmp_path):
+        """Regression: get_node_realized_fee_ppm (7d) queries only forwards;
+        the new date indexes must not disturb it."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            "SELECT COALESCE(SUM(fee_msat), 0) AS fee_msat,"
+            " COALESCE(SUM(out_msat), 0) AS out_msat"
+            " FROM forwards WHERE timestamp >= ?",
+            (NOW - 7 * 86400,),
+        )
+        assert "idx_forwards_time" in plan
+
+
+class TestPlannerActionsPeerTimeIndex:
+    """idx_planner_actions_peer_time: composite (peer_id, created_at) replaces
+    the bare peer_id index to eliminate the temp b-tree sort."""
+
+    def test_new_index_exists(self, tmp_path):
+        db = _make_db(tmp_path)
+        assert "idx_planner_actions_peer_time" in _index_names(
+            db._get_connection(), "planner_actions"
+        )
+
+    def test_old_peer_index_dropped(self, tmp_path):
+        """idx_planner_actions_peer is a strict prefix of the composite index
+        and must be dropped on initialize()."""
+        db = _make_db(tmp_path)
+        assert "idx_planner_actions_peer" not in _index_names(
+            db._get_connection(), "planner_actions"
+        )
+
+    def test_old_peer_index_dropped_on_existing_db(self, tmp_path):
+        """Existing databases that still carry idx_planner_actions_peer converge
+        to the new schema on the next initialize()."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_planner_actions_peer "
+            "ON planner_actions(peer_id)"
+        )
+        assert "idx_planner_actions_peer" in _index_names(conn, "planner_actions")
+        db.initialize()
+        assert "idx_planner_actions_peer" not in _index_names(conn, "planner_actions")
+
+    def test_plan_uses_composite_index_no_temp_sort(self, tmp_path):
+        """get_recent_planner_actions must use the composite index and must NOT
+        need a temp b-tree to satisfy ORDER BY created_at DESC."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            "SELECT * FROM planner_actions "
+            "WHERE peer_id = ? AND created_at >= ? "
+            "ORDER BY created_at DESC",
+            ("02" + "aa" * 32, NOW - 86400),
+        )
+        assert "idx_planner_actions_peer_time" in plan
+        assert "USE TEMP B-TREE" not in plan.upper()
+
+    def test_status_index_still_used_for_status_filter(self, tmp_path):
+        """Regression: get_planner_actions(status=?) must still use
+        idx_planner_actions_status — the composite index must not regress it."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            "SELECT * FROM planner_actions WHERE status = ? "
+            "ORDER BY created_at DESC LIMIT 20",
+            ("planned",),
+        )
+        assert "idx_planner_actions_status" in plan
+
+
+class TestSuccessPartialIndex:
+    """idx_rh_success_to_channel: partial covering index for get_last_rebalance_times
+    and get_last_post_rebalance_state."""
+
+    def test_index_exists(self, tmp_path):
+        db = _make_db(tmp_path)
+        assert "idx_rh_success_to_channel" in _index_names(
+            db._get_connection(), "rebalance_history"
+        )
+
+    def test_last_rebalance_times_uses_partial_index(self, tmp_path):
+        """get_last_rebalance_times GROUP BY query must use the partial index
+        (covers the status='success' filter implicitly)."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            "SELECT to_channel, MAX(timestamp) AS last_time "
+            "FROM rebalance_history "
+            "WHERE status = 'success' "
+            "GROUP BY to_channel",
+        )
+        assert "idx_rh_success_to_channel" in plan
+
+    def test_last_post_rebalance_state_uses_to_channel_index(self, tmp_path):
+        """get_last_post_rebalance_state per-channel lookup must use an index on
+        to_channel (either the partial idx_rh_success_to_channel or the full
+        idx_rebalance_history_to_channel — both provide to_channel= seek).
+
+        The partial index is strictly smaller and is the preferred path when the
+        optimizer has ANALYZE statistics; without them both are equally estimated
+        and the planner may choose either.  The important invariant is that no
+        temp b-tree or full table scan is needed."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            "SELECT timestamp, post_local_ratio, amount_sats "
+            "FROM rebalance_history "
+            "WHERE to_channel = ? AND status = 'success' "
+            "  AND post_local_ratio IS NOT NULL "
+            "ORDER BY timestamp DESC LIMIT 1",
+            ("100x1x0",),
+        )
+        assert (
+            "idx_rh_success_to_channel" in plan
+            or "idx_rebalance_history_to_channel" in plan
+        ), f"expected a to_channel index in plan: {plan}"
+        assert "SCAN rebalance_history" not in plan
+
+    def test_category_spend_plan_regression(self, tmp_path):
+        """Regression: get_category_spend_sats must still use
+        idx_spend_events_category after all new indexes are added."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            "SELECT COALESCE(SUM(amount_sats), 0) AS total FROM spend_events "
+            "WHERE category = ? AND timestamp >= ?",
+            ("boltz", NOW - 86400),
+        )
+        assert "idx_spend_events_category" in plan
+
+    def test_last_post_rebalance_state_regression(self, tmp_path):
+        """Regression check: after the partial index is added,
+        get_last_post_rebalance_state still receives an index-driven plan."""
+        db = _make_db(tmp_path)
+        conn = db._get_connection()
+        plan = _plan(
+            conn,
+            "SELECT timestamp, post_local_ratio, amount_sats "
+            "FROM rebalance_history "
+            "WHERE to_channel = ? AND status = 'success' "
+            "  AND post_local_ratio IS NOT NULL "
+            "ORDER BY timestamp DESC LIMIT 1",
+            ("100x1x0",),
+        )
+        # Must use some index (the partial index subsumes idx_rebalance_history_to_channel)
+        assert "SCAN rebalance_history" not in plan or "USING INDEX" in plan

@@ -845,6 +845,23 @@ class Database:
         # get_total_rebalance_fees, get_budget_status, get_daily_rebalance_spend).
         # rebalance_costs is never pruned, so these were full table scans.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_time ON rebalance_costs(timestamp, cost_sats)")
+        # Covering index for get_total_capex_by_channel: WHERE timestamp >= ? GROUP BY channel_id.
+        # The (channel_id, timestamp) index scans all rows without bounding the 30d window;
+        # (timestamp, channel_id, cost_sats) is a covering index that bounds the scan by
+        # timestamp first.  The planner selects between the two based on data distribution;
+        # this index ensures the bounded-range path is always available.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rebalance_costs_time_channel ON rebalance_costs(timestamp, channel_id, cost_sats)")
+        # Partial index for get_pending_settlement_rebalances: filters status='pending_settlement'
+        # and orders by timestamp.  Without this, every rebalance cycle does a full index scan
+        # on idx_rebalance_history_time with status as a residual filter; with it the engine
+        # touches only the (typically tiny) pending_settlement partition.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rh_pending_settlement ON rebalance_history(timestamp) WHERE status='pending_settlement'")
+        # Partial covering index for get_last_rebalance_times and get_last_post_rebalance_state:
+        # GROUP BY to_channel WHERE status='success'.  The existing idx_rebalance_history_to_channel
+        # (to_channel, timestamp) is a non-partial scan; this partial index reduces the index
+        # pages read to the success partition only, which on a busy node is a small fraction of
+        # all rebalance rows.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rh_success_to_channel ON rebalance_history(to_channel, timestamp) WHERE status='success'")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_channel_states_peer ON channel_states(peer_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connection_history_peer_time ON peer_connection_history(peer_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mempool_time ON mempool_fee_history(timestamp)")
@@ -873,6 +890,11 @@ class Database:
                 PRIMARY KEY (channel_id, date)
             )
         """)
+        # Date-only index for get_node_realized_fee_ppm_30d and get_total_routing_revenue:
+        # both query daily_forwarding_stats with WHERE date >= ? (or date range), but the
+        # PK is (channel_id, date) so SQLite cannot use it for a date-first range scan.
+        # This index converts those queries from full table scans to index range seeks.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_fwd_stats_date ON daily_forwarding_stats(date)")
 
         # Daily aggregated entry-side forwarding stats (Profitability v2.0)
         # Preserves "in_channel" contribution metrics when raw forwards are pruned.
@@ -886,6 +908,8 @@ class Database:
                 PRIMARY KEY (channel_id, date)
             )
         """)
+        # Symmetric date index for the inbound table.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_fwd_stats_inbound_date ON daily_forwarding_stats_inbound(date)")
         
         # Budget reservations table for atomic budget management (CRITICAL-01 fix)
         # Prevents race conditions where multiple concurrent jobs can overspend
@@ -934,6 +958,12 @@ class Database:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_spend_events_time ON spend_events(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_spend_events_category ON spend_events(category, timestamp)")
+        # Covering index for get_total_capex_by_channel spend_events branch:
+        # WHERE timestamp >= ? AND channel_id IS NOT NULL GROUP BY channel_id.
+        # idx_spend_events_time (timestamp) provides a range seek but requires a
+        # separate row lookup for channel_id and amount_sats; this covering index
+        # eliminates the table row reads entirely.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_spend_events_time_channel ON spend_events(timestamp, channel_id, amount_sats)")
 
         # Financial Snapshots for P&L Dashboard
         # Records daily node state for TLV tracking and trend analysis
@@ -1227,7 +1257,15 @@ class Database:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_status ON planner_actions(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_peer ON planner_actions(peer_id)")
+        # Composite (peer_id, created_at) index for get_recent_planner_actions:
+        # WHERE peer_id = ? AND created_at >= ? ORDER BY created_at DESC.
+        # The old single-column idx_planner_actions_peer (peer_id) left the planner
+        # scanning the peer's entire history with a temp b-tree sort; this composite
+        # index makes both the filter and the ORDER BY index-driven with no temp sort.
+        # idx_planner_actions_peer is a strict prefix of the new index and is therefore
+        # redundant; drop it on existing databases to remove the maintenance overhead.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_peer_time ON planner_actions(peer_id, created_at)")
+        conn.execute("DROP INDEX IF EXISTS idx_planner_actions_peer")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS dead_capital_stage (
