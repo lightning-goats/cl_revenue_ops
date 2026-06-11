@@ -260,8 +260,11 @@ class RebalanceHiveRouter:
         cltv_delta = 6
 
         try:
-            chans = self._get_peer_channels(pair.dest_peer_id)
-            for ch in chans.get("channels", []):
+            # The broadcast listpeerchannels dump is cached (30s) by the
+            # data service while per-peer lookups are deliberately uncached;
+            # the v2 helper filters the broadcast in memory and only falls
+            # back to the per-peer RPC when the peer is absent from it.
+            for ch in self._v2_helpers._peer_channels_for(str(pair.dest_peer_id)):
                 if ch.get("short_channel_id") != scid:
                     continue
                 remote = (ch.get("updates") or {}).get("remote") or {}

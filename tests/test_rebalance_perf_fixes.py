@@ -274,6 +274,162 @@ def test_v3_router_exclude_layer_per_call_outside_cycle():
     assert _count_rpc(plugin, "askrene-remove-layer") == 2
 
 
+# ---------------------------------------------------------------------------
+# 3. Final-hop policy served from the broadcast listpeerchannels cache
+# ---------------------------------------------------------------------------
+
+
+class _RecordingDataService:
+    """Minimal data service double recording get_peer_channels arguments."""
+
+    def __init__(self, channels):
+        self._channels = list(channels)
+        self.peer_channel_calls = []
+
+    def get_peer_channels(self, peer_id=None):
+        self.peer_channel_calls.append(peer_id)
+        if peer_id:
+            return {
+                "channels": [
+                    ch for ch in self._channels if ch.get("peer_id") == peer_id
+                ]
+            }
+        return {"channels": list(self._channels)}
+
+    def get_channels(self, source=None, destination=None, short_channel_id=None):
+        return {"channels": []}
+
+    def get_configs(self):
+        return {"configs": {"cltv-final": {"value_int": 18}}}
+
+
+def _dest_policy_channel():
+    return {
+        "peer_id": DST_PEER,
+        "short_channel_id": "200x2x0",
+        "updates": {
+            "remote": {
+                "fee_proportional_millionths": 250,
+                "fee_base_msat": 1000,
+                "cltv_expiry_delta": 40,
+            }
+        },
+    }
+
+
+def test_v2_final_hop_policy_uses_broadcast_cache():
+    """When the (cached) broadcast dump contains the peer, no per-peer
+    listpeerchannels RPC is issued."""
+    from modules.rebalance_router_v2 import RebalanceRouter
+
+    ds = _RecordingDataService([_dest_policy_channel()])
+    router = RebalanceRouter(MagicMock(), OUR_ID, data_service=ds)
+
+    policy = router._get_final_hop_policy(DST_PEER, "200x2x0")
+
+    assert policy == {"fee_ppm": 250, "fee_base_msat": 1000, "cltv_delta": 40}
+    assert ds.peer_channel_calls == [None]
+
+
+def test_v2_final_hop_policy_falls_back_to_per_peer_rpc_when_absent():
+    """A peer missing from the broadcast (shouldn't happen for our own
+    channels) still triggers the per-peer lookup."""
+    from modules.rebalance_router_v2 import RebalanceRouter
+
+    other = dict(_dest_policy_channel(), peer_id=SRC_PEER)
+    ds = _RecordingDataService([other])
+    router = RebalanceRouter(MagicMock(), OUR_ID, data_service=ds)
+
+    router._get_final_hop_policy(DST_PEER, "200x2x0")
+
+    assert ds.peer_channel_calls == [None, DST_PEER]
+
+
+def test_hive_return_hop_policy_uses_broadcast_cache():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    ds = _RecordingDataService([_dest_policy_channel()])
+    router = RebalanceHiveRouter(
+        plugin=MagicMock(),
+        our_node_id=OUR_ID,
+        hive_hints=None,
+        data_service=ds,
+    )
+    pair = SimpleNamespace(dest_channel_id="200x2x0", dest_peer_id=DST_PEER)
+
+    amount_msat = 1_000_000
+    required_amount_msat, required_cltv = router._return_hop_policy(
+        pair, amount_msat
+    )
+
+    # fee = 1000 base + 1_000_000 * 250ppm / 1e6 = 1250 msat
+    assert required_amount_msat == amount_msat + 1250
+    assert required_cltv == 18 + 40
+    assert None in ds.peer_channel_calls
+    assert DST_PEER not in ds.peer_channel_calls
+
+
+def test_hive_return_hop_policy_falls_back_to_per_peer_rpc_when_absent():
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+
+    ds = _RecordingDataService([dict(_dest_policy_channel(), peer_id=SRC_PEER)])
+    router = RebalanceHiveRouter(
+        plugin=MagicMock(),
+        our_node_id=OUR_ID,
+        hive_hints=None,
+        data_service=ds,
+    )
+    pair = SimpleNamespace(dest_channel_id="200x2x0", dest_peer_id=DST_PEER)
+
+    router._return_hop_policy(pair, 1_000_000)
+
+    assert DST_PEER in ds.peer_channel_calls
+
+
+def test_v3_pricing_issues_zero_per_peer_listpeerchannels():
+    """End to end: a v3 price_pair backed by a broadcast containing the dest
+    peer performs no per-peer listpeerchannels calls."""
+    from modules.rebalance_router_v3 import RebalanceRouterV3
+
+    plugin = _make_v3_plugin()
+
+    class _V3DataService(_RecordingDataService):
+        def get_channels(
+            self, source=None, destination=None, short_channel_id=None
+        ):
+            return plugin.rpc.listchannels.return_value
+
+        def get_askrene_layers(self):
+            return {"layers": [{"layer": "hive-fleet"}]}
+
+        def get_routes(self, **kwargs):
+            return plugin.rpc.getroutes(**kwargs)
+
+        def askrene_create_layer(self, layer):
+            pass
+
+        def askrene_update_channel(self, layer, scid_dir, enabled):
+            pass
+
+        def askrene_remove_layer(self, layer):
+            pass
+
+    ds = _V3DataService([_dest_policy_channel()])
+    router = RebalanceRouterV3(
+        plugin=plugin,
+        our_node_id=OUR_ID,
+        layer_names=["hive-fleet"],
+        log=lambda m, l: None,
+        data_service=ds,
+    )
+
+    result = _v3_price(router)
+
+    assert result.success is True, result.error
+    assert all(peer is None for peer in ds.peer_channel_calls)
+    plugin.rpc.listpeerchannels.assert_not_called()
+
+
 def test_v3_router_unknown_layer_error_drops_cached_exclude_layers():
     plugin = _make_v3_plugin()
     router = _make_v3_router(plugin)

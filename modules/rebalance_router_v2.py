@@ -94,22 +94,49 @@ class RebalanceRouter:
         alias = ch.get("alias") or {}
         return str(alias.get("local") or "") == dest_channel_id
 
+    def _peer_channels_for(self, peer_id: str) -> List[Dict[str, Any]]:
+        """Channel entries for one peer, preferring the broadcast cache.
+
+        The data service caches the full (broadcast) listpeerchannels dump
+        for 30s but deliberately leaves per-peer lookups uncached. Every
+        field the routers read for policy lookups is present in the
+        broadcast entries, so filter that dump in memory and only fall back
+        to the per-peer RPC when the peer is absent from the broadcast
+        (shouldn't happen for our own channels) or the broadcast fetch
+        fails. Without a data service there is no cache to leverage; the
+        per-peer RPC remains the cheapest call.
+        """
+        if self.data_service is not None:
+            try:
+                broadcast = self.data_service.get_peer_channels()
+                peer_channels = [
+                    ch
+                    for ch in broadcast.get("channels", [])
+                    if ch.get("peer_id") == peer_id
+                ]
+                if peer_channels:
+                    return peer_channels
+            except Exception as e:
+                self._log(f"broadcast listpeerchannels lookup failed: {e}")
+        if self.data_service is not None:
+            result = self.data_service.get_peer_channels(peer_id)
+        else:
+            result = self.plugin.rpc.listpeerchannels(peer_id=peer_id)
+        return list(result.get("channels", []))
+
     def _get_final_hop_policy(
         self, dest_peer_id: str, dest_channel_id: Optional[str] = None
     ) -> Optional[Dict[str, int]]:
         """Get the actual inbound policy the dest peer charges us.
 
         Priority 1: listpeerchannels updates.remote.fee_proportional_millionths
+        (served from the broadcast cache when a data service is present).
         Priority 2: listchannels for the dest peer's channel toward us.
         Returns None if the policy cannot be determined.
         """
         # --- Priority 1: listpeerchannels filtered by peer ---
         try:
-            if self.data_service is not None:
-                result = self.data_service.get_peer_channels(dest_peer_id)
-            else:
-                result = self.plugin.rpc.listpeerchannels(peer_id=dest_peer_id)
-            for ch in result.get("channels", []):
+            for ch in self._peer_channels_for(dest_peer_id):
                 if ch.get("peer_id") != dest_peer_id:
                     continue
                 if not self._channel_matches_scid(ch, dest_channel_id):
