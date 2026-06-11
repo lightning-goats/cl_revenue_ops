@@ -3810,9 +3810,25 @@ class FeeController:
             "stable_cycles": row_fields["stable_cycles"],
             "forward_count_since_update": row_fields["forward_count_since_update"],
             "last_volume_sats": row_fields["last_volume_sats"],
-            "v2_state_json": json.dumps(v2_data),
+            # PERF: kept UNSERIALIZED here. Every terminal path saves cycle
+            # state then fee state back-to-back; with batched persistence the
+            # pending dict is last-write-wins, so serializing the full ~50KB
+            # row on every save discarded half the json.dumps work. The row
+            # is serialized exactly once: at flush (batched) or at immediate
+            # persist (out-of-cycle).
+            "v2_state_json": v2_data,
             "last_update": row_fields["last_update"],
         }
+
+    @staticmethod
+    def _serialize_fee_strategy_row(row_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Return row kwargs with v2_state_json serialized to a JSON string."""
+        v2_data = row_kwargs.get("v2_state_json")
+        if isinstance(v2_data, str):
+            return row_kwargs
+        serialized = dict(row_kwargs)
+        serialized["v2_state_json"] = json.dumps(v2_data if v2_data is not None else {})
+        return serialized
 
     def _persist_fee_strategy_row(self, row_kwargs: Dict[str, Any]) -> None:
         """Persist a merged fee strategy row.
@@ -3821,11 +3837,18 @@ class FeeController:
         channel wins) and flushed once at cycle end. Outside a cycle the row
         is written immediately, preserving durability for manual RPC paths,
         set_initial_fee, and hook threads.
+
+        Aliasing note: enqueued rows hold the live to_v2_dict()/to_dict()
+        structures (e.g. thompson observations list) rather than a frozen
+        JSON string. This is safe because the flush runs in the same
+        _state_lock critical section as the cycle loop — hook threads cannot
+        mutate fee state between enqueue and flush, and a re-save of the
+        same channel replaces the whole pending row.
         """
         if self._cycle_batch_active:
             self._pending_fee_strategy_rows[row_kwargs["channel_id"]] = row_kwargs
             return
-        self.database.update_fee_strategy_state(**row_kwargs)
+        self.database.update_fee_strategy_state(**self._serialize_fee_strategy_row(row_kwargs))
 
     def _flush_pending_fee_strategy_rows(self) -> None:
         """Flush rows deferred during an adjust_all_fees cycle in one batch."""
@@ -3833,7 +3856,7 @@ class FeeController:
         if not pending:
             return
         self._pending_fee_strategy_rows = {}
-        rows = list(pending.values())
+        rows = [self._serialize_fee_strategy_row(row) for row in pending.values()]
 
         batch_writer = getattr(self.database, "update_fee_strategy_states_batch", None)
         if callable(batch_writer):

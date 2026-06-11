@@ -660,6 +660,79 @@ class TestGossipPrefetch:
             "Channel info fetch must happen before _state_lock is acquired"
 
 
+class TestSingleSerializationPerChannel:
+    """Item: wasted json.dumps removal.
+
+    Every terminal path saves cycle state then fee state back-to-back.
+    Each save used to json.dumps the full ~50KB merged row even though the
+    batch pending dict is last-write-wins, so the first serialization was
+    always discarded. Batched rows are now enqueued UNSERIALIZED and dumped
+    once at flush.
+    """
+
+    def _count_dumps(self, monkeypatch):
+        import modules.fee_controller as fc_mod
+        real_dumps = fc_mod.json.dumps
+        calls = []
+
+        def counting_dumps(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return real_dumps(*args, **kwargs)
+
+        monkeypatch.setattr(fc_mod.json, "dumps", counting_dumps)
+        return calls
+
+    def test_one_dumps_per_channel_per_cycle(
+        self, mock_plugin, mock_database, monkeypatch
+    ):
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        fc.adjust_all_fees()  # warm states (loads may dump during migration)
+
+        calls = self._count_dumps(monkeypatch)
+        fc.adjust_all_fees()
+
+        assert len(calls) == len(CHANNEL_IDS), \
+            (f"Expected exactly 1 json.dumps per channel per cycle "
+             f"(was 2), got {len(calls)} for {len(CHANNEL_IDS)} channels")
+
+    def test_batch_rows_carry_serialized_json(self, mock_plugin, mock_database):
+        """The flush must hand the database layer fully serialized rows."""
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+
+        fc.adjust_all_fees()
+
+        rows = mock_database.update_fee_strategy_states_batch.call_args[0][0]
+        assert rows
+        for row in rows:
+            assert isinstance(row["v2_state_json"], str)
+            json.loads(row["v2_state_json"])  # valid JSON
+
+    def test_fallback_per_row_writes_carry_serialized_json(
+        self, mock_plugin, mock_database
+    ):
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        del mock_database.update_fee_strategy_states_batch
+
+        fc.adjust_all_fees()
+
+        assert mock_database.update_fee_strategy_state.call_count == len(CHANNEL_IDS)
+        for call in mock_database.update_fee_strategy_state.call_args_list:
+            assert isinstance(call.kwargs["v2_state_json"], str)
+
+    def test_out_of_cycle_save_passes_serialized_json(
+        self, mock_plugin, mock_database
+    ):
+        fc, _ = _make_cycle_fc(mock_plugin, mock_database)
+        ts = fc._get_channel_fee_state(CHANNEL_IDS[0], PEER_IDS[0])
+
+        mock_database.update_fee_strategy_state.reset_mock()
+        fc._save_channel_fee_state(CHANNEL_IDS[0], ts)
+
+        kwargs = mock_database.update_fee_strategy_state.call_args.kwargs
+        assert isinstance(kwargs["v2_state_json"], str)
+        json.loads(kwargs["v2_state_json"])
+
+
 class TestProfitabilityWarmup:
 
     def test_warmup_runs_before_lock_acquisition(self, mock_plugin, mock_database):
