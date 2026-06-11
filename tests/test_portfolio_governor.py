@@ -118,3 +118,27 @@ class TestPortfolioBalanceGovernor:
         # 9.5M + 3M = 12.5M local / 20M total = 62.5%
         state = planner._check_portfolio_balance_gate(channels)
         assert state == "healthy"
+
+
+class TestConstrainedBandAlignment:
+    """F6b (audit): the constrained band starts at 80% local, aligning with
+    receivable_ratio_floor (0.20) — by 80% local the node is already
+    receivables-starved."""
+
+    def test_boundary_80_is_constrained(self):
+        planner = _make_planner()
+        channels = _make_channels([80, 80, 80, 80])
+        state = planner._check_portfolio_balance_gate(channels)
+        assert state == "constrained"
+
+    def test_82_is_constrained_not_watch(self):
+        planner = _make_planner()
+        channels = _make_channels([82, 82, 82, 82])
+        state = planner._check_portfolio_balance_gate(channels)
+        assert state == "constrained"
+
+    def test_79_still_watch(self):
+        planner = _make_planner()
+        channels = _make_channels([79, 79, 79, 79])
+        state = planner._check_portfolio_balance_gate(channels)
+        assert state == "watch"

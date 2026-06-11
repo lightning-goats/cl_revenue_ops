@@ -4887,3 +4887,143 @@ class TestExecuteCycleRedeploymentPricing:
 
         planner._calculate_redeployment_ev.assert_not_called()
         assert len(result["closes"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# F6: portfolio governor — blocked-state remedies and discovery
+# ---------------------------------------------------------------------------
+
+def _blocked_listpeerchannels():
+    """A 96%-local fleet: portfolio governor returns 'blocked'."""
+    return {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "to_us_msat": 960_000_000,
+                "total_msat": 1_000_000_000,
+            }
+            for _ in range(4)
+        ]
+    }
+
+
+class TestBlockedPortfolioRemedies:
+    """F6 (audit): when >= 95% local, opens that DRAIN local balance or
+    BRING inbound (sink-adjacent, dual-funded) are the remedy, not the
+    disease — and discovery must still run so recycle/Boltz coordination
+    gets candidates (the comment claimed recycle worked when blocked, but
+    the code discovered no candidates: a dead branch)."""
+
+    def _make_blocked_planner(self):
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        plugin.rpc.listpeerchannels.return_value = _blocked_listpeerchannels()
+        planner._identify_winners = MagicMock(return_value=[])
+        planner._identify_losers = MagicMock(return_value=[])
+        planner._update_candidate_pool = MagicMock()
+        planner._calculate_open_ev = MagicMock(return_value=5_000)
+        planner._size_channel = MagicMock(return_value=1_000_000)
+        return planner, plugin, prof
+
+    def test_blocked_still_runs_candidate_discovery(self):
+        planner, plugin, prof = self._make_blocked_planner()
+        candidate = {"peer_id": "02" + "a" * 64, "score": 0.9, "reason": "x"}
+        planner._discover_peers = MagicMock(return_value=[candidate])
+
+        result = planner.execute_cycle(_make_cycle_cfg())
+
+        planner._discover_peers.assert_called_once()
+        assert result["portfolio_state"] == "blocked"
+        assert result["candidate_count"] == 1
+
+    def test_blocked_skips_regular_open_execution(self):
+        planner, plugin, prof = self._make_blocked_planner()
+        candidate = {"peer_id": "02" + "a" * 64, "score": 0.9, "reason": "x"}
+        planner._discover_peers = MagicMock(return_value=[candidate])
+        planner._execute_open = MagicMock()
+
+        result = planner.execute_cycle(_make_cycle_cfg())
+
+        planner._execute_open.assert_not_called()
+        assert result["opens"] == []
+        assert any("not sink-adjacent or dual-fund" in r for r in result["skipped_reasons"])
+
+    def test_blocked_allows_sink_adjacent_open(self):
+        planner, plugin, prof = self._make_blocked_planner()
+        peer = "02" + "a" * 64
+        candidate = {"peer_id": peer, "score": 0.9, "reason": "sink adj"}
+        planner._discover_peers = MagicMock(return_value=[candidate])
+        planner._demand_flow_sink_adjacent = {peer}
+        planner._execute_open = MagicMock(
+            return_value={"action_id": 1, "status": "completed"}
+        )
+
+        result = planner.execute_cycle(_make_cycle_cfg(planner_max_opens_per_cycle=1))
+
+        planner._execute_open.assert_called_once()
+        assert len(result["opens"]) == 1
+
+    def test_blocked_allows_dual_funded_open(self):
+        planner, plugin, prof = self._make_blocked_planner()
+        peer = "02" + "a" * 64
+        candidate = {"peer_id": peer, "score": 0.9, "reason": "dual fund"}
+        planner._discover_peers = MagicMock(return_value=[candidate])
+        planner._get_cached_node = MagicMock(return_value={
+            "nodeid": peer,
+            "option_will_fund": {"compact_lease": "abcd"},
+        })
+        planner._execute_open = MagicMock(
+            return_value={"action_id": 1, "status": "completed"}
+        )
+
+        result = planner.execute_cycle(_make_cycle_cfg(planner_max_opens_per_cycle=1))
+
+        planner._execute_open.assert_called_once()
+        assert len(result["opens"]) == 1
+
+    def test_blocked_feeds_recycle_coordination(self):
+        """The dead branch: recycle needs candidates while blocked."""
+        planner, plugin, prof = self._make_blocked_planner()
+        candidate = {"peer_id": "02" + "a" * 64, "score": 0.9, "reason": "x"}
+        loser = {
+            "scid": "800000x1x0",
+            "peer_id": "03" + "b" * 64,
+            "action": "CLOSE",
+            "reason": "STAGNANT",
+            "marginal_roi": -10.0,
+            "capacity": 2_000_000,
+            "marginal_profit_30d_sats": -500,
+            "is_fire_sale": True,  # bypass F4a demotion for this fixture
+        }
+        planner._identify_losers = MagicMock(return_value=[loser])
+        planner._discover_peers = MagicMock(return_value=[candidate])
+        planner._evaluate_recycle_opportunities = MagicMock(return_value=None)
+        # Closes need a policy answer; keep them out of the way
+        planner._check_close_allowed = MagicMock(return_value=(False, "test"))
+
+        planner.execute_cycle(_make_cycle_cfg())
+
+        planner._evaluate_recycle_opportunities.assert_called_once()
+        passed_candidates = planner._evaluate_recycle_opportunities.call_args[0][1]
+        assert passed_candidates == [candidate]
+
+    def test_constrained_still_filters_regular_opens(self):
+        """80-95% local keeps the existing constrained filter."""
+        planner, plugin, prof = self._make_blocked_planner()
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "state": "CHANNELD_NORMAL",
+                    "to_us_msat": 850_000_000,
+                    "total_msat": 1_000_000_000,
+                }
+                for _ in range(4)
+            ]
+        }
+        candidate = {"peer_id": "02" + "a" * 64, "score": 0.9, "reason": "x"}
+        planner._discover_peers = MagicMock(return_value=[candidate])
+        planner._execute_open = MagicMock()
+
+        result = planner.execute_cycle(_make_cycle_cfg())
+
+        assert result["portfolio_state"] == "constrained"
+        planner._execute_open.assert_not_called()

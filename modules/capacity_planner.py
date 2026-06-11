@@ -272,9 +272,17 @@ class CapacityPlanner:
 
         States:
             healthy     (< 70% local)  — all opens permitted
-            watch       (70-85% local) — opens permitted, log warning
-            constrained (85-95% local) — only dual-funded or sink-targeting opens
-            blocked     (>= 95% local) — no new outbound opens
+            watch       (70-80% local) — opens permitted, log warning
+            constrained (80-95% local) — only dual-funded or sink-targeting opens
+            blocked     (>= 95% local) — only dual-funded or sink-targeting opens
+
+        F6 (audit): the constrained band starts at 80% local, aligning with
+        receivable_ratio_floor (0.20) — by 80% local the node is already
+        receivables-starved. In the blocked state, sink-adjacent and
+        dual-funded opens remain allowed: they are the REMEDY for being
+        local-heavy (they drain local balance / bring inbound), not the
+        disease. Candidate discovery also still runs when blocked so
+        recycle/Boltz coordination has candidates to work with.
         """
         total_local = 0
         total_capacity = 0
@@ -293,7 +301,8 @@ class CapacityPlanner:
 
         if local_pct >= 95:
             return "blocked"
-        elif local_pct >= 85:
+        elif local_pct >= 80:
+            # F6b: aligned with receivable_ratio_floor (0.20)
             return "constrained"
         elif local_pct >= 70:
             return "watch"
@@ -452,7 +461,11 @@ class CapacityPlanner:
         self._last_best_candidate = {}
         self._last_preferred_loop_out_scid = None
         self._last_preferred_loop_out_reason = ""
-        if fee_ok and portfolio_state != "blocked":
+        if fee_ok:
+            # F6c (audit): discovery always runs — even when blocked — so
+            # recycle/Boltz coordination receives candidates. Only open
+            # EXECUTION is restricted by the portfolio state (and even then,
+            # sink-adjacent/dual-funded remedies stay allowed — F6a).
             candidates = self._discover_peers(winners, all_profitability, all_flow)
 
             # Get available funds for sizing
@@ -565,14 +578,18 @@ class CapacityPlanner:
                     )
                     continue
 
-                # Constrained portfolio: only allow sink-adjacent or dual-fund candidates
-                if portfolio_state == "constrained":
+                # Constrained/blocked portfolio: only allow sink-adjacent or
+                # dual-fund candidates. F6a (audit): in the blocked state
+                # these opens are the remedy for being local-heavy (they
+                # drain local / bring inbound), not the disease.
+                if portfolio_state in ("constrained", "blocked"):
                     is_sink_adj = peer_id in self._demand_flow_sink_adjacent
                     node_info = self._get_cached_node(peer_id)
                     has_lads = bool(node_info and node_info.get("option_will_fund"))
                     if not is_sink_adj and not has_lads:
                         summary["skipped_reasons"].append(
-                            f"Constrained: {peer_id[:16]}... not sink-adjacent or dual-fund"
+                            f"{portfolio_state.capitalize()}: {peer_id[:16]}... "
+                            f"not sink-adjacent or dual-fund"
                         )
                         continue
 
@@ -639,7 +656,7 @@ class CapacityPlanner:
         if summary["skipped_reasons"]:
             for reason in summary["skipped_reasons"]:
                 self.plugin.log(f"PLANNER SKIP: {reason}", level='info')
-        if not candidates and fee_ok and portfolio_state != "blocked":
+        if not candidates and fee_ok:
             self.plugin.log(
                 f"PLANNER: No open candidates discovered "
                 f"(winners={len(winners)}, losers={len(losers)})",
