@@ -612,7 +612,9 @@ class CapacityPlanner:
 
         # 9. Evaluate recycling opportunities (works even when blocked)
         if candidates and losers:
-            recycle_plan = self._evaluate_recycle_opportunities(losers, candidates, cfg)
+            recycle_plan = self._evaluate_recycle_opportunities(
+                losers, candidates, cfg, all_profitability, all_flow
+            )
             if recycle_plan:
                 summary["recycle_opportunity"] = {
                     "close_scid": recycle_plan["loser"]["scid"],
@@ -2111,30 +2113,44 @@ class CapacityPlanner:
     ) -> float:
         """Calculate EV of closing loser and opening to candidate.
 
+        F5 (audit): candidate_ev from _calculate_open_ev already nets the
+        new channel's open AND close costs internally, so subtracting
+        open_cost here double-counted it. Both sides now use the same
+        180-day horizon: the loser's foregone residual is marginal_30d x 6
+        (it was x3 = 90 days against the candidate's 180 — a 2x pro-recycle
+        bias). The only incremental cash cost left is closing the loser.
+
         Returns recycle_ev in sats.
         """
         capacity = loser.get("capacity", 0)
 
-        # Candidate EV
+        # Candidate EV over 180 days, net of the new channel's chain costs
         candidate_ev = self._calculate_open_ev(candidate["peer_id"], capacity, cfg)
 
-        # Residual value: credit the loser for its remaining earnings (90-day horizon)
+        # Residual value: the loser's foregone earnings over the SAME horizon
         marginal_30d = loser.get("marginal_profit_30d_sats", 0)
-        residual_value = marginal_30d * 3
+        residual_value = marginal_30d * 6  # 180 days, matching candidate_ev
 
-        # On-chain costs (dynamic via feerates RPC, legacy static fallback)
-        open_cost = self._estimate_open_cost()
+        # Closing the loser is the only chain cost not already in candidate_ev
         close_cost = self._estimate_close_cost()
 
-        recycle_ev = candidate_ev - residual_value - close_cost - open_cost
+        recycle_ev = candidate_ev - residual_value - close_cost
         return recycle_ev
 
     RECYCLE_MIN_EV_SATS = 5000
 
     def _evaluate_recycle_opportunities(
-        self, losers: List[Dict], candidates: List[Dict], cfg
+        self, losers: List[Dict], candidates: List[Dict], cfg,
+        all_profitability=None, all_flow=None,
     ) -> Dict[str, Any] | None:
         """Find the best recycle opportunity: close a loser, open to a candidate.
+
+        F5 (audit): recycle nomination previously bypassed
+        _close_protection_reason — a protected channel (inbound gateway,
+        sourced-fee contributor, revenue route, low-confidence Kalman) could
+        be nominated as the preferred loop-out/close target. When the
+        profitability/flow snapshots are provided, every nominee is run
+        through the same protective gates as the close paths.
 
         Returns a recycle plan dict or None if no viable opportunity exists.
         """
@@ -2167,12 +2183,33 @@ class CapacityPlanner:
         except Exception:
             pass
 
+        # Index analysis snapshots by display SCID for protection checks
+        prof_by_scid: Dict[str, Any] = {}
+        flow_by_scid: Dict[str, Any] = {}
+        try:
+            for key, value in (all_profitability or {}).items():
+                prof_by_scid[str(key).replace(":", "x")] = value
+            for key, value in (all_flow or {}).items():
+                flow_by_scid[str(key).replace(":", "x")] = value
+        except Exception:
+            prof_by_scid, flow_by_scid = {}, {}
+
         # Find eligible losers
         eligible_losers = []
         for loser in losers:
             ok, reason = self._is_recycle_eligible(loser, protected_peers, route_pair_scids)
-            if ok:
-                eligible_losers.append(loser)
+            if not ok:
+                continue
+            # F5: protective closure gates apply to recycle nomination too
+            scid = str(loser.get("scid", ""))
+            prof = prof_by_scid.get(scid)
+            if prof is not None:
+                protection = self._close_protection_reason(
+                    scid, prof, flow_by_scid.get(scid), route_pair_scids
+                )
+                if protection:
+                    continue
+            eligible_losers.append(loser)
 
         if not eligible_losers:
             return None

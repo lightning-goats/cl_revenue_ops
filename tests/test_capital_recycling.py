@@ -197,3 +197,94 @@ class TestDualFundDetection:
         # positional args: (peer_id, amount, None, None) or (peer_id, amount)
         if len(args) > 2:
             assert args[2] is None  # request_amt should be None
+
+
+class TestRecycleEVAccounting:
+    """F5 (audit): the recycle formula double-counted the open cost
+    (candidate_ev already nets open+close internally), credited the loser
+    only 90 days of residual against the candidate's 180 (2x pro-recycle
+    bias), and skipped _close_protection_reason."""
+
+    def _planner_with_costs(self, candidate_ev=20_000, close_cost=1_000, open_cost=700):
+        planner = _make_planner()
+        planner._calculate_open_ev = MagicMock(return_value=candidate_ev)
+        planner._estimate_close_cost = MagicMock(return_value=close_cost)
+        planner._estimate_open_cost = MagicMock(return_value=open_cost)
+        return planner
+
+    def test_open_cost_not_subtracted_again(self):
+        """candidate_ev already nets the new channel's open cost; the
+        recycle EV must subtract only the loser's close cost."""
+        planner = self._planner_with_costs(candidate_ev=20_000, close_cost=1_000, open_cost=700)
+        loser = _make_loser(marginal_profit_30d=0)
+        ev = planner._calculate_recycle_ev(loser, {"peer_id": "new_peer"}, MagicMock())
+        # 20000 - residual(0) - close(1000); open_cost must NOT appear
+        assert ev == pytest.approx(19_000)
+        planner._estimate_open_cost.assert_not_called()
+
+    def test_residual_uses_common_180d_horizon(self):
+        """The loser's foregone earnings use the same 180-day horizon as the
+        candidate EV: marginal_30d x 6, not x 3."""
+        planner = self._planner_with_costs(candidate_ev=20_000, close_cost=1_000)
+        loser = _make_loser(marginal_profit_30d=-200)
+        ev = planner._calculate_recycle_ev(loser, {"peer_id": "new_peer"}, MagicMock())
+        # residual = -200 * 6 = -1200 => 20000 + 1200 - 1000
+        assert ev == pytest.approx(20_200)
+
+    def test_marginally_positive_loser_residual_priced_at_180d(self):
+        """A loser still earning a little gets full 180d credit, making
+        borderline recycles harder to justify (bias removed)."""
+        planner = self._planner_with_costs(candidate_ev=4_000, close_cost=1_000)
+        loser = _make_loser(marginal_profit_30d=400)
+        ev = planner._calculate_recycle_ev(loser, {"peer_id": "new_peer"}, MagicMock())
+        # 4000 - 2400 - 1000 = 600 (old x3 formula would say 4000-1200-1000-700=1100)
+        assert ev == pytest.approx(600)
+
+
+class TestRecycleProtections:
+    """F5: recycle nomination must run losers through _close_protection_reason."""
+
+    def _setup(self, sourced_fee_sats):
+        planner = _make_planner()
+        planner.plugin.rpc.getinfo.return_value = {"blockheight": 943000}
+        planner._calculate_open_ev = MagicMock(return_value=50_000)
+        planner._estimate_close_cost = MagicMock(return_value=1_000)
+        planner.policy_manager = None
+        db = planner.profitability.database
+        db.get_top_route_pairs.return_value = []
+
+        loser = _make_loser(scid="800000x1x0", marginal_roi=-5.0, marginal_profit_30d=-500)
+        candidate = {"peer_id": "03" + "c" * 64, "score": 0.9}
+
+        prof = MagicMock()
+        prof.peer_id = loser["peer_id"]
+        prof.marginal_roi_percent = -5.0
+        prof.channel_role = "balanced"
+        prof.revenue.sourced_fee_contribution_sats = sourced_fee_sats
+        flow = MagicMock()
+        flow.confidence = 1.0
+        flow.forward_count = 0
+        all_prof = {"800000x1x0": prof}
+        all_flow = {"800000x1x0": flow}
+        return planner, loser, candidate, all_prof, all_flow
+
+    def test_protected_loser_not_nominated(self):
+        """A sourced-fee contributor must not become the recycle target."""
+        planner, loser, candidate, all_prof, all_flow = self._setup(sourced_fee_sats=5_000)
+
+        plan = planner._evaluate_recycle_opportunities(
+            [loser], [candidate], MagicMock(), all_prof, all_flow
+        )
+
+        assert plan is None
+        assert planner._last_preferred_loop_out_scid is None
+
+    def test_unprotected_loser_still_nominated(self):
+        planner, loser, candidate, all_prof, all_flow = self._setup(sourced_fee_sats=0)
+
+        plan = planner._evaluate_recycle_opportunities(
+            [loser], [candidate], MagicMock(), all_prof, all_flow
+        )
+
+        assert plan is not None
+        assert plan["loser"]["scid"] == "800000x1x0"
