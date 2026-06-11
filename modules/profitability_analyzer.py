@@ -865,6 +865,7 @@ class ChannelProfitabilityAnalyzer:
                 peer_id=peer_id,
                 forward_count=revenue.total_forward_count,
                 fee_states=fee_states,
+                contribution_30d_msat=int(contribution_30d_msat or 0),
             )
 
             profitability = ChannelProfitability(
@@ -2540,7 +2541,8 @@ class ChannelProfitabilityAnalyzer:
                          channel_id: Optional[str] = None,
                          peer_id: Optional[str] = None,
                          forward_count: int = 0,
-                         fee_states: Optional[Dict[str, Dict[str, Any]]] = None) -> ProfitabilityClass:
+                         fee_states: Optional[Dict[str, Dict[str, Any]]] = None,
+                         contribution_30d_msat: Optional[int] = None) -> ProfitabilityClass:
         """Classify a channel based on profitability metrics.
 
         Args:
@@ -2548,6 +2550,10 @@ class ChannelProfitabilityAnalyzer:
                 channel_id. When provided, avoids a per-channel DB query; a
                 missing key behaves like the per-channel default state (no
                 threshold widening).
+            contribution_30d_msat: Optional trailing-30d total contribution
+                (audit F3). When provided, enables the inactivity branch that
+                reclassifies historically-profitable corpses as STAGNANT.
+                None means "no windowed data" and disables that branch.
         """
         
         # Check for inactivity
@@ -2632,6 +2638,20 @@ class ChannelProfitabilityAnalyzer:
                     return ProfitabilityClass.BREAK_EVEN
             except Exception:
                 pass
+
+        # 5. Audit F3: historically-profitable corpse. Lifetime ROI never
+        # decays, so a channel that earned well a year ago and has been dead
+        # since could NEVER become STAGNANT (branch 2 requires roi < -10%).
+        # Inactivity is judged independently of the lifetime ROI sign:
+        # a month with zero forwards in either direction and zero 30d
+        # contribution on a mature channel is dead capital regardless of
+        # how profitable it once was. Placed AFTER the structural/gateway
+        # protections above so protected channels are never reclassified.
+        if (contribution_30d_msat is not None
+                and contribution_30d_msat <= 0
+                and days_inactive >= 30
+                and days_open > 60):
+            return ProfitabilityClass.STAGNANT_CANDIDATE
 
         if roi > profitable_thresh:
             return ProfitabilityClass.PROFITABLE

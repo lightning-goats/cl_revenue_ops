@@ -391,6 +391,143 @@ class TestZombieFalsePositive:
 
 
 # ============================================================
+# Audit F3: lifetime-ROI classification blind spot
+# ============================================================
+
+class TestProfitableCorpseClassification:
+    """A historically-profitable channel that has been dead for months must
+    become STAGNANT_CANDIDATE regardless of its lifetime ROI sign."""
+
+    def _classify(self, analyzer, **kwargs):
+        defaults = dict(
+            roi=0.12, net_profit=5000,
+            last_routed=int(time.time()) - 3600,
+            days_open=400,
+            channel_id="111x222x0",
+            peer_id="02" + "a" * 64,
+            forward_count=500,
+        )
+        defaults.update(kwargs)
+        return analyzer._classify_channel(**defaults)
+
+    def _analyzer(self):
+        analyzer = _make_analyzer()
+        analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 0, "last_success_time": 0,
+        }
+        analyzer.database.get_fee_strategy_state.return_value = None
+        return analyzer
+
+    def test_profitable_corpse_is_stagnant(self):
+        """Lifetime ROI +12%, dead 1 year, 0 contribution in 30d -> STAGNANT."""
+        result = self._classify(
+            self._analyzer(),
+            roi=0.12,
+            last_routed=int(time.time()) - 86400 * 365,
+            contribution_30d_msat=0,
+        )
+        assert result == ProfitabilityClass.STAGNANT_CANDIDATE
+
+    def test_active_profitable_channel_unchanged(self):
+        """Recently-routing profitable channel stays PROFITABLE."""
+        result = self._classify(
+            self._analyzer(),
+            roi=0.12,
+            last_routed=int(time.time()) - 3600,
+            contribution_30d_msat=500_000,
+        )
+        assert result == ProfitabilityClass.PROFITABLE
+
+    def test_quiet_but_sourcing_gateway_unchanged(self):
+        """A channel whose 30d contribution comes from sourcing is not a
+        corpse even when its exit side looks quiet."""
+        result = self._classify(
+            self._analyzer(),
+            roi=0.12,
+            last_routed=int(time.time()) - 3600,  # sourcing counts as routing
+            contribution_30d_msat=120_000,
+        )
+        assert result == ProfitabilityClass.PROFITABLE
+
+    def test_young_channel_not_reclassified(self):
+        """days_open <= 60 channels are left to the existing branches."""
+        result = self._classify(
+            self._analyzer(),
+            roi=0.12,
+            days_open=50,
+            last_routed=int(time.time()) - 86400 * 40,
+            contribution_30d_msat=0,
+        )
+        assert result == ProfitabilityClass.PROFITABLE
+
+    def test_short_inactivity_not_reclassified(self):
+        """Less than 30 days of inactivity is not a corpse."""
+        result = self._classify(
+            self._analyzer(),
+            roi=0.12,
+            last_routed=int(time.time()) - 86400 * 20,
+            contribution_30d_msat=0,
+        )
+        assert result == ProfitabilityClass.PROFITABLE
+
+    def test_no_window_data_keeps_legacy_behavior(self):
+        """Without 30d contribution data the branch must not fire."""
+        result = self._classify(
+            self._analyzer(),
+            roi=0.12,
+            last_routed=int(time.time()) - 86400 * 365,
+            contribution_30d_msat=None,
+        )
+        assert result == ProfitabilityClass.PROFITABLE
+
+    def test_hive_protected_gateway_not_reclassified(self):
+        """Structural (hive) protections run BEFORE the corpse branch: a
+        corridor owner with poor ROI but zero 30d contribution still gets
+        the structural BREAK_EVEN upgrade, not a STAGNANT reclassification."""
+        analyzer = self._analyzer()
+        mock_hints = MagicMock()
+        mock_hints.is_hive_member.return_value = True
+        mock_hints.get_centrality.return_value = 0.001
+        mock_hints.get_corridor_role.return_value = "owner"
+        analyzer.hive_hints = mock_hints
+        result = self._classify(
+            analyzer,
+            roi=-0.5,  # underwater -> structural protection path
+            last_routed=int(time.time()) - 86400 * 2,
+            contribution_30d_msat=0,
+        )
+        assert result == ProfitabilityClass.BREAK_EVEN
+
+    def test_analyze_channel_classifies_profitable_corpse(self):
+        """End-to-end: analyze_channel passes 30d contribution to classify."""
+        analyzer = self._analyzer()
+        channel_info = {
+            "peer_id": "02" + "a" * 64,
+            "capacity": 2_000_000,
+            "funding_txid": "abc123",
+            "opener": "local",
+            "open_timestamp": int(time.time()) - 86400 * 400,
+        }
+        analyzer._get_channel_costs = MagicMock(return_value=_make_costs(
+            open_cost=500, rebalance=100))
+        # Big lifetime revenue -> high lifetime ROI
+        analyzer._get_channel_revenue = MagicMock(return_value=_make_revenue(
+            fees=20_000, forwards=900))
+        # Dead for a year
+        analyzer._get_last_routing_time = MagicMock(
+            return_value=int(time.time()) - 86400 * 365)
+        analyzer.database.get_channel_full_pnl.return_value = {
+            'total_contribution_msat': 0,
+            'total_contribution_sats': 0,
+            'rebalance_cost_sats': 0,
+        }
+        result = analyzer.analyze_channel("111x222x0", channel_info=channel_info)
+        assert result is not None
+        assert result.roi_percent > 10  # historically profitable
+        assert result.classification == ProfitabilityClass.STAGNANT_CANDIDATE
+
+
+# ============================================================
 # Fix 5: ROI Sorting & Volume Double-Count
 # ============================================================
 
