@@ -160,10 +160,15 @@ def test_pair_in_futility_never_reaches_router(mock_plugin, mock_database):
     assert selected == []
     engine.router_v3.price_pair.assert_not_called()
     engine._hive_router.price_pair.assert_not_called()
-    assert any(
-        call.kwargs.get("reason") == "pair_futility"
+    audited_reasons = [
+        call.kwargs.get("reason")
         for call in engine._audit.log_skip.call_args_list
-    )
+    ] + [
+        getattr(skip, "reason", None)
+        for call in engine._audit.log_skips.call_args_list
+        for skip in (call.args[0] if call.args else call.kwargs.get("skips", []))
+    ]
+    assert "pair_futility" in audited_reasons
 
 
 def test_pair_below_futility_threshold_is_still_priced(

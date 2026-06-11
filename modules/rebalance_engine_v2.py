@@ -1601,16 +1601,10 @@ class RebalanceEngine:
 
             plan.selected = priced
 
-        # Audit all skips
-        for skip in plan.skipped:
-            self._audit.log_skip(
-                channel_id=skip.channel_id,
-                reason=skip.reason,
-                value_class=skip.value_class,
-                remaining_budget_sats=skip.remaining_budget_sats,
-                detail=skip.detail or "",
-                router=router_tag,
-            )
+        # Audit all skips. Per-channel records stay on the cycle result;
+        # log emission is aggregated for non-actionable reasons
+        # (inside_band / not_valuable) to cut the per-cycle IPC volume.
+        self._audit.log_skips(plan.skipped, router=router_tag)
 
         self._audit.log_cycle_summary(
             selected_count=len(plan.selected),

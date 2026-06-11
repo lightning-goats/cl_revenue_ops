@@ -7,6 +7,20 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def _audited_skip_reasons(audit_mock):
+    """Skip reasons reaching a mocked audit via log_skip OR bulk log_skips."""
+    reasons = []
+    for call in audit_mock.log_skip.call_args_list:
+        reasons.append(
+            call.kwargs.get("reason")
+            or (call.args[1] if len(call.args) > 1 else None)
+        )
+    for call in audit_mock.log_skips.call_args_list:
+        skips = call.args[0] if call.args else call.kwargs.get("skips", [])
+        reasons.extend(getattr(skip, "reason", None) for skip in skips)
+    return reasons
+
+
 def _make_cycle_result(candidates=None, executions=None):
     from modules.rebalance_engine_v2 import CycleResult
     cr = CycleResult()
@@ -1976,10 +1990,7 @@ def test_engine_skips_pairs_with_persisted_cooldown_before_pricing(
 
     assert selected == []
     engine.router_v3.price_pair.assert_not_called()
-    assert any(
-        call.kwargs.get("reason") == "pair_cooldown" or call.args[1] == "pair_cooldown"
-        for call in engine._audit.log_skip.call_args_list
-    )
+    assert "pair_cooldown" in _audited_skip_reasons(engine._audit)
 
 
 def test_engine_runs_planner_selected_pair_without_local_route_snapshot(
@@ -2324,12 +2335,8 @@ def test_engine_signals_local_route_pricing_failure_without_blocking_selection(
     engine.router_v3.price_pair.assert_called_once()
     assert engine.router_v3.price_pair.call_args.kwargs["exclude"] is None
     engine._audit.log_pick.assert_not_called()
-    log_skip_calls = engine._audit.log_skip.call_args_list
-    assert any(
-        c.kwargs.get("reason") == "no_route"
-        or (len(c.args) > 1 and c.args[1] == "no_route")
-        for c in log_skip_calls
-    ), f"expected a no_route skip; got {log_skip_calls}"
+    reasons = _audited_skip_reasons(engine._audit)
+    assert "no_route" in reasons, f"expected a no_route skip; got {reasons}"
 
 
 def test_engine_run_cycle_skips_when_native_executor_unavailable(mock_plugin, mock_database):

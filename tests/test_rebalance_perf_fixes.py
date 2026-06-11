@@ -275,6 +275,108 @@ def test_v3_router_exclude_layer_per_call_outside_cycle():
 
 
 # ---------------------------------------------------------------------------
+# 7. Skip-log emission aggregated for non-actionable reasons
+# ---------------------------------------------------------------------------
+
+
+def _skip_record(channel_id, reason, value_class="none", detail=""):
+    from modules.rebalance_types_v2 import SkipRecord
+
+    return SkipRecord(
+        channel_id=channel_id,
+        reason=reason,
+        value_class=value_class,
+        detail=detail,
+    )
+
+
+def test_log_skips_emits_single_line_for_inside_band_bulk():
+    """60 inside_band channels produce ONE summary log line, not 60."""
+    from modules.rebalance_audit_v2 import RebalanceAudit
+
+    plugin = MagicMock()
+    audit = RebalanceAudit(plugin)
+    skips = [_skip_record(f"{i}x1x0", "inside_band") for i in range(60)]
+
+    audit.log_skips(skips, router="v3")
+
+    assert plugin.log.call_count == 1
+    message = plugin.log.call_args.args[0]
+    assert "REBAL_SKIP" in message
+    assert "reason=inside_band" in message
+    assert "count=60" in message
+
+
+def test_log_skips_keeps_per_channel_lines_for_actionable_reasons():
+    from modules.rebalance_audit_v2 import RebalanceAudit
+
+    plugin = MagicMock()
+    audit = RebalanceAudit(plugin)
+    skips = [
+        _skip_record(f"{i}x1x0", "inside_band") for i in range(10)
+    ] + [
+        _skip_record("90x1x0", "cooldown", value_class="valuable"),
+        _skip_record("91x1x0", "no_budget", value_class="valuable"),
+        _skip_record("92x1x0", "pair_futility", value_class="valuable"),
+        _skip_record("93x1x0", "below_hold_margin", value_class="valuable"),
+        _skip_record("94x1x0", "not_valuable"),
+    ]
+
+    audit.log_skips(skips, router="v3")
+
+    messages = [c.args[0] for c in plugin.log.call_args_list]
+    # 4 actionable per-channel lines + 2 aggregate lines.
+    assert len(messages) == 6
+    per_channel = [m for m in messages if "channel=" in m]
+    assert len(per_channel) == 4
+    assert any("channel=90x1x0" in m and "reason=cooldown" in m for m in per_channel)
+    assert any("reason=inside_band" in m and "count=10" in m for m in messages)
+    assert any("reason=not_valuable" in m and "count=1" in m for m in messages)
+
+
+def test_find_candidates_aggregates_inside_band_log_volume(
+    mock_plugin, mock_database
+):
+    """Engine-level: a planner skipping 60 inside_band channels emits one
+    REBAL_SKIP log line while keeping all 60 audit records."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    mock_plugin.rpc.getinfo.return_value = {"id": OUR_ID}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    engine = RebalanceEngine(
+        plugin=mock_plugin, config=cfg, database=mock_database
+    )
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[SimpleNamespace(value_class="none")],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+    mock_plugin.log.reset_mock()
+
+    skips = [_skip_record(f"{i}x1x0", "inside_band") for i in range(60)]
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner = planner_cls.return_value
+        planner.plan.return_value = SimpleNamespace(selected=[], skipped=skips)
+
+        engine.find_candidates()
+
+    skip_lines = [
+        c.args[0]
+        for c in mock_plugin.log.call_args_list
+        if "REBAL_SKIP" in str(c.args[0])
+    ]
+    assert len(skip_lines) == 1
+    assert "count=60" in skip_lines[0]
+    # The audit records (cycle result surface) keep one entry per channel.
+    assert len(engine._last_cycle_result.audit_records) == 60
+
+
+# ---------------------------------------------------------------------------
 # 6. Pending settlement without payment_hash is terminal, not parked
 # ---------------------------------------------------------------------------
 

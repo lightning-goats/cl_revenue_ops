@@ -14,6 +14,18 @@ from __future__ import annotations
 from typing import Any, Optional
 
 
+# Skip reasons that describe channels with nothing to do (healthy or not
+# worth refilling). They dominate the per-cycle skip volume (~96 log lines
+# per cycle, ~9.2k/day at scale) while carrying no operator action, so the
+# log emission is aggregated to one summary line per reason. The full
+# per-channel SkipRecords are NOT affected: the cycle result / debug
+# surface keeps every record (the audit contract is unchanged).
+NON_ACTIONABLE_SKIP_REASONS: frozenset[str] = frozenset({
+    "inside_band",
+    "not_valuable",
+})
+
+
 VALID_SKIP_REASONS: frozenset[str] = frozenset({
     # Produced by the planner
     "inside_band",
@@ -86,6 +98,10 @@ class RebalanceAudit:
         return " ".join(parts)
 
     @staticmethod
+    def format_skip_summary(reason: str, count: int, router: str = "v2") -> str:
+        return f"REBAL_SKIP reason={reason} count={count} router={router}"
+
+    @staticmethod
     def format_cycle_summary(
         selected_count: int,
         skipped_count: int,
@@ -146,6 +162,39 @@ class RebalanceAudit:
             ),
             level="debug",
         )
+
+    def log_skips(self, skips: Any, router: str = "v2") -> None:
+        """Emit the cycle's skip records with aggregated log volume.
+
+        Actionable reasons (cooldowns, budget, futility, below_hold_margin,
+        lease, ...) keep one grep-friendly line per channel. Non-actionable
+        reasons (NON_ACTIONABLE_SKIP_REASONS) are rolled up into one
+        summary line per reason — e.g. ``REBAL_SKIP reason=inside_band
+        count=61`` — since per-channel lines for healthy channels are pure
+        IPC volume. Callers keep the full per-channel records in the cycle
+        result; only the log emission is aggregated.
+        """
+        aggregated: dict[str, int] = {}
+        for skip in skips:
+            reason = str(getattr(skip, "reason", "") or "")
+            if reason in NON_ACTIONABLE_SKIP_REASONS:
+                aggregated[reason] = aggregated.get(reason, 0) + 1
+                continue
+            self.log_skip(
+                channel_id=getattr(skip, "channel_id", ""),
+                reason=reason,
+                value_class=getattr(skip, "value_class", ""),
+                remaining_budget_sats=int(
+                    getattr(skip, "remaining_budget_sats", 0) or 0
+                ),
+                detail=getattr(skip, "detail", "") or "",
+                router=router,
+            )
+        for reason, count in aggregated.items():
+            self._plugin.log(
+                self.format_skip_summary(reason, count, router=router),
+                level="debug",
+            )
 
     def log_cycle_summary(
         self,
