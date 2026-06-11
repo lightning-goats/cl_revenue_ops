@@ -3120,8 +3120,10 @@ def test_hive_equalization_score_is_normalized_to_planner_units(
 
     assert len(selected) == 1
     assert selected[0].reason_code == "hive_equalization"
-    # drain (0.9-0.65)/0.35 + urgency (0.35-0.1)/0.35 = ~1.4286
-    expected = _drain_score(0.9, 0.65) + _refill_urgency(0.1, 0.35)
+    # Audit F4: planner coefficients — 0.30 x urgency + 0.20 x drain.
+    expected = (
+        0.30 * _refill_urgency(0.1, 0.35) + 0.20 * _drain_score(0.9, 0.65)
+    )
     assert selected[0].score == pytest.approx(expected, rel=1e-4)
     assert selected[0].score < 2.0
 

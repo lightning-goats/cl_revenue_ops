@@ -216,8 +216,8 @@ def test_overlay_keeps_pair_when_overlapping_lease_is_ours():
 
 def test_overlay_score_is_normalized_to_planner_units():
     """Overlay scores are band-normalized ratios in planner units, not raw
-    sats. _make_snapshot: drain (0.9-0.65)/0.35 + urgency (0.35-0.1)/0.35
-    = ~1.4286 base, priority 90 -> x(1 + 0.90 * 0.15)."""
+    sats, using the planner's coefficients (audit F4): base =
+    0.30 * urgency + 0.20 * drain, priority 90 -> x(1 + 0.90 * 0.15)."""
     import pytest
 
     from modules.rebalance_coordination_overlay import build_coordination_pairs
@@ -242,7 +242,9 @@ def test_overlay_score_is_normalized_to_planner_units():
         snapshot, hive_hints=hints, our_node_id="02ours"
     )
 
-    expected_base = _drain_score(0.9, 0.65) + _refill_urgency(0.1, 0.35)
+    expected_base = (
+        0.30 * _refill_urgency(0.1, 0.35) + 0.20 * _drain_score(0.9, 0.65)
+    )
     assert len(candidates) == 1
     assert candidates[0].score == pytest.approx(expected_base * 1.135, rel=1e-4)
     # Comparable with planner units (roughly [0.1, 1.5], never sats-scale).
@@ -273,7 +275,9 @@ def test_overlay_score_priority_multiplier_is_bounded():
         snapshot, hive_hints=hints, our_node_id="02ours"
     )
 
-    expected_base = _drain_score(0.9, 0.65) + _refill_urgency(0.1, 0.35)
+    expected_base = (
+        0.30 * _refill_urgency(0.1, 0.35) + 0.20 * _drain_score(0.9, 0.65)
+    )
     assert len(candidates) == 1
     assert candidates[0].score == pytest.approx(expected_base * 1.15, rel=1e-4)
 

@@ -1033,16 +1033,14 @@ class RebalanceEngine:
                 if amount_sats <= 0:
                     continue
                 # Score in planner units so equalization pairs are comparable
-                # with planner and coordination pairs in final ordering and
-                # the hold-margin gate. Mirrors the coordination overlay's
-                # normalization (_drain_score/_refill_urgency shapes).
+                # with planner and coordination pairs in final ordering.
+                # Audit F4: same coefficients as the planner's role-aware
+                # terms (0.30 x dest urgency + 0.20 x source drain), matching
+                # the coordination overlay's normalization.
                 equalization_score = max(
                     0.0,
-                    min(
-                        2.0,
-                        _drain_score(source.local_ratio, high_pct)
-                        + _refill_urgency(dest.local_ratio, low_pct),
-                    ),
+                    0.30 * _refill_urgency(dest.local_ratio, low_pct)
+                    + 0.20 * _drain_score(source.local_ratio, high_pct),
                 )
                 candidate_pairs.append(
                     PairCandidate(

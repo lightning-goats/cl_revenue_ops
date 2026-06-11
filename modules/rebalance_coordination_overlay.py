@@ -265,16 +265,18 @@ def _build_pair_from_entry(
 
     source_excess = _channel_excess_sats(source, target_band_high)
     sink_need = _channel_need_sats(sink, target_band_low)
-    # Score in planner units (roughly [0.1, 1.5]) so coordination pairs are
-    # comparable with planner pairs in final ordering and so the engine's
-    # hold-margin EV gate is meaningful. The ratios mirror rebalance_state_v2's
-    # _drain_score/_refill_urgency shapes (excess over band headroom, deficit
-    # over the band floor, each in [0, 1]); the bounded priority multiplier
-    # preserves producer ranking without letting a raw sats-scale score
-    # dominate everything.
+    # Score in planner units so coordination pairs are comparable with
+    # planner pairs in final ordering. Audit F4: use the SAME coefficients
+    # as the planner's role-aware terms (0.30 x dest urgency + 0.20 x source
+    # drain — see RebalancePlanner._generate_pairs); the previous coefficient
+    # of 1.0 on each ratio put overlay scores at ~2x planner scale. The
+    # ratios mirror rebalance_state_v2's _drain_score/_refill_urgency shapes
+    # (excess over band headroom, deficit over the band floor, each in
+    # [0, 1]); the bounded priority multiplier preserves producer ranking
+    # without letting a raw sats-scale score dominate everything.
     excess_ratio = _drain_score(source.local_ratio, target_band_high)
     need_ratio = _refill_urgency(sink.local_ratio, target_band_low)
-    base_score = max(0.0, min(2.0, need_ratio + excess_ratio))
+    base_score = max(0.0, 0.30 * need_ratio + 0.20 * excess_ratio)
     priority = _priority_score(entry)
     normalized_score = base_score * (
         1.0 + min(priority, MAX_HINT_PRIORITY_SCORE) / 100.0 * 0.15
@@ -504,7 +506,10 @@ def merge_coordination_pairs(
                 if _pair_key(existing) != key:
                     continue
                 # Planner, overlay, and equalization scores all share planner
-                # units, so taking the max is a like-for-like comparison.
+                # units AND the same 0.30/0.20 urgency/drain coefficients
+                # (audit F4), so taking the max is a like-for-like comparison
+                # (the planner adds value/cheap-return terms, the overlay a
+                # bounded priority multiplier — same order of magnitude).
                 existing.score = max(existing.score, pair.score)
                 if existing.route_decision is None:
                     existing.route_decision = pair.route_decision
