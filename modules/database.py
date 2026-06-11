@@ -5074,9 +5074,14 @@ class Database:
         conn = self._get_connection()
         cutoff = int(time.time()) - (window_days * 86400)
 
+        # F5: the denominator counts only TERMINAL outcomes. rebalance_history
+        # status vocabulary is 'pending' (in-flight), 'pending_settlement'
+        # (parked awaiting the reconcile sweep), 'success' and 'failed'
+        # (terminal). Counting non-terminal rows in total made parked
+        # payments look like failures and dragged the success rate down.
         row = conn.execute(f"""
             SELECT
-                COUNT(*) as total,
+                SUM(CASE WHEN status IN ('success', 'failed') THEN 1 ELSE 0 END) as total,
                 SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as successes,
                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failures,
                 AVG(CASE WHEN status = 'success' AND amount_sats > 0
@@ -5087,7 +5092,7 @@ class Database:
             WHERE {where_sql} AND timestamp >= ?
         """, (*where_params, cutoff)).fetchone()
 
-        if not row or row['total'] == 0:
+        if not row or not row['total']:
             return None
 
         total = row['total']

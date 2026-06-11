@@ -116,6 +116,69 @@ class TestChannelRebalanceSuccessRate:
         result = db.get_channel_rebalance_success_rate("999x999x0", 30)
         assert result is None
 
+    def _insert(self, conn, channel, status, ts):
+        conn.execute(
+            "INSERT INTO rebalance_history "
+            "(from_channel, to_channel, amount_sats, max_fee_sats, "
+            "expected_profit_sats, status, rebalance_type, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("src", channel, 50000, 100, 50, status, "normal", ts),
+        )
+
+    def test_pending_settlement_rows_do_not_drop_the_rate(self, tmp_path):
+        """F5: parked pending_settlement (and in-flight pending) rows are not
+        terminal outcomes and must not pollute the denominator — 3 successes
+        + 4 parked rows is a 100% success rate, not 43%."""
+        db = self._make_db(tmp_path)
+        conn = db._get_connection()
+        now = int(time.time())
+        channel = "111x222x0"
+
+        for i in range(3):
+            self._insert(conn, channel, "success", now - i * 3600)
+        for i in range(3):
+            self._insert(conn, channel, "pending_settlement", now - (3 + i) * 3600)
+        self._insert(conn, channel, "pending", now - 7 * 3600)
+        conn.commit()
+
+        result = db.get_channel_rebalance_success_rate(channel, 30)
+
+        assert result is not None
+        assert result['total'] == 3       # terminal rows only
+        assert result['successes'] == 3
+        assert result['failures'] == 0
+        assert result['success_rate'] == 1.0
+
+    def test_only_pending_rows_returns_none(self, tmp_path):
+        """No terminal outcomes yet -> no rate (None), not a fake 0%."""
+        db = self._make_db(tmp_path)
+        conn = db._get_connection()
+        now = int(time.time())
+        channel = "111x222x0"
+        for i in range(4):
+            self._insert(conn, channel, "pending_settlement", now - i * 3600)
+        conn.commit()
+
+        assert db.get_channel_rebalance_success_rate(channel, 30) is None
+
+    def test_pending_rows_do_not_fake_rebalance_impossible(self, tmp_path):
+        """3 parked + 1 failed must not look like '3+ attempts, 0% success'
+        (the consumer's rebalance_impossible heuristic): total counts only
+        terminal rows, so total==1 here."""
+        db = self._make_db(tmp_path)
+        conn = db._get_connection()
+        now = int(time.time())
+        channel = "111x222x0"
+        for i in range(3):
+            self._insert(conn, channel, "pending_settlement", now - i * 3600)
+        self._insert(conn, channel, "failed", now - 4 * 3600)
+        conn.commit()
+
+        result = db.get_channel_rebalance_success_rate(channel, 30)
+
+        assert result['total'] == 1
+        assert result['success_rate'] == 0.0
+
 
 class TestPeerAndSourceRebalanceSuccessRate:
     """Real SQLite tests for peer/source rebalance success aggregation."""
