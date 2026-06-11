@@ -2226,11 +2226,34 @@ class FeeController:
     # posterior, while the PID multiplier MULTIPLIES the sampled fee. The old
     # [0.25, 4.0] range gave the divisor a 16x spread that systematically
     # depressed the posterior on proven-demand channels, directly opposing the
-    # PID's balance correction. Invariant: demand normalization may at most
-    # halve or double an observation (4x spread), keeping it subordinate to
-    # the PID and to the posterior's own variance handling.
-    KALMAN_DEMAND_FACTOR_MIN = 0.5
+    # PID's balance correction.
+    # F3 (2026-06 audit): floor raised 0.5 -> 1.0. The 0.5 lower clamp,
+    # combined with the ed<0.05 noise-guard branch, produced a 2x reward
+    # cliff at ed=0.05 (factor jumped 1.0 -> 0.5) exactly where most
+    # channels live. Invariant: demand normalization may at most HALVE an
+    # observation and never amplifies one, keeping it subordinate to the
+    # PID and to the posterior's own variance handling.
+    KALMAN_DEMAND_FACTOR_MIN = 1.0
     KALMAN_DEMAND_FACTOR_MAX = 2.0
+
+    @classmethod
+    def _kalman_demand_factor(cls, expected_demand: float) -> float:
+        """F3: continuous, monotone demand-normalization factor.
+
+        Old curve: ed < 0.05 -> 1.0; else clamp(ed/0.5, 0.5, 2.0). That is
+        discontinuous at ed=0.05 (1.0 -> 0.5, i.e. reward x2.0) and
+        non-monotone around the guard. The replacement keeps the original
+        anchors — factor(~0)=1.0 (noise guard), factor(0.5)=1.0 (healthy
+        baseline demand is neutral), factor(>=1.0)=2.0 (ceiling) — and the
+        original normalization slope (ed/0.5) in the active region, dropping
+        only the sub-1.0 amplification dip that caused the cliff:
+
+            factor = clamp(ed / 0.5, 1.0, 2.0)
+        """
+        return max(
+            cls.KALMAN_DEMAND_FACTOR_MIN,
+            min(cls.KALMAN_DEMAND_FACTOR_MAX, expected_demand / 0.5),
+        )
 
     # Phase B.3 (2026-04-23): variance-gated undercut. When DTS posterior
     # variance is above this threshold the channel is still exploring;
@@ -5574,15 +5597,10 @@ class FeeController:
                 self.plugin.log(f"Kalman demand fallback: {e}", level='debug')
 
             # Scale expected demand into a bounded factor.
-            # P5: clamped to [0.5, 2.0] — see KALMAN_DEMAND_FACTOR_* for why
-            # this divisor must stay subordinate to the PID multiplier.
-            if expected_demand < 0.05:
-                demand_factor = 1.0  # Too low, avoid amplifying noise
-            else:
-                demand_factor = max(
-                    self.KALMAN_DEMAND_FACTOR_MIN,
-                    min(self.KALMAN_DEMAND_FACTOR_MAX, expected_demand / 0.5),
-                )
+            # F3: continuous monotone map (see _kalman_demand_factor) — the
+            # old ed<0.05 branch + 0.5 clamp created a 2x reward cliff at
+            # ed=0.05. P5: still clamped, subordinate to the PID multiplier.
+            demand_factor = self._kalman_demand_factor(expected_demand)
 
             adjusted_revenue_rate = current_revenue_rate / demand_factor
 

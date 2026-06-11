@@ -247,10 +247,12 @@ class TestKalmanDemandFactorClamp:
         # raw rate: 50_000 sats * 150ppm / 1e6 = 7.5 sats over ~2h = ~3.75/hr
         assert captured["revenue_rate"] == pytest.approx(3.75 / 2.0, rel=0.02)
 
-    def test_low_demand_multiplier_clamped_to_half(self, mock_plugin, mock_database):
-        """expected_demand=0.1 used to divide by 0.25 (4x boost); now 0.5 (2x)."""
+    def test_low_demand_no_longer_amplifies(self, mock_plugin, mock_database):
+        """F3: expected_demand=0.1 used to hit the 0.5 clamp (2x reward
+        boost, a cliff right at ed=0.05). The continuous curve keeps the
+        factor at 1.0 for all below-baseline demand."""
         captured = self._captured_observation(mock_plugin, mock_database, kalman_flow_ratio=0.1)
-        assert captured["revenue_rate"] == pytest.approx(3.75 / 0.5, rel=0.02)
+        assert captured["revenue_rate"] == pytest.approx(3.75, rel=0.02)
 
     def test_neutral_demand_unchanged(self, mock_plugin, mock_database):
         """Sub-noise demand keeps factor at 1.0."""
@@ -258,8 +260,55 @@ class TestKalmanDemandFactorClamp:
         assert captured["revenue_rate"] == pytest.approx(3.75, rel=0.02)
 
     def test_clamp_constants(self):
-        assert FeeController.KALMAN_DEMAND_FACTOR_MIN == 0.5
+        # F3: floor raised 0.5 -> 1.0; demand normalization may discount but
+        # never amplify a revenue observation.
+        assert FeeController.KALMAN_DEMAND_FACTOR_MIN == 1.0
         assert FeeController.KALMAN_DEMAND_FACTOR_MAX == 2.0
+
+
+# =============================================================================
+# F3 (2026-06 audit): demand divisor must be continuous and monotone
+# =============================================================================
+
+class TestKalmanDemandFactorContinuity:
+    """The old curve jumped factor 1.0 -> 0.5 at ed=0.05 (a 2x reward cliff
+    exactly where most channels live: ed 0.05-0.10)."""
+
+    def test_no_cliff_at_0_05(self):
+        below = FeeController._kalman_demand_factor(0.049)
+        above = FeeController._kalman_demand_factor(0.051)
+        assert below == pytest.approx(above, rel=0.01)
+        assert above == pytest.approx(1.0)
+
+    def test_sweep_continuous_and_monotone(self):
+        """Sweep ed in [0, 0.6] at 0.001 resolution: no step >10% between
+        adjacent values, and monotone non-decreasing."""
+        eds = [i / 1000.0 for i in range(0, 601)]
+        factors = [FeeController._kalman_demand_factor(ed) for ed in eds]
+        for i in range(1, len(factors)):
+            step = abs(factors[i] - factors[i - 1]) / factors[i - 1]
+            assert step <= 0.10, (
+                f"step {step:.3f} at ed={eds[i]:.3f} "
+                f"({factors[i-1]:.3f} -> {factors[i]:.3f})"
+            )
+            assert factors[i] >= factors[i - 1], (
+                f"non-monotone at ed={eds[i]:.3f}"
+            )
+
+    def test_preserves_real_curve_anchors(self):
+        """Anchors of the original curve: 1.0 at negligible demand, 1.0 at
+        the healthy baseline (ed=0.5), 2.0 ceiling at ed>=1.0."""
+        assert FeeController._kalman_demand_factor(0.0) == pytest.approx(1.0)
+        assert FeeController._kalman_demand_factor(0.01) == pytest.approx(1.0)
+        assert FeeController._kalman_demand_factor(0.5) == pytest.approx(1.0)
+        assert FeeController._kalman_demand_factor(0.75) == pytest.approx(1.5)
+        assert FeeController._kalman_demand_factor(1.0) == pytest.approx(2.0)
+        assert FeeController._kalman_demand_factor(8.0) == pytest.approx(2.0)
+
+    def test_factor_never_amplifies_reward(self):
+        """Factor >= 1.0 everywhere: revenue / factor <= revenue."""
+        for i in range(0, 2001):
+            assert FeeController._kalman_demand_factor(i / 1000.0) >= 1.0
 
 
 # =============================================================================
