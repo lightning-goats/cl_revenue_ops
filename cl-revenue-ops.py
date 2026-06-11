@@ -6742,6 +6742,7 @@ def _filter_boltz_treasury_recommendations(
     deficit_sats: int,
     exclude_protected: bool = True,
     min_source_local_pct: Optional[float] = None,
+    min_amount_sats: int = 100_000,
 ) -> Dict[str, Any]:
     """Filter a balance plan down to treasury-appropriate reverse swaps."""
     recs = list(plan.get("recommendations", [])) if isinstance(plan, dict) else []
@@ -6781,9 +6782,23 @@ def _filter_boltz_treasury_recommendations(
             continue
         amt = int(rec.get("amount_sats", 0) or 0)
         if remaining_target > 0 and amt > remaining_target:
+            # F10: enforce the target cap at plan time. The annotation alone
+            # was never honored by the executor, which swapped the full
+            # amount and overshot the treasury target.
+            if remaining_target < int(min_amount_sats):
+                skipped.append({
+                    "channel_id": rec.get("channel_id"),
+                    "peer_id": rec.get("peer_id"),
+                    "reason": "remaining_target_below_min_amount",
+                    "remaining_target_sats": int(remaining_target),
+                    "min_amount_sats": int(min_amount_sats),
+                })
+                continue
             rec = dict(rec)
+            rec["amount_sats"] = int(remaining_target)
             rec["treasury_target_cap_sats"] = int(remaining_target)
             rec["treasury_amount_exceeds_deficit"] = True
+            rec["treasury_amount_clamped"] = True
         filtered.append(rec)
     out = dict(plan)
     out["recommendations"] = filtered
@@ -6866,6 +6881,7 @@ def _build_boltz_expansion_treasury_plan(
         deficit_sats=deficit,
         exclude_protected=bool(exclude_protected),
         min_source_local_pct=float(min_source_local_pct),
+        min_amount_sats=int(min_amount_sats),
     )
     filtered["treasury"] = treasury
     filtered["status"] = "ok"
