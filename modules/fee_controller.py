@@ -2366,6 +2366,12 @@ class FeeController:
         # immediately.
         self._cycle_batch_active: bool = False
         self._pending_fee_strategy_rows: Dict[str, Dict[str, Any]] = {}
+
+        # PERF: per-cycle per-peer memo for get_peer_latency_stats (the
+        # query scans all 24h forward rows; ~0.8ms on busy peers). Parallel
+        # channels to one peer pay once per cycle. Cleared at cycle start;
+        # out-of-cycle floor calculations bypass it entirely.
+        self._cycle_peer_latency_memo: Dict[str, Dict[str, Any]] = {}
         try:
             self._our_node_id: str = self.data_service.get_node_id() if self.data_service else self.plugin.rpc.getinfo().get("id", "")
         except Exception:
@@ -4421,6 +4427,7 @@ class FeeController:
         # mid-cycle crash is acceptable.
         self._cycle_batch_active = True
         self._pending_fee_strategy_rows.clear()
+        self._cycle_peer_latency_memo.clear()
         try:
             self._adjust_all_fees_channel_loop(
                 channel_states=channel_states,
@@ -7390,7 +7397,17 @@ class FeeController:
         
         # 3. HTLC Hold Risk Premium (Stall Defense)
         if peer_id:
-            latency = self.database.get_peer_latency_stats(peer_id, window_seconds=86400)
+            # PERF: during a fee cycle, parallel channels to the same peer
+            # share one latency query (memo cleared at cycle start).
+            if self._cycle_batch_active:
+                latency = self._cycle_peer_latency_memo.get(peer_id)
+                if latency is None:
+                    latency = self.database.get_peer_latency_stats(
+                        peer_id, window_seconds=86400
+                    )
+                    self._cycle_peer_latency_memo[peer_id] = latency
+            else:
+                latency = self.database.get_peer_latency_stats(peer_id, window_seconds=86400)
             avg_res = latency.get('avg', 0)
             std_res = latency.get('std', 0)
             

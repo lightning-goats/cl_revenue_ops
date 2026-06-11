@@ -733,6 +733,96 @@ class TestSingleSerializationPerChannel:
         json.loads(kwargs["v2_state_json"])
 
 
+class TestPeerLatencyMemo:
+    """Item: per-cycle per-peer latency memo.
+
+    _calculate_floor fetches all 24h forward rows per CHANNEL per cycle
+    (~0.8ms on busy peers). Parallel channels to the same peer should pay
+    once per cycle; the memo is cleared at cycle start so data never goes
+    stale across cycles, and out-of-cycle calls keep querying directly.
+    """
+
+    def _make_fc_two_channels_one_peer(self, mock_plugin, mock_database):
+        fc, cfg = _make_cycle_fc(mock_plugin, mock_database)
+        shared_peer = PEER_IDS[0]
+        now = int(time.time())
+        mock_database.get_all_channel_states.return_value = [
+            {
+                "channel_id": cid,
+                "peer_id": shared_peer,
+                "state": "balanced",
+                "flow_ratio": 0.5,
+                "sats_in": 100_000,
+                "sats_out": 100_000,
+                "capacity": 2_000_000,
+                "updated_at": now,
+                "kalman_flow_ratio": 0.3,
+                "kalman_velocity": 0.01,
+            }
+            for cid in CHANNEL_IDS[:2]
+        ]
+        channels_info = {
+            cid: {
+                "channel_id": cid,
+                "short_channel_id": cid,
+                "peer_id": shared_peer,
+                "capacity": 2_000_000,
+                "spendable_msat": 1_000_000_000,
+                "receivable_msat": 1_000_000_000,
+                "fee_base_msat": 0,
+                "fee_proportional_millionths": 150,
+                "htlc_minimum_msat": 0,
+                "htlc_min_msat": 0,
+                "htlc_maximum_msat": 0,
+                "htlc_max_msat": 0,
+                "opener": "local",
+            }
+            for cid in CHANNEL_IDS[:2]
+        }
+        fc._get_channels_info = lambda: channels_info
+        return fc
+
+    def test_latency_queried_once_per_peer_per_cycle(
+        self, mock_plugin, mock_database
+    ):
+        fc = self._make_fc_two_channels_one_peer(mock_plugin, mock_database)
+
+        fc.adjust_all_fees()
+
+        assert mock_database.get_peer_latency_stats.call_count == 1, \
+            (f"2 channels to one peer must share a single latency query, got "
+             f"{mock_database.get_peer_latency_stats.call_count}")
+
+    def test_memo_cleared_between_cycles(self, mock_plugin, mock_database):
+        fc = self._make_fc_two_channels_one_peer(mock_plugin, mock_database)
+
+        fc.adjust_all_fees()
+        mock_database.get_peer_latency_stats.reset_mock()
+        # Make both channels eligible again next cycle
+        now = int(time.time())
+        for cid in CHANNEL_IDS[:2]:
+            if cid in fc._cycle_states:
+                fc._cycle_states[cid].last_update = now - 7200
+            if cid in fc._channel_fee_states:
+                fc._channel_fee_states[cid].last_update = now - 7200
+
+        fc.adjust_all_fees()
+
+        assert mock_database.get_peer_latency_stats.call_count == 1, \
+            "Memo must be refreshed (and used) again on the next cycle"
+
+    def test_out_of_cycle_floor_query_not_memoized(
+        self, mock_plugin, mock_database
+    ):
+        fc = self._make_fc_two_channels_one_peer(mock_plugin, mock_database)
+
+        fc._calculate_floor(2_000_000, peer_id=PEER_IDS[0])
+        fc._calculate_floor(2_000_000, peer_id=PEER_IDS[0])
+
+        assert mock_database.get_peer_latency_stats.call_count == 2, \
+            "Out-of-cycle floor calculations must keep querying directly"
+
+
 class TestProfitabilityWarmup:
 
     def test_warmup_runs_before_lock_acquisition(self, mock_plugin, mock_database):
