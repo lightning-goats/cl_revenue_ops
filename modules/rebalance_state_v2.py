@@ -22,6 +22,9 @@ class ChannelInput:
     capacity_sats: int
     local_sats: int
     actual_inbound_fee_ppm: int = 0
+    # Our OWN outbound fee on this channel (ppm). Anchors the sats-EV
+    # rebalance gate: it is what the channel earns per routed sat.
+    local_out_fee_ppm: int = 0
     is_hive_member: bool = False
     is_profitable: bool = False
     is_active: bool = False
@@ -56,6 +59,8 @@ class ChannelState:
     source_drain_score: float = 0.0
     budget_source: str = "none"
     rebalance_bias: float = 1.0
+    # Our OWN outbound fee on this channel (ppm) — sats-EV gate input.
+    local_out_fee_ppm: int = 0
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,7 @@ def _normalize_channel_input(value: Any) -> ChannelInput:
             actual_inbound_fee_ppm=_as_int(
                 value.get("actual_inbound_fee_ppm", value.get("peer_inbound_fee_ppm", 0))
             ),
+            local_out_fee_ppm=_as_int(value.get("local_out_fee_ppm", 0)),
             is_hive_member=_as_bool(value.get("is_hive_member", False)),
             is_profitable=_as_bool(value.get("is_profitable", False)),
             is_active=_as_bool(value.get("is_active", False)),
@@ -294,6 +300,7 @@ def build_state_snapshot(
                 capacity_sats=capacity_sats,
                 local_ratio=round(local_ratio, 6),
                 actual_inbound_fee_ppm=max(0, _as_int(channel.actual_inbound_fee_ppm)),
+                local_out_fee_ppm=max(0, _as_int(channel.local_out_fee_ppm)),
                 value_class=value_class,
                 is_valuable=is_valuable,
                 remaining_budget_sats=remaining_budget_sats,

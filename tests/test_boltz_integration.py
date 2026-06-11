@@ -33,6 +33,31 @@ def _load_boltz_plugin_module():
     return mod
 
 
+def _executable_rec(channel_id="100x1x0"):
+    """A treasury rec the treasury executor will actually run."""
+    return {
+        "channel_id": channel_id,
+        "economics": {"passes_profit_guard": True, "structural": False},
+    }
+
+
+def _structural_rec(channel_id="100x1x0"):
+    """A rec that only passes the profit guard via the structural credit —
+    the treasury executor skips these (structural_credit_requires_balance_cycle)."""
+    return {
+        "channel_id": channel_id,
+        "economics": {"passes_profit_guard": True, "structural": True},
+    }
+
+
+def _guard_failed_rec(channel_id="100x1x0"):
+    """A rec the treasury executor skips (profit_guard_failed)."""
+    return {
+        "channel_id": channel_id,
+        "economics": {"passes_profit_guard": False, "structural": False},
+    }
+
+
 class TestBoltzAutoCycleModeSelection:
     def test_prefers_treasury_when_reserve_below_target(self):
         mod = _load_boltz_plugin_module()
@@ -40,7 +65,7 @@ class TestBoltzAutoCycleModeSelection:
         selection = mod._select_boltz_auto_cycle_mode(
             treasury_plan={
                 "status": "ok",
-                "recommendations": [{"channel_id": "100x1x0"}],
+                "recommendations": [_executable_rec()],
                 "treasury": {"deficit_sats": 700000, "min_deficit_sats": 250000},
             },
             balance_plan={
@@ -53,6 +78,43 @@ class TestBoltzAutoCycleModeSelection:
         assert selection["reserve_deficit_sats"] == 700000
         assert selection["treasury_candidate_count"] == 1
         assert selection["balance_candidate_count"] == 1
+
+    def test_treasury_not_selected_when_only_structural_recs(self):
+        """F1 deadlock: structural-credit-dependent recs are skipped by the
+        treasury executor, so they must not count toward treasury selection —
+        otherwise treasury 'wins', executes 0, and the balance cycle (where
+        the structural envelope lives) never runs."""
+        mod = _load_boltz_plugin_module()
+
+        selection = mod._select_boltz_auto_cycle_mode(
+            treasury_plan={
+                "status": "ok",
+                "recommendations": [_structural_rec(), _guard_failed_rec("101x1x0")],
+                "treasury": {"deficit_sats": 700000, "min_deficit_sats": 250000},
+            },
+            balance_plan={
+                "recommendations": [{"channel_id": "200x1x0"}],
+            },
+        )
+
+        assert selection["mode"] == "balance"
+        assert selection["treasury_executable_count"] == 0
+
+    def test_treasury_selected_when_mixed_recs_include_executable(self):
+        mod = _load_boltz_plugin_module()
+
+        selection = mod._select_boltz_auto_cycle_mode(
+            treasury_plan={
+                "status": "ok",
+                "recommendations": [_structural_rec(), _executable_rec("101x1x0")],
+                "treasury": {"deficit_sats": 700000, "min_deficit_sats": 250000},
+            },
+            balance_plan={"recommendations": []},
+        )
+
+        assert selection["mode"] == "treasury"
+        assert selection["treasury_executable_count"] == 1
+        assert selection["treasury_candidate_count"] == 2
 
     def test_falls_back_to_balance_when_treasury_is_at_target(self):
         mod = _load_boltz_plugin_module()
@@ -113,7 +175,7 @@ class TestBoltzAutoCycleScheduler:
         mod = self._make_module()
         mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
             "status": "ok",
-            "recommendations": [{"channel_id": "100x1x0"}],
+            "recommendations": [_executable_rec()],
             "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
         })
         mod._build_boltz_balance_plan = MagicMock()
@@ -222,7 +284,7 @@ class TestBoltzAutoCycleScheduler:
         )
         mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
             "status": "ok",
-            "recommendations": [{"channel_id": "100x1x0"}],
+            "recommendations": [_executable_rec()],
             "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
         })
         mod._build_boltz_balance_plan = MagicMock()
@@ -238,6 +300,123 @@ class TestBoltzAutoCycleScheduler:
         kwargs = mod.revenue_boltz_expansion_treasury_cycle.call_args.kwargs
         assert kwargs["max_actions"] == 3
         mod.revenue_boltz_balance_cycle.assert_not_called()
+
+    def test_structural_only_treasury_recs_run_balance_cycle(self):
+        """F1 end-to-end: a node with a treasury deficit but only
+        structural-credit-dependent loop-outs must run the BALANCE cycle
+        (and execute within the structural envelope) instead of deadlocking
+        in treasury mode with executed_count == 0."""
+        mod = self._make_module()
+        # Structural envelope config used by the real balance executor.
+        mod.config.boltz_structural_budget_sats_per_day = 1000
+        mod.database = MagicMock()
+        mod.database.get_category_spend_sats.return_value = 0
+        mod.hive_router = None
+        bm = MagicMock()
+        bm.loop_out.return_value = {"status": "accepted"}
+        mod._require_boltz_manager = MagicMock(return_value=bm)
+
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "status": "ok",
+            "recommendations": [_structural_rec()],
+            "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
+        })
+        balance_plan = {
+            "generated_at": 1,
+            "pending_swap_count": 0,
+            "budget": {"remaining_24h_sats_estimate": 100_000},
+            "recommendations": [
+                {
+                    "channel_id": "100x1x0",
+                    "peer_id": "02" + "b" * 64,
+                    "direction": "loop_out",
+                    "amount_sats": 200_000,
+                    "economics": {
+                        "passes_profit_guard": True,
+                        "estimated_swap_fee_sats": 100,
+                        "structural_uplift_sats": 500,
+                        "structural": True,
+                    },
+                }
+            ],
+            "total_candidates": 1,
+            "skipped_count": 0,
+            "skipped_examples": [],
+        }
+        mod._build_boltz_balance_plan = MagicMock(return_value=balance_plan)
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock()
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        # Treasury never ran; the balance cycle executed the structural swap.
+        mod.revenue_boltz_expansion_treasury_cycle.assert_not_called()
+        assert result["mode"] == "balance"
+        assert result["status"] == "executed"
+        assert result["executed_count"] == 1
+        bm.loop_out.assert_called_once()
+        assert bm.loop_out.call_args.kwargs["structural"] is True
+
+    def test_treasury_zero_executed_falls_through_to_balance(self):
+        """F1 fall-through: treasury is selected (executable recs exist) but
+        executes nothing (cooldown/budget skips) — the auto-cycle must fall
+        through to the balance cycle within the same run."""
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "status": "ok",
+            "recommendations": [_executable_rec()],
+            "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
+        })
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 0,
+            "skipped_count": 1,
+        })
+        balance_plan = {
+            "pending_swap_count": 0,
+            "budget": {"remaining_24h_sats_estimate": 100_000},
+            "recommendations": [{"channel_id": "200x1x0"}],
+        }
+        mod._build_boltz_balance_plan = MagicMock(return_value=balance_plan)
+        mod._execute_boltz_balance_cycle = MagicMock(return_value={
+            "status": "executed",
+            "executed_count": 1,
+        })
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        mod.revenue_boltz_expansion_treasury_cycle.assert_called_once()
+        mod._execute_boltz_balance_cycle.assert_called_once()
+        assert (
+            mod._execute_boltz_balance_cycle.call_args.kwargs["precomputed_plan"]
+            is balance_plan
+        )
+        assert result["mode"] == "balance"
+        assert result["selection_reason"] == "treasury_executed_zero_fallback_to_balance"
+        assert result["executed_count"] == 1
+
+    def test_treasury_blocked_does_not_fall_through(self):
+        """Pending swaps block treasury AND balance alike — falling through
+        would just build a plan that immediately blocks again."""
+        mod = self._make_module()
+        mod._build_boltz_expansion_treasury_plan = MagicMock(return_value={
+            "status": "ok",
+            "recommendations": [_executable_rec()],
+            "treasury": {"deficit_sats": 900000, "min_deficit_sats": 250000},
+        })
+        mod.revenue_boltz_expansion_treasury_cycle = MagicMock(return_value={
+            "status": "blocked",
+            "reason": "1 pending Boltz swap(s) detected",
+            "executed_count": 0,
+        })
+        mod._build_boltz_balance_plan = MagicMock()
+        mod._execute_boltz_balance_cycle = MagicMock()
+
+        result = mod._run_boltz_auto_cycle_once(trigger="scheduler")
+
+        assert result["status"] == "blocked"
+        assert result["mode"] == "treasury"
+        mod._build_boltz_balance_plan.assert_not_called()
+        mod._execute_boltz_balance_cycle.assert_not_called()
 
 
 class TestBoltzAutoCycleStatus:

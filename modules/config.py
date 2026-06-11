@@ -253,6 +253,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_max_amount': (10000, 100000000),
     'flow_window_days': (1, 365),
     # AUDIT FIX C-2/I-4: Missing range validation for float/int fields
+    # F1: full ±1.0 range still allowed, but defaults are ±0.05 — values
+    # beyond ~±0.2 are effectively dead for typical daily turnover.
     'source_threshold': (-1.0, 1.0),
     'sink_threshold': (-1.0, 1.0),
     'expansion_treasury_min_source_local_pct': (0.0, 100.0),
@@ -362,9 +364,14 @@ class Config:
     target_flow: int = 100000      # Target sats routed per day per channel
     flow_window_days: int = 7      # Days to analyze for flow calculation
     
-    # Flow ratio thresholds for classification
-    source_threshold: float = 0.5   # FlowRatio > 0.5 = Source (draining)
-    sink_threshold: float = -0.5    # FlowRatio < -0.5 = Sink (filling)
+    # Flow ratio thresholds for classification (net daily flow / capacity).
+    # F1 (2026-06 audit): the old ±0.5 defaults required HALF the channel
+    # capacity to net-flow per day before firing; typical channels run
+    # 0.01-0.10, so the thresholds were dead and classification always fell
+    # through to the instantaneous balance position. ±0.05 lets the Kalman
+    # flow estimate classify first.
+    source_threshold: float = 0.05   # FlowRatio > +0.05/day = Source (draining)
+    sink_threshold: float = -0.05    # FlowRatio < -0.05/day = Sink (filling)
     
     # Fee parameters
     min_fee_ppm: int = 10          # Floor fee in PPM (matches plugin option default)

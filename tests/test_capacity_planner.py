@@ -4644,3 +4644,166 @@ def test_metabolic_open_bias_cannot_bypass_planner_disabled_gate():
 
     assert result == {"skipped": True, "reason": "planner disabled"}
     plugin.rpc.call.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# F1 (audit CRITICAL): Open-EV revenue forecast anchored to observed node data
+# ---------------------------------------------------------------------------
+
+class TestOpenEVAnchoredForecast:
+    """The open-EV forecast must derive from the node's realized
+    revenue-per-capacity, not the legacy 45 ppm/day constant.
+
+    Audit: daily_revenue = size * 0.3 * 150 / 1e6 is 45 ppm of capacity per
+    DAY (16,425 ppm/year gross) — 10-50x reality. It approved nearly every
+    open at max size; sizing was decided by the constant.
+    """
+
+    @staticmethod
+    def _prof(capacity_sats, annual_ppm, days_open=365):
+        """A channel realizing `annual_ppm` of its capacity per year."""
+        prof = MagicMock()
+        prof.capacity_sats = capacity_sats
+        prof.days_open = days_open
+        fees_sats_total = capacity_sats * annual_ppm / 1_000_000 * (days_open / 365.0)
+        prof.revenue.fees_earned_msat = int(fees_sats_total * 1000)
+        return prof
+
+    def _make_planner(self, channel_annual_ppms, feerate_perkb=2000,
+                      capacity_sats=5_000_000):
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        plugin.rpc.feerates.return_value = {"perkb": {"opening": feerate_perkb}}
+        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = None
+        prof_analyzer.database.get_historical_inbound_fee_ppm.return_value = None
+        prof_analyzer.analyze_all_channels.return_value = {
+            f"{100 + i}x1x0": self._prof(capacity_sats, ppm)
+            for i, ppm in enumerate(channel_annual_ppms)
+        }
+        return CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
+
+    @staticmethod
+    def _make_cfg():
+        cfg = MagicMock()
+        cfg.planner_min_channel_sats = 500000
+        cfg.planner_max_channel_sats = 10000000
+        cfg.min_wallet_reserve = 1000000
+        cfg.planner_min_annual_roi_pct = 1.0
+        return cfg
+
+    def test_audit_case_300ppm_node_1m_open_is_negative_ev(self):
+        """A node realizing ~300 ppm/year must NOT approve a 1M open at
+        realistic on-chain costs (audit: true EV ~= -5,400 vs old +1,678)."""
+        planner = self._make_planner([300.0, 300.0, 300.0], feerate_perkb=2000)
+        cfg = self._make_cfg()
+
+        ev = planner._calculate_open_ev("02" + "ee" * 32, 1_000_000, cfg)
+
+        # anchor: 300/365 ppm/day, discounted x0.5 => ~0.411 ppm/day
+        # revenue: 1M * 0.411e-6 * 180d ~= 74 sats
+        # on-chain at 2 sat/vB: 280 + 400 = 680; hurdle 1M*1%*180/365 ~= 4932
+        assert ev < 0
+        assert -8000 < ev < -4000
+
+    def test_high_earning_node_stays_positive(self):
+        """A genuinely high-earning node keeps positive EV for new opens."""
+        # 16,425 ppm/year == the legacy 45 ppm/day assumption made real
+        planner = self._make_planner([16425.0, 16425.0, 16425.0], feerate_perkb=1000)
+        cfg = self._make_cfg()
+
+        ev = planner._calculate_open_ev("02" + "ee" * 32, 5_000_000, cfg)
+
+        assert ev > 0
+
+    def test_forecast_clamped_to_legacy_ceiling(self):
+        """The observed anchor can never exceed the old 45 ppm/day constant."""
+        from modules.capacity_planner import LEGACY_FORECAST_DAILY_PPM_CEILING
+        # absurd realized rate: 365,000 ppm/year = 1000 ppm/day; x0.5 = 500 > 45
+        planner = self._make_planner([365_000.0] * 3, feerate_perkb=1000)
+        cfg = self._make_cfg()
+
+        ev = planner._calculate_open_ev("02" + "ee" * 32, 5_000_000, cfg)
+
+        daily_revenue = 5_000_000 * LEGACY_FORECAST_DAILY_PPM_CEILING / 1_000_000
+        hurdle = 5_000_000 * 0.01 * (180 / 365)
+        expected = (daily_revenue * 180) - (daily_revenue * 0.1 * 180) - 340 - hurdle
+        assert ev == pytest.approx(expected, abs=2.0)
+
+    def test_ev_uses_anchored_rate_not_constant(self):
+        """EV must scale with the observed anchor (sizing no longer decided
+        by the constant): a weak node's EV per sat is below a strong node's."""
+        from modules.capacity_planner import NEW_PEER_DISCOUNT
+        weak = self._make_planner([300.0] * 3, feerate_perkb=1000)
+        strong = self._make_planner([7300.0] * 3, feerate_perkb=1000)
+        cfg = self._make_cfg()
+
+        ev_weak = weak._calculate_open_ev("02" + "ee" * 32, 2_000_000, cfg)
+        ev_strong = strong._calculate_open_ev("02" + "ee" * 32, 2_000_000, cfg)
+        assert ev_strong > ev_weak
+
+        # Exact anchored forecast: median 7300 ppm/yr = 20 ppm/day, x0.5 = 10
+        daily_revenue = 2_000_000 * (7300 / 365.0) * NEW_PEER_DISCOUNT / 1_000_000
+        hurdle = 2_000_000 * 0.01 * (180 / 365)
+        expected = (daily_revenue * 180) - (daily_revenue * 0.1 * 180) - 340 - hurdle
+        assert ev_strong == pytest.approx(expected, abs=2.0)
+
+    def test_median_is_robust_to_one_outlier_channel(self):
+        """One windfall channel must not set the whole node's forecast."""
+        from modules.capacity_planner import NEW_PEER_DISCOUNT
+        planner = self._make_planner([300.0, 365.0, 365_000.0], feerate_perkb=1000)
+        cfg = self._make_cfg()
+
+        ev = planner._calculate_open_ev("02" + "ee" * 32, 2_000_000, cfg)
+
+        daily_revenue = 2_000_000 * (365.0 / 365.0) * NEW_PEER_DISCOUNT / 1_000_000
+        hurdle = 2_000_000 * 0.01 * (180 / 365)
+        expected = (daily_revenue * 180) - (daily_revenue * 0.1 * 180) - 340 - hurdle
+        assert ev == pytest.approx(expected, abs=2.0)
+
+    def test_no_observed_data_falls_back_to_legacy_ceiling(self):
+        """Bootstrap: a node with no routing history uses the legacy rate."""
+        planner = self._make_planner([], feerate_perkb=1000)
+        cfg = self._make_cfg()
+
+        ev = planner._calculate_open_ev("02" + "ee" * 32, 5_000_000, cfg)
+
+        # Legacy fallback: 5M * 45e-6 = 225 sats/day (back-compat bootstrap)
+        daily_revenue = 225.0
+        hurdle = 5_000_000 * 0.01 * (180 / 365)
+        expected = (daily_revenue * 180) - (daily_revenue * 0.1 * 180) - 340 - hurdle
+        assert ev == pytest.approx(expected, abs=2.0)
+
+    def test_rebalance_branch_shares_revenue_volume_model(self):
+        """The rebalance-cost branch must use the SAME volume model as the
+        revenue side (audit: it assumed 30% turnover regardless of forecast)."""
+        from modules.capacity_planner import ASSUMED_AVG_FEE_PPM, NEW_PEER_DISCOUNT
+        planner = self._make_planner([730.0] * 3, feerate_perkb=1000)
+        planner.profitability.database.get_historical_inbound_fee_ppm.return_value = {
+            "median_fee_ppm": 300,
+        }
+        cfg = self._make_cfg()
+
+        ev = planner._calculate_open_ev("02" + "ee" * 32, 2_000_000, cfg)
+
+        # anchor: 730/365 = 2 ppm/day, x0.5 = 1 ppm/day => 2 sats/day on 2M
+        daily_revenue = 2_000_000 * 1.0 / 1_000_000
+        daily_volume = daily_revenue * 1_000_000 / ASSUMED_AVG_FEE_PPM
+        rebal_per_day = daily_volume * 300 / 1_000_000
+        hurdle = 2_000_000 * 0.01 * (180 / 365)
+        expected = (daily_revenue * 180) - (rebal_per_day * 180) - 340 - hurdle
+        assert ev == pytest.approx(expected, abs=2.0)
+
+    def test_cycle_seeds_anchor_from_in_hand_profitability(self):
+        """execute_cycle must reuse the profitability objects it already
+        fetched rather than re-deriving the anchor per candidate."""
+        planner = self._make_planner([300.0] * 3)
+        all_prof = planner.profitability.analyze_all_channels()
+        planner._seed_revenue_anchor(all_prof)
+        planner.profitability.analyze_all_channels.side_effect = AssertionError(
+            "anchor must come from the seeded cycle data"
+        )
+        cfg = self._make_cfg()
+
+        ev = planner._calculate_open_ev("02" + "ee" * 32, 1_000_000, cfg)
+        assert ev < 0

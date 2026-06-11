@@ -308,6 +308,21 @@ class ChannelProfitability:
     marginal_profit_30d_sats: int = 0
     rebalance_cost_30d_sats: int = 0
     opener: str = "local"
+    # --- Windowed (30d) decision inputs (additive; audit F1/F2) ---
+    # Derived from the same prefetched 30d P&L as marginal_profit_30d_sats.
+    # Decision consumers (capex budgets, close-protection gates, planners)
+    # should read these instead of the lifetime aggregates above, which never
+    # decay: a channel that earned 50k sats years ago but 100 sats in the
+    # last 30 days must be budgeted/protected on the 100, not the 50k.
+    contribution_30d_msat: int = 0       # max(exit fees, sourced fees) in 30d
+    fees_earned_30d_msat: int = 0        # direct exit-fee revenue in 30d
+    sourced_fee_30d_msat: int = 0        # sourced fee contribution in 30d
+    forward_count_30d: int = 0           # forwards as exit channel in 30d
+    sourced_forward_count_30d: int = 0   # forwards as entry channel in 30d
+    # True when the 30d P&L window was actually fetched. Objects built
+    # without windowed data carry False so consumers can fall back to
+    # lifetime fields instead of mistaking "no data" for "earned nothing".
+    window_30d_available: bool = False
 
     @property
     def marginal_roi(self) -> float:
@@ -372,6 +387,56 @@ class ChannelProfitability:
         else:
             return ChannelRole.BALANCED
 
+    @property
+    def total_forward_count_30d(self) -> int:
+        """Total forwards in the trailing 30d window: exit + entry."""
+        return self.forward_count_30d + self.sourced_forward_count_30d
+
+    @property
+    def role_30d(self) -> 'ChannelRole':
+        """
+        Windowed (30d) flow-role classification (audit F2).
+
+        Same thresholds as channel_role (>=10 forwards, >70% directional)
+        but computed from the trailing-30d forward counts, so a channel
+        that sourced volume two years ago and nothing since decays to
+        DORMANT instead of staying a protected gateway forever.
+
+        NOTE for consumers (capacity planner close-protection gate): this
+        is the honest signal for "is this channel CURRENTLY a gateway".
+        Prefer role_30d + sourced_fee_30d_msat over channel_role +
+        sourced_fee_contribution_msat for close/keep decisions.
+
+        Falls back to the lifetime channel_role when no 30d window was
+        fetched (window_30d_available is False).
+        """
+        if not self.window_30d_available:
+            return self.channel_role
+
+        total_forwards = self.total_forward_count_30d
+        if total_forwards < 10:
+            return ChannelRole.DORMANT
+
+        inbound_ratio = self.sourced_forward_count_30d / total_forwards
+        outbound_ratio = self.forward_count_30d / total_forwards
+        if inbound_ratio > 0.70:
+            return ChannelRole.INBOUND_GATEWAY
+        elif outbound_ratio > 0.70:
+            return ChannelRole.OUTBOUND_GATEWAY
+        else:
+            return ChannelRole.BALANCED
+
+    @property
+    def marginal_roi_reliable(self) -> bool:
+        """
+        Whether marginal_roi rests on material evidence (audit F8).
+
+        With less than 100 sats of 30d rebalance spend, the marginal ROI
+        ratio swings wildly on a few sats of cost; consumers should treat
+        the metric as neutral (no boost, no penalty) when this is False.
+        """
+        return self.rebalance_cost_30d_sats >= 100
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "channel_id": self.channel_id,
@@ -392,6 +457,15 @@ class ChannelProfitability:
             "fee_per_sat_routed": round(self.fee_per_sat_routed, 6),
             "days_open": self.days_open,
             "last_routed": self.last_routed,
+            # Audit F1/F2/F8: windowed (30d) decision inputs
+            "contribution_30d_msat": self.contribution_30d_msat,
+            "fees_earned_30d_msat": self.fees_earned_30d_msat,
+            "sourced_fee_30d_msat": self.sourced_fee_30d_msat,
+            "forward_count_30d": self.forward_count_30d,
+            "sourced_forward_count_30d": self.sourced_forward_count_30d,
+            "window_30d_available": self.window_30d_available,
+            "role_30d": self.role_30d.value,
+            "marginal_roi_reliable": self.marginal_roi_reliable,
             # Issue #21: Inbound vs outbound revenue attribution
             "channel_role": self.channel_role.value,
             "inbound_flow": {
@@ -655,6 +729,14 @@ class ChannelProfitabilityAnalyzer:
                 "open_cost_msat": sats_to_base(p.costs.open_cost_sats),
                 "rebalance_cost_msat": sats_to_base(p.costs.rebalance_cost_sats),
                 "net_pnl_msat": p.revenue.total_contribution_msat - sats_to_base(p.costs.total_cost_sats),
+                # Audit F1/F2/F8: windowed (30d) decision inputs
+                "contribution_30d_msat": p.contribution_30d_msat,
+                "fees_earned_30d_msat": p.fees_earned_30d_msat,
+                "sourced_fee_30d_msat": p.sourced_fee_30d_msat,
+                "forward_count_30d": p.forward_count_30d,
+                "sourced_forward_count_30d": p.sourced_forward_count_30d,
+                "role_30d": p.role_30d.value,
+                "marginal_roi_reliable": p.marginal_roi_reliable,
             }
 
         payload = {
@@ -770,6 +852,12 @@ class ChannelProfitabilityAnalyzer:
                 contribution_30d_msat - rebalance_cost_30d_msat
             )
 
+            # Windowed decision inputs (audit F1/F2) — same prefetched dict
+            fees_earned_30d_msat = int(pnl_30d.get('direct_revenue_msat', 0) or 0)
+            sourced_fee_30d_msat = int(pnl_30d.get('sourced_fee_contribution_msat', 0) or 0)
+            forward_count_30d = int(pnl_30d.get('direct_forward_count', 0) or 0)
+            sourced_forward_count_30d = int(pnl_30d.get('sourced_forward_count', 0) or 0)
+
             # Classify
             classification = self._classify_channel(
                 roi, net_profit, last_routed, days_open,
@@ -794,7 +882,13 @@ class ChannelProfitabilityAnalyzer:
                 last_routed=last_routed,
                 marginal_profit_30d_sats=marginal_profit_30d,
                 rebalance_cost_30d_sats=rebalance_cost_30d,
-                opener=opener
+                opener=opener,
+                contribution_30d_msat=int(contribution_30d_msat or 0),
+                fees_earned_30d_msat=fees_earned_30d_msat,
+                sourced_fee_30d_msat=sourced_fee_30d_msat,
+                forward_count_30d=forward_count_30d,
+                sourced_forward_count_30d=sourced_forward_count_30d,
+                window_30d_available=True,
             )
             
             return profitability

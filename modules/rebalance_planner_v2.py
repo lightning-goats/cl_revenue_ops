@@ -343,6 +343,12 @@ class RebalancePlanner:
                     dest_value_class=dest.value_class,
                     source_budget_source=src.budget_source,
                     dest_budget_source=dest.budget_source,
+                    source_out_fee_ppm=max(
+                        0, int(getattr(src, "local_out_fee_ppm", 0) or 0)
+                    ),
+                    dest_out_fee_ppm=max(
+                        0, int(getattr(dest, "local_out_fee_ppm", 0) or 0)
+                    ),
                     hive_source_rebalance_bias=source_rebalance_bias,
                     hive_dest_rebalance_bias=dest_rebalance_bias,
                     hive_hint_score_multiplier=hint_multiplier,

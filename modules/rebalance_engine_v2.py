@@ -44,6 +44,21 @@ from .segment_observations import SegmentObservationStore
 from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
 from .utils import base_to_sats_ceil, parse_msat
 
+# ---------------------------------------------------------------------------
+# Sats-EV gate constants (audit F2).
+# ---------------------------------------------------------------------------
+# Expected fraction of refilled liquidity actually routed (and earning the
+# destination's outbound fee) within the evaluation horizon. We refill more
+# than we expect to route because liquidity also buys availability.
+EXPECTED_UTILIZATION = 0.5
+# The source was over-full: its marginal sat routes with lower probability
+# than the destination's marginal sat, so its forgone earnings are
+# discounted relative to the destination's expected earnings.
+SOURCE_UTILIZATION_DISCOUNT = 0.5
+# Each recent in-window failure of this pair charges this fraction of the
+# route cost as an expected-retry penalty.
+FAILURE_COST_RATE = 0.25
+
 
 @dataclass
 class CycleResult:
@@ -244,8 +259,38 @@ class RebalanceEngine:
         return (str(pair.source_channel_id), str(pair.dest_channel_id))
 
     def _failure_penalty(self, pair: PairCandidate) -> float:
-        fresh = self._prune_pair_failures(self._pair_key(pair))
-        return round(min(1.0, len(fresh) * 0.25), 6)
+        return round(min(1.0, self._failure_count(pair) * 0.25), 6)
+
+    def _failure_count(self, pair: PairCandidate) -> int:
+        return len(self._prune_pair_failures(self._pair_key(pair)))
+
+    def _empirical_dest_success_rate(self, dest_channel_id: str) -> Optional[float]:
+        """Best-effort empirical rebalance success rate for a destination.
+
+        Audit F6: when the router reports no probability we previously used a
+        flat 0.5. Blend in the channel's observed success rate when there is
+        enough history (>= 3 attempts in the DB window). Returns None when
+        unavailable so the caller keeps the prior.
+        """
+        if self.database is None or not dest_channel_id:
+            return None
+        getter = getattr(self.database, "get_channel_rebalance_success_rate", None)
+        if not callable(getter):
+            return None
+        try:
+            stats = getter(dest_channel_id)
+        except Exception:
+            return None
+        if not isinstance(stats, dict):
+            return None
+        try:
+            total = int(stats.get("total", 0) or 0)
+            rate = stats.get("success_rate")
+            if total < 3 or not isinstance(rate, (int, float)):
+                return None
+            return min(1.0, max(0.0, float(rate)))
+        except (TypeError, ValueError):
+            return None
 
     def _build_score_decomposition(
         self,
@@ -259,10 +304,23 @@ class RebalanceEngine:
     ) -> Dict[str, Any]:
         """Build an explicit, operator-visible score breakdown.
 
-        This is the first refactor step from the brief: expose the current
-        decision model clearly before replacing it with a stronger empirical EV
-        model. The values are normalized planner/debug units, not a final
-        sat-denominated economics model.
+        Audit F2: the decision GATE is sats-denominated. The pair's planner
+        score stays as the ORDERING signal (which candidate to try first),
+        but whether a priced pair beats do-nothing is decided in sats:
+
+            final_score_sats = p_success * expected_future_value_sats
+                               - expected_fee_sats
+                               - source_opportunity_sats
+                               - failure_penalty_sats
+
+        where expected_future_value_sats anchors to the destination's own
+        outbound fee (what the refilled liquidity earns when routed) and
+        source_opportunity_sats to the source's outbound fee (what the
+        drained liquidity forgoes, discounted because the source was
+        over-full). The legacy normalized keys are kept for compatibility;
+        the old fraction-of-excess-cleared "source_opportunity_cost" term
+        is removed (audit F5 — it penalized drain completeness, which has
+        no economic meaning).
         """
         cfg = self.config if not hasattr(self.config, "snapshot") else self.config.snapshot()
         high_threshold = float(getattr(cfg, "high_liquidity_threshold", 0.65) or 0.65)
@@ -278,21 +336,19 @@ class RebalanceEngine:
         if dest_capacity > 0:
             dest_post_ratio += amount_sats / max(1, dest_capacity)
 
-        source_excess_before = max(0.0, float(getattr(pair, "source_local_ratio", 0.0) or 0.0) - high_threshold)
-        source_excess_after = max(0.0, source_post_ratio - high_threshold)
-        source_opportunity_cost = 0.0
-        if source_excess_before > 0.0:
-            source_opportunity_cost = min(
-                0.25,
-                max(0.0, source_excess_before - source_excess_after) / source_excess_before * 0.25,
-            )
-
         if probability_ppm > 0:
             p_success = min(0.99, max(0.05, probability_ppm / 1_000_000.0))
         elif rejection_reason == "no_route":
             p_success = 0.05
         else:
+            # Audit F6: blend the 0.5 prior with the destination's empirical
+            # success rate when the router reported no probability.
             p_success = 0.5
+            empirical = self._empirical_dest_success_rate(
+                str(getattr(pair, "dest_channel_id", "") or "")
+            )
+            if empirical is not None:
+                p_success = min(0.95, max(0.05, 0.5 * (0.5 + empirical)))
 
         expected_fee_sats = int(route_cost_sats or 0)
         raw_budget_sats = int(getattr(pair, "pair_budget_sats", 0) or 0)
@@ -305,36 +361,90 @@ class RebalanceEngine:
         capital_risk_penalty = 0.0
         if effective_budget > 0 and expected_fee_sats > 0:
             expected_fee = min(1.0, expected_fee_sats / effective_budget)
-        if raw_budget_sats > 0 and expected_fee_sats > 0:
+        # Audit F3: at default config (capex_probability_budget_bonus == 0)
+        # the effective budget equals the raw budget, so expected_fee and
+        # capital_risk_penalty were the same number subtracted twice. Keep
+        # the capital-risk term only when a budget bonus actually widened
+        # (or a per-attempt cap narrowed) the effective envelope.
+        if (
+            raw_budget_sats > 0
+            and expected_fee_sats > 0
+            and effective_budget != raw_budget_sats
+        ):
             capital_risk_penalty = min(1.0, expected_fee_sats / raw_budget_sats)
 
+        failure_count = self._failure_count(pair)
         failure_penalty = self._failure_penalty(pair)
+
+        # --- Sats-EV gate terms (audit F2) ---
+        dest_out_fee_ppm = max(0, int(getattr(pair, "dest_out_fee_ppm", 0) or 0))
+        source_out_fee_ppm = max(0, int(getattr(pair, "source_out_fee_ppm", 0) or 0))
+        expected_future_value_sats = (
+            amount_sats * dest_out_fee_ppm / 1_000_000.0 * EXPECTED_UTILIZATION
+        )
+        source_opportunity_sats = (
+            amount_sats
+            * source_out_fee_ppm
+            / 1_000_000.0
+            * EXPECTED_UTILIZATION
+            * SOURCE_UTILIZATION_DISCOUNT
+        )
+        failure_penalty_sats = (
+            failure_count * expected_fee_sats * FAILURE_COST_RATE
+        )
+        final_score_sats = round(
+            p_success * expected_future_value_sats
+            - expected_fee_sats
+            - source_opportunity_sats
+            - failure_penalty_sats,
+            6,
+        )
+
+        # Legacy normalized score, kept for compatibility/diagnostics only
+        # (selection ordering uses pair.score; the gate uses the sats terms).
         expected_future_value = round(float(getattr(pair, "score", 0.0) or 0.0), 6)
         final_score = round(
             p_success * expected_future_value
             - expected_fee
-            - source_opportunity_cost
             - failure_penalty
             - capital_risk_penalty,
             6,
         )
-        beats_do_nothing = bool(not rejection_reason and final_score > 0.0)
+        # Zero-cost moves spend no capital and can never lose to do-nothing;
+        # this also preserves the zero-budget equalization invariant.
+        beats_do_nothing = bool(
+            not rejection_reason
+            and (expected_fee_sats <= 0 or final_score_sats > 0.0)
+        )
 
         return {
-            "model_version": "v2-bootstrap-explainability",
+            "model_version": "v2-sats-ev",
             "score_units": "planner_score_minus_budget_share",
+            "gate_units": "sats",
             "stage": route_status,
             "p_success": round(p_success, 6),
             "expected_future_value": expected_future_value,
             "expected_fee": round(expected_fee, 6),
-            "source_opportunity_cost": round(source_opportunity_cost, 6),
+            # Audit F5: fraction-based term removed; key kept for consumers.
+            "source_opportunity_cost": 0.0,
             "failure_penalty": round(failure_penalty, 6),
             "capital_risk_penalty": round(capital_risk_penalty, 6),
             "do_nothing_score": 0.0,
             "final_score": final_score,
+            # Sats-EV gate terms (audit F2).
+            "expected_future_value_sats": round(expected_future_value_sats, 6),
+            "expected_fee_sats": expected_fee_sats,
+            "source_opportunity_sats": round(source_opportunity_sats, 6),
+            "failure_penalty_sats": round(failure_penalty_sats, 6),
+            "final_score_sats": final_score_sats,
+            "expected_utilization": EXPECTED_UTILIZATION,
+            "source_utilization_discount": SOURCE_UTILIZATION_DISCOUNT,
             "beats_do_nothing": beats_do_nothing,
             "rejection_reason": rejection_reason,
             "inputs": {
+                "dest_out_fee_ppm": dest_out_fee_ppm,
+                "source_out_fee_ppm": source_out_fee_ppm,
+                "failure_count": failure_count,
                 "reason_code": str(getattr(pair, "reason_code", "") or ""),
                 "route_policy": getattr(
                     getattr(getattr(pair, "route_decision", None), "policy", None),
@@ -715,13 +825,20 @@ class RebalanceEngine:
                 local_msat = int(local_msat.rstrip("msat"))
             local_sats = local_msat // 1000
 
-            # Actual inbound fee from peer's remote updates
+            # Actual inbound fee from peer's remote updates, and our OWN
+            # outbound fee from the local updates (sats-EV gate input).
             inbound_fee_ppm = 0
+            local_out_fee_ppm = 0
             updates = ch.get("updates", {})
             if updates:
                 remote = updates.get("remote", {})
                 if remote:
                     inbound_fee_ppm = remote.get("fee_proportional_millionths", 0)
+                local_update = updates.get("local", {})
+                if local_update:
+                    local_out_fee_ppm = local_update.get(
+                        "fee_proportional_millionths", 0
+                    )
 
             # Hive membership check
             is_hive = False
@@ -785,6 +902,7 @@ class RebalanceEngine:
                 "capacity_sats": capacity_sats,
                 "local_sats": local_sats,
                 "actual_inbound_fee_ppm": inbound_fee_ppm,
+                "local_out_fee_ppm": local_out_fee_ppm,
                 "is_hive_member": is_hive,
                 "is_profitable": is_profitable,
                 "is_active": is_active,
@@ -938,6 +1056,12 @@ class RebalanceEngine:
                         dest_value_class=dest.value_class,
                         source_budget_source=source.budget_source,
                         dest_budget_source=dest.budget_source,
+                        source_out_fee_ppm=max(
+                            0, int(getattr(source, "local_out_fee_ppm", 0) or 0)
+                        ),
+                        dest_out_fee_ppm=max(
+                            0, int(getattr(dest, "local_out_fee_ppm", 0) or 0)
+                        ),
                         score=equalization_score,
                         source_local_ratio=source.local_ratio,
                         dest_local_ratio=dest.local_ratio,
@@ -1225,19 +1349,29 @@ class RebalanceEngine:
                                 route_status="priced",
                             )
                         if route_result.route_cost_sats <= effective_budget:
-                            # Phase 4.3: do_nothing hard gate. A priced pair
-                            # whose final_score does not clear the configured
-                            # hold margin is rejected with an explicit reason
-                            # rather than silently picked.
+                            # Phase 4.3 / audit F2: do_nothing hard gate, now
+                            # denominated in sats. A priced pair whose sats EV
+                            # does not clear the configured hold margin is
+                            # rejected with an explicit reason rather than
+                            # silently picked. Zero-cost routes bypass the
+                            # gate: they spend no capital, so they can never
+                            # lose to do-nothing (this preserves the
+                            # zero-budget equalization invariant).
                             hold_margin_raw = getattr(cfg, "rebalance_hold_margin", 0.0)
                             if isinstance(hold_margin_raw, (int, float)):
                                 hold_margin = float(hold_margin_raw)
                             else:
                                 hold_margin = 0.0
                             decomp = pair.score_decomposition or {}
-                            final_score_present = "final_score" in decomp
-                            final_score = float(decomp.get("final_score", 0.0) or 0.0)
-                            if final_score_present and final_score <= hold_margin:
+                            final_score_present = "final_score_sats" in decomp
+                            final_score = float(
+                                decomp.get("final_score_sats", 0.0) or 0.0
+                            )
+                            if (
+                                final_score_present
+                                and int(route_result.route_cost_sats or 0) > 0
+                                and final_score <= hold_margin
+                            ):
                                 self._update_pair_score_decomposition(
                                     pair,
                                     probability_ppm=int(getattr(route_result, "probability_ppm", 0) or 0),

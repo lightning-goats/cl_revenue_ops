@@ -241,6 +241,99 @@ class TestMarginalRoi30d:
 
 
 # ============================================================
+# Audit F1/F2: Windowed (30d) decision inputs on the prof object
+# ============================================================
+
+class TestWindowedDecisionInputs:
+    """analyze_channel must expose 30d windowed fields from the prefetched
+    P&L so decision consumers stop using lifetime aggregates."""
+
+    def _analyze_with_pnl(self, pnl_30d, revenue=None, last_routed_age=3600):
+        analyzer = _make_analyzer()
+        channel_info = {
+            "peer_id": "02" + "a" * 64,
+            "capacity": 2_000_000,
+            "funding_txid": "abc123",
+            "opener": "local",
+            "open_timestamp": int(time.time()) - 86400 * 400,
+        }
+        analyzer._get_channel_costs = MagicMock(return_value=_make_costs())
+        analyzer._get_channel_revenue = MagicMock(
+            return_value=revenue or _make_revenue())
+        analyzer._get_last_routing_time = MagicMock(
+            return_value=int(time.time()) - last_routed_age)
+        analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 0, "last_success_time": 0,
+        }
+        analyzer.database.get_channel_full_pnl.return_value = pnl_30d
+        return analyzer.analyze_channel("111x222x0", channel_info=channel_info)
+
+    def test_windowed_fields_default_to_zero_and_unavailable(self):
+        """Objects built without window data are marked unavailable."""
+        prof = _make_profitability()
+        assert prof.contribution_30d_msat == 0
+        assert prof.fees_earned_30d_msat == 0
+        assert prof.sourced_fee_30d_msat == 0
+        assert prof.forward_count_30d == 0
+        assert prof.sourced_forward_count_30d == 0
+        assert prof.window_30d_available is False
+
+    def test_analyze_channel_populates_windowed_fields(self):
+        result = self._analyze_with_pnl({
+            'total_contribution_msat': 800_000,
+            'total_contribution_sats': 800,
+            'rebalance_cost_sats': 300,
+            'direct_revenue_msat': 650_000,
+            'sourced_fee_contribution_msat': 800_000,
+            'direct_forward_count': 12,
+            'sourced_forward_count': 30,
+        })
+        assert result is not None
+        assert result.contribution_30d_msat == 800_000
+        assert result.fees_earned_30d_msat == 650_000
+        assert result.sourced_fee_30d_msat == 800_000
+        assert result.forward_count_30d == 12
+        assert result.sourced_forward_count_30d == 30
+        assert result.window_30d_available is True
+
+    def test_quiet_channel_windowed_fields_are_zero(self):
+        """A channel with big lifetime revenue but a dead 30d window exposes
+        zeros — the honest data for windowed decisions (audit F1/F2)."""
+        # Lifetime: 5000 sats sourced two years ago
+        revenue = _make_revenue(fees=0, sourced_fees=5000, sourced_forwards=200)
+        result = self._analyze_with_pnl({
+            'total_contribution_msat': 0,
+            'total_contribution_sats': 0,
+            'rebalance_cost_sats': 0,
+            'direct_revenue_msat': 0,
+            'sourced_fee_contribution_msat': 0,
+            'direct_forward_count': 0,
+            'sourced_forward_count': 0,
+        }, revenue=revenue, last_routed_age=86400 * 365)
+        assert result is not None
+        assert result.revenue.sourced_fee_contribution_msat == 5_000_000
+        assert result.sourced_fee_30d_msat == 0
+        assert result.contribution_30d_msat == 0
+        assert result.window_30d_available is True
+
+    def test_to_dict_includes_windowed_fields(self):
+        result = self._analyze_with_pnl({
+            'total_contribution_msat': 800_000,
+            'total_contribution_sats': 800,
+            'rebalance_cost_sats': 300,
+            'direct_revenue_msat': 650_000,
+            'sourced_fee_contribution_msat': 800_000,
+            'direct_forward_count': 12,
+            'sourced_forward_count': 30,
+        })
+        d = result.to_dict()
+        assert d["contribution_30d_msat"] == 800_000
+        assert d["sourced_fee_30d_msat"] == 800_000
+        assert d["fees_earned_30d_msat"] == 650_000
+        assert "role_30d" in d
+
+
+# ============================================================
 # Fix 4: Zombie False-Positive Guard
 # ============================================================
 

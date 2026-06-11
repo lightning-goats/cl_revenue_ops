@@ -172,6 +172,13 @@ def _make_mock_profitability(
     capacity_sats=5_000_000,      # Channel capacity stays in sats
     classification="break_even",
     marginal_roi=0.0,
+    contribution_30d_msat=None,   # default: mirror lifetime (steady earner)
+    fees_earned_30d_msat=None,    # default: mirror lifetime (steady earner)
+    sourced_fee_msat=0,
+    sourced_fee_30d_msat=0,
+    channel_role="balanced",
+    marginal_roi_reliable=True,
+    window_30d_available=True,
 ):
     """Create a mock ChannelProfitability object."""
     prof = MagicMock()
@@ -180,10 +187,23 @@ def _make_mock_profitability(
     prof.revenue.total_contribution_msat = contribution_msat
     prof.revenue.fees_earned_msat = fees_earned_msat
     prof.revenue.total_forward_count = total_forward_count
+    prof.revenue.sourced_fee_contribution_msat = sourced_fee_msat
     prof.days_open = days_open
     prof.capacity_sats = capacity_sats
     prof.classification.value = classification
     prof.marginal_roi = marginal_roi
+    prof.marginal_roi_reliable = marginal_roi_reliable
+    # Windowed (30d) decision inputs — default to lifetime values so legacy
+    # steady-state expectations hold (lifetime == trailing 30d run rate).
+    prof.contribution_30d_msat = (
+        contribution_msat if contribution_30d_msat is None else contribution_30d_msat
+    )
+    prof.fees_earned_30d_msat = (
+        fees_earned_msat if fees_earned_30d_msat is None else fees_earned_30d_msat
+    )
+    prof.sourced_fee_30d_msat = sourced_fee_30d_msat
+    prof.window_30d_available = window_30d_available
+    prof.channel_role.value = channel_role
     return prof
 
 
@@ -962,6 +982,147 @@ class TestFleetTier:
         assert budget.tier == "fleet"
         assert budget.budget_msat > 0
 
+class TestWindowedCapexFunding:
+    """Audit F1: budgets are funded by the trailing-30d run rate, not lifetime
+    contribution, killing the bleed→block→age-out→bleed oscillation."""
+
+    def test_decayed_channel_budget_collapses_to_run_rate(self):
+        """50k sats lifetime / ~100 sats per 30d: budget must be ~50 sats,
+        not 25,000 sats (lifetime x reinvestment_rate)."""
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=50_000_000_000,   # 50k sats lifetime
+                    fees_earned_msat=50_000_000_000,
+                    total_forward_count=5000,
+                    contribution_30d_msat=101_000,      # 101 sats in last 30d
+                    fees_earned_30d_msat=101_000,
+                    days_open=700,
+                ),
+            },
+        )
+        alloc = engine.compute_allocations()
+        b = alloc.channel_budgets["100x1x0"]
+        assert b.tier == "proven"
+        # 101_000 * 0.50 = 50_500 msat -> 51 sats (ceiling), NOT ~25_000 sats
+        assert b.budget_msat == 50_500
+        assert b.budget_sats <= 51
+
+    def test_decayed_channel_30d_spend_debits_30d_funding(self):
+        """30d spend is debited against 30d funding (same window)."""
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=50_000_000_000,
+                    fees_earned_msat=50_000_000_000,
+                    total_forward_count=5000,
+                    contribution_30d_msat=101_000,
+                    fees_earned_30d_msat=101_000,
+                    days_open=700,
+                ),
+            },
+            rebalance_cost_by_channel={"100x1x0": 51},  # already spent 51 sats
+        )
+        alloc = engine.compute_allocations()
+        b = alloc.channel_budgets["100x1x0"]
+        # 50_500 - 51_000 msat -> clamped to 0: no fresh bleed allowance
+        assert b.budget_msat == 0
+
+    def test_proven_tier_gate_is_windowed(self):
+        """Lifetime contribution > 100 sats no longer keeps a channel in the
+        proven tier when its 30d contribution decayed below the gate."""
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=50_000_000_000,
+                    fees_earned_msat=50_000_000_000,
+                    total_forward_count=5000,
+                    contribution_30d_msat=5_000,        # 5 sats in 30d
+                    fees_earned_30d_msat=5_000,
+                    days_open=700,
+                ),
+            },
+        )
+        alloc = engine.compute_allocations()
+        b = alloc.channel_budgets["100x1x0"]
+        assert b.tier != "proven"
+
+    def test_young_high_earner_funded_by_run_rate(self):
+        """Channel younger than grace with real 30d earnings gets a budget
+        proportional to its actual run rate."""
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=5_000_000,        # 5000 sats (all in 30d)
+                    fees_earned_msat=5_000_000,
+                    total_forward_count=120,
+                    contribution_30d_msat=5_000_000,
+                    fees_earned_30d_msat=5_000_000,
+                    days_open=10,                       # younger than grace
+                ),
+            },
+        )
+        alloc = engine.compute_allocations()
+        b = alloc.channel_budgets["100x1x0"]
+        assert b.tier == "proven"
+        # 5_000_000 * 0.50 = 2_500_000 msat = 2500 sats
+        assert b.budget_sats == 2500
+
+    def test_bootstrap_channel_keeps_bootstrap_path(self):
+        """Zero-history channel past grace keeps the bootstrap floor."""
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=0,
+                    total_forward_count=0,
+                    days_open=20,
+                    classification="stagnant_candidate",
+                ),
+            },
+        )
+        alloc = engine.compute_allocations()
+        b = alloc.channel_budgets["100x1x0"]
+        assert b.tier == "bootstrap"
+        assert b.budget_sats == 200
+
+    def test_exploration_funded_by_30d_exit_fees(self):
+        """Fleet exploration budget derives from 30d exit fees, not lifetime."""
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=500_000_000,      # large lifetime
+                    fees_earned_msat=500_000_000,
+                    total_forward_count=500,
+                    contribution_30d_msat=800_000,      # 800 sats in 30d
+                    fees_earned_30d_msat=800_000,
+                ),
+            },
+        )
+        alloc = engine.compute_allocations()
+        # Fleet 30d revenue = 800_000 msat; exploration = 10% = 80_000 msat
+        assert alloc.total_fleet_contribution_msat == 800_000
+        assert alloc.fleet_exploration_budget_sats == 80
+
+    def test_legacy_prof_without_window_falls_back_to_lifetime(self):
+        """Prof objects without windowed data keep the lifetime behavior."""
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=1_000_000,
+                    fees_earned_msat=800_000,
+                    total_forward_count=50,
+                    window_30d_available=False,
+                ),
+            },
+            rebalance_cost_by_channel={"100x1x0": 200},
+        )
+        alloc = engine.compute_allocations()
+        b = alloc.channel_budgets["100x1x0"]
+        assert b.tier == "proven"
+        assert b.budget_sats == 300  # legacy lifetime math
+
+
+class TestFleetTierContinued:
     def test_no_hive_member_check_skips_fleet(self):
         """When hive_member_check is None, fleet tier is never assigned."""
         engine = CapexBudgetEngine.__new__(CapexBudgetEngine)

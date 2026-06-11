@@ -32,6 +32,12 @@ class PairCandidate:
     dest_value_class: str = "neutral"
     source_budget_source: str = "none"
     dest_budget_source: str = "none"
+    # Our OWN outbound fee (ppm) on each leg of the pair. dest_out_fee_ppm
+    # anchors the sats-EV gate's expected future value (what the refilled
+    # destination earns when it routes); source_out_fee_ppm anchors the
+    # source opportunity cost (what the drained source forgoes).
+    source_out_fee_ppm: int = 0
+    dest_out_fee_ppm: int = 0
     hive_source_rebalance_bias: float = 1.0
     hive_dest_rebalance_bias: float = 1.0
     hive_hint_score_multiplier: float = 1.0

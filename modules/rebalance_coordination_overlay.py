@@ -318,6 +318,10 @@ def _build_pair_from_entry(
         dest_value_class=sink.value_class,
         source_budget_source=source.budget_source,
         dest_budget_source=sink.budget_source,
+        source_out_fee_ppm=max(
+            0, int(getattr(source, "local_out_fee_ppm", 0) or 0)
+        ),
+        dest_out_fee_ppm=max(0, int(getattr(sink, "local_out_fee_ppm", 0) or 0)),
         score=normalized_score,
         source_local_ratio=source.local_ratio,
         dest_local_ratio=sink.local_ratio,

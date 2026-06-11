@@ -1207,6 +1207,23 @@ def _boltz_auto_cycle_mark_state(**updates):
         _boltz_auto_cycle_state.update(updates)
 
 
+def _treasury_recommendation_executable(rec: Any) -> bool:
+    """True when the treasury executor would actually RUN this rec.
+
+    The treasury executor skips recs that fail the profit guard
+    (profit_guard_failed) and recs whose pass depends on the structural
+    inbound-scarcity credit (structural_credit_requires_balance_cycle).
+    Counting those toward treasury-mode selection deadlocks the auto-cycle:
+    treasury wins the mode pick, executes 0 actions, and the balance cycle
+    (where the structural envelope lives) never gets a turn.
+    """
+    if not isinstance(rec, dict):
+        return False
+    econ = rec.get("economics")
+    econ = econ if isinstance(econ, dict) else {}
+    return bool(econ.get("passes_profit_guard")) and not bool(econ.get("structural"))
+
+
 def _select_boltz_auto_cycle_mode(
     *,
     treasury_plan: Optional[Dict[str, Any]],
@@ -1228,14 +1245,19 @@ def _select_boltz_auto_cycle_mode(
         if isinstance(balance_plan.get("recommendations", []), list)
         else []
     )
+    # Only EXECUTABLE treasury recs count toward picking treasury mode.
+    treasury_executable = [
+        r for r in treasury_recommendations if _treasury_recommendation_executable(r)
+    ]
     reserve_deficit_sats = int(treasury.get("deficit_sats", 0) or 0)
 
-    if str(treasury_plan.get("status") or "") == "ok" and treasury_recommendations:
+    if str(treasury_plan.get("status") or "") == "ok" and treasury_executable:
         return {
             "mode": "treasury",
             "reason": "standing_onchain_reserve_below_target",
             "reserve_deficit_sats": reserve_deficit_sats,
             "treasury_candidate_count": len(treasury_recommendations),
+            "treasury_executable_count": len(treasury_executable),
             "balance_candidate_count": len(balance_recommendations),
         }
 
@@ -1245,6 +1267,7 @@ def _select_boltz_auto_cycle_mode(
             "reason": "onchain_reserve_healthy_use_balance_mode",
             "reserve_deficit_sats": reserve_deficit_sats,
             "treasury_candidate_count": len(treasury_recommendations),
+            "treasury_executable_count": len(treasury_executable),
             "balance_candidate_count": len(balance_recommendations),
         }
 
@@ -1253,6 +1276,7 @@ def _select_boltz_auto_cycle_mode(
         "reason": "no_eligible_boltz_actions",
         "reserve_deficit_sats": reserve_deficit_sats,
         "treasury_candidate_count": len(treasury_recommendations),
+        "treasury_executable_count": len(treasury_executable),
         "balance_candidate_count": len(balance_recommendations),
     }
 
@@ -1449,6 +1473,39 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                 max_actions=treasury_max_actions,
                 allow_concurrent_swaps=False,
             )
+            # F1 fall-through: when treasury mode executed nothing (every
+            # candidate was skipped at execution time), run the balance
+            # cycle within the same auto-cycle run so the structural drain
+            # envelope still gets a turn. Blocked cycles (pending swaps)
+            # would block the balance cycle too, so don't bother.
+            _treasury_status = str(result.get('status') or '') if isinstance(result, dict) else ''
+            _treasury_executed = int(result.get('executed_count', 0) or 0) if isinstance(result, dict) else 0
+            if _treasury_status == 'executed' and _treasury_executed == 0:
+                fallback_plan = _build_boltz_balance_plan(
+                    max_candidates=max(max(5, int(max_actions) * 5), 20),
+                    require_profitable=True,
+                    min_marginal_roi=0.0,
+                    profit_margin_factor=1.2,
+                    expected_horizon_days=3.0,
+                    loop_in_currency='auto',
+                    loop_out_currency='auto',
+                    planner_coordination=_planner_coord,
+                )
+                if isinstance(fallback_plan, dict) and 'error' not in fallback_plan:
+                    fallback_selection = _select_boltz_auto_cycle_mode(
+                        treasury_plan=None, balance_plan=fallback_plan,
+                    )
+                    if fallback_selection.get("mode") == "balance":
+                        selection = dict(fallback_selection)
+                        selection["reason"] = "treasury_executed_zero_fallback_to_balance"
+                        result = _execute_boltz_balance_cycle(
+                            dry_run=False,
+                            max_actions=max_actions,
+                            allow_concurrent_swaps=False,
+                            loop_in_currency='auto',
+                            loop_out_currency='auto',
+                            precomputed_plan=fallback_plan,
+                        )
         status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
         if isinstance(result, dict):
             result.update({

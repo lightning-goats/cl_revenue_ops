@@ -32,6 +32,31 @@ def _classify(obj) -> str:
     return str(obj).rsplit('.', 1)[-1].lower()
 
 
+def _has_30d_window(prof) -> bool:
+    """Whether the prof object carries trailing-30d windowed fields (audit F1).
+
+    Producers that prefetch the 30d P&L set window_30d_available=True; older
+    objects (or mocks without the flag) fall back to lifetime aggregates.
+    """
+    return getattr(prof, 'window_30d_available', False) is True
+
+
+def _windowed_msat(prof, attr: str, fallback_msat: int) -> int:
+    """Read a windowed msat field from prof, falling back to a lifetime value.
+
+    Falls back when the 30d window is unavailable or the field is not a
+    plain number (e.g. partially-mocked objects).
+    """
+    if _has_30d_window(prof):
+        val = getattr(prof, attr, None)
+        if isinstance(val, (int, float)):
+            return int(val)
+    try:
+        return int(fallback_msat)
+    except (TypeError, ValueError):
+        return 0
+
+
 @dataclass
 class ChannelCapexBudget:
     """Per-channel capex budget computed by the engine."""
@@ -141,7 +166,11 @@ class CapexBudgetEngine:
 
         for ch_id, prof in all_prof.items():
             contribution_msat = prof.revenue.total_contribution_msat
-            total_fleet_contribution_msat += prof.revenue.fees_earned_msat  # Fleet revenue = exit only
+            # Audit F1(d): fleet budgets are debited by 30d spend, so they must
+            # be FUNDED by 30d revenue (exit fees only), not lifetime totals.
+            total_fleet_contribution_msat += _windowed_msat(
+                prof, 'fees_earned_30d_msat', prof.revenue.fees_earned_msat
+            )  # Fleet revenue = exit only
             total_capex_msat = capex_by_channel.get(ch_id, 0) * MSAT_PER_SAT
 
             # Bleeder status
@@ -358,6 +387,14 @@ class CapexBudgetEngine:
         """Compute budget for a single channel (all arithmetic in msat)."""
         classification = _classify(prof.classification)
         contribution_msat = prof.revenue.total_contribution_msat
+        # Audit F1: budgets are debited by 30d spend, so the funding side must
+        # also be the trailing-30d contribution. Funding from LIFETIME
+        # contribution let decayed channels (50k sats lifetime, ~100 sats/30d)
+        # claim 20k+/month budgets, manufacturing hard bleeders and a
+        # block -> age-out -> "proven" again oscillation.
+        contribution_30d_msat = _windowed_msat(
+            prof, 'contribution_30d_msat', contribution_msat
+        )
         total_fwd = prof.revenue.total_forward_count
         days_open = prof.days_open
         marginal_roi = getattr(prof, 'marginal_roi', 0.0)
@@ -428,9 +465,10 @@ class CapexBudgetEngine:
         else:
             discount = 1.0
 
-        # Proven budget (msat): contribution x rate - total capex spent
+        # Proven budget (msat): 30d contribution x rate - 30d capex spent.
+        # Same window on both sides (audit F1b).
         reinvestment = cfg.capex_reinvestment_rate
-        proven_budget_msat = max(0, int(contribution_msat * reinvestment) - total_capex_30d_msat)
+        proven_budget_msat = max(0, int(contribution_30d_msat * reinvestment) - total_capex_30d_msat)
 
         # Bootstrap budget (msat): basis points of capacity
         capacity_msat = (getattr(prof, 'capacity_sats', 0) or 0) * MSAT_PER_SAT
@@ -440,7 +478,9 @@ class CapexBudgetEngine:
         )
 
         # Tier classification
-        if contribution_msat > 100 * MSAT_PER_SAT:
+        # Audit F1c: the proven gate is windowed — a channel must have EARNED
+        # >100 sats in the last 30 days, not at any point in its lifetime.
+        if contribution_30d_msat > 100 * MSAT_PER_SAT:
             tier = "proven"
             tier_ppm = 2000
             priority = "preservation"

@@ -30,6 +30,24 @@ _LOSER_SEVERITY = {
 _CLOSE_TX_VBYTES = 200
 _DEFAULT_CLOSE_FEE_RESERVE_MULTIPLIER = 2.0
 
+# F1 (audit CRITICAL): the legacy open-EV forecast assumed 30% of capacity
+# turning over daily at 150 ppm — i.e. 45 ppm of capacity per DAY, which is
+# 16,425 ppm/year gross, 10-50x observed reality. It approved nearly every
+# open at max size and channel sizing was effectively decided by this
+# constant. The forecast is now anchored to the node's realized
+# revenue-per-capacity; the old constant is retained ONLY as a hard ceiling
+# on that anchor and as a bootstrap when the node has no routing history.
+LEGACY_FORECAST_DAILY_PPM_CEILING = 45.0
+
+# Discount applied to the node's observed median per-day revenue ppm when
+# forecasting a brand-new peer with no track record of its own.
+NEW_PEER_DISCOUNT = 0.5
+
+# Assumed average fee rate used to convert forecast revenue into forecast
+# volume. The revenue side and the rebalance-cost side of the open-EV model
+# must share one volume model (audit: they previously diverged).
+ASSUMED_AVG_FEE_PPM = 150.0
+
 # Strategy weights for score normalization (higher = more trusted signal)
 STRATEGY_WEIGHTS = {
     "winner": 1.0,
@@ -76,6 +94,8 @@ class CapacityPlanner:
         self._cycle_nodes_by_id: Dict[str, dict] = {}
         self._cycle_channels_dest: Dict[str, list] = {}
         self._cycle_channels_source: Dict[str, list] = {}
+        # F1: per-cycle cached revenue anchor (1-tuple when computed, else None)
+        self._observed_daily_ppm_cache: tuple | None = None
 
     def set_capex_engine(self, engine: 'CapexBudgetEngine'):
         """Inject the unified capex budget engine."""
@@ -132,6 +152,7 @@ class CapacityPlanner:
         # Fetch analyses once and pass to both identification methods
         all_profitability = self.profitability.analyze_all_channels()
         all_flow = self.flow.analyze_all_channels()
+        self._seed_revenue_anchor(all_profitability)
 
         winners = self._identify_winners(all_profitability, all_flow)
         losers = self._identify_losers(all_profitability, all_flow)
@@ -177,6 +198,7 @@ class CapacityPlanner:
         self._cycle_channels_dest.clear()
         self._cycle_channels_source.clear()
         self._cycle_nodes_by_id.clear()
+        self._observed_daily_ppm_cache = None
 
     def _get_cached_channels(self, peer_id: str, direction: str = "destination") -> list:
         """Get listchannels result, cached for this cycle."""
@@ -273,6 +295,7 @@ class CapacityPlanner:
         # 2. Fetch analysis data
         all_profitability = self.profitability.analyze_all_channels()
         all_flow = self.flow.analyze_all_channels()
+        self._seed_revenue_anchor(all_profitability)
 
         # 3. Identify winners and losers
         winners = self._identify_winners(all_profitability, all_flow)
@@ -2599,11 +2622,66 @@ class CapacityPlanner:
         return max(cfg.planner_min_channel_sats,
                    min(raw_size, cfg.planner_max_channel_sats))
 
+    def _seed_revenue_anchor(self, all_profitability) -> None:
+        """Cache the observed revenue anchor from profitability data in hand.
+
+        Called by execute_cycle/generate_report with the analyze_all_channels
+        result they already fetched, so per-candidate EV calls do not
+        re-derive the anchor.
+        """
+        self._observed_daily_ppm_cache = (
+            self._compute_observed_daily_ppm(all_profitability),
+        )
+
+    def _observed_node_daily_ppm(self) -> float | None:
+        """Return the node's observed median per-day revenue ppm (cached)."""
+        cache = self._observed_daily_ppm_cache
+        if cache is not None:
+            return cache[0]
+        try:
+            all_profitability = self.profitability.analyze_all_channels()
+        except Exception:
+            all_profitability = None
+        value = self._compute_observed_daily_ppm(all_profitability)
+        self._observed_daily_ppm_cache = (value,)
+        return value
+
+    @staticmethod
+    def _compute_observed_daily_ppm(all_profitability) -> float | None:
+        """Median realized (fees_earned/days_open)/capacity across channels, in ppm/day.
+
+        Returns None when no channel exposes usable numeric data (e.g. a
+        brand-new node), letting the caller fall back to the bootstrap rate.
+        """
+        try:
+            profs = list(all_profitability.values())
+        except Exception:
+            return None
+        samples = []
+        for prof in profs:
+            try:
+                capacity_sats = int(getattr(prof, "capacity_sats", 0) or 0)
+                days_open = int(getattr(prof, "days_open", 0) or 0)
+                revenue = getattr(prof, "revenue", None)
+                fees_sats = float(getattr(revenue, "fees_earned_msat", 0) or 0) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            if capacity_sats <= 0 or days_open <= 0 or fees_sats < 0:
+                continue
+            samples.append((fees_sats / days_open) / capacity_sats * 1_000_000.0)
+        if not samples:
+            return None
+        return float(median(samples))
+
     def _calculate_open_ev(self, peer_id: str, channel_size_sats: int, cfg) -> float:
         """EV-based channel open decision. Returns expected profit in sats.
 
         EV = expected_lifetime_revenue - on_chain_cost - expected_rebalance_costs
         Only open when EV > 0.
+
+        F1 (audit): the revenue forecast is anchored to the node's OBSERVED
+        median revenue-per-capacity (discounted for new peers and clamped to
+        the legacy constant as a ceiling), not a fixed utilization guess.
         """
         # Estimate daily revenue
         daily_revenue = 0.0
@@ -2616,10 +2694,18 @@ class CapacityPlanner:
         except Exception:
             pass
 
-        # Fallback: estimate from channel size assuming modest utilization
+        # Fallback: anchor to this node's realized revenue-per-capacity.
         if daily_revenue <= 0:
-            # Assume 30% utilization and 150 PPM average fee
-            daily_revenue = channel_size_sats * 0.3 * 150 / 1_000_000
+            observed_daily_ppm = self._observed_node_daily_ppm()
+            if observed_daily_ppm is not None:
+                forecast_daily_ppm = min(
+                    observed_daily_ppm * NEW_PEER_DISCOUNT,
+                    LEGACY_FORECAST_DAILY_PPM_CEILING,
+                )
+            else:
+                # Bootstrap: no routing history at all — use the legacy rate.
+                forecast_daily_ppm = LEGACY_FORECAST_DAILY_PPM_CEILING
+            daily_revenue = channel_size_sats * forecast_daily_ppm / 1_000_000.0
 
         # Hive demand signal: apply bounded, confidence-weighted fleet bias
         if self.hive_hints:
@@ -2641,8 +2727,11 @@ class CapacityPlanner:
             if inbound_data and isinstance(inbound_data, dict):
                 median_inbound_ppm = inbound_data.get('median_fee_ppm', 0)
                 if median_inbound_ppm > 0:
-                    # Daily rebalance cost = daily_volume * inbound_fee_rate
-                    daily_volume_est = channel_size_sats * 0.3  # Same utilization assumption
+                    # Daily rebalance cost = daily_volume * inbound_fee_rate.
+                    # The volume estimate is derived from the SAME forecast as
+                    # the revenue side (audit: it previously assumed 30%
+                    # turnover regardless of the revenue model).
+                    daily_volume_est = daily_revenue * 1_000_000.0 / ASSUMED_AVG_FEE_PPM
                     rebal_cost_per_day = (daily_volume_est * median_inbound_ppm) / 1_000_000
         except Exception:
             pass  # Fallback to 10% default

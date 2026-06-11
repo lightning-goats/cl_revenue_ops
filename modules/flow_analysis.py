@@ -118,6 +118,26 @@ KALMAN_MIN_OBSERVATIONS = 5  # Minimum observation count before Kalman can overr
 # BALANCED_ACTIVE classification: distinguish busy two-way channels from dormant ones
 BALANCED_ACTIVE_TURNOVER_THRESHOLD = 0.01  # 1% of capacity per day
 
+# =============================================================================
+# F1 (2026-06 audit): Balance-position hysteresis + Kalman direction veto
+# =============================================================================
+# The balance-position fallback used hard 0.25/0.75 cutoffs with no
+# hysteresis: channels hovering at a boundary flipped class ~1.3x/day, each
+# flip swinging the fee floor (x0.75 SINK vs x1.10 SOURCE), toggling the
+# rebalance-cost floor (sinks exempt) and flipping the PID balance target.
+# Asymmetric enter/exit bands hold the previous class until the channel
+# moves decisively out of its band.
+SINK_ENTER_OUTBOUND_RATIO = 0.78    # become SINK when outbound ratio rises above
+SINK_EXIT_OUTBOUND_RATIO = 0.72     # stop being SINK when outbound ratio falls below
+SOURCE_ENTER_OUTBOUND_RATIO = 0.22  # become SOURCE when outbound ratio falls below
+SOURCE_EXIT_OUTBOUND_RATIO = 0.28   # stop being SOURCE when outbound ratio rises above
+
+# F1c: Kalman veto for balance-position labels. A channel that is currently
+# full but measurably DRAINING (kalman_ratio > +0.05/day) is not a SINK; one
+# that is empty but measurably FILLING (kalman_ratio < -0.05/day) is not a
+# SOURCE. The structural label must never contradict a measured flow trend.
+KALMAN_BALANCE_VETO_RATIO = 0.05
+
 
 @dataclass
 class KalmanFlowState:
@@ -938,6 +958,7 @@ class FlowAnalyzer:
         raw_entries: List,
         last_forward_ts: int,
         pending_kalman_saves: Optional[List[Dict[str, Any]]] = None,
+        previous_state: Optional[str] = None,
     ) -> None:
         """Apply Kalman filter and reclassify channel state based on the result.
 
@@ -1017,19 +1038,14 @@ class FlowAnalyzer:
             elif kalman_ratio < sink_thresh:
                 metrics.state = ChannelState.SINK
             else:
-                # Kalman ratio is small — use balance position as
-                # structural signal (matching EMA fallback logic).
+                # Kalman ratio is small — use balance position as structural
+                # signal (matching EMA fallback logic). F1: hysteresis on the
+                # previous class + veto from the fresh Kalman estimate.
                 outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
-                if outbound_ratio < 0.25:
-                    metrics.state = ChannelState.SOURCE
-                elif outbound_ratio > 0.75:
-                    metrics.state = ChannelState.SINK
-                else:
-                    turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
-                    if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
-                        metrics.state = ChannelState.BALANCED_ACTIVE
-                    else:
-                        metrics.state = ChannelState.BALANCED
+                turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
+                metrics.state = self._classify_balance_position(
+                    outbound_ratio, previous_state, kalman_ratio, turnover,
+                )
 
     # =========================================================================
     # v2.0 IMPROVEMENT METHODS
@@ -1302,6 +1318,12 @@ class FlowAnalyzer:
             # BUG FIX: Ensure updated_at is an integer timestamp
             prev_ts_raw = prev_state.get("updated_at", 0) if prev_state else 0
             prev_ts = int(prev_ts_raw) if prev_ts_raw else 0
+            # F1: previous class + persisted Kalman estimate for hysteresis/veto
+            prev_class = prev_state.get("state") if prev_state else None
+            prev_kalman_ratio = (
+                float(prev_state.get("kalman_flow_ratio") or 0.0)
+                if prev_state else 0.0
+            )
 
             # Calculate metrics (with balance fallback for zero-flow channels)
             metrics = self._calculate_metrics(
@@ -1320,7 +1342,9 @@ class FlowAnalyzer:
                 last_forward_ts=last_forward_ts,
                 adaptive_decay=adaptive_decay,
                 previous_ratio=prev_ratio,
-                previous_ratio_ts=prev_ts
+                previous_ratio_ts=prev_ts,
+                previous_state=prev_class,
+                previous_kalman_ratio=prev_kalman_ratio
             )
 
             # v2.1: Apply Kalman filter for improved flow estimation
@@ -1333,6 +1357,7 @@ class FlowAnalyzer:
                 raw_entries=raw_flow_data.get(channel_id, []),
                 last_forward_ts=last_forward_ts,
                 pending_kalman_saves=pending_kalman_rows,
+                previous_state=prev_class,
             )
 
             results[channel_id] = metrics
@@ -1600,6 +1625,12 @@ class FlowAnalyzer:
         # BUG FIX: Ensure updated_at is an integer timestamp
         prev_ts_raw = prev_state.get("updated_at", 0) if prev_state else 0
         prev_ts = int(prev_ts_raw) if prev_ts_raw else 0
+        # F1: previous class + persisted Kalman estimate for hysteresis/veto
+        prev_class = prev_state.get("state") if prev_state else None
+        prev_kalman_ratio = (
+            float(prev_state.get("kalman_flow_ratio") or 0.0)
+            if prev_state else 0.0
+        )
 
         metrics = self._calculate_metrics(
             channel_id=channel_id,
@@ -1617,7 +1648,9 @@ class FlowAnalyzer:
             last_forward_ts=last_forward_ts,
             adaptive_decay=adaptive_decay,
             previous_ratio=prev_ratio,
-            previous_ratio_ts=prev_ts
+            previous_ratio_ts=prev_ts,
+            previous_state=prev_class,
+            previous_kalman_ratio=prev_kalman_ratio
         )
 
         # v2.1: Apply Kalman filter
@@ -1632,6 +1665,7 @@ class FlowAnalyzer:
                 channel_id, window_hours=24
             ),
             last_forward_ts=last_forward_ts,
+            previous_state=prev_class,
         )
 
         # I-9: Skip DB persistence when called during bulk analyze_all_channels(),
@@ -1658,6 +1692,53 @@ class FlowAnalyzer:
 
         return metrics
 
+    def _classify_balance_position(
+        self,
+        outbound_ratio: float,
+        previous_state: Optional[str],
+        kalman_ratio: float,
+        turnover: float,
+    ) -> ChannelState:
+        """Classify via balance position when net flow is too weak to decide.
+
+        F1 (2026-06 audit): hysteresis bands keyed on the PREVIOUS class
+        prevent boundary channels from flapping each cycle, and a Kalman
+        direction veto stops a draining-but-currently-full channel from being
+        labelled SINK (or a filling-but-empty one SOURCE).
+
+        Args:
+            outbound_ratio: our_balance / capacity (0..1)
+            previous_state: previous cycle's class string (e.g. "sink"), or
+                None when no prior state exists
+            kalman_ratio: best available Kalman flow estimate (fresh estimate
+                on the Kalman path, previous cycle's persisted value on the
+                EMA path)
+            turnover: daily_volume / capacity
+        """
+        prev = (previous_state or "").lower()
+
+        sink_band = (
+            SINK_EXIT_OUTBOUND_RATIO if prev == ChannelState.SINK.value
+            else SINK_ENTER_OUTBOUND_RATIO
+        )
+        source_band = (
+            SOURCE_EXIT_OUTBOUND_RATIO if prev == ChannelState.SOURCE.value
+            else SOURCE_ENTER_OUTBOUND_RATIO
+        )
+
+        # F1c: direction veto — never label against a measured flow trend.
+        sink_vetoed = kalman_ratio > KALMAN_BALANCE_VETO_RATIO
+        source_vetoed = kalman_ratio < -KALMAN_BALANCE_VETO_RATIO
+
+        if outbound_ratio > sink_band and not sink_vetoed:
+            return ChannelState.SINK
+        if outbound_ratio < source_band and not source_vetoed:
+            return ChannelState.SOURCE
+
+        if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
+            return ChannelState.BALANCED_ACTIVE
+        return ChannelState.BALANCED
+
     def _calculate_metrics(
         self, channel_id: str, peer_id: str,
         sats_in: int, sats_out: int, capacity: int,
@@ -1669,7 +1750,10 @@ class FlowAnalyzer:
         last_forward_ts: int = 0,
         adaptive_decay: float = BASE_EMA_DECAY,
         previous_ratio: float = 0.0,
-        previous_ratio_ts: int = 0
+        previous_ratio_ts: int = 0,
+        # F1: previous class + persisted Kalman estimate for hysteresis/veto
+        previous_state: Optional[str] = None,
+        previous_kalman_ratio: float = 0.0
     ) -> FlowMetrics:
         """
         Calculate flow metrics and classify a channel using EMA.
@@ -1718,19 +1802,15 @@ class FlowAnalyzer:
                 # EMA net flow is small relative to capacity — use balance position
                 # as a structural signal. A channel with most liquidity on one side
                 # is clearly a source or sink regardless of EMA magnitude.
-                # (EMA flow_ratio for typical channels is 0.01-0.10 — too small
-                # to exceed ±0.5 thresholds, so balance position is more reliable.)
+                # F1: hysteresis + Kalman veto (using the previous cycle's
+                # persisted Kalman estimate — the fresh one is applied later
+                # in _apply_kalman_reclassification).
                 outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
-                if outbound_ratio < 0.25:
-                    state = ChannelState.SOURCE
-                elif outbound_ratio > 0.75:
-                    state = ChannelState.SINK
-                else:
-                    turnover = daily_volume / capacity if capacity > 0 else 0.0
-                    if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
-                        state = ChannelState.BALANCED_ACTIVE
-                    else:
-                        state = ChannelState.BALANCED
+                turnover = daily_volume / capacity if capacity > 0 else 0.0
+                state = self._classify_balance_position(
+                    outbound_ratio, previous_state, previous_kalman_ratio,
+                    turnover,
+                )
         else:
             # FALLBACK: Infer from current balance (no flow data at all)
             outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
