@@ -2671,7 +2671,11 @@ class ChannelProfitabilityAnalyzer:
                 if fee_state:
                     v2_json = fee_state.get('v2_state_json', '{}') or '{}'
                     v2_data = json.loads(v2_json) if isinstance(v2_json, str) else v2_json
-                    ts = v2_data.get('thompson_state', {})
+                    # Nested-first: new rows only store thompson_state under
+                    # fee_state; flat fallback covers rows written before the
+                    # mirror removal.
+                    ts = ((v2_data.get('fee_state') or {}).get('thompson_state')
+                          or v2_data.get('thompson_state', {}))
                     variance = ts.get('posterior_variance', 10000)
                     if isinstance(variance, (int, float)) and variance < 2500:  # std < 50 PPM
                         # Proven fee channel: widen thresholds by 50%

@@ -1827,8 +1827,10 @@ class TestDTSPIDIntegration:
         assert mock_database.update_fee_strategy_state.called
         call_kwargs = mock_database.update_fee_strategy_state.call_args
         v2_json = call_kwargs.kwargs.get("v2_state_json") or call_kwargs[1].get("v2_state_json", "{}")
-        v2_data = json.loads(v2_json)
-        assert "pid_state" in v2_data
+        v2_data = json.loads(v2_json) if isinstance(v2_json, str) else v2_json
+        # PID state lives in the nested fee_state payload (the flat mirror
+        # was removed to halve the persisted row size).
+        assert "pid_state" in v2_data.get("fee_state", {})
 
     def test_produces_fee_adjustment_instance(self, mock_plugin, mock_database):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)

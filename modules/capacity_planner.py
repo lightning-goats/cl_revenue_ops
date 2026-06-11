@@ -774,7 +774,13 @@ class CapacityPlanner:
                 if fee_state:
                     v2_json_str = fee_state.get('v2_state_json', '{}') or '{}'
                     v2_data = json.loads(v2_json_str) if isinstance(v2_json_str, str) else v2_json_str
-                    thompson_state = v2_data.get('thompson_state', {})
+                    # Nested-first: new rows only store thompson_state under
+                    # fee_state; flat fallback covers rows written before the
+                    # mirror removal.
+                    thompson_state = (
+                        (v2_data.get('fee_state') or {}).get('thompson_state')
+                        or v2_data.get('thompson_state', {})
+                    )
                     if thompson_state:
                         dts_mean = thompson_state.get('posterior_mean')
             except Exception:

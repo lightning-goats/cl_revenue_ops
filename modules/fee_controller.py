@@ -3657,10 +3657,22 @@ class FeeController:
             "algorithm_version": fee_payload.get("algorithm_version", "dts_pid_v1"),
             "fee_state": fee_payload,
             "cycle_state": cycle_payload,
-            # Flat compatibility mirrors for existing readers/tests.
-            "thompson_state": fee_payload.get("thompson_state", {}),
-            "last_vegas_multiplier": fee_payload.get("last_vegas_multiplier", 1.0),
-            "pid_state": fee_payload.get("pid_state", {}),
+            # PERF: the flat thompson_state/pid_state/last_vegas_multiplier
+            # compatibility mirrors are no longer written — the flat
+            # thompson_state copy alone was ~49% of the serialized row
+            # (~214 MB/day of WAL churn at 90 channels). Readers prefer the
+            # nested fee_state payload and fall back to flat for rows written
+            # before this change (_extract_fee_state_payload, plus the
+            # external readers in flow_analysis / profitability_analyzer /
+            # capacity_planner).
+            # TODO(other-agent): cl-revenue-ops.py:~3303 still reads the flat
+            # v2_state["thompson_state"]; migrate it to nested-first
+            # (v2_state.get("fee_state", {}).get("thompson_state")) with flat
+            # fallback — owned by the cl-revenue-ops.py agent, do not edit
+            # from fee_controller work.
+            # The three small shared canonical scalars keep their flat copies:
+            # they are the merge fallback source (_extract_*_payload) and are
+            # a few bytes each.
             "last_gossip_refresh": canonical_last_gossip_refresh,
             "last_broadcast_at": canonical_last_broadcast_at,
             "dynamic_htlcmin_baseline_msat": canonical_htlcmin_baseline_msat,
