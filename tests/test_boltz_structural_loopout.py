@@ -258,8 +258,13 @@ def _structural_module(scarcity, realized_ppm=500, structural_budget=1000):
 
 
 def test_starved_node_loopout_earns_structural_credit():
-    """Fully starved node: the structural credit alone (750 sats vs 120 sats
-    threshold) carries the loop-out past the profit guard."""
+    """Fully starved node: the structural credit alone (250 sats vs 120 sats
+    threshold) carries the loop-out past the profit guard.
+
+    Arithmetic (marginal, per-horizon credit): amount 1M sats x 0.5 turnover
+    per horizon x scarcity 1.0 x (realized 500ppm - channel posterior 0ppm)
+    / 1e6 = 250. No xhorizon_days multiplier: the 0.5 turnover IS the
+    per-horizon volume assumption."""
     mod = _structural_module(scarcity=1.0)
 
     plan = mod._build_boltz_balance_plan(require_profitable=True)
@@ -268,9 +273,88 @@ def test_starved_node_loopout_earns_structural_credit():
     recs = plan["recommendations"]
     assert len(recs) == 1
     econ = recs[0]["economics"]
-    assert econ["structural_uplift_sats"] > 0
+    assert econ["structural_uplift_sats"] == 250
     assert econ["passes_profit_guard"] is True
     assert econ["structural"] is True
+
+
+def test_structural_credit_is_marginal_over_channel_posterior():
+    """Audit double-count case: DTS posterior 800ppm (tight) + realized
+    800ppm + scarcity 1.0 must yield ~0 structural credit (was 600): when
+    DTS already prices the channel's own volume, structural only credits the
+    node-level premium over it — here the premium is zero."""
+    mod = _structural_module(scarcity=1.0, realized_ppm=800)
+    mod.fee_controller.get_dts_summary.return_value = {
+        "broadcast_fee_ppm": 0,
+        "posterior_mean": 800,
+        "posterior_std": 50,  # tight: < 100
+    }
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    econ = plan["recommendations"][0]["economics"]
+    assert econ["structural_uplift_sats"] == 0
+
+
+def test_structural_credit_pays_only_node_premium_over_posterior():
+    """Realized 800ppm, tight channel posterior 300ppm: the credit prices
+    only the 500ppm premium: 1M x 0.5 x 1.0 x (800-300)/1e6 = 250."""
+    mod = _structural_module(scarcity=1.0, realized_ppm=800)
+    mod.fee_controller.get_dts_summary.return_value = {
+        "broadcast_fee_ppm": 0,
+        "posterior_mean": 300,
+        "posterior_std": 50,
+    }
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    econ = plan["recommendations"][0]["economics"]
+    assert econ["structural_uplift_sats"] == 250
+
+
+def test_loose_posterior_credits_full_realized_rate():
+    """posterior_std >= 100 means DTS does not price this channel's volume:
+    the full realized rate is credited (channel_posterior_ppm treated as 0)."""
+    mod = _structural_module(scarcity=1.0, realized_ppm=500)
+    mod.fee_controller.get_dts_summary.return_value = {
+        "broadcast_fee_ppm": 0,
+        "posterior_mean": 800,
+        "posterior_std": 200,  # loose
+    }
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    econ = plan["recommendations"][0]["economics"]
+    assert econ["structural_uplift_sats"] == 250  # 1M x 0.5 x 1.0 x 500/1e6
+
+
+def test_uplifts_have_no_horizon_multiplier():
+    """F3b horizon honesty: the 0.5 turnover is PER HORIZON, so neither the
+    DTS uplift nor the structural credit may scale with expected_horizon_days
+    (code now matches the '50% of the amount ... over the horizon' comment)."""
+    mod3 = _structural_module(scarcity=1.0)
+    mod3.fee_controller.get_dts_summary.return_value = {
+        "broadcast_fee_ppm": 0, "posterior_mean": 400, "posterior_std": 50,
+    }
+    mod6 = _structural_module(scarcity=1.0)
+    mod6.fee_controller.get_dts_summary.return_value = {
+        "broadcast_fee_ppm": 0, "posterior_mean": 400, "posterior_std": 50,
+    }
+
+    plan3 = mod3._build_boltz_balance_plan(require_profitable=True, expected_horizon_days=3.0)
+    plan6 = mod6._build_boltz_balance_plan(require_profitable=True, expected_horizon_days=6.0)
+
+    econ3 = plan3["recommendations"][0]["economics"]
+    econ6 = plan6["recommendations"][0]["economics"]
+    # DTS uplift: 1M x 0.5 x 400/1e6 = 200, horizon-independent.
+    assert econ3["dts_uplift_sats"] == 200
+    assert econ6["dts_uplift_sats"] == econ3["dts_uplift_sats"]
+    # Structural: 1M x 0.5 x 1.0 x (500-400)/1e6 = 50, horizon-independent.
+    assert econ3["structural_uplift_sats"] == 50
+    assert econ6["structural_uplift_sats"] == econ3["structural_uplift_sats"]
 
 
 def test_healthy_node_gets_zero_credit_and_unchanged_guard():

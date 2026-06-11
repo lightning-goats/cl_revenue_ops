@@ -7154,9 +7154,12 @@ def _build_boltz_balance_plan(
         dts_uplift_sats = 0
         if posterior_mean > 0 and posterior_std < 100:
             # Tight posterior = confident fee estimate; project revenue from rebalanced capacity
-            # Conservative: use 50% of the amount as volume estimate over the horizon
+            # Conservative: use 50% of the amount as volume estimate over the horizon.
+            # F3b horizon honesty: the 0.5 turnover IS the per-horizon volume
+            # assumption, so there is no extra xhorizon_days multiplier (it
+            # used to inflate the projection into 150% turnover at 3 days).
             projected_volume = amount_sats * 0.5
-            dts_uplift_sats = int(projected_volume * posterior_mean / 1_000_000 * float(expected_horizon_days))
+            dts_uplift_sats = int(projected_volume * posterior_mean / 1_000_000)
         # Use the better of historical and DTS-projected uplift
         expected_gross_uplift_sats = max(expected_gross_uplift_sats, dts_uplift_sats)
 
@@ -7188,13 +7191,22 @@ def _build_boltz_balance_plan(
             and structural_scarcity > 0.0
             and structural_realized_ppm > 0
         ):
-            # Mirror the conservative DTS-uplift volume model:
-            # assume half the freed inbound turns over per horizon.
-            projected_volume = amount_sats * 0.5 * structural_scarcity
-            structural_uplift_sats = int(
-                projected_volume * structural_realized_ppm / 1_000_000
-                * float(expected_horizon_days)
+            # F3 marginal credit: when DTS already prices this channel's own
+            # volume (tight posterior), expected_gross already contains that
+            # revenue via dts_uplift — crediting the full realized rate again
+            # would double-pay for the same freed volume. Structural therefore
+            # only credits the NODE-LEVEL PREMIUM over the channel's own rate.
+            # With a loose posterior (std >= 100) the channel rate is unknown
+            # and the full realized rate applies.
+            channel_posterior_ppm = (
+                float(posterior_mean) if (posterior_mean > 0 and posterior_std < 100) else 0.0
             )
+            premium_ppm = max(0.0, float(structural_realized_ppm) - channel_posterior_ppm)
+            # Mirror the conservative DTS-uplift volume model: half the freed
+            # inbound turns over per horizon. F3b: no xhorizon_days multiplier
+            # — the 0.5 turnover is already the per-horizon assumption.
+            projected_volume = amount_sats * 0.5 * structural_scarcity
+            structural_uplift_sats = int(projected_volume * premium_ppm / 1_000_000)
         passes_without_credit = expected_gross_uplift_sats >= required_profit_threshold_sats
         expected_gross_uplift_sats += structural_uplift_sats
 
