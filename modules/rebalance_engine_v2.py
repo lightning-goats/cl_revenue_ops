@@ -1329,9 +1329,15 @@ class RebalanceEngine:
                             pair.pair_budget_sats,
                             getattr(route_result, "probability_ppm", 0),
                         )
+                        # Audit F1: the per-attempt fee ceiling bounds route
+                        # acceptance; the pair budget remains the reservation
+                        # amount cap.
+                        effective_budget = self._per_attempt_fee_ceiling(
+                            pair.amount_sats, effective_budget, cfg
+                        )
                         # Persist the planner's effective ceiling so execution
-                        # and budget reservation honor the same budget that
-                        # accepted this route (no-op when the bonus is 0).
+                        # and budget reservation honor the same ceiling that
+                        # accepted this route.
                         pair.effective_budget_sats = int(effective_budget)
                         self._update_pair_score_decomposition(
                             pair,
@@ -1922,27 +1928,54 @@ class RebalanceEngine:
         bonus_fraction = clamped * bonus_rate
         return int(pair_budget_sats * (1.0 + bonus_fraction))
 
+    def _per_attempt_fee_ceiling(
+        self, amount_sats: int, budget_sats: int, cfg: Any = None
+    ) -> int:
+        """Audit F1: bound a single attempt's fee by the ppm cap on amount.
+
+        The pair budget (capex/bootstrap) is the RESERVATION cap — how much
+        this destination may consume over the budget window — and must not
+        double as the per-attempt fee envelope: a 2,500-sat budget would
+        otherwise approve a 25,000-ppm fee on a 100k move. Any single
+        attempt may pay at most::
+
+            min(budget_sats, ceil(amount_sats * pair_fee_cap_ppm / 1e6))
+
+        pair_fee_cap_ppm == 0 disables the ceiling (legacy: budget only).
+        budget 0 keeps the zero-budget equalization invariant: only free
+        routes are admitted.
+        """
+        budget = max(0, int(budget_sats or 0))
+        if cfg is None:
+            cfg = self._config_snapshot()
+        ppm_raw = getattr(cfg, "pair_fee_cap_ppm", 0)
+        ppm = int(ppm_raw) if isinstance(ppm_raw, (int, float)) else 0
+        amount = int(amount_sats or 0)
+        if ppm <= 0 or amount <= 0:
+            return budget
+        ppm_cap_sats = (amount * ppm + 999_999) // 1_000_000
+        return min(budget, ppm_cap_sats)
+
     @staticmethod
     def _pair_max_fee_sats(pair: PairCandidate) -> int:
         """Return the fee ceiling execution must honor for this pair.
 
-        When the probability budget bonus accepted a route above the raw
-        pair budget, find_candidates stores the planner's effective budget
-        on the pair (``effective_budget_sats``). Execution and budget
-        reservation must use that same ceiling or _validate_route would
-        deterministically reject every bonus-band route. With the default
-        bonus of 0.0 the effective budget equals the raw pair budget and
-        behavior is unchanged.
+        find_candidates stores the per-attempt ceiling (the probability-
+        adjusted budget bounded by the pair_fee_cap_ppm ceiling — audit F1)
+        on ``effective_budget_sats``. When present it IS the ceiling, even
+        when below the raw pair budget: the budget is the reservation
+        amount cap, not the per-attempt fee envelope. Pairs without a
+        stored ceiling (manual execute_candidate) fall back to the raw
+        budget the caller authorized.
         """
         base = int(getattr(pair, "pair_budget_sats", 0) or 0)
         effective = getattr(pair, "effective_budget_sats", None)
         if effective is None:
             return base
         try:
-            effective = int(effective)
+            return int(effective)
         except (TypeError, ValueError):
             return base
-        return max(base, effective)
 
     def _config_snapshot(self) -> Any:
         return self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
@@ -2194,6 +2227,11 @@ class RebalanceEngine:
             int(getattr(pair, "pair_budget_sats", 0) or 0),
             int(getattr(route_result, "probability_ppm", 0) or 0),
         )
+        # Audit F1: the retry route must honor the same per-attempt ceiling
+        # as the original acceptance.
+        effective_budget = self._per_attempt_fee_ceiling(
+            int(getattr(pair, "amount_sats", 0) or 0), effective_budget
+        )
         if int(getattr(route_result, "route_cost_sats", 0) or 0) > effective_budget:
             first_result.error = (
                 f"{first_result.error}; retry_route_over_budget: "
@@ -2352,6 +2390,11 @@ class RebalanceEngine:
             effective_budget = self._probability_adjusted_budget(
                 scaled_budget,
                 int(getattr(route_result, "probability_ppm", 0) or 0),
+            )
+            # Audit F1: partial fills honor the per-attempt ppm ceiling at
+            # the retry amount, same as the original acceptance.
+            effective_budget = self._per_attempt_fee_ceiling(
+                amount_sats, effective_budget
             )
             pair.effective_budget_sats = int(effective_budget)
             if route_cost > effective_budget:

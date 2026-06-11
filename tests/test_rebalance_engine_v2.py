@@ -955,7 +955,14 @@ def test_polar_s7_oscillation_loses_to_hold_margin(mock_plugin, mock_database):
     from modules.rebalance_engine_v2 import RebalanceEngine
     from modules.rebalance_types_v2 import PairCandidate
 
-    cfg = Config(dry_run=True, rebalance_router="v3", rebalance_hold_margin=0.05)
+    # pair_fee_cap_ppm raised so the per-attempt ceiling (F1) does not
+    # reject the route before the hold-margin gate gets to decide.
+    cfg = Config(
+        dry_run=True,
+        rebalance_router="v3",
+        rebalance_hold_margin=0.05,
+        pair_fee_cap_ppm=5_000,
+    )
     mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
     mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
     mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
@@ -1446,6 +1453,9 @@ def test_c1_engine_rejects_route_bait_even_when_route_prices(
     from modules.rebalance_types_v2 import PairCandidate
 
     engine = _make_engine(mock_plugin, mock_database)
+    # Lift the per-attempt ppm ceiling (F1) above the bait route's cost so
+    # this test keeps exercising the hold-margin gate, not the ceiling.
+    engine.config.pair_fee_cap_ppm = 10_000
     engine.router_v3 = MagicMock(name="market_router")
     engine._audit = MagicMock()
     engine._build_snapshot = MagicMock(
@@ -3123,9 +3133,12 @@ def test_coordination_pair_with_negative_ev_is_rejected_by_hold_margin(
     p*score dwarf every penalty so the hold-margin gate could never reject
     a coordination pair. Normalized scores make the gate real."""
     engine = _make_engine(mock_plugin, mock_database)
+    # Lift the per-attempt ppm ceiling (F1) above the route cost so the
+    # sats-EV hold-margin gate is what rejects this pair.
+    engine.config.pair_fee_cap_ppm = 100_000
     engine.router_v3 = MagicMock(name="market_router")
-    # Route prices at nearly the entire pair budget: expected_fee ~= 1.0 and
-    # capital_risk ~= 1.0, so final_score is negative unless score is huge.
+    # Route prices at nearly the entire pair budget: the sats EV is deeply
+    # negative, so the hold-margin gate must reject.
     engine.router_v3.price_pair.return_value = SimpleNamespace(
         success=True,
         route_cost_sats=9_999,

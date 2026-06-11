@@ -199,6 +199,82 @@ def test_f2d_hold_margin_is_respected_in_sats(mock_plugin, mock_database):
 
 
 # ---------------------------------------------------------------------------
+# F1 — per-attempt fee ceiling: the 30-day budget is the reservation cap,
+# the ppm cap bounds any single attempt
+# ---------------------------------------------------------------------------
+
+
+def test_f1_budget_does_not_double_as_fee_envelope(mock_plugin, mock_database):
+    """Audit case: a 2,500-sat capex budget must not approve a 25,000-ppm
+    fee on a 100k move. With pair_fee_cap_ppm=1000 (default) the
+    per-attempt ceiling on 100k is 100 sats, so a 150-sat route is
+    rejected even though the budget would cover it."""
+    engine = _make_engine(mock_plugin, mock_database)
+    pair = _make_pair(
+        amount_sats=100_000,
+        pair_budget_sats=2_500,
+        dest_out_fee_ppm=5_000,
+    )
+
+    selected = _run_single_pair(engine, pair, route_cost_sats=150)
+
+    assert selected == []
+    assert _skip_reasons(engine).get("200x2x0") == "route_over_budget"
+
+
+def test_f1_execution_honors_ppm_ceiling_not_budget(mock_plugin, mock_database):
+    """An accepted route's execution fee ceiling is the per-attempt cap
+    (min(budget, ceil(amount * ppm / 1e6))), not the full pair budget."""
+    engine = _make_engine(mock_plugin, mock_database)
+    pair = _make_pair(
+        amount_sats=100_000,
+        pair_budget_sats=2_500,
+        dest_out_fee_ppm=5_000,
+    )
+
+    selected = _run_single_pair(engine, pair, route_cost_sats=50)
+
+    assert selected == [pair]
+    assert int(pair.effective_budget_sats) == 100
+    assert engine._pair_max_fee_sats(pair) == 100
+    assert engine._execution_kwargs(pair)["max_fee_sats"] == 100
+
+
+def test_f1_zero_ppm_cap_keeps_budget_envelope(mock_plugin, mock_database):
+    """pair_fee_cap_ppm == 0 disables the ceiling (legacy behavior: the
+    budget is the per-attempt envelope)."""
+    engine = _make_engine(mock_plugin, mock_database, pair_fee_cap_ppm=0)
+    pair = _make_pair(
+        amount_sats=100_000,
+        pair_budget_sats=2_500,
+        dest_out_fee_ppm=4_000,
+    )
+
+    selected = _run_single_pair(engine, pair, route_cost_sats=150)
+
+    assert selected == [pair]
+    assert engine._pair_max_fee_sats(pair) == 2_500
+
+
+def test_f1_small_budget_remains_binding_below_ppm_cap(
+    mock_plugin, mock_database
+):
+    """The ceiling never exceeds the pair budget: a 30-sat budget with a
+    1000-ppm cap on 100k (100 sats) still only authorizes 30 sats."""
+    engine = _make_engine(mock_plugin, mock_database)
+    pair = _make_pair(
+        amount_sats=100_000,
+        pair_budget_sats=30,
+        dest_out_fee_ppm=5_000,
+    )
+
+    selected = _run_single_pair(engine, pair, route_cost_sats=50)
+
+    assert selected == []
+    assert _skip_reasons(engine).get("200x2x0") == "route_over_budget"
+
+
+# ---------------------------------------------------------------------------
 # F3 — capital_risk_penalty only when the effective budget differs
 # ---------------------------------------------------------------------------
 
