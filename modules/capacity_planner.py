@@ -339,6 +339,12 @@ class CapacityPlanner:
         winners = self._identify_winners(all_profitability, all_flow)
         losers = self._identify_losers(all_profitability, all_flow)
 
+        # F4a (audit): price the EXECUTED close path. The redeployment-EV
+        # demotion previously ran only in generate_report, so execute_cycle
+        # closed channels without pricing whether the freed capital had
+        # anywhere profitable to go.
+        self._apply_redeployment_ev_demotion(losers, winners, cfg)
+
         # Publish loser SCIDs for Boltz coordination (avoid loop-out through doomed channels)
         self._last_loser_scids = {
             l.get("scid") for l in losers
@@ -1106,6 +1112,73 @@ class CapacityPlanner:
             return False  # Unknowable data: stay conservative, keep the gate
         return forward_count == 0 and days_open > self._flow_window_days() + 7
 
+    def _dead_capital_defib_attempted(self, scid: str) -> bool:
+        """F4b: has at least one diagnostic rebalance EXECUTED recently?
+
+        Reuses the same evidence source as the regular loser path (which
+        requires attempt_count >= 2): diagnostic rebalance attempts recorded
+        in the last 14 days. Dead-capital staging requires >= 1 executed
+        attempt before a CLOSE stage may be entered.
+        """
+        db = self.profitability.database if self.profitability else None
+        if db is None:
+            return False
+        try:
+            stats = db.get_diagnostic_rebalance_stats(scid, days=14)
+            return int(stats.get("attempt_count", 0) or 0) >= 1
+        except Exception:
+            return False
+
+    def _record_fee_reduce_delegation(self, scid: str, peer_id: str) -> bool:
+        """F4c: record FEE_REDUCE stage entry as an explicit planner action.
+
+        The planner does not execute fee reductions itself: the work is
+        delegated to the fee controller's zero-revenue descent, which will
+        walk the channel's fee toward the floor while it earns nothing.
+        Recording the delegation (a) makes the stage auditable in
+        planner_actions and (b) anchors the stage timer — the timer starts
+        only when this record succeeds, so a silently-skipped intervention
+        can never age a channel toward CLOSE.
+
+        Returns True when the action was recorded.
+        """
+        db = self.profitability.database if self.profitability else None
+        if db is None:
+            return False
+        try:
+            action_id = db.record_planner_action(
+                action_type="fee_reduce",
+                peer_id=peer_id,
+                channel_id=scid,
+                estimated_cost_sats=0,
+                reason=(
+                    "DEAD_CAPITAL stage entry: fee reduction delegated to "
+                    "the fee controller's zero-revenue descent"
+                ),
+            )
+            db.update_planner_action(action_id, status="delegated")
+        except Exception as e:
+            try:
+                self.plugin.log(
+                    f"DEAD CAPITAL: could not record FEE_REDUCE delegation for "
+                    f"{scid}: {e} — stage timer NOT started",
+                    level="warn",
+                )
+            except Exception:
+                pass
+            return False
+        try:
+            self.plugin.log(
+                f"DEAD CAPITAL: {scid} entered FEE_REDUCE — fee reduction is "
+                f"DELEGATED to the fee controller's zero-revenue descent (the "
+                f"planner does not set fees); stage timer starts from "
+                f"planner_action #{action_id}",
+                level="info",
+            )
+        except Exception:
+            pass
+        return True
+
     def _build_dead_capital_loser(
         self,
         scid: str,
@@ -1141,11 +1214,17 @@ class CapacityPlanner:
         persist_stage = None
 
         close_blocked = False
+        defib_gate_hold = False
         if stage == "none":
             action = "FEE_REDUCE"
             stage = "fee_reduction"
             entered_at = now
-            persist_stage = stage
+            # F4c: nothing in the planner executes FEE_REDUCE — the actual
+            # fee reduction is delegated to the fee controller's
+            # zero-revenue descent. Record that delegation as a planner
+            # action and start the stage timer only from that record.
+            if self._record_fee_reduce_delegation(scid, prof.peer_id):
+                persist_stage = stage
         elif stage == "fee_reduction" and entered_at and now - entered_at >= stage_timeout:
             action = "DEFIBRILLATE"
             stage = "defibrillation"
@@ -1159,6 +1238,11 @@ class CapacityPlanner:
                 # instead of advancing (and re-evaluate next cycle).
                 action = "DEFIBRILLATE"
                 close_blocked = True
+            elif not self._dead_capital_defib_attempted(scid):
+                # F4b: stage timers alone must not stage a CLOSE — at least
+                # one defibrillation must have actually EXECUTED first.
+                action = "DEFIBRILLATE"
+                defib_gate_hold = True
             else:
                 action = "CLOSE"
                 stage = "close"
@@ -1167,14 +1251,16 @@ class CapacityPlanner:
         elif stage == "defibrillation":
             action = "DEFIBRILLATE"
         else:
-            if close_protection:
+            if close_protection or not self._dead_capital_defib_attempted(scid):
                 # A previously persisted close stage is demoted back to
-                # defibrillation while the channel is protected.
+                # defibrillation while the channel is protected (or while no
+                # defibrillation has ever executed — F4b).
                 action = "DEFIBRILLATE"
                 stage = "defibrillation"
                 entered_at = now
                 persist_stage = stage
-                close_blocked = True
+                close_blocked = bool(close_protection)
+                defib_gate_hold = not close_protection
             else:
                 action = "CLOSE"
                 stage = "close"
@@ -1184,6 +1270,16 @@ class CapacityPlanner:
                 self.plugin.log(
                     f"DEAD CAPITAL: close staging blocked for {scid} "
                     f"(protection: {close_protection}); holding at DEFIBRILLATE",
+                    level="info",
+                )
+            except Exception:
+                pass
+        if defib_gate_hold:
+            try:
+                self.plugin.log(
+                    f"DEAD CAPITAL: close staging held for {scid} — no "
+                    f"executed defibrillation attempt in the last 14 days; "
+                    f"intervening before closing",
                     level="info",
                 )
             except Exception:
@@ -1239,27 +1335,8 @@ class CapacityPlanner:
         # Sort winners by ROI (descending)
         sorted_winners = sorted(winners, key=lambda x: x['roi'], reverse=True)
 
-        # EV-based demotion: check each CLOSE loser
-        for loser in losers:
-            if loser.get("action") != "CLOSE":
-                continue
-            # Fire sale and hard bleeders bypass EV check
-            if loser.get("is_fire_sale", False) or loser.get("is_hard_bleeder", False):
-                continue
-            # Compute redeployment EV
-            try:
-                ev, best_peer, winner_ev = self._calculate_redeployment_ev(
-                    loser, sorted_winners, self.config
-                )
-                loser["redeployment_ev"] = round(ev, 0)
-                loser["best_winner_peer"] = best_peer
-                loser["winner_ev"] = round(winner_ev, 0)
-
-                if ev <= 0:
-                    loser["action"] = "DEFIBRILLATE"
-                    loser["reason"] = f"{loser['reason']} (NO PROFITABLE REDEPLOYMENT)"
-            except Exception:
-                pass  # On error, keep original action
+        # EV-based demotion: check each CLOSE loser (shared with execute_cycle)
+        self._apply_redeployment_ev_demotion(losers, winners, self.config)
 
         # Re-separate after demotion
         fee_reduce = [l for l in losers if l.get("action") == "FEE_REDUCE"]
@@ -1315,6 +1392,37 @@ class CapacityPlanner:
             )
 
         return recommendations
+
+    def _apply_redeployment_ev_demotion(self, losers: List[Dict], winners: List[Dict], cfg) -> None:
+        """Price CLOSE losers against redeployment; demote unprofitable ones.
+
+        F4a (audit): closes are capital reallocations, not garbage
+        collection. A CLOSE loser whose redeployment EV is non-positive is
+        demoted to DEFIBRILLATE — the capital is better off staying until a
+        profitable destination exists. Fire-sale and hard-bleeder losers
+        bypass pricing: they are structurally unprofitable regardless of
+        where the capital would go. Mutates the loser dicts in place.
+        """
+        sorted_winners = sorted(winners, key=lambda x: x.get('roi', 0), reverse=True)
+        for loser in losers:
+            if loser.get("action") != "CLOSE":
+                continue
+            # Fire sale and hard bleeders bypass EV check
+            if loser.get("is_fire_sale", False) or loser.get("is_hard_bleeder", False):
+                continue
+            try:
+                ev, best_peer, winner_ev = self._calculate_redeployment_ev(
+                    loser, sorted_winners, cfg
+                )
+                loser["redeployment_ev"] = round(ev, 0)
+                loser["best_winner_peer"] = best_peer
+                loser["winner_ev"] = round(winner_ev, 0)
+
+                if ev <= 0:
+                    loser["action"] = "DEFIBRILLATE"
+                    loser["reason"] = f"{loser['reason']} (NO PROFITABLE REDEPLOYMENT)"
+            except Exception:
+                pass  # On error, keep original action
 
     def _discover_from_winners(self, winners: List[Dict]) -> List[Dict]:
         """Strategy 1: Propose existing winners for additional channel opens."""

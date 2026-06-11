@@ -124,6 +124,10 @@ class TestDeadCapitalCloseProtections:
         planner, prof_analyzer = _make_planner()
         _set_dead_capital(planner, stage="defibrillation")
         _expired_stage(prof_analyzer, stage="defibrillation")
+        # F4b: CLOSE staging requires at least one EXECUTED defibrillation
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 1
+        }
         prof = _make_prof(sourced_fee_sats=0, marginal_roi_percent=-80.0)
 
         losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow()})
@@ -319,3 +323,115 @@ class TestKalmanGateSemantics:
         assert len(losers) == 1
         assert losers[0]["action"] == "DEFIBRILLATE"
         assert losers[0]["close_protection"] == "KALMAN_LOW_CONFIDENCE"
+
+
+class TestDeadCapitalDefibExecutionGate:
+    """F4b (audit): stage advancement to CLOSE was driven by timers alone.
+    A CLOSE stage now requires at least one EXECUTED defibrillation attempt
+    (same evidence source the regular path uses with attempt_count >= 2)."""
+
+    def test_expired_defib_stage_holds_without_executed_attempt(self):
+        planner, prof_analyzer = _make_planner()
+        _set_dead_capital(planner, stage="defibrillation")
+        _expired_stage(prof_analyzer, stage="defibrillation")
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 0
+        }
+        prof = _make_prof(sourced_fee_sats=0, marginal_roi_percent=-80.0)
+
+        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow()})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "DEFIBRILLATE"
+        # The close stage must NOT be persisted
+        prof_analyzer.database.upsert_dead_capital_stage.assert_not_called()
+
+    def test_expired_defib_stage_advances_after_executed_attempt(self):
+        planner, prof_analyzer = _make_planner()
+        _set_dead_capital(planner, stage="defibrillation")
+        _expired_stage(prof_analyzer, stage="defibrillation")
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 1
+        }
+        prof = _make_prof(sourced_fee_sats=0, marginal_roi_percent=-80.0)
+
+        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow()})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "CLOSE"
+        prof_analyzer.database.upsert_dead_capital_stage.assert_called_with(
+            SCID, "close", pytest.approx(int(time.time()), abs=2)
+        )
+
+    def test_persisted_close_stage_demoted_without_executed_attempt(self):
+        """Legacy/poisoned close stages are demoted back to defibrillation
+        when no defibrillation ever executed."""
+        planner, prof_analyzer = _make_planner()
+        _set_dead_capital(planner, stage="close")
+        _expired_stage(prof_analyzer, stage="close", hours_ago=1)
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 0
+        }
+        prof = _make_prof(sourced_fee_sats=0, marginal_roi_percent=-80.0)
+
+        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow()})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "DEFIBRILLATE"
+        prof_analyzer.database.upsert_dead_capital_stage.assert_called_with(
+            SCID, "defibrillation", pytest.approx(int(time.time()), abs=2)
+        )
+
+
+class TestFeeReduceDelegation:
+    """F4c (audit): nothing executed FEE_REDUCE. Stage entry now records an
+    explicit planner action delegating the work to the fee controller's
+    zero-revenue descent, and the stage timer starts only from that record."""
+
+    def test_fee_reduce_entry_records_delegation_action(self):
+        planner, prof_analyzer = _make_planner()
+        _set_dead_capital(planner, stage="none")
+        prof_analyzer.database.record_planner_action.return_value = 77
+        prof = _make_prof(sourced_fee_sats=0, marginal_roi_percent=-10.0)
+
+        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow()})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "FEE_REDUCE"
+        kwargs = prof_analyzer.database.record_planner_action.call_args.kwargs
+        assert kwargs["action_type"] == "fee_reduce"
+        assert kwargs["channel_id"] == SCID
+        assert "zero-revenue descent" in kwargs["reason"]
+        prof_analyzer.database.update_planner_action.assert_called_with(
+            77, status="delegated"
+        )
+        # Timer started: stage persisted alongside the record
+        prof_analyzer.database.upsert_dead_capital_stage.assert_called_with(
+            SCID, "fee_reduction", pytest.approx(int(time.time()), abs=2)
+        )
+
+    def test_stage_timer_not_started_when_record_fails(self):
+        planner, prof_analyzer = _make_planner()
+        _set_dead_capital(planner, stage="none")
+        prof_analyzer.database.record_planner_action.side_effect = Exception("db down")
+        prof = _make_prof(sourced_fee_sats=0, marginal_roi_percent=-10.0)
+
+        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow()})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "FEE_REDUCE"
+        # No record -> no timer -> stage must not be persisted
+        prof_analyzer.database.upsert_dead_capital_stage.assert_not_called()
+
+    def test_delegation_recorded_once_not_every_cycle(self):
+        """While already in fee_reduction, no further actions are recorded."""
+        planner, prof_analyzer = _make_planner()
+        _set_dead_capital(planner, stage="fee_reduction")
+        _expired_stage(prof_analyzer, stage="fee_reduction", hours_ago=1)
+        prof = _make_prof(sourced_fee_sats=0, marginal_roi_percent=-10.0)
+
+        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow()})
+
+        assert len(losers) == 1
+        assert losers[0]["action"] == "FEE_REDUCE"
+        prof_analyzer.database.record_planner_action.assert_not_called()

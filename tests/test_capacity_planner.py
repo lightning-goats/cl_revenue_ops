@@ -3677,6 +3677,9 @@ class TestExecuteCycle:
                 "reason": "ZOMBIE",
                 "action": "CLOSE",
                 "marginal_roi": -90.0,
+                # ZOMBIE losers are fire sales; the flag also bypasses the
+                # F4a redeployment-EV pricing, matching _identify_losers.
+                "is_fire_sale": True,
             },
             {
                 "scid": "300x1x0",
@@ -4809,3 +4812,78 @@ class TestOpenEVAnchoredForecast:
 
         ev = planner._calculate_open_ev("02" + "ee" * 32, 1_000_000, cfg)
         assert ev < 0
+
+
+# ---------------------------------------------------------------------------
+# F4a: redeployment-EV pricing on the EXECUTED close path
+# ---------------------------------------------------------------------------
+
+class TestExecuteCycleRedeploymentPricing:
+    """F4a (audit): the redeployment-EV demotion only ran in generate_report;
+    execute_cycle (the path that actually closes channels) was unpriced."""
+
+    @staticmethod
+    def _stagnant_close_loser():
+        return {
+            "scid": "100x1x0",
+            "peer_id": "02" + "a" * 64,
+            "reason": "STAGNANT",
+            "action": "CLOSE",
+            "marginal_roi": -5.0,
+            "capacity": 2_000_000,
+            "marginal_profit_30d_sats": -100,
+            "is_fire_sale": False,
+            "is_hard_bleeder": False,
+        }
+
+    def test_unpriced_close_demoted_to_defibrillate_in_execute_cycle(self):
+        """With no profitable redeployment, the executed close path must
+        demote the loser instead of closing it."""
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        planner._identify_winners = MagicMock(return_value=[])
+        planner._identify_losers = MagicMock(return_value=[self._stagnant_close_loser()])
+        planner._execute_close = MagicMock()
+        planner.rebalancer = MagicMock()
+        planner.rebalancer.diagnostic_rebalance.return_value = {"success": True}
+
+        cfg = _make_cycle_cfg(planner_execute_closes=True)
+        result = planner.execute_cycle(cfg)
+
+        planner._execute_close.assert_not_called()
+        assert result["closes"] == []
+        assert len(result["defibrillations"]) == 1
+        assert "NO PROFITABLE REDEPLOYMENT" in result["defibrillations"][0]["reason"]
+
+    def test_positive_redeployment_ev_still_closes(self):
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        planner._identify_winners = MagicMock(return_value=[
+            {"peer_id": "02" + "f" * 64, "roi": 60.0, "scid": "9x9x9"},
+        ])
+        planner._identify_losers = MagicMock(return_value=[self._stagnant_close_loser()])
+        planner._calculate_redeployment_ev = MagicMock(
+            return_value=(15_000.0, "02" + "f" * 64, 20_000.0)
+        )
+        planner._execute_close = MagicMock(return_value={"action_id": 1, "status": "completed"})
+
+        cfg = _make_cycle_cfg(planner_execute_closes=True, planner_max_closes_per_cycle=1)
+        result = planner.execute_cycle(cfg)
+
+        assert len(result["closes"]) == 1
+        planner._execute_close.assert_called_once()
+
+    def test_fire_sale_bypasses_redeployment_pricing(self):
+        """Structurally unprofitable losers close regardless of winners."""
+        loser = self._stagnant_close_loser()
+        loser["reason"] = "ZOMBIE"
+        loser["is_fire_sale"] = True
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        planner._identify_winners = MagicMock(return_value=[])
+        planner._identify_losers = MagicMock(return_value=[loser])
+        planner._calculate_redeployment_ev = MagicMock()
+        planner._execute_close = MagicMock(return_value={"action_id": 1, "status": "completed"})
+
+        cfg = _make_cycle_cfg(planner_execute_closes=True, planner_max_closes_per_cycle=1)
+        result = planner.execute_cycle(cfg)
+
+        planner._calculate_redeployment_ev.assert_not_called()
+        assert len(result["closes"]) == 1
