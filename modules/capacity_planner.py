@@ -30,6 +30,17 @@ _LOSER_SEVERITY = {
 _CLOSE_TX_VBYTES = 200
 _DEFAULT_CLOSE_FEE_RESERVE_MULTIPLIER = 2.0
 
+# F8 (audit LOW): the cooldown check deliberately excludes status='failed'
+# planner actions (failures must not consume the action budget) — but that
+# let unconnectable top candidates retry every single cycle forever. Failed
+# opens now back off exponentially: after N consecutive failures the peer is
+# skipped until 2^N hours (capped at 7 days) have passed since the latest.
+FAILED_OPEN_BACKOFF_CAP_HOURS = 168  # 7 days
+
+# F8: never concentrate more than this multiple of the max single-channel
+# size on one peer via planner opens.
+PEER_EXPOSURE_CAP_MULTIPLIER = 2
+
 # F1 (audit CRITICAL): the legacy open-EV forecast assumed 30% of capacity
 # turning over daily at 150 ppm — i.e. 45 ppm of capacity per DAY, which is
 # 16,425 ppm/year gross, 10-50x observed reality. It approved nearly every
@@ -134,6 +145,8 @@ class CapacityPlanner:
         self._cycle_channels_source: Dict[str, list] = {}
         # F1: per-cycle cached revenue anchor (1-tuple when computed, else None)
         self._observed_daily_ppm_cache: tuple | None = None
+        # F8: per-cycle cached listpeerchannels result (set by execute_cycle)
+        self._cycle_peer_channels: list | None = None
 
     def set_capex_engine(self, engine: 'CapexBudgetEngine'):
         """Inject the unified capex budget engine."""
@@ -237,6 +250,7 @@ class CapacityPlanner:
         self._cycle_channels_source.clear()
         self._cycle_nodes_by_id.clear()
         self._observed_daily_ppm_cache = None
+        self._cycle_peer_channels = None
 
     def _get_cached_channels(self, peer_id: str, direction: str = "destination") -> list:
         """Get listchannels result, cached for this cycle."""
@@ -446,6 +460,7 @@ class CapacityPlanner:
         portfolio_state = "healthy"
         try:
             peer_channels = (self.data_service.get_peer_channels() if self.data_service else self.plugin.rpc.listpeerchannels()).get("channels", [])
+            self._cycle_peer_channels = peer_channels  # reused by exposure cap (F8)
             portfolio_state = self._check_portfolio_balance_gate(peer_channels)
             if portfolio_state == "watch":
                 self.plugin.log(f"Portfolio balance governor: {portfolio_state} — opens permitted with warning", level='info')
@@ -528,6 +543,19 @@ class CapacityPlanner:
 
             for candidate in sorted(candidates, key=lambda c: c.get("score", 0), reverse=True):
                 peer_id = candidate["peer_id"]
+
+                # F8: exponential backoff for repeatedly failing opens
+                backoff_reason = self._failed_open_backoff_reason(peer_id)
+                if backoff_reason:
+                    summary["skipped_reasons"].append(backoff_reason)
+                    continue
+
+                # F8: per-peer exposure cap
+                exposure_reason = self._peer_exposure_cap_reason(peer_id, cfg)
+                if exposure_reason:
+                    summary["skipped_reasons"].append(exposure_reason)
+                    continue
+
                 channel_size = self._size_channel(candidate, sizing_pool_for(candidate), available_sats, cfg)
                 ev = self._calculate_open_ev(peer_id, channel_size, cfg)
                 summary["evaluated_open_candidates"].append({
@@ -2605,6 +2633,102 @@ class CapacityPlanner:
             return True, "No recent actions for peer"
         except Exception as e:
             return False, f"Cooldown check failed: {e}"
+
+    def _failed_open_backoff_reason(self, peer_id: str) -> Optional[str]:
+        """F8: skip candidates in exponential failed-open backoff.
+
+        Counts the peer's consecutive most-recent FAILED open actions within
+        the 7-day window (a completed/dry_run open resets the streak). With
+        N failures, the peer is skipped until 2^N hours — capped at
+        FAILED_OPEN_BACKOFF_CAP_HOURS — have elapsed since the latest
+        failure. Returns a skip reason, or None when clear to retry.
+        """
+        db = self.profitability.database if self.profitability else None
+        if db is None:
+            return None
+        try:
+            actions = db.get_recent_planner_actions(
+                peer_id, hours=FAILED_OPEN_BACKOFF_CAP_HOURS
+            )
+        except Exception:
+            return None
+
+        failures = 0
+        last_failure_ts = 0
+        for action in actions or []:  # newest first (ORDER BY created_at DESC)
+            if not isinstance(action, dict):
+                continue
+            if str(action.get("action_type", "")) != "open":
+                continue
+            status = str(action.get("status", "")).lower()
+            if status == "failed":
+                failures += 1
+                try:
+                    created_at = int(action.get("created_at", 0) or 0)
+                except (TypeError, ValueError):
+                    created_at = 0
+                last_failure_ts = max(last_failure_ts, created_at)
+            elif status in ("completed", "dry_run"):
+                break  # a successful open resets the failure streak
+
+        if failures <= 0 or last_failure_ts <= 0:
+            return None
+
+        backoff_hours = min(float(2 ** min(failures, 30)), float(FAILED_OPEN_BACKOFF_CAP_HOURS))
+        elapsed_hours = max(0.0, (time.time() - last_failure_ts) / 3600.0)
+        if elapsed_hours < backoff_hours:
+            return (
+                f"Failed-open backoff for {peer_id[:16]}...: {failures} recent "
+                f"failure(s), retry in {backoff_hours - elapsed_hours:.1f}h"
+            )
+        return None
+
+    def _peer_exposure_cap_reason(self, peer_id: str, cfg) -> Optional[str]:
+        """F8: skip opens that would over-concentrate capital on one peer.
+
+        When the existing CHANNELD_NORMAL capacity to the peer is already
+        >= planner_max_channel_sats x PEER_EXPOSURE_CAP_MULTIPLIER, another
+        open adds concentration risk without diversification benefit.
+
+        Reuses the listpeerchannels snapshot already fetched for the
+        portfolio governor this cycle (no extra RPC in the hot loop).
+        """
+        max_channel_sats = getattr(cfg, "planner_max_channel_sats", 0)
+        if isinstance(max_channel_sats, bool) or not isinstance(max_channel_sats, (int, float)):
+            return None
+        cap_sats = int(max_channel_sats) * PEER_EXPOSURE_CAP_MULTIPLIER
+        if cap_sats <= 0:
+            return None
+
+        channels = self._cycle_peer_channels
+        if channels is None:
+            try:
+                result = (
+                    self.data_service.get_peer_channels()
+                    if self.data_service
+                    else self.plugin.rpc.listpeerchannels()
+                )
+                channels = result.get("channels", []) if isinstance(result, dict) else []
+            except Exception:
+                return None
+
+        total_capacity_sats = 0
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
+            if str(channel.get("peer_id", "")) != peer_id:
+                continue
+            if channel.get("state") != "CHANNELD_NORMAL":
+                continue
+            total_capacity_sats += base_to_sats_floor(parse_msat(channel.get("total_msat", 0)))
+
+        if total_capacity_sats >= cap_sats:
+            return (
+                f"Peer exposure cap for {peer_id[:16]}...: existing capacity "
+                f"{total_capacity_sats} sats >= cap {cap_sats} sats "
+                f"({PEER_EXPOSURE_CAP_MULTIPLIER}x planner_max_channel_sats)"
+            )
+        return None
 
     @staticmethod
     def _close_fee_reserve_multiplier(cfg) -> float:

@@ -5027,3 +5027,169 @@ class TestBlockedPortfolioRemedies:
 
         assert result["portfolio_state"] == "constrained"
         planner._execute_open.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# F8: failed-open exponential backoff and per-peer exposure cap
+# ---------------------------------------------------------------------------
+
+def _failed_open(hours_ago, status="failed", action_type="open"):
+    return {
+        "action_type": action_type,
+        "status": status,
+        "created_at": int(time.time()) - int(hours_ago * 3600),
+        "peer_id": "02" + "a" * 64,
+    }
+
+
+class TestFailedOpenBackoff:
+    """F8 (audit): cooldown excludes status='failed', so unconnectable top
+    candidates retried every cycle forever. Failed opens now back off
+    exponentially (2^N hours for N consecutive failures, capped at 7 days)."""
+
+    def _planner(self, actions):
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        prof.database.get_recent_planner_actions.return_value = actions
+        return planner
+
+    def test_one_recent_failure_backs_off_two_hours(self):
+        planner = self._planner([_failed_open(hours_ago=0.5)])
+        reason = planner._failed_open_backoff_reason("02" + "a" * 64)
+        assert reason is not None
+        assert "backoff" in reason.lower()
+
+    def test_backoff_expires_after_window(self):
+        planner = self._planner([_failed_open(hours_ago=3)])  # 2^1 = 2h passed
+        assert planner._failed_open_backoff_reason("02" + "a" * 64) is None
+
+    def test_three_failures_back_off_eight_hours(self):
+        planner = self._planner([
+            _failed_open(hours_ago=6),
+            _failed_open(hours_ago=20),
+            _failed_open(hours_ago=40),
+        ])
+        # 2^3 = 8h > 6h elapsed -> still backing off
+        assert planner._failed_open_backoff_reason("02" + "a" * 64) is not None
+
+    def test_backoff_capped_at_seven_days(self):
+        planner = self._planner([
+            _failed_open(hours_ago=167),
+            *[_failed_open(hours_ago=167.5) for _ in range(9)],
+        ])
+        # 2^10 = 1024h but cap is 168h; 167h elapsed < 168h -> backing off
+        reason = planner._failed_open_backoff_reason("02" + "a" * 64)
+        assert reason is not None
+        # ...and barely: under the cap the remaining wait is < 1.5h
+        planner2 = self._planner([
+            _failed_open(hours_ago=168.5),
+            *[_failed_open(hours_ago=169) for _ in range(9)],
+        ])
+        # window query is 168h; actions older than that are excluded anyway —
+        # emulate the DB by returning nothing
+        planner2.profitability.database.get_recent_planner_actions.return_value = []
+        assert planner2._failed_open_backoff_reason("02" + "a" * 64) is None
+
+    def test_successful_open_resets_streak(self):
+        planner = self._planner([
+            _failed_open(hours_ago=1, status="completed"),
+            _failed_open(hours_ago=5),
+            _failed_open(hours_ago=10),
+        ])
+        assert planner._failed_open_backoff_reason("02" + "a" * 64) is None
+
+    def test_non_open_actions_ignored(self):
+        planner = self._planner([
+            _failed_open(hours_ago=0.5, action_type="defibrillate"),
+        ])
+        assert planner._failed_open_backoff_reason("02" + "a" * 64) is None
+
+    def test_execute_cycle_skips_backing_off_candidate(self):
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        peer = "02" + "a" * 64
+        prof.database.get_recent_planner_actions.return_value = [
+            _failed_open(hours_ago=0.5),
+        ]
+        planner._identify_winners = MagicMock(return_value=[])
+        planner._identify_losers = MagicMock(return_value=[])
+        planner._discover_peers = MagicMock(return_value=[
+            {"peer_id": peer, "score": 0.9, "reason": "x"},
+        ])
+        planner._update_candidate_pool = MagicMock()
+        planner._calculate_open_ev = MagicMock(return_value=5_000)
+        planner._execute_open = MagicMock()
+
+        result = planner.execute_cycle(_make_cycle_cfg())
+
+        planner._execute_open.assert_not_called()
+        assert any("backoff" in r.lower() for r in result["skipped_reasons"])
+
+
+class TestPeerExposureCap:
+    """F8: skip opens when existing capacity to the peer is already
+    >= planner_max_channel_sats x 2."""
+
+    PEER = "02" + "a" * 64
+
+    def _planner_with_peer_capacity(self, capacity_sats, state="CHANNELD_NORMAL"):
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "peer_id": self.PEER,
+                    "state": state,
+                    "total_msat": capacity_sats * 1000,
+                    "to_us_msat": 0,
+                }
+            ]
+        }
+        return planner, plugin
+
+    def test_exposure_at_cap_is_skipped(self):
+        planner, plugin = self._planner_with_peer_capacity(20_000_000)
+        cfg = _make_cycle_cfg()  # planner_max_channel_sats = 10M -> cap 20M
+        reason = planner._peer_exposure_cap_reason(self.PEER, cfg)
+        assert reason is not None
+        assert "exposure cap" in reason.lower()
+
+    def test_exposure_below_cap_is_allowed(self):
+        planner, plugin = self._planner_with_peer_capacity(19_000_000)
+        cfg = _make_cycle_cfg()
+        assert planner._peer_exposure_cap_reason(self.PEER, cfg) is None
+
+    def test_non_normal_channels_do_not_count(self):
+        planner, plugin = self._planner_with_peer_capacity(
+            50_000_000, state="CHANNELD_AWAITING_LOCKIN"
+        )
+        cfg = _make_cycle_cfg()
+        assert planner._peer_exposure_cap_reason(self.PEER, cfg) is None
+
+    def test_other_peers_capacity_does_not_count(self):
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "peer_id": "03" + "b" * 64,
+                    "state": "CHANNELD_NORMAL",
+                    "total_msat": 50_000_000_000,
+                }
+            ]
+        }
+        cfg = _make_cycle_cfg()
+        assert planner._peer_exposure_cap_reason(self.PEER, cfg) is None
+
+    def test_execute_cycle_skips_over_exposed_candidate(self):
+        planner, plugin = self._planner_with_peer_capacity(25_000_000)
+        peer = "02" + "a" * 64
+        planner._identify_winners = MagicMock(return_value=[])
+        planner._identify_losers = MagicMock(return_value=[])
+        planner._discover_peers = MagicMock(return_value=[
+            {"peer_id": peer, "score": 0.9, "reason": "x"},
+        ])
+        planner._update_candidate_pool = MagicMock()
+        planner._calculate_open_ev = MagicMock(return_value=5_000)
+        planner._execute_open = MagicMock()
+
+        result = planner.execute_cycle(_make_cycle_cfg())
+
+        planner._execute_open.assert_not_called()
+        assert any("exposure cap" in r.lower() for r in result["skipped_reasons"])
