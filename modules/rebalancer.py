@@ -1233,12 +1233,16 @@ class EVRebalancer:
         - Uses ephemeral fee cache for listchannels calls
         """
         candidates = []
-        # Early-suppression paths (no slots / capital controls) report an
-        # empty liquidity state below — no engine snapshot exists yet on those
-        # paths. The NORMAL path reports REAL state derived from the engine
-        # cycle snapshot via _report_liquidity_state_from_cycle.
-        depleted_channels: List[Tuple[str, Dict[str, Any], float]] = []
-        source_channels: List[Tuple[str, Dict[str, Any], float]] = []
+        # Early-suppression paths (no slots / capital controls) deliberately
+        # do NOT report liquidity state: no engine snapshot exists on those
+        # paths, and the consumer (cl-hive's record_member_liquidity_report)
+        # overwrites depleted/saturated wholesale — partial updates are not
+        # supported — so writing hardcoded-empty lists with a fresh timestamp
+        # would clobber the last REAL state under sustained suppression.
+        # Skipping lets the previous real payload stand until the
+        # coordinator's TTL ages it out, which is honest. The NORMAL path
+        # reports REAL state derived from the engine cycle snapshot via
+        # _report_liquidity_state_from_cycle.
 
         # Initialize ephemeral fee cache for this run (cleared at end)
         self._fee_cache: Dict[Tuple[str, int], Optional[int]] = {}
@@ -1272,7 +1276,6 @@ class EVRebalancer:
                 self.plugin.log(
                     f"No rebalance slots available ({self.job_manager.active_job_count} jobs active)"
                 )
-                self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
             
             # Check capital controls (pass cfg for thread-safe config access)
@@ -1284,7 +1287,6 @@ class EVRebalancer:
                     safety_block=True,
                     budget_blocked=True,
                 )
-                self._report_hive_liquidity_state(depleted_channels, source_channels, candidates)
                 return candidates
 
             # V2 engine handles candidate selection AND execution.

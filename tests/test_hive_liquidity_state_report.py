@@ -10,7 +10,13 @@ These tests pin the honest producer contract:
   derived from the engine's state snapshot (depleted = below the planner
   band-low, source = above band-high) and the selected pair candidates;
 - channel entries carry capacity in BOTH keys: capacity_msat (primary,
-  what cl-hive's liquidity_coordinator reads) and capacity_sats (compat).
+  what cl-hive's liquidity_coordinator reads) and capacity_sats (compat);
+- suppression cycles (no slots / capital controls) do NOT write the
+  payload at all: cl-hive's record_member_liquidity_report overwrites
+  every field (no partial-update support), so a suppression-time write
+  with empty lists would clobber the last real state with fresh-looking
+  emptiness. Skipping lets the previous real state age out via the
+  coordinator's TTL, which is honest.
 """
 
 from types import SimpleNamespace
@@ -168,6 +174,44 @@ def test_report_failure_does_not_break_cycle(mock_plugin, mock_database):
     # Must not raise.
     result = r.find_rebalance_candidates()
     assert result == []
+
+
+def _liquidity_state_pushes(data_service):
+    return [
+        c for c in data_service.datastore_push.call_args_list
+        if c.args[0] == ["revenue", "liquidity-state"]
+    ]
+
+
+def test_no_slots_suppression_leaves_liquidity_state_untouched(
+    mock_plugin, mock_database
+):
+    # Suppression paths must not write the payload: the consumer
+    # (record_member_liquidity_report) overwrites all fields, so an empty
+    # write with a fresh timestamp would clobber the last REAL state.
+    cycle_result = CycleResult(candidates=[], snapshot=_snapshot([]))
+    r, data_service = _make_rebalancer(mock_plugin, mock_database, cycle_result)
+    r.job_manager = MagicMock()
+    r.job_manager.slots_available.return_value = 0
+    r.job_manager.active_job_count = 3
+
+    result = r.find_rebalance_candidates()
+
+    assert result == []
+    assert _liquidity_state_pushes(data_service) == []
+
+
+def test_capital_controls_suppression_leaves_liquidity_state_untouched(
+    mock_plugin, mock_database
+):
+    cycle_result = CycleResult(candidates=[], snapshot=_snapshot([]))
+    r, data_service = _make_rebalancer(mock_plugin, mock_database, cycle_result)
+    r._check_capital_controls = MagicMock(return_value=False)
+
+    result = r.find_rebalance_candidates()
+
+    assert result == []
+    assert _liquidity_state_pushes(data_service) == []
 
 
 def test_payload_builder_emits_capacity_in_both_keys(mock_plugin, mock_database):
