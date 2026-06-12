@@ -258,6 +258,13 @@ class GaussianThompsonState:
     last_sampled_fee: int = 0
     last_sample_time: int = 0
 
+    # One-shot prior re-seed marker (fleet_fee_median-skew era repair).
+    # 0 = the re-seed check has not resolved yet. Stamped (and persisted)
+    # once _maybe_reseed_skewed_prior resolves against an available prior
+    # source — whether or not a correction was applied — so the check runs
+    # at most once per channel.
+    reseeded_at: int = 0
+
     # -----------------------------------------------------------------
     # 3x3 matrix helpers (inline to avoid external deps)
     # -----------------------------------------------------------------
@@ -1399,7 +1406,8 @@ class GaussianThompsonState:
             "zero_run_start_ts": self.zero_run_start_ts,
             "exploration_boost": self.exploration_boost,
             "last_sampled_fee": self.last_sampled_fee,
-            "last_sample_time": self.last_sample_time
+            "last_sample_time": self.last_sample_time,
+            "reseeded_at": self.reseeded_at,
         }
 
     @classmethod
@@ -1525,6 +1533,12 @@ class GaussianThompsonState:
             cls.EXPLORATION_BOOST_MIN,
             min(cls.EXPLORATION_BOOST_MAX, state.exploration_boost),
         )
+
+        # One-shot prior re-seed marker (legacy dicts: never resolved)
+        try:
+            state.reseeded_at = max(0, int(d.get("reseeded_at", 0)))
+        except (TypeError, ValueError):
+            state.reseeded_at = 0
 
         state.last_sampled_fee = d.get("last_sampled_fee", 0)
         state.last_sample_time = d.get("last_sample_time", 0)
@@ -2143,6 +2157,11 @@ class FeeController:
     # prior so the sample-time bias machinery carries the signal through the
     # early fee cycles (until real observations accumulate).
     INITIAL_PRIOR_NUDGE_WEIGHT = 0.3
+    # One-time prior re-seed (fleet_fee_median-skew era repair): minimum
+    # relative divergence between a quiet channel's stored prior mean and
+    # the CURRENT best prior source before the prior is re-seeded.
+    # See _maybe_reseed_skewed_prior.
+    PRIOR_RESEED_SKEW_FRAC = 0.15
 
     # ==========================================================================
     # Issue #20: Flow-Based Ceiling Reduction
@@ -5527,6 +5546,18 @@ class FeeController:
 
             # Load channel fee state
             ts_state = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
+            # One-time repair of skewed-era priors while the state is in
+            # hand — resolves at most once per channel, so the sampled
+            # distribution below already reflects the corrected prior.
+            # See _maybe_reseed_skewed_prior.
+            try:
+                self._maybe_reseed_skewed_prior(channel_id, peer_id, ts_state)
+            except Exception as reseed_err:
+                self.plugin.log(
+                    f"PRIOR_RESEED: check failed for {channel_id[:16]}...: "
+                    f"{reseed_err}",
+                    level='debug'
+                )
             observation_count = len(ts_state.thompson.observations)
             sparse_data_conservative = self._is_sparse_data_channel(
                 observation_count=observation_count,
@@ -6854,6 +6885,123 @@ class FeeController:
 
         return result
     
+    def _select_best_fee_prior(
+        self, peer_id: str, scid: str, allow_rpc: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """Select the best available fee prior source for a channel.
+
+        Priority: fleet-informed prior (most reliable — real forward data;
+        read from the cached hint snapshot, no RPC) > network gossip prior >
+        None (caller keeps the defaults).
+
+        allow_rpc=False skips the network-gossip fallback: that path is an
+        uncached listchannels RPC, so per-cycle callers running inside the
+        locked channel loop (see _maybe_reseed_skewed_prior) must not take
+        it. Out-of-cycle callers (set_initial_fee) keep the full chain.
+
+        Returns {"mean", "std", "source"} or None when no source has data.
+        """
+        if self.hive_hints:
+            try:
+                fleet_fee = self.hive_hints.get_fleet_fee_prior(peer_id)
+                if fleet_fee and fleet_fee > 0:
+                    return {
+                        "mean": fleet_fee,
+                        "std": self.FLEET_PRIOR_STD_PPM,
+                        "source": "fleet",
+                    }
+            except Exception:
+                pass
+
+        if not allow_rpc:
+            return None
+
+        network_prior = self._get_network_fee_prior(peer_id, scid)
+        if network_prior:
+            return {
+                "mean": network_prior["mean"],
+                "std": network_prior["std"],
+                "source": "network",
+            }
+        return None
+
+    def _maybe_reseed_skewed_prior(
+        self,
+        channel_id: str,
+        peer_id: str,
+        fee_state: 'ChannelFeeState',
+    ) -> bool:
+        """One-time-per-channel Thompson prior re-seed (skewed-prior repair).
+
+        Channels opened while get_fleet_fee_prior returned a skewed
+        fleet_fee_median had their PERSISTENT priors seeded from that skew
+        (set_initial_fee, audit F5). Active channels self-correct through
+        observations, but quiet channels (< MIN_OBSERVATIONS) keep sampling
+        around the bad prior forever.
+
+        Called from the fee cycle where the channel's state is already in
+        hand (cheap: the fleet prior getter reads the cached hint snapshot;
+        no new RPC — allow_rpc=False skips the uncached gossip fallback,
+        which is fine because the skew era seeded priors FROM the fleet
+        median, so the affected population has fleet priors). When the
+        state has fewer than MIN_OBSERVATIONS observations and its
+        prior_mean_fee diverges by more than PRIOR_RESEED_SKEW_FRAC from the
+        CURRENT best prior source (same selection helper as
+        set_initial_fee), the prior is re-seeded and one durable nudge
+        recorded, mirroring initial-fee seeding.
+
+        The check resolves AT MOST ONCE per channel: thompson.reseeded_at is
+        stamped and persisted whenever a prior source was available — whether
+        or not a correction was applied — so this never becomes recurring
+        per-cycle work. If no source has data yet (e.g. hint snapshot not
+        warmed), the marker is left unset and the check retries next cycle.
+
+        Returns True when the prior was actually re-seeded.
+        """
+        ts = getattr(fee_state, "thompson", None)
+        if not isinstance(ts, GaussianThompsonState):
+            return False
+        if getattr(ts, "reseeded_at", 0):
+            return False  # Already resolved — at most once per channel
+        if len(ts.observations) >= GaussianThompsonState.MIN_OBSERVATIONS:
+            # Active channel: the posterior is observation-driven, the
+            # prior no longer matters enough to touch.
+            return False
+
+        try:
+            prior = self._select_best_fee_prior(
+                peer_id, channel_id, allow_rpc=False
+            )
+        except Exception:
+            prior = None
+        if not prior:
+            return False  # No evidence available yet; retry next cycle
+
+        best_mean = float(prior["mean"])
+        if best_mean <= 0:
+            return False
+
+        current_mean = float(ts.prior_mean_fee)
+        reseeded = False
+        if abs(current_mean - best_mean) > best_mean * self.PRIOR_RESEED_SKEW_FRAC:
+            ts.prior_mean_fee = prior["mean"]
+            ts.prior_std_fee = prior["std"]
+            ts.record_posterior_nudge(
+                best_mean, self.INITIAL_PRIOR_NUDGE_WEIGHT
+            )
+            reseeded = True
+            self.plugin.log(
+                f"PRIOR_RESEED: {channel_id[:16]}... prior_mean "
+                f"{int(current_mean)} -> {prior['mean']} ppm "
+                f"({prior['source']} prior; "
+                f"{len(ts.observations)} observations)",
+                level='info'
+            )
+
+        ts.reseeded_at = int(time.time())
+        self._save_channel_fee_state(channel_id, fee_state)
+        return reseeded
+
     def set_initial_fee(self, channel_id: str, peer_id: str) -> Optional[Dict[str, Any]]:
         """
         Set an initial fee for a newly opened channel.
@@ -6989,35 +7137,16 @@ class FeeController:
             ts = GaussianThompsonState()
             ts.prior_std_fee = cfg.thompson_prior_std_fee
 
-            # Try fleet-informed prior first (most reliable — real forward data)
-            fleet_prior = None
-            if self.hive_hints:
-                try:
-                    fleet_fee = self.hive_hints.get_fleet_fee_prior(peer_id)
-                    if fleet_fee and fleet_fee > 0:
-                        fleet_prior = {"mean": fleet_fee, "std": self.FLEET_PRIOR_STD_PPM}
-                        self.plugin.log(
-                            f"INITIAL_FEE: {scid[:16]}... using fleet prior "
-                            f"(mean={fleet_fee}, std={self.FLEET_PRIOR_STD_PPM})",
-                            level='debug'
-                        )
-                except Exception:
-                    pass
-
-            # Fall back to network gossip prior
-            network_prior = self._get_network_fee_prior(peer_id, scid)
-
-            # Apply best available: fleet > network > default
-            prior = fleet_prior or network_prior
+            # Apply best available prior: fleet > network > default
+            prior = self._select_best_fee_prior(peer_id, scid)
             if prior:
                 ts.prior_mean_fee = prior["mean"]
                 ts.prior_std_fee = prior["std"]
-                if not fleet_prior and network_prior:
-                    self.plugin.log(
-                        f"INITIAL_FEE: {scid[:16]}... using network prior "
-                        f"(mean={network_prior['mean']}, std={network_prior['std']})",
-                        level='debug'
-                    )
+                self.plugin.log(
+                    f"INITIAL_FEE: {scid[:16]}... using {prior['source']} prior "
+                    f"(mean={prior['mean']}, std={prior['std']})",
+                    level='debug'
+                )
 
                 # Audit F5: the prior used to live ONLY in the throwaway
                 # state above — the channel's PERSISTENT thompson state
