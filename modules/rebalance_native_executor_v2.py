@@ -193,6 +193,18 @@ class NativeRouteExecutor:
                 exclusions.append(entry)
         return exclusions
 
+    # Confidence model for failure observations (audit finding 4):
+    # - CLN names channel AND direction: full attributed confidence.
+    # - CLN names only the channel: both directions at half confidence
+    #   (previously dropped silently — the recording loop skipped entries
+    #   without a '/dir' suffix).
+    # - No attribution at all (all-middle-hops fallback): the blame is
+    #   split across the suspect set, 0.85 / n_middle_hops with a 0.2
+    #   floor, so mostly-innocent segments are never gossiped fleet-wide
+    #   at full confidence.
+    ATTRIBUTED_CONFIDENCE = 0.85
+    INFERRED_CONFIDENCE_FLOOR = 0.2
+
     def _record_failure_observations(
         self,
         *,
@@ -207,20 +219,45 @@ class NativeRouteExecutor:
             return
         failure_data = dict(result.failure_data or {})
         failure_class = str(failure_data.get("failure_class") or "unknown")
-        # Observations are recorded only for entries in excluded_channels,
-        # which always carry channel attribution; failures without any
-        # attribution produce no excluded entries and nothing to export, so
-        # confidence is a constant here (the old 0.55 branch was unreachable).
-        confidence = 0.85
+
+        attributed_channel = str(failure_data.get("erring_channel") or "").strip()
+        attributed_direction = failure_data.get("erring_direction")
+
+        # Build (scid, direction, confidence) targets per attribution quality.
+        targets: List[Tuple[str, int, float]] = []
+        if attributed_channel and attributed_direction in (0, 1, "0", "1"):
+            targets.append(
+                (attributed_channel, int(attributed_direction), self.ATTRIBUTED_CONFIDENCE)
+            )
+        elif attributed_channel:
+            # Attributed channel, unknown direction: record both directions
+            # at half confidence instead of dropping the observation.
+            for direction in (0, 1):
+                targets.append(
+                    (attributed_channel, direction, self.ATTRIBUTED_CONFIDENCE / 2.0)
+                )
+        else:
+            # Inferred attribution: excluded_channels is the all-middle-hops
+            # fallback. Split the evidence across the suspects.
+            directed: List[Tuple[str, int]] = []
+            for entry in result.excluded_channels:
+                scid, sep, direction_text = str(entry).partition("/")
+                if not scid or not sep:
+                    continue
+                try:
+                    directed.append((scid, int(direction_text)))
+                except (TypeError, ValueError):
+                    continue
+            if not directed:
+                return
+            confidence = max(
+                self.INFERRED_CONFIDENCE_FLOOR,
+                self.ATTRIBUTED_CONFIDENCE / len(directed),
+            )
+            targets = [(scid, direction, confidence) for scid, direction in directed]
+
         context = observation_context or {}
-        for entry in result.excluded_channels:
-            scid, sep, direction_text = str(entry).partition("/")
-            if not scid or not sep:
-                continue
-            try:
-                direction = int(direction_text)
-            except (TypeError, ValueError):
-                continue
+        for scid, direction, confidence in targets:
             try:
                 store.record_failure(
                     short_channel_id=scid,
