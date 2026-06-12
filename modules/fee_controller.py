@@ -150,7 +150,44 @@ class GaussianThompsonState:
     DECAY_HOURS = 168.0             # 7-day half-life for observation decay
     MIN_OBSERVATIONS = 5            # Minimum before trusting posterior
     MIN_STD = 10                    # Never let uncertainty go below 10 ppm
-    ZERO_REVENUE_WEIGHT_FACTOR = 0.15  # Zero-revenue observations get 15% of time-weight
+
+    # =========================================================================
+    # Observation weighting: EXPOSURE TIME ONLY (2026-06-12 LOOP incident).
+    # =========================================================================
+    # Weights used to scale with the window's revenue (log1p(rate), with zero
+    # windows down-weighted to 15%). That is outcome-weighting: one lucky
+    # whale window at a high fee outweighed dozens of zero windows at the
+    # same fee, so the revenue-curve fit estimated "best window ever seen at
+    # this fee" instead of E[rate | fee] and chased rare large payments
+    # upward (nexus-01 946890x2272x0 climbed 101 -> 2612 ppm in 10 hours).
+    # Weight is now observation time only; outcomes live in the regression's
+    # dependent variable where they belong. ZERO_REVENUE_WEIGHT_FACTOR is
+    # retained solely to rescale legacy persisted observations on load.
+    WEIGHT_SCHEME = "exposure_v2"
+    ZERO_REVENUE_WEIGHT_FACTOR = 0.15  # LEGACY (migration only): old zero-window factor
+
+    # Trickle guard: a window earning under TRICKLE_RESET_FRAC of the
+    # channel's positive-rate reference is economically dead and must not
+    # reset the zero-revenue streak (a 1 sat trickle at a dead fee used to
+    # block descent forever). The reference is an EMA over meaningful
+    # positive windows, decayed with a 7-day half-life so old glory doesn't
+    # permanently reclassify a genuinely smaller demand regime as trickle.
+    TRICKLE_RESET_FRAC = 0.10
+    POSITIVE_RATE_EMA_ALPHA = 0.2
+    POSITIVE_RATE_REF_HALF_LIFE_HOURS = 168.0
+
+    # Supported-fee ceiling (climb governor): the fee below which
+    # SUPPORTED_CEILING_MASS_QUANTILE of recency-weighted positive revenue
+    # mass lies, times SUPPORTED_CEILING_HEADROOM. DTS+PID targets are capped
+    # here so the optimizer can only climb as fast as higher fees are PROVEN
+    # to earn (one headroom step per earning evidence, instead of +50%/cycle
+    # on extrapolated faith). A mass quantile — not the max earning fee —
+    # so a single whale window cannot extend the ceiling. Probe and
+    # congestion-window observations are excluded (not market tests).
+    SUPPORTED_CEILING_HEADROOM = 1.25
+    SUPPORTED_CEILING_MASS_QUANTILE = 0.90
+    SUPPORTED_CEILING_MIN_WEIGHT = 1e-3
+    CONGESTION_OBS_FLAG = "congestion"  # 6th tuple element on congested windows
 
     # Directional zero-revenue probing: plain zero-revenue observations only
     # re-anchor the posterior on fees we already charged, so a channel parked
@@ -248,6 +285,11 @@ class GaussianThompsonState:
     zero_revenue_streak: int = 0
     zero_run_start_fee: float = 0.0
     zero_run_start_ts: int = 0
+
+    # Positive-rate reference for the trickle guard (see TRICKLE_RESET_FRAC):
+    # EMA of meaningful positive revenue rates + timestamp for time decay.
+    positive_rate_ref: float = 0.0
+    positive_rate_ref_ts: int = 0
 
     # One-shot exploration multiplier armed by scale_variance() and consumed
     # by the next sample_fee/sample_fee_contextual call (the pipeline re-arms
@@ -582,19 +624,26 @@ class GaussianThompsonState:
         fee: int,
         revenue_rate: float,
         hours: float,
-        time_bucket: str = "normal"
+        time_bucket: str = "normal",
+        congested: bool = False
     ) -> None:
         """
         Update posterior after observing revenue at a given fee.
 
-        Uses Bayesian update for Normal-Normal conjugate prior.
-        Higher revenue rates increase the weight of that fee observation.
+        Observation weight is EXPOSURE TIME ONLY (see WEIGHT_SCHEME): the
+        regression estimates E[revenue rate | fee], so outcomes must not
+        leak into the weights (outcome-weighting let rare whale windows
+        dominate and the fit chased them upward — 2026-06-12 incident).
 
         Args:
             fee: Fee that was charged (ppm)
             revenue_rate: Observed revenue rate (sats/hour)
             hours: Hours of observation
             time_bucket: Time period bucket ("low", "normal", "peak")
+            congested: True when this window ran under the congestion
+                override. The observation is recorded (real data) but
+                flagged so the supported-fee ceiling ignores it: congestion
+                pricing is slot protection, not a market test.
         """
         now = int(time.time())
 
@@ -606,44 +655,60 @@ class GaussianThompsonState:
         if not math.isfinite(fee) or fee < 0:
             return  # Skip corrupt observation entirely
 
-        # Weight based on revenue (higher revenue = more confidence)
-        # and observation duration (longer = more confidence)
-        # MA-8: Use log scale to avoid saturation at 100 sats/hr on high-volume nodes
-        if revenue_rate <= 0:
-            # Zero revenue: silence is weak evidence that this fee isn't working.
-            # 15% of time-weight — enough to drift the posterior, but positive
-            # observations always dominate. See dts-stagnant-decay-design.md.
-            weight = min(1.0, hours / 6.0) * self.ZERO_REVENUE_WEIGHT_FACTOR
+        weight = min(1.0, hours / 6.0)
+
+        # Trickle guard: revenue below TRICKLE_RESET_FRAC of the positive-rate
+        # reference is economically dead — it extends the zero streak instead
+        # of resetting it (the observation itself still records the real rate).
+        ref = self._effective_positive_rate_ref(now)
+        meaningful = revenue_rate > 0 and revenue_rate >= self.TRICKLE_RESET_FRAC * ref
+
+        if meaningful:
+            self.zero_revenue_streak = 0
+            self.zero_run_start_fee = 0.0
+            self.zero_run_start_ts = 0
+            if self.positive_rate_ref <= 0:
+                self.positive_rate_ref = revenue_rate
+            else:
+                self.positive_rate_ref = (
+                    (1.0 - self.POSITIVE_RATE_EMA_ALPHA) * ref
+                    + self.POSITIVE_RATE_EMA_ALPHA * revenue_rate
+                )
+            self.positive_rate_ref_ts = now
+        else:
             if self.zero_revenue_streak == 0:
                 self.zero_run_start_fee = float(fee)
                 self.zero_run_start_ts = now
             self.zero_revenue_streak += 1
+
+        # Add observation (5-tuple, or 6-tuple when congestion-flagged)
+        if congested:
+            self.observations.append(
+                (fee, revenue_rate, weight, now, time_bucket,
+                 self.CONGESTION_OBS_FLAG)
+            )
         else:
-            # Positive revenue: original formula (log-scaled revenue * time)
-            weight = min(1.0, hours / 6.0) * min(1.0, math.log1p(revenue_rate) / math.log1p(1000))
-            weight = max(0.01, weight)  # Minimum weight for positive observations
-            self.zero_revenue_streak = 0
-            self.zero_run_start_fee = 0.0
-            self.zero_run_start_ts = 0
+            self.observations.append((fee, revenue_rate, weight, now, time_bucket))
 
-        # Add observation with time bucket (5-tuple)
-        self.observations.append((fee, revenue_rate, weight, now, time_bucket))
-
-        # Directional zero-revenue probing: after a sustained zero-revenue run
-        # inject a flagged pseudo-observation slightly BELOW the charged fee so
-        # the posterior gains a downward gradient instead of stalling on (or
-        # wandering above) fees that earn nothing. Bounded by the cumulative
-        # floor relative to the fee at run start; reversible (any revenue
-        # resets the streak and stops injection).
-        if (revenue_rate <= 0
+        # Directional zero-revenue probing: after a sustained dead run inject
+        # a flagged pseudo-observation slightly BELOW the charged fee so the
+        # posterior gains a downward gradient instead of stalling on (or
+        # wandering above) fees that earn nothing. The descent floor is
+        # relative to the EARNING anchor when one exists (descend to at most
+        # 30% of where revenue last lived); only without any earning history
+        # does it fall back to the zero-run start fee — flooring against the
+        # overshoot fee froze recovery at ~30% of the runaway level.
+        if (not meaningful
                 and self.zero_revenue_streak >= self.ZERO_REVENUE_STREAK_THRESHOLD
-                and self.zero_run_start_fee > 0
-                and self.posterior_mean >= self.ZERO_PROBE_FLOOR_FRAC * self.zero_run_start_fee):
-            probe_fee = max(1, int(fee * self.ZERO_PROBE_STEP_FRAC))
-            if probe_fee < fee:
-                self.observations.append(
-                    (probe_fee, 0.0, weight, now, time_bucket, self.ZERO_PROBE_FLAG)
-                )
+                and self.zero_run_start_fee > 0):
+            earning_anchor = self._earning_region_fee(now)
+            floor_ref = earning_anchor if earning_anchor else self.zero_run_start_fee
+            if self.posterior_mean >= self.ZERO_PROBE_FLOOR_FRAC * floor_ref:
+                probe_fee = max(1, int(fee * self.ZERO_PROBE_STEP_FRAC))
+                if probe_fee < fee:
+                    self.observations.append(
+                        (probe_fee, 0.0, weight, now, time_bucket, self.ZERO_PROBE_FLAG)
+                    )
 
         # Prune old observations
         if len(self.observations) > self.MAX_OBSERVATIONS:
@@ -651,6 +716,85 @@ class GaussianThompsonState:
 
         # Recompute posterior
         self._recompute_posterior()
+
+    def _effective_positive_rate_ref(self, now: int) -> float:
+        """Positive-rate reference with 7-day half-life decay applied."""
+        if self.positive_rate_ref <= 0 or self.positive_rate_ref_ts <= 0:
+            return 0.0
+        age_hours = max(0.0, (now - self.positive_rate_ref_ts) / 3600.0)
+        return self.positive_rate_ref * math.pow(
+            0.5, age_hours / self.POSITIVE_RATE_REF_HALF_LIFE_HOURS
+        )
+
+    def _positive_revenue_mass(
+        self, now: int
+    ) -> List[Tuple[float, float]]:
+        """(fee, recency-decayed revenue mass) for genuine earning windows.
+
+        Probe pseudo-observations carry zero revenue (self-excluded);
+        congestion-flagged windows are excluded explicitly — their revenue
+        is real but confounded (the fee was set for slot protection, not as
+        a market test).
+        """
+        masses: List[Tuple[float, float]] = []
+        for obs in self.observations:
+            if len(obs) < 4:
+                continue
+            fee, rev, w, ts = obs[0], obs[1], obs[2], obs[3]
+            if rev <= 0:
+                continue
+            if len(obs) >= 6 and obs[5] == self.CONGESTION_OBS_FLAG:
+                continue
+            age_hours = max(0.0, (now - ts) / 3600.0)
+            decay = math.pow(0.5, age_hours / self.DECAY_HOURS)
+            mass = float(rev) * float(w) * decay
+            if mass > self.SUPPORTED_CEILING_MIN_WEIGHT:
+                masses.append((float(fee), mass))
+        # Winsorize: cap any single window's mass at 3x the median so one
+        # unreplicated whale window cannot dominate the region statistics.
+        # Replicated high earnings (several windows) remain full evidence.
+        if len(masses) >= 4:
+            sorted_m = sorted(m for _, m in masses)
+            median_m = sorted_m[len(sorted_m) // 2]
+            cap = 3.0 * median_m
+            masses = [(f, min(m, cap)) for f, m in masses]
+        return masses
+
+    def _earning_region_fee(self, now: int) -> Optional[float]:
+        """Revenue-mass-weighted mean fee over earning windows, or None."""
+        masses = self._positive_revenue_mass(now)
+        total = sum(m for _, m in masses)
+        if total <= 0:
+            return None
+        return sum(f * m for f, m in masses) / total
+
+    def supported_fee_ceiling(self, now: Optional[int] = None) -> Optional[float]:
+        """Highest fee the earning evidence supports, with headroom.
+
+        Returns the fee below which SUPPORTED_CEILING_MASS_QUANTILE of the
+        recency-weighted positive revenue mass lies, times the headroom
+        factor — or None when there is no earning history (new channels:
+        the prior governs). Used by the controller as an upper bound on
+        DTS+PID targets: the optimizer climbs one headroom step per proven
+        earning level instead of extrapolating upward on faith. A bound,
+        never an attractor.
+        """
+        if now is None:
+            now = int(time.time())
+        masses = self._positive_revenue_mass(now)
+        total = sum(m for _, m in masses)
+        if total <= 0:
+            return None
+        masses.sort(key=lambda fm: fm[0])
+        threshold = total * self.SUPPORTED_CEILING_MASS_QUANTILE
+        acc = 0.0
+        quantile_fee = masses[-1][0]
+        for fee, mass in masses:
+            acc += mass
+            if acc >= threshold:
+                quantile_fee = fee
+                break
+        return quantile_fee * self.SUPPORTED_CEILING_HEADROOM
 
     @staticmethod
     def _time_similarity(bucket1: str, bucket2: str) -> float:
@@ -1013,9 +1157,36 @@ class GaussianThompsonState:
             and self.zero_run_start_ts > 0
         )
         if total_w > 0 and (zero_mass or streak_override):
-            # Recency-emphasised anchor weights: the global 7-day half-life
-            # would make the anchor lag the entire run's fee history and
-            # stall the descent toward live demand.
+            # 2026-06-12 incident fix: when the market has moved (sustained
+            # dead run), the best available estimate of live demand is where
+            # revenue LAST LIVED — the revenue-mass-weighted fee over earning
+            # windows — not the dead fees of the current run. Anchoring on
+            # the run's charged fees made recovery from an overshoot a slow
+            # 10%-per-probe walk down from the runaway level (101 -> 2612 ppm
+            # took 10 hours up and could never come back down).
+            earning_anchor = self._earning_region_fee(now)
+            if streak_override and earning_anchor is not None:
+                fees_pos = [f for f, _ in self._positive_revenue_mass(now)]
+                spread_std = (
+                    (max(fees_pos) - min(fees_pos)) / 4.0
+                    if len(fees_pos) > 1 else 0.0
+                )
+                max_std = math.sqrt(1.0 / self.MIN_PRECISION)
+                self.posterior_mean = earning_anchor
+                self.posterior_std = max(
+                    float(self.MIN_STD),
+                    min(max_std,
+                        max(spread_std, self.ZERO_REGIME_REL_STD * earning_anchor)),
+                )
+                # Degenerate range => polynomial sampling disabled
+                self._last_fee_min = 0.0
+                self._last_fee_max = 0.0
+                return
+
+            # No earning history: recency-emphasised anchor over charged and
+            # probed fees (the probes provide the downward gradient). The
+            # global 7-day half-life would make the anchor lag the entire
+            # run's fee history and stall the descent toward live demand.
             anchor_all = [
                 (
                     f,
@@ -1131,13 +1302,31 @@ class GaussianThompsonState:
             f_star = max(-0.5, min(1.5, f_star))
             self.posterior_mean = f_star * fee_range + fee_min
         else:
-            # Non-concave: use best observed fee
-            best_fee = fee_min
-            best_rev = float('-inf')
+            # Non-concave: pick the best fee REGION by expected rate, not the
+            # single best window. Selecting the argmax observation was
+            # outcome-driven (one whale window beat hundreds of steady
+            # windows) and chased the fee upward. Bucket observations into
+            # ~10% fee bins and choose the bucket with the best lower
+            # confidence bound (mean - std/sqrt(n_eff)): a lone lucky window
+            # carries huge variance and cannot outrank a steady earner.
+            buckets: Dict[int, List[Tuple[float, float, float]]] = {}
             for fee_raw, rev, w in weighted_obs:
-                if rev > best_rev:
-                    best_rev = rev
-                    best_fee = fee_raw
+                key = int(math.log(max(fee_raw, 1.0)) / math.log(1.1))
+                buckets.setdefault(key, []).append((fee_raw, rev, w))
+            best_fee = fee_min
+            best_lcb = float('-inf')
+            for entries in buckets.values():
+                bw = sum(w for _, _, w in entries)
+                if bw <= 0:
+                    continue
+                mean_rev = sum(r * w for _, r, w in entries) / bw
+                var = sum(w * (r - mean_rev) ** 2 for _, r, w in entries) / bw
+                sq = sum(w * w for _, _, w in entries)
+                n_eff = (bw * bw / sq) if sq > 0 else 1.0
+                lcb = mean_rev - math.sqrt(max(0.0, var)) / math.sqrt(max(n_eff, 1.0))
+                if lcb > best_lcb:
+                    best_lcb = lcb
+                    best_fee = sum(f * w for f, _, w in entries) / bw
             self.posterior_mean = best_fee
 
         # Propagated uncertainty via delta method: Var(F*) ≈ (∂F*/∂β)^T Σ (∂F*/∂β)
@@ -1404,6 +1593,9 @@ class GaussianThompsonState:
             "zero_revenue_streak": self.zero_revenue_streak,
             "zero_run_start_fee": self.zero_run_start_fee,
             "zero_run_start_ts": self.zero_run_start_ts,
+            "positive_rate_ref": self.positive_rate_ref,
+            "positive_rate_ref_ts": self.positive_rate_ref_ts,
+            "weight_scheme": self.WEIGHT_SCHEME,
             "exploration_boost": self.exploration_boost,
             "last_sampled_fee": self.last_sampled_fee,
             "last_sample_time": self.last_sample_time,
@@ -1416,14 +1608,31 @@ class GaussianThompsonState:
         state = cls()
         state.prior_mean_fee = d.get("prior_mean_fee", 200)
         state.prior_std_fee = d.get("prior_std_fee", 100)
+        # Legacy payloads (no weight_scheme marker) carry outcome-scaled
+        # weights: positive windows were time_w * log1p(rate)/log1p(1000)
+        # (floored at 0.01) and zero windows time_w * 0.15. Both factors are
+        # exactly invertible from the stored rate, so rescale to the
+        # exposure-only scheme instead of letting old whale windows dominate
+        # new honest observations ~10:1.
+        legacy_weights = d.get("weight_scheme") != cls.WEIGHT_SCHEME
         converted_observations = []
         for obs in d.get("observations", []):
             t = tuple(obs)
             if len(t) == 4:
                 fee, revenue_rate, weight, ts = t
-                converted_observations.append((fee, revenue_rate, weight, ts, "normal"))
-            else:
-                converted_observations.append(t)
+                t = (fee, revenue_rate, weight, ts, "normal")
+            if legacy_weights and len(t) >= 4:
+                rate = float(t[1])
+                w = float(t[2])
+                if rate > 0:
+                    factor = min(1.0, math.log1p(rate) / math.log1p(1000))
+                    if factor > 0 and w > 0:
+                        w = w / factor
+                else:
+                    w = w / cls.ZERO_REVENUE_WEIGHT_FACTOR
+                w = min(1.0, w)
+                t = (t[0], t[1], w) + tuple(t[3:])
+            converted_observations.append(t)
         state.observations = converted_observations
         state.posterior_mean = d.get("posterior_mean", 200.0)
         state.posterior_std = d.get("posterior_std", 100.0)
@@ -1521,6 +1730,18 @@ class GaussianThompsonState:
             state.zero_run_start_ts = max(0, int(d.get("zero_run_start_ts", 0)))
         except (TypeError, ValueError):
             state.zero_run_start_ts = 0
+
+        # Positive-rate reference for the trickle guard (legacy dicts: none)
+        try:
+            state.positive_rate_ref = float(d.get("positive_rate_ref", 0.0))
+        except (TypeError, ValueError):
+            state.positive_rate_ref = 0.0
+        if not math.isfinite(state.positive_rate_ref) or state.positive_rate_ref < 0:
+            state.positive_rate_ref = 0.0
+        try:
+            state.positive_rate_ref_ts = max(0, int(d.get("positive_rate_ref_ts", 0)))
+        except (TypeError, ValueError):
+            state.positive_rate_ref_ts = 0
 
         # One-shot exploration boost (legacy dicts: neutral 1.0)
         try:
@@ -1873,6 +2094,12 @@ class ChannelCycleState:
     # take one undamped step to the congestion cap, later cycles are damped.
     congestion_active: bool = False
 
+    # Fee at congestion-episode entry (0 = no episode). The whole episode is
+    # capped at entry * CONGESTION_EPISODE_MAX_MULTIPLIER: the per-cycle
+    # 2x cap compounding on `current` let sustained episodes ratchet to the
+    # global ceiling (2026-06-12 LOOP incident watch item realized).
+    congestion_entry_fee_ppm: int = 0
+
     # P2: target suppressed by the gossip gate / alpha guard (0 = none).
     # The next cycle blends FROM this value instead of the chain fee so
     # sub-threshold deltas accumulate instead of being discarded — the 5%
@@ -2214,6 +2441,13 @@ class FeeController:
     CONGESTION_FEE_MAX_MULTIPLIER = 2.0
     CONGESTION_FEE_MIN_HEADROOM_PPM = 250
     CONGESTION_FLOOR_MULTIPLIER = 1.5
+
+    # 2026-06-12: per-cycle damping alone still let SUSTAINED episodes
+    # compound 2x/cycle toward the global ceiling (the LOOP channel rode
+    # this 101 -> 2612 ppm in 10 hours). The whole episode is additionally
+    # capped relative to the fee at episode ENTRY: strong slot-pressure
+    # deterrent, bounded blast radius. Entry re-arms when the episode ends.
+    CONGESTION_EPISODE_MAX_MULTIPLIER = 4.0
 
     # ==========================================================================
     # P8 fix (2026-06-10): Vegas spike wake-up for sleeping channels
@@ -3413,6 +3647,7 @@ class FeeController:
             "forward_count_since_update": state.forward_count_since_update,
             "last_volume_sats": state.last_volume_sats,
             "congestion_active": bool(state.congestion_active),
+            "congestion_entry_fee_ppm": int(state.congestion_entry_fee_ppm or 0),
             "pending_target_ppm": int(state.pending_target_ppm or 0),
             "last_gossip_refresh": state.last_gossip_refresh,
             "dynamic_htlcmin_baseline_msat": state.dynamic_htlcmin_baseline_msat,
@@ -5375,8 +5610,10 @@ class FeeController:
         # P1 fix (2026-06-10): bounded + damped, observation always recorded.
         # See CONGESTION_FEE_* constants for the invariants.
         if not is_congested and cycle.congestion_active:
-            # Episode over — re-arm the one-shot fast step for the next one.
+            # Episode over — re-arm the one-shot fast step and the episode
+            # entry anchor for the next one.
             cycle.congestion_active = False
+            cycle.congestion_entry_fee_ppm = 0
 
         if is_congested:
             decision_reason = "CONGESTION"
@@ -5394,25 +5631,47 @@ class FeeController:
                 _, congestion_time_bucket, _ = self._get_context_with_values(
                     channel_id, peer_id, outbound_ratio, flow_state=flow_state
                 )
+                # Flagged: real data for the fit, but congestion pricing is
+                # slot protection, not a market test — the supported-fee
+                # ceiling must not treat revenue at ratcheted fees as proof
+                # that the market bears them.
                 ts_state.thompson.update_posterior(
                     fee=raw_chain_fee,
                     revenue_rate=current_revenue_rate,
                     hours=hours_elapsed,
                     time_bucket=congestion_time_bucket,
+                    congested=True,
                 )
 
+            first_trip = not cycle.congestion_active
+            cycle.congestion_active = True
+            if first_trip or cycle.congestion_entry_fee_ppm <= 0:
+                cycle.congestion_entry_fee_ppm = max(1, int(current_fee_ppm))
+
             # (a) Emergency target capped per cycle — a strong fast response
-            # without the old 50 -> 5000 ceiling cliff.
+            # without the old 50 -> 5000 ceiling cliff — and capped per
+            # EPISODE relative to the entry fee so sustained congestion
+            # cannot compound to the global ceiling. The episode bound
+            # mirrors the per-cycle bound's structure (multiplier OR
+            # absolute headroom) so low-fee channels keep a meaningful
+            # emergency response.
+            episode_cap_ppm = max(
+                int(
+                    cycle.congestion_entry_fee_ppm
+                    * self.CONGESTION_EPISODE_MAX_MULTIPLIER
+                ),
+                cycle.congestion_entry_fee_ppm
+                + self.CONGESTION_FEE_MIN_HEADROOM_PPM,
+            )
             congestion_cap_ppm = min(
                 ceiling_ppm,
+                episode_cap_ppm,
                 max(
                     int(current_fee_ppm * self.CONGESTION_FEE_MAX_MULTIPLIER),
                     current_fee_ppm + self.CONGESTION_FEE_MIN_HEADROOM_PPM,
                 ),
             )
-
-            first_trip = not cycle.congestion_active
-            cycle.congestion_active = True
+            congestion_cap_ppm = max(congestion_cap_ppm, current_fee_ppm)
 
             if first_trip:
                 # One undamped step up to the cap when congestion FIRST trips.
@@ -5988,6 +6247,28 @@ class FeeController:
             # deprecated hard-None stubs — see their docstrings for the
             # incident rationale — so the guard/support/downshift consumers
             # were unreachable dead code and have been deleted.
+
+            # Supported-fee ceiling (2026-06-12): cap the target at headroom
+            # above the fee region the earning evidence actually supports.
+            # The optimizer climbs one headroom step per PROVEN earning
+            # level instead of +50%/cycle on extrapolated faith, and an
+            # overshot fee is pulled back to the supported region instead
+            # of waiting out a 10%-per-probe descent. Hard floors below
+            # still win (cost floors are not negotiable).
+            supported_cap_ppm = None
+            try:
+                supported_cap = ts_state.thompson.supported_fee_ceiling()
+            except Exception:
+                supported_cap = None
+            if supported_cap is not None and post_pid_target_ppm > supported_cap:
+                supported_cap_ppm = max(1, int(supported_cap))
+                self.plugin.log(
+                    f"SUPPORTED_CEILING: {channel_id[:12]}... target "
+                    f"{post_pid_target_ppm} -> {supported_cap_ppm} ppm "
+                    f"(earning evidence cap)",
+                    level='debug'
+                )
+                post_pid_target_ppm = supported_cap_ppm
 
             bounded_target_ppm = max(floor_ppm, min(ceiling_ppm, post_pid_target_ppm))
             if bounded_target_ppm != post_pid_target_ppm:
@@ -7406,6 +7687,13 @@ class FeeController:
             pending_target_ppm = 0
         pending_target_ppm = max(0, min(pending_target_ppm, self.ABS_MAX_FEE_PPM))
 
+        def _safe_entry_fee(value: Any) -> int:
+            try:
+                entry = int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+            return max(0, min(entry, self.ABS_MAX_FEE_PPM))
+
         cycle = ChannelCycleState(
             last_revenue_rate=cycle_data.get("last_revenue_rate", 0.0),
             last_fee_ppm=cycle_data.get("last_fee_ppm", 0),
@@ -7422,6 +7710,9 @@ class FeeController:
             forward_count_since_update=cycle_data.get("forward_count_since_update", 0),
             last_volume_sats=cycle_data.get("last_volume_sats", 0),
             congestion_active=bool(cycle_data.get("congestion_active", False)),
+            congestion_entry_fee_ppm=_safe_entry_fee(
+                cycle_data.get("congestion_entry_fee_ppm", 0)
+            ),
             pending_target_ppm=pending_target_ppm,
             last_gossip_refresh=cycle_data.get("last_gossip_refresh", 0),
             dynamic_htlcmin_baseline_msat=cycle_data.get("dynamic_htlcmin_baseline_msat"),

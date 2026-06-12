@@ -1,4 +1,12 @@
-"""Tests for DTS stagnant decay: zero-revenue observations get 15% weight."""
+"""Tests for DTS observation weighting.
+
+2026-06-12 (LOOP incident): weights are now EXPOSURE TIME ONLY. The old
+scheme scaled weight with the window's revenue (log1p, zero windows at
+15%), which was outcome-weighting: a single whale window outweighed dozens
+of zero windows at the same fee and the revenue-curve fit chased rare
+large payments upward. ZERO_REVENUE_WEIGHT_FACTOR survives only as the
+legacy-migration rescale factor.
+"""
 import math
 import time
 from unittest.mock import MagicMock
@@ -8,72 +16,64 @@ from modules.fee_controller import GaussianThompsonState
 
 
 class TestZeroRevenueWeight:
-    """Verify zero-revenue weight formula: min(1.0, hours/6) * 0.15."""
+    """Verify exposure-only weight formula: min(1.0, hours/6)."""
 
-    def test_zero_revenue_6h_weight_is_015(self):
-        """6 hours of zero revenue should produce weight = 1.0 * 0.15 = 0.15."""
+    def test_zero_revenue_6h_weight_is_full(self):
+        """6 hours of zero revenue is full evidence: weight = 1.0."""
         state = GaussianThompsonState()
         state.update_posterior(fee=200, revenue_rate=0.0, hours=6.0)
         _, _, weight, _, _ = state.observations[-1]
-        assert abs(weight - 0.15) < 1e-9, f"Expected 0.15, got {weight}"
+        assert abs(weight - 1.0) < 1e-9, f"Expected 1.0, got {weight}"
 
-    def test_zero_revenue_3h_weight_is_0075(self):
-        """3 hours of zero revenue should produce weight = 0.5 * 0.15 = 0.075."""
+    def test_zero_revenue_3h_weight_is_half(self):
+        """3 hours of zero revenue: weight = 3/6 = 0.5."""
         state = GaussianThompsonState()
         state.update_posterior(fee=200, revenue_rate=0.0, hours=3.0)
         _, _, weight, _, _ = state.observations[-1]
-        assert abs(weight - 0.075) < 1e-9, f"Expected 0.075, got {weight}"
+        assert abs(weight - 0.5) < 1e-9, f"Expected 0.5, got {weight}"
 
-    def test_zero_revenue_12h_caps_at_015(self):
-        """12 hours of zero revenue: hours/6 = 2.0, capped at 1.0, so weight = 0.15."""
+    def test_zero_revenue_12h_caps_at_one(self):
+        """12 hours of zero revenue: hours/6 = 2.0, capped at 1.0."""
         state = GaussianThompsonState()
         state.update_posterior(fee=200, revenue_rate=0.0, hours=12.0)
         _, _, weight, _, _ = state.observations[-1]
-        assert abs(weight - 0.15) < 1e-9, f"Expected 0.15, got {weight}"
+        assert abs(weight - 1.0) < 1e-9, f"Expected 1.0, got {weight}"
 
 
 class TestPositiveRevenueWeightUnchanged:
-    """Verify positive-revenue path is unchanged from original formula."""
+    """Positive windows use the same exposure-only formula as zero windows."""
 
-    def test_positive_revenue_weight_unchanged(self):
-        """Positive revenue should use the original log-scaled formula."""
+    def test_positive_revenue_weight_is_exposure_only(self):
+        """Outcome must not leak into the weight (whale-chasing incident)."""
         state = GaussianThompsonState()
-        revenue_rate = 100.0
-        hours = 6.0
-        state.update_posterior(fee=200, revenue_rate=revenue_rate, hours=hours)
+        state.update_posterior(fee=200, revenue_rate=100.0, hours=6.0)
         _, _, weight, _, _ = state.observations[-1]
-        expected = min(1.0, hours / 6.0) * min(
-            1.0, math.log1p(revenue_rate) / math.log1p(1000)
-        )
-        expected = max(0.01, expected)
-        assert abs(weight - expected) < 1e-9, f"Expected {expected}, got {weight}"
+        assert abs(weight - 1.0) < 1e-9, f"Expected 1.0, got {weight}"
 
-    def test_positive_revenue_floor_still_applies(self):
-        """Very low positive revenue should still have the 0.01 floor."""
+    def test_positive_revenue_short_window_scales_with_time(self):
+        """Weight scales with observation time, never with revenue."""
         state = GaussianThompsonState()
-        # Very small revenue rate and short time -> original formula gives tiny weight
-        # but floor keeps it at 0.01
         state.update_posterior(fee=200, revenue_rate=0.001, hours=0.01)
         _, _, weight, _, _ = state.observations[-1]
-        assert weight >= 0.01, f"Floor should keep weight >= 0.01, got {weight}"
+        expected = min(1.0, 0.01 / 6.0)
+        assert abs(weight - expected) < 1e-9, f"Expected {expected}, got {weight}"
 
 
 class TestZeroVsPositiveWeight:
-    """Zero-revenue weight should always be less than moderate positive revenue."""
+    """Equal-duration windows carry equal weight regardless of outcome."""
 
-    def test_zero_revenue_weight_less_than_positive(self):
-        """Zero-revenue 6h weight (0.15) should be less than moderate positive revenue."""
+    def test_zero_and_positive_weights_equal(self):
         state = GaussianThompsonState()
-        # Zero revenue observation
         state.update_posterior(fee=200, revenue_rate=0.0, hours=6.0)
         _, _, zero_weight, _, _ = state.observations[-1]
 
-        # Moderate positive revenue observation
         state.update_posterior(fee=200, revenue_rate=50.0, hours=6.0)
         _, _, positive_weight, _, _ = state.observations[-1]
 
-        assert zero_weight < positive_weight, (
-            f"Zero weight {zero_weight} should be < positive weight {positive_weight}"
+        assert abs(zero_weight - positive_weight) < 1e-9, (
+            f"Zero weight {zero_weight} must equal positive weight "
+            f"{positive_weight}: outcomes belong in the regression target, "
+            f"not the weights"
         )
 
 
@@ -123,6 +123,8 @@ class TestConstantExists:
     """Verify the class constant is defined and correct."""
 
     def test_constant_zero_revenue_weight_factor_exists(self):
-        """ZERO_REVENUE_WEIGHT_FACTOR should be 0.15."""
+        """ZERO_REVENUE_WEIGHT_FACTOR survives at 0.15 for legacy-payload
+        weight migration only (see WEIGHT_SCHEME)."""
         assert hasattr(GaussianThompsonState, 'ZERO_REVENUE_WEIGHT_FACTOR')
         assert GaussianThompsonState.ZERO_REVENUE_WEIGHT_FACTOR == 0.15
+        assert GaussianThompsonState.WEIGHT_SCHEME == "exposure_v2"

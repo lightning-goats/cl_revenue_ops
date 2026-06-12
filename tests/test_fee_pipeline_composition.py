@@ -616,20 +616,21 @@ class TestCongestionDamping:
 
     def test_second_congested_cycle_is_damped(self, mock_plugin, mock_database):
         """While the episode persists, follow-up moves ride the normal
-        blend/delta-cap path (with the congestion floor)."""
+        blend/delta-cap path (with the congestion floor), and the whole
+        episode is bounded at entry * CONGESTION_EPISODE_MAX_MULTIPLIER."""
         fc, cfg = _make_fc(mock_plugin, mock_database)
-        chain = {"fee": 100}
+        chain = {"fee": 500}
         _stub_broadcasts(fc, chain)
 
-        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=100)
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=500)
         ts_state.thompson.update_posterior = lambda *a, **k: None  # determinism
         ts_state.thompson.posterior_std = 250.0  # blend ratio 0.20
 
         r1 = fc._adjust_channel_fee(
             CHANNEL_ID, PEER_ID, self._congested_state(),
-            _channel_info(100), cfg=cfg,
+            _channel_info(500), cfg=cfg,
         )
-        assert r1.new_fee_ppm == 350  # undamped first step
+        assert r1.new_fee_ppm == 1000  # undamped first step (2x entry)
 
         _open_window(fc)
         ts_state.thompson.posterior_std = 250.0
@@ -640,10 +641,26 @@ class TestCongestionDamping:
 
         assert r2 is not None
         assert r2.reason_code == FeeReasonCode.CONGESTION.value
-        # cap = min(5000, max(700, 600)) = 700; blended = 350 + 0.2*(700-350)
-        assert r2.new_fee_ppm == 420
-        # bounded by the normal per-cycle delta cap from 350
-        assert r2.new_fee_ppm <= 350 + max(100, int(350 * 0.5) + 1)
+        # cap = min(5000, episode 2000, max(2000, 1250)) = 2000;
+        # blended = 1000 + 0.2*(2000-1000) = 1200 — damped, no second jump
+        assert r2.new_fee_ppm == 1200
+        # bounded by the normal per-cycle delta cap from 1000
+        assert r2.new_fee_ppm <= 1000 + max(100, int(1000 * 0.5) + 1)
+
+        # Sustained congestion: the episode cap (4x entry = 2000) holds no
+        # matter how many cycles the episode lasts (the old per-cycle 2x cap
+        # compounded toward the global ceiling).
+        episode_cap = 500 * fc.CONGESTION_EPISODE_MAX_MULTIPLIER
+        for _ in range(6):
+            _open_window(fc)
+            ts_state.thompson.posterior_std = 250.0
+            r = fc._adjust_channel_fee(
+                CHANNEL_ID, PEER_ID, self._congested_state(),
+                _channel_info(chain["fee"]), cfg=cfg,
+            )
+            if r is not None:
+                assert r.new_fee_ppm <= episode_cap
+        assert chain["fee"] <= episode_cap
 
     def test_recovery_after_congestion_uses_normal_blend(self, mock_plugin, mock_database):
         """Once congestion clears, the next cycle is a normal DTS+PID move

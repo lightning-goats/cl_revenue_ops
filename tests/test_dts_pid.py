@@ -298,7 +298,16 @@ class TestContextualPosteriorUpdates:
             }
         )
 
-        assert state.observations == [(125, 3.0, 0.5, 1234567890, "normal")]
+        # Legacy payloads (no weight_scheme marker) are rescaled to the
+        # exposure-only weight scheme on load: the stored 0.5 was
+        # time_w * log1p(3)/log1p(1000), so the rescale divides the
+        # outcome factor back out (clamped at 1.0).
+        assert len(state.observations) == 1
+        fee, rate, weight, ts, bucket = state.observations[0]
+        assert (fee, rate, ts, bucket) == (125, 3.0, 1234567890, "normal")
+        import math as _math
+        factor = min(1.0, _math.log1p(3.0) / _math.log1p(1000))
+        assert weight == pytest.approx(min(1.0, 0.5 / factor))
 
 
 class TestPIDStatePersistence:

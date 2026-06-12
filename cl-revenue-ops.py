@@ -3235,6 +3235,22 @@ def revenue_rebalance_debug(
     return result
 
 
+def _supported_fee_ceiling_from_state(ts_state: Dict[str, Any]) -> Optional[float]:
+    """Compute the supported-fee ceiling from a persisted thompson payload.
+
+    Diagnostic-only rehydration for revenue-fee-debug: the 2026-06-12 LOOP
+    incident took an hour of forensics because the debug surface didn't show
+    what the earning evidence supported vs what the posterior believed.
+    """
+    try:
+        from modules.fee_controller import GaussianThompsonState
+        st = GaussianThompsonState.from_dict(ts_state or {})
+        cap = st.supported_fee_ceiling()
+        return round(cap, 1) if cap is not None else None
+    except Exception:
+        return None
+
+
 @plugin.method("revenue-fee-debug")
 def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     """
@@ -3376,6 +3392,9 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
                 "posterior_std": ts_state.get("posterior_std"),
                 "observations": len(ts_state.get("observations") or []),
                 "last_sampled_fee": ts_state.get("last_sampled_fee"),
+                "zero_revenue_streak": ts_state.get("zero_revenue_streak", 0),
+                "positive_rate_ref": ts_state.get("positive_rate_ref", 0.0),
+                "supported_fee_ceiling": _supported_fee_ceiling_from_state(ts_state),
             },
             "context": {
                 "key": v2_state.get("last_context_key", ""),
