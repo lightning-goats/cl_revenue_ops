@@ -1,0 +1,68 @@
+# Intent Contract: modules/boltz_manager.py
+
+Tier 1 — deep treatment. Authored 2026-06-12 from code at commit 9f8f219.
+
+## 1. Purpose
+
+BoltzCliManager is a synchronous wrapper around the external `boltzcli` binary (talking to a local `boltzd`) that gives the plugin submarine-swap liquidity operations: loop-in (on-chain → local balance, :1366-1444), loop-out (local balance → on-chain, :1446-1757), quotes, chain swaps, refunds/claims, wallet/backup management. Its real job, beyond shelling out, is *budget containment and accounting*: every swap creation runs a three-layer gate under a creation lock — (1) unified daily liquidity budget shared with the rebalancer and planner (:1306-1324, :823-853), (2) capex tactical budget for treasury swaps (:76-106), (3) per-channel capex budget for channel-targeted swaps, fail-closed on lookup errors (:123-189) — and every executed swap's fee is recorded once into the unified "boltz" spend category (:1193-1217). The module docstring's claim of "a local daily fee budget" understates current behavior: the cfg daily_budget_sats (default 3000) is only a *fallback* when the unified budget provider is not registered (:823-853). One explicitly documented divergence between code paths: `compute_cost_attribution`'s channel/tactical split is dead-lettered — persisted only as journal metadata and never used as budget accounting (audit note in code, :191-210). Channel "targeting" is also weaker than the API suggests: submarine loop-ins cannot pin a channel at all (trigger metadata only, :1366-1374), and reverse loop-outs pin a first hop only via chanIds or an external-pay workaround (:1530-1652).
+
+## 2. Inputs / Outputs
+
+**RPC exposed (via main plugin, cl-revenue-ops.py):** revenue-boltz-quote (:6082), -loop-out (:6090), -loop-in (:6102), -status (:6113), -history (:6121), -external-pay-ignores (:6129), -budget (:6137), -wallet (:6145), -refund (:6153), -claim (:6161), -chainswap (:6169), -withdraw (:6180), -deposit (:6192), -backup / -backup-verify (:6200/:6208).
+
+**External process:** `boltzcli --datadir <datadir>` subprocess, optionally `sudo -n -u boltz` (:224-254); commands: quote, createswap, createreverseswap, listswaps, swapinfo, refund, claim, wallet ops.
+
+**CLN RPC consumed:** decodepay, listpays, pay with exclude lists for first-hop-pinned external-pay loop-outs (:509-657), listpeerchannels for peer→channel resolution (:374-486).
+
+**Files (under boltz datadir, lock-serialized):** cl_revenue_ops_swap_journal.json (:49, :977-996) and cl_revenue_ops_ignored_external_swaps.json (:50, :997-1031). These are the manager's own persistence; it does not use the plugin SQLite database directly.
+
+**Modules/providers consumed:** capex_budget engine via set_capex_engine (get_tactical_budget :97, get_channel_budget :139, attribute_boltz_cost :208, record_boltz_spend :1202-1217); external_liquidity_cost_provider and global_budget_limit_provider callbacks injected by the main plugin (:56-61, :792-853); structural_envelope_provider → config boltz_structural_budget_sats_per_day (:62-67, :108-121; wired at cl-revenue-ops.py:2039, option at :1681).
+
+**Feeds / consumers:** get_budget_status (:1265-1304) is the unified-budget surface other modules see for Boltz costs; the in-plugin Boltz auto-cycle (cl-revenue-ops.py:1317-1560) consumes capacity_planner.get_boltz_coordination and rebalancer coordination and calls loop_in/loop_out with structural=True where applicable; mode selection is treasury → balance → idle (cl-revenue-ops.py:1224-1279).
+
+## 3. Invariants
+
+- **BM-I1** — No boltzcli subprocess runs while the integration is disabled: every command path goes through `_run` → `_ensure_enabled`, which raises when cfg.enabled is false (:220-233).
+- **BM-I2** — When enforce_budget=true, a swap is rejected ("status": "rejected") if its estimated fee exceeds the remaining unified 24h budget, using the *same* fee estimator for gating and spend accounting (:1306-1324; loop_in :1384-1391; loop_out :1471-1478).
+- **BM-I3** — Budget check and swap creation are atomic with respect to each other: both loop_in and loop_out hold `_swap_creation_lock` across quote → gates → createswap (:54-55, :1382, :1463-1465), so concurrent swaps cannot both pass on the same remaining budget.
+- **BM-I4** — Pure treasury loop-ins and loop-outs (channel_id=None) never exceed the capex tactical budget when an engine is injected (:76-106, called at :1394-1403 and :1481-1490). Scope caveat: `chainswap` (:1837-1877) is gated only by the unified budget under the creation lock — it bypasses both the tactical and per-channel capex gates entirely, despite its fee depleting the same "boltz" spend category.
+- **BM-I5** — Channel-targeted swaps never exceed the channel's remaining capex budget, and an unreadable/unknown channel budget rejects the swap (fail closed) (:123-189) — with exactly one exception: structural loop-outs when the daily structural envelope is configured > 0 bypass the per-channel gate (:1499-1518) but remain gated by the unified budget and the envelope itself.
+- **BM-I6** — The structural bypass itself fails closed: no provider, provider error, or a non-positive envelope value all report 0 and disable the bypass (:108-121).
+- **BM-I7** — Every executed (non-error) swap from a spend-recording source writes its full estimated fee exactly once to the capex "boltz" spend category, subcategory "structural" for structural swaps and "swap_fee" otherwise; the channel/tactical attribution split never depletes any budget (:191-210, :1193-1217). "Exactly once" is enforced by the idempotent event id `boltz:{swap_id}` (INSERT OR REPLACE; capex_budget.py:352-395), not by call-site discipline — repeated journal updates for the same swap overwrite rather than accumulate.
+- **BM-I8** — Pending (non-terminal) swaps count as reserved budget, and the reserved estimate is capped at remaining budget (min of boltz cfg budget and the passed unified cap) so over-estimation cannot permanently wedge the unified control (:898-923).
+- **BM-I9** — `get_boltz_cost_components` never calls global_budget_limit_provider (mutual-recursion guard; the cap is passed in explicitly) (:855-868, caller :1269-1272).
+- **BM-I10** — Swap journal and ignore-list read-modify-write cycles are serialized under their locks; no lost updates from concurrent RPC calls (:51-53, :1087-1092, :1158-1161).
+- **BM-I11** — amount_sats <= 0 raises BoltzCliError before any gate or subprocess (:1340-1342, :1375-1377, :1457-1459).
+- **BM-I12** — When the capability cache already says the CLN backend rejects reverse-swap chanIds, a channel/peer-targeted loop-out is first-hop constrained via external-pay creation followed by a CLN `pay` that excludes all other local peers (:1530-1652; capability cache :263-297). When support is still *unknown*, the swap is attempted with chanIds; if the backend then rejects them (synchronously, asynchronously via swapinfo probe, or as an exception), the loop-out is retried *without* pinning — never silently: a warning is recorded and the unified budget is re-checked before the second creation (:1676-1685, :1702-1711, :1719-1728). (The "submitted without channel pinning" branch at :1654-1656 is unreachable in practice: cached-False targeted swaps always take the external-pay path.)
+- **BM-I13** — An external-pay loop-out never pays more principal than requested: the boltz-produced invoice is decoded and rejected (BoltzCliError, before `pay`) when its amount is missing or exceeds the requested amount_sats (:580-594). The routing-fee side of that payment is capped only when routing_fee_limit_ppm is configured (default 0 = boltzcli default).
+- **BM-I14** — The budget machinery gates only *swap-fee* spend at creation time (loop_in/loop_out/chainswap). Swap principal and wallet principal movements — `withdraw` (:1879-1901), `deposit_address`, `refund` (:1824-1827), `claim` (:1829-1835) — pass through no budget gate at all; the only principal guard anywhere in the module is BM-I13.
+
+## 4. Revenue role
+
+Indirect, and primarily defensive: Boltz swaps do not earn fees, they *spend* fees to reshape liquidity. Loop-out converts unroutable local-heavy balance into on-chain funds (restoring inbound capacity on drained channels and funding the planner's next open — the treasury mode exists exactly to refill the on-chain reserve the planner needs, cl-revenue-ops.py:1251-1260); loop-in refills depleted local balance so existing channels can keep forwarding. The revenue case is that a swap fee of tens-to-hundreds of sats buys back routing capability on corridors that demonstrably earn, and structural loop-outs are explicitly justified by an inbound-scarcity credit computed elsewhere (:1449-1455). Net-positive revenue depends entirely on (a) the targeted channels actually resuming earning and (b) budget discipline keeping swap spend below recovered routing income; the module enforces (b) only.
+
+## 5. Pre-registered hypotheses
+
+- **BM-H1 (swap pays for itself):** For each channel identifiable as the target of a completed loop-out, incremental routing fees earned through that channel in the 14 days after the swap, minus the swap fee, exceed the fees earned in the 14 days before. Identification caveat: revenue-spend-ledger.json exposes only category aggregates (no per-event channel metadata) and the swap journal is not in the corpus, so target channels must be recovered from revenue-boltz-auto-cycle-status.json `last_result` snapshots (lossy — only the most recent cycle per snapshot) and/or hive-organism-status.json metabolism entries; swap fees from the boltz-category deltas between consecutive ledger snapshots. Metric: Δ(14d channel fee income from listforwards-window.json.gz) − swap_fee_sats. Baseline: same channel pre-swap. Direction: > 0. Test: one-sided Wilcoxon signed-rank across identifiable swap events; minimum n=5 identifiable events else descriptive only. If target identification recovers <5 events, report the identification gap itself as a finding.
+- **BM-H2 (budget compliance is real):** In no corpus snapshot does the rolling-24h Boltz spend (revenue-spend-ledger.json by-category total for "boltz", and the boltz_spent_24h component of revenue-total-cost-budget.json) exceed the unified daily budget reported in the same snapshot. Rolling-24h totals are what the gate actually enforces (:1306-1324) and what the artifacts directly report. Metric: count of violating node-snapshots. Baseline: zero violations expected (modulo fee-estimate vs settled-fee error, see Uncertainties). Test: exact count; any violation falsifies (invariant-grade, testable purely from the corpus).
+- **BM-H3 (treasury mode supports planner throughput):** Hours following completed treasury-mode loop-outs show a reduced planner funding deficit (revenue-planner-status / planner coordination state via revenue-capex-status and on-chain outputs in revenue-status.json) compared to the 24h before the swap. Direction: deficit decreases. Test: one-sided paired Wilcoxon on pre/post 24h mean on-chain available funds.
+
+## 6. Observable surface
+
+- **revenue-spend-ledger.json** — boltz category spend totals (subcategory swap_fee / structural), the primary execution trace (:1202-1217). Caveat: the RPC (cl-revenue-ops.py:5935 → get_spend_ledger_summary) returns category/subcategory aggregates and active reservations only — individual spend events (with swap id and channel_id) live in the spend_events table but are not exposed; per-swap attribution must be inferred (see BM-H1).
+- **revenue-total-cost-budget.json** — unified budget the swaps were gated against; includes Boltz components via get_boltz_cost_components.
+- **revenue-capex-status.json** — tactical/channel budgets that gates BM-I4/I5 read.
+- **hive-organism-status.json** — metabolism ledger view of liquidity spend.
+- **revenue-status.json / revenue-dashboard.json** — on-chain vs channel balance shifts after swaps; auto-cycle state.
+- **listpeerchannels.json** — per-channel local/remote balance changes attributable to loop-in/loop-out settlement.
+- **listforwards-window.json.gz** — outcome routing income for BM-H1.
+- Not in the corpus: the swap journal and ignore files live in the boltz datadir, and boltzcli's own listswaps output is not snapshotted — swap identity must be inferred from the spend ledger.
+
+## 7. Uncertainties
+
+- Is the auto-cycle (revenue-ops-boltz-auto-cycle-enabled) on in production, and with what max_actions/interval? Without it, only manual RPC swaps appear in the corpus.
+- `_estimate_swap_fee_sats` (:738-766) recursively scans the quote payload for fee-like keys; its accuracy vs the actually-settled fee is unverified — both budget gating and BM-H1 inherit that error.
+- Whether boltzd/boltzcli v2.11.0 behavior assumed in the channel-pinning warnings still matches the deployed binary version.
+- The "balance plan" generator the auto-cycle uses (`_boltz_balance_plan`-style logic in the main plugin) was not audited here; which channels get selected for structural drains is outside this module.
+- Whether external (non-plugin) swaps created directly via boltzcli are correctly excluded from budget accounting in practice (the ignore-list mechanism :997-1157 exists for this, but depends on operator curation).
+- daily_budget_sats default 3000 vs the unified provider: which budget actually binds on production nodes?
