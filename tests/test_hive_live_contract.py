@@ -141,35 +141,50 @@ def live_snapshot() -> dict:
             Metric(PEER_REBAL, "source", 1_000_000),
         ]
 
+        # Current producer contract: corridor_role is keyed by corridor
+        # ENDPOINT peer and only corridors WE serve are emitted (cl-hive
+        # audit HIGH-1). Two corridors: one we own (endpoint PEER_PRIMARY)
+        # and one where we are a secondary (endpoint PEER_SECONDARY).
         corridor_mgr = MagicMock()
         corridor_mgr.get_assignments.return_value = [
             CorridorAssignment(
                 corridor=FlowCorridor(
-                    source_peer_id="source",
-                    destination_peer_id="dest",
-                    capable_members=[PEER_PRIMARY, PEER_SECONDARY],
+                    source_peer_id=PEER_PRIMARY,
+                    destination_peer_id=OUR_PUBKEY,
+                    capable_members=[OUR_PUBKEY, PEER_SECONDARY],
                 ),
-                primary_member=PEER_PRIMARY,
+                primary_member=OUR_PUBKEY,
                 secondary_members=[PEER_SECONDARY],
                 primary_fee_ppm=500,
                 secondary_fee_ppm=900,
                 assignment_reason="test",
                 confidence=0.9,
-            )
+            ),
+            CorridorAssignment(
+                corridor=FlowCorridor(
+                    source_peer_id=PEER_SECONDARY,
+                    destination_peer_id=OUR_PUBKEY,
+                    capable_members=[PEER_PRIMARY, OUR_PUBKEY],
+                ),
+                primary_member=PEER_PRIMARY,
+                secondary_members=[OUR_PUBKEY],
+                primary_fee_ppm=500,
+                secondary_fee_ppm=900,
+                assignment_reason="test",
+                confidence=0.9,
+            ),
         ]
 
         fee_coordination_mgr = MagicMock(corridor_mgr=corridor_mgr)
 
         # Provide observed fee data for PEER_SECONDARY so fleet_fee_median is
         # populated from real fee intelligence (not the old corridor-derived
-        # constant). optimal_fee_estimate comes from the observed-fee profile.
-        _fee_profiles = {{
-            PEER_SECONDARY: {{"optimal_fee_estimate": 900}},
-        }}
+        # constant). The producer reads the OBSERVED per-reporter medians via
+        # get_observed_fee_medians (never the model's optimal_fee_estimate).
         fee_intel_mgr = MagicMock()
-        fee_intel_mgr.get_aggregated_profile.side_effect = (
-            lambda peer_id: _fee_profiles.get(peer_id)
-        )
+        fee_intel_mgr.get_observed_fee_medians.return_value = {{
+            PEER_SECONDARY: 900,
+        }}
 
         ctx = HiveContext(
             database=db,
