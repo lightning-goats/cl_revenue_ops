@@ -3251,6 +3251,27 @@ def _supported_fee_ceiling_from_state(ts_state: Dict[str, Any]) -> Optional[floa
         return None
 
 
+def _zero_flow_guard_state(
+    last_revenue_rate: Any,
+    forwards_since_update: Any,
+    zero_revenue_streak: Any,
+) -> Optional[str]:
+    """Return the active DTS+PID zero-flow guard state for diagnostics."""
+    try:
+        rate = float(last_revenue_rate)
+        forwards = int(forwards_since_update)
+        streak = int(zero_revenue_streak)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if rate != 0.0 or forwards != 0:
+        return None
+    if streak >= FeeController.ZERO_FLOW_DOWNSHIFT_STREAK:
+        return "zero_flow_downshift"
+    if streak >= FeeController.ZERO_FLOW_GUARD_STREAK:
+        return "zero_flow_ratchet_guard"
+    return None
+
+
 @plugin.method("revenue-fee-debug")
 def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     """
@@ -3375,6 +3396,12 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
                 hive_fee_debug = fee_controller.get_hive_fee_hint_debug(peer_id)
             except Exception as e:
                 hive_fee_debug = {"error": str(e)}
+        zero_revenue_streak = ts_state.get("zero_revenue_streak", 0)
+        zero_flow_guard = _zero_flow_guard_state(
+            last_revenue_rate,
+            forward_count,
+            zero_revenue_streak,
+        )
         result["channels"].append({
             "channel_id": channel_id[:12] + "..." if len(channel_id) > 12 else channel_id,
             "peer_id": peer_id,
@@ -3385,6 +3412,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
             "forwards_since_update": forward_count,
             "last_broadcast_fee_ppm": last_broadcast_fee,
             "last_revenue_rate": round(last_revenue_rate, 2),
+            "zero_flow_guard": zero_flow_guard,
             "flow_state": chan_state.get("state", "unknown"),
             "fee_profile": v2_state.get("last_fee_profile", profile["name"]),
             "dts": {
@@ -3392,7 +3420,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
                 "posterior_std": ts_state.get("posterior_std"),
                 "observations": len(ts_state.get("observations") or []),
                 "last_sampled_fee": ts_state.get("last_sampled_fee"),
-                "zero_revenue_streak": ts_state.get("zero_revenue_streak", 0),
+                "zero_revenue_streak": zero_revenue_streak,
                 "positive_rate_ref": ts_state.get("positive_rate_ref", 0.0),
                 "supported_fee_ceiling": _supported_fee_ceiling_from_state(ts_state),
             },

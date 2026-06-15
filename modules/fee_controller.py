@@ -2399,6 +2399,15 @@ class FeeController:
     ZERO_FLOW_REDUCTION_MODERATE = 0.75
     ZERO_FLOW_REDUCTION_SEVERE = 0.50
 
+    # Persistent current-window silence must override stale profitable-history
+    # beliefs before they can ratchet the applied DTS+PID fee upward. The
+    # moderate threshold freezes upward movement. At the severe threshold the
+    # already-blended target is capped 15% below the live fee; normal damping
+    # and economic floors still apply afterward.
+    ZERO_FLOW_GUARD_STREAK = 8
+    ZERO_FLOW_DOWNSHIFT_STREAK = 24
+    ZERO_FLOW_DOWNSHIFT_RATIO = 0.85
+
     # ==========================================================================
     # Issue #32: Rebalance Cost-Aware Fee Floor
     # ==========================================================================
@@ -5173,6 +5182,47 @@ class FeeController:
             "cap_applied": cap_applied,
             "wake_damping_applied": woke_from_sleep,
         }
+
+    def _apply_zero_flow_ratchet_guard(
+        self,
+        *,
+        current_fee: int,
+        target_fee: int,
+        min_fee: int,
+        zero_revenue_streak: int,
+        forwards_since_update: int,
+        revenue_rate: float,
+        supported_fee_ceiling: Optional[float] = None,
+    ) -> Tuple[int, Optional[str]]:
+        """Prevent stale DTS belief from raising fees during current silence."""
+        try:
+            current = int(current_fee)
+            target = int(target_fee)
+            floor = max(0, int(min_fee))
+            streak = max(0, int(zero_revenue_streak))
+            forwards = max(0, int(forwards_since_update))
+            rate = float(revenue_rate)
+        except (TypeError, ValueError, OverflowError):
+            return int(target_fee), None
+
+        if rate != 0.0 or forwards != 0 or streak < self.ZERO_FLOW_GUARD_STREAK:
+            return target, None
+
+        if streak < self.ZERO_FLOW_DOWNSHIFT_STREAK:
+            return max(floor, min(target, current)), "zero_flow_ratchet_guard"
+
+        downshift_cap = int(math.floor(current * self.ZERO_FLOW_DOWNSHIFT_RATIO))
+        try:
+            supported_cap = float(supported_fee_ceiling)
+        except (TypeError, ValueError, OverflowError):
+            supported_cap = 0.0
+        if math.isfinite(supported_cap) and supported_cap > 0:
+            downshift_cap = min(downshift_cap, int(supported_cap))
+
+        return (
+            max(floor, min(target, downshift_cap)),
+            "zero_flow_downshift",
+        )
     
     def _detect_congestion(self, state: Optional[Dict[str, Any]],
                            channel_info: Optional[Dict[str, Any]],
@@ -5267,6 +5317,10 @@ class FeeController:
         bounded_target_ppm = None
         blended_target_ppm = None
         applied_target_ppm = None
+        zero_flow_guard_reason = None
+        zero_flow_guard_target_ppm = None
+        zero_revenue_streak = None
+        supported_cap_ppm = None
         bound_reason = "none"
         delta_cap_reason = "none"
         delta_cap_ppm = 0
@@ -6255,7 +6309,6 @@ class FeeController:
             # overshot fee is pulled back to the supported region instead
             # of waiting out a 10%-per-probe descent. Hard floors below
             # still win (cost floors are not negotiable).
-            supported_cap_ppm = None
             try:
                 supported_cap = ts_state.thompson.supported_fee_ceiling()
             except Exception:
@@ -6319,6 +6372,26 @@ class FeeController:
                 cfg=cfg,
             )
             target_blend_ratio = blend_info["blend_ratio"]
+            pre_guard_blended_target_ppm = blended_target_ppm
+            zero_revenue_streak = ts_state.thompson.zero_revenue_streak
+            blended_target_ppm, zero_flow_guard_reason = self._apply_zero_flow_ratchet_guard(
+                current_fee=current_fee_ppm,
+                target_fee=blended_target_ppm,
+                min_fee=floor_ppm,
+                zero_revenue_streak=zero_revenue_streak,
+                forwards_since_update=forward_count,
+                revenue_rate=current_revenue_rate,
+                supported_fee_ceiling=supported_cap_ppm,
+            )
+            if zero_flow_guard_reason:
+                zero_flow_guard_target_ppm = blended_target_ppm
+                self.plugin.log(
+                    f"ZERO_FLOW_GUARD: {channel_id[:12]}... "
+                    f"{zero_flow_guard_reason}, streak={zero_revenue_streak}, "
+                    f"target={pre_guard_blended_target_ppm}->{blended_target_ppm}ppm, "
+                    f"current={current_fee_ppm}ppm, floor={floor_ppm}ppm",
+                    level='debug',
+                )
             new_fee_ppm, damping_info = self._apply_damped_fee_target(
                 current_fee_ppm=current_fee_ppm,
                 target_fee_ppm=blended_target_ppm,
@@ -6331,9 +6404,12 @@ class FeeController:
             delta_cap_applied = damping_info["cap_applied"]
 
             hive_tag = f", hive={hive_fee_bias:.2f}" if hive_fee_bias != 1.0 else ""
+            zero_flow_tag = (
+                f", guard={zero_flow_guard_reason}" if zero_flow_guard_reason else ""
+            )
             decision_reason = (
                 f"dts_pid (dts={dts_fee}, pid={pid_multiplier:.2f}, "
-                f"flow={flow_state_str}{hive_tag})"
+                f"flow={flow_state_str}{hive_tag}{zero_flow_tag})"
             )
 
             # Update volume tracking
@@ -6547,7 +6623,8 @@ class FeeController:
             f"targets=dts:{raw_dts_target_ppm}, post_pid:{post_pid_target_ppm}, "
             f"bounded:{bounded_target_ppm}, blended:{blended_target_ppm}, applied:{applied_target_ppm}, "
             f"blend:{target_blend_ratio:.2f}, bound:{bound_reason}, cap:{delta_cap_reason}({delta_cap_ppm}ppm), "
-            f"wake:{wake_reason}, sparse:{sparse_data_conservative}, exploration:{exploration_mode}"
+            f"wake:{wake_reason}, sparse:{sparse_data_conservative}, exploration:{exploration_mode}, "
+            f"zero_flow_guard:{zero_flow_guard_reason or 'none'}"
             f"{rebal_cost_tag}"
             if raw_dts_target_ppm is not None else
             f"targets=n/a, blend:{target_blend_ratio:.2f}, wake:{wake_reason}, "
@@ -6692,6 +6769,10 @@ class FeeController:
                     "volatility_reset": volatility_reset,
                     "raw_dts_target_ppm": raw_dts_target_ppm,
                     "post_pid_target_ppm": post_pid_target_ppm,
+                    "zero_flow_guard_reason": zero_flow_guard_reason,
+                    "zero_flow_guard_target_ppm": zero_flow_guard_target_ppm,
+                    "zero_revenue_streak": zero_revenue_streak,
+                    "supported_fee_ceiling_ppm": supported_cap_ppm,
                     "bounded_target_ppm": bounded_target_ppm,
                     "blended_target_ppm": blended_target_ppm if blended_target_ppm is not None else bounded_target_ppm,
                     "applied_target_ppm": applied_target_ppm if applied_target_ppm is not None else new_fee_ppm,

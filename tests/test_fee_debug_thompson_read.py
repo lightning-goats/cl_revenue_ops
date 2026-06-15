@@ -18,6 +18,7 @@ THOMPSON = {
     "posterior_std": 45.0,
     "observations": [1, 2, 3],
     "last_sampled_fee": 300,
+    "zero_revenue_streak": 24,
 }
 
 
@@ -73,6 +74,7 @@ def test_reads_nested_fee_state_thompson_state():
     assert dts["posterior_std"] == 45.0
     assert dts["observations"] == 3
     assert dts["last_sampled_fee"] == 300
+    assert _channel_entry(result, "100x1x0")["zero_flow_guard"] == "zero_flow_downshift"
 
 
 def test_falls_back_to_flat_thompson_state_for_old_rows():

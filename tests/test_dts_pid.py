@@ -1041,6 +1041,134 @@ def _make_fc_for_dts_pid(mock_plugin, mock_database):
     return fc, cfg
 
 
+class TestZeroFlowRatchetGuard:
+    def test_moderate_stall_blocks_upward_target(self, mock_plugin, mock_database):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=2306,
+            target_fee=3000,
+            min_fee=100,
+            zero_revenue_streak=FeeController.ZERO_FLOW_GUARD_STREAK,
+            forwards_since_update=0,
+            revenue_rate=0.0,
+            supported_fee_ceiling=3200,
+        )
+
+        assert guarded == 2306
+        assert reason == "zero_flow_ratchet_guard"
+
+    @pytest.mark.parametrize(
+        ("revenue_rate", "forwards_since_update"),
+        [(1.0, 0), (0.0, 1)],
+    )
+    def test_recovered_flow_preserves_normal_upward_target(
+        self,
+        mock_plugin,
+        mock_database,
+        revenue_rate,
+        forwards_since_update,
+    ):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=2306,
+            target_fee=3000,
+            min_fee=100,
+            zero_revenue_streak=198,
+            forwards_since_update=forwards_since_update,
+            revenue_rate=revenue_rate,
+            supported_fee_ceiling=3200,
+        )
+
+        assert guarded == 3000
+        assert reason is None
+
+    def test_severe_stall_respects_economic_floor(self, mock_plugin, mock_database):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=200,
+            target_fee=1000,
+            min_fee=190,
+            zero_revenue_streak=FeeController.ZERO_FLOW_DOWNSHIFT_STREAK,
+            forwards_since_update=0,
+            revenue_rate=0.0,
+            supported_fee_ceiling=150,
+        )
+
+        assert guarded == 190
+        assert reason == "zero_flow_downshift"
+
+    def test_loop_style_severe_stall_downshifts_instead_of_ratchet(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.min_fee_ppm = 100
+        cfg.max_fee_ppm = 5000
+        channel_id = "946890x2272x0"
+        peer_id = "021c97a90a411ff2b10dc2a8e32de2f29d2fa49d41bfbb52bd416e460db0747d0d"
+        current_fee_ppm = 2306
+        now = int(time.time())
+
+        mock_database.get_volume_since.return_value = 0
+        mock_database.get_forward_count_since.return_value = 0
+        fc._calculate_floor = MagicMock(return_value=cfg.min_fee_ppm)
+        fc._get_rebalance_cost_floor = MagicMock(return_value=None)
+        fc._get_channel_rebalance_cost_ppm = MagicMock(return_value=0)
+        fc._get_neighbor_fee_median = MagicMock(return_value=None)
+        fc.set_channel_fee = MagicMock(
+            side_effect=lambda _channel_id, fee_ppm, **_kwargs: {
+                "success": True,
+                "fee_ppm": fee_ppm,
+            }
+        )
+
+        fc._cycle_states[channel_id] = ChannelCycleState(
+            last_revenue_rate=0.0,
+            last_fee_ppm=current_fee_ppm,
+            last_update=now - 7200,
+            last_broadcast_fee_ppm=current_fee_ppm,
+            last_state="dts_pid",
+        )
+        ts_state = ChannelFeeState(
+            last_revenue_rate=0.0,
+            last_fee_ppm=current_fee_ppm,
+            last_update=now - 7200,
+            last_broadcast_fee_ppm=current_fee_ppm,
+            last_state="dts_pid",
+        )
+        ts_state.thompson.zero_revenue_streak = 198
+        ts_state.thompson.posterior_mean = 2812.0
+        ts_state.thompson.posterior_std = 200.0
+        ts_state.thompson.observations = [
+            (2500, 10.0, 1.0, now, "normal")
+        ] * 10
+        ts_state.thompson.sample_fee_contextual = MagicMock(return_value=3000)
+        ts_state.pid.calculate_multiplier = MagicMock(return_value=1.0)
+        fc._channel_fee_states[channel_id] = ts_state
+
+        result = fc._adjust_channel_fee(
+            channel_id,
+            peer_id,
+            {"state": "source", "forward_count": 0, "sats_out": 0},
+            {
+                "fee_proportional_millionths": current_fee_ppm,
+                "fee_base_msat": 0,
+                "capacity": 17_000_000,
+                "spendable_msat": "9690000000msat",
+                "receivable_msat": "7310000000msat",
+                "opener": "local",
+            },
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert int(current_fee_ppm * 0.80) <= result.new_fee_ppm < current_fee_ppm
+        assert result.algorithm_values["zero_flow_guard_reason"] == "zero_flow_downshift"
+        assert "zero_flow_downshift" in result.reason
+
+
 class TestMarketBoundaryGuard:
     def _install_competitor_gossip(self, fc, *, peer_id, our_id="our-node", competitor_fees=(80,)):
         channels = [
