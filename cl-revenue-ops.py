@@ -61,6 +61,10 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.9.0: Zero-flow fee ratchet guard, intent contracts, and audit visibility
+#   - Prevents DTS+PID upward fee moves during persistent zero-flow stalls
+#   - Adds adversarial intent contracts and Hermes data-quality audit tooling
+#   - Improves fee-debug visibility for stalled/high-posterior channels
 # v2.8.0: Structural liquidity, fee optimizer honesty, and hot-path hardening
 #   - Expands hive hint freshness diagnostics and standalone safety coverage
 #   - Documents cross-plugin datastore contracts for cl-mycelium/revenue artifacts
@@ -82,7 +86,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.8.0"
+PLUGIN_VERSION = "2.9.0"
 HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
 
