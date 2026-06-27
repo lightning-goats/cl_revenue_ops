@@ -41,7 +41,7 @@ from .rebalance_state_v2 import (
     build_state_snapshot,
 )
 from .segment_observations import SegmentObservationStore
-from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
+from .rebalance_types_v2 import DrainDemand, PairCandidate, PlanResult, SkipRecord
 from .utils import base_to_sats_ceil, parse_msat
 
 # ---------------------------------------------------------------------------
@@ -58,6 +58,43 @@ SOURCE_UTILIZATION_DISCOUNT = 0.5
 # Each recent in-window failure of this pair charges this fraction of the
 # route cost as an expected-retry penalty.
 FAILURE_COST_RATE = 0.25
+
+
+def _nonnegative_float(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < 0.0:
+        return 0.0
+    return parsed
+
+
+def _nonnegative_msat_int(value: Any) -> int:
+    if isinstance(value, str):
+        value = value.strip()
+        if value.endswith("msat"):
+            value = value[:-4]
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bounded_historical_fee_ppm(value: Any, cap_ppm: float) -> float:
+    parsed = _nonnegative_float(value)
+    if cap_ppm > 0.0:
+        parsed = min(parsed, cap_ppm)
+    return parsed
+
+
+def _historical_fee_rate_ppm(fee_msat: Any, volume_msat: Any, cap_ppm: float) -> float:
+    fee = _nonnegative_msat_int(fee_msat)
+    volume = _nonnegative_msat_int(volume_msat)
+    if fee <= 0 or volume <= 0:
+        return 0.0
+    return _bounded_historical_fee_ppm(fee * 1_000_000.0 / volume, cap_ppm)
+
 
 # Sentinel distinguishing "caller did not supply an anchor row" from "caller
 # looked the anchor up and found none" in _effective_dest_cooldown_secs.
@@ -343,6 +380,7 @@ class RebalanceEngine:
         cfg = self.config if not hasattr(self.config, "snapshot") else self.config.snapshot()
         high_threshold = float(getattr(cfg, "high_liquidity_threshold", 0.65) or 0.65)
         low_threshold = float(getattr(cfg, "low_liquidity_threshold", 0.35) or 0.35)
+        historical_fee_cap_ppm = _nonnegative_float(getattr(cfg, "max_fee_ppm", 0) or 0)
 
         source_capacity = int(getattr(pair, "source_capacity_sats", 0) or 0)
         dest_capacity = int(getattr(pair, "dest_capacity_sats", 0) or 0)
@@ -397,12 +435,39 @@ class RebalanceEngine:
         # --- Sats-EV gate terms (audit F2) ---
         dest_out_fee_ppm = max(0, int(getattr(pair, "dest_out_fee_ppm", 0) or 0))
         source_out_fee_ppm = max(0, int(getattr(pair, "source_out_fee_ppm", 0) or 0))
+        source_historical_direct_fee_ppm = _bounded_historical_fee_ppm(
+            getattr(pair, "source_historical_direct_fee_ppm", 0.0),
+            historical_fee_cap_ppm,
+        )
+        source_historical_sourced_fee_ppm = _bounded_historical_fee_ppm(
+            getattr(pair, "source_historical_sourced_fee_ppm", 0.0),
+            historical_fee_cap_ppm,
+        )
+        dest_historical_direct_fee_ppm = _bounded_historical_fee_ppm(
+            getattr(pair, "dest_historical_direct_fee_ppm", 0.0),
+            historical_fee_cap_ppm,
+        )
+        dest_historical_sourced_fee_ppm = _bounded_historical_fee_ppm(
+            getattr(pair, "dest_historical_sourced_fee_ppm", 0.0),
+            historical_fee_cap_ppm,
+        )
+        dest_value_fee_ppm = max(dest_out_fee_ppm, dest_historical_direct_fee_ppm)
+        source_opportunity_fee_ppm = max(source_out_fee_ppm, source_historical_direct_fee_ppm)
+        destination_refill_value_sats = (
+            amount_sats * dest_value_fee_ppm / 1_000_000.0 * EXPECTED_UTILIZATION
+        )
+        source_drain_value_sats = (
+            amount_sats
+            * source_historical_sourced_fee_ppm
+            / 1_000_000.0
+            * EXPECTED_UTILIZATION
+        )
         expected_future_value_sats = (
-            amount_sats * dest_out_fee_ppm / 1_000_000.0 * EXPECTED_UTILIZATION
+            destination_refill_value_sats + source_drain_value_sats
         )
         source_opportunity_sats = (
             amount_sats
-            * source_out_fee_ppm
+            * source_opportunity_fee_ppm
             / 1_000_000.0
             * EXPECTED_UTILIZATION
             * SOURCE_UTILIZATION_DISCOUNT
@@ -432,7 +497,7 @@ class RebalanceEngine:
         # this also preserves the zero-budget equalization invariant.
         beats_do_nothing = bool(
             not rejection_reason
-            and (expected_fee_sats <= 0 or final_score_sats > 0.0)
+            and (expected_fee_sats <= 0 or final_score_sats >= 0.0)
         )
 
         return {
@@ -451,6 +516,8 @@ class RebalanceEngine:
             "final_score": final_score,
             # Sats-EV gate terms (audit F2).
             "expected_future_value_sats": round(expected_future_value_sats, 6),
+            "destination_refill_value_sats": round(destination_refill_value_sats, 6),
+            "source_drain_value_sats": round(source_drain_value_sats, 6),
             "expected_fee_sats": expected_fee_sats,
             "source_opportunity_sats": round(source_opportunity_sats, 6),
             "failure_penalty_sats": round(failure_penalty_sats, 6),
@@ -462,6 +529,12 @@ class RebalanceEngine:
             "inputs": {
                 "dest_out_fee_ppm": dest_out_fee_ppm,
                 "source_out_fee_ppm": source_out_fee_ppm,
+                "dest_value_fee_ppm": round(dest_value_fee_ppm, 6),
+                "source_opportunity_fee_ppm": round(source_opportunity_fee_ppm, 6),
+                "dest_historical_direct_fee_ppm": round(dest_historical_direct_fee_ppm, 6),
+                "dest_historical_sourced_fee_ppm": round(dest_historical_sourced_fee_ppm, 6),
+                "source_historical_direct_fee_ppm": round(source_historical_direct_fee_ppm, 6),
+                "source_historical_sourced_fee_ppm": round(source_historical_sourced_fee_ppm, 6),
                 "failure_count": failure_count,
                 "reason_code": str(getattr(pair, "reason_code", "") or ""),
                 "route_policy": getattr(
@@ -637,9 +710,7 @@ class RebalanceEngine:
                 buckets["source_inside_band"] += 1
         return buckets
 
-    # DrainDemand lives in rebalance_types_v2; string-annotated (PEP 563 is in
-    # effect here) so we avoid a runtime import used only for typing.
-    def get_drain_demand(self) -> Optional["DrainDemand"]:
+    def get_drain_demand(self) -> Optional[DrainDemand]:
         """Residual over-local demand from the last planning pass, or None.
 
         Consumed by the Boltz structural loop-out path. Read-only snapshot;
@@ -854,6 +925,7 @@ class RebalanceEngine:
     def _build_snapshot(self) -> Optional[StateSnapshot]:
         """Build a normalized state snapshot from live data."""
         cfg = self.config if not hasattr(self.config, 'snapshot') else self.config.snapshot()
+        historical_fee_cap_ppm = _nonnegative_float(getattr(cfg, "max_fee_ppm", 0) or 0)
 
         def _coerce_float(name: str, default: float) -> float:
             value = getattr(cfg, name, default)
@@ -957,6 +1029,8 @@ class RebalanceEngine:
             # Profitability check
             is_profitable = False
             is_active = False
+            historical_direct_fee_ppm = 0.0
+            historical_sourced_fee_ppm = 0.0
             if self._profitability:
                 try:
                     prof = self._profitability.get_profitability(scid)
@@ -965,6 +1039,36 @@ class RebalanceEngine:
                         if revenue:
                             is_profitable = getattr(revenue, 'total_contribution_msat', 0) > 0
                             is_active = getattr(revenue, 'total_forward_count', 0) > 5
+                            direct_fee_msat = getattr(
+                                revenue,
+                                'fees_earned_msat',
+                                getattr(revenue, 'fees_earned_sats', 0) * 1000,
+                            )
+                            direct_volume_msat = getattr(
+                                revenue,
+                                'volume_routed_msat',
+                                getattr(revenue, 'volume_routed_sats', 0) * 1000,
+                            )
+                            sourced_fee_msat = getattr(
+                                revenue,
+                                'sourced_fee_contribution_msat',
+                                getattr(revenue, 'sourced_fee_contribution_sats', 0) * 1000,
+                            )
+                            sourced_volume_msat = getattr(
+                                revenue,
+                                'sourced_volume_msat',
+                                getattr(revenue, 'sourced_volume_sats', 0) * 1000,
+                            )
+                            historical_direct_fee_ppm = _historical_fee_rate_ppm(
+                                direct_fee_msat,
+                                direct_volume_msat,
+                                historical_fee_cap_ppm,
+                            )
+                            historical_sourced_fee_ppm = _historical_fee_rate_ppm(
+                                sourced_fee_msat,
+                                sourced_volume_msat,
+                                historical_fee_cap_ppm,
+                            )
                 except Exception:
                     pass
 
@@ -1025,6 +1129,8 @@ class RebalanceEngine:
                 "local_sats": local_sats,
                 "actual_inbound_fee_ppm": inbound_fee_ppm,
                 "local_out_fee_ppm": local_out_fee_ppm,
+                "historical_direct_fee_ppm": historical_direct_fee_ppm,
+                "historical_sourced_fee_ppm": historical_sourced_fee_ppm,
                 "is_hive_member": is_hive,
                 "is_profitable": is_profitable,
                 "is_active": is_active,
@@ -1490,7 +1596,7 @@ class RebalanceEngine:
                             if (
                                 final_score_present
                                 and int(route_result.route_cost_sats or 0) > 0
-                                and final_score <= hold_margin
+                                and final_score < hold_margin
                             ):
                                 self._update_pair_score_decomposition(
                                     pair,

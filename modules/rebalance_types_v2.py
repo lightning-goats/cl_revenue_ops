@@ -38,6 +38,13 @@ class PairCandidate:
     # source opportunity cost (what the drained source forgoes).
     source_out_fee_ppm: int = 0
     dest_out_fee_ppm: int = 0
+    # Historical role fee rates from local profitability accounting. Direct
+    # rates credit a channel when it acts as the exit; sourced rates credit a
+    # channel when it acts as the entry that enables fees on other exits.
+    source_historical_direct_fee_ppm: float = 0.0
+    source_historical_sourced_fee_ppm: float = 0.0
+    dest_historical_direct_fee_ppm: float = 0.0
+    dest_historical_sourced_fee_ppm: float = 0.0
     hive_source_rebalance_bias: float = 1.0
     hive_dest_rebalance_bias: float = 1.0
     hive_hint_score_multiplier: float = 1.0

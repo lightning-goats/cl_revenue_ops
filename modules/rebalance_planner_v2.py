@@ -8,7 +8,7 @@ it doesn't select.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List
 
 from .rebalance_state_v2 import ChannelState, StateSnapshot
 from .rebalance_types_v2 import (
@@ -280,7 +280,6 @@ class RebalancePlanner:
                 # Phase 4.1: explicit additive role-aware planner score.
                 # Each term carries a clear meaning instead of a single
                 # value*imbalance scalar.
-                src_value = _VALUE_SCORES.get(src.value_class, 0)
                 dest_value = _VALUE_SCORES.get(dest.value_class, 0)
 
                 # Destination value drives the investment decision. Phase 5
@@ -348,6 +347,18 @@ class RebalancePlanner:
                     ),
                     dest_out_fee_ppm=max(
                         0, int(getattr(dest, "local_out_fee_ppm", 0) or 0)
+                    ),
+                    source_historical_direct_fee_ppm=max(
+                        0.0, float(getattr(src, "historical_direct_fee_ppm", 0.0) or 0.0)
+                    ),
+                    source_historical_sourced_fee_ppm=max(
+                        0.0, float(getattr(src, "historical_sourced_fee_ppm", 0.0) or 0.0)
+                    ),
+                    dest_historical_direct_fee_ppm=max(
+                        0.0, float(getattr(dest, "historical_direct_fee_ppm", 0.0) or 0.0)
+                    ),
+                    dest_historical_sourced_fee_ppm=max(
+                        0.0, float(getattr(dest, "historical_sourced_fee_ppm", 0.0) or 0.0)
                     ),
                     hive_source_rebalance_bias=source_rebalance_bias,
                     hive_dest_rebalance_bias=dest_rebalance_bias,

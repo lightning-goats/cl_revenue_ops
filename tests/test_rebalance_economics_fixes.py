@@ -198,6 +198,61 @@ def test_f2d_hold_margin_is_respected_in_sats(mock_plugin, mock_database):
     assert len(selected) == 1
 
 
+def test_f2e_break_even_paid_route_is_approved(mock_plugin, mock_database):
+    """Default margin 0 should execute paid routes whose sats EV is exactly 0.
+
+    This is the more-rebalancing/no-negative-profit boundary: route cost equals
+    probability-adjusted expected future value, so the route is break-even.
+    """
+    engine = _make_engine(mock_plugin, mock_database)
+    pair = _make_pair(
+        amount_sats=1_000_000,
+        pair_budget_sats=1_000,
+        dest_out_fee_ppm=200,  # expected value = 100 sats; 0.99 * 100 = 99
+        source_out_fee_ppm=0,
+    )
+
+    selected = _run_single_pair(
+        engine, pair, route_cost_sats=99, probability_ppm=990_000
+    )
+
+    assert selected == [pair]
+    decomp = pair.score_decomposition
+    assert decomp["final_score_sats"] == pytest.approx(0.0)
+    assert decomp["beats_do_nothing"] is True
+
+
+def test_f2f_historical_destination_and_source_value_feed_sats_ev(
+    mock_plugin, mock_database
+):
+    """Historical role profitability should improve the local EV estimate.
+
+    The current destination fee is zero, so the old model sees no future value.
+    Historical direct destination earnings plus source sourced-fee contribution
+    make the move positive without relying on hive hints or raising budgets.
+    """
+    engine = _make_engine(mock_plugin, mock_database)
+    pair = _make_pair(
+        amount_sats=1_000_000,
+        pair_budget_sats=1_000,
+        dest_out_fee_ppm=0,
+        source_out_fee_ppm=0,
+    )
+    pair.dest_historical_direct_fee_ppm = 200.0
+    pair.source_historical_sourced_fee_ppm = 100.0
+
+    selected = _run_single_pair(
+        engine, pair, route_cost_sats=120, probability_ppm=990_000
+    )
+
+    assert selected == [pair]
+    decomp = pair.score_decomposition
+    assert decomp["destination_refill_value_sats"] == pytest.approx(100.0)
+    assert decomp["source_drain_value_sats"] == pytest.approx(50.0)
+    assert decomp["expected_future_value_sats"] == pytest.approx(150.0)
+    assert decomp["final_score_sats"] == pytest.approx(28.5)
+
+
 # ---------------------------------------------------------------------------
 # F1 — per-attempt fee ceiling: the 30-day budget is the reservation cap,
 # the ppm cap bounds any single attempt

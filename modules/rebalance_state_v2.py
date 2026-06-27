@@ -25,6 +25,10 @@ class ChannelInput:
     # Our OWN outbound fee on this channel (ppm). Anchors the sats-EV
     # rebalance gate: it is what the channel earns per routed sat.
     local_out_fee_ppm: int = 0
+    # Historical role rates from profitability accounting. direct = exit role;
+    # sourced = entry role whose inbound flow earned fees on another exit.
+    historical_direct_fee_ppm: float = 0.0
+    historical_sourced_fee_ppm: float = 0.0
     is_hive_member: bool = False
     is_profitable: bool = False
     is_active: bool = False
@@ -61,6 +65,8 @@ class ChannelState:
     rebalance_bias: float = 1.0
     # Our OWN outbound fee on this channel (ppm) — sats-EV gate input.
     local_out_fee_ppm: int = 0
+    historical_direct_fee_ppm: float = 0.0
+    historical_sourced_fee_ppm: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -96,6 +102,18 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _as_nonnegative_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < 0.0:
+        return 0.0
+    return parsed
+
+
 def _as_rebalance_bias(value: Any) -> float:
     try:
         parsed = float(value)
@@ -117,6 +135,12 @@ def _normalize_channel_input(value: Any) -> ChannelInput:
                 value.get("actual_inbound_fee_ppm", value.get("peer_inbound_fee_ppm", 0))
             ),
             local_out_fee_ppm=_as_int(value.get("local_out_fee_ppm", 0)),
+            historical_direct_fee_ppm=_as_nonnegative_float(
+                value.get("historical_direct_fee_ppm", 0.0)
+            ),
+            historical_sourced_fee_ppm=_as_nonnegative_float(
+                value.get("historical_sourced_fee_ppm", 0.0)
+            ),
             is_hive_member=_as_bool(value.get("is_hive_member", False)),
             is_profitable=_as_bool(value.get("is_profitable", False)),
             is_active=_as_bool(value.get("is_active", False)),
@@ -301,6 +325,12 @@ def build_state_snapshot(
                 local_ratio=round(local_ratio, 6),
                 actual_inbound_fee_ppm=max(0, _as_int(channel.actual_inbound_fee_ppm)),
                 local_out_fee_ppm=max(0, _as_int(channel.local_out_fee_ppm)),
+                historical_direct_fee_ppm=_as_nonnegative_float(
+                    channel.historical_direct_fee_ppm
+                ),
+                historical_sourced_fee_ppm=_as_nonnegative_float(
+                    channel.historical_sourced_fee_ppm
+                ),
                 value_class=value_class,
                 is_valuable=is_valuable,
                 remaining_budget_sats=remaining_budget_sats,

@@ -1345,6 +1345,45 @@ def test_v2_planner_uses_hive_rebalance_bias_for_pair_roles():
     assert pair.score > inputs["pre_hint_pair_score"]
 
 
+def test_v2_planner_carries_historical_profitability_role_metrics():
+    from modules.rebalance_planner_v2 import RebalancePlanner
+    from modules.rebalance_state_v2 import build_state_snapshot
+
+    source = "100x1x0"
+    dest = "200x1x0"
+    snapshot = build_state_snapshot(
+        [
+            {
+                "channel_id": source,
+                "peer_id": "03" + "1" * 64,
+                "capacity_sats": 1_000_000,
+                "local_sats": 900_000,
+                "historical_direct_fee_ppm": 50.0,
+                "historical_sourced_fee_ppm": 100.0,
+            },
+            {
+                "channel_id": dest,
+                "peer_id": "03" + "2" * 64,
+                "capacity_sats": 1_000_000,
+                "local_sats": 100_000,
+                "is_profitable": True,
+                "historical_direct_fee_ppm": 200.0,
+                "historical_sourced_fee_ppm": 25.0,
+            },
+        ],
+        {"channel_budgets": {dest: {"budget_sats": 1_000}}},
+    )
+
+    selected = RebalancePlanner(max_pairs=1).plan(snapshot).selected
+
+    assert len(selected) == 1
+    pair = selected[0]
+    assert getattr(pair, "source_historical_direct_fee_ppm", 0.0) == pytest.approx(50.0)
+    assert getattr(pair, "source_historical_sourced_fee_ppm", 0.0) == pytest.approx(100.0)
+    assert getattr(pair, "dest_historical_direct_fee_ppm", 0.0) == pytest.approx(200.0)
+    assert getattr(pair, "dest_historical_sourced_fee_ppm", 0.0) == pytest.approx(25.0)
+
+
 def test_c1_planner_accepts_known_good_pair_and_explains_no_budget_destination():
     from modules.rebalance_planner_v2 import RebalancePlanner
     from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
