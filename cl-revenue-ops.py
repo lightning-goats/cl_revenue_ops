@@ -61,6 +61,10 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.10.0: Hive member zero-fee policy restoration
+#   - Restores confirmed hive-member channels to 0 ppm and 0 msat base fee
+#   - Keeps stale/malformed/missing hive hints neutral unless recent membership grace applies
+#   - Preserves cl_revenue_ops executor authority while honoring fleet membership policy
 # v2.9.0: Zero-flow fee ratchet guard, intent contracts, and audit visibility
 #   - Prevents DTS+PID upward fee moves during persistent zero-flow stalls
 #   - Adds adversarial intent contracts and Hermes data-quality audit tooling
@@ -86,7 +90,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.9.0"
+PLUGIN_VERSION = "2.10.0"
 HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
 
