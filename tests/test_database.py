@@ -598,3 +598,22 @@ class TestForwardDoubleDipPrevention:
             inserted = db.bulk_insert_forwards([dict(f, resolution_time=3)])
             assert inserted == 0
             assert self._count(db) == 1
+
+
+def test_spend_ledger_summary_reports_freshness_coverage(tmp_path):
+    db_path = os.path.join(tmp_path, "test_spend_coverage.db")
+    plugin = MagicMock()
+    db = Database(db_path, plugin)
+    db.initialize()
+
+    result = db.get_spend_ledger_summary(window_hours=24, include_reservations=True)
+
+    assert isinstance(result["timestamp"], int)
+    assert result["generated_at"] == result["timestamp"]
+    assert result["ttl_seconds"] == 1800
+    assert result["coverage_hours"] == 24
+    assert result["covered_hours"] == 24
+    assert result["coverage_status"] == "complete"
+    assert result["window_hours"] == 24
+    assert result["spent_by_category"] == {}
+    assert result["reserved_by_category"] == {}

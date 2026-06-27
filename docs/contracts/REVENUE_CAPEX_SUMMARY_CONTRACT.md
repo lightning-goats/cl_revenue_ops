@@ -12,11 +12,11 @@ cl-hive / cl-mycelium and other read-only consumers may consume this datastore p
 
 ## Generated At
 
-The current payload uses `timestamp` as the generated-at field. It is a Unix epoch timestamp in seconds and should be normalized by consumers as `generated_at`. Producers may add `generated_at` later, but `timestamp` remains the compatibility field.
+The payload uses `timestamp` as the compatibility generated-at field and also emits `generated_at` with the same Unix epoch seconds value. Consumers may normalize either field to generated-at time; `timestamp` remains the compatibility field.
 
 ## TTL And Freshness
 
-Recommended freshness TTL is 1800 seconds. Stale capex summaries may be reported with lowered confidence, but they must not override local executor budgets or planner policy.
+Recommended freshness TTL is 1800 seconds. Producers should emit `ttl_seconds: 1800` when possible. Stale capex summaries may be reported with lowered confidence, but they must not override local executor budgets or planner policy.
 
 ## Units
 
@@ -25,6 +25,9 @@ Fields ending in `_sats` are satoshis. Internally the capex engine uses msat and
 ## Required Fields
 
 - `timestamp`: Unix epoch seconds.
+- `generated_at`: Unix epoch seconds, same value as `timestamp`.
+- `ttl_seconds`: freshness TTL in seconds.
+- `status`: producer status, `ok` for a successful allocation.
 - `priority_class`
 - `global_envelope_sats`
 - `fleet_exploration_budget_sats`
@@ -35,7 +38,7 @@ Fields ending in `_sats` are satoshis. Internally the capex engine uses msat and
 
 ## Optional Fields
 
-The RPC response includes per-channel budget details, but the compact datastore summary intentionally omits them. Producers may add fields such as confidence or window metadata. Consumers must ignore unknown fields.
+The RPC response includes per-channel budget details, but the compact datastore summary intentionally omits them. The RPC response includes per-channel budget details under `channels`, but the compact datastore summary intentionally omits them. Producers may add fields such as confidence or window metadata. Consumers must ignore unknown fields.
 
 ## Stale Behavior
 
@@ -58,6 +61,9 @@ This is the current compact capex summary contract. `timestamp` is retained for 
 ```json
 {
   "timestamp": 1760000000,
+  "generated_at": 1760000000,
+  "ttl_seconds": 1800,
+  "status": "ok",
   "priority_class": "growth",
   "global_envelope_sats": 10000,
   "fleet_exploration_budget_sats": 1000,

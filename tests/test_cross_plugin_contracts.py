@@ -284,11 +284,24 @@ def test_capex_summary_producer_payload_matches_contract():
 
     key, payload = mod.data_service.datastore_push.call_args.args
     _jsonable(payload)
+    _jsonable(result)
     assert key == ["revenue", "capex-summary"]
+    assert result["status"] == "ok"
+    assert isinstance(result["timestamp"], int)
+    assert result["generated_at"] == result["timestamp"]
+    assert result["ttl_seconds"] == 1800
+    assert result["channel_count"] == 1
     assert result["channels"]["100x1x0"]["budget_sats"] == 700
     assert isinstance(payload["timestamp"], int)
+    assert payload["timestamp"] == result["timestamp"]
+    assert payload["generated_at"] == result["timestamp"]
+    assert payload["ttl_seconds"] == 1800
+    assert payload["status"] == "ok"
     assert payload == {
         "timestamp": payload["timestamp"],
+        "generated_at": payload["generated_at"],
+        "ttl_seconds": 1800,
+        "status": "ok",
         "priority_class": "growth",
         "global_envelope_sats": 10_000,
         "fleet_exploration_budget_sats": 1_000,

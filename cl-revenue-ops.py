@@ -5936,7 +5936,12 @@ def revenue_capex_status(plugin, **kwargs):
             "hive_multiplier": b.hive_multiplier,
         }
 
+    now = int(time.time())
     result = {
+        "timestamp": now,
+        "generated_at": now,
+        "ttl_seconds": 1800,
+        "status": "ok",
         "priority_class": alloc.priority_class,
         "global_envelope_sats": alloc.global_envelope_sats,
         "fleet_exploration_budget_sats": alloc.fleet_exploration_budget_sats,
@@ -5951,7 +5956,10 @@ def revenue_capex_status(plugin, **kwargs):
     try:
         import json as _json
         summary = {
-            "timestamp": int(time.time()),
+            "timestamp": now,
+            "generated_at": now,
+            "ttl_seconds": 1800,
+            "status": "ok",
             "priority_class": alloc.priority_class,
             "global_envelope_sats": alloc.global_envelope_sats,
             "fleet_exploration_budget_sats": alloc.fleet_exploration_budget_sats,
@@ -6573,7 +6581,13 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
 
     return {
         "source": "total_cost_budget",
+        "timestamp": now,
+        "generated_at": now,
+        "ttl_seconds": 1800,
         "window_hours": wh,
+        "coverage_hours": wh,
+        "covered_hours": wh,
+        "coverage_status": "complete",
         "since_timestamp": since,
         "mode": "fixed",
         "daily_budget_sats": daily_budget_sats,

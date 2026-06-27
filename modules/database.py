@@ -3917,7 +3917,9 @@ class Database:
     ) -> Dict[str, Any]:
         """Summarize generic spend ledger events + reservations for unified budget accounting."""
         conn = self._get_connection()
-        cutoff = int(time.time()) - (int(window_hours) * 3600)
+        window_hours = max(1, int(window_hours))
+        now = int(time.time())
+        cutoff = now - (window_hours * 3600)
 
         spent_row = conn.execute("""
             SELECT COALESCE(SUM(amount_sats), 0) AS total_spent
@@ -3960,7 +3962,13 @@ class Database:
         reserved_by_category = {str(r["category"]): int(r["total"] or 0) for r in by_cat_resv}
 
         result = {
-            "window_hours": int(window_hours),
+            "timestamp": now,
+            "generated_at": now,
+            "ttl_seconds": 1800,
+            "window_hours": window_hours,
+            "coverage_hours": window_hours,
+            "covered_hours": window_hours,
+            "coverage_status": "complete",
             "spent_24h_sats": int((spent_row["total_spent"] if spent_row else 0) or 0),
             "reserved_24h_sats": int((reserved_row["total_reserved"] if reserved_row else 0) or 0),
             "spent_by_category": spent_by_category,

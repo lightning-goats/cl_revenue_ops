@@ -997,6 +997,12 @@ def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
 
     result = mod._total_cost_budget_status(window_hours=24)
 
+    assert isinstance(result["timestamp"], int)
+    assert result["generated_at"] == result["timestamp"]
+    assert result["ttl_seconds"] == 1800
+    assert result["coverage_hours"] == 24
+    assert result["covered_hours"] == 24
+    assert result["coverage_status"] == "complete"
     assert result["actual_spent_by_category"] == {
         "rebalance": 11,
         "boltz": 5,
