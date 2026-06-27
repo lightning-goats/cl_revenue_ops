@@ -167,7 +167,7 @@ class TestFeeHiveBias:
 
 
 class TestMemberFeePolicy:
-    def test_hive_member_uses_advisory_dynamic_fee(self, mock_plugin, mock_config, mock_database):
+    def test_hive_member_uses_zero_fee_policy(self, mock_plugin, mock_config, mock_database):
         fc = FeeController(mock_plugin, mock_config, mock_database)
         adapter = MagicMock()
         adapter.is_hive_member.return_value = True
@@ -176,12 +176,12 @@ class TestMemberFeePolicy:
         adapter._effective_ttl.return_value = 900
         fc.hive_hints = adapter
         result = fc._check_hive_member_fee("02member")
-        assert result is None
+        assert result == 0
         assert fc._consume_hive_member_advisory("02member") is True
         assert fc._consume_hive_member_advisory("02member") is False
 
-    def test_configured_intra_fleet_ppm_does_not_force_static_member_fee(self, mock_plugin, mock_config, mock_database):
-        """Hive membership remains advisory even when intra-fleet ppm is configured."""
+    def test_configured_intra_fleet_ppm_does_not_override_zero_member_fee(self, mock_plugin, mock_config, mock_database):
+        """Hive membership forces zero fees even when older intra-fleet ppm config is nonzero."""
         mock_config.fee_ppm_intra_fleet = 1
         fc = FeeController(mock_plugin, mock_config, mock_database)
         adapter = MagicMock()
@@ -191,7 +191,7 @@ class TestMemberFeePolicy:
         adapter._effective_ttl.return_value = 900
         fc.hive_hints = adapter
         result = fc._check_hive_member_fee("02member")
-        assert result is None
+        assert result == 0
         assert fc._consume_hive_member_advisory("02member") is True
 
     def test_non_member_returns_none(self, mock_plugin, mock_config, mock_database):
@@ -217,13 +217,13 @@ class TestMemberFeePolicy:
         adapter.is_usable.return_value = True
         adapter._effective_ttl.return_value = 900
         fc.hive_hints = adapter
-        assert fc._check_hive_member_fee("02peer") is None
+        assert fc._check_hive_member_fee("02peer") == 0
         assert fc._consume_hive_member_advisory("02peer") is True
 
         adapter.is_hive_member.return_value = False
         adapter.is_fresh.return_value = False
         adapter.is_usable.return_value = True
-        assert fc._check_hive_member_fee("02peer") is None
+        assert fc._check_hive_member_fee("02peer") == 0
         assert fc._consume_hive_member_advisory("02peer") is False
 
     def test_explicit_hive_unavailable_clears_sticky_membership(self, mock_plugin, mock_config, mock_database):
@@ -234,7 +234,7 @@ class TestMemberFeePolicy:
         adapter.is_usable.return_value = True
         adapter._effective_ttl.return_value = 900
         fc.hive_hints = adapter
-        assert fc._check_hive_member_fee("02peer") is None
+        assert fc._check_hive_member_fee("02peer") == 0
         assert fc._consume_hive_member_advisory("02peer") is True
 
         adapter.is_hive_member.return_value = False
@@ -247,7 +247,7 @@ class TestMemberFeePolicy:
         assert fc._consume_hive_member_release("02peer") is False
 
     def test_grace_period_expires(self, mock_plugin, mock_config, mock_database):
-        """After grace period expires, revert to DTS+PID (return None)."""
+        """After grace period expires, zero-fee policy deactivates."""
         import time as _time
         fc = FeeController(mock_plugin, mock_config, mock_database)
         adapter = MagicMock()

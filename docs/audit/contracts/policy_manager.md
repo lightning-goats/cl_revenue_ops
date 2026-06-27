@@ -15,11 +15,10 @@ validates, rate-limits, caches (write-through), persists, and notifies subscribe
 (fee_controller.py:6751-6795). It also runs two advisory/automation layers: profitability-driven
 policy *suggestions* (bleeders/zombies/high-velocity sources — suggestions only, never auto-applied,
 :898-1041) and hive-corridor auto-policies that tag corridor owners and reconcile role loss while
-refusing to touch operator-owned policies (:1047-1139). Docstring drift, noted: the
-`apply_corridor_policies` docstring says fleet members get "dedicated hint-driven 0-fee handling in
-the fee controller" (:1056-1057, :1085-1087), but the current fee controller treats hive membership
-as advisory and keeps DTS/PID active (fee_controller.py:4692-4694); the 0-PPM forced path no longer
-exists, so that comment describes a previous regime.
+refusing to touch operator-owned policies (:1047-1139). The fee controller now implements the
+fleet-member policy described by `apply_corridor_policies`: confirmed or grace-valid hive members
+are held at 0 ppm and 0 msat base fee, and those channels do not enter DTS/PID pricing while the
+membership signal is active.
 
 ## 2. Inputs / Outputs
 

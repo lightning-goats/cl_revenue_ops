@@ -317,9 +317,9 @@ class TestAdjustAllFeesSkipClassification:
 
         assert fc._adjust_channel_fee.call_args.kwargs["force_reprice_reason"] == "hive_unavailable"
 
-    def test_hive_member_forces_dynamic_advisory_reprice_path(self, mock_database, mock_plugin, sample_peer_ids):
-        """Hive members should use dynamic pricing instead of a static zero-fee short-circuit."""
-        from modules.fee_controller import ChannelCycleState
+    def test_hive_member_forces_zero_fee_policy_path(self, mock_database, mock_plugin, sample_peer_ids):
+        """Hive members should be held at 0 ppm/0 base fee instead of entering DTS/PID pricing."""
+        from modules.fee_controller import ChannelCycleState, FeeReasonCode
 
         fc = self._make_fc(mock_plugin, mock_database)
         channel_id = "123x456x0"
@@ -327,13 +327,19 @@ class TestAdjustAllFeesSkipClassification:
         now = int(time.time())
         fc._cycle_states[channel_id] = ChannelCycleState(
             last_update=now,
-            last_fee_ppm=0,
-            last_broadcast_fee_ppm=0,
+            last_fee_ppm=100,
+            last_broadcast_fee_ppm=100,
         )
 
         adapter = MagicMock()
-        adapter.is_hive_member.return_value = True
-        adapter.is_usable.return_value = True
+        adapter.get_membership_status.return_value = {
+            "peer_id": peer_id,
+            "known": True,
+            "member": True,
+            "fresh": True,
+            "usable": True,
+            "source": "datastore",
+        }
         fc.hive_hints = adapter
 
         mock_database.get_all_channel_states.return_value = [
@@ -344,14 +350,26 @@ class TestAdjustAllFeesSkipClassification:
             channel_id: {
                 "channel_id": channel_id,
                 "peer_id": peer_id,
-                "fee_proportional_millionths": 0,
+                "fee_base_msat": 1000,
+                "fee_proportional_millionths": 100,
             }
         })
+        fc.set_channel_fee = MagicMock(return_value={"success": True, "fee_ppm": 0})
         fc._adjust_channel_fee = MagicMock(return_value=None)
 
-        fc._adjust_all_fees_inner()
+        adjustments = fc._adjust_all_fees_inner()
 
-        assert fc._adjust_channel_fee.call_args.kwargs["force_reprice_reason"] == "hive_member_advisory"
+        fc._adjust_channel_fee.assert_not_called()
+        fc.set_channel_fee.assert_called_once()
+        call = fc.set_channel_fee.call_args
+        assert call.args[:2] == (channel_id, 0)
+        assert call.kwargs["enforce_limits"] is False
+        assert call.kwargs["base_fee_msat_override"] == 0
+        assert call.kwargs["reason_code"] == FeeReasonCode.HIVE_MEMBER_ZERO_FEE.value
+        assert len(adjustments) == 1
+        assert adjustments[0].old_fee_ppm == 100
+        assert adjustments[0].new_fee_ppm == 0
+        assert adjustments[0].reason_code == FeeReasonCode.HIVE_MEMBER_ZERO_FEE.value
 
     def test_adjust_all_fees_reports_idempotent(self, mock_database, mock_plugin, sample_peer_ids):
         """Same-fee on-chain no-op should hit idempotent."""

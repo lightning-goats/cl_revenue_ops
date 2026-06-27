@@ -59,7 +59,7 @@ def test_generates_t14_report_when_checkpoint_reached(tmp_path: Path) -> None:
     (day_dir / "rollback-watch.log").write_text(
         "\n".join(
             [
-                "INITIAL_FEE Hive member: 1-PPM fleet policy",
+                "INITIAL_FEE Hive member: zero-fee fleet policy",
                 "FEE: channel=1x1x1 blend:0.30",
                 "competition_aware preserve 1x1x1",
             ]
@@ -67,7 +67,7 @@ def test_generates_t14_report_when_checkpoint_reached(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (day_dir / "listpeerchannels.json").write_text(
-        json.dumps({"channels": [{"peer_id": "02hive", "fee_proportional_millionths": 1}]}),
+        json.dumps({"channels": [{"peer_id": "02hive", "fee_proportional_millionths": 0}]}),
         encoding="utf-8",
     )
     (day_dir / "hive-members.json").write_text(
@@ -156,7 +156,7 @@ def test_generates_t28_report_when_checkpoint_reached(tmp_path: Path) -> None:
     (day_dir / "rollback-watch.log").write_text(
         "\n".join(
             [
-                "INITIAL_FEE Hive member: 1-PPM fleet policy",
+                "INITIAL_FEE Hive member: zero-fee fleet policy",
                 "competition_aware preserve 1x1x1",
                 "estimated_closure_cost=1200",
             ]
@@ -164,7 +164,7 @@ def test_generates_t28_report_when_checkpoint_reached(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (day_dir / "listpeerchannels.json").write_text(
-        json.dumps({"channels": [{"peer_id": "02hive", "fee_proportional_millionths": 1}]}),
+        json.dumps({"channels": [{"peer_id": "02hive", "fee_proportional_millionths": 0}]}),
         encoding="utf-8",
     )
     (day_dir / "hive-members.json").write_text(

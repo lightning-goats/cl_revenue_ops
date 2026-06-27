@@ -94,6 +94,7 @@ class FeeReasonCode(Enum):
     # Policy overrides
     POLICY_PASSIVE = "policy_passive"     # Peer has passive fee strategy
     POLICY_STATIC = "policy_static"       # Peer has static fee target
+    HIVE_MEMBER_ZERO_FEE = "hive_member_zero_fee"  # Confirmed fleet member zero-fee policy
 
     # Algorithm decisions
     DTS_PID_SAMPLE = "dts_pid_sample"                 # Normal DTS posterior sample
@@ -2809,6 +2810,33 @@ class FeeController:
             "source": "legacy_adapter",
         }
 
+    def _hive_member_zero_fee_active(self, peer_id: str) -> bool:
+        """Return True when this peer is covered by the fleet zero-fee policy."""
+        if not peer_id or self.hive_hints is None:
+            return False
+
+        status = self._get_hive_membership_status(peer_id)
+        if status.get("member"):
+            self._remember_hive_member(peer_id)
+            return True
+
+        if not status.get("usable"):
+            if (
+                status.get("source") not in ("none", "legacy_adapter")
+                and self._cached_hive_membership_active(peer_id)
+            ):
+                return True
+            self._clear_hive_member_cache(peer_id, release=True)
+            return False
+
+        last_set = self._hive_member_set_at.get(peer_id)
+        if last_set is not None:
+            if int(time.time()) - int(last_set) <= self._hive_hint_effective_ttl() * 2:
+                return True
+            self._clear_hive_member_cache(peer_id, release=False)
+
+        return False
+
     def _classify_channel_role(self, peer_id: str) -> str:
         """Return channel role for base_fee selection.
 
@@ -3442,51 +3470,8 @@ class FeeController:
             return 0
 
     def _check_hive_member_fee(self, peer_id: str) -> Optional[int]:
-        """Refresh hive membership state and let dynamic pricing set the fee.
-
-        Hive membership used to be a hard 0-PPM fleet policy. Tournament
-        testing showed that wins route share but destroys fee revenue, so the
-        member hint is now advisory: it seeds/biases DTS+PID elsewhere and
-        forces a prompt dynamic reprice when membership is observed or removed.
-        """
-        if self.hive_hints is None:
-            return None
-
-        status = self._get_hive_membership_status(peer_id)
-        hints_usable = bool(status.get("usable", False))
-
-        if status.get("member"):
-            self._remember_hive_member(peer_id)
-            return None
-
-        if not hints_usable:
-            # A previously observed snapshot can age just past TTL before the
-            # next successful poll. Keep membership sticky through the grace
-            # window for fee/base-fee continuity, but release immediately when
-            # the adapter explicitly reports no hive state or an older test
-            # double cannot distinguish cache staleness from hive absence.
-            if (
-                status.get("source") not in ("none", "legacy_adapter")
-                and self._cached_hive_membership_active(peer_id)
-            ):
-                return None
-            self._clear_hive_member_cache(peer_id, release=True)
-            return None
-
-        # Grace period: treat stale-but-usable membership as advisory for one
-        # extra TTL window to avoid oscillating when gossip/export lags.
-        last_set = self._hive_member_set_at.get(peer_id)
-        if last_set is not None:
-            try:
-                ttl = self.hive_hints._effective_ttl()
-            except Exception:
-                ttl = 900
-            if int(time.time()) - last_set <= ttl * 2:
-                return None
-            else:
-                self._clear_hive_member_cache(peer_id, release=False)
-
-        return None
+        """Refresh hive membership state and return the fleet fee if active."""
+        return 0 if self._hive_member_zero_fee_active(peer_id) else None
 
     def _consume_hive_member_release(self, peer_id: str) -> bool:
         if peer_id in self._hive_member_released_peers:
@@ -4698,13 +4683,55 @@ class FeeController:
 
                 # DYNAMIC strategy continues to normal fee optimization below
 
-            # Hive membership is advisory: keep DTS/PID active while using
-            # hive hints for priors, market boundary estimates, and bias.
-            self._check_hive_member_fee(peer_id)
+            hive_member_fee = self._check_hive_member_fee(peer_id)
 
             # Get channel info
             channel_info = channels.get(channel_id)
             if not channel_info:
+                continue
+
+            if hive_member_fee == 0:
+                current_fee = int(channel_info.get("fee_proportional_millionths", 0) or 0)
+                current_base_fee_msat = parse_msat(channel_info.get("fee_base_msat", 0))
+                if current_fee == 0 and current_base_fee_msat == 0:
+                    skip_reasons["idempotent"] += 1
+                    continue
+                try:
+                    result = self.set_channel_fee(
+                        channel_id,
+                        0,
+                        reason="Hive member: zero-fee fleet policy",
+                        reason_code=FeeReasonCode.HIVE_MEMBER_ZERO_FEE.value,
+                        enforce_limits=False,
+                        channel_info=channel_info,
+                        base_fee_msat_override=0,
+                    )
+                    if not result.get("success"):
+                        self.plugin.log(
+                            f"Error setting hive-member zero fee for {channel_id}: "
+                            f"{result.get('message', 'unknown error')}",
+                            level='error'
+                        )
+                        skip_reasons["error"] += 1
+                        continue
+                    applied_fee_ppm = int(result.get("fee_ppm", 0) or 0)
+                    adjustments.append(FeeAdjustment(
+                        channel_id=channel_id,
+                        peer_id=peer_id,
+                        old_fee_ppm=current_fee,
+                        new_fee_ppm=applied_fee_ppm,
+                        reason="Hive member: zero-fee fleet policy",
+                        algorithm_values={
+                            "hive_member_zero_fee": True,
+                            "current_base_fee_msat": current_base_fee_msat,
+                            "target_base_fee_msat": 0,
+                            "hive_membership": self._get_hive_membership_status(peer_id),
+                        },
+                        reason_code=FeeReasonCode.HIVE_MEMBER_ZERO_FEE.value,
+                    ))
+                except Exception as e:
+                    self.plugin.log(f"Error setting hive-member zero fee for {channel_id}: {e}", level='error')
+                    skip_reasons["error"] += 1
                 continue
 
             try:
@@ -7070,6 +7097,15 @@ class FeeController:
             
             peer_id = channel_info.get("peer_id", "")
             old_fee_ppm = channel_info.get("fee_proportional_millionths", 0)
+            hive_member_zero_fee = self._hive_member_zero_fee_active(peer_id)
+            if hive_member_zero_fee:
+                if fee_ppm != 0:
+                    self.plugin.log(
+                        f"HIVE_MEMBER_FEE: {resolved_channel_id[:16]}... forcing 0 ppm fleet policy",
+                        level='debug'
+                    )
+                fee_ppm = 0
+                result["fee_ppm"] = 0
 
             # TS-1: Protect state mutations with _state_lock (RLock allows re-entrant calls).
             # Resolve the reference first so manual full-channel IDs/colon SCIDs update
@@ -7110,6 +7146,8 @@ class FeeController:
                 feebase_msat = int(base_fee_msat_override)
             else:
                 feebase_msat = self._resolve_base_fee_msat(peer_id, cfg)
+            if hive_member_zero_fee:
+                feebase_msat = 0
             # Use setchannel command
             rpc_params = {
                 "id": resolved_channel_id,
@@ -7481,19 +7519,20 @@ class FeeController:
                         channel_info=channel_info
                     )
 
-            # Hive membership should improve the dynamic prior/bias, not force
-            # a free public route that destroys routing revenue.
-            if self.hive_hints is not None:
-                try:
-                    if self.hive_hints.is_hive_member(peer_id):
-                        self._hive_member_set_at[peer_id] = int(time.time())
-                        self._hive_member_advisory_peers.add(peer_id)
-                        self.plugin.log(
-                            f"INITIAL_FEE: {scid[:16]}... hive member; using dynamic fleet-aware pricing",
-                            level='debug'
-                        )
-                except Exception:
-                    pass
+            if self._hive_member_zero_fee_active(peer_id):
+                self.plugin.log(
+                    f"INITIAL_FEE: {scid[:16]}... hive member; applying zero-fee fleet policy",
+                    level='debug'
+                )
+                return self.set_channel_fee(
+                    scid,
+                    0,
+                    reason="Initial fee: hive member zero-fee fleet policy",
+                    reason_code=FeeReasonCode.HIVE_MEMBER_ZERO_FEE.value,
+                    enforce_limits=False,
+                    channel_info=channel_info,
+                    base_fee_msat_override=0,
+                )
 
             # ── DYNAMIC: DTS prior sample ─────────────────────────────
             ts = GaussianThompsonState()

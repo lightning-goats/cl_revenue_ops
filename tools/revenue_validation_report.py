@@ -123,7 +123,10 @@ def _activation_summary(results_root: str | Path, node_name: str, start_date: da
     for day in _date_strings(start_date, end_date):
         for line in _read_log_lines(results_root, day, node_name):
             lowered = line.lower()
-            if "hive member: 1-ppm fleet policy" in lowered:
+            if (
+                "hive member: zero-fee fleet policy" in lowered
+                or "hive member: 1-ppm fleet policy" in lowered
+            ):
                 counts["intra_fleet_policy"] += 1
             if "blend:" in lowered and "blend:0.15" not in lowered and "blend:0.20" not in lowered:
                 counts["non_default_blend"] += 1
