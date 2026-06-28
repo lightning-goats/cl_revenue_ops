@@ -915,6 +915,17 @@ class PolicyManager:
 
         suggestions = []
 
+        def _channel_scope_fields(channel_id: str, suggested_mode: Optional[str] = None) -> Dict[str, Any]:
+            channel_key = str(channel_id or '')
+            channel_short = channel_key[:12] + '...' if len(channel_key) > 12 else channel_key
+            return {
+                'scope': 'channel' if channel_key else 'peer',
+                'channel_id': channel_key,
+                'channel_id_short': channel_short,
+                'suggested_channel_rebalance_mode': suggested_mode if channel_key else None,
+                'policy_evidence_scope': 'channel_specific' if channel_key else 'peer_fallback',
+            }
+
         try:
             if profitability_analyzer is None:
                 self.plugin.log("PolicyManager: No profitability_analyzer for suggestions", level='debug')
@@ -965,6 +976,7 @@ class PolicyManager:
                     suggestions.append({
                         'peer_id': peer_id,
                         'peer_id_short': peer_id[:12] + '...',
+                        **_channel_scope_fields(channel_id, 'disabled'),
                         'current_strategy': current_policy.strategy.value,
                         'current_rebalance_mode': current_policy.rebalance_mode.value,
                         'suggested_strategy': 'passive',
@@ -987,13 +999,15 @@ class PolicyManager:
                         severity = 'medium'
                         action = 'disable_rebalance'
 
+                    suggested_rebalance_mode = 'disabled' if action == 'disable_rebalance' else None
                     suggestions.append({
                         'peer_id': peer_id,
                         'peer_id_short': peer_id[:12] + '...',
+                        **_channel_scope_fields(channel_id, suggested_rebalance_mode),
                         'current_strategy': current_policy.strategy.value,
                         'current_rebalance_mode': current_policy.rebalance_mode.value,
                         'suggested_strategy': None,  # Keep current
-                        'suggested_rebalance_mode': 'disabled' if action == 'disable_rebalance' else None,
+                        'suggested_rebalance_mode': suggested_rebalance_mode,
                         'reason': f"Bleeder: rebalance cost {rebalance_cost} > revenue, net loss {abs(net_pnl)} sats",
                         'severity': severity,
                         'action': action,
@@ -1010,6 +1024,7 @@ class PolicyManager:
 
                     flow_state = state.get('state', '')
                     flow_ratio = state.get('flow_ratio', 0)
+                    channel_id = state.get('channel_id', '') or state.get('short_channel_id', '')
 
                     # High-velocity source: strong outflow ratio
                     if flow_state == 'source' and flow_ratio > 0.7:
@@ -1024,6 +1039,7 @@ class PolicyManager:
                         suggestions.append({
                             'peer_id': peer_id,
                             'peer_id_short': peer_id[:12] + '...',
+                            **_channel_scope_fields(channel_id, 'source_only'),
                             'current_strategy': current_policy.strategy.value,
                             'current_rebalance_mode': current_policy.rebalance_mode.value,
                             'suggested_strategy': None,

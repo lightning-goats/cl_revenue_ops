@@ -51,6 +51,44 @@ class TestPolicyManagerInit:
         assert policy.fee_ppm_target == 500
 
 
+class TestPolicySuggestions:
+    """Test profitability-driven policy suggestions."""
+
+    def test_bleeder_suggestion_carries_channel_scope(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        pm = PolicyManager(mock_database, mock_plugin)
+        peer_id = sample_peer_ids[0]
+        channel_id = "123x456x0"
+        analyzer = MagicMock()
+        analyzer.identify_bleeders.return_value = [
+            {
+                "peer_id": peer_id,
+                "channel_id": channel_id,
+                "net_pnl_sats": -250,
+                "forward_count": 4,
+                "sourced_forward_count": 1,
+                "rebalance_cost_sats": 800,
+            }
+        ]
+        mock_database.get_channel_rebalance_success_rate.side_effect = [
+            {"total": 3, "success_rate": 0.30},
+            {"total": 6, "success_rate": 0.50},
+        ]
+        mock_database.get_all_channel_states.return_value = []
+
+        suggestions = pm.get_policy_suggestions(analyzer)
+
+        assert len(suggestions) == 1
+        suggestion = suggestions[0]
+        assert suggestion["scope"] == "channel"
+        assert suggestion["channel_id"] == channel_id
+        assert suggestion["channel_id_short"] == "123x456x0"
+        assert suggestion["suggested_channel_rebalance_mode"] == "disabled"
+        assert suggestion["suggested_rebalance_mode"] == "disabled"
+        assert suggestion["policy_evidence_scope"] == "channel_specific"
+
+
 class TestPolicyBatchOperations:
     """Test batch policy operations."""
 
