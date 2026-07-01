@@ -66,13 +66,19 @@ carry `route_policy` set by the v3/hive stack.
   pair** (`source_peer == dest_peer`), so the skip-getroute branch is
   code-verified only. Run: pass.
 - **R2-5 (route_cost_sats = max(0, ceil(...)), never negative)** —
-  **verified.** Code: :521-525 and `_route_fee_sats` :203-217 (both
+  **verified for the cost formula; REFUTED as test-pitted, downgraded to
+  verified (code-only), for the never-negative clamp** (refutation pass
+  2026-07-01: removing the `max(0, ...)` at :521-525 survives all 13 tests —
+  no test constructs a would-be-negative cost, so the clamp itself is
+  unpitted). Code: :521-525 and `_route_fee_sats` :203-217 (both
   `max(0, ...)`). Tests: `TestZeroFeePeer::test_zero_ppm_peer_costs_zero`
   (cost exactly 0, not clamped to 1) and
   `test_router_includes_final_hop_base_fee_in_middle_amount` (cost 1 from
   base fee). Corpus: sweep C1 (route_cost_sats >= 0) and C5 (implied cost ==
-  reported ±1) over 178 route-bearing candidates: 0 violations — the cost
-  formula holds on every corpus route the v2 arithmetic priced (via v3).
+  reported ±1) over 178 route-bearing candidates: 0 violations — but note the
+  178 candidates are snapshot resamples of only **14 distinct candidates**
+  (the sweep dedups observations/history but not debug candidates), so the
+  corpus evidence base is 14 routes, not 178.
 - **R2-6 (invoice final CLTV from listconfigs, cached, default 18; final hop
   uses it)** — **verified.** Code: `_get_invoice_final_cltv` :348-373
   (process-lifetime cache :357, default 18 at :372); final hop delay :517.
@@ -117,3 +123,48 @@ artifact can isolate v2's own `price_pair` (retired), as the contract states.
 3. Corpus span is 2026-06-09 → 2026-06-20 for both nodes — narrower than the
    campaign brief's "2026-05-19 → present", and collection apparently stopped
    2026-06-20. All corpus-based statements in this campaign cover ~12 days.
+   **REFUTED (partially): a termination capture dated 20260701T203541Z (one
+   snapshot per node) landed after this doc's sweep ran** — the frozen corpus
+   carries accumulated history/datastore state through 2026-07-01 (segment
+   observations 33 → 41, deduped history 38 → 51,
+   `native_route_over_budget` tokens 9 → 18), though snapshot coverage still
+   has a 10-day hole (no captures 2026-06-21 → 2026-06-30; ~12 observed
+   days total — the "narrower than the campaign brief" point stands). This
+   doc's corpus numbers describe the pre-termination corpus; a full re-sweep
+   of the frozen corpus on 2026-07-01 still reports 0 violations.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification at HEAD dac9b48 (module byte-identical to f905cfd
+through HEAD; line cites exact). Method: mutation testing in a scratch copy +
+direct corpus interrogation + sweep-script audit.
+
+- Attacked: retirement claim, R2-1..R2-6, corpus notes, anomalies.
+- Survived: retirement claim (config.py:312/:637-642 re-read; grep confirms
+  the only class imports are the v3/hive helper embeddings;
+  `_get_final_hop_fee_ppm` re-confirmed zero-caller dead). R2-1 (mutating
+  price_pair to assume a 0-ppm/0-base final hop when policy is unknown kills
+  `test_router_returns_failure_when_fee_unknown`). R2-2's violated verdict
+  upheld (fallback code at :160-177 re-read: no SCID filter). R2-3 (disabling
+  the backwards reprice loop kills `test_first_hop_amount_includes_fee_for_
+  first_middle_edge` and the hive-router reprice test). R2-4 first half
+  (dropping the cltv_delta term kills the delay-70 test). R2-6 (hardcoding
+  the final-hop delay kills `test_route_uses_invoice_cltv_and_explicit_
+  directions`).
+- Refuted: R2-5's never-negative clamp as a test-pitted claim (inline note) —
+  formula still verified; clamp is code-only. Anomaly 3's "collection stopped
+  2026-06-20" (inline note) — a 2026-07-01 termination capture exists.
+- Sweep-script audit (this doc cites the sweep as "validated, see
+  verification/rebalance_hive_router.md appendix note" — **that appendix does
+  not exist**; dangling citation): C1/C2/C4/C5 silently skip candidates
+  missing `route_cost_sats`/`amount_sats`/route amounts — verified non-vacuous
+  here by direct corpus read (178/178 candidates carry every needed field);
+  however the sweep does NOT dedup debug candidates, so "178 route-bearing
+  candidates" = 14 distinct candidates resampled across snapshots. Sweep C9
+  (execution attempts/fees) and L1 (spend categories) evaluated **zero**
+  records on the frozen corpus (no `executions` arrays, no spend categories
+  captured) — any reliance on C9/L1 would be vacuous (this doc does not rely
+  on them).
+
+Counts: attacked 7 verdicts + 3 anomalies; survived 8; refuted 2 (R2-5
+never-negative clause → code-only; Anomaly 3 corpus-span claim corrected).

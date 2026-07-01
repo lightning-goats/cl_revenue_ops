@@ -28,8 +28,15 @@ segment observations are v3-attributed.
   `test_router_v3_excludes_local_endpoint_channels_from_middle_path` asserts
   askrene-update-channel disabled `100x1x0/{0,1}` and `200x1x0/{0,1}` and
   that a `rebalance-exclude-*` layer was passed to getroutes. Run: pass.
-- **R3-3 (exclude layers never leak)** — **verified** for the per-call paths,
-  **verified (code-only)** for the cycle-cache teardown. Code: half-built
+- **R3-3 (exclude layers never leak)** — **verified** for the non-cycle
+  context-manager path; **verified (code-only)** for the cycle-cache teardown
+  **and — REFUTED as test-pitted (refutation pass 2026-07-01) — for the
+  half-built-layer removal before re-raise (:650-652): deleting that cleanup
+  (re-raise without `_remove_exclude_layer`) survives all 43 router tests.
+  `test_exclude_layer_removes_on_exception` exercises only the
+  context-manager `finally` at :700-704, not a mid-build askrene failure
+  (the same gap RHR-8 correctly records for the hive router's analog); the
+  "per-call paths" wording overstated coverage.** Code: half-built
   layer removed before re-raise :650-652; non-cycle context removes on exit
   even on exception :700-704; cycle teardown `end_cycle` →
   `_teardown_cycle_exclude_layers` :237-241/:252-258 and
@@ -54,13 +61,25 @@ segment observations are v3-attributed.
   and succeeds. Genuinely pits both the failure translation and the
   cache-drop. Run: pass.
 - **R3-6 (cheapest route selected; hop amounts repriced from live policy)** —
-  **verified.** Code: `min(routes, key=self._route_fee_msat)` :476,
+  **repricing verified; cheapest-selection REFUTED as test-pitted, downgraded
+  to verified (code-only)** (refutation pass 2026-07-01: mutating
+  `min(routes, ...)` to `max(routes, ...)` survives the entire 80-test
+  battery — `test_price_pair_picks_cheapest_when_multiple_routes` builds its
+  world with 0-ppm live policies, so the mandatory reprice step erases the
+  two routes' fee difference before the loose `route_cost_sats <= 1`
+  assertion runs; the test cannot distinguish cheapest from most expensive.
+  Corpus C2/C4/C5 check arithmetic consistency of the chosen route, not
+  selection optimality, so they cannot rescue the clause).
+  Code: `min(routes, key=self._route_fee_msat)` :476,
   `_route_fee_msat` :581-588; reprice via v2 helper :492-497. Tests:
-  `::test_price_pair_picks_cheapest_when_multiple_routes`,
+  `::test_price_pair_picks_cheapest_when_multiple_routes` (see above),
   `::test_price_pair_adds_source_peer_forwarding_fee_to_first_hop`,
-  `::test_replay_multi_hop_fixture_succeeds`. Corpus: sweep C2 (monotone
+  `::test_replay_multi_hop_fixture_succeeds` — the latter two genuinely pit
+  the repricing arithmetic (disabling the backwards reprice loop kills
+  them). Corpus: sweep C2 (monotone
   non-increasing amounts), C4 (last hop == delivery), C5 (cost formula ±1)
-  over 178 v3-priced candidates: 0 violations. Run: pass.
+  over 178 v3-priced candidates (14 distinct — the sweep does not dedup
+  debug candidates): 0 violations. Run: pass.
 - **R3-7 (cycle state is thread-local)** — **verified (code-only)** for the
   cross-thread claim; the cycle-scoping semantics are pitted. Code:
   `threading.local()` at :202, accessors :242-250, begin/end :217-241.
@@ -73,9 +92,16 @@ segment observations are v3-attributed.
   :454. **No test asserts the maxfee_msat kwarg** (grep of all v3 tests:
   zero `maxfee` assertions). Downstream gating evidence: corpus
   `revenue-status.json` error tokens include `native_route_over_budget` (9
-  entries) — the native executor's NX-2 gate visibly rejecting routes that
+  entries pre-termination; 18 in the frozen corpus) — the native executor's
+  NX-2 gate visibly rejecting routes that
   v3's permissive discovery allowed — and sweep S1 (fee <= max_fee on
   successes) has 0 violations over 38 deduped history entries.
+  **Refutation pass 2026-07-01: the S1 citation is near-vacuous and must not
+  be read as positive evidence — S1 only evaluates entries with
+  status=success carrying numeric fee and cap, and the frozen corpus has
+  exactly 2 such entries, both `rebalance_type=manual` with
+  `actual_fee_sats=0`. The over-budget error tokens remain the only real
+  corpus evidence of downstream gating.**
 
 ## Purpose-section claims
 
@@ -128,3 +154,34 @@ R3-5's recovery path is corpus-unobserved (test-verified only).
 3. The engine's vestigial `router_kind = "v3" if ... else "v2"` ternary
    (rebalance_engine_v2.py) never emitted "v2" in the corpus (33/33 "v3"),
    consistent with the contract's analysis.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification at HEAD dac9b48 (module byte-identical to f905cfd
+through HEAD; line cites exact; test battery re-run: 80 passed). Method:
+mutation testing in a scratch copy + frozen-corpus re-sweep + sweep-script
+audit.
+
+- Attacked: R3-1..R3-8, all four Purpose-section claims, corpus notes.
+- Survived: R3-1 (disabling the loops-through-us check kills the validation
+  tests), R3-2 (skipping the pinned-SCID excludes kills
+  `test_router_v3_excludes_local_endpoint_channels_from_middle_path`),
+  R3-3 non-cycle path (removing the context-manager `finally` kills three
+  tests), R3-5 (skipping `invalidate_layer_cache` on unknown_layer kills the
+  cycle-optimization test), R3-6 reprice half (killed via the shared v2
+  helper mutation), R3-8 code cite (`"maxfee_msat": route_amount_msat` at
+  :454 re-read exact; the no-test gap stands as documented). Purpose claims:
+  config raise re-confirmed at modules/config.py:637-642.
+- Refuted: R3-6 cheapest-selection as test-pitted (inline; now code-only —
+  a `min`→`max` regression would ship green through 80 tests); R3-3
+  "per-call paths" wording (half-built cleanup at :650-652 is unpitted);
+  R3-8's S1 corpus citation (near-vacuous: 2 manual zero-fee successes).
+- Corpus-number staleness: this doc's sweep predates the 20260701T203541Z
+  termination capture; frozen corpus = 1227 debug / 5191 status snapshots,
+  41 segment observations (all v3 — O1 still clean), over-budget tokens 18.
+  Re-sweep of the frozen corpus: 0 violations. Note the sweep does not dedup
+  debug candidates: 178 rows = 14 distinct candidates.
+
+Counts: attacked 8 invariants + 4 purpose claims; survived 9; refuted 3
+(R3-6 selection clause → code-only; R3-3 half-built clause → code-only;
+R3-8 S1 evidence marked vacuous).

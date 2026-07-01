@@ -31,7 +31,11 @@ pit this.
   (route_summary first hop == source_channel_id) has 0 violations over 178
   route-bearing candidates — but all 178 are market_only (v3) routes, so
   this corroborates source pinning generally, not this module's check
-  specifically.
+  specifically. (Refutation pass 2026-07-01: the 178 rows are snapshot
+  resamples of 14 distinct candidates — the sweep does not dedup debug
+  candidates — and C3 silently passes any candidate missing
+  `source_channel_id` or the first-hop `channel`; verified non-vacuous by
+  direct corpus read: 178/178 carry both fields.)
 - **RHR-2 (HIVE_ONLY rejects non-member intermediates; HYBRID requires >=1
   member hop)** — **verified.** Code: `_validate_hive_only_path` :479-482,
   applied :612-616; HYBRID gate :617-618. Tests (genuine):
@@ -85,8 +89,12 @@ pit this.
   `::test_hive_router_reprices_prefix_amounts_from_live_forwarding_policies`
   (exact repriced amounts asserted, via the shared v2 helper). Corpus: sweep
   C5 (implied vs reported cost) 0 violations; downstream budget gate visible
-  as `native_route_over_budget` (9) in revenue-status error tokens and S1
-  (fee <= max on success) 0 violations.
+  as `native_route_over_budget` (9; 18 in the frozen corpus) in
+  revenue-status error tokens and S1
+  (fee <= max on success) 0 violations. (Refutation pass 2026-07-01: the S1
+  citation is near-vacuous — S1 evaluates only success entries with numeric
+  fee and cap, of which the frozen corpus has exactly 2, both manual with
+  actual_fee_sats=0; the over-budget tokens are the real evidence.)
 - **RHR-8 (unique throwaway layer names; half-built layers removed before
   error propagation)** — **verified (code-only).** Code: `_exclude_counter`
   :51-55, `_layer_name` :336-337 (itertools.count + timestamp);
@@ -129,3 +137,42 @@ pit this.
    RHR-2 nuance.
 3. Line drift vs contract in the engine (construction :209-216, call :1967);
    module-internal citations all accurate at HEAD.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification at HEAD dac9b48 (module byte-identical to f905cfd
+through HEAD; suite re-run: 14 passed). Method: mutation testing in a scratch
+copy + frozen-corpus re-sweep.
+
+- Attacked: purpose claims, RHR-1..RHR-8, both corpus citations.
+- Survived — every mutation was killed by the cited test:
+  RHR-2 HIVE_ONLY (emptying `_validate_hive_only_path` kills
+  `test_hive_router_rejects_non_hive_intermediate_for_hive_only`) and HYBRID
+  gate (disabling the `_has_hive_hop` check kills
+  `test_hive_router_returns_no_fleet_route_when_hybrid_path_has_no_hive_hops`);
+  RHR-3 layer order (inserting the exclude layer first instead of last kills
+  `test_hive_router_pinned_layer_order_in_getroutes`) and legacy fallback
+  (raising instead of falling back kills
+  `test_hive_router_falls_back_to_legacy_excludes_when_pinning_fails`);
+  RHR-4 (skipping the stale-layer rebuild kills
+  `test_hive_router_recreates_stale_base_layer_from_prior_run`);
+  RHR-5 retry (raising on unknown-layer without retry kills
+  `test_hive_router_retries_once_when_expansion_layers_rotate`);
+  RHR-6 (skipping end_cycle layer removal kills
+  `test_hive_router_reuses_pinned_layers_within_cycle` — end_cycle teardown
+  is in fact pitted, slightly better than this doc claimed). Code-only cites
+  re-read exact: RHR-1 :608-610, RHR-7 maxfee formula :507, RHR-8
+  `_exclude_counter` :51-55. The `_return_hop_policy` fail-open anomaly
+  re-confirmed by read.
+- Refuted: no verdicts. Two evidence citations corrected inline: C3's
+  "178 candidates" = 14 distinct (field presence verified, so C3 is
+  non-vacuous but narrow); RHR-7's S1 citation is near-vacuous (2 manual
+  zero-fee successes).
+- Note: this doc's sweep predates the 20260701T203541Z termination capture
+  (frozen corpus: history 51 entries, over-budget tokens 18, observations
+  41 = 40 market_only + 1 hive_only). Re-sweep of the frozen corpus: 0
+  violations; still zero HIVE_ONLY/HYBRID priced candidates, so RHR-2
+  remains corpus-unobserved as stated.
+
+Counts: attacked 8 invariants + purpose claims + 3 anomalies; survived all
+(11); refuted 0 verdicts (2 corpus-evidence citations downgraded inline).

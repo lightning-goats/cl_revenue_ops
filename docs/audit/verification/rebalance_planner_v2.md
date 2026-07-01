@@ -5,7 +5,9 @@ Phase 2 — Tier 2 (targeted). Verified 2026-07-01 at HEAD 61b031c against
 9f8f219).
 
 **Drift check (441b8e3, 2026-06-27 "Improve rebalance EV criteria")**: the
-planner diff is +15/−2 — (a) removed the unused `src_value` lookup, (b)
+planner diff is +13/−2 (15 changed lines; refutation pass corrected the
+"+15/−2" miscount against `git diff --stat f905cfd..HEAD`) — (a) removed
+the unused `src_value` lookup, (b)
 threads four new historical role-fee fields
 (`source/dest_historical_direct_fee_ppm`, `source/dest_historical_sourced_fee_ppm`)
 from `ChannelState` into `PairCandidate` (new fields in
@@ -160,3 +162,35 @@ the engine's EV gate, not this module). All 178 priced candidates carry
 4. Corpus: `max_pairs_reached` never appears in 1,227 debug snapshots — the
    fleet has never saturated `max_pairs` in the frozen window; that skip path
    is test-verified only.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification at HEAD dac9b48 (only planner/types drifted since
+f905cfd, exactly as this doc's drift note records; drifted line cites
+:390-396/:398-411 re-read exact). Method: mutation testing in a scratch copy
++ frozen-corpus re-sweep.
+
+- Attacked: drift note, RP2-1..RP2-7, purpose claims, corpus statements.
+- Survived — every decisive mutation was killed by the cited test:
+  RP2-1 (letting source-eligibility bypass the band test kills a
+  TestSkipReasons case); RP2-3 (sorting ascending kills the
+  higher-scoring-source test — insertion order genuinely ruled out); RP2-5
+  (substituting the source's budget for the destination's kills
+  `test_destination_budget_authorizes_pair_spend` plus two siblings — the
+  destination-authorizes-spend envelope is among the best-pitted claims in
+  the routing stack); RP2-6 (removing the source-side inversion kills
+  `test_v2_planner_uses_hive_rebalance_bias_for_pair_roles`, exact 1.10
+  multiplier); RP2-7 (measuring excess against band_low instead of band_high
+  kills `test_excess_sats_measured_against_band_high`). RP2-4's same-peer
+  guard re-read at :248-249 (code-only gap stands); RP2-6 clamp bounds
+  re-read (:390-396, :398-411; unpitted-at-this-layer gap stands).
+- Refuted: no verdicts. One arithmetic nit corrected inline (drift note said
+  "+15/−2"; actual diff is 13 insertions / 2 deletions).
+- Corpus: this doc's numbers match the frozen sweep exactly (re-run
+  2026-07-01: inside_band 3,316 / no_partner 2,984 / outcompeted 1,032 /
+  below_hold_margin 177; max_pairs_reached absent; 178 candidate rows all
+  ev_positive+market_only — note those rows are resamples of 14 distinct
+  candidates, the sweep does not dedup debug candidates).
+
+Counts: attacked 7 invariants + 3 purpose claims + drift note; survived all
+verdicts; refuted 0 (1 numeric correction).

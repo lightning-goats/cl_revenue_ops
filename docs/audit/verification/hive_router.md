@@ -25,9 +25,17 @@ drift).
 ## Invariants
 
 - **HR-1 (discover_route None unless available; per-peer 60 s cache incl.
-  None failures)** — **availability gate verified; cache verified
+  None failures)** — **availability gate REFUTED as test-pitted, downgraded
+  to verified (code-only)** (refutation pass 2026-07-01: deleting the
+  `self.available` check survives all 32 tests —
+  `test_discover_returns_none_when_unavailable` runs against a bare
+  `MagicMock()` plugin, so the mutant still returns None through a later
+  failure path; the test asserts the right value for the wrong reason and
+  cannot distinguish "gate enforced" from "discovery attempted and
+  failed"); **cache verified
   (code-only) with an accuracy nuance.** Gate: modules/hive_router.py:276-277,
-  pitted by `tests/test_hive_router.py::TestHiveRouterDiscover::`
+  cited (but not genuinely pitted, see above) by
+  `tests/test_hive_router.py::TestHiveRouterDiscover::`
   `test_discover_returns_none_when_unavailable`. Cache: 60 s window
   :282-287, success cached :381, exception-failure None cached :386,
   `clear_route_cache` :393-396. **Nuance:** the "including None failures"
@@ -50,9 +58,17 @@ drift).
   `maxfee_msat` kwarg.
 - **HR-4 (layer ownership defers to cl-hive; standalone creation only when
   absent; 0-fee both directions + node bias +5)** — **ownership split
-  verified; parameter details verified (code-only).** Code: `refresh_layer`
+  REFUTED as test-pitted, downgraded to verified (code-only)** (refutation
+  pass 2026-07-01: bypassing the managed-layer detection so standalone
+  creation ALWAYS runs survives all 32 tests —
+  `test_detects_cl_hive_managed_layer` asserts only `result is True` /
+  `available is True` / member cached, all of which the standalone path also
+  satisfies against its MagicMock rpc; no test asserts that layer-creation
+  RPCs are NOT issued when `hive-fleet` already exists);
+  **parameter details verified (code-only).** Code: `refresh_layer`
   :119-148 (managed detect :134-143), `_create_standalone_layer` :165-258
-  (0-fee both dirs :197-217, bias +5 in/out :219-240). Tests:
+  (0-fee both dirs :197-217, bias +5 in/out :219-240). Tests (cited, but see
+  refutation above):
   `TestHiveRouterLayerDetection::test_detects_cl_hive_managed_layer` and
   `::test_falls_back_to_standalone_when_no_cl_hive`, plus
   `TestHiveRouterRefresh::test_refresh_skips_remove_when_layer_missing` /
@@ -121,3 +137,34 @@ drift).
 4. Line drift vs contract: engine duck-typing moved to
    rebalance_engine_v2.py:140-145; Boltz hive-route usage moved to
    cl-revenue-ops.py:8072-8076. No semantic drift found.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification at HEAD dac9b48 (module byte-identical to f905cfd
+through HEAD; test suite re-run: 32 passed). Method: mutation testing in a
+scratch copy + call-site grep.
+
+- Attacked: purpose claims (line cites), HR-1..HR-7, dead-surface anomaly.
+- Survived: purpose-claim cites re-checked (cl-revenue-ops.py:2109
+  construction, rebalancer.py:1639 discover_route, cl-revenue-ops.py:8072-8076
+  Boltz hive route — all exact). HR-2 first clause (adding `auto.sourcefree`
+  to the discovery layer list kills
+  `test_discover_avoids_auto_sourcefree_crash_vector`). HR-3 code cite
+  (`amount_msat // 100` re-read exact; no-test gap stands). HR-5 formula
+  re-read exact (min(25% capacity, available above 40% floor), 0 when
+  unknown); dead-surface grep re-run clean (zero callers in modules/ or
+  cl-revenue-ops.py). HR-6 (removing path normalization kills
+  `test_reserve_path_normalizes_to_exact_hops`). HR-7 (changing the
+  profitable bias 3 → 1 kills `test_profitable_channel_gets_positive_bias`;
+  the stagnant_candidate no-test gap stands as documented).
+- Refuted: HR-1 availability gate and HR-4 ownership split as test-pitted
+  claims (inline notes) — both downgraded to code-only. Both cited tests are
+  mock-satisfied: they pass under mutants that remove the very behavior they
+  are cited for. With HR-1's cache already untested, every clause of HR-1 is
+  now code-only, and this module has NO corpus surface — HiveRouter's
+  entire verified story rests on code reading plus tests that pit HR-2's
+  layer list, HR-6 normalization, and HR-7 bias values only.
+
+Counts: attacked 7 invariants + purpose claims + 4 anomalies; survived 9;
+refuted 2 (HR-1 gate clause → code-only; HR-4 ownership-split clause →
+code-only).

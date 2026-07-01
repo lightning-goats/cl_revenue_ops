@@ -53,12 +53,19 @@ module.
   `::test_compute_fleet_route_rejects_unplanned_first_hop`; the
   `no_fleet_route` check :895-901 has **no covering test** (every
   hive-router-equipped test stubs `is_hive_member` to True for path nodes).
-- **RX-6 (valid askrene inform semantics only)** — **verified.**
-  `_inform_result` :473-481, `_inform_failure` :483-522 (code-204 only,
+- **RX-6 (valid askrene inform semantics only)** — **verified** for the
+  prefix/erring-hop/nothing-downstream sequence; **REFUTED as test-pitted,
+  downgraded to verified (code-only), for the code-204-only gate**
+  (refutation pass 2026-07-01: mutating `failure.get("code") != 204` to
+  inform on every code survives all 44 tests — no test feeds a non-204
+  failure and asserts no inform). `_inform_result` :473-481,
+  `_inform_failure` :483-522 (code-204 only,
   prefix `unconstrained` / erring hop `constrained`, nothing downstream),
-  whitelist :449-454. Pitted by `TestInformChannel::test_informs_on_success`,
+  whitelist :449-454. The sequence half is genuinely pitted by
+  `TestInformChannel::test_informs_on_success`,
   `::test_informs_on_failure_with_valid_askrene_semantics` (exact sequence
-  asserted), and two `TestHiveEqualizationRouteValidation` tests. The
+  asserted; mutation informing downstream hops is killed), and two
+  `TestHiveEqualizationRouteValidation` tests. The
   raise-on-invalid-value branch of `_inform_channel` itself is untested.
 - **RX-7 (no auto.sourcefree; phantom first-hop fee stripped with cascade)** —
   **first half verified, second half verified (code-only).** `_get_layers`
@@ -123,3 +130,36 @@ Test run: `.venv/bin/python -m pytest tests/test_rebalance_executor.py -q` →
 4. `self.database` assigned at :93 and never read (vestigial).
 5. Contract line references verified accurate at HEAD except `delpay` at :549
    (contract says :548).
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification at HEAD dac9b48 (module byte-identical to
+f905cfd/6740115; all line cites re-checked). Method: mutation testing in a
+scratch copy — break each claimed invariant, run the cited tests.
+
+- Attacked: liveness (dead-code grep repeated on HEAD), RX-1..RX-8, the
+  tautology findings, corpus statements, anomalies 1-5.
+- Survived: liveness (grep clean: only tests + the v2 alias name collision +
+  a log string); RX-2 (removing the `_validate_sendpay_route` call kills
+  `test_rejects_malformed_route_before_sendpay`); RX-4 (disabling
+  `_validate_pure_hive_path` kills the equalization-reject test); RX-5 first
+  half (disabling the `fleet_source_mismatch` raise kills
+  `test_compute_fleet_route_rejects_unplanned_first_hop`); RX-7 first half
+  (adding `auto.sourcefree` in `_get_layers` kills two TestLayerSelection
+  tests); RX-8 positive paths. Code-only cites RX-1 (:1293-1297/:1347-1351)
+  and RX-3 (:841/:1036-1041) re-read and exact. Tautology finding confirmed:
+  tests/test_rebalance_executor.py:1787 literally copies the inflation logic
+  under "# Simulate the inflation logic". `stable_failure_reason` divergence
+  re-confirmed (rebalance_execution.py has zero `no_viable_hive_path` /
+  `no_fleet_route` hits). Doc-claimed negatives independently reproduced:
+  `should_retry = True` (static-excludes no-retry removed) survives all 44
+  tests, confirming the RX-8 negative-case gap as stated.
+- Refuted: RX-6's code-204-only clause (see inline note) — one clause
+  downgraded from test-pitted to code-only; the invariant's code is intact.
+- New anomaly: the corpus was NOT final when this doc's sweep ran — a
+  termination capture (20260701T203541Z, one per node) landed afterward;
+  frozen-corpus history is 51 deduped entries (not 38). No new violations on
+  re-sweep; dead-code status makes the numbers immaterial here.
+
+Counts: attacked 8 invariants + 5 anomalies + liveness; survived 13;
+refuted 1 clause (RX-6 code-204 gate → code-only).

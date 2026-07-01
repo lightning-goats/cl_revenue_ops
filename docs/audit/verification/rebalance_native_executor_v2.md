@@ -110,14 +110,23 @@ violations.
   pinned source/dest hop is excluded verbatim
   (`test_terminal_waitsendpay_failure_still_cleans_up` supplies erring own-hop
   data but never inspects `excluded_channels`). Run: pass.
-- **NX-7 (success fees are actuals)** — **verified** for the
+- **NX-7 (success fees are actuals)** — **REFUTED as test-pitted at this
+  module's level, downgraded to verified (code-only)** for the
   `amount_sent_msat` derivation; **verified (code-only)** for the
-  first-hop fallback. Code: :453-465. Test:
+  first-hop fallback. Refutation pass 2026-07-01: mutating the derivation to
+  always use the route-estimate path (`parse_msat(route[0]["amount_msat"])`)
+  survives the entire 19-test battery — the cited test's fixture route has
+  first hop 101_000 msat, identical to the mocked
+  `amount_sent_msat: "101000msat"`, so `fee_msat == 1000` holds on both
+  paths and the parenthetical "(not the route estimate path)" was false: the
+  test cannot distinguish actuals from the planned estimate. Code: :453-465.
+  Test:
   `::test_native_executor_executes_priced_route_with_sendpay` — waitsendpay
   reports `amount_sent_msat: "101000msat"`, asserted `fee_msat == 1000`,
-  `fee_sats == 1` (not the route estimate path). The fallback
+  `fee_sats == 1`. The fallback
   `parse_msat(route[0]["amount_msat"])` when `amount_sent_msat` is absent
-  (:458) is untested. Engine-side actuals also pitted by
+  (:458) is untested — and because planned == sent in every fixture, so is
+  the primary path's distinctness. Engine-side actuals also pitted by
   `tests/test_payment_pending_settlement.py::`
   `test_reconcile_settled_payment_records_cost_and_marks_spent` (actual 5000
   msat from listsendpays). Corpus: prior sweep S1 (fee ≤ max_fee on
@@ -170,3 +179,38 @@ violations.
    (thorough) test suite.
 3. Engine call-site line references in the contract drifted after 441b8e3
    (see Purpose-section claims); module-internal references are exact.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification at HEAD dac9b48 (module byte-identical to f905cfd
+through HEAD, matching this doc's drift check; suites re-run: 19 passed).
+Method: mutation testing in a scratch copy + frozen-corpus re-sweep.
+
+- Attacked: NX-1..NX-7, purpose claims, corpus statements.
+- Survived — every decisive mutation was killed by the cited test:
+  NX-1 ordering (accepting an empty route kills
+  `test_native_executor_rejects_missing_route_before_invoice`, whose
+  zero-RPC assertion is real); NX-2 (disabling the budget comparison kills
+  `test_native_executor_rejects_route_over_budget_before_invoice`); NX-3
+  (treating code 200 as terminal kills
+  `test_waitsendpay_cln_code_200_marks_payment_pending`); NX-4 (gutting
+  `_cleanup_failed_payment` kills both cleanup tests); NX-5 (0.85 → 0.5
+  kills the full-confidence test; floor 0.2 → 0.05 kills the floor test —
+  the exact-value assertions are real); NX-6 (excluding the full route
+  instead of `route[1:-1]` kills four tests). `_validate_route` re-read:
+  every claimed branch present (:277-332); the six-unpitted-branches gap
+  and the malformed-invoice cleanup hole (:422-428) stand as documented
+  (grep `native_invoice_error` in tests/: still zero hits).
+- Refuted: NX-7's `amount_sent_msat` derivation as test-pitted (inline note)
+  — the fixture makes planned fee == actual fee, so the "actuals, not
+  estimate" property is code-only at this module's level. The engine-side
+  reconcile test (actual 5000 msat from listsendpays) still pits actuals at
+  the engine layer, which is why this is a clause downgrade rather than an
+  invariant refutation.
+- Corpus: this doc's numbers match the frozen sweep exactly (re-run
+  2026-07-01: over-budget 18, sendpay_error 17, 41 observations, history
+  49 failed / 2 success, 0 violations); NX-3 correctly labeled
+  corpus-vacuous.
+
+Counts: attacked 7 invariants + 3 purpose claims; survived 9; refuted 1
+clause (NX-7 actuals derivation → code-only).

@@ -171,3 +171,45 @@ happy-path invariant below is corpus-vacuous**; verdicts rest on tests + code.
    silently (no SkipRecord), unlike every other rejection path in the module —
    contradicts the "every decision explained" spirit but matches the contract
    text, which only promises skips for the enumerated reasons.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification at HEAD dac9b48 (module byte-identical to f905cfd
+through HEAD, matching this doc's drift check). Method: mutation testing in a
+scratch copy + frozen-corpus re-sweep.
+
+- Attacked: RCO-1, RCO-2, RCO-4, RCO-5, RCO-6, purpose claims, corpus
+  statements.
+- Survived — every decisive mutation was killed:
+  RCO-1 (letting an unknown SCID fall through to peer binding kills
+  `test_overlay_does_not_wildcard_when_scid_unknown_but_peer_given`);
+  RCO-2 (blanking `primary_executor_member_id` handling kills
+  `test_overlay_skips_hint_designating_another_executor`);
+  RCO-4 coefficients (0.30 → 0.35 kills the normalized-score test and an F4
+  economics test — the exact-value assertions are real);
+  RCO-5 (ignoring lease ownership kills
+  `test_overlay_keeps_pair_when_overlapping_lease_is_ours`).
+  RCO-3/RCO-7 code-only cites re-read exact (amount-min clause,
+  `invalid_pairing`, `amount_not_viable`, status gate :96-99); the
+  documented test-coverage gaps stand.
+- RCO-4 note: removing the `min(priority, MAX_HINT_PRIORITY_SCORE)` clamp in
+  the multiplier expression survives the bounded-multiplier test — but only
+  because `_priority_score` (:110-117) independently clamps to the same
+  bound; the invariant is protected by redundant defense-in-depth, and
+  removing both clamps is caught. Not a refutation; recorded so a future
+  "simplification" removing one clamp is not mistaken for safe.
+- RCO-6 note: a mutation forcing coordination pairs through the planner-pool
+  capacity branch survives all 25 overlay tests, but analysis shows it is
+  semantically equivalent in every tested configuration (coordination pairs
+  merge before planner pairs, so `plan_count == 0` during coordination
+  admission and the two branches compute identical outcomes; with
+  reserved=0 the branches are textually identical). The precedence and
+  reserved-slot tests genuinely pit observable behavior; no flip.
+- Corpus: this doc's numbers match the frozen sweep exactly (re-run
+  2026-07-01: coordination_unavailable 788, zero coordinated episodes, zero
+  occurrences of the other five skip reasons, history reason codes
+  defibrillator 37 / manual 10 / ev_positive 4). The doc correctly labels
+  every happy-path invariant corpus-vacuous — the standard this campaign
+  requires.
+
+Counts: attacked 7 invariants + 4 purpose claims; survived all; refuted 0.
