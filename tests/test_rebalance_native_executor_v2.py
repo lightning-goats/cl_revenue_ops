@@ -262,6 +262,97 @@ def test_native_executor_fallback_excludes_attempted_middle_path():
 
 
 # =============================================================================
+# Audit finding NX-4: malformed invoice responses must still clean up the
+# (possibly server-side-created) invoice and carry a failure_class, exactly
+# like the thrown-exception path.
+# =============================================================================
+
+
+def test_native_executor_cleans_up_malformed_invoice_response():
+    """A non-dict invoice response may still have created the invoice
+    server-side; the executor must attempt best-effort delinvoice instead of
+    leaving it to linger until the 300s expiry."""
+    rpc = FakeRpc(
+        responses={
+            "getinfo": {"id": OUR_ID},
+            "invoice": "mangled proxy response",
+            "delinvoice": {"ok": True},
+        }
+    )
+    executor = NativeRouteExecutor(FakePlugin(rpc))
+
+    result = executor.execute(
+        route=_route(),
+        amount_sats=100,
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        max_fee_sats=1,
+    )
+
+    assert result.success is False
+    assert result.error == "native_invoice_error: unexpected response"
+    assert result.failure_data["failure_class"] == "unknown"
+    assert result.payment_pending is False
+    methods = [method for method, _ in rpc.calls]
+    assert methods == ["getinfo", "invoice", "delinvoice"]
+    assert "delpay" not in methods  # sendpay never ran; nothing to delete
+    delinvoice_params = rpc.calls[-1][1]
+    assert delinvoice_params["label"].startswith("rebal-native-")
+    assert delinvoice_params["label"].endswith("200x1x0")
+    assert delinvoice_params["status"] == "unpaid"
+
+
+def test_native_executor_cleans_up_invoice_response_missing_payment_hash():
+    rpc = FakeRpc(
+        responses={
+            "getinfo": {"id": OUR_ID},
+            "invoice": {"bolt11": "lnbc-test"},
+            "delinvoice": {"ok": True},
+        }
+    )
+    executor = NativeRouteExecutor(FakePlugin(rpc))
+
+    result = executor.execute(
+        route=_route(),
+        amount_sats=100,
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        max_fee_sats=1,
+    )
+
+    assert result.success is False
+    assert result.error == "native_invoice_error: missing payment_hash"
+    assert result.failure_data["failure_class"] == "unknown"
+    assert [method for method, _ in rpc.calls] == ["getinfo", "invoice", "delinvoice"]
+
+
+def test_malformed_invoice_cleanup_is_best_effort():
+    """delinvoice failing (e.g. invoice was never actually created) must not
+    mask the original native_invoice_error result."""
+    rpc = FakeRpc(
+        responses={
+            "getinfo": {"id": OUR_ID},
+            "invoice": {"bolt11": "lnbc-test"},
+        },
+        failures={"delinvoice": RuntimeError("Unknown invoice")},
+    )
+    executor = NativeRouteExecutor(FakePlugin(rpc))
+
+    result = executor.execute(
+        route=_route(),
+        amount_sats=100,
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        max_fee_sats=1,
+    )
+
+    assert result.success is False
+    assert result.error == "native_invoice_error: missing payment_hash"
+    assert result.failure_data["failure_class"] == "unknown"
+    assert [method for method, _ in rpc.calls] == ["getinfo", "invoice", "delinvoice"]
+
+
+# =============================================================================
 # Audit finding 4: failure-observation confidence must reflect attribution
 # quality — inferred blame is split across suspects, never smeared at 0.85.
 # =============================================================================
