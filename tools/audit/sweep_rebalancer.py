@@ -42,12 +42,13 @@ Not corpus-observable (pure code properties, noted for the verification doc):
 
 import gzip
 import json
+import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-CORPUS = Path("/home/sat/cl-mycelium-hermes")
+CORPUS = Path(os.environ.get("CL_MYCELIUM_HERMES_ROOT", "/home/sat/cl-mycelium-hermes"))
 NODES = ["hive-nexus-01", "hive-nexus-02"]
 
 

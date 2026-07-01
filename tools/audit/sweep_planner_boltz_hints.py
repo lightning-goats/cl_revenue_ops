@@ -43,7 +43,7 @@ sys.modules.setdefault("pyln.client", mock_pyln)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from modules.hive_hints import HiveHintAdapter  # noqa: E402
 
-CORPUS = "/home/sat/cl-mycelium-hermes"
+CORPUS = os.environ.get("CL_MYCELIUM_HERMES_ROOT", "/home/sat/cl-mycelium-hermes")
 NODES = ("hive-nexus-01", "hive-nexus-02")
 
 DEFIB_CLUSTER_SECONDS = 600      # actions created within this window = one cycle

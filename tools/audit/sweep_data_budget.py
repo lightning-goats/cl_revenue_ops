@@ -12,11 +12,13 @@ Usage: python3 tools/audit/sweep_data_budget.py [corpus_root]
 """
 
 import json
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-CORPUS = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/home/sat/cl-mycelium-hermes")
+CORPUS = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(
+    os.environ.get("CL_MYCELIUM_HERMES_ROOT", "/home/sat/cl-mycelium-hermes"))
 NODES = ("hive-nexus-01", "hive-nexus-02")
 
 SO_BUCKETS = {50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000}

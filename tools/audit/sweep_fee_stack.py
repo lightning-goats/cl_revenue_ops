@@ -42,7 +42,7 @@ import re
 import sys
 from collections import Counter, defaultdict
 
-CORPUS = "/home/sat/cl-mycelium-hermes"
+CORPUS = os.environ.get("CL_MYCELIUM_HERMES_ROOT", "/home/sat/cl-mycelium-hermes")
 NODES = ("hive-nexus-01", "hive-nexus-02")
 
 EPS = 1e-9

@@ -36,11 +36,12 @@ Not corpus-observable (verified by unit tests / code reading instead):
 
 import gzip
 import json
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-CORPUS = Path("/home/sat/cl-mycelium-hermes")
+CORPUS = Path(os.environ.get("CL_MYCELIUM_HERMES_ROOT", "/home/sat/cl-mycelium-hermes"))
 NODES = ["hive-nexus-01", "hive-nexus-02"]
 
 CLASS_KEYS = ["profitable", "break_even", "underwater", "stagnant_candidate", "zombie"]

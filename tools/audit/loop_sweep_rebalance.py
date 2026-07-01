@@ -48,13 +48,15 @@ Usage: python3 tools/audit/loop_sweep_rebalance.py [corpus_root]
 
 import gzip
 import json
+import os
 import re
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-CORPUS = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/home/sat/cl-mycelium-hermes")
+CORPUS = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(
+    os.environ.get("CL_MYCELIUM_HERMES_ROOT", "/home/sat/cl-mycelium-hermes"))
 NODES = ("hive-nexus-01", "hive-nexus-02")
 
 # commit 62ae545 (2026-06-10 06:14 -0600) shipped the shared-history-row fix

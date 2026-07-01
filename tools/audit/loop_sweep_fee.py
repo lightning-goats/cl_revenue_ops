@@ -76,7 +76,7 @@ from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
-CORPUS = "/home/sat/cl-mycelium-hermes"
+CORPUS = os.environ.get("CL_MYCELIUM_HERMES_ROOT", "/home/sat/cl-mycelium-hermes")
 NODES = ("hive-nexus-01", "hive-nexus-02")
 
 CYCLE_SECONDS = 1800          # fee_interval_seconds on both nodes (fee-debug config)
