@@ -18,11 +18,14 @@ Outputs:
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
 from .utils import MSAT_PER_SAT, base_to_sats_ceil
+
+_log = logging.getLogger("cl-revenue-ops.capex_budget")
 
 
 def _classify(obj) -> str:
@@ -87,6 +90,10 @@ class CapexAllocations:
     tactical_budget_msat: int = 0
     allocated_by_priority_msat: Dict[str, int] = field(default_factory=dict)
     total_fleet_contribution_msat: int = 0
+    # CB-4 fail-closed: True when spend history could not be read from the
+    # database this cycle, so all budgets were zeroed (spend denied) rather
+    # than re-granted as if nothing had been spent.
+    db_degraded: bool = False
 
     @property
     def global_envelope_sats(self) -> int:
@@ -153,8 +160,13 @@ class CapexBudgetEngine:
         except Exception:
             pass
 
-        # Get total capex per channel (rebalance_costs + spend_events) — in sats
+        # Get total capex per channel (rebalance_costs + spend_events) — in sats.
+        # CB-4 fail-closed: None means the DB read failed; treat spend history
+        # as unknown and deny all spend this cycle (db_degraded below).
         capex_by_channel = self._get_total_capex_by_channel(window_days=30)
+        db_degraded = capex_by_channel is None
+        if capex_by_channel is None:
+            capex_by_channel = {}
         fleet_efficiency = None
         if self._capital_efficiency is not None:
             try:
@@ -234,6 +246,9 @@ class CapexBudgetEngine:
         tactical_msat = max(0, tactical_msat)
 
         spend_summary = self._get_spend_ledger_summary(window_days=30)
+        if spend_summary is None:
+            db_degraded = True
+            spend_summary = {"spent_by_category": {}, "reserved_by_category": {}}
         if total_fleet_contribution_msat > 0:
             revenue_exploration_msat = int(total_fleet_contribution_msat * cfg.capex_exploration_rate)
             wallet_floor_msat = self._get_wallet_exploration_floor_msat(cfg)
@@ -253,6 +268,19 @@ class CapexBudgetEngine:
             summary=spend_summary,
             category="boltz",
         )
+
+        # CB-4 fail-closed: with spend history unreadable we cannot know what
+        # has already been spent or reserved, so deny ALL spend this cycle
+        # (zero every budget) rather than re-grant full budgets fleet-wide.
+        if db_degraded:
+            _log.warning(
+                "capex_budget: DB degraded this cycle — failing closed: "
+                "all channel, exploration and tactical budgets zeroed"
+            )
+            exploration_msat = 0
+            tactical_msat = 0
+            for b in channel_budgets.values():
+                b.budget_msat = 0
 
         # Global envelope enforcement (msat)
         total_channel_budgets_msat = sum(b.budget_msat for b in channel_budgets.values())
@@ -296,6 +324,7 @@ class CapexBudgetEngine:
             fleet_exploration_budget_msat=exploration_msat,
             tactical_budget_msat=tactical_msat,
             total_fleet_contribution_msat=total_fleet_contribution_msat,
+            db_degraded=db_degraded,
             allocated_by_priority_msat={
                 "defensive": defensive_total_msat,
                 "preservation": preservation_total_msat,
@@ -662,19 +691,37 @@ class CapexBudgetEngine:
         open_fee_sats = max(0, open_fee_sats)
         return min(wallet_excess_sats, open_fee_sats) * MSAT_PER_SAT
 
-    def _get_total_capex_by_channel(self, window_days: int = 30) -> Dict[str, int]:
-        """Get total capex per channel from rebalance_costs + spend_events."""
+    def _get_total_capex_by_channel(self, window_days: int = 30) -> Optional[Dict[str, int]]:
+        """Get total capex per channel from rebalance_costs + spend_events.
+
+        CB-4 fail-closed: returns None on DB error (never an empty dict, which
+        downstream arithmetic would treat as "nothing spent" and re-grant full
+        budgets). Callers must treat None as degraded and deny spend.
+        """
         try:
             return self._database.get_total_capex_by_channel(window_days)
-        except Exception:
-            return {}
+        except Exception as exc:
+            _log.warning(
+                "capex_budget: DB error reading 30d capex by channel (%s); "
+                "failing closed — denying capex spend this cycle", exc
+            )
+            return None
 
-    def _get_spend_ledger_summary(self, window_days: int = 30) -> Dict[str, Dict[str, int]]:
-        """Get generic spend ledger totals for the requested rolling window."""
+    def _get_spend_ledger_summary(self, window_days: int = 30) -> Optional[Dict[str, Dict[str, int]]]:
+        """Get generic spend ledger totals for the requested rolling window.
+
+        CB-4 fail-closed: returns None on DB error (never empty category dicts,
+        which downstream depletion would treat as fully un-depleted budgets).
+        Callers must treat None as degraded and deny spend.
+        """
         try:
             return self._database.get_spend_ledger_summary(window_hours=window_days * 24)
-        except Exception:
-            return {"spent_by_category": {}, "reserved_by_category": {}}
+        except Exception as exc:
+            _log.warning(
+                "capex_budget: DB error reading spend ledger summary (%s); "
+                "failing closed — denying capex spend this cycle", exc
+            )
+            return None
 
     def _apply_category_spend_remaining(
         self,

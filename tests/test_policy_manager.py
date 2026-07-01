@@ -102,12 +102,19 @@ class TestPolicyBatchOperations:
         assert all(isinstance(p, PeerPolicy) for p in results)
 
     def test_batch_update_applies_rebalance_modes(self, mock_database, mock_plugin, sample_peer_ids):
-        """Batch update correctly sets rebalance modes."""
+        """Batch update correctly sets rebalance modes.
+
+        PM-I2 fix: the STATIC entry must carry a fee_ppm_target — this test
+        previously entrenched the batch static-without-target gap by asserting
+        success for the invalid input (see test_batch_update_rejects_static_
+        without_target for the rejection).
+        """
         pm = PolicyManager(mock_database, mock_plugin)
 
         updates = [
             {"peer_id": sample_peer_ids[0], "strategy": "dynamic", "rebalance_mode": "sink_only"},
-            {"peer_id": sample_peer_ids[1], "strategy": "static", "rebalance_mode": "source_only"},
+            {"peer_id": sample_peer_ids[1], "strategy": "static", "rebalance_mode": "source_only",
+             "fee_ppm_target": 500},
             {"peer_id": sample_peer_ids[2], "strategy": "passive", "rebalance_mode": "disabled"},
         ]
         results = pm.set_policies_batch(updates)
@@ -115,6 +122,34 @@ class TestPolicyBatchOperations:
         assert results[0].rebalance_mode == RebalanceMode.SINK_ONLY
         assert results[1].rebalance_mode == RebalanceMode.SOURCE_ONLY
         assert results[2].rebalance_mode == RebalanceMode.DISABLED
+
+    def test_batch_update_rejects_static_without_target(self, mock_database, mock_plugin, sample_peer_ids):
+        """PM-I2: batch STATIC without fee_ppm_target is rejected like set_policy.
+
+        Whole batch fails (validate-first semantics, PM-I10) and nothing is
+        persisted; previously this persisted STATIC with fee_ppm_target=None
+        and the fee controller silently fell through to dynamic management.
+        """
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        updates = [
+            {"peer_id": sample_peer_ids[0], "strategy": "dynamic"},
+            {"peer_id": sample_peer_ids[1], "strategy": "static"},  # no target
+        ]
+        with pytest.raises(ValueError, match="fee_ppm_target"):
+            pm.set_policies_batch(updates)
+        mock_database.upsert_policies_batch.assert_not_called()
+
+    def test_batch_update_accepts_static_with_target(self, mock_database, mock_plugin, sample_peer_ids):
+        """PM-I2: batch STATIC with an explicit target (including 0) succeeds."""
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        results = pm.set_policies_batch([
+            {"peer_id": sample_peer_ids[0], "strategy": "static", "fee_ppm_target": 0},
+        ])
+
+        assert results[0].strategy == FeeStrategy.STATIC
+        assert results[0].fee_ppm_target == 0
 
     def test_batch_update_empty_list_returns_empty(self, mock_database, mock_plugin):
         """Batch update with empty list returns empty list."""
@@ -519,6 +554,56 @@ class TestRateLimiting:
             pass
 
 
+class TestCorruptRowIsolation:
+    """PM-I13: one corrupt DB row must not poison the cache / brick all reads."""
+
+    @staticmethod
+    def _row(peer_id, **overrides):
+        row = {
+            "peer_id": peer_id,
+            "strategy": "dynamic",
+            "rebalance_mode": "enabled",
+            "fee_ppm_target": None,
+            "tags": "[]",
+            "updated_at": 1000,
+            "fee_multiplier_min": None,
+            "fee_multiplier_max": None,
+            "expires_at": None,
+        }
+        row.update(overrides)
+        return row
+
+    def test_corrupt_expires_at_row_does_not_poison_cache(self, mock_database, mock_plugin, sample_peer_ids):
+        """A corrupt TEXT expires_at (TypeError in is_expired) is skipped with a
+        warning; get_policy still serves every other peer's stored policy."""
+        corrupt = self._row(sample_peer_ids[1], expires_at="garbage")
+        valid = self._row(sample_peer_ids[0], strategy="static", fee_ppm_target=500)
+        mock_database.get_all_policies.return_value = [corrupt, valid]
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        policy = pm.get_policy(sample_peer_ids[0])
+
+        assert policy.strategy == FeeStrategy.STATIC
+        assert policy.fee_ppm_target == 500
+        # A warning was logged for the skipped row
+        assert any(
+            "corrupt" in str(call.args[0]).lower()
+            for call in mock_plugin.log.call_args_list
+        )
+
+    def test_corrupt_row_peer_degrades_to_default(self, mock_database, mock_plugin, sample_peer_ids):
+        """The peer whose row is corrupt gets the permissive default (PM-I7),
+        not an exception."""
+        corrupt = self._row(sample_peer_ids[1], expires_at="garbage")
+        mock_database.get_all_policies.return_value = [corrupt]
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        fallback = pm.get_policy(sample_peer_ids[1])
+
+        assert fallback.strategy == FeeStrategy.DYNAMIC
+        assert fallback.rebalance_mode == RebalanceMode.ENABLED
+
+
 class TestPeerPolicyDataclass:
     """Test PeerPolicy dataclass behavior."""
 
@@ -615,6 +700,34 @@ class TestValidation:
         for invalid_id in invalid_ids:
             with pytest.raises(ValueError):
                 pm.set_policy(invalid_id, strategy="dynamic")
+
+    def test_peer_id_trailing_newline_rejected(self, mock_database, mock_plugin):
+        """PM-I1: 66 hex chars + trailing newline must be rejected.
+
+        Python's re '$' matches before a trailing newline, so '^...{66}$'
+        accepted a 67-char input and persisted a junk row end-to-end.
+        """
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        with pytest.raises(ValueError):
+            pm.set_policy("02" + "a" * 64 + "\n", strategy="dynamic")
+        mock_database.upsert_policy.assert_not_called()
+
+    def test_peer_id_wrong_length_rejected(self, mock_database, mock_plugin):
+        """PM-I1: 67 hex chars (and 65) are rejected strictly."""
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        for bad in ("02" + "a" * 65, "02" + "a" * 63):
+            with pytest.raises(ValueError):
+                pm.set_policy(bad, strategy="dynamic")
+        mock_database.upsert_policy.assert_not_called()
+
+    def test_peer_id_non_hex_rejected(self, mock_database, mock_plugin):
+        """PM-I1: right length but non-hex characters are rejected."""
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        with pytest.raises(ValueError):
+            pm.set_policy("02" + "g" * 64, strategy="dynamic")
 
     def test_valid_peer_id_accepted(self, mock_database, mock_plugin):
         """Valid peer IDs are accepted."""

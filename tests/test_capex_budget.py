@@ -1378,3 +1378,86 @@ class TestFleetTierContinued:
         )
 
         assert budget.tier != "fleet"
+
+
+class TestDbErrorFailsClosed:
+    """CB-4 fix: DB errors must fail CLOSED (deny spend), never re-grant budgets.
+
+    Previously _get_total_capex_by_channel / _get_spend_ledger_summary swallowed
+    any DB exception and returned empty dicts, so downstream arithmetic computed
+    budgets as if nothing had been spent in 30 days (fail-open).
+    """
+
+    def _make_raw_engine(self, *, capex_raises=False, ledger_raises=False):
+        """Engine whose DB wrappers are NOT monkeypatched (unlike _make_engine)."""
+        mock_profitability = MagicMock()
+        mock_profitability.analyze_all_channels.return_value = {
+            "100x1x0": _make_mock_profitability(
+                channel_id="100x1x0",
+                contribution_msat=500_000_000,   # 500k sats — proven earner
+                fees_earned_msat=500_000_000,
+                total_forward_count=50,
+            ),
+        }
+        mock_profitability.get_bleeder_status.return_value = None
+
+        mock_db = MagicMock()
+        mock_db.get_confirmed_onchain_sats.return_value = 1_000_000
+        mock_db.get_channel_rebalance_success_rate.return_value = None
+        if capex_raises:
+            mock_db.get_total_capex_by_channel.side_effect = Exception("db locked")
+        else:
+            mock_db.get_total_capex_by_channel.return_value = {}
+        if ledger_raises:
+            mock_db.get_spend_ledger_summary.side_effect = Exception("db locked")
+        else:
+            mock_db.get_spend_ledger_summary.return_value = {
+                "spent_by_category": {},
+                "reserved_by_category": {},
+            }
+
+        return CapexBudgetEngine(
+            profitability_analyzer=mock_profitability,
+            database=mock_db,
+            config=Config(),
+        )
+
+    def test_capex_db_error_zeroes_all_budgets(self):
+        engine = self._make_raw_engine(capex_raises=True)
+        alloc = engine.compute_allocations()
+
+        assert alloc.db_degraded is True
+        for b in alloc.channel_budgets.values():
+            assert b.budget_msat == 0
+            assert b.budget_sats == 0
+        assert alloc.fleet_exploration_budget_msat == 0
+        assert alloc.tactical_budget_msat == 0
+        assert engine.get_fleet_exploration_budget() == 0
+        assert engine.get_tactical_budget() == 0
+        assert engine.get_channel_budget("100x1x0").budget_sats == 0
+
+    def test_spend_ledger_db_error_zeroes_all_budgets(self):
+        engine = self._make_raw_engine(ledger_raises=True)
+        alloc = engine.compute_allocations()
+
+        assert alloc.db_degraded is True
+        for b in alloc.channel_budgets.values():
+            assert b.budget_msat == 0
+        assert alloc.fleet_exploration_budget_msat == 0
+        assert alloc.tactical_budget_msat == 0
+
+    def test_healthy_db_path_unchanged(self):
+        engine = self._make_raw_engine()
+        alloc = engine.compute_allocations()
+
+        assert alloc.db_degraded is False
+        # Proven earner with zero recorded spend keeps a real budget
+        assert alloc.channel_budgets["100x1x0"].budget_msat > 0
+        assert alloc.fleet_exploration_budget_msat > 0
+
+    def test_db_error_logs_fail_closed_warning(self, caplog):
+        import logging
+        engine = self._make_raw_engine(capex_raises=True)
+        with caplog.at_level(logging.WARNING, logger="cl-revenue-ops.capex_budget"):
+            engine.compute_allocations()
+        assert any("failing closed" in rec.getMessage() for rec in caplog.records)

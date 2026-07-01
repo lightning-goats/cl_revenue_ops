@@ -145,8 +145,10 @@ class PeerPolicy:
         }
 
 
-# Regex for validating 66-character hex peer IDs
-PEER_ID_PATTERN = re.compile(r'^[0-9a-fA-F]{66}$')
+# Regex for validating 66-character hex peer IDs.
+# PM-I1: anchored with \A...\Z, not ^...$ — Python's '$' matches before a
+# trailing newline, which let a 67-char '...\n' peer_id through and persist.
+PEER_ID_PATTERN = re.compile(r'\A[0-9a-fA-F]{66}\Z')
 
 
 class PolicyManager:
@@ -347,10 +349,27 @@ class PolicyManager:
 
         new_cache = {}
         for row in rows:
-            policy = self._row_to_policy(row)
-            # v2.0: Skip expired policies during cache load
-            if not policy.is_expired():
-                new_cache[policy.peer_id] = policy
+            # PM-I13: per-row isolation — a row that fails to parse/validate
+            # (e.g. a corrupt TEXT expires_at raising TypeError in is_expired)
+            # is skipped with a warning; it must not poison the cache and
+            # brick policy reads for every peer.
+            try:
+                policy = self._row_to_policy(row)
+                # v2.0: Skip expired policies during cache load
+                if policy.is_expired():
+                    continue
+            except Exception as e:
+                try:
+                    peer = str(row['peer_id'])[:12]
+                except Exception:
+                    peer = '<unknown>'
+                self.plugin.log(
+                    f"PolicyManager: Skipping corrupt policy row for peer "
+                    f"{peer}...: {e}. Peer degrades to default policy.",
+                    level='warn'
+                )
+                continue
+            new_cache[policy.peer_id] = policy
 
         # Update cache atomically under lock
         with self._cache_lock:
@@ -1221,6 +1240,13 @@ class PolicyManager:
                     raise ValueError(f"fee_ppm_target must be a non-negative integer for peer {peer_id[:12]}...")
                 if fee_ppm > 100000:
                     raise ValueError(f"fee_ppm_target cannot exceed 100000 PPM for peer {peer_id[:12]}...")
+            # PM-I2: mirror set_policy — without a target the fee controller
+            # silently falls through to dynamic management, the opposite of
+            # what 'static' promises.
+            if new_strategy == FeeStrategy.STATIC and fee_ppm is None:
+                raise ValueError(
+                    f"strategy=static requires fee_ppm_target for peer {peer_id[:12]}..."
+                )
 
             tags = update.get('tags', existing.tags)
             if not isinstance(tags, list):
