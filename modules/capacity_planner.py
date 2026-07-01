@@ -184,10 +184,21 @@ class CapacityPlanner:
                 hive_open_count = len(self.hive_hints.get_open_candidates())
             except Exception:
                 pass
+        max_closes = getattr(cfg, 'planner_max_closes_per_cycle', 0) if cfg else 0
+        if not isinstance(max_closes, (int, float)) or isinstance(max_closes, bool):
+            max_closes = 0
         return {
             "enabled": getattr(cfg, 'planner_enabled', False) if cfg else False,
             "dry_run": getattr(cfg, 'planner_dry_run', False) if cfg else False,
             "execute_closes": getattr(cfg, 'planner_execute_closes', False) if cfg else False,
+            # Audit (Phase 3): execute_closes=true is inert while
+            # max_closes_per_cycle=0 — surface the effective gate so the
+            # status cannot claim close execution that can never happen.
+            "max_closes_per_cycle": int(max_closes),
+            "close_execution_effective": (
+                bool(getattr(cfg, 'planner_execute_closes', False)) and int(max_closes) > 0
+                if cfg else False
+            ),
             "candidate_pool_size": len(db.get_planner_candidates()) if db else 0,
             "recent_actions": db.get_planner_actions(limit=5) if db else [],
             "hive_open_candidates": hive_open_count,

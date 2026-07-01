@@ -4520,6 +4520,47 @@ class TestPlannerIntegration:
         assert status["candidate_pool_size"] == 2
         assert len(status["recent_actions"]) == 1
 
+    def _status_planner(self, execute_closes, max_closes):
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        mock_config = MagicMock()
+        mock_config.planner_enabled = True
+        mock_config.planner_dry_run = False
+        mock_config.planner_execute_closes = execute_closes
+        mock_config.planner_max_closes_per_cycle = max_closes
+        prof_analyzer.database.get_planner_candidates.return_value = []
+        prof_analyzer.database.get_planner_actions.return_value = []
+        return CapacityPlanner(plugin, prof_analyzer, flow_analyzer, config=mock_config)
+
+    def test_status_exposes_inert_close_execution(self):
+        """Audit (Phase 3): execute_closes=true with max_closes_per_cycle=0
+        is inert — the status surface must say so instead of echoing the
+        flag as if closes were live."""
+        planner = self._status_planner(execute_closes=True, max_closes=0)
+
+        status = planner.get_status()
+
+        assert status["execute_closes"] is True
+        assert status["max_closes_per_cycle"] == 0
+        assert status["close_execution_effective"] is False
+
+    def test_status_exposes_effective_close_execution(self):
+        planner = self._status_planner(execute_closes=True, max_closes=2)
+
+        status = planner.get_status()
+
+        assert status["execute_closes"] is True
+        assert status["max_closes_per_cycle"] == 2
+        assert status["close_execution_effective"] is True
+
+    def test_status_close_execution_disabled_flag_wins(self):
+        planner = self._status_planner(execute_closes=False, max_closes=2)
+
+        status = planner.get_status()
+
+        assert status["close_execution_effective"] is False
+
 
 class TestConstructorCleanup:
     """Verify constructor signature and state initialization."""
