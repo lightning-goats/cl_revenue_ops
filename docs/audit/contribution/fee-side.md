@@ -141,10 +141,12 @@ hard zero anyway):
 - resumption within 7d: treated 5/17 (29%) vs control 1/17 (6%); McNemar exact
   on discordant pairs (5 vs 1) p = 0.219.
 
-Direction consistently favors repricing (the three biggest earners after
+Direction favors repricing in 4 of the 5 informative (non-tied) pairs — 12/17
+pairs are 0-vs-0 — (the three biggest earners after
 treatment — 953555x1338x0 +13.0, 944584x1998x0 +6.5, 950402x2686x0 +1.5
 sats/day — were all fee-drops into the 60-ppm floor region), but the corpus
-does not have the power to confirm it.
+does not have the power to confirm it. (SKEPTIC: "consistently favors" softened
+to the actual 4/5-of-informative-pairs, p=0.375.)
 
 **Record-loss limit (binding):** treatments were identified from recovered
 records only — nexus-01 recovery is **3,610 of 9,152 ids (60.6% lost)** across
@@ -188,7 +190,8 @@ Median overshoot **2.81 [1.68, 6.33] before → 1.12 [1.00, 2.71] after**;
 one-sided MWU p = 0.0136 (**holm-adjusted 0.068** across the confirmatory
 family — does not survive correction).
 
-**Attribution check (decisive):** splitting the after-period at the 071a5b3
+**Attribution check (observational; SKEPTIC: previously labeled "decisive" —
+downgraded, see caveat below the table):** splitting the after-period at the 071a5b3
 zero-flow-ratchet deploy (06-15T19:22):
 
 | epoch | n | median overshoot | mean |
@@ -204,6 +207,21 @@ overshoot 18.53; 946628x754x0 8.46). The collapse to ~1.0 coincides with the
 ratchet, exactly as Phase 3's guard-trajectory evidence (LF-8: 244/246
 correct-direction guard changes, the 720→61 fleet unwind) predicts.
 
+SKEPTIC caveats on this split (why it cannot be read as demonstrated causation):
+(1) the "post-ratchet" epoch consists entirely of wk+1 channel-weeks with only
+31 hourly LPC points (~1.3 days of advertised-fee coverage before the hole) vs
+246–335 points for the earlier epochs — overshoot uses the *max* advertised fee,
+so short coverage mechanically deflates it, in the direction that favors the
+ratchet attribution (the §3 coverage caveat applies to this table too, not only
+to the registered test); (2) the "governor→ratchet" epoch is mixed — wk+0 weeks
+straddle the 06-15 deploy — so "under the governor alone" is not observable at
+week granularity; (3) the external reprice of 946890x2272x0 (2306→250, 56% of
+node revenue) landed 06-15T18:16–19:35, within ~1 h of the ratchet deploy, and
+no node-level before/after split can separate the two events. The attribution
+therefore rests on the wk+0 ladders (genuine evidence the governor alone did not
+stop laddering) plus Phase 3's independent guard-trajectory corroboration — a
+consistent observational story, not a demonstrated effect.
+
 **Result (b):** mean fees/channel-week before 183.27 (n=89) vs after 75.11
 (n=102): change **−59.0% [95% CI −90.6%, +57.1%]** — the CI does not exclude a
 >20% decline (nor any effect from −90% to +57%). Survivors-only (mass-close
@@ -215,8 +233,10 @@ after-data cannot resolve the earnings guardrail either way.
 before (raw p<0.05, fails Holm), but the registered causal reading — that the
 *06-12 climb governor* reduced it — is contradicted by the within-after-period
 timing: the reduction arrives with the 06-15 ratchet. The earnings-preservation
-arm cannot be resolved. Descriptively, **071a5b3 is the change that ended
-optimizer overshoot** (post-ratchet median exactly 1.00); the 06-27 fee-ratchet
+arm cannot be resolved. Descriptively, **071a5b3 is the best-supported candidate
+for what ended optimizer overshoot** (post-ratchet median exactly 1.00 — but see
+the SKEPTIC caveats above: coverage-thin post-ratchet weeks and the near-simultaneous
+external reprice mean this is a timing consistency, not a demonstration); the 06-27 fee-ratchet
 fix (441b8e3 era) sits in the corpus hole and only its 07-01 endpoint is
 observable.
 
@@ -430,9 +450,11 @@ Nothing in the confirmatory family survives correction. The two robust
 positive results of this phase are non-hypothesis artifacts: the revenue
 decomposition (§1) and the exploratory elasticity episode (§5), which together
 say: this node's demand lives below ~250 ppm, is extremely concentrated, and
-the fee stack's measurable contribution in-window was made by the 06-15
-zero-flow ratchet (and an external operator hand), not by the DTS optimizer's
-price discovery.
+the fee-stack improvement observed in-window coincides with the 06-15
+zero-flow ratchet (and an external operator hand), not with the DTS optimizer's
+price discovery (SKEPTIC: observational attribution — see §3 caveats; what is
+directly demonstrated against DTS is the 69.6 h of ≥300-ppm exposure that
+bought zero forwards).
 
 ## Files
 

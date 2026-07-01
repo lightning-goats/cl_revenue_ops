@@ -187,6 +187,13 @@ routed nothing). Controls = 24 never-flagged nexus-01 channels within ±50%
 of any flagged capacity, present at coverage start, outcome at the median
 flag date. Caveat: the flag dates predate listpeerchannels coverage by ~1
 day, so control presence is tested at coverage start (06-08 23:27Z).
+SKEPTIC: the capacity "match" is vacuous in effect — flagged capacities span
+200k–14.3M sats, so "within ±50% of *any* flagged capacity" covers [100k, 21.45M]
+and excluded **zero** channels; the 24 controls are simply every never-flagged
+nexus-01 channel present at coverage start (22 + 24 = the node's 46 pre-close
+channels). The effective comparison is therefore "flagged vs the rest of the
+node", including the top earners, not a per-channel capacity-matched contrast
+as the registration most naturally reads.
 
 **Result.**
 
@@ -209,8 +216,9 @@ day, so control presence is tested at coverage start (06-08 23:27Z).
   beats holding. The two earners show the flag is not infallible at the
   individual-channel level.
 
-**Verdict: SUPPORTED.** Close-flagged channels genuinely underperform
-capacity-matched peers over the following 14 days, and the result is not an
+**Verdict: SUPPORTED.** Close-flagged channels genuinely underperform the
+node's never-flagged peers over the following 14 days (SKEPTIC: "capacity-matched"
+dropped — see the matching note above), and the result is not an
 artifact of the operator executing the recommendations (it survives
 excluding every channel closed during its window).
 
@@ -218,8 +226,15 @@ excluding every channel closed during its window).
 residual paths remain (flagged channels also receive fee-floor descent and
 defib probes — treatments that could depress or lift their forwarding);
 controls measured at one common T (median flag date) while flagged use their
-own T (3-day spread); single node; capacity matching is coarse (±50%);
+own T (3-day spread); single node; capacity matching is vacuous in effect (see
+SKEPTIC note above — controls are all never-flagged channels);
 n small — the effect size CI is wide though bounded away from 0.
+SKEPTIC: this is predictive validity, not causation — flags are computed from
+past inactivity and forwarding autocorrelates (the same caveat stated for
+PA-H1 applies here); and the survivorship-robust variant (raw p=0.024) would
+not survive a campaign-wide Holm family on its own — the Holm-surviving
+evidence is the full-cohort primary (p=1.4e-4), which retains the 12
+mechanically-zeroed mass-close channels.
 
 ## CP-H3 — defibrillation efficacy
 
@@ -406,7 +421,8 @@ enabled.
 
 Registered confirmatory tests actually run: PA-H1 (U-vs-P primary; S/Z
 extensions Holm-corrected within each horizon) and CP-H2 (single test +
-pre-declared sensitivity). All other registered tests returned
+sensitivity; SKEPTIC: the sensitivity has no registration artifact, so
+"pre-declared" is dropped). All other registered tests returned
 UNTESTABLE/VACUOUS before any p-value was computed. Exploratory analyses
 (Fisher proportions, participation attribution, hold-margin sweep) are
 labeled, unadjusted, and generate hypotheses only. With ~6 p-values total
