@@ -70,10 +70,21 @@ Outputs (produced):
 - FC-I4 **Floor < ceiling, discovery ceiling wins.** After all floor sources compose, if floor >=
   ceiling the floor is lowered to max(min_fee, ceiling-10); the zero-flow discovery ceiling beats
   rebalance/Vegas cost floors unless min_fee itself forces inversion. Code: :5582-5600.
-- FC-I5 **Posterior honesty.** Every DTS posterior observation pairs the fee actually advertised
-  on-chain (raw_chain_fee > 0) with the revenue it produced; 0-fee windows are never ingested, and
+- FC-I5 **Posterior honesty.** (Amended 2026-07-01 — the original universal claim was partially
+  refuted.) Every INGESTED DTS posterior observation pairs the fee actually advertised on-chain
+  (raw_chain_fee > 0) with the revenue it produced; 0-fee windows are never ingested, and
   congested-window observations are flagged so they cannot raise the supported-fee ceiling.
-  Code: :5919-5941, :5627-5644, GaussianThompsonState :154-190.
+  **Carve-out — zero-probe pseudo-observations:** after a sustained zero-revenue streak
+  (>= ZERO_REVENUE_STREAK_THRESHOLD 4 windows, subject to the earning-anchor descent floor),
+  `add_observation`/`update_posterior` deliberately INJECTS a pseudo-observation pairing a
+  never-advertised fee (charged fee x ZERO_PROBE_STEP_FRAC 0.9) with fabricated 0.0 revenue, to
+  give the posterior a downward gradient off dead fee levels. This is by design and self-honest:
+  every such observation carries ZERO_PROBE_FLAG as its 6th tuple element, and its zero revenue
+  self-excludes it from the supported-fee ceiling (`_positive_revenue_mass` drops rev <= 0), so
+  probes can steer the posterior down but can never fabricate earning evidence or raise the
+  ceiling. Code (HEAD cdb536a): ingestion gates :6008 (DTS) / :5711 (congestion), probe injection
+  :702-712, ceiling exclusion :730-748, constants :196-205. Tests: test_fee_optimal_guards.py
+  (TestZeroProbeHonesty pinning tests, TestSupportedFeeCeiling).
 - FC-I6 **Declared, individually bounded hive influence channels.** (Amended 2026-07-01 after the
   Phase 2 refutation: the original "ALL hive-derived hints compose into a single multiplier clamped
   [0.9, 1.1], so hints can never move the target more than +/-10%" was false — that bound only ever
