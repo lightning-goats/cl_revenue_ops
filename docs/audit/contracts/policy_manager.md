@@ -49,8 +49,11 @@ Outputs / consumers:
 ## 3. Invariants
 
 - PM-I1 **Peer-id validation.** Every write path validates a 66-char hex peer_id and raises ValueError
-  otherwise (:300-313, used at :572, :712, :1179). Checkable: tests/test_database_policies.py,
-  test_operator_surface.py.
+  otherwise (:300-313, used at set/delete/batch entry points). The pattern is strictly anchored with
+  `\A[0-9a-fA-F]{66}\Z` — `^...$` anchoring previously accepted 66 hex chars plus a trailing newline
+  (Python `$` matches before a final `\n`) and persisted the junk key end-to-end; fixed by the PM-I1
+  fix. Note: validation lives only in PolicyManager — the Database layer performs no peer-id
+  validation of its own on these paths. Checkable: tests/test_policy_manager.py::TestValidation.
 - PM-I2 **STATIC requires a target — both write paths.** `set_policy(strategy=static)` without
   `fee_ppm_target` raises (:606-609), and `set_policies_batch` enforces the same check per entry
   during its validate-first pass (any STATIC entry resolving to a None target fails the whole

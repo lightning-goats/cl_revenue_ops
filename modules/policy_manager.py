@@ -145,8 +145,10 @@ class PeerPolicy:
         }
 
 
-# Regex for validating 66-character hex peer IDs
-PEER_ID_PATTERN = re.compile(r'^[0-9a-fA-F]{66}$')
+# Regex for validating 66-character hex peer IDs.
+# PM-I1: anchored with \A...\Z, not ^...$ — Python's '$' matches before a
+# trailing newline, which let a 67-char '...\n' peer_id through and persist.
+PEER_ID_PATTERN = re.compile(r'\A[0-9a-fA-F]{66}\Z')
 
 
 class PolicyManager:

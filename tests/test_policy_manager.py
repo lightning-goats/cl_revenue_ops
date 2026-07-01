@@ -701,6 +701,34 @@ class TestValidation:
             with pytest.raises(ValueError):
                 pm.set_policy(invalid_id, strategy="dynamic")
 
+    def test_peer_id_trailing_newline_rejected(self, mock_database, mock_plugin):
+        """PM-I1: 66 hex chars + trailing newline must be rejected.
+
+        Python's re '$' matches before a trailing newline, so '^...{66}$'
+        accepted a 67-char input and persisted a junk row end-to-end.
+        """
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        with pytest.raises(ValueError):
+            pm.set_policy("02" + "a" * 64 + "\n", strategy="dynamic")
+        mock_database.upsert_policy.assert_not_called()
+
+    def test_peer_id_wrong_length_rejected(self, mock_database, mock_plugin):
+        """PM-I1: 67 hex chars (and 65) are rejected strictly."""
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        for bad in ("02" + "a" * 65, "02" + "a" * 63):
+            with pytest.raises(ValueError):
+                pm.set_policy(bad, strategy="dynamic")
+        mock_database.upsert_policy.assert_not_called()
+
+    def test_peer_id_non_hex_rejected(self, mock_database, mock_plugin):
+        """PM-I1: right length but non-hex characters are rejected."""
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        with pytest.raises(ValueError):
+            pm.set_policy("02" + "g" * 64, strategy="dynamic")
+
     def test_valid_peer_id_accepted(self, mock_database, mock_plugin):
         """Valid peer IDs are accepted."""
         pm = PolicyManager(mock_database, mock_plugin)
