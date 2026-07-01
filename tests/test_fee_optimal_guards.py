@@ -583,6 +583,11 @@ class TestIncidentReplay:
     def test_steady_state_does_not_run_away(self, fake_time):
         """400 windows of heavy-tail demand: the fee must stay in/near the
         steady region instead of chasing whales upward."""
+        # GaussianThompsonState.sample_fee draws from the GLOBAL random
+        # module; seed it so the DTS trajectory is deterministic (this test
+        # was flaky depending on process-wide RNG state — see
+        # docs/audit/verification/fee_controller.md, Anomaly 1).
+        random.seed(3)
         rng = random.Random(3)
         st = GaussianThompsonState()
         fee = 100
@@ -601,6 +606,10 @@ class TestIncidentReplay:
         anchored high, earning history at ~90 two days old). Within 48
         half-hour windows the fee must be back at/below 2x the steady
         region."""
+        # Seed the GLOBAL RNG used by sample_fee (see note in
+        # test_steady_state_does_not_run_away): unseeded, this test failed
+        # nondeterministically (~50% of isolated runs).
+        random.seed(11)
         rng = random.Random(11)
         st = GaussianThompsonState()
         # Earning era
