@@ -236,14 +236,19 @@ def main():
                     info["fc_i1b_channels_checked"] += 1
                     if fee == 0:
                         info["fc_i1b_zero_fee_channels"] += 1
-                        # cross-check hive membership lazily
+                        # cross-check hive membership lazily.
+                        # Membership lives in hive-export-hints.json's `hints`
+                        # dict (per-peer `member` booleans); revenue-hive-hints-
+                        # status.json only carries counts, not peer ids.
                         if member_peers is None:
-                            hh = load_json(os.path.join(cmd_dir, "revenue-hive-hints-status.json"))
                             member_peers = set()
-                            if isinstance(hh, dict):
-                                blob = json.dumps(hh)
-                                # membership lists vary in shape; collect any pubkeys
-                                member_peers = set(re.findall(r"0[23][0-9a-f]{64}", blob))
+                            eh = load_json(os.path.join(cmd_dir, "hive-export-hints.json"))
+                            hints = (eh or {}).get("hints")
+                            if isinstance(hints, dict):
+                                member_peers = {
+                                    peer for peer, hint in hints.items()
+                                    if isinstance(hint, dict) and hint.get("member")
+                                }
                         if chan.get("peer_id") not in (member_peers or set()):
                             info["fc_i1b_zero_fee_nonmember"] += 1
                             if len(examples["FC-I1b zero-fee on non-hive peer (info)"]) < 5:
