@@ -241,6 +241,57 @@ class TestDeadCapitalCloseProtections:
         )
 
 
+class TestMemberCloseProtectionWithoutClassMask:
+    """D2 (audit): with the UNDERWATER -> BREAK_EVEN fleet-loss mask removed
+    from the profitability analyzer, close protection for hive members must
+    still hold — via the explicit member skip / HIVE_MEMBER protection
+    reason, never via class falsification."""
+
+    def test_underwater_hive_member_never_emitted_as_close_loser(self):
+        """A deeply underwater hive member with a fire-sale signature (the
+        exact shape the mask used to hide) produces no CLOSE loser."""
+        planner, prof_analyzer = _make_planner()
+        planner.hive_hints = MagicMock()
+        planner.hive_hints.is_hive_member.return_value = True
+        planner.hive_hints.get_corridor_role.return_value = None
+        # Fire-sale signature: mature, UNDERWATER, marginal ROI < -50
+        prof = _make_prof(
+            marginal_roi_percent=-80.0,
+            classification=ProfitabilityClass.UNDERWATER,
+        )
+        prof.days_open = 200
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 5
+        }
+
+        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow(
+            confidence=1.0, forward_count=10)})
+
+        assert not any(l.get("action") == "CLOSE" for l in losers)
+
+    def test_underwater_non_member_still_closeable(self):
+        """Control: the same fire-sale signature without membership is
+        recommended for CLOSE — protection is member-specific."""
+        planner, prof_analyzer = _make_planner()
+        planner.hive_hints = MagicMock()
+        planner.hive_hints.is_hive_member.return_value = False
+        planner.hive_hints.get_corridor_role.return_value = None
+        planner.hive_hints.is_closure_recommended_fresh.return_value = False
+        prof = _make_prof(
+            marginal_roi_percent=-80.0,
+            classification=ProfitabilityClass.UNDERWATER,
+        )
+        prof.days_open = 200
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {
+            "attempt_count": 5
+        }
+
+        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow(
+            confidence=1.0, forward_count=10)})
+
+        assert any(l.get("action") == "CLOSE" for l in losers)
+
+
 class TestKalmanGateSemantics:
     """F3 (audit HIGH): the Kalman-confidence gate made CLOSE unreachable.
 

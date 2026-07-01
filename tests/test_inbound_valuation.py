@@ -495,8 +495,10 @@ class TestClassificationTotalForwardCount:
             ProfitabilityClass.ZOMBIE,
         ), f"Got {result.classification.value} — inbound gateway with 100 sourced forwards should not be stagnant/zombie"
 
-    def test_fleet_member_protection_with_sourced_forwards(self):
-        """Hive member with sourced forwards is protected from UNDERWATER."""
+    def test_fleet_member_loss_stays_visible(self):
+        """D2 (audit): a hive member with sourced forwards but underwater
+        ROI is classified UNDERWATER — the class rewrite that hid fleet
+        losses was removed; close protection lives in capacity_planner."""
         from modules.profitability_analyzer import ChannelProfitabilityAnalyzer as ProfitabilityAnalyzer, ProfitabilityClass
 
         mock_plugin = MagicMock()
@@ -523,8 +525,8 @@ class TestClassificationTotalForwardCount:
             peer_id=peer_id,
             forward_count=50,
         )
-        assert classification == ProfitabilityClass.BREAK_EVEN, (
-            f"Hive member with 50 forwards should be BREAK_EVEN, got {classification.value}"
+        assert classification == ProfitabilityClass.UNDERWATER, (
+            f"Underwater hive member must stay UNDERWATER (D2), got {classification.value}"
         )
 
 
