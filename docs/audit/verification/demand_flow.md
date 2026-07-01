@@ -49,3 +49,38 @@ here has corpus evidence — verdicts rest on tests and code only.
    test_demand_flow_integration.py) — sink-adjacent candidates are structurally
    faint. Not a defect, but relevant when Phase 3 asks why demand_flow
    candidates rarely win.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification on HEAD. `git diff f905cfd..HEAD -- modules/demand_flow.py`
+re-confirmed empty; the full module (233 lines) was re-read line by line.
+
+**No verdict flipped.** DF-1..DF-6 survived direct attack:
+
+- **DF-1**: thresholds :78-83 (`> 0.3` / `< -0.3`, so exact ±0.3 → router — the doc's
+  boundary-untested note is accurate), zero-volume early-out :73-75. All 6
+  TestPeerFlowProfiles tests exist and pass.
+- **DF-2**: formula :85-86 re-read — `min(0.9, ·)` then `max(0.1, ·)`, both clamps bind;
+  0.9 ⇔ total = 1e18 sats and the 1M-sat realized ceiling of 0.3 both recomputed and
+  correct. The "no covering test at all" claim was hunted for counterexamples and holds:
+  no test asserts any confidence value from the volume formula (the only confidence
+  assertion anywhere is the zero-volume 0.0 path).
+- **DF-3**: argmax :170-183 with the `≥` chain resolving ties source > sink > router as
+  stated; zero-score → ("unknown", 0.0) :171-173.
+- **DF-4**: `_safe_float` :33-40, `parse_msat` usage :132/:152, dict-typed active filter
+  :128; the four malformed-gossip tests exist (test_demand_flow.py :139, :145, :155, :171).
+- **DF-5/DF-6**: :203-233 re-read — top-5 slice :207, active skip :218, `seen` dedupe
+  :216, ≤10 truncation :233, score formula :221 (rank 0 of n gives factor 2 → 0.8·conf).
+  Planner wiring re-confirmed at capacity_planner.py:2094 (classify_peers), :2110
+  (find_sink_adjacent_candidates), :2934 (strategy 6 discovery), :2392-2395 (sink-adjacent
+  1.4x boost / cached profile annotation).
+- **Anomaly 1 (production-dead classify_candidate) re-confirmed by independent grep**:
+  the only references to `classify_candidate` outside the module itself are in
+  tests/test_demand_flow.py — no caller in modules/ or cl-revenue-ops.py. **Anomaly 2
+  (fee_extractive dead signal) re-confirmed**: recorded at :164 into `signals` only; no
+  score variable is ever decremented, so it cannot influence the argmax.
+
+**Citation correction (evidence hygiene, verdicts unaffected):** tests/test_demand_flow.py
+contains 23 tests, not 24 (23 + 4 integration = 27 pass on HEAD). Consequently the
+"12 of the 24 unit tests exercise dead code" tally in Anomaly 1 is 12 of 23 —
+the conclusion (coverage overstates live-path assurance) is unchanged.

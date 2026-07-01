@@ -4,10 +4,12 @@ Contract: docs/audit/contracts/capital_efficiency.md (CE-1..CE-6, + metabolism-l
 seam section). Drift check: `git diff f905cfd..HEAD -- modules/capital_efficiency.py`
 is empty — module is byte-identical to the contract-authoring commit; all cited line
 numbers reconfirmed directly against HEAD. Corpus: `tools/audit/sweep_data_budget.py`
-over 5,196 snapshots (both nodes, 2026-05-19 → 2026-07-01); this module emits no RPC/
+over 5,196 snapshots (both nodes, ~~2026-05-19 → 2026-07-01~~ **corrected 2026-07-01:
+corpus spans 2026-06-09 → 2026-06-20 plus one 2026-07-01 snapshot pair; May data
+quarantined**); this module emits no RPC/
 datastore surface of its own, so corpus evidence here is limited to the metabolism-ledger
-seam (`ML-*` checks) plus cross-checks in tests/test_capital_efficiency.py (31 tests,
-all pass on HEAD).
+seam (`ML-*` checks) plus cross-checks in tests/test_capital_efficiency.py (~~31 tests~~
+**corrected: 12 tests**, all pass on HEAD).
 
 | Invariant | Verdict | Evidence |
 |---|---|---|
@@ -18,7 +20,7 @@ all pass on HEAD).
 | CE-5 fleet totals are non-negative sums; dead-capital sats only for dead-classified channels | **verified** | code confirmed (:112-118 total_deployed_sats, :134-136 dead_capital accumulation gated on `is_dead_capital`); test_analyze_computes_rpsd_rank_and_fleet_summary asserts exact totals (`dead_capital_sats == 2_000_000` for the one dead channel only, `total_deployed_sats == 12_500_000` = sum of all three) — non-tautological, real arithmetic checked |
 | CE-6 SCID-format drift cannot orphan flow/stage lookups (normalize_scid aliasing) | **verified** | code confirmed (:69-78 `flow_by_normalized_channel`/`stages` built via `normalize_scid`, :122-127 three-way fallback chain `flow.get(channel_id) or flow.get(normalized) or flow_by_normalized_channel.get(normalized)`, :145 stage lookup via normalized key); test_stage_lookup_normalizes_scid_keys, test_flow_lookup_normalizes_scid_keys, test_stage_lookup_degrades_cleanly_on_db_failure (DB exception → `raw_stages = {}`, code confirmed :65-68) |
 
-All six cited test files/functions were executed directly (`pytest tests/test_capital_efficiency.py tests/test_dead_capital_protections.py`) and pass on HEAD (31 + 19 = 50 passed). `test_dead_capital_protections.py` exercises `capacity_planner`'s stage-progression gates (a *consumer* of `dead_capital_stage`, not this module's own classification) — included for context but not counted as direct CE-4 coverage.
+All six cited test files/functions were executed directly (`pytest tests/test_capital_efficiency.py tests/test_dead_capital_protections.py`) and pass on HEAD (~~31 + 19 = 50 passed~~ **corrected: 12 + 19 = 31 passed — the original text mistook the combined-run total (31) for the CE file's own count and then double-added**). `test_dead_capital_protections.py` exercises `capacity_planner`'s stage-progression gates (a *consumer* of `dead_capital_stage`, not this module's own classification) — included for context but not counted as direct CE-4 coverage.
 
 ## Metabolism-ledger seam — DB-7/covered_hours drift, verified fixed
 
@@ -123,3 +125,54 @@ underlying measurement — arguably worse for downstream consumers that gate beh
    :2498-2517, logic unchanged from contract's :2061-2080 description). None of this is
    capital_efficiency.py's responsibility — this module supplies no metabolism-ledger
    inputs at all.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification on HEAD (plugin cdb536a-era tree; cl-hive read-only at
+53bc7c1). `git diff f905cfd..HEAD -- modules/capital_efficiency.py` re-confirmed empty.
+
+**No verdict flipped.** CE-1..CE-6 survived direct attack — the full module (227 lines)
+was re-read and every cited line range matches: `_calculate_rpsd` :151-164 (0.0 at zero
+capacity :154-155), windowed-blend break-to-`{}` :92-96 with blend gate :98-103,
+`_calculate_windowed_net_rpsd` :166-182 (None on missing/bool/non-numeric field),
+`_calculate_percentile_ranks` :184-207 (single-item 1.0 :190-192, tie-averaging
+:197-206), `_is_dead_capital` :209-227 (flow-None → False :211-212, grace :217, hive
+bypass :220-225), fleet totals :112-118/:134-136, normalize_scid maps :69-78 and
+three-way fallback :123-127, DB-degrade :65-68, unguarded flow-analyzer call :63-64
+(gap stands). All 12 cited test functions exist and were re-run (12 + 19 pass);
+`test_analyze_computes_rpsd_rank_and_fleet_summary` re-read — asserts exact fleet
+arithmetic (dead 2,000,000 / total 12,500,000 / median 50.0 / per-channel rpsd and
+ranks), genuinely non-tautological.
+
+**Seam attribution attack (the load-bearing claim) — survived, verified precisely on
+cl-hive HEAD 53bc7c1:**
+- `_ledger_window_coverage` at runtime.py:2677-2699 exactly as cited; defensive
+  either-key read at :2684; own-status computation at :2696 (producer's
+  `coverage_status` ignored); not-a-dict → `insufficient_coverage`/`covered_hours: 0`
+  at :2678-2683.
+- `_build_canonical_metabolism_ledger` at :2702; intake computed once outside the
+  window loop (:2716-2725), reserves once (:2730-2736), both copied verbatim into all 5
+  windows (:2774, :2780) — ML-INTAKE-IDENT / ML-RESERVE-IDENT (0/4,600 pass each,
+  reproduced by re-running the sweep) are cl-hive constructions, exactly as attributed.
+- burn/development lifetime fallback at :2757-2761 with `burn:` source_notes :2767;
+  `_ledger_spend_totals_msat` at :2498. ML-BURN/DEV-IDENT 2,285/2,315 reproduced.
+- The `unknown=22,859 / insufficient_coverage=131 / complete=10` breakdown was
+  independently recomputed from the raw corpus JSON and matches exactly; the 10
+  `complete` rows are solely the two 20260701T203541Z snapshots (2 nodes × 5 windows).
+  The doc's correction of the "141 = post-fix" hint is itself correct.
+- The covered_hours echo anomaly re-confirmed, and strengthened: `coverage_status:
+  "complete"` is a hardcoded literal at *both* plugin writers (modules/database.py:3971
+  and cl-revenue-ops.py:6590 — the total-cost-budget surface echoes `wh` the same way),
+  so the falsely-confident-"complete" concern applies to every coverage-bearing surface
+  the plugin emits, not just the spend ledger.
+
+**Corrections (evidence hygiene, verdicts unaffected):**
+
+1. Test-count arithmetic fixed inline: tests/test_capital_efficiency.py has 12 tests,
+   not 31; the combined run is 31, not 50.
+2. Corpus window fixed inline (2026-06-09 → 06-20 + 07-01; May quarantined).
+3. The 131 `insufficient_coverage` windows are not only "from 2026-06-09": they span
+   2026-06-09 → 2026-06-13 plus 2026-06-18, all on hive-nexus-01 (spot-verified
+   source_notes on 20260609T034120Z show `burn:revenue_profitability_summary`, i.e. the
+   spend-payload-missing fallback, exactly the mechanism the doc describes — the
+   mechanism claim is right, the date scoping was narrow).

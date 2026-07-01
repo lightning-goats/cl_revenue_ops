@@ -7,7 +7,9 @@ cited line numbers below are current on HEAD (cdb536a). Evidence: test mapping (
 HEAD, 2026-07-01, 133/133 passed across the six cited files), code confirmation, and corpus
 sweep `tools/audit/sweep_data_budget.py` over 1,227 revenue-capex-status snapshots /
 27,012 channel rows (corpus root `/home/sat/cl-mycelium-hermes`, both nodes,
-2026-05-19 → 2026-07-01).
+~~2026-05-19 → 2026-07-01~~ **corrected 2026-07-01: corpus actually spans 2026-06-09 →
+2026-06-20 plus one 2026-07-01 snapshot pair — ~12 observed days, 10-day hole
+06-21..06-30; May data quarantined**).
 
 | Invariant | Verdict | Evidence |
 |---|---|---|
@@ -101,3 +103,67 @@ happy path remains verified.
 2. No other drift or discrepancy found: all corpus-observable CB-* checks are 100% clean
    (0 failures across 27,012 channel rows / 1,227 snapshots), consistent with the module
    being byte-identical to the audited commit.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification on HEAD. Recovery check: this doc (recovered from a lost-write
+transcript) is intact — well-formed markdown, no truncation. `git diff f905cfd..HEAD --
+modules/capex_budget.py` re-confirmed empty.
+
+**No verdict flipped.** All eight CB verdicts and the CB-4 fail-open finding survived
+direct attack:
+
+- **Fail-open finding re-confirmed byte-for-byte** at capex_budget.py:665-677; call-site
+  trace re-verified (`capex_by_channel.get(ch_id, 0)` :185; proven formula
+  `max(0, int(contribution_30d_msat * reinvestment) - total_capex_30d_msat)` :509-ish;
+  `_apply_category_spend_remaining` :679-693). Independent grep confirms no test anywhere
+  sets a raising side_effect on either wrapper — the no-regression-coverage claim holds.
+- **CB-1**: `TestGlobalEnvelope::test_operator_envelope_caps_total` (:914) asserts the
+  ceiling at **msat** precision against a real engine — non-tautological. The sweep's
+  "+ceil slack" tolerance was attacked and is *justified*: every sats field on the status
+  surface is `base_to_sats_ceil` (capex_budget.py:75-114), the corpus-wide worst overshoot
+  is 26 sats at 38 channels (slack 40), and overshoot never exceeded per-part rounding
+  bound. Crucially the check is **not vacuous**: the envelope binds in the corpus (median
+  headroom 0 sats; total ≥ envelope in all 1,227 snapshots), so proportional scale-down
+  (:275-280) was live in production throughout.
+- **CB-2/CB-5/CB-6/CB-7 corpus checks are non-vacuous**: `hive_multiplier` is present on
+  all 27,012 channel rows with real variation (1.0×23,945 / 1.5×3,049 / 2.0×18 — the
+  sweep's `.get(..., 1.0)` default never engaged); 18 blocked rows and 3,065 fleet rows
+  are real. CB-2 code re-read (:266-272): both overrides strictly `min()`. CB-8 re-read
+  (:352-395): fail-closed as claimed; `test_database_failure_returns_false` uses a real
+  raising side_effect (test_boltz_capex_gating.py:410).
+- Sweep tallies reproduced exactly by re-running tools/audit/sweep_data_budget.py
+  (5,196 snapshots; CB1-ENVELOPE 1,227/0, CB5-BLOCKED-ZERO 18/0, CB5-FLEET-CAP 3,065/0,
+  CB6-HIVE-MULT 27,012/0, CB-PRIO/CB-PRIOCLASS 1,227/0).
+
+**Citation corrections (evidence hygiene, verdicts unaffected):**
+
+1. Five cited test *class* names do not exist: `TestBudgetTiers`, `TestBlockedChannels`,
+   `TestEfficiencyMultiplier`, `TestROIMultiplier`, `TestHiveMultiplier`. Every cited test
+   *function* does exist, under `TestPerChannelBudget`, `TestWindowedCapexFunding`,
+   `TestMarginalRoiBudgetMultiplier`, `TestFleetTier`, and `TestFleetExplorationBudget` /
+   `TestTacticalBudget` in tests/test_capex_budget.py — verified individually by grep and
+   by running the file (74 tests pass).
+2. "133/133 passed across the six cited files" is not reproducible as stated: the six
+   files are never enumerated, and the only two files the table actually names
+   (test_capex_budget.py + test_boltz_capex_gating.py) contain 107 tests (107 pass on
+   HEAD). No natural file combination tried yields exactly 133. The tests that matter all
+   pass; the headline count is unaccountable.
+3. Corpus window corrected in the header (2026-06-09 → 06-20 + 07-01, not 05-19 →).
+
+**New anomalies found by this pass:**
+
+1. **Actual 24h spend exceeded the effective daily budget in 129 of 1,227
+   total-cost-budget snapshots** (`actual_spent_sats > effective_budget_sats`, so
+   `remaining_sats` clamps to 0). The budget surface reports the breach honestly, but this
+   is production evidence that the daily ceiling is advisory-after-the-fact at this
+   surface — consistent with (and adding observed weight to) the fail-open direction of
+   Anomaly #1. Also: `reserved_sats == 0` in **all** 1,227 snapshots, so the sweep's
+   TCB-REMAIN check never exercised the reserved term, and TCB-REMAIN recomputes the same
+   `max(0, eff - spent - resv)` formula as production (cl-revenue-ops.py:6580) — it is a
+   serialization-consistency (replica) check, incapable of detecting a wrong formula.
+   Neither limitation was labeled in the sweep.
+2. The corpus-era generic spend ledger is entirely zeros (see database.md refutation pass,
+   anomaly 1), so CB-4's depletion arithmetic likewise has **zero** corpus evidence of a
+   nonzero depletion ever occurring in production — happy-path tests are the only
+   non-vacuous evidence for CB-4's arithmetic.
