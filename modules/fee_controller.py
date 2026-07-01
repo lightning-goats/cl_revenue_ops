@@ -6595,13 +6595,26 @@ class FeeController:
             # resets below do not mask refresh eligibility.
             # =========================================================================
             if self._should_force_gossip_refresh(channel_id, cycle, now):
-                return self._create_gossip_refresh_adjustment(
+                refresh_adjustment = self._create_gossip_refresh_adjustment(
                     channel_id=channel_id,
                     peer_id=peer_id,
                     state=cycle,
                     current_fee_ppm=current_fee_ppm,
                     current_time=now
                 )
+                if refresh_adjustment is not None:
+                    # Success: the helper already reset the observation
+                    # cursor (state.last_update) alongside the broadcast
+                    # timestamps, so returning here keeps exactly one reset.
+                    return refresh_adjustment
+                # FC-I16 fix (2026-07-01): the helper returns None when no
+                # safe nudge exists (pinned min==max config) or the
+                # setchannel RPC failed — WITHOUT touching the cursor. The
+                # DTS+PID posterior has already consumed this window above,
+                # so fall through to the hysteresis reset below instead of
+                # returning early; otherwise the next cycle re-ingests the
+                # same volume/revenue (double-counting), mirroring the
+                # main-broadcast RPC-failure path which does reset.
 
             # HYSTERESIS: Skip RPC, update internal target but reset observation timer.
             # We MUST reset last_update because the fee/revenue data for this window
