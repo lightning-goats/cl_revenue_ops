@@ -51,7 +51,11 @@ records Boltz swap fees into the spend ledger so its own budgets self-deplete.
   producers that don't prefetch the 30d P&L.
 - **CB-4** Category budgets self-deplete: exploration and tactical budgets subtract both
   spent and actively-reserved sats for their category (`channel_open`, `boltz`) and floor
-  at 0 (`_apply_category_spend_remaining`, :679–693).
+  at 0 (`_apply_category_spend_remaining`). DB errors fail CLOSED: if either spend-history
+  read (`_get_total_capex_by_channel`, `_get_spend_ledger_summary`) raises, the wrapper
+  returns None with a warning log and `compute_allocations` zeroes ALL channel, exploration
+  and tactical budgets for the cycle (spend denied), flagging `CapexAllocations.db_degraded=True`
+  — it never re-grants budgets as if nothing was spent.
 - **CB-5** Blocked means zero: zombies, hard bleeders, and in-grace zero-contribution
   channels return tier `blocked` with `budget_msat=0` (:457–471, :538–541); hive-member
   channels bypass these gates into the `fleet` tier capped at min(50 bps of capacity,
@@ -87,7 +91,5 @@ category depletion it reads back; cl-hive's metabolism ledger lists
 - Wallet-backed bootstrap exploration (:633–644) intentionally skips spend-ledger
   debiting (double-count argument in the docstring); whether reservations alone are
   sufficient protection during concurrent opens is untested.
-- `_get_spend_ledger_summary` failure returns empty dicts (:677) — under DB errors CB-4
-  silently stops depleting categories (fails open).
 - `success_rate_30d` is carried as a diagnostic only (audit F6); confirm no downstream
   consumer still multiplies by it.
