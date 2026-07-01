@@ -74,12 +74,38 @@ Outputs (produced):
   on-chain (raw_chain_fee > 0) with the revenue it produced; 0-fee windows are never ingested, and
   congested-window observations are flagged so they cannot raise the supported-fee ceiling.
   Code: :5919-5941, :5627-5644, GaussianThompsonState :154-190.
-- FC-I6 **Bounded hive authority.** All hive-derived hints compose into a single multiplier clamped
-  to [0.9, 1.1] at the one multiplication site, so hints can never move the target more than +/-10%.
-  (Precisely: metabolic/immune are each clamped [0.95, 1.05] and folded into the fee bias, which is
-  clamped [0.9, 1.1] inside `_get_hive_fee_bias`; that result x temporal is clamped [0.9, 1.1] again
-  before multiplying — two nested clamp stages, one bounded effect.) Code: :2475-2476, :6008-6019,
-  `_get_hive_fee_bias` :2676-2692. Tests: test_fee_hive_bias.py.
+- FC-I6 **Declared, individually bounded hive influence channels.** (Amended 2026-07-01 after the
+  Phase 2 refutation: the original "ALL hive-derived hints compose into a single multiplier clamped
+  [0.9, 1.1], so hints can never move the target more than +/-10%" was false — that bound only ever
+  scoped the fee-bias/temporal multiplier. Three hive influence channels exist by design, each with
+  its own bound:)
+  1. **Fee-bias x temporal multiplier, clamped [0.9, 1.1].** Metabolic/immune are each clamped
+     [0.95, 1.05] and folded into the fee bias, which is clamped [0.9, 1.1] inside
+     `_get_hive_fee_bias`; that result x temporal is clamped [0.9, 1.1] again before the single
+     multiplication site — two nested clamp stages, one bounded multiplicative effect (<= +/-10%)
+     on the post-PID target. Code (HEAD cdb536a): constants :2486-2487, `_get_hive_fee_bias`
+     :2694-2700, composite clamp + multiply :6089-6097. Tests: test_fee_hive_bias.py
+     (TestFeeHiveBias), test_fee_pipeline_composition.py (TestCompositeHintBiasClamp).
+  2. **Exploration multiplier, clamped [0.75, 2.0].** `_get_hive_exploration_multiplier`
+     (centrality/corridor-role/elasticity hints) returns a draw-noise scale in [0.75, 2.0] that is
+     consumed via `GaussianThompsonState.scale_variance` — every sample path re-clamps the boost to
+     [EXPLORATION_BOOST_MIN 0.75, EXPLORATION_BOOST_MAX 2.0]. It scales the sampled DEVIATION
+     around the posterior mean (and persistently widens posterior_std, self-healing on the next
+     recompute); it does not shift the mean, but it is NOT bounded by the +/-10% clamp of channel 1.
+     Code: :2904-2930, scale_variance :395-422, `_resolve_exploration_boost` :424-443, armed
+     :6047-6058, consumed :469/:477/:491. Tests: test_fee_hive_bias.py
+     (TestHiveInfluenceBoundsPinning).
+  3. **Fleet fee prior, accepted only in [1, 10000] ppm — otherwise None.** `_select_best_fee_prior`
+     seeds (and `_maybe_reseed_skewed_prior` one-time re-seeds) `prior_mean_fee` from
+     `hive_hints.get_fleet_fee_prior`, which neutralizes anything outside
+     [1, MAX_FLEET_FEE_PRIOR_PPM 10000] (or non-finite) to None. On young/quiet channels
+     (< MIN_OBSERVATIONS) samples are drawn around this hive-set ABSOLUTE prior mean — an influence
+     channel bounded by the accept-range and the floor/ceiling clamp on the sample, not by +/-10%.
+     Code: :7288-7326, :5894 (in-cycle reseed), hive_hints.py get_fleet_fee_prior. Tests:
+     test_fee_hive_bias.py (TestHiveInfluenceBoundsPinning).
+  Separately, the hive-member zero-fee gate (8630ca6) is a membership-based 100% override
+  (structurally like PASSIVE/STATIC, not a hint multiplier) — see FC-I1 drift notes in
+  docs/audit/verification/fee_controller.md.
 - FC-I7 **Bounded congestion response.** A congestion episode's first cycle may step at most to
   min(ceiling, episode_cap, max(2x current, current+250)); subsequent congested cycles ride the
   normal blend/delta-cap path; the whole episode is capped at max(4x entry fee, entry+250).

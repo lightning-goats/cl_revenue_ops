@@ -263,3 +263,129 @@ class TestMemberFeePolicy:
         adapter.is_usable.return_value = True
         assert fc._check_hive_member_fee("02peer") is None
         assert fc._consume_hive_member_advisory("02peer") is False
+
+
+class TestHiveInfluenceBoundsPinning:
+    """FC-I6 pinning tests (contract amended 2026-07-01).
+
+    The hive influences the fee decision through THREE declared channels:
+    (1) the fee-bias x temporal multiplier clamped [0.9, 1.1] (covered by
+    TestFeeHiveBias above), (2) the exploration multiplier clamped
+    [0.75, 2.0] that scales DTS draw noise, and (3) the fleet fee prior
+    accepted only in [1, 10000] ppm (else None) that seeds the Thompson
+    prior mean. These tests lock the bounds of (2) and (3) so any future
+    widening of hive authority breaks the suite instead of shipping
+    silently.
+    """
+
+    # ---- Channel 2: exploration multiplier [0.75, 2.0] ----
+
+    def test_exploration_bound_constants_pinned(self):
+        from modules.fee_controller import GaussianThompsonState
+        assert GaussianThompsonState.EXPLORATION_BOOST_MIN == 0.75
+        assert GaussianThompsonState.EXPLORATION_BOOST_MAX == 2.0
+
+    def test_scale_variance_clamps_at_upper_boundary(self):
+        from modules.fee_controller import GaussianThompsonState
+        st = GaussianThompsonState()
+        st.scale_variance(1_000_000.0)
+        assert st.exploration_boost == 2.0
+
+    def test_scale_variance_clamps_at_lower_boundary(self):
+        from modules.fee_controller import GaussianThompsonState
+        st = GaussianThompsonState()
+        st.scale_variance(1e-9)
+        assert st.exploration_boost == 0.75
+
+    def test_resolve_exploration_boost_clamps_explicit_argument(self):
+        from modules.fee_controller import GaussianThompsonState
+        st = GaussianThompsonState()
+        assert st._resolve_exploration_boost(50.0) == 2.0
+        assert st._resolve_exploration_boost(0.0001) == 0.75
+        # In-range values pass through unclamped.
+        assert st._resolve_exploration_boost(1.3) == pytest.approx(1.3)
+
+    def test_hive_exploration_multiplier_bounded_for_adversarial_hints(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        """Whatever the hint adapter returns (poisoned centrality/elasticity
+        included), the multiplier handed to scale_variance stays in
+        [0.75, 2.0]."""
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        adversarial_cases = [
+            (1e9, "owner", 1e-9),        # max upward composite
+            (1e9, "owner", float("nan")),
+            (0.05, "owner", 0.25),        # suite's known >1.5 case
+            (0.0, "none", 1e9),           # max downward composite
+            (float("inf"), "owner", 0.5),
+        ]
+        for centrality, role, elasticity in adversarial_cases:
+            adapter = MagicMock()
+            adapter.get_centrality.return_value = centrality
+            adapter.get_corridor_role.return_value = role
+            adapter.get_fee_elasticity.return_value = elasticity
+            fc.hive_hints = adapter
+            m = fc._get_hive_exploration_multiplier("02aabb")
+            assert 0.75 <= m <= 2.0, (
+                f"exploration multiplier escaped [0.75, 2.0] for "
+                f"centrality={centrality}, role={role}, "
+                f"elasticity={elasticity}: {m}"
+            )
+
+    # ---- Channel 3: fleet fee prior [1, 10000]-or-None ----
+
+    def _adapter_with_fleet_prior(self, mock_plugin, fleet_fee_median):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        snapshot = {
+            "generated_at": int(time.time()),
+            "ttl_seconds": 900,
+            "hints": {
+                "02aabb": {"fleet_fee_median": fleet_fee_median},
+            },
+        }
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter.poll()
+        return adapter
+
+    def test_fleet_prior_bound_constant_pinned(self):
+        assert HiveHintAdapter.MAX_FLEET_FEE_PRIOR_PPM == 10_000
+
+    @pytest.mark.parametrize(
+        ("fleet_fee_median", "expected"),
+        [
+            (1, 1),            # lower boundary accepted
+            (10_000, 10_000),  # upper boundary accepted
+            (2_500, 2_500),
+            (0, None),         # below lower boundary rejected
+            (10_001, None),    # above upper boundary rejected
+            (-5, None),
+            (float("nan"), None),
+            (float("inf"), None),
+            (True, None),      # bools are not fees
+            (None, None),
+        ],
+    )
+    def test_fleet_fee_prior_accepts_only_1_to_10000_else_none(
+        self, mock_plugin, fleet_fee_median, expected
+    ):
+        adapter = self._adapter_with_fleet_prior(mock_plugin, fleet_fee_median)
+        assert adapter.get_fleet_fee_prior("02aabb") == expected
+
+    def test_fee_controller_prior_selection_honors_none(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        """When the fleet prior neutralizes to None, _select_best_fee_prior
+        must not seed from hive data (falls back to network/None)."""
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.hive_hints = self._adapter_with_fleet_prior(mock_plugin, 10_001)
+        assert fc._select_best_fee_prior("02aabb", "100x1x0", allow_rpc=False) is None
+
+    def test_fee_controller_prior_selection_uses_bounded_fleet_value(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc.hive_hints = self._adapter_with_fleet_prior(mock_plugin, 10_000)
+        prior = fc._select_best_fee_prior("02aabb", "100x1x0", allow_rpc=False)
+        assert prior is not None
+        assert prior["source"] == "fleet"
+        assert 1 <= prior["mean"] <= 10_000
