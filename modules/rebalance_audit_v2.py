@@ -35,11 +35,27 @@ VALID_SKIP_REASONS: frozenset[str] = frozenset({
     "no_budget",
     "max_pairs_reached",
     "outcompeted",
+    # Planner eligibility fallbacks (RA2-1) when the state layer supplies
+    # no specific source/dest reason
+    "source_ineligible",
+    "dest_ineligible",
     # Produced by the router / engine (both v2 and v3)
     "no_route",
     "route_over_budget",
     # Produced by the engine's pair-level futility tracker
     "pair_futility",
+    # Produced by the engine's gates and cycle lock (RA2-1)
+    "pair_cooldown",
+    "below_hold_margin",
+    "hive_equalization_cooldown",
+    "cycle_already_running",
+    "fleet_lease_held",
+    # Produced by the coordination overlay (RA2-1)
+    "not_designated_executor",
+    "coordination_unavailable",
+    "coordination_unresolvable_endpoint",
+    "coordination_preempted",
+    "lease_conflict",
     # Produced by the v3 askrene router specifically
     "unknown_source_node",
     "unknown_dest_node",
