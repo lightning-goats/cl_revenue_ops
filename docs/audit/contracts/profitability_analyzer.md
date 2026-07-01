@@ -199,8 +199,12 @@ glory, are the load-bearing outputs.
   same window (:1563), and the materiality floor only downgrades to "none", never adds
   hards. Residual risk: divergence only if the two paths read different P&L rows
   (per-channel fallback vs batch). Worth one corpus spot-check, not a code question.
-- Structural protection upgrades UNDERWATER → BREAK_EVEN for hive members / corridor
+- ~~Structural protection upgrades UNDERWATER → BREAK_EVEN for hive members / corridor
   owners / centrality > 0.03 (:2693-2701) — this silently hides losses on fleet channels
-  from close recommendations. Intended interaction with the sovereignty revenue target?
+  from close recommendations. Intended interaction with the sovereignty revenue target?~~
+  **RESOLVED (Sat, 2026-06-12): should be removed — losses must be visible; fleet close
+  protection belongs in an explicit protection reason, not a class rewrite. See
+  docs/audit/operator-decisions.md D2. Verification still checks current behavior
+  as-implemented; Phase 4 quantifies the masked losses.**
 - TLV counts only `CHANNELD_NORMAL` channels and confirmed outputs (:1877-1894): closing/
   pending balances are invisible, so TLV dips during channel state transitions. Accepted?
