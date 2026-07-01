@@ -102,12 +102,19 @@ class TestPolicyBatchOperations:
         assert all(isinstance(p, PeerPolicy) for p in results)
 
     def test_batch_update_applies_rebalance_modes(self, mock_database, mock_plugin, sample_peer_ids):
-        """Batch update correctly sets rebalance modes."""
+        """Batch update correctly sets rebalance modes.
+
+        PM-I2 fix: the STATIC entry must carry a fee_ppm_target — this test
+        previously entrenched the batch static-without-target gap by asserting
+        success for the invalid input (see test_batch_update_rejects_static_
+        without_target for the rejection).
+        """
         pm = PolicyManager(mock_database, mock_plugin)
 
         updates = [
             {"peer_id": sample_peer_ids[0], "strategy": "dynamic", "rebalance_mode": "sink_only"},
-            {"peer_id": sample_peer_ids[1], "strategy": "static", "rebalance_mode": "source_only"},
+            {"peer_id": sample_peer_ids[1], "strategy": "static", "rebalance_mode": "source_only",
+             "fee_ppm_target": 500},
             {"peer_id": sample_peer_ids[2], "strategy": "passive", "rebalance_mode": "disabled"},
         ]
         results = pm.set_policies_batch(updates)
@@ -115,6 +122,34 @@ class TestPolicyBatchOperations:
         assert results[0].rebalance_mode == RebalanceMode.SINK_ONLY
         assert results[1].rebalance_mode == RebalanceMode.SOURCE_ONLY
         assert results[2].rebalance_mode == RebalanceMode.DISABLED
+
+    def test_batch_update_rejects_static_without_target(self, mock_database, mock_plugin, sample_peer_ids):
+        """PM-I2: batch STATIC without fee_ppm_target is rejected like set_policy.
+
+        Whole batch fails (validate-first semantics, PM-I10) and nothing is
+        persisted; previously this persisted STATIC with fee_ppm_target=None
+        and the fee controller silently fell through to dynamic management.
+        """
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        updates = [
+            {"peer_id": sample_peer_ids[0], "strategy": "dynamic"},
+            {"peer_id": sample_peer_ids[1], "strategy": "static"},  # no target
+        ]
+        with pytest.raises(ValueError, match="fee_ppm_target"):
+            pm.set_policies_batch(updates)
+        mock_database.upsert_policies_batch.assert_not_called()
+
+    def test_batch_update_accepts_static_with_target(self, mock_database, mock_plugin, sample_peer_ids):
+        """PM-I2: batch STATIC with an explicit target (including 0) succeeds."""
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        results = pm.set_policies_batch([
+            {"peer_id": sample_peer_ids[0], "strategy": "static", "fee_ppm_target": 0},
+        ])
+
+        assert results[0].strategy == FeeStrategy.STATIC
+        assert results[0].fee_ppm_target == 0
 
     def test_batch_update_empty_list_returns_empty(self, mock_database, mock_plugin):
         """Batch update with empty list returns empty list."""

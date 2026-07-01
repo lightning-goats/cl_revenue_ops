@@ -1221,6 +1221,13 @@ class PolicyManager:
                     raise ValueError(f"fee_ppm_target must be a non-negative integer for peer {peer_id[:12]}...")
                 if fee_ppm > 100000:
                     raise ValueError(f"fee_ppm_target cannot exceed 100000 PPM for peer {peer_id[:12]}...")
+            # PM-I2: mirror set_policy — without a target the fee controller
+            # silently falls through to dynamic management, the opposite of
+            # what 'static' promises.
+            if new_strategy == FeeStrategy.STATIC and fee_ppm is None:
+                raise ValueError(
+                    f"strategy=static requires fee_ppm_target for peer {peer_id[:12]}..."
+                )
 
             tags = update.get('tags', existing.tags)
             if not isinstance(tags, list):

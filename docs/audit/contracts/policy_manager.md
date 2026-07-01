@@ -51,14 +51,13 @@ Outputs / consumers:
 - PM-I1 **Peer-id validation.** Every write path validates a 66-char hex peer_id and raises ValueError
   otherwise (:300-313, used at :572, :712, :1179). Checkable: tests/test_database_policies.py,
   test_operator_surface.py.
-- PM-I2 **STATIC requires a target — single-set path only.** `set_policy(strategy=static)` without
-  `fee_ppm_target` raises (:606-609). VERIFIED GAP: `set_policies_batch` performs no such check
-  (its per-entry validation at :1184-1207 covers strategy/mode/fee bounds/tags/multipliers/expiry but
-  not the static-target pairing), so a batch update can persist STATIC with fee_ppm_target=None —
-  in which case the fee controller silently falls through to dynamic management, the exact failure
-  this invariant exists to prevent. The only backstops are consumer-side null-checks
-  (fee_controller.py:4644 and :7391 proceed past STATIC when the target is None). Needs a code fix
-  to restore batch/single parity.
+- PM-I2 **STATIC requires a target — both write paths.** `set_policy(strategy=static)` without
+  `fee_ppm_target` raises (:606-609), and `set_policies_batch` enforces the same check per entry
+  during its validate-first pass (any STATIC entry resolving to a None target fails the whole
+  batch with ValueError, nothing persisted) — batch/single parity restored by the PM-I2 fix.
+  Previously the batch path could persist STATIC with fee_ppm_target=None, in which case the fee
+  controller silently fell through to dynamic management (consumer-side null-checks at
+  fee_controller.py:4638 and :7510 remain as backstops).
 - PM-I3 **Fee target bounds.** `fee_ppm_target` must be a non-negative int <= 100000 (:601-605,
   batch :1203-1207). Note: the *applied* static fee is additionally clamped to configured economic
   bounds by the fee controller (fee_controller.py:4649-4652).
@@ -92,9 +91,9 @@ Outputs / consumers:
   (cl-revenue-ops.py:2172-2174).
 - PM-I10 **Batch is validate-first.** `set_policies_batch` validates every entry (and checks rate
   limits read-only) before any DB write; a single invalid entry fails the whole batch with no
-  counter pollution and no partial persistence (:1173-1279). Two verified deviations from
-  set_policy parity: the STATIC-requires-target check is missing (see PM-I2) and rate-limit
-  timestamps are recorded before the DB write (see PM-I6).
+  counter pollution and no partial persistence (:1173-1279). One verified deviation from
+  set_policy parity remains: rate-limit timestamps are recorded before the DB write (see PM-I6).
+  (The formerly missing STATIC-requires-target check was added by the PM-I2 fix.)
 - PM-I11 **Legacy semantics are narrower than PASSIVE.** `is_peer_ignored` returns True only for
   PASSIVE *and* DISABLED (:1346-1358), while fee management stops at PASSIVE alone (:825-838) —
   consumers must not treat these as equivalent.

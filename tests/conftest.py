@@ -116,7 +116,8 @@ def sample_policy_updates(sample_peer_ids):
         {
             "peer_id": sample_peer_ids[1],
             "strategy": "static",
-            "rebalance_mode": "sink_only"
+            "rebalance_mode": "sink_only",
+            "fee_ppm_target": 500
         },
         {
             "peer_id": sample_peer_ids[2],
