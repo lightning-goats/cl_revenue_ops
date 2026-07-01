@@ -6,11 +6,15 @@ Evidence: test mapping (subagent, spot-checked), code confirmation on current HE
 all contract line citations remain valid), corpus sweep
 `tools/audit/sweep_planner_boltz_hints.py` over 2,595 (hive-nexus-01) + 2,598
 (hive-nexus-02) revenue-hive-hints-status snapshots plus offline replay of the
-adapter's bias getters over 123 producer payloads per node (stride 5;
-2026-05-19 → 2026-07-01). All cited test files pass on HEAD: 179 passed
+adapter's bias getters over 123 producer payloads per node (stride 5).
+CORRECTED (refutation pass): snapshot coverage is 2026-06-08 → 2026-06-20 plus a
+single terminal snapshot on 2026-07-01 — NOT "2026-05-19 → 2026-07-01";
+2026-06-21..06-30 has zero snapshots. All cited test files pass on HEAD: 179 passed
 (test_hive_hints.py, test_hint_hardening.py, test_hive_hints_finite_hardening.py,
 test_metabolic_influence_hints.py, test_immune_influence_hints.py,
-test_metabolic_level2c_integration.py and companions).
+test_metabolic_level2c_integration.py, plus companions
+test_hive_hint_freshness_rpc_diagnostics.py and
+test_hive_hints_diagnostics_regression.py — the exact set reproducing 179).
 
 Production posture (from the sweep): hints were **fresh in 5,193/5,193 snapshots**
 on both nodes; stale_fallback_active in 0; m2_scope always `legacy_seed_only`
@@ -51,8 +55,9 @@ hive_export_rpc 144+26; effective TTL observed at 300s and 900s.
 
 ## Anomalies
 
-1. **The stale-fallback machinery has never run in production** (0 activations in
-   5,193 snapshots; hints fresh 100% of the time). Combined with the contract's
+1. **The stale-fallback machinery never ran in the observed corpus** (0 activations
+   in 5,193 snapshots; hints fresh in every observed snapshot — note the observation
+   window is ~12 days plus one terminal snapshot, not a continuous 6-week study). Combined with the contract's
    note that stale_fallback_policy is not wired to any CLN option (production is
    pinned to bounded_bias, and diagnostics_only / full_legacy_fallback are dead
    configuration), a meaningful slice of this module — and of its test suite — is
@@ -69,3 +74,39 @@ hive_export_rpc 144+26; effective TTL observed at 300s and 900s.
 4. The RPC fallback path did fire in production (144 snapshots on n1, 26 on n2),
    so the HH-I5 RPC-transport gap is on a *live* code path, not a theoretical one
    — the datastore-first design reduces but does not eliminate exposure.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification on HEAD (dac9b48; `git diff f905cfd..HEAD` on the module
+still empty). All 12 verdicts attacked; **0 refuted, 12 survived**. Method: re-ran the
+cited test files (179 reproduced only after identifying the two unnamed "companion"
+files — now listed in the header), re-ran the sweep including the offline replay
+(123+123 payloads through the real `HiveHintAdapter`, 0 bias/prior violations
+reproduced), and re-read every load-bearing code citation.
+
+Findings:
+
+1. **HH-I3 bounds hold by construction and by genuine adversarial pitting.**
+   TestSafetyRails sweeps role × competition × confidence (fee) and preference ×
+   quality × confidence (rebalance) grids including out-of-range values (±50, 100.0)
+   and asserts the closed bounds — not mock echoes. The documented corridor-bias gap
+   (no analogous sweep) is accurate. The sweep replay is a real-code replay:
+   `_validate_and_normalize_snapshot` + `_store_snapshot` + the actual getters, with
+   only freshness pinned — a getter exception would have crashed the sweep, so the
+   0-violation result is load-bearing.
+2. **HH-I5's two documented gaps re-confirmed in code**: the RPC transport (:266)
+   returns pyln-pre-parsed data with no `_json_loads_strict`; segment validators use
+   bare `float()` and `max(lo, min(hi, x))` where NaN propagates to the upper bound
+   (Python `min(1.0, nan)` returns 1.0). "verified (as-implemented, gaps confirmed)"
+   is the correct verdict framing; neither gap is pinned by any test, as stated.
+3. **Membership source sanity (feeds CP-I5/D1)**: the sweep derives member sets from
+   per-peer `member` booleans in hive-export-hints payloads (not a counts-only
+   surface); all 613+614 payload snapshots yield a stable 4-member set, and the
+   detected member episodes reproduce exactly.
+4. **Corpus-window correction (header, Anomaly 1)**: freshness/M2/fallback
+   production-vacuity claims are established over ~12 observed days
+   (2026-06-08 → 2026-06-20) plus one 2026-07-01 snapshot; the 06-21..06-30 hole
+   means "never fired in production" cannot be asserted for that interval.
+5. HH-I12's datastore-first test genuinely pits (`rpc.call.assert_not_called()`
+   after a fresh hex datastore poll), and HH-I1's ttl_override ceiling clamp
+   (:427-428) matches the code; the untested-override gap note is accurate.

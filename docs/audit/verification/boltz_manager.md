@@ -5,7 +5,9 @@ Evidence: test mapping (subagent, spot-checked), code confirmation on current HE
 (module unchanged since contract commit f905cfd — `git diff f905cfd..HEAD` empty, so
 all contract line citations remain valid), corpus sweep
 `tools/audit/sweep_planner_boltz_hints.py` over 613 (hive-nexus-01) + 614
-(hive-nexus-02) revenue-spend-ledger snapshots (2026-05-19 → 2026-07-01).
+(hive-nexus-02) revenue-spend-ledger snapshots. CORRECTED (refutation pass): snapshot
+coverage is 2026-06-08 → 2026-06-20 plus a single terminal snapshot on 2026-07-01 —
+NOT "2026-05-19 → 2026-07-01"; 2026-06-21..06-30 has zero snapshots.
 All cited test files pass on HEAD: 184 passed (test_boltz_manager.py,
 test_boltz_capex_gating.py, test_boltz_integration.py, test_boltz_invoice_validation.py,
 test_capex_boltz.py, test_budget_recursion_fix.py, test_boltz_structural_loopout.py).
@@ -52,8 +54,11 @@ rest on tests and code.
 
 ## Anomalies
 
-1. **Boltz was effectively dormant in production during the entire study window**
-   (0 boltz spend events across 1,227 ledger snapshots on both nodes). Either the
+1. **Boltz was effectively dormant in production during the observed window**
+   (0 boltz spend events across 1,227 ledger snapshots on both nodes). CORRECTED
+   (refutation pass): the ledgers are rolling-24h views and the corpus has no
+   snapshots for 2026-06-21..06-30, so dormancy is established for ~12 observed days
+   plus the 24h before 2026-07-01, not the "entire study window". Either the
    integration/auto-cycle is disabled or it never selected an action. This answers
    the contract's first uncertainty in the negative for this corpus and should be
    recorded as scoping input for Phase 3/4: the module's budget machinery is
@@ -62,3 +67,39 @@ rest on tests and code.
    the same tactical "boltz" category whose creation-time gate they bypass —
    the asymmetry is one-directional (spend counted, gate skipped), which makes the
    bypass budget-visible after the fact but unenforced at creation.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification on HEAD (dac9b48; `git diff f905cfd..HEAD` on the module
+still empty). All 14 verdicts attacked; **0 refuted, 14 survived**. Method: re-ran all
+7 cited test files (184 passed reproduced), re-ran the sweep (BM-H2 vacuous-pass and
+zero-activity inventory reproduced), independently re-confirmed every code-only claim
+on HEAD, and audited the vacuous-corpus handling.
+
+Findings:
+
+1. **Code-only verdicts (BM-I1, I10, I11, I14) independently re-confirmed.**
+   `subprocess` is invoked at exactly one site in the module (:236, inside `_run`),
+   with no `Popen`/`os.system`/`check_*` anywhere, and `_run` calls `_ensure_enabled`
+   first — BM-I1's funnel claim is structurally airtight, not just path-sampled.
+   Journal/ignore locks (:1158-1161, :1087-1092), amount_sats<=0 raises in
+   quote/loop_in/loop_out/chainswap, and gate-free refund/claim/withdraw/deposit_address
+   all match the cited lines. The "no covering test" labels are accurate.
+2. **BM-I4 chainswap bypass direction confirmed on HEAD**: chainswap (:1848-1859)
+   runs `_enforce_budget_for_quote` only — no `check_tactical_budget`, no
+   `check_channel_capex_budget` — and records into the "boltz" category
+   (`chainswap` ∈ `_SPEND_RECORD_SOURCES` :1156). `grep -rn chainswap tests/` returns
+   nothing, confirming zero test coverage. One sharpening note: chainswap feeds the
+   raw `boltzcli quote … chain` JSON to the gate (loop_in/loop_out feed the nested
+   `quote["quote"]`); `_estimate_swap_fee_sats` (:738) tolerates unknown shapes via
+   its recursive fee-key fallback, so the unified gate is not vacuous, but the
+   chain-quote shape is exercised by no test either.
+3. **BM-I3 caveat verified by reading the test**: the serialization assertion in
+   test_concurrent_loop_in_serialized is inside
+   `if len(enforce_starts) >= 2 and len(enforce_ends) >= 1:` exactly as documented —
+   an early thread error yields a silent pass.
+4. **No BM verdict leans on the vacuous corpus as positive evidence** — every
+   invariant row cites tests/code only, the header flags the vacuity up front, and
+   BM-H2 is labeled trivially-passing. Confirmed clean.
+5. Corpus-window correction (header, Anomaly 1): dormancy is evidenced for the
+   observed ~12 days + the final 24h window, not a continuous 6-week study window.

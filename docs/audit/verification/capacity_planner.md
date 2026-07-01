@@ -6,7 +6,11 @@ Evidence: test mapping (subagent, spot-checked), code confirmation on current HE
 all contract line citations remain valid), corpus sweep
 `tools/audit/sweep_planner_boltz_hints.py` over 194 revenue-planner-status snapshots
 per node plus reconstructed planner-action ledgers (hive-nexus-01: 93 unique actions,
-ids 872–981; hive-nexus-02: 35 unique actions, ids 269–305; 2026-05-19 → 2026-07-01).
+ids 872–981; hive-nexus-02: 35 unique actions, ids 269–305). CORRECTED (refutation
+pass): snapshot coverage is 2026-06-08 → 2026-06-20 plus a single terminal snapshot
+on 2026-07-01 — NOT "2026-05-19 → 2026-07-01"; there are zero snapshots for
+2026-06-21..06-30 and none from May (ledger created_at reaches back to 2026-06-07 on
+n1 / 2026-05-13 on n2 via retrospective history windows only).
 All cited test files pass on HEAD: 338 passed (test_capacity_planner.py,
 test_dead_capital_protections.py, test_capital_recycling.py, test_score_normalization.py,
 test_hive_discovery.py, test_planner_hive_hints.py, test_hive_hint_impact_matrix.py).
@@ -31,7 +35,7 @@ execute_closes=False in all 194.
 | CP-I11 hive hints cannot dominate scoring | **verified** | test_score_normalization.py (anchor ceiling :92-108/:2499-2532, hive-below-winner ordering, 0.09 floor), test_planner_hive_hints.py (open/avoid/low-confidence bias), test_capacity_planner.py metabolic/immune-bias bound tests, test_hive_hint_impact_matrix.py directionality; code confirmed (raw cap 0.3 :1925/:2082, hint bias ×[0.70,1.20] :2339-2353, stacked multiplier clamp [0.75,1.25] :2405-2442 — combined worst case ×[0.525,1.50] exactly as contract states). Partial gap: the joint two-stage bound is not pinned by any single test |
 | CP-I12 fee gate + unified budget block live open/close | **verified** | TestSafetyGuards (fee gate block/boundary, zero-budget block, open uses estimated open cost, close uses reserved fee cap) + TestExecuteCycle (fee-gate and zero-budget cycle-level blocks) + TestDirectClose::test_execute_close_blocks_zero_unified_budget_before_rpc; code confirmed (:2597-2607, :2832-2876, :2878-2911, close path :3567-3588) |
 | CP-I13 reserve check (confirmed − min_wallet_reserve ≥ amount) before live open | **verified** | TestSafetyGuards (insufficient/sufficient/unconfirmed-ignored/guards-wiring) + TestChannelOpen::test_retry_respects_min_wallet_reserve (:3363 re-check); code confirmed (:2609-2624). Mining-fee caveat (amount-only, reserve can dip by the funding fee) confirmed in code, not pinned by tests |
-| CP-I14 24h per-peer cooldown incl. recommended/delegated | **verified** | TestSafetyGuards::test_cooldown_blocks_recent_peer_action, ::test_cooldown_ignores_dry_run_and_failed_actions (pins that recommended/delegated consume cooldown), ::test_cooldown_allows_no_recent_actions + 2 cycle-level tests; code confirmed (:2626-2641); **corpus: 0 violations in 56 (n1) + 24 (n2) checked action pairs** |
+| CP-I14 24h per-peer cooldown incl. recommended/delegated | **verified** | TestSafetyGuards::test_cooldown_blocks_recent_peer_action, ::test_cooldown_ignores_dry_run_and_failed_actions, ::test_cooldown_allows_no_recent_actions + 2 cycle-level tests; code confirmed (:2626-2641); **corpus: 0 violations in 56 (n1) + 24 (n2) checked action pairs**. CORRECTED (refutation pass): no test uses status="recommended"/"delegated" — the "incl. recommended/delegated" leg rests on code (denylist filters only dry_run/failed) + corpus, not on any test; an ignore-list widened to recommended/delegated would pass the whole suite |
 | CP-I15 execution guards fail closed on data errors (with documented fail-open exceptions) | **verified** | TestSafetyGuards (fee-gate RPC error, reserve RPC error, cooldown DB error → blocked, provider-raises → blocked) + TestDirectClose policy-exception → blocked; code confirmed (:2606-2607, :2623-2624, :2875-2876, :2640-2641, :3428-3430); fail-open exceptions confirmed in code (:899-903, :1066-1070, :1126-1131, :2702-2719). **Gap: none of the fail-open branches is covered by tests** |
 
 ## Gaps
@@ -84,3 +88,42 @@ execute_closes=False in all 194.
    recommended/dry_run 62, defibrillate/completed 25, opens 0. The planner's
    revenue role in this corpus is recommendations plus defibrillation spend, not
    capital redeployment — relevant to CP-H1/CP-H3 feasibility in Phase 4.
+
+## Refutation pass (2026-07-01)
+
+Adversarial re-verification on HEAD (dac9b48; `git diff f905cfd..HEAD` on the module
+still empty). All 15 verdicts attacked; **0 refuted, 15 survived**. Method: re-ran all
+7 cited test files (338 passed reproduced), re-ran the sweep (all counts reproduced
+exactly, including the 9+4 member FEE_REDUCE and 3 member-defib D1 hits), re-read every
+load-bearing code citation (all line numbers accurate on HEAD), and read the cited test
+sources for mock-echo/one-branch weaknesses.
+
+Corrections and findings (evidence-level, none verdict-flipping):
+
+1. **Corpus window was misstated** (fixed in header). Actual snapshot coverage is
+   ~12 days (2026-06-08 → 2026-06-20) plus one snapshot on 2026-07-01; 2026-06-21..30
+   is a hole and nothing from May exists (quarantine/collector-transport-failures-20260520
+   suggests early study data was lost). "2026-05-19" matches neither the snapshots
+   (06-08) nor either node's ledger (06-07 / 05-13).
+2. **CP-I14 pitting was misattributed** (fixed in table). No cooldown test exercises
+   recommended/delegated statuses; that leg is code-confirmed + corpus-only. New gap
+   for the inventory: adding "recommended"/"delegated" to the :2633-2636 ignore filter
+   would break the invariant with zero test failures.
+3. **CP-I4 grouping method**: the sweep's "per cycle" is a 600s created_at cluster,
+   not a real cycle boundary (observed cadence is ~1 cycle/day, so clustering is
+   conservative for observed ids). Sharper version of Anomaly 4: missing ids 953–959
+   and 961–962 fall inside the 06-20 → 06-24 observation hole directly between three
+   observed defibrillations of the SAME peer 0324ba23… (06-20, 06-24, 06-25). A CP-I4
+   or CP-I14 violation involving those ids would be invisible to the sweep. Tests+code
+   still carry both verdicts.
+4. **CP-I5 strengthened**: a superset re-check of ALL 93+35 reconstructed actions
+   (not just the 55+7 with a member snapshot within 24h) against the union of all
+   per-peer `member: true` sets found **0 CLOSE actions on any ever-member peer** on
+   either node. The sweep's membership source is correct (per-peer member booleans
+   from hive-export-hints payloads; member-set size 4 in all 613+614 snapshots).
+5. Pitting quality confirmed where it matters: dry-run tests assert
+   `rpc.call.assert_not_called()` (not status echo); the defib-limit test asserts
+   exact execution order with 2 DEFIB losers; test_hive_member_blocks_dead_capital_close
+   pins close_protection=HIVE_MEMBER on the emitted loser; the failed-open-slot test
+   drives a real two-candidate cycle through a failing fundchannel. The
+   test_close_allowed_on_policy_exception name-hazard note is accurate (asserts blocked).
