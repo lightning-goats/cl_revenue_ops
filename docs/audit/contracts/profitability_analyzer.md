@@ -59,8 +59,10 @@ Database: reads `get_all_channels_revenue_totals`, `get_channel_revenue_totals`,
 Consumers (modules): fee_controller (fee multiplier), rebalance_engine_v2
 (modules/rebalance_engine_v2.py:960-969), rebalancer hot-channel protection
 (modules/rebalancer.py:1395-1404), capex_budget, capacity_planner, capital_efficiency,
-boltz_manager, hive_router. `hive_hints` is consumed for structural protection
-(centrality/corridor/membership, :2693-2701).
+boltz_manager, hive_router. `hive_hints` is no longer consumed by classification:
+the structural-protection class rewrite (centrality/corridor/membership,
+formerly :2693-2701) was removed per operator decision D2 (commit 91e4bd0,
+2026-07-01); the attribute remains injected but is unused within this module.
 
 ## 3. Invariants
 
@@ -199,8 +201,11 @@ glory, are the load-bearing outputs.
   same window (:1563), and the materiality floor only downgrades to "none", never adds
   hards. Residual risk: divergence only if the two paths read different P&L rows
   (per-channel fallback vs batch). Worth one corpus spot-check, not a code question.
-- Structural protection upgrades UNDERWATER → BREAK_EVEN for hive members / corridor
+- ~~Structural protection upgrades UNDERWATER → BREAK_EVEN for hive members / corridor
   owners / centrality > 0.03 (:2693-2701) — this silently hides losses on fleet channels
-  from close recommendations. Intended interaction with the sovereignty revenue target?
+  from close recommendations. Intended interaction with the sovereignty revenue target?~~
+  RESOLVED: operator ruled removal (D2); the reclassification was deleted in commit
+  91e4bd0 (2026-07-01). Losses on fleet channels are always visible; close protection
+  is expressed only via capacity_planner's explicit protection reasons.
 - TLV counts only `CHANNELD_NORMAL` channels and confirmed outputs (:1877-1894): closing/
   pending balances are invisible, so TLV dips during channel state transitions. Accepted?

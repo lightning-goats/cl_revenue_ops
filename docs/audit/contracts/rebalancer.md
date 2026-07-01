@@ -103,6 +103,11 @@ signal), capacity planner (defibrillator), cl-hive via datastore + report RPCs.
   `manual_rebalance` (modules/rebalancer.py:2564-2590) + `_record_successful_rebalance_fee` (:1836).
 - **RB-I10** — Diagnostic ("defibrillator") rebalances are bounded: 50,000 sats amount,
   100 sats max fee, blocked by capital controls. Enforced: modules/rebalancer.py:2411-2447.
+  Amended (commit e2fbdca, 2026-07-01, defibrillation status honesty): the result dict
+  now carries an explicit `shock_status` ∈ {completed, blocked, failed, pending} plus
+  `actual_fee_sats` on success — a capital-controls block or a failed/pending shock is
+  no longer reported as a bare success=True that downstream (capacity_planner) recorded
+  as status="completed". Bounds and capital-controls gating are unchanged.
 - **RB-I11** — The normalized success signal is bounded: rate ∈ [0.10, 0.95], confidence
   = min(1, total/10) ∈ [0, 1] and non-decreasing in sample count; None below 3 samples.
   Enforced: `_normalize_rebalance_success_signal` (modules/rebalancer.py:1100-1114).
