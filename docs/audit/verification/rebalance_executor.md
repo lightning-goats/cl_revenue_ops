@@ -1,5 +1,15 @@
 # Verification: modules/rebalance_executor.py
 
+> **REMOVED (2026-07-01, commit 9bc0953)** — the dead-code finding below was acted
+> on: `modules/rebalance_executor.py` was deleted together with
+> `modules/rebalance_memory.py` (whose sole importer it was) and its dedicated test
+> file `tests/test_rebalance_executor.py` (44 tests). The 13-line
+> `modules/rebalance_executor_v2.py` shim was kept (it imports only the live
+> `rebalance_execution`/`rebalance_native_executor_v2` modules). This also retires
+> Anomaly 2 below: the legacy 6-reason `stable_failure_reason` vocabulary is gone
+> and only the live 5-reason map in `modules/rebalance_execution.py` remains.
+> Everything below describes the module as it existed before removal.
+
 Phase 2 — Tier 2. Verified 2026-07-01 at HEAD 6740115 against
 `docs/audit/contracts/rebalance_executor.md`. Full verification performed by a
 prior Phase 2 agent; this doc consolidates that report after independent

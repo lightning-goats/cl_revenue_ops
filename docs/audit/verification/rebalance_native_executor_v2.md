@@ -1,5 +1,16 @@
 # Verification: modules/rebalance_native_executor_v2.py
 
+> **Remediation (2026-07-01, commit d14256e):** the NX-4 malformed-invoice cleanup
+> gap (Gap 1 / Anomaly 1 below) is FIXED — both malformed-response early returns
+> (pre-fix :422-428) now route through `_fail_malformed_invoice_response`, which
+> attempts the same best-effort `_cleanup_failed_payment("", label)` as the
+> thrown-exception path and stamps `failure_class` into `failure_data`. Three
+> pitting tests added in tests/test_rebalance_native_executor_v2.py
+> (`test_native_executor_cleans_up_malformed_invoice_response`,
+> `test_native_executor_cleans_up_invoice_response_missing_payment_hash`,
+> `test_malformed_invoice_cleanup_is_best_effort`) — grep `native_invoice_error`
+> in tests/ is no longer zero. Line references below describe the pre-fix code.
+
 Phase 2 — Tier 2 (targeted). Verified 2026-07-01 at HEAD 61b031c against
 `docs/audit/contracts/rebalance_native_executor_v2.md` (authored at f905cfd
 against 9f8f219). Module unchanged since the contract commit

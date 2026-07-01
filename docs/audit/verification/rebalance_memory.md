@@ -1,5 +1,13 @@
 # Verification: modules/rebalance_memory.py (Tier 3)
 
+> **REMOVED (2026-07-01, commit 9bc0953)** — the dead-code finding below was acted
+> on: `modules/rebalance_memory.py` was deleted together with its sole importer
+> `modules/rebalance_executor.py` and their dedicated test files
+> (`tests/test_rebalance_memory.py`: 2 tests; `tests/test_rebalance_executor.py`:
+> 44 tests). Re-verified by grep at removal time: no other importer existed in
+> `cl-revenue-ops.py`, `modules/`, `scripts/`, or `tools/`. Everything below
+> describes the module as it existed before removal.
+
 Contract: docs/audit/contracts/rebalance_memory.md — verified 2026-07-01 (Phase 2).
 
 ## HEADLINE: DEAD CODE CONFIRMED (Phase 1 finding upheld)

@@ -38,8 +38,12 @@ study is terminated (operator decision D3); the corpus is frozen.
    test-guarded. Log-consumer bucketing contract broken.
 8. **NX-4 (minor)** — malformed-invoice-response early returns skip invoice cleanup
    and `failure_class` (rebalance_native_executor_v2.py:422-428).
+   **FIXED (2026-07-01, commit d14256e)**: both early returns now clean up and set
+   failure_class; pitting tests added.
 9. **stable_failure_reason divergence** — legacy rebalance_executor.py vs live
    rebalance_execution.py vocabularies differ (mitigated: legacy side is dead code).
+   **RETIRED (2026-07-01, commit 9bc0953)**: the legacy module was removed; only
+   the live rebalance_execution.py vocabulary remains.
 
 ## Operator decisions with fresh production evidence
 
@@ -62,11 +66,16 @@ study is terminated (operator decision D3); the corpus is frozen.
   echo of the requested window; `coverage_status` is a hardcoded "complete" literal
   at both writers (database.py:3971, cl-revenue-ops.py:6590). Trades honest "unknown"
   for false confidence. The cl-hive-side ML-*-IDENT defects remain (runtime.py:2702).
+  **FIXED (2026-07-01, commit 9ad0b59)**: both writers now measure coverage against
+  the oldest cost-evidence row (capped at the window) and emit
+  covered_hours=null/"unknown" when no measurement basis exists.
 
 ## Dead / vestigial code confirmed
 
 - rebalance_executor.py + rebalance_memory.py: dead (test-supported only) — removal
   candidates. rebalance_executor_v2.py: 13-line vestigial shim.
+  **REMOVED (2026-07-01, commit 9bc0953)**: both dead modules and their dedicated
+  test files deleted (46 tests); the executor_v2 shim kept (imports live code only).
 - demand_flow.py: `classify_candidate` + keyword scoring production-dead, yet carries
   12 of the module's 23 tests; `fee_extractive` signal dead within the dead code.
 
