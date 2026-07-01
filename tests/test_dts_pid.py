@@ -1084,6 +1084,64 @@ class TestZeroFlowRatchetGuard:
         assert guarded == 3000
         assert reason is None
 
+    def test_downshift_floor_arm_raise_uses_floor_override_tag(self, mock_plugin, mock_database):
+        """Fee-loop audit anomaly 3: when the effective floor (e.g. a
+        rebalance-cost floor) exceeds the current fee, the downshift arm's
+        max(floor, ...) RAISES the fee. Telemetry must not label that move
+        'zero_flow_downshift'."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        # Incident shape from the corpus: current 60, 66-ppm cost floor.
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=60,
+            target_fee=50,
+            min_fee=66,
+            zero_revenue_streak=FeeController.ZERO_FLOW_DOWNSHIFT_STREAK,
+            forwards_since_update=0,
+            revenue_rate=0.0,
+            supported_fee_ceiling=3200,
+        )
+
+        assert guarded == 66
+        assert guarded > 60, "floor arm should raise to the effective floor"
+        assert reason == "zero_flow_floor_override"
+
+    def test_ratchet_floor_arm_raise_uses_floor_override_tag(self, mock_plugin, mock_database):
+        """Same honesty rule for the pre-downshift ratchet arm: a
+        floor-driven raise must not carry the hold/ratchet tag."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=60,
+            target_fee=100,
+            min_fee=66,
+            zero_revenue_streak=FeeController.ZERO_FLOW_GUARD_STREAK,
+            forwards_since_update=0,
+            revenue_rate=0.0,
+            supported_fee_ceiling=3200,
+        )
+
+        assert guarded == 66
+        assert reason == "zero_flow_floor_override"
+
+    def test_genuine_downshift_keeps_downshift_tag(self, mock_plugin, mock_database):
+        """A real downward move keeps the original telemetry tag."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=2306,
+            target_fee=3000,
+            min_fee=100,
+            zero_revenue_streak=FeeController.ZERO_FLOW_DOWNSHIFT_STREAK,
+            forwards_since_update=0,
+            revenue_rate=0.0,
+            supported_fee_ceiling=3200,
+        )
+
+        assert guarded == int(2306 * FeeController.ZERO_FLOW_DOWNSHIFT_RATIO)
+        assert guarded < 2306
+        assert reason == "zero_flow_downshift"
+
     def test_severe_stall_respects_economic_floor(self, mock_plugin, mock_database):
         fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
 

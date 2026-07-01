@@ -5236,7 +5236,15 @@ class FeeController:
             return target, None
 
         if streak < self.ZERO_FLOW_DOWNSHIFT_STREAK:
-            return max(floor, min(target, current)), "zero_flow_ratchet_guard"
+            guarded = max(floor, min(target, current))
+            # Guard-tag honesty (fee-loop audit anomaly 3, 2026-07-01): when
+            # the effective floor exceeds the current fee, the max(floor, ...)
+            # arm RAISES the fee ("hard floors win"). Tag those moves
+            # distinctly so telemetry consumers bucketing by guard tag do not
+            # misread a floor-driven raise as a hold/downshift.
+            if guarded > current:
+                return guarded, "zero_flow_floor_override"
+            return guarded, "zero_flow_ratchet_guard"
 
         downshift_cap = int(math.floor(current * self.ZERO_FLOW_DOWNSHIFT_RATIO))
         try:
@@ -5246,10 +5254,12 @@ class FeeController:
         if math.isfinite(supported_cap) and supported_cap > 0:
             downshift_cap = min(downshift_cap, int(supported_cap))
 
-        return (
-            max(floor, min(target, downshift_cap)),
-            "zero_flow_downshift",
-        )
+        guarded = max(floor, min(target, downshift_cap))
+        if guarded > current:
+            # Floor arm fired on the downshift branch: an upward move must
+            # not be stamped "downshift" (see guard-tag honesty note above).
+            return guarded, "zero_flow_floor_override"
+        return guarded, "zero_flow_downshift"
     
     def _detect_congestion(self, state: Optional[Dict[str, Any]],
                            channel_info: Optional[Dict[str, Any]],
