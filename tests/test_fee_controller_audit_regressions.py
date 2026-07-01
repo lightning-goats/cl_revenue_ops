@@ -790,6 +790,124 @@ class TestAdjustChannelFeeEndToEnd:
         assert result.new_fee_ppm > 0
         assert fc.data_service.set_channel.called
 
+    def _make_gossip_refresh_scenario(self, fc, cfg, mock_database, now):
+        """Channel that ingests a 2h window, lands in the sub-5% gossip band,
+        and is eligible for a forced gossip refresh (FC-I16 edge paths).
+
+        current fee 80 (<100, so the alpha guard minimum is 1 ppm); DTS sample
+        90 blends to ~83 (delta 3: past the alpha guard, inside the 5% gossip
+        band of 4 ppm). last_broadcast_at / last forward / last refresh are all
+        2 days old, so _should_force_gossip_refresh returns True.
+        """
+        channel_id = "123x456x7"
+        peer_id = "02" + "f" * 64
+        window_start = now - 7200
+
+        cycle = ChannelCycleState(
+            last_revenue_rate=2.0,
+            last_fee_ppm=80,
+            last_broadcast_fee_ppm=80,
+            last_update=window_start,
+            last_state="dts_pid (prior)",
+        )
+        cycle.last_broadcast_at = now - 172800
+        cycle.last_gossip_refresh = now - 172800
+        fc._cycle_states[channel_id] = cycle
+
+        ts_state = fc._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=80)
+        ts_state.last_revenue_rate = 2.0
+        ts_state.last_fee_ppm = 80
+        ts_state.last_broadcast_fee_ppm = 80
+        ts_state.last_update = window_start
+        ts_state.last_broadcast_at = now - 172800
+        ts_state.thompson.sample_fee = lambda floor, ceiling: 90
+        ts_state.pid.calculate_multiplier = lambda **kwargs: 1.0
+
+        # Volume/forward queries keyed on the observation cursor: the 2h-old
+        # window has data; a reset cursor (>= now - 60) sees an empty window.
+        mock_database.get_volume_since.side_effect = (
+            lambda _cid, since: 50_000 if since <= window_start else 0
+        )
+        mock_database.get_forward_count_since.side_effect = (
+            lambda _cid, since: 10 if since <= window_start else 0
+        )
+        # Idle for 2 days as far as the gossip-refresh eligibility check goes.
+        mock_database.get_last_forward_time.return_value = now - 172800
+
+        channel_info = {
+            "fee_proportional_millionths": 80,
+            "capacity": 2_000_000,
+            "spendable_msat": "1000000000msat",
+            "opener": "local",
+        }
+        state = {"state": "balanced", "forward_count": 10, "sats_out": 10000}
+        return channel_id, peer_id, state, channel_info
+
+    def test_gossip_refresh_rpc_failure_resets_observation_cursor(self, mock_plugin, mock_database):
+        """FC-I16 edge: when the gossip-refresh nudge's setchannel RPC fails,
+        the observation cursor must still reset — the posterior already
+        consumed this window, so the next cycle must not re-ingest it."""
+        fc, cfg = self._make_fc_full(mock_plugin, mock_database)
+        now = int(time.time())
+        channel_id, peer_id, state, channel_info = self._make_gossip_refresh_scenario(
+            fc, cfg, mock_database, now
+        )
+        fc.set_channel_fee = MagicMock(return_value={"success": False})
+
+        result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
+
+        assert result is None
+        # Prove the refresh path (not the alpha guard / plain hysteresis)
+        # actually fired and failed at the RPC.
+        assert fc.set_channel_fee.called
+        assert fc.set_channel_fee.call_args.kwargs.get("reason") == "gossip_refresh"
+        # Cursor reset exactly like the other post-ingestion suppression paths.
+        assert fc._cycle_states[channel_id].last_update >= now
+        assert fc._channel_fee_states[channel_id].last_update >= now
+        # The failed nudge must NOT count as a broadcast.
+        assert fc._cycle_states[channel_id].last_broadcast_at == now - 172800
+
+        # Next cycle: the window was consumed, so nothing may be re-ingested.
+        observations_after_first = list(
+            fc._channel_fee_states[channel_id].thompson.observations
+        )
+        result2 = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
+        assert result2 is None
+        assert (
+            list(fc._channel_fee_states[channel_id].thompson.observations)
+            == observations_after_first
+        ), "gossip-refresh RPC-failure path re-ingested a consumed window"
+
+    def test_gossip_refresh_no_nudge_resets_observation_cursor(self, mock_plugin, mock_database):
+        """FC-I16 edge: when no safe nudge exists (helper returns None, e.g.
+        min_fee == max_fee pinned config), the cursor must still reset."""
+        fc, cfg = self._make_fc_full(mock_plugin, mock_database)
+        now = int(time.time())
+        channel_id, peer_id, state, channel_info = self._make_gossip_refresh_scenario(
+            fc, cfg, mock_database, now
+        )
+        # Simulate the helper's no-safe-nudge contract: returns None without
+        # touching any state (mirrors fee_controller._create_gossip_refresh_adjustment
+        # when both nudge candidates clamp back to the current fee).
+        fc._create_gossip_refresh_adjustment = MagicMock(return_value=None)
+
+        result = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
+
+        assert result is None
+        assert fc._create_gossip_refresh_adjustment.called
+        assert fc._cycle_states[channel_id].last_update >= now
+        assert fc._channel_fee_states[channel_id].last_update >= now
+
+        observations_after_first = list(
+            fc._channel_fee_states[channel_id].thompson.observations
+        )
+        result2 = fc._adjust_channel_fee(channel_id, peer_id, state, channel_info, cfg=cfg)
+        assert result2 is None
+        assert (
+            list(fc._channel_fee_states[channel_id].thompson.observations)
+            == observations_after_first
+        ), "gossip-refresh no-nudge path re-ingested a consumed window"
+
     def test_successful_broadcast_updates_both_observation_and_broadcast_timestamps(self, mock_plugin, mock_database):
         fc, cfg = self._make_fc_full(mock_plugin, mock_database)
         channel_id = "123x456x5"

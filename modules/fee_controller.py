@@ -5236,7 +5236,15 @@ class FeeController:
             return target, None
 
         if streak < self.ZERO_FLOW_DOWNSHIFT_STREAK:
-            return max(floor, min(target, current)), "zero_flow_ratchet_guard"
+            guarded = max(floor, min(target, current))
+            # Guard-tag honesty (fee-loop audit anomaly 3, 2026-07-01): when
+            # the effective floor exceeds the current fee, the max(floor, ...)
+            # arm RAISES the fee ("hard floors win"). Tag those moves
+            # distinctly so telemetry consumers bucketing by guard tag do not
+            # misread a floor-driven raise as a hold/downshift.
+            if guarded > current:
+                return guarded, "zero_flow_floor_override"
+            return guarded, "zero_flow_ratchet_guard"
 
         downshift_cap = int(math.floor(current * self.ZERO_FLOW_DOWNSHIFT_RATIO))
         try:
@@ -5246,10 +5254,12 @@ class FeeController:
         if math.isfinite(supported_cap) and supported_cap > 0:
             downshift_cap = min(downshift_cap, int(supported_cap))
 
-        return (
-            max(floor, min(target, downshift_cap)),
-            "zero_flow_downshift",
-        )
+        guarded = max(floor, min(target, downshift_cap))
+        if guarded > current:
+            # Floor arm fired on the downshift branch: an upward move must
+            # not be stamped "downshift" (see guard-tag honesty note above).
+            return guarded, "zero_flow_floor_override"
+        return guarded, "zero_flow_downshift"
     
     def _detect_congestion(self, state: Optional[Dict[str, Any]],
                            channel_info: Optional[Dict[str, Any]],
@@ -6595,13 +6605,26 @@ class FeeController:
             # resets below do not mask refresh eligibility.
             # =========================================================================
             if self._should_force_gossip_refresh(channel_id, cycle, now):
-                return self._create_gossip_refresh_adjustment(
+                refresh_adjustment = self._create_gossip_refresh_adjustment(
                     channel_id=channel_id,
                     peer_id=peer_id,
                     state=cycle,
                     current_fee_ppm=current_fee_ppm,
                     current_time=now
                 )
+                if refresh_adjustment is not None:
+                    # Success: the helper already reset the observation
+                    # cursor (state.last_update) alongside the broadcast
+                    # timestamps, so returning here keeps exactly one reset.
+                    return refresh_adjustment
+                # FC-I16 fix (2026-07-01): the helper returns None when no
+                # safe nudge exists (pinned min==max config) or the
+                # setchannel RPC failed — WITHOUT touching the cursor. The
+                # DTS+PID posterior has already consumed this window above,
+                # so fall through to the hysteresis reset below instead of
+                # returning early; otherwise the next cycle re-ingests the
+                # same volume/revenue (double-counting), mirroring the
+                # main-broadcast RPC-failure path which does reset.
 
             # HYSTERESIS: Skip RPC, update internal target but reset observation timer.
             # We MUST reset last_update because the fee/revenue data for this window

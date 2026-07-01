@@ -310,6 +310,106 @@ class TestSupportedFeeCeiling:
 
 
 # =============================================================================
+# 4b. Zero-probe pseudo-observation honesty (FC-I5 carve-out pinning)
+# =============================================================================
+
+class TestZeroProbeHonesty:
+    """FC-I5 pinning tests (contract amended 2026-07-01).
+
+    The zero-probe mechanism deliberately injects pseudo-observations at a
+    never-advertised fee (fee x ZERO_PROBE_STEP_FRAC) with fabricated 0.0
+    revenue after a sustained dead streak. The carve-out is honest only as
+    long as (i) every injected probe is flagged with ZERO_PROBE_FLAG and
+    (ii) probes are excluded from the supported-fee ceiling. Lock both.
+    """
+
+    def _dead_streak_state(self, dead_fee=2400, dead_windows=None):
+        st = GaussianThompsonState()
+        # Earning era at ~90 ppm so the ceiling has genuine evidence.
+        feed_windows(st, fee=90, rate=500.0, n=48)
+        if dead_windows is None:
+            dead_windows = GaussianThompsonState.ZERO_REVENUE_STREAK_THRESHOLD + 3
+        feed_windows(st, fee=dead_fee, rate=0.0, n=dead_windows)
+        return st
+
+    def test_zero_probe_observations_are_flagged(self, fake_time):
+        """(i) Every injected probe carries ZERO_PROBE_FLAG, pairs the
+        never-advertised fee x 0.9 with fabricated 0.0 revenue."""
+        dead_fee = 2400
+        st = self._dead_streak_state(dead_fee=dead_fee)
+
+        probes = [
+            o for o in st.observations
+            if len(o) >= 6 and o[5] == GaussianThompsonState.ZERO_PROBE_FLAG
+        ]
+        assert probes, "sustained dead streak must inject zero-probe observations"
+        expected_probe_fee = max(
+            1, int(dead_fee * GaussianThompsonState.ZERO_PROBE_STEP_FRAC)
+        )
+        for probe in probes:
+            assert probe[0] == expected_probe_fee, (
+                f"probe fee {probe[0]} != fee x ZERO_PROBE_STEP_FRAC "
+                f"{expected_probe_fee}"
+            )
+            assert probe[1] == 0.0, "probe revenue must be the fabricated 0.0"
+
+        # And nothing else in the observation set silently carries a
+        # never-advertised fee: non-probe observations pair only fees that
+        # were actually fed (90 earning-era, 2400 dead-era).
+        non_probe_fees = {
+            o[0] for o in st.observations
+            if not (len(o) >= 6 and o[5] == GaussianThompsonState.ZERO_PROBE_FLAG)
+        }
+        assert non_probe_fees <= {90, dead_fee}
+
+    def test_zero_probe_step_frac_pinned(self):
+        assert GaussianThompsonState.ZERO_PROBE_STEP_FRAC == 0.9
+
+    def test_zero_probe_excluded_from_supported_fee_ceiling(self, fake_time):
+        """(ii) Probes (zero revenue at a fee never advertised) must not
+        move the supported-fee ceiling: the ceiling before and after probe
+        injection tracks only the genuine earning region."""
+        st = GaussianThompsonState()
+        feed_windows(st, fee=90, rate=500.0, n=48)
+        cap_before = st.supported_fee_ceiling()
+        assert cap_before is not None
+
+        # Dead streak at a high fee injects probes at 2160 ppm.
+        feed_windows(
+            st, fee=2400, rate=0.0,
+            n=GaussianThompsonState.ZERO_REVENUE_STREAK_THRESHOLD + 3,
+        )
+        n_probes = sum(
+            1 for o in st.observations
+            if len(o) >= 6 and o[5] == GaussianThompsonState.ZERO_PROBE_FLAG
+        )
+        assert n_probes > 0
+
+        cap_after = st.supported_fee_ceiling()
+        assert cap_after is not None
+        assert cap_after < 2160, (
+            f"probe fees leaked into the supported ceiling: {cap_after:.0f}"
+        )
+        assert cap_after <= cap_before, (
+            "zero-revenue probes must never RAISE the supported ceiling"
+        )
+
+    def test_probe_only_history_yields_no_ceiling(self, fake_time):
+        """Probes alone are not earning evidence: with zero positive-revenue
+        windows the ceiling must stay None even after probes injected."""
+        st = GaussianThompsonState()
+        feed_windows(
+            st, fee=1000, rate=0.0,
+            n=GaussianThompsonState.ZERO_REVENUE_STREAK_THRESHOLD + 3,
+        )
+        assert any(
+            len(o) >= 6 and o[5] == GaussianThompsonState.ZERO_PROBE_FLAG
+            for o in st.observations
+        ), "probe injection expected without any earning history"
+        assert st.supported_fee_ceiling() is None
+
+
+# =============================================================================
 # 5. Congestion episode cap
 # =============================================================================
 
@@ -483,6 +583,11 @@ class TestIncidentReplay:
     def test_steady_state_does_not_run_away(self, fake_time):
         """400 windows of heavy-tail demand: the fee must stay in/near the
         steady region instead of chasing whales upward."""
+        # GaussianThompsonState.sample_fee draws from the GLOBAL random
+        # module; seed it so the DTS trajectory is deterministic (this test
+        # was flaky depending on process-wide RNG state — see
+        # docs/audit/verification/fee_controller.md, Anomaly 1).
+        random.seed(3)
         rng = random.Random(3)
         st = GaussianThompsonState()
         fee = 100
@@ -501,6 +606,10 @@ class TestIncidentReplay:
         anchored high, earning history at ~90 two days old). Within 48
         half-hour windows the fee must be back at/below 2x the steady
         region."""
+        # Seed the GLOBAL RNG used by sample_fee (see note in
+        # test_steady_state_does_not_run_away): unseeded, this test failed
+        # nondeterministically (~50% of isolated runs).
+        random.seed(11)
         rng = random.Random(11)
         st = GaussianThompsonState()
         # Earning era
