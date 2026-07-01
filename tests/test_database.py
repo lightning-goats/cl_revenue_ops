@@ -681,6 +681,27 @@ def test_spend_ledger_summary_reservation_evidence_counts_as_coverage(tmp_path):
     assert 5.9 <= result["covered_hours"] <= 6.1
 
 
+def test_validate_peer_id_rejects_trailing_newline(tmp_path):
+    """PM-I1-adjacent: '$' with re.match matches before a trailing newline,
+    so 66 hex chars + '\\n' passed validation. Must be exact-length only."""
+    db = _fresh_spend_db(tmp_path)
+    valid_peer = "02" + "a" * 64
+    assert db._validate_peer_id(valid_peer) is True
+    assert db._validate_peer_id(valid_peer + "\n") is False
+    assert db._validate_peer_id(valid_peer[:-1]) is False  # 65 chars
+    assert db._validate_peer_id(valid_peer + "f") is False  # 67 chars
+    assert db._validate_peer_id("") is False
+    assert db._validate_peer_id(None) is False
+
+
+def test_validate_channel_id_rejects_trailing_newline(tmp_path):
+    """Same '$'-anchor defect as PEER_ID_PATTERN, one line up."""
+    db = _fresh_spend_db(tmp_path)
+    assert db._validate_channel_id("123x456x789") is True
+    assert db._validate_channel_id("123x456x789\n") is False
+    assert db._validate_channel_id("123x456x") is False
+
+
 def test_cost_evidence_coverage_unknown_on_fresh_db(tmp_path):
     db = _fresh_spend_db(tmp_path)
 

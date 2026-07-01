@@ -450,10 +450,12 @@ class Database:
     MAX_FEE_SATS: int = 50000
     # Maximum reasonable capacity amount (100 BTC in sats)
     MAX_AMOUNT_SATS: int = 10_000_000_000
-    # Channel ID format: short_channel_id like "123x456x789" or "123456x789x0"
-    CHANNEL_ID_PATTERN = r'^\d+x\d+x\d+$'
-    # Peer ID format: 66 hex characters (33 bytes public key)
-    PEER_ID_PATTERN = r'^[0-9a-fA-F]{66}$'
+    # Channel ID format: short_channel_id like "123x456x789" or "123456x789x0".
+    # \A/\Z, not ^/$: '$' matches before a trailing newline, so '^...$' with
+    # re.match accepted e.g. "1x2x3\n" (PM-I1-adjacent audit finding).
+    CHANNEL_ID_PATTERN = r'\A\d+x\d+x\d+\Z'
+    # Peer ID format: exactly 66 hex characters (33 bytes public key)
+    PEER_ID_PATTERN = r'\A[0-9a-fA-F]{66}\Z'
 
     def _validate_channel_id(self, channel_id: str) -> bool:
         """
