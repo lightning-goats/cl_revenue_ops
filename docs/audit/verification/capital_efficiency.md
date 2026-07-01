@@ -81,6 +81,15 @@ ledger's confidence signal from "we don't know" to "we're sure" without adding t
 underlying measurement — arguably worse for downstream consumers that gate behavior on
 `coverage_status`.
 
+> **Remediation (2026-07-01, commit 9ad0b59):** this echo anomaly (and Anomaly 2
+> below) is FIXED essentially as recommended — `get_spend_ledger_summary` and the
+> total-cost-budget writer now compute
+> `min(window_hours, (now - earliest_evidence_ts)/3600)` from the oldest
+> cost-evidence row, and emit `covered_hours: null` + `coverage_status: "unknown"`
+> when no evidence exists. `_ledger_window_coverage`'s `covered_hours >=
+> window_hours` test is no longer a tautology. See
+> docs/audit/verification/database.md remediation note for details.
+
 ## Gaps
 
 - CE-1..CE-6 have no dedicated hermes/RPC surface (contract: "No RPC surface and no

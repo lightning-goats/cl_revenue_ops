@@ -6579,15 +6579,40 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
 
     remaining_sats = max(0, int(effective_budget_sats) - actual_total - reserved_total)
 
+    # Measured window coverage (honest, never an echo of the request):
+    # hours between the oldest cost-evidence row and now, capped at the
+    # window. When the measurement basis is absent or malformed, report an
+    # honest unknown (covered_hours=null) rather than a fabricated
+    # "complete". cl-hive's _ledger_window_coverage reads covered_hours/
+    # coverage_hours numerically and treats null as unknown.
+    covered_hours: Optional[float] = None
+    coverage_status = "unknown"
+    try:
+        coverage = database.get_cost_evidence_coverage(window_hours=wh) if database else None
+    except Exception as exc:
+        coverage = None
+        plugin.log(f"get_cost_evidence_coverage failed: {exc}", level="debug")
+    if isinstance(coverage, dict):
+        raw_covered = coverage.get("covered_hours")
+        if isinstance(raw_covered, (int, float)) and not isinstance(raw_covered, bool):
+            covered_hours = min(float(raw_covered), float(wh))
+            if covered_hours == int(covered_hours):
+                covered_hours = int(covered_hours)
+            raw_status = coverage.get("coverage_status")
+            if isinstance(raw_status, str) and raw_status:
+                coverage_status = raw_status
+            else:
+                coverage_status = "complete" if covered_hours >= wh else "partial"
+
     return {
         "source": "total_cost_budget",
         "timestamp": now,
         "generated_at": now,
         "ttl_seconds": 1800,
         "window_hours": wh,
-        "coverage_hours": wh,
-        "covered_hours": wh,
-        "coverage_status": "complete",
+        "coverage_hours": covered_hours,
+        "covered_hours": covered_hours,
+        "coverage_status": coverage_status,
         "since_timestamp": since,
         "mode": "fixed",
         "daily_budget_sats": daily_budget_sats,

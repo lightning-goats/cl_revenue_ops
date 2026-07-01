@@ -1,5 +1,26 @@
 # Phase 2 Verification — database.py
 
+> **Remediation (2026-07-01):**
+> - **covered_hours echo (Anomaly 1 below) FIXED in commit 9ad0b59** —
+>   `get_spend_ledger_summary` now measures coverage (hours between the oldest
+>   spend_events/spend_reservations row and now, capped at window_hours) instead of
+>   echoing the request; with no evidence it emits `covered_hours: null` +
+>   `coverage_status: "unknown"` (never a fabricated "complete"). The mirror writer
+>   in cl-revenue-ops.py `_compute_total_cost_budget_status` consumes the new
+>   `Database.get_cost_evidence_coverage` (broader basis: spend ledger, rebalance
+>   history/costs, budget reservations, channel open/close costs) with the same
+>   null/unknown fallback. cl-hive's `_ledger_window_coverage` consumer contract
+>   is preserved (null → unknown, measured < window → insufficient_coverage,
+>   full span → complete). Pitting tests in tests/test_database.py
+>   (`test_spend_ledger_summary_*`, `test_cost_evidence_coverage_*`) and
+>   tests/test_operator_surface.py (`test_total_cost_budget_coverage_*`).
+> - **Peer/channel-id anchor defect FIXED in commit 1aed384** (PM-I1-adjacent):
+>   `PEER_ID_PATTERN`/`CHANNEL_ID_PATTERN` used `^...$` with `re.match`, accepting
+>   a trailing newline; now `\A...\Z` with pitting tests
+>   (`test_validate_peer_id_rejects_trailing_newline`,
+>   `test_validate_channel_id_rejects_trailing_newline`).
+> Line references below describe the pre-fix code.
+
 Contract: docs/audit/contracts/database.md (DB-1..DB-7), authored 2026-06-12 at f905cfd.
 Drift check: `git log --oneline f905cfd..HEAD -- modules/database.py` shows exactly one
 commit, **2247370** "Expose freshness metadata for revenue evidence" (2026-06-27), touching

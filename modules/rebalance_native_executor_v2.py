@@ -362,6 +362,24 @@ class NativeRouteExecutor:
             return True
         return "waitsendpay_status=pending" in error_text
 
+    def _fail_malformed_invoice_response(
+        self, result: ExecutionResult, label: str, reason: str
+    ) -> ExecutionResult:
+        """Terminal failure for a mangled invoice RPC response (NX-4).
+
+        CLN may have created the invoice server-side even though the proxy
+        response was malformed, so attempt the same best-effort cleanup as
+        the thrown-exception path (no payment_hash: sendpay never ran, so
+        there is no payment to delete). Also stamp failure_class so this
+        path's failure_data has the same shape as every other failure.
+        """
+        result.error = f"native_invoice_error: {reason}"
+        if not isinstance(result.failure_data, dict):
+            result.failure_data = {}
+        result.failure_data["failure_class"] = self._failure_class(result.error)
+        self._cleanup_failed_payment("", label)
+        return result
+
     def _cleanup_failed_payment(self, payment_hash: str, label: str) -> None:
         if payment_hash:
             try:
@@ -420,12 +438,14 @@ class NativeRouteExecutor:
                 },
             )
             if not isinstance(invoice, dict):
-                result.error = "native_invoice_error: unexpected response"
-                return result
+                return self._fail_malformed_invoice_response(
+                    result, label, "unexpected response"
+                )
             payment_hash = str(invoice.get("payment_hash") or "")
             if not payment_hash:
-                result.error = "native_invoice_error: missing payment_hash"
-                return result
+                return self._fail_malformed_invoice_response(
+                    result, label, "missing payment_hash"
+                )
 
             sendpay_params: Dict[str, Any] = {
                 "route": route,

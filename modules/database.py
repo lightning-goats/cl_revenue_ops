@@ -450,10 +450,12 @@ class Database:
     MAX_FEE_SATS: int = 50000
     # Maximum reasonable capacity amount (100 BTC in sats)
     MAX_AMOUNT_SATS: int = 10_000_000_000
-    # Channel ID format: short_channel_id like "123x456x789" or "123456x789x0"
-    CHANNEL_ID_PATTERN = r'^\d+x\d+x\d+$'
-    # Peer ID format: 66 hex characters (33 bytes public key)
-    PEER_ID_PATTERN = r'^[0-9a-fA-F]{66}$'
+    # Channel ID format: short_channel_id like "123x456x789" or "123456x789x0".
+    # \A/\Z, not ^/$: '$' matches before a trailing newline, so '^...$' with
+    # re.match accepted e.g. "1x2x3\n" (PM-I1-adjacent audit finding).
+    CHANNEL_ID_PATTERN = r'\A\d+x\d+x\d+\Z'
+    # Peer ID format: exactly 66 hex characters (33 bytes public key)
+    PEER_ID_PATTERN = r'\A[0-9a-fA-F]{66}\Z'
 
     def _validate_channel_id(self, channel_id: str) -> bool:
         """
@@ -3909,6 +3911,82 @@ class Database:
             "reservation_ids": ids,
         }
 
+    # Evidence sources for coverage measurement: (table, timestamp column).
+    # The generic spend ledger's own coverage is backed by its two tables;
+    # the unified total-cost budget surface aggregates the broader cost set.
+    _SPEND_LEDGER_EVIDENCE_SOURCES = (
+        ("spend_events", "timestamp"),
+        ("spend_reservations", "reserved_at"),
+    )
+    _TOTAL_COST_EVIDENCE_SOURCES = _SPEND_LEDGER_EVIDENCE_SOURCES + (
+        ("rebalance_history", "timestamp"),
+        ("rebalance_costs", "timestamp"),
+        ("budget_reservations", "reserved_at"),
+        ("channel_costs", "opened_at"),
+        ("channel_closure_costs", "closed_at"),
+    )
+
+    @staticmethod
+    def _earliest_evidence_timestamp(conn, sources) -> Optional[int]:
+        """Oldest ledger-evidence timestamp across the given (table, column) sources."""
+        earliest: Optional[int] = None
+        for table, column in sources:
+            try:
+                row = conn.execute(
+                    f"SELECT MIN({column}) AS earliest FROM {table}"
+                ).fetchone()
+            except sqlite3.Error:
+                continue
+            value = row["earliest"] if row else None
+            if value is None:
+                continue
+            try:
+                ts = int(value)
+            except (TypeError, ValueError):
+                continue
+            if ts <= 0:
+                continue
+            if earliest is None or ts < earliest:
+                earliest = ts
+        return earliest
+
+    @staticmethod
+    def _coverage_from_earliest(
+        earliest: Optional[int], now: int, window_hours: int
+    ) -> Dict[str, Any]:
+        """Honest window coverage: measured hours of evidence, capped at the window.
+
+        With no measurement basis the answer is unknown (covered_hours=None),
+        never a fabricated "complete" echo of the requested window.
+        """
+        if earliest is None or earliest > now:
+            return {"covered_hours": None, "coverage_status": "unknown"}
+        span_seconds = now - earliest
+        if span_seconds >= window_hours * 3600:
+            return {"covered_hours": int(window_hours), "coverage_status": "complete"}
+        return {
+            "covered_hours": round(span_seconds / 3600.0, 2),
+            "coverage_status": "partial",
+        }
+
+    def get_cost_evidence_coverage(
+        self, window_hours: int = 24, now: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Measured coverage of the unified total-cost budget window.
+
+        covered_hours = hours between the oldest cost-evidence row (generic
+        spend ledger, rebalance history/costs, budget reservations, channel
+        open/close costs) and now, capped at window_hours. None + "unknown"
+        when no evidence exists.
+        """
+        window_hours = max(1, int(window_hours))
+        now_ts = int(now if now is not None else time.time())
+        conn = self._get_connection()
+        earliest = self._earliest_evidence_timestamp(
+            conn, self._TOTAL_COST_EVIDENCE_SOURCES
+        )
+        return self._coverage_from_earliest(earliest, now_ts, window_hours)
+
     def get_spend_ledger_summary(
         self,
         window_hours: int = 24,
@@ -3961,14 +4039,22 @@ class Database:
         spent_by_category = {str(r["category"]): int(r["total"] or 0) for r in by_cat_events}
         reserved_by_category = {str(r["category"]): int(r["total"] or 0) for r in by_cat_resv}
 
+        # Measured coverage, not an echo of the request: how many hours of
+        # the window are actually backed by ledger evidence.
+        coverage = self._coverage_from_earliest(
+            self._earliest_evidence_timestamp(conn, self._SPEND_LEDGER_EVIDENCE_SOURCES),
+            now,
+            window_hours,
+        )
+
         result = {
             "timestamp": now,
             "generated_at": now,
             "ttl_seconds": 1800,
             "window_hours": window_hours,
-            "coverage_hours": window_hours,
-            "covered_hours": window_hours,
-            "coverage_status": "complete",
+            "coverage_hours": coverage["covered_hours"],
+            "covered_hours": coverage["covered_hours"],
+            "coverage_status": coverage["coverage_status"],
             "spent_24h_sats": int((spent_row["total_spent"] if spent_row else 0) or 0),
             "reserved_24h_sats": int((reserved_row["total_reserved"] if reserved_row else 0) or 0),
             "spent_by_category": spent_by_category,
