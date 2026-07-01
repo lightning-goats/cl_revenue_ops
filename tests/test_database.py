@@ -600,20 +600,118 @@ class TestForwardDoubleDipPrevention:
             assert self._count(db) == 1
 
 
-def test_spend_ledger_summary_reports_freshness_coverage(tmp_path):
+def _fresh_spend_db(tmp_path):
     db_path = os.path.join(tmp_path, "test_spend_coverage.db")
     plugin = MagicMock()
     db = Database(db_path, plugin)
     db.initialize()
+    return db
+
+
+def test_spend_ledger_summary_reports_freshness_coverage(tmp_path):
+    """A fresh DB has no ledger evidence: coverage must be an honest unknown,
+    never a fabricated 'complete' echo of the requested window."""
+    db = _fresh_spend_db(tmp_path)
 
     result = db.get_spend_ledger_summary(window_hours=24, include_reservations=True)
 
     assert isinstance(result["timestamp"], int)
     assert result["generated_at"] == result["timestamp"]
     assert result["ttl_seconds"] == 1800
-    assert result["coverage_hours"] == 24
-    assert result["covered_hours"] == 24
-    assert result["coverage_status"] == "complete"
+    assert result["coverage_hours"] is None
+    assert result["covered_hours"] is None
+    assert result["coverage_status"] == "unknown"
     assert result["window_hours"] == 24
     assert result["spent_by_category"] == {}
     assert result["reserved_by_category"] == {}
+
+
+def test_spend_ledger_summary_measures_partial_coverage(tmp_path):
+    """Ledger evidence spanning ~3h of a 24h window must report ~3 covered
+    hours, not the requested 24."""
+    db = _fresh_spend_db(tmp_path)
+    now = int(time.time())
+    assert db.record_spend_event("evt-cov-1", "misc_ops", 10, timestamp=now - 3 * 3600)
+
+    result = db.get_spend_ledger_summary(window_hours=24)
+
+    covered = result["covered_hours"]
+    assert isinstance(covered, (int, float))
+    assert 2.9 <= covered <= 3.1
+    assert result["coverage_hours"] == covered
+    assert result["coverage_status"] == "partial"
+    # cl-hive's _ledger_window_coverage reads covered_hours numerically and
+    # computes: complete iff int(float(covered_hours)) >= window_hours.
+    assert int(float(covered)) < result["window_hours"]  # -> insufficient_coverage
+
+
+def test_spend_ledger_summary_full_span_reports_complete(tmp_path):
+    """Evidence older than the window fully covers it: covered_hours is
+    capped at window_hours and status is complete."""
+    db = _fresh_spend_db(tmp_path)
+    now = int(time.time())
+    assert db.record_spend_event("evt-cov-2", "misc_ops", 10, timestamp=now - 25 * 3600)
+
+    result = db.get_spend_ledger_summary(window_hours=24)
+
+    assert result["covered_hours"] == 24
+    assert result["coverage_hours"] == 24
+    assert result["coverage_status"] == "complete"
+    assert int(float(result["covered_hours"])) >= result["window_hours"]  # -> complete
+
+
+def test_spend_ledger_summary_reservation_evidence_counts_as_coverage(tmp_path):
+    """A spend reservation is ledger evidence too (the ledger was live even
+    if no spend settled)."""
+    db = _fresh_spend_db(tmp_path)
+    now = int(time.time())
+    conn = db._get_connection()
+    conn.execute(
+        """
+        INSERT INTO spend_reservations
+        (reservation_id, category, reserved_sats, reserved_at, status)
+        VALUES (?, ?, ?, ?, 'released')
+        """,
+        ("res-cov-1", "misc_ops", 10, now - 6 * 3600),
+    )
+
+    result = db.get_spend_ledger_summary(window_hours=24)
+
+    assert result["coverage_status"] == "partial"
+    assert 5.9 <= result["covered_hours"] <= 6.1
+
+
+def test_cost_evidence_coverage_unknown_on_fresh_db(tmp_path):
+    db = _fresh_spend_db(tmp_path)
+
+    coverage = db.get_cost_evidence_coverage(window_hours=24)
+
+    assert coverage == {"covered_hours": None, "coverage_status": "unknown"}
+
+
+def test_cost_evidence_coverage_uses_broader_cost_tables(tmp_path):
+    """The total-cost budget surface aggregates rebalance/open/close costs
+    beyond the generic spend ledger; its coverage measurement must see that
+    evidence."""
+    db = _fresh_spend_db(tmp_path)
+    now = int(time.time())
+    conn = db._get_connection()
+    conn.execute(
+        "INSERT INTO rebalance_costs (channel_id, peer_id, cost_sats, amount_sats, timestamp) VALUES (?, ?, ?, ?, ?)",
+        ("100x1x0", "02" + "b" * 64, 5, 1000, now - 5 * 3600),
+    )
+
+    coverage = db.get_cost_evidence_coverage(window_hours=24)
+
+    assert coverage["coverage_status"] == "partial"
+    assert 4.9 <= coverage["covered_hours"] <= 5.1
+
+
+def test_cost_evidence_coverage_complete_when_evidence_predates_window(tmp_path):
+    db = _fresh_spend_db(tmp_path)
+    now = int(time.time())
+    assert db.record_spend_event("evt-cov-3", "misc_ops", 10, timestamp=now - 48 * 3600)
+
+    coverage = db.get_cost_evidence_coverage(window_hours=24)
+
+    assert coverage == {"covered_hours": 24, "coverage_status": "complete"}

@@ -988,6 +988,10 @@ def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
     mod.database.get_total_routing_revenue.return_value = 500
     mod.database.get_opening_costs_since.return_value = 100
     mod.database.get_closure_costs_since.return_value = 30
+    mod.database.get_cost_evidence_coverage.return_value = {
+        "covered_hours": 24,
+        "coverage_status": "complete",
+    }
     mod._rebalance_liquidity_cost_components = MagicMock(
         return_value={"spent_24h_sats": 11, "reserved_24h_sats": 2}
     )
@@ -1031,6 +1035,77 @@ def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
         "excluded_open_close_spend_sats": 65,
         "reserved_open_close_sats": 20,
     }
+
+
+def _total_cost_budget_module_with_stub_components():
+    mod = load_plugin_module()
+    mod.config = SimpleNamespace(
+        reservation_timeout_hours=4,
+        daily_budget_sats=2000,
+    )
+    mod.database = MagicMock()
+    mod.database.get_spend_ledger_summary.return_value = {
+        "spent_24h_sats": 0,
+        "reserved_24h_sats": 0,
+        "spent_by_category": {},
+        "reserved_by_category": {},
+        "event_count_by_category": {},
+        "active_reservation_count_by_category": {},
+    }
+    mod.database.get_total_routing_revenue.return_value = 0
+    mod.database.get_opening_costs_since.return_value = 0
+    mod.database.get_closure_costs_since.return_value = 0
+    mod._rebalance_liquidity_cost_components = MagicMock(
+        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
+    )
+    mod._boltz_liquidity_cost_components = MagicMock(
+        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
+    )
+    return mod
+
+
+def test_total_cost_budget_coverage_unknown_when_unmeasurable():
+    """No measurement basis (coverage lookup fails) must surface an honest
+    unknown — never a fabricated 'complete' echo of the requested window."""
+    mod = _total_cost_budget_module_with_stub_components()
+    mod.database.get_cost_evidence_coverage.side_effect = RuntimeError("db gone")
+
+    result = mod._total_cost_budget_status(window_hours=24)
+
+    assert result["covered_hours"] is None
+    assert result["coverage_hours"] is None
+    assert result["coverage_status"] == "unknown"
+    assert result["window_hours"] == 24
+
+
+def test_total_cost_budget_coverage_unknown_on_garbage_payload():
+    mod = _total_cost_budget_module_with_stub_components()
+    mod.database.get_cost_evidence_coverage.return_value = {
+        "covered_hours": "not-a-number",
+        "coverage_status": "complete",
+    }
+
+    result = mod._total_cost_budget_status(window_hours=24)
+
+    assert result["covered_hours"] is None
+    assert result["coverage_status"] == "unknown"
+
+
+def test_total_cost_budget_reports_measured_partial_coverage():
+    """Coverage fields must reflect the measured evidence span, not the
+    requested window (cl-hive reads covered_hours numerically)."""
+    mod = _total_cost_budget_module_with_stub_components()
+    mod.database.get_cost_evidence_coverage.return_value = {
+        "covered_hours": 3.0,
+        "coverage_status": "partial",
+    }
+
+    result = mod._total_cost_budget_status(window_hours=24)
+
+    assert result["covered_hours"] == 3.0
+    assert result["coverage_hours"] == 3.0
+    assert result["coverage_status"] == "partial"
+    mod.database.get_cost_evidence_coverage.assert_called_once_with(window_hours=24)
 
 
 def test_total_cost_budget_reports_pending_open_close_visibility_delay():
