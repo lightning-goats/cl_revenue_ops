@@ -101,8 +101,11 @@ Outputs / consumers:
   validation work (:1162-1165).
 - PM-I13 **Corrupt rows degrade to safe defaults.** Unparseable tags JSON, an unknown strategy, or an
   unknown rebalance_mode in a stored row are logged and replaced by [] / DYNAMIC / ENABLED during row
-  decode rather than raising (:362-418) — a corrupted row can neither brick policy reads nor silently
-  freeze a peer (consistent with PM-I7's permissive default).
+  decode rather than raising (:362-418). Additionally, `_load_cache` isolates failures per row: any
+  row that raises during decode or expiry evaluation (e.g. a corrupt TEXT `expires_at` raising
+  TypeError inside `is_expired()` — SQLite columns are dynamically typed) is skipped with a warning
+  and the affected peer degrades to the permissive default (PM-I7) — a corrupted row can neither
+  brick policy reads for other peers nor silently freeze a peer.
 
 ## 4. Revenue role
 

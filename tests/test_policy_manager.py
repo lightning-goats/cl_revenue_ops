@@ -554,6 +554,56 @@ class TestRateLimiting:
             pass
 
 
+class TestCorruptRowIsolation:
+    """PM-I13: one corrupt DB row must not poison the cache / brick all reads."""
+
+    @staticmethod
+    def _row(peer_id, **overrides):
+        row = {
+            "peer_id": peer_id,
+            "strategy": "dynamic",
+            "rebalance_mode": "enabled",
+            "fee_ppm_target": None,
+            "tags": "[]",
+            "updated_at": 1000,
+            "fee_multiplier_min": None,
+            "fee_multiplier_max": None,
+            "expires_at": None,
+        }
+        row.update(overrides)
+        return row
+
+    def test_corrupt_expires_at_row_does_not_poison_cache(self, mock_database, mock_plugin, sample_peer_ids):
+        """A corrupt TEXT expires_at (TypeError in is_expired) is skipped with a
+        warning; get_policy still serves every other peer's stored policy."""
+        corrupt = self._row(sample_peer_ids[1], expires_at="garbage")
+        valid = self._row(sample_peer_ids[0], strategy="static", fee_ppm_target=500)
+        mock_database.get_all_policies.return_value = [corrupt, valid]
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        policy = pm.get_policy(sample_peer_ids[0])
+
+        assert policy.strategy == FeeStrategy.STATIC
+        assert policy.fee_ppm_target == 500
+        # A warning was logged for the skipped row
+        assert any(
+            "corrupt" in str(call.args[0]).lower()
+            for call in mock_plugin.log.call_args_list
+        )
+
+    def test_corrupt_row_peer_degrades_to_default(self, mock_database, mock_plugin, sample_peer_ids):
+        """The peer whose row is corrupt gets the permissive default (PM-I7),
+        not an exception."""
+        corrupt = self._row(sample_peer_ids[1], expires_at="garbage")
+        mock_database.get_all_policies.return_value = [corrupt]
+        pm = PolicyManager(mock_database, mock_plugin)
+
+        fallback = pm.get_policy(sample_peer_ids[1])
+
+        assert fallback.strategy == FeeStrategy.DYNAMIC
+        assert fallback.rebalance_mode == RebalanceMode.ENABLED
+
+
 class TestPeerPolicyDataclass:
     """Test PeerPolicy dataclass behavior."""
 

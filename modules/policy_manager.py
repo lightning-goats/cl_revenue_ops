@@ -347,10 +347,27 @@ class PolicyManager:
 
         new_cache = {}
         for row in rows:
-            policy = self._row_to_policy(row)
-            # v2.0: Skip expired policies during cache load
-            if not policy.is_expired():
-                new_cache[policy.peer_id] = policy
+            # PM-I13: per-row isolation — a row that fails to parse/validate
+            # (e.g. a corrupt TEXT expires_at raising TypeError in is_expired)
+            # is skipped with a warning; it must not poison the cache and
+            # brick policy reads for every peer.
+            try:
+                policy = self._row_to_policy(row)
+                # v2.0: Skip expired policies during cache load
+                if policy.is_expired():
+                    continue
+            except Exception as e:
+                try:
+                    peer = str(row['peer_id'])[:12]
+                except Exception:
+                    peer = '<unknown>'
+                self.plugin.log(
+                    f"PolicyManager: Skipping corrupt policy row for peer "
+                    f"{peer}...: {e}. Peer degrades to default policy.",
+                    level='warn'
+                )
+                continue
+            new_cache[policy.peer_id] = policy
 
         # Update cache atomically under lock
         with self._cache_lock:
