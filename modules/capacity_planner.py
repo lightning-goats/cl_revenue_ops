@@ -3498,11 +3498,32 @@ class CapacityPlanner:
 
         try:
             result = self.rebalancer.diagnostic_rebalance(channel_id)
-            success = bool(result.get("success")) if isinstance(result, dict) else False
-            status = "completed" if success else "failed"
+            # Audit (defibrillation honesty): record the ACTUAL shock
+            # outcome. Blocked (capital controls) and failed shocks must
+            # not be recorded as completed — Phase 3 found 0/25 "completed"
+            # shocks had delivered liquidity.
+            shock_status = None
+            actual_fee_sats = None
+            if isinstance(result, dict):
+                shock_status = result.get("shock_status")
+                actual_fee_sats = result.get("actual_fee_sats")
+            if shock_status in ("completed", "blocked", "failed", "pending"):
+                status = shock_status
+            else:
+                # Legacy rebalancers without a shock_status surface
+                success = bool(result.get("success")) if isinstance(result, dict) else False
+                status = "completed" if success else "failed"
             if db and action_id:
                 try:
-                    db.update_planner_action(action_id, status=status)
+                    update_kwargs = {"status": status}
+                    if (isinstance(actual_fee_sats, (int, float))
+                            and not isinstance(actual_fee_sats, bool)):
+                        update_kwargs["actual_cost_sats"] = int(actual_fee_sats)
+                    if status == "blocked":
+                        # Terminal for this action: update_planner_action
+                        # only auto-stamps completed/failed.
+                        update_kwargs["completed_at"] = int(time.time())
+                    db.update_planner_action(action_id, **update_kwargs)
                 except Exception:
                     pass
             return {
