@@ -605,6 +605,81 @@ class TestExecuteOnceDiagnostic:
         mock_database.record_rebalance.assert_called_once()
         mock_database.update_rebalance_result.assert_called_once_with(99, 'failed', error_message="no route")
 
+    def _make_diag_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        channel_id = "111x222x0"
+        r._get_channels_with_balances = MagicMock(return_value={
+            channel_id: {"capacity": 1_000_000, "spendable_sats": 50_000, "peer_id": "02" + "b" * 64, "fee_ppm": 100},
+            "333x444x0": {"capacity": 2_000_000, "spendable_sats": 1_500_000, "peer_id": "02" + "c" * 64, "fee_ppm": 200},
+        })
+        r._estimate_inbound_fee = MagicMock(return_value=50)
+        r._check_capital_controls = MagicMock(return_value=True)
+        mock_database.record_rebalance = MagicMock(return_value=99)
+        mock_database.update_rebalance_result = MagicMock()
+        return r, channel_id
+
+    def test_blocked_shock_reports_shock_status_blocked(self, mock_plugin, mock_database):
+        """Audit (defibrillation honesty): capital-controls block must be
+        reported as shock_status='blocked', never as a completed shock."""
+        r, channel_id = self._make_diag_rebalancer(mock_plugin, mock_database)
+        r._check_capital_controls = MagicMock(return_value=False)
+        r.rebalance_engine_v2 = MagicMock()
+
+        result = r.diagnostic_rebalance(channel_id)
+
+        assert result["shock_status"] == "blocked"
+        r.rebalance_engine_v2.execute_candidate.assert_not_called()
+
+    def test_failed_shock_reports_shock_status_failed(self, mock_plugin, mock_database):
+        from modules.rebalance_executor_v2 import ExecutionResult
+
+        r, channel_id = self._make_diag_rebalancer(mock_plugin, mock_database)
+        r.rebalance_engine_v2 = MagicMock()
+        r.rebalance_engine_v2.execute_candidate.return_value = ExecutionResult(
+            success=False, error="no route",
+        )
+
+        result = r.diagnostic_rebalance(channel_id)
+
+        assert result["shock_status"] == "failed"
+
+    def test_successful_shock_reports_completed_with_actual_fee(self, mock_plugin, mock_database):
+        from modules.rebalance_executor_v2 import ExecutionResult
+
+        r, channel_id = self._make_diag_rebalancer(mock_plugin, mock_database)
+        r.rebalance_engine_v2 = MagicMock()
+        r.rebalance_engine_v2.execute_candidate.return_value = ExecutionResult(
+            success=True, fee_msat=5000, fee_sats=5,
+        )
+
+        result = r.diagnostic_rebalance(channel_id)
+
+        assert result["shock_status"] == "completed"
+        assert result["actual_fee_sats"] == 5
+
+    def test_no_engine_reports_shock_status_failed(self, mock_plugin, mock_database):
+        r, channel_id = self._make_diag_rebalancer(mock_plugin, mock_database)
+        r.rebalance_engine_v2 = None
+
+        result = r.diagnostic_rebalance(channel_id)
+
+        assert result["shock_status"] == "failed"
+
+    def test_no_sources_reports_shock_status_failed(self, mock_plugin, mock_database):
+        r, channel_id = self._make_diag_rebalancer(mock_plugin, mock_database)
+        # Only the target channel exists — no viable shock source
+        r._get_channels_with_balances = MagicMock(return_value={
+            channel_id: {"capacity": 1_000_000, "spendable_sats": 50_000, "peer_id": "02" + "b" * 64, "fee_ppm": 100},
+        })
+
+        result = r.diagnostic_rebalance(channel_id)
+
+        assert result["shock_status"] == "failed"
+
 
 class TestExecuteOnceManual:
     """Manual rebalance uses the v2 execution stack."""

@@ -4520,6 +4520,47 @@ class TestPlannerIntegration:
         assert status["candidate_pool_size"] == 2
         assert len(status["recent_actions"]) == 1
 
+    def _status_planner(self, execute_closes, max_closes):
+        plugin = MagicMock()
+        prof_analyzer = MagicMock()
+        flow_analyzer = MagicMock()
+        mock_config = MagicMock()
+        mock_config.planner_enabled = True
+        mock_config.planner_dry_run = False
+        mock_config.planner_execute_closes = execute_closes
+        mock_config.planner_max_closes_per_cycle = max_closes
+        prof_analyzer.database.get_planner_candidates.return_value = []
+        prof_analyzer.database.get_planner_actions.return_value = []
+        return CapacityPlanner(plugin, prof_analyzer, flow_analyzer, config=mock_config)
+
+    def test_status_exposes_inert_close_execution(self):
+        """Audit (Phase 3): execute_closes=true with max_closes_per_cycle=0
+        is inert — the status surface must say so instead of echoing the
+        flag as if closes were live."""
+        planner = self._status_planner(execute_closes=True, max_closes=0)
+
+        status = planner.get_status()
+
+        assert status["execute_closes"] is True
+        assert status["max_closes_per_cycle"] == 0
+        assert status["close_execution_effective"] is False
+
+    def test_status_exposes_effective_close_execution(self):
+        planner = self._status_planner(execute_closes=True, max_closes=2)
+
+        status = planner.get_status()
+
+        assert status["execute_closes"] is True
+        assert status["max_closes_per_cycle"] == 2
+        assert status["close_execution_effective"] is True
+
+    def test_status_close_execution_disabled_flag_wins(self):
+        planner = self._status_planner(execute_closes=False, max_closes=2)
+
+        status = planner.get_status()
+
+        assert status["close_execution_effective"] is False
+
 
 class TestConstructorCleanup:
     """Verify constructor signature and state initialization."""
@@ -5193,3 +5234,79 @@ class TestPeerExposureCap:
 
         planner._execute_open.assert_not_called()
         assert any("exposure cap" in r.lower() for r in result["skipped_reasons"])
+
+
+class TestDefibrillationStatusHonesty:
+    """Audit (Phase 3): blocked / failed shocks were recorded as
+    status='completed' in planner_actions (0/25 'completed' shocks delivered
+    liquidity). The planner must record the actual shock outcome and, on
+    success, the actual fee spent."""
+
+    PEER = "02" + "a" * 64
+
+    def _planner(self):
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        prof.database.record_planner_action.return_value = 42
+        planner.rebalancer = MagicMock()
+        return planner, prof
+
+    def test_blocked_shock_records_status_blocked(self):
+        planner, prof = self._planner()
+        planner.rebalancer.diagnostic_rebalance.return_value = {
+            "success": True,
+            "shock_status": "blocked",
+            "message": "Zero-Fee flag set, but Active Shock blocked: daily budget exhausted",
+        }
+
+        result = planner._execute_defibrillation(
+            "100x1x0", self.PEER, _make_cycle_cfg(), "STAGNANT")
+
+        assert result["status"] == "blocked"
+        kwargs = prof.database.update_planner_action.call_args.kwargs
+        args = prof.database.update_planner_action.call_args.args
+        assert args[0] == 42
+        assert kwargs["status"] == "blocked"
+
+    def test_failed_shock_records_status_failed(self):
+        planner, prof = self._planner()
+        planner.rebalancer.diagnostic_rebalance.return_value = {
+            "success": True,
+            "shock_status": "failed",
+            "message": "Defibrillator active: Zero-Fee flag set + Shock failed",
+        }
+
+        result = planner._execute_defibrillation(
+            "100x1x0", self.PEER, _make_cycle_cfg(), "STAGNANT")
+
+        assert result["status"] == "failed"
+        kwargs = prof.database.update_planner_action.call_args.kwargs
+        assert kwargs["status"] == "failed"
+
+    def test_completed_shock_records_actual_cost(self):
+        planner, prof = self._planner()
+        planner.rebalancer.diagnostic_rebalance.return_value = {
+            "success": True,
+            "shock_status": "completed",
+            "actual_fee_sats": 7,
+            "message": "Defibrillator active: Zero-Fee flag set + Shock completed",
+        }
+
+        result = planner._execute_defibrillation(
+            "100x1x0", self.PEER, _make_cycle_cfg(), "STAGNANT")
+
+        assert result["status"] == "completed"
+        kwargs = prof.database.update_planner_action.call_args.kwargs
+        assert kwargs["status"] == "completed"
+        assert kwargs["actual_cost_sats"] == 7
+
+    def test_legacy_result_without_shock_status_falls_back_to_success_flag(self):
+        planner, prof = self._planner()
+        planner.rebalancer.diagnostic_rebalance.return_value = {
+            "success": False,
+            "message": "Channel not found locally",
+        }
+
+        result = planner._execute_defibrillation(
+            "100x1x0", self.PEER, _make_cycle_cfg(), "STAGNANT")
+
+        assert result["status"] == "failed"

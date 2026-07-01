@@ -2684,21 +2684,13 @@ class ChannelProfitabilityAnalyzer:
             except Exception:
                 pass
 
-        # 4. Routing structural value: protect channels that are structurally
-        # important even if their ROI is poor.  A corridor-owner or high-centrality
-        # channel should not be classified UNDERWATER or ZOMBIE — upgrade to
-        # BREAK_EVEN so close recommendations don't target it.
-        # Fleet member protection only applies when the channel has non-zero forwards
-        # (i.e. it is actually routing traffic), preventing protection of dead channels.
-        if roi < underwater_thresh and self.hive_hints and peer_id:
-            try:
-                centrality = self.hive_hints.get_centrality(peer_id)
-                corridor_role = self.hive_hints.get_corridor_role(peer_id)
-                is_member = self.hive_hints.is_hive_member(peer_id)
-                if (is_member and forward_count > 0) or corridor_role == "owner" or centrality > 0.03:
-                    return ProfitabilityClass.BREAK_EVEN
-            except Exception:
-                pass
+        # 4. (removed — operator decision D2, 2026-06-12): the structural
+        # UNDERWATER -> BREAK_EVEN reclassification for hive members /
+        # corridor owners / centrality > 0.03 masked real losses on fleet
+        # channels from loss reporting. Losses must stay visible; close
+        # protection for fleet channels is expressed downstream as an
+        # explicit protection reason (capacity_planner._close_protection_reason
+        # -> HIVE_MEMBER), never by falsifying the profitability class.
 
         # 5. Audit F3: historically-profitable corpse. Lifetime ROI never
         # decays, so a channel that earned well a year ago and has been dead
@@ -2706,8 +2698,7 @@ class ChannelProfitabilityAnalyzer:
         # Inactivity is judged independently of the lifetime ROI sign:
         # a month with zero forwards in either direction and zero 30d
         # contribution on a mature channel is dead capital regardless of
-        # how profitable it once was. Placed AFTER the structural/gateway
-        # protections above so protected channels are never reclassified.
+        # how profitable it once was.
         if (contribution_30d_msat is not None
                 and contribution_30d_msat <= 0
                 and days_inactive >= 30

@@ -44,6 +44,18 @@ always roi < −10% (14,756 / 4,253 rows, 0 violations).
    profitability_analyzer.py:2693-2701 firing in production. Only 1 distinct channel,
    ~265 snapshot-weighted masked sats so far — small today, unbounded by design.
    Sat has ruled the mask for removal (docs/audit/operator-decisions.md D2).
+   **FIXED in commit 91e4bd0 (2026-07-01)**: the UNDERWATER→BREAK_EVEN
+   reclassification for hive members / corridor owners / centrality > 0.03 was
+   removed from `_classify_channel`; losses on fleet channels are now always
+   visible. Close protection remains expressed only via explicit protection
+   reasons (capacity_planner `_close_protection_reason` → HIVE_MEMBER + the
+   loser-pipeline member skip), pinned by new tests
+   (TestD2FleetLossVisibility in tests/test_profitability_fixes.py,
+   TestMemberCloseProtectionWithoutClassMask in
+   tests/test_dead_capital_protections.py). BREAK_EVEN consumers were checked:
+   get_rebalance_priority / get_max_rebalance_fee_multiplier now see honest
+   UNDERWATER values (0.5 vs the masked 1.0); no consumer relied on the class
+   rewrite for close protection.
 2. Class distribution across corpus rows: profitable 14,756, stagnant_candidate 7,949,
    underwater 4,253, break_even 36, zombie 18 — stagnant+underwater ≈ 45% of
    channel-snapshots; input for Phase 4 contribution analysis.

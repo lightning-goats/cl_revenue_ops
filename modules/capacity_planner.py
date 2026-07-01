@@ -184,10 +184,21 @@ class CapacityPlanner:
                 hive_open_count = len(self.hive_hints.get_open_candidates())
             except Exception:
                 pass
+        max_closes = getattr(cfg, 'planner_max_closes_per_cycle', 0) if cfg else 0
+        if not isinstance(max_closes, (int, float)) or isinstance(max_closes, bool):
+            max_closes = 0
         return {
             "enabled": getattr(cfg, 'planner_enabled', False) if cfg else False,
             "dry_run": getattr(cfg, 'planner_dry_run', False) if cfg else False,
             "execute_closes": getattr(cfg, 'planner_execute_closes', False) if cfg else False,
+            # Audit (Phase 3): execute_closes=true is inert while
+            # max_closes_per_cycle=0 — surface the effective gate so the
+            # status cannot claim close execution that can never happen.
+            "max_closes_per_cycle": int(max_closes),
+            "close_execution_effective": (
+                bool(getattr(cfg, 'planner_execute_closes', False)) and int(max_closes) > 0
+                if cfg else False
+            ),
             "candidate_pool_size": len(db.get_planner_candidates()) if db else 0,
             "recent_actions": db.get_planner_actions(limit=5) if db else [],
             "hive_open_candidates": hive_open_count,
@@ -872,6 +883,13 @@ class CapacityPlanner:
                 except Exception:
                     pass
 
+            # Hive member protection -- never emit fleet channels as losers.
+            # D1 (operator decision): this skip runs BEFORE the dead-capital
+            # pipeline so members are never staged FEE_REDUCE/DEFIBRILLATE/
+            # CLOSE either, and the membership check fails CLOSED.
+            if self._is_protected_hive_member(prof.peer_id):
+                continue
+
             dead_capital_loser = self._build_dead_capital_loser(
                 scid_display,
                 prof,
@@ -893,14 +911,6 @@ class CapacityPlanner:
             rebal_difficulty = 0.0
             if success_data and success_data.get('total', 0) >= 3:
                 rebal_difficulty = 1.0 - success_data.get('success_rate', 1.0)  # 0=easy, 1=impossible
-
-            # Hive member protection -- never recommend closing fleet channels
-            if self.hive_hints is not None:
-                try:
-                    if self.hive_hints.is_hive_member(prof.peer_id):
-                        continue
-                except Exception:
-                    pass
 
             # Protective closure gates (Kalman confidence, inbound gateway,
             # sourced-fee contribution, route-pair). Shared with the
@@ -1043,6 +1053,30 @@ class CapacityPlanner:
 
         return losers
 
+    def _is_protected_hive_member(self, peer_id) -> bool:
+        """Return True when the peer must be protected as a hive member.
+
+        Fail-CLOSED (audit D1 / CP-I15): if the hive adapter raises, treat
+        the peer as protected and log, rather than silently dropping fleet
+        protection. No hive adapter (hive_hints is None) means no fleet,
+        so no protection applies.
+        """
+        if self.hive_hints is None:
+            return False
+        try:
+            return bool(self.hive_hints.is_hive_member(peer_id))
+        except Exception as e:
+            try:
+                peer_disp = str(peer_id or "")[:16]
+                self.plugin.log(
+                    f"PLANNER: hive membership check failed for {peer_disp}...: "
+                    f"{e} — treating peer as protected (fail-closed)",
+                    level="warn",
+                )
+            except Exception:
+                pass
+            return True
+
     def _close_protection_reason(
         self,
         scid_display: str,
@@ -1061,13 +1095,10 @@ class CapacityPlanner:
         """
         from .profitability_analyzer import ChannelRole
 
-        # Hive member protection -- never recommend closing fleet channels
-        if self.hive_hints is not None:
-            try:
-                if self.hive_hints.is_hive_member(prof.peer_id):
-                    return "HIVE_MEMBER"
-            except Exception:
-                pass
+        # Hive member protection -- never recommend closing fleet channels.
+        # Fails CLOSED (D1): an adapter error protects the peer.
+        if self._is_protected_hive_member(prof.peer_id):
+            return "HIVE_MEMBER"
 
         # Kalman confidence gate -- block closure only when the Kalman
         # estimate is load-bearing (recent/mixed activity with low
@@ -2141,13 +2172,9 @@ class CapacityPlanner:
         if loser.get("marginal_roi", 0) >= 0:
             return False, f"Marginal ROI {loser.get('marginal_roi', 0):.1f}% >= 0"
 
-        # Hive member protection
-        if self.hive_hints is not None:
-            try:
-                if self.hive_hints.is_hive_member(peer_id):
-                    return False, "Hive member protected"
-            except Exception:
-                pass
+        # Hive member protection (fails CLOSED on adapter errors — D1)
+        if self._is_protected_hive_member(peer_id):
+            return False, "Hive member protected"
 
         # Policy protection
         if peer_id in protected_peers:
@@ -3482,11 +3509,32 @@ class CapacityPlanner:
 
         try:
             result = self.rebalancer.diagnostic_rebalance(channel_id)
-            success = bool(result.get("success")) if isinstance(result, dict) else False
-            status = "completed" if success else "failed"
+            # Audit (defibrillation honesty): record the ACTUAL shock
+            # outcome. Blocked (capital controls) and failed shocks must
+            # not be recorded as completed — Phase 3 found 0/25 "completed"
+            # shocks had delivered liquidity.
+            shock_status = None
+            actual_fee_sats = None
+            if isinstance(result, dict):
+                shock_status = result.get("shock_status")
+                actual_fee_sats = result.get("actual_fee_sats")
+            if shock_status in ("completed", "blocked", "failed", "pending"):
+                status = shock_status
+            else:
+                # Legacy rebalancers without a shock_status surface
+                success = bool(result.get("success")) if isinstance(result, dict) else False
+                status = "completed" if success else "failed"
             if db and action_id:
                 try:
-                    db.update_planner_action(action_id, status=status)
+                    update_kwargs = {"status": status}
+                    if (isinstance(actual_fee_sats, (int, float))
+                            and not isinstance(actual_fee_sats, bool)):
+                        update_kwargs["actual_cost_sats"] = int(actual_fee_sats)
+                    if status == "blocked":
+                        # Terminal for this action: update_planner_action
+                        # only auto-stamps completed/failed.
+                        update_kwargs["completed_at"] = int(time.time())
+                    db.update_planner_action(action_id, **update_kwargs)
                 except Exception:
                     pass
             return {

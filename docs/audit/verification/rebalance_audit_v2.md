@@ -8,7 +8,18 @@ wrappers (lines 122-216); `NON_ACTIONABLE_SKIP_REASONS` (lines 23-26), `VALID_SK
 (lines 29-49).
 
 ## Invariant verdicts
-- **RA2-1 — VIOLATED.** Production `SkipRecord` emitters use at least ten reasons that are NOT
+- **RA2-1 — VIOLATED → FIXED in commit 0798b50 (2026-07-01).** The authoritative
+  emitter list was re-derived by scraping every `SkipRecord` call site; 12 missing
+  reasons were added to `VALID_SKIP_REASONS` (the ~10 below plus `fleet_lease_held`
+  and `lease_conflict` — the `suppress_leased_pairs` default the coordination
+  overlay uses). A drift-guard test
+  (tests/test_rebalance_audit_v2.py::test_all_emitted_skip_reasons_are_in_vocabulary)
+  now AST-scrapes all modules/*.py for reason literals reachable by SkipRecords
+  (construction sites, local `reason` assignments, emitter-helper call
+  sites/defaults, and the indirect eligibility / router-error producers) and
+  asserts them ⊆ VALID_SKIP_REASONS, with a sanity test pinning known reasons
+  from every emitter layer. Original finding:
+  Production `SkipRecord` emitters use at least ten reasons that are NOT
   in `VALID_SKIP_REASONS`:
   - planner (rebalance_planner_v2.py 133-148): `source_ineligible`, `dest_ineligible` fallbacks
     (and `ch.source_reason`/`ch.dest_reason` pass through state-layer strings)
@@ -40,12 +51,13 @@ LIVE. Sole production consumer: `modules/rebalance_engine_v2.py`.
 
 ## Gaps
 - Nothing rejects unknown reasons at runtime (contract acknowledges: set is declarative).
-  Combined with the RA2-1 drift, the "canonical vocabulary" is now aspirational.
+  Since commit 0798b50 the vocabulary is enforced at test time by the AST drift guard,
+  so the "canonical vocabulary" claim holds again for all current emitters.
 
 ## Anomalies
-- **Headline: RA2-1 vocabulary drift** (above). Recommend either adding the ~10 missing reasons
-  to `VALID_SKIP_REASONS` or adding an architecture-guard test that greps SkipRecord emitters —
-  finding only, no fix applied.
-- The `log_skips` docstring mentions "below_hold_margin" and "lease" as actionable reasons; both
-  are emitted in production but absent from the vocabulary — the docstring reflects reality
-  better than `VALID_SKIP_REASONS` does.
+- **Headline: RA2-1 vocabulary drift** (above). **RESOLVED in commit 0798b50**: the
+  12 missing reasons were added and an AST-based drift-guard test now scrapes
+  SkipRecord emitters so the vocabulary cannot silently diverge again.
+- The `log_skips` docstring mentions "below_hold_margin" and "lease" as actionable reasons;
+  both are emitted in production and (since 0798b50) both are in the vocabulary
+  (below_hold_margin, fleet_lease_held/lease_conflict) — docstring and vocabulary agree again.

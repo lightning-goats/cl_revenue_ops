@@ -43,6 +43,14 @@ All cited tests pass on HEAD (2026-07-01).
    reason codes: defibrillator 37, manual 10, ev_positive 4). Most spend activity is
    diagnostic defibrillation, not EV-positive refills. Feeds Phase 3 (rebalance
    decision loop) and Phase 4 (RB hypotheses likely inconclusive on n=2 successes).
+   **Defibrillation status honesty FIXED in commit e2fbdca (2026-07-01)** (Phase 3
+   follow-up: 0/25 planner_actions "completed" shocks had delivered liquidity):
+   `diagnostic_rebalance` now reports an explicit `shock_status`
+   (completed | blocked | failed | pending) and `actual_fee_sats` on success —
+   capital-controls blocks and failed/pending shocks are no longer collapsed
+   into a success=True result that the planner recorded as completed. RB-I10
+   bounds (50k sats, 100-sat fee cap, capital-controls gate) are unchanged.
+   Pinned by new TestExecuteOnceDiagnostic tests in tests/test_rebalancer_module.py.
 2. One failed row records actual_fee_sats > max_fee_sats — executor-rejection
    bookkeeping, not overspend (see rebalance_engine_v2.md anomaly 2).
 3. Suppressed windows total 550 of 5,191 decision snapshots (~11%) — budget

@@ -2385,7 +2385,11 @@ class EVRebalancer:
             # Find a healthy source channel
             channels = self._get_channels_with_balances()
             if channel_id not in channels:
-                return {"success": False, "message": "Channel not found locally"}
+                return {
+                    "success": False,
+                    "shock_status": "failed",
+                    "message": "Channel not found locally",
+                }
 
             dest_info = channels[channel_id]
             
@@ -2397,7 +2401,8 @@ class EVRebalancer:
             
             if not valid_sources:
                 return {
-                    "success": True, 
+                    "success": True,
+                    "shock_status": "failed",
                     "message": "Exploration flag set, but no sources available for active shock."
                 }
             
@@ -2441,8 +2446,11 @@ class EVRebalancer:
             # Capital Controls Check - diagnostic rebalances count against daily budget
             if not self._check_capital_controls():
                 self.plugin.log("Defibrillator Active Shock blocked by capital controls", level='warn')
+                # Audit (defibrillation honesty): a blocked shock delivered
+                # no liquidity — report it as blocked, never completed.
                 return {
                     "success": True,
+                    "shock_status": "blocked",
                     "message": "Zero-Fee flag set, but Active Shock blocked: daily budget exhausted or reserve too low"
                 }
 
@@ -2457,12 +2465,13 @@ class EVRebalancer:
                 reason_code='defibrillator'
             )
 
+            actual_fee_sats = None
             if self.rebalance_engine_v2:
                 exec_result = self._execute_candidate_v2(
                     candidate, rebalance_id=rebalance_id
                 )
                 if exec_result.success:
-                    self._record_successful_rebalance_fee(
+                    actual_fee_sats = self._record_successful_rebalance_fee(
                         rebalance_id,
                         status='success',
                         channel_id=channel_id,
@@ -2478,19 +2487,35 @@ class EVRebalancer:
                         error_message=exec_result.error or "rebalance failed"
                     )
                 shock_ok = exec_result.success
+                shock_pending = bool(getattr(exec_result, "payment_pending", False)) and not shock_ok
             else:
                 self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no rebalance engine available")
                 shock_ok = False
+                shock_pending = False
 
-            return {
+            # Audit (defibrillation honesty): report the ACTUAL shock
+            # outcome. A failed or still-pending shock delivered no
+            # confirmed liquidity and must not read as completed.
+            if shock_ok:
+                shock_status = "completed"
+            elif shock_pending:
+                shock_status = "pending"
+            else:
+                shock_status = "failed"
+            result = {
                 "success": True,
-                "message": f"Defibrillator active: Zero-Fee flag set + Shock {'completed' if shock_ok else 'failed'}"
+                "shock_status": shock_status,
+                "message": f"Defibrillator active: Zero-Fee flag set + Shock {shock_status}"
             }
+            if actual_fee_sats is not None:
+                result["actual_fee_sats"] = actual_fee_sats
+            return result
 
         except Exception as e:
             self.plugin.log(f"Defibrillator shock failed: {e}", level='error')
             return {
                 "success": False,
+                "shock_status": "failed",
                 "message": f"Zero-Fee flag set, but active shock failed: {e}"
             }
 

@@ -16,6 +16,10 @@ both identically.
 ## Invariants
 - RA2-1: Every reason the planner/router/engine emits in a `SkipRecord` is a member of
   `VALID_SKIP_REASONS`; new reasons must be added there or audit consumers lose bucketing.
+  (Restored in commit 0798b50, 2026-07-01: the 12 missing production reasons —
+  planner eligibility fallbacks, coordination-overlay reasons, engine gate/lock/lease
+  reasons — were added, and the invariant is now enforced by an AST drift-guard test in
+  tests/test_rebalance_audit_v2.py that scrapes all SkipRecord emitter call sites.)
 - RA2-2: Non-actionable reasons (`inside_band`, `not_valuable` — the frozenset
   `NON_ACTIONABLE_SKIP_REASONS`) are aggregated by `log_skips` into one
   `REBAL_SKIP reason=<r> count=<n>` summary line per reason; actionable reasons keep one line per
@@ -30,7 +34,9 @@ both identically.
 aggregation behavior of `log_skips` against a recording fake plugin.
 
 ## Notes
-- `log_skips`'s docstring mentions reasons "below_hold_margin" and "lease" as actionable, but
-  neither appears in `VALID_SKIP_REASONS` — docstring/vocabulary drift worth reconciling.
+- `log_skips`'s docstring mentions reasons "below_hold_margin" and "lease" as actionable;
+  since commit 0798b50 both are in `VALID_SKIP_REASONS` (below_hold_margin,
+  fleet_lease_held/lease_conflict) — the docstring/vocabulary drift is reconciled.
 - The validity set is declarative only: nothing in this module rejects an unknown reason at
-  runtime; enforcement (if any) lives in tests.
+  runtime; enforcement lives in tests (since 0798b50, the AST drift guard in
+  tests/test_rebalance_audit_v2.py covers every emitter, not just the v3 router).

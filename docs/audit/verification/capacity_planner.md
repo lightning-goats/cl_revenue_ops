@@ -26,7 +26,7 @@ execute_closes=False in all 194.
 | CP-I2 dry_run: no fundchannel/close/diagnostic RPC; status=dry_run | **verified** | TestChannelOpen (dry_run does not call fundchannel, records action, no reservation), TestDirectClose::test_execute_close_dry_run, TestExecuteCycle/TestPlannerIntegration full-cycle dry-run tests; code confirmed (:3266-3277 open, :3537-3548 close, :3451-3467 defib — all before RPC); **corpus: dry_run statuses consistent with flags in 73 (n1) + 15 (n2) checked actions, 0 violations**. Partial gap: the defibrillation leg (diagnostic_rebalance NOT called under dry_run) has no direct test |
 | CP-I3 open cap counts only completed/dry_run; failures don't consume slots | **verified** | TestExecuteCycle::test_execute_cycle_respects_max_opens_per_cycle, ::test_failed_open_does_not_consume_open_slot_or_available_funds; code confirmed (:583-584 cap, :646-649 increment on completed/dry_run only) |
 | CP-I4 ≤ planner_max_defibrillations_per_cycle (default 1) | **verified** | TestExecuteCycle::test_execute_cycle_runs_one_defibrillation_before_close (2 DEFIB losers → exactly 1 executed), ::test_execute_cycle_defibrillation_respects_cooldown; code confirmed (`_defibrillation_limit` :238-245, loop :379-405); **corpus: 18 (n1) + 7 (n2) defibrillate actions, never >1 per cycle, 0 violations** |
-| CP-I5 hive member never CLOSE; dead-capital FEE_REDUCE/DEFIBRILLATE permitted (D1) | **verified (as-implemented)** | test_dead_capital_protections.py::test_hive_member_blocks_dead_capital_close (member emitted as DEFIBRILLATE with close_protection=HIVE_MEMBER — directly pins the D1 behavior) + protected-channel stage tests + test_capital_recycling.py::test_ineligible_hive_member; code confirmed on HEAD: dead-capital pipeline (:875) runs BEFORE the regular-pipeline member skip (:897-903); `_close_protection_reason` returns HIVE_MEMBER (:1064-1070) and blocks CLOSE staging (:1289-1293) and recycle nomination (:2144-2150, :2254-2262) while FEE_REDUCE/DEFIBRILLATE stages remain allowed (:1248-1251); both member checks swallow exceptions (fail open, :899-903 / :1066-1070); **corpus: 0 member CLOSE in 55 (n1) + 7 (n2) checked actions; D1 CONFIRMED IN PRODUCTION: nexus-02 defibrillated hive-member channels 3× (944921x2901x0 ×2, 944921x2899x0, status=completed) and both nodes issued member FEE_REDUCE delegations (9 on n1, 4 on n2)** — the permissive dead-capital path executes for real; operator ruled it a removal candidate (operator-decisions.md D1) |
+| CP-I5 hive member never CLOSE; dead-capital FEE_REDUCE/DEFIBRILLATE permitted (D1) | **verified (as-implemented)** | test_dead_capital_protections.py::test_hive_member_blocks_dead_capital_close (member emitted as DEFIBRILLATE with close_protection=HIVE_MEMBER — directly pins the D1 behavior) + protected-channel stage tests + test_capital_recycling.py::test_ineligible_hive_member; code confirmed on HEAD: dead-capital pipeline (:875) runs BEFORE the regular-pipeline member skip (:897-903); `_close_protection_reason` returns HIVE_MEMBER (:1064-1070) and blocks CLOSE staging (:1289-1293) and recycle nomination (:2144-2150, :2254-2262) while FEE_REDUCE/DEFIBRILLATE stages remain allowed (:1248-1251); both member checks swallow exceptions (fail open, :899-903 / :1066-1070); **corpus: 0 member CLOSE in 55 (n1) + 7 (n2) checked actions; D1 CONFIRMED IN PRODUCTION: nexus-02 defibrillated hive-member channels 3× (944921x2901x0 ×2, 944921x2899x0, status=completed) and both nodes issued member FEE_REDUCE delegations (9 on n1, 4 on n2)** — the permissive dead-capital path executes for real; operator ruled it a removal candidate (operator-decisions.md D1). **FIXED in commit c0731ff (2026-07-01)**: member skip now precedes the dead-capital pipeline (no member loser/stage/action of any kind) and all member checks fail CLOSED via `_is_protected_hive_member` — see Anomaly 1 |
 | CP-I6 static/passive/protect/no_close never auto-closed; fail closed | **verified** | TestDirectClose (static, passive, protect, no_close, dynamic-allowed, and exception→blocked) + TestExecuteCycle::test_execute_cycle_skips_close_for_static_policy; code confirmed (`_check_close_allowed` :3395-3432, fail closed :3428-3430) |
 | CP-I7 reservation before live open; released on failure, spent on success | **verified** | TestChannelOpen (reserves, releases on failure, aborts on reservation failure, marks spent, no-database caveat pinned by ::test_no_database_still_works, dry-run skips reservation) + TestDirectClose close-fee settle test; code confirmed (:3279-3306, :3338-3347, :3386-3390; close ledger :3610-3638; whole block inside `if db:` :3282 as contract caveats) |
 | CP-I8 size ∈ [min,max], ≤50% available (min-clamp last) | **verified** | TestChannelSizing (9 tests incl. ::test_size_clamped_to_min pinning the min-clamp-beats-50% caveat, ::test_never_more_than_half_available); code confirmed (:2975-2978, :3003-3005) |
@@ -45,6 +45,9 @@ execute_closes=False in all 194.
   the single most consequential untested branch in this module, and the same
   refactoring-inversion risk class as RB-I2. The regular loser-pipeline member
   skip (:897-903) is also untested (only the dead-capital-path variant is pinned).
+  **CLOSED by commit c0731ff (2026-07-01)**: member checks now fail CLOSED and
+  both the fail-closed branch and the loser-pipeline skip are test-pinned
+  (TestD1MemberDeadCapitalShortCircuit, TestMemberCloseProtectionWithoutClassMask).
 - CP-I2's defibrillation leg under dry_run (no diagnostic_rebalance call) is untested;
   cycle-level dry-run tests use CLOSE-only losers.
 - CP-I11's joint stacking bound (×[0.525, 1.50] from two independently clamped
@@ -70,21 +73,48 @@ execute_closes=False in all 194.
    operator-decisions.md D1 this is *not intended* and member protection should
    short-circuit dead-capital staging. Until that lands, real rebalance fees are
    being spent defibrillating fleet channels.
+   **FIXED in commit c0731ff (2026-07-01)**: the hive-member skip now runs
+   BEFORE `_build_dead_capital_loser` in `_identify_losers`, so members are
+   never emitted as DEAD_CAPITAL losers, defibrillated, or fee-reduced by the
+   dead-capital pipeline. The fail-open `is_hive_member` exception swallowing
+   (formerly :899-903 / :1064-1070 / `_is_recycle_eligible`) is also fixed:
+   all three member checks share `_is_protected_hive_member`, which treats an
+   adapter exception as protected (fail-closed) and logs a warning. Pinned by
+   TestD1MemberDeadCapitalShortCircuit in tests/test_dead_capital_protections.py.
+   This closes the "CP-I5 / CP-I15 fail-open member protection has no test" gap
+   above and amends CP-I5's caveat (dead-capital FEE_REDUCE/DEFIBRILLATE is no
+   longer permitted for members) and CP-I15's fail-open exception list (member
+   protection now fails CLOSED).
 2. **Posture change mid-corpus**: nexus-01 flipped planner_execute_closes
    False→True (76 → 118 status snapshots). Despite 118 snapshots with execution
    enabled, the corpus contains **zero completed closes** — all 44 nexus-01 close
    actions carry status=recommended. Either all close staging predates the flip or
    the budget/policy/cooldown gates blocked every attempt; Phase 3 should
    distinguish these before treating "planner closes" as an active behavior.
-3. nexus-02's 18 close/dry_run actions coexist with 194/194 status snapshots
+   **Phase 3 root cause + FIX (commit fccc485, 2026-07-01)**: execute_closes=true
+   was inert because planner_max_closes_per_cycle=0 disables execution in
+   `_close_execution_enabled` while the status surface still echoed
+   execute_closes=true. `get_status` (revenue-planner-status) now exposes
+   `max_closes_per_cycle` and `close_execution_effective`
+   (= execute_closes AND max_closes_per_cycle > 0) so the surface cannot claim
+   close execution that can never happen.
+3. **Defibrillation status honesty FIXED (commit e2fbdca, 2026-07-01)**: Phase 3
+   found 0/25 planner_actions defibrillations recorded status=completed had
+   delivered liquidity — capital-controls blocks and failed shocks were folded
+   into success=True. `rebalancer.diagnostic_rebalance` now returns an explicit
+   shock_status (completed | blocked | failed | pending) plus actual_fee_sats;
+   `_execute_defibrillation` records that outcome verbatim in planner_actions
+   (with actual_cost_sats backfilled for completed shocks). Pinned by
+   TestDefibrillationStatusHonesty in tests/test_capacity_planner.py.
+4. nexus-02's 18 close/dry_run actions coexist with 194/194 status snapshots
    reporting dry_run=False — the dry-run actions predate the corpus flag coverage
    (sweep checked the 15 flag-overlapping actions: consistent). Flag history is
    not fully reconstructible from snapshots.
-4. Ledger id continuity gaps in the sweep reconstruction (17 ids on n1, 2 on n2)
+5. Ledger id continuity gaps in the sweep reconstruction (17 ids on n1, 2 on n2)
    are a snapshot-cadence artifact (revenue-planner-history.json windows), not
    evidence of missing invariant checks — but they mean per-cycle counting (CP-I4)
    was verified on the *observable* subset only.
-5. Observed action mix is heavily advisory: fee_reduce/delegated 41, close
+6. Observed action mix is heavily advisory: fee_reduce/delegated 41, close
    recommended/dry_run 62, defibrillate/completed 25, opens 0. The planner's
    revenue role in this corpus is recommendations plus defibrillation spend, not
    capital redeployment — relevant to CP-H1/CP-H3 feasibility in Phase 4.
