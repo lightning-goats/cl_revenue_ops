@@ -22,6 +22,20 @@ the fail-open `is_hive_member` exception swallowing noted in CP-I5 at the same t
 Until then, Phase 2 verifies CP-I5 against current (permissive) behavior and flags
 any corpus episode where a member was actually defibrillated.
 
+## D3 — Hermes study terminated (2026-07-01)
+
+**Ruling (Sat):** "We're no longer doing the hermes study." The hermes gateway /
+collection stack is not being restored. The observational corpus is frozen as-is:
+2026-05-19 → 2026-06-20 continuous, plus a one-shot 2026-07-01 capture that closed
+the forwards backlog losslessly.
+
+**Consequences for the campaign:** Phase 0's pending acceptance criterion (a ≥95%
+post-fix coverage week) is moot — the corpus quality findings stand as final. Phases
+2–4 proceed against the frozen corpus. Phase 5 (ongoing scorecard *in the hermes
+report pipeline*) must be re-scoped: the sweep scripts in tools/audit/ remain
+runnable standalone against any future data source, but there is no hermes cadence
+to wire them into.
+
 ## D2 — Fleet-loss masking in profitability (profitability_analyzer)
 
 **Question:** Structural protection upgrades UNDERWATER → BREAK_EVEN for hive
