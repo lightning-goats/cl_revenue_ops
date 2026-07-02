@@ -6386,10 +6386,19 @@ def revenue_spend_reserve(
         if amount_sats <= 0:
             return {"error": "amount_sats must be > 0"}
         with _spend_reserve_lock:
-            budget = _total_cost_budget_status()
+            # DD1 / P2-011: gate against a LIVE unified budget (force_fresh
+            # bypasses the 30s telemetry memo) so N reservations in one window
+            # cannot pass against the same stale snapshot. The AUTHORITATIVE
+            # cross-category rail is enforced inside reserve_spend's
+            # BEGIN IMMEDIATE (below) — this pre-check only yields a friendly
+            # early rejection.
+            budget = _total_cost_budget_status(force_fresh=True)
             if "error" in budget:
                 return budget
             remaining = int(budget.get("remaining_sats", 0) or 0)
+            effective_budget_sats = int(budget.get("effective_budget_sats", 0) or 0)
+            budget_window_hours = int(budget.get("window_hours", 24) or 24)
+            budget_since = int(time.time()) - (budget_window_hours * 3600)
             if amount_sats > remaining:
                 return {
                     "status": "rejected",
@@ -6412,6 +6421,8 @@ def revenue_spend_reserve(
                 reference_id=reference_id,
                 channel_id=channel_id,
                 metadata=metadata,
+                effective_budget_sats=effective_budget_sats,
+                since_timestamp=budget_since,
             )
         if not ok:
             return {"status": "error", "error": "Failed to reserve spend"}
@@ -6838,12 +6849,18 @@ _total_cost_budget_memo_lock = threading.Lock()
 _total_cost_budget_reentry = threading.local()
 
 
-def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, Any]:
+def _total_cost_budget_status(window_hours: Optional[int] = None,
+                              force_fresh: bool = False) -> Dict[str, Any]:
     """Unified budget status across rebalances, Boltz swaps, and on-chain liquidity ops.
 
     Memoized per window_hours with a short TTL; guarded against re-entrant
     evaluation from cost-component providers (returns the last cached value or
     a minimal safe result instead of recursing).
+
+    DD1 / P2-011: gating callers (the reservation path) MUST pass
+    ``force_fresh=True`` so they never gate against the 30s-stale memo. The memo
+    remains for non-gating telemetry reads (dashboards, status), which the fresh
+    recompute still refreshes.
     """
     if config is None or database is None:
         return {"error": "Plugin not initialized"}
@@ -6855,11 +6872,12 @@ def _total_cost_budget_status(window_hours: Optional[int] = None) -> Dict[str, A
     # dict(): a shallow copy shares the nested components/category dicts
     # with the memo, so a caller mutating its copy would poison every
     # cached read for the TTL window. The dict is small and the 30s TTL
-    # makes the copy cost irrelevant.
-    with _total_cost_budget_memo_lock:
-        entry = _total_cost_budget_memo.get(wh)
-        if entry is not None and (time.monotonic() - entry[0]) < _TOTAL_COST_BUDGET_MEMO_TTL_SECONDS:
-            return copy.deepcopy(entry[1])
+    # makes the copy cost irrelevant. Skipped entirely when force_fresh.
+    if not force_fresh:
+        with _total_cost_budget_memo_lock:
+            entry = _total_cost_budget_memo.get(wh)
+            if entry is not None and (time.monotonic() - entry[0]) < _TOTAL_COST_BUDGET_MEMO_TTL_SECONDS:
+                return copy.deepcopy(entry[1])
 
     # Re-entrancy guard: never recurse into a full recomputation. Prefer the
     # last known value for this window (even if stale); otherwise return a

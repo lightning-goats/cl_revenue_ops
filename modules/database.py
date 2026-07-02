@@ -118,6 +118,18 @@ def _reserve_budget_atomic(conn, reservation_id: str, amount_sats: int,
 
     conn.execute("BEGIN IMMEDIATE")
 
+    # DD1 / P1-003: cross-category active generic reservations + committed
+    # generic spend events must count against the SAME unified budget as the
+    # rebalance category. Because this whole check runs inside BEGIN IMMEDIATE
+    # (which grabs the single WAL writer lock up front), it is serialized
+    # against the generic-ledger reserve path (reserve_spend, also BEGIN
+    # IMMEDIATE) — so the two categories can never jointly overshoot the budget.
+    generic_reserved_row = conn.execute(
+        "SELECT COALESCE(SUM(reserved_sats), 0) FROM spend_reservations "
+        "WHERE status = 'active'",
+    ).fetchone()
+    generic_reserved = generic_reserved_row[0] if generic_reserved_row else 0
+
     # --- Daily check ---
     spent_row = conn.execute(
         "SELECT COALESCE(SUM(cost_sats), 0) FROM rebalance_costs WHERE timestamp >= ?",
@@ -132,7 +144,13 @@ def _reserve_budget_atomic(conn, reservation_id: str, amount_sats: int,
     ).fetchone()
     daily_reserved = reserved_row[0] if reserved_row else 0
 
-    daily_committed = daily_spent + daily_reserved
+    daily_generic_spent_row = conn.execute(
+        "SELECT COALESCE(SUM(amount_sats), 0) FROM spend_events WHERE timestamp >= ?",
+        (since_timestamp,),
+    ).fetchone()
+    daily_generic_spent = daily_generic_spent_row[0] if daily_generic_spent_row else 0
+
+    daily_committed = daily_spent + daily_reserved + generic_reserved + daily_generic_spent
     daily_remaining = budget_limit - daily_committed
 
     if amount_sats > daily_remaining:
@@ -154,7 +172,13 @@ def _reserve_budget_atomic(conn, reservation_id: str, amount_sats: int,
         ).fetchone()
         weekly_reserved = weekly_reserved_row[0] if weekly_reserved_row else 0
 
-        weekly_committed = weekly_spent + weekly_reserved
+        weekly_generic_spent_row = conn.execute(
+            "SELECT COALESCE(SUM(amount_sats), 0) FROM spend_events WHERE timestamp >= ?",
+            (weekly_since_timestamp,),
+        ).fetchone()
+        weekly_generic_spent = weekly_generic_spent_row[0] if weekly_generic_spent_row else 0
+
+        weekly_committed = weekly_spent + weekly_reserved + generic_reserved + weekly_generic_spent
         weekly_remaining = weekly_budget_limit - weekly_committed
 
         if amount_sats > weekly_remaining:
@@ -3743,8 +3767,21 @@ class Database:
 
     def reserve_spend(self, reservation_id: str, amount_sats: int, category: str,
                      subcategory: Optional[str] = None, reference_id: Optional[str] = None,
-                     channel_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> bool:
-        """Create a generic spend reservation (best-effort, caller enforces budget)."""
+                     channel_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+                     effective_budget_sats: Optional[int] = None,
+                     since_timestamp: Optional[int] = None) -> bool:
+        """Create a generic spend reservation.
+
+        DD1 / P1-003: when ``effective_budget_sats`` is provided, the unified
+        cross-category budget is enforced INSIDE this reservation's
+        BEGIN IMMEDIATE transaction. Because BEGIN IMMEDIATE grabs the single
+        WAL writer lock up front, this check is serialized against the rebalance
+        reserve path (_reserve_budget_atomic, also BEGIN IMMEDIATE) — the sum of
+        generic spend_reservations + rebalance budget_reservations + committed
+        spends can never jointly exceed the budget (no cross-category TOCTOU).
+        When ``effective_budget_sats`` is None the reservation is best-effort
+        (caller enforces budget), preserving prior direct-caller behavior.
+        """
         conn = self._get_connection()
         now = int(time.time())
         amount = self._sanitize_amount(amount_sats, "reserved_sats")
@@ -3757,6 +3794,8 @@ class Database:
         if not cat:
             return False
         meta_json = json.dumps(metadata or {}, sort_keys=True) if metadata else None
+        enforce_budget = effective_budget_sats is not None
+        budget_since = int(since_timestamp) if since_timestamp is not None else (now - 24 * 3600)
         # P2-003: The terminal-state guard SELECT and the INSERT OR REPLACE are a
         # read-then-write pair. Wrap them in one BEGIN IMMEDIATE so the status
         # check and the write cannot interleave with (or be split by a crash
@@ -3771,6 +3810,7 @@ class Database:
                 "SELECT status FROM spend_reservations WHERE reservation_id = ?",
                 (rid,),
             ).fetchone()
+            existing_active_sats = 0
             if existing is not None:
                 status = existing["status"] if not isinstance(existing, tuple) else existing[0]
                 if str(status) in ("spent", "released"):
@@ -3778,6 +3818,50 @@ class Database:
                     self.plugin.log(
                         f"Spend reservation {rid} already {status}; refusing to "
                         "resurrect to active",
+                        level='warn',
+                    )
+                    return False
+                if str(status) == "active":
+                    # Re-reserving an active id REPLACES its amount, so only the
+                    # delta counts against the budget (avoid double-counting).
+                    row_amt = conn.execute(
+                        "SELECT reserved_sats FROM spend_reservations WHERE reservation_id = ?",
+                        (rid,),
+                    ).fetchone()
+                    if row_amt is not None:
+                        existing_active_sats = int(
+                            row_amt["reserved_sats"] if not isinstance(row_amt, tuple) else row_amt[0]
+                        )
+            if enforce_budget:
+                # Live cross-category total, read inside the writer lock.
+                gen_row = conn.execute(
+                    "SELECT COALESCE(SUM(reserved_sats), 0) FROM spend_reservations "
+                    "WHERE status = 'active'",
+                ).fetchone()
+                gen_reserved = int(gen_row[0] if gen_row else 0)
+                reb_row = conn.execute(
+                    "SELECT COALESCE(SUM(reserved_sats), 0) FROM budget_reservations "
+                    "WHERE status = 'active'",
+                ).fetchone()
+                reb_reserved = int(reb_row[0] if reb_row else 0)
+                reb_cost_row = conn.execute(
+                    "SELECT COALESCE(SUM(cost_sats), 0) FROM rebalance_costs WHERE timestamp >= ?",
+                    (budget_since,),
+                ).fetchone()
+                reb_committed = int(reb_cost_row[0] if reb_cost_row else 0)
+                gen_committed_row = conn.execute(
+                    "SELECT COALESCE(SUM(amount_sats), 0) FROM spend_events WHERE timestamp >= ?",
+                    (budget_since,),
+                ).fetchone()
+                gen_committed = int(gen_committed_row[0] if gen_committed_row else 0)
+                # Exclude this id's current active amount (it is being replaced).
+                already = gen_reserved + reb_reserved + reb_committed + gen_committed - existing_active_sats
+                if amount + already > int(effective_budget_sats):
+                    conn.execute("ROLLBACK")
+                    self.plugin.log(
+                        f"Spend reservation {rid} rejected: unified budget "
+                        f"{effective_budget_sats} would be exceeded "
+                        f"(requested {amount} + committed/reserved {already})",
                         level='warn',
                     )
                     return False
@@ -3871,16 +3955,37 @@ class Database:
         ts = int(timestamp or time.time())
         amount = self._sanitize_amount(amount_sats, "amount_sats")
         meta_json = json.dumps(metadata or {}, sort_keys=True) if metadata else None
-        try:
-            conn.execute("""
-                INSERT OR REPLACE INTO spend_events
-                (event_id, category, subcategory, amount_sats, timestamp, reference_id, channel_id, source, metadata_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (eid, cat, subcategory, amount, ts, reference_id, channel_id, source, meta_json))
-            return True
-        except Exception as e:
-            self.plugin.log(f"Record spend event failed: {e}", level='error')
-            return False
+        # P2-008: a spend event that fails to persist under-counts the unified
+        # budget in the OVERSPEND-permitting direction. A transient
+        # "database is locked" (OperationalError) must NOT be swallowed into a
+        # silent lost write — retry a bounded number of times, then propagate so
+        # the caller (e.g. mark_spend_reservation_spent) can roll back rather
+        # than report the reservation spent against a lost event.
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                conn.execute("""
+                    INSERT OR REPLACE INTO spend_events
+                    (event_id, category, subcategory, amount_sats, timestamp, reference_id, channel_id, source, metadata_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (eid, cat, subcategory, amount, ts, reference_id, channel_id, source, meta_json))
+                return True
+            except sqlite3.OperationalError as e:
+                last_exc = e
+                self.plugin.log(
+                    f"Record spend event transient failure (attempt {attempt + 1}/3): {e}",
+                    level='warn',
+                )
+                time.sleep(0.05 * (attempt + 1))
+            except Exception as e:
+                # Non-transient (e.g. programming/schema error): do not silently
+                # lose the write — surface it to the caller.
+                self.plugin.log(f"Record spend event failed: {e}", level='error')
+                raise
+        self.plugin.log(
+            f"Record spend event failed after retries: {last_exc}", level='error'
+        )
+        raise last_exc if last_exc is not None else RuntimeError("record_spend_event failed")
 
     def get_category_spend_sats(self, category: str,
                                 subcategory: Optional[str] = None,
