@@ -3699,10 +3699,25 @@ class Database:
         """
         conn = self._get_connection()
         cutoff = int(time.time()) - max_age_seconds
+        # P4-015: never force-release a reservation whose payment is still
+        # in-flight. The rebalance engine holds the reservation (P4-007) while
+        # its HTLC is unresolved by parking the rebalance_history row as
+        # 'pending_settlement'; reconcile_pending_settlements owns the terminal
+        # release/spend once listsendpays reports a final state. The reservation
+        # is linked to that row by reservation_id == str(rebalance_history.id)
+        # (see rebalance_engine_v2._run_single / _reconcile_pending_row). Skip
+        # any active reservation matching a still-pending row so the budget stays
+        # held; a genuinely-abandoned reservation (no pending row, e.g. a crashed
+        # job) is still released, and a reservation whose pending row terminally
+        # resolves is releasable on the next sweep.
         cursor = conn.execute("""
             UPDATE budget_reservations
             SET status = 'released'
             WHERE status = 'active' AND reserved_at < ?
+              AND reservation_id NOT IN (
+                  SELECT CAST(id AS TEXT) FROM rebalance_history
+                  WHERE status = 'pending_settlement'
+              )
         """, (cutoff,))
         count = cursor.rowcount
         if count > 0:
