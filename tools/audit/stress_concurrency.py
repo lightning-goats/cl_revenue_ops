@@ -26,6 +26,10 @@ What it does
     - Boltz-swap reservations via the P4-014 atomic path
       (``category="boltz"`` reserve_spend against the live unified budget) so
       the budget invariant now covers the boltz leg of DD1's cross-category rail
+    - chainswap reservations via the P4-023 atomic path (the SIXTH reserver;
+      ``category="boltz"`` reserve_spend on the same boltz rail
+      ``_open_swap_budget_reservation`` drives) so budget-never-exceeded now
+      covers the 6th (chainswap) swap-create spend path
     - capacity-planner channel_open reservations via the P4-018 atomic path
       (``category="channel_open"`` reserve_spend against the live unified budget)
       so budget-never-exceeded now covers the FOURTH (planner) daemon spend path
@@ -432,6 +436,58 @@ class StressHarness:
                 self.record_exception(f"boltz_reserve[{wid}]", exc)
             self.bump()
 
+    def worker_chainswap_reserve(self, wid):
+        """Firehose: chainswap reservations via the P4-023 atomic path.
+
+        chainswap (createchainswap) is the 6th swap-create; after P4-023 it
+        reserves its estimated swap fee through the SAME boltz rail as loop_in /
+        loop_out — category="boltz" reserve_spend against the LIVE unified
+        budget inside _reserve_budget_atomic's BEGIN IMMEDIATE (via
+        capex_budget.reserve_boltz_swap_budget, the path
+        boltz_manager._open_swap_budget_reservation drives). This is the SIXTH
+        reserver on DD1's cross-category rail: a chainswap reservation must be
+        counted by (and count) the rebalance, generic, boltz, planner, and
+        defibrillation reservations, so budget-never-exceeded now covers all six
+        autonomous spend paths. reserve + release churns the chainswap
+        commitment against the shared budget.
+        """
+        mod = self.mod
+        db = mod.database
+        rng = random.Random(self.rng_seed * 7000 + wid)
+        counter = 0
+        live = deque()
+        while not self.stop.is_set():
+            counter += 1
+            roll = rng.random()
+            try:
+                if roll < 0.75 or not live:
+                    rid = f"boltz-swap:chain-{wid}-{counter}"
+                    amt = rng.randint(200, max(300, self.budget_sats // 3))
+                    try:
+                        prov = mod._total_cost_budget_limit_provider()
+                        eff = int(prov.get("effective_budget_sats", self.budget_sats) or 0)
+                    except Exception:
+                        eff = self.budget_sats
+                    ok = db.reserve_spend(
+                        reservation_id=rid,
+                        amount_sats=amt,
+                        category="boltz",
+                        subcategory="swap_fee",
+                        effective_budget_sats=eff,
+                        since_timestamp=self._since_24h(),
+                    )
+                    if ok:
+                        live.append(rid)
+                    self.journal(f"chain{wid}", "chainswap_reserve", amt, "boltz",
+                                 f"ok={ok},eff={eff}")
+                else:
+                    rid = live.popleft()
+                    ok = db.release_spend_reservation(rid)
+                    self.journal(f"chain{wid}", "chainswap_release", None, "boltz", f"ok={ok}")
+            except Exception as exc:
+                self.record_exception(f"chainswap_reserve[{wid}]", exc)
+            self.bump()
+
     def worker_planner_open_reserve(self, wid):
         """Firehose: capacity-planner channel_open reservations via the P4-018
         atomic path.
@@ -700,6 +756,8 @@ class StressHarness:
             spawn(self.worker_rebalance_reserve, f"rebalance-{i}", i)
         for i in range(n):
             spawn(self.worker_boltz_reserve, f"boltz-{i}", i)
+        for i in range(n):
+            spawn(self.worker_chainswap_reserve, f"chainswap-{i}", i)
         for i in range(n):
             spawn(self.worker_planner_open_reserve, f"planner-{i}", i)
         for i in range(n):
