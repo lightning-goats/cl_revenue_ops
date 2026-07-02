@@ -7064,7 +7064,8 @@ class FeeController:
                        channel_info: Optional[Dict[str, Any]] = None,
                        htlcmin_msat: Optional[int] = None,
                        htlcmax_msat: Optional[int] = None,
-                       base_fee_msat_override: Optional[int] = None) -> Dict[str, Any]:
+                       base_fee_msat_override: Optional[int] = None,
+                       force: bool = False) -> Dict[str, Any]:
         """
         Set the fee for a channel.
 
@@ -7138,7 +7139,15 @@ class FeeController:
             peer_id = channel_info.get("peer_id", "")
             old_fee_ppm = channel_info.get("fee_proportional_millionths", 0)
             hive_member_zero_fee = self._hive_member_zero_fee_active(peer_id)
-            if hive_member_zero_fee:
+            # DD6/DEF-081: an explicit operator force=true set-fee overrides the
+            # automatic fleet zero-fee policy. force means the operator has
+            # deliberately chosen a non-zero fee on a hive peer (already clamped
+            # to the DD2 [min_fee_ppm, max_fee_ppm] rail at the revenue-set-fee
+            # RPC layer); only automatic cycles and non-force sets keep the
+            # zero-fee fleet policy. Without the force gate the clamp below would
+            # clobber the operator's explicit choice.
+            apply_hive_zero_fee = hive_member_zero_fee and not force
+            if apply_hive_zero_fee:
                 if fee_ppm != 0:
                     self.plugin.log(
                         f"HIVE_MEMBER_FEE: {resolved_channel_id[:16]}... forcing 0 ppm fleet policy",
@@ -7186,7 +7195,7 @@ class FeeController:
                 feebase_msat = int(base_fee_msat_override)
             else:
                 feebase_msat = self._resolve_base_fee_msat(peer_id, cfg)
-            if hive_member_zero_fee:
+            if apply_hive_zero_fee:
                 feebase_msat = 0
             # Use setchannel command
             rpc_params = {
