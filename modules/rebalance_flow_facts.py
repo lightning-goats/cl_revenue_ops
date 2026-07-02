@@ -31,15 +31,27 @@ def _neutral(channel_id: str) -> ChannelFlowFacts:
     )
 
 
+def _cfg_get(cfg, name, default):
+    """Read a config value, falling back to default only when absent or None.
+
+    Uses an ``is None`` check rather than truthiness so a legitimate falsy
+    setting (e.g. ``rebalance_utilization_min_forwards = 0`` to disable the
+    thin-history gate, or ``rebalance_utilization_floor = 0.0``) is respected
+    instead of being silently replaced by the default.
+    """
+    value = getattr(cfg, name, default)
+    return default if value is None else value
+
+
 def compute_channel_flow_facts(db, channel_id: str, capacity_sats: int, now: int, cfg) -> ChannelFlowFacts:
     if capacity_sats <= 0:
         return _neutral(channel_id)
     try:
-        activity_window = int(getattr(cfg, "rebalance_activity_window_seconds", 3600) or 3600)
-        util_days = int(getattr(cfg, "rebalance_utilization_window_days", 7) or 7)
-        floor = float(getattr(cfg, "rebalance_utilization_floor", 0.05) or 0.05)
-        ceiling = float(getattr(cfg, "rebalance_utilization_ceiling", 1.0) or 1.0)
-        min_forwards = int(getattr(cfg, "rebalance_utilization_min_forwards", 5) or 5)
+        activity_window = int(_cfg_get(cfg, "rebalance_activity_window_seconds", 3600))
+        util_days = int(_cfg_get(cfg, "rebalance_utilization_window_days", 7))
+        floor = float(_cfg_get(cfg, "rebalance_utilization_floor", 0.05))
+        ceiling = float(_cfg_get(cfg, "rebalance_utilization_ceiling", 1.0))
+        min_forwards = int(_cfg_get(cfg, "rebalance_utilization_min_forwards", 5))
 
         short_since = now - activity_window
         long_since = now - util_days * 86_400

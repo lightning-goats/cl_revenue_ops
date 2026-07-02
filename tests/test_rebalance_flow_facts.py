@@ -115,3 +115,24 @@ def test_fail_open_on_db_error():
     assert facts.out_sats_window == 0 and facts.in_sats_window == 0
     assert facts.forward_count_window == 0
     assert facts.channel_id == "A"
+
+
+def test_falsy_config_values_are_respected(tmp_path):
+    """min_forwards=0 disables the thin-history gate and floor=0.0 removes the
+    floor clamp — legitimate falsy settings must not collapse to defaults."""
+    db = _make_db(tmp_path)
+    now = 2_000_000
+    # a single small outbound forward: 1000 sats out of a 1M-sat channel -> raw 0.001
+    _seed(db, out_channel="A", in_channel="B", out_msat=1_000_000, in_msat=1_000_000, ts=now - 50)
+
+    class _FalsyCfg:
+        rebalance_activity_window_seconds = 3600
+        rebalance_utilization_window_days = 7
+        rebalance_utilization_floor = 0.0        # no floor
+        rebalance_utilization_ceiling = 1.0
+        rebalance_utilization_min_forwards = 0   # gate disabled
+
+    facts = compute_channel_flow_facts(db, "A", capacity_sats=1_000_000, now=now, cfg=_FalsyCfg())
+    # gate disabled -> realized even with 1 forward; floor 0.0 -> raw 0.001 not lifted to 0.05
+    assert facts.utilization_is_realized is True
+    assert abs(facts.realized_utilization - 0.001) < 1e-9
