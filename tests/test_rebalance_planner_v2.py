@@ -3,7 +3,11 @@
 import pytest
 
 from modules.rebalance_planner_v2 import RebalancePlanner
-from modules.rebalance_state_v2 import ChannelState, StateSnapshot
+from modules.rebalance_state_v2 import (
+    ChannelState,
+    StateSnapshot,
+    compute_size_tiered_bands,
+)
 
 
 def _ch(
@@ -16,6 +20,8 @@ def _ch(
     is_valuable=True,
     remaining_budget_sats=500,
     cooldown_active=False,
+    target_band_low=0.35,
+    target_band_high=0.65,
 ):
     # Mirror the Phase 2 role-aware eligibility derived in build_state_snapshot
     # so planner unit tests describe the same semantics as the live snapshot.
@@ -57,6 +63,8 @@ def _ch(
         dest_reason=dest_reason,
         dest_urgency=dest_urgency,
         source_drain_score=source_drain_score,
+        target_band_low=target_band_low,
+        target_band_high=target_band_high,
     )
 
 
@@ -187,6 +195,68 @@ class TestPairGeneration:
 
         # Destination budget caps spend even when source has more.
         assert result.selected[0].pair_budget_sats == 500
+
+    def test_generate_pairs_threads_realized_utilization_without_transpose(self):
+        """Upstream pattern #2 regression guard: _generate_pairs must map
+        src.realized_utilization -> PairCandidate.source_realized_utilization
+        and dest.realized_utilization -> PairCandidate.dest_realized_utilization
+        (and the matching *_is_realized flags) WITHOUT swapping src/dest. Use
+        distinct, asymmetric values on each side so a transpose bug (source
+        and dest utilization silently swapped) would fail this assertion."""
+        import dataclasses
+
+        planner = RebalancePlanner()
+        src = dataclasses.replace(
+            _ch(channel_id="src", peer_id="02" + "aa" * 32, local_ratio=0.90),
+            realized_utilization=0.7,
+            utilization_is_realized=True,
+        )
+        dest = dataclasses.replace(
+            _ch(channel_id="dest", peer_id="02" + "bb" * 32, local_ratio=0.10),
+            realized_utilization=0.3,
+            utilization_is_realized=False,
+        )
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        pair = result.selected[0]
+        assert pair.source_channel_id == "src"
+        assert pair.dest_channel_id == "dest"
+        assert pair.source_realized_utilization == pytest.approx(0.7)
+        assert pair.source_utilization_is_realized is True
+        assert pair.dest_realized_utilization == pytest.approx(0.3)
+        assert pair.dest_utilization_is_realized is False
+
+    def test_generate_pairs_threads_activity_sats_without_transpose(self):
+        """Task 8 coverage gap: _generate_pairs must map
+        src.activity_out_sats -> PairCandidate.source_activity_out_sats and
+        dest.activity_in_sats -> PairCandidate.dest_activity_in_sats WITHOUT
+        reading the wrong attribute (activity_out vs activity_in) or
+        swapping src/dest. Use distinct, asymmetric values on both fields of
+        both channels so either mistake would fail this assertion."""
+        import dataclasses
+
+        planner = RebalancePlanner()
+        src = dataclasses.replace(
+            _ch(channel_id="src", peer_id="02" + "aa" * 32, local_ratio=0.90),
+            activity_out_sats=700_000,
+            activity_in_sats=111,
+        )
+        dest = dataclasses.replace(
+            _ch(channel_id="dest", peer_id="02" + "bb" * 32, local_ratio=0.10),
+            activity_in_sats=900_000,
+            activity_out_sats=222,
+        )
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        pair = result.selected[0]
+        assert pair.source_channel_id == "src"
+        assert pair.dest_channel_id == "dest"
+        assert pair.source_activity_out_sats == 700_000
+        assert pair.dest_activity_in_sats == 900_000
 
 
 class TestSkipReasons:
@@ -487,3 +557,263 @@ class TestScoring:
 
         assert len(result.selected) == 1
         assert result.selected[0].source_channel_id == "very_full"
+
+
+def test_small_channel_keeps_flat_band():
+    caps = {"s1": 1_000_000, "s2": 1_000_000, "s3": 1_000_000, "big": 20_000_000}
+    bands = compute_size_tiered_bands(caps, percentile=0.5, small_half_width=0.15, flat_low=0.35, flat_high=0.65)
+    assert bands["s1"] == (0.35, 0.65)
+
+
+def test_large_channel_gets_wider_band():
+    caps = {"s1": 1_000_000, "s2": 1_000_000, "s3": 1_000_000, "big": 20_000_000}
+    bands = compute_size_tiered_bands(caps, percentile=0.5, small_half_width=0.15, flat_low=0.35, flat_high=0.65)
+    low, high = bands["big"]
+    assert low < 0.35 and high > 0.65
+    assert 0.0 < low < high < 1.0
+    # Symmetric widening: the distance below 0.5 must equal the distance
+    # above 0.5 (big channels tolerate more imbalance in EITHER direction,
+    # they are not skewed to tolerate more remote-heaviness than local).
+    assert abs((high - 0.5) - (0.5 - low)) < 1e-9
+
+
+def test_empty_capacities_returns_empty():
+    assert compute_size_tiered_bands({}, percentile=0.5, small_half_width=0.15, flat_low=0.35, flat_high=0.65) == {}
+
+
+class TestSizeTieredPlannerClassification:
+    """Task 7: the planner must classify each channel against ITS OWN
+    per-channel target_band_low/target_band_high, not the planner's flat
+    self.target_band_low/high scalars."""
+
+    def test_large_channel_classified_by_its_own_wider_band_not_flat(self):
+        """A large channel sitting at local_ratio=0.70 would be classified
+        over_local under the flat 0.65 band, but its own asymmetric
+        per-channel band (e.g. high=0.80) says it's still inside band --
+        the planner must honor the per-channel band."""
+        planner = RebalancePlanner(target_band_low=0.35, target_band_high=0.65)
+
+        # Big channel: local_ratio 0.70 is > flat 0.65 (would be over_local
+        # under the OLD flat-band logic) but its own per-channel band
+        # (0.20, 0.80) says it is still comfortably inside band.
+        big = _ch(
+            channel_id="big",
+            peer_id="02" + "aa" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.70,
+            value_class="active",
+            target_band_low=0.20,
+            target_band_high=0.80,
+        )
+        # Small channel at the SAME 0.70 ratio, flat band -- over_local.
+        small = _ch(
+            channel_id="small",
+            peer_id="02" + "bb" * 32,
+            capacity_sats=1_000_000,
+            local_ratio=0.70,
+            value_class="active",
+            target_band_low=0.35,
+            target_band_high=0.65,
+        )
+        dest = _ch(
+            channel_id="dest",
+            peer_id="02" + "cc" * 32,
+            local_ratio=0.10,
+            target_band_low=0.35,
+            target_band_high=0.65,
+        )
+        snap = _snap(big, small, dest)
+
+        result = planner.plan(snap)
+
+        # Only the small channel should be selected as an over_local source;
+        # the big channel is inside its own (wider) band and should be
+        # skipped as "inside_band", not paired as a drain source.
+        assert len(result.selected) == 1
+        assert result.selected[0].source_channel_id == "small"
+        skip_reasons = {s.channel_id: s.reason for s in result.skipped}
+        assert skip_reasons.get("big") == "inside_band"
+
+    def test_toggle_off_matches_flat_band_behavior(self):
+        """When rebalance_size_tiered_targets is False, the engine builds no
+        target_bands map, so build_state_snapshot defaults every channel's
+        per-channel band to the flat cfg/default band. Classification with
+        all channels carrying (0.35, 0.65) must be identical to the
+        pre-feature flat-band behavior."""
+        planner = RebalancePlanner(target_band_low=0.35, target_band_high=0.65)
+
+        src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
+                  local_ratio=0.90, target_band_low=0.35, target_band_high=0.65)
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.10, target_band_low=0.35, target_band_high=0.65)
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        assert result.selected[0].source_channel_id == "src"
+        assert result.selected[0].dest_channel_id == "dest"
+
+
+class TestSizeTieredPlannerSizingAndScoring:
+    """FIX 2(a): sizing (source_excess/dest_need) and diagnostics must use
+    each channel's OWN per-channel band, not the planner's flat
+    self.target_band_low/high scalars -- coherent with classification."""
+
+    def test_drain_demand_excess_uses_source_own_band_not_flat(self):
+        """A big over-local channel with no over-remote partner publishes its
+        residual via DrainDemand. Its excess_sats must be measured against
+        ITS OWN target_band_high (0.80), not the planner's flat 0.65 --
+        giving a smaller excess than the old flat-band math would."""
+        planner = RebalancePlanner(target_band_low=0.35, target_band_high=0.65)
+
+        big = _ch(
+            channel_id="big",
+            peer_id="02" + "aa" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.85,
+            value_class="active",
+            target_band_low=0.20,
+            target_band_high=0.80,
+        )
+        snap = _snap(big)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 0
+        assert result.drain_demand.total_excess_sats > 0
+        entry = result.drain_demand.entries[0]
+        assert entry.channel_id == "big"
+        # Correct (own band 0.80): (0.85 - 0.80) * 20_000_000 = 1_000_000.
+        # Old flat-band bug (0.65): (0.85 - 0.65) * 20_000_000 = 4_000_000.
+        assert entry.excess_sats == 1_000_000
+
+    def test_pair_amount_uses_source_own_high_and_dest_own_low(self):
+        """A big source/dest pair whose per-channel bands are wider than the
+        flat planner scalars must have their sizing capped by the OWN
+        bands, not the flat 0.35/0.65 -- giving a smaller amount than the
+        pre-fix flat-band math would."""
+        planner = RebalancePlanner(
+            target_band_low=0.35, target_band_high=0.65, max_chunk_sats=10_000_000,
+        )
+
+        src = _ch(
+            channel_id="big_src",
+            peer_id="02" + "aa" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.85,
+            value_class="active",
+            target_band_low=0.20,
+            target_band_high=0.80,
+        )
+        dest = _ch(
+            channel_id="big_dest",
+            peer_id="02" + "bb" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.05,
+            value_class="active",
+            target_band_low=0.35,
+            target_band_high=0.65,
+        )
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        pair = result.selected[0]
+        assert pair.source_channel_id == "big_src"
+        assert pair.dest_channel_id == "big_dest"
+        # source_excess (own high 0.80): (0.85-0.80)*20_000_000 = 1_000_000.
+        # dest_need (own low 0.35, unchanged): (0.35-0.05)*20_000_000 = 6_000_000.
+        # amount = min(source_excess, dest_need, max_chunk) = 1_000_000.
+        # The pre-fix flat-band bug would have used source high=0.65,
+        # giving source_excess=4_000_000 and thus amount=4_000_000.
+        assert pair.amount_sats == 1_000_000
+
+        # Diagnostics (score_decomposition inputs) must also reflect the
+        # source's own band, not the flat one.
+        imbalance_score = pair.score_decomposition["inputs"]["imbalance_score"]
+        # src_imbalance = 0.85-0.80=0.05; dest_imbalance = 0.35-0.05=0.30.
+        assert imbalance_score == pytest.approx((0.05 + 0.30) / 2.0)
+
+
+def test_all_three_features_thread_onto_one_big_channel_pair():
+    """Composition guard (final review): the branch ships live default-ON
+    and every existing threading test above proves #2 (realized
+    utilization) or #1 (activity sats) thread onto a PairCandidate without
+    transposition IN ISOLATION, and TestSizeTieredPlannerSizingAndScoring
+    proves #3 (size-tiered per-channel band) drives sizing IN ISOLATION.
+    Nothing proves a single big channel can carry all three at once and
+    have every field land correctly on the SAME resulting PairCandidate --
+    e.g. that adding realized-utilization/activity fields to a ChannelState
+    doesn't disturb the per-channel-band sizing math, or vice versa.
+
+    Reuses the exact big_src/big_dest wide-band scenario from
+    test_pair_amount_uses_source_own_high_and_dest_own_low (already proven
+    to size to 1_000_000 via the channels' OWN (0.20, 0.80)/(0.35, 0.65)
+    bands, not the planner's flat scalars) and additionally decorates both
+    channels with realized utilization and live-activity facts, asserting
+    ALL THREE thread onto the one resulting pair with nothing swapped or
+    dropped."""
+    import dataclasses
+
+    planner = RebalancePlanner(
+        target_band_low=0.35, target_band_high=0.65, max_chunk_sats=10_000_000,
+    )
+
+    src = dataclasses.replace(
+        _ch(
+            channel_id="big_src",
+            peer_id="02" + "aa" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.85,
+            value_class="active",
+            target_band_low=0.20,
+            target_band_high=0.80,
+        ),
+        realized_utilization=0.8,
+        utilization_is_realized=True,
+        activity_out_sats=150_000,
+        activity_in_sats=10,
+    )
+    dest = dataclasses.replace(
+        _ch(
+            channel_id="big_dest",
+            peer_id="02" + "bb" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.05,
+            value_class="active",
+            target_band_low=0.35,
+            target_band_high=0.65,
+        ),
+        realized_utilization=0.3,
+        utilization_is_realized=False,
+        activity_in_sats=200_000,
+        activity_out_sats=20,
+    )
+    snap = _snap(src, dest)
+
+    result = planner.plan(snap)
+
+    assert len(result.selected) == 1
+    pair = result.selected[0]
+    assert pair.source_channel_id == "big_src"
+    assert pair.dest_channel_id == "big_dest"
+
+    # --- #3 (size-tiered band): sizing still uses the channels' OWN wide
+    # bands, not the planner's flat 0.35/0.65 -- identical to the
+    # single-feature test this scenario is copied from. ---
+    # source_excess (own high 0.80): (0.85-0.80)*20_000_000 = 1_000_000.
+    # dest_need (own low 0.35, unchanged): (0.35-0.05)*20_000_000 = 6_000_000.
+    # amount = min(source_excess, dest_need, max_chunk) = 1_000_000.
+    assert pair.amount_sats == 1_000_000
+
+    # --- #2 (realized utilization): threaded without transpose. ---
+    assert pair.source_realized_utilization == pytest.approx(0.8)
+    assert pair.source_utilization_is_realized is True
+    assert pair.dest_realized_utilization == pytest.approx(0.3)
+    assert pair.dest_utilization_is_realized is False
+
+    # --- #1 (activity): threaded without transpose. ---
+    assert pair.source_activity_out_sats == 150_000
+    assert pair.dest_activity_in_sats == 200_000

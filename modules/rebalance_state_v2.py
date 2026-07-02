@@ -67,6 +67,18 @@ class ChannelState:
     local_out_fee_ppm: int = 0
     historical_direct_fee_ppm: float = 0.0
     historical_sourced_fee_ppm: float = 0.0
+    # Upstream-pattern fields (#1 activity, #2 realized util, #3 per-channel band).
+    realized_utilization: float = 0.5
+    utilization_is_realized: bool = False
+    activity_out_sats: int = 0
+    activity_in_sats: int = 0
+    # Per-channel target band (from the target_bands map / cfg thresholds).
+    # Consumed by the planner's band classification AND pair sizing, and by
+    # dest_urgency/source_drain_score in build_state_snapshot (scoring_band_*).
+    # build_state_snapshot's function-scope target_band_low/high kwargs are the
+    # fallback used only when a channel has no per-channel band (flat behavior).
+    target_band_low: float = 0.35
+    target_band_high: float = 0.65
 
 
 @dataclass(frozen=True)
@@ -208,6 +220,52 @@ def _value_class(channel: ChannelInput, remaining_budget_sats: int = 0) -> str:
 # planner defaults so role metadata stays consistent without coupling modules.
 _DEFAULT_TARGET_BAND_LOW = 0.35
 _DEFAULT_TARGET_BAND_HIGH = 0.65
+
+
+# Cap on how far a large channel's band half-width can scale relative to the
+# small-channel half-width (e.g. 2.0 -> at most double the small-channel
+# widen amount), so extremely large channels don't get an unbounded band.
+_BAND_MAX_SIZE_SCALE = 2.0
+
+
+def compute_size_tiered_bands(
+    capacities: Mapping[str, Any],
+    percentile: float = 0.5,
+    small_half_width: float = 0.15,
+    flat_low: float = _DEFAULT_TARGET_BAND_LOW,
+    flat_high: float = _DEFAULT_TARGET_BAND_HIGH,
+) -> dict[str, Tuple[float, float]]:
+    """Per-channel (band_low, band_high) from the node's capacity distribution.
+
+    Channels at/below the reference capacity (a percentile of the size
+    distribution) keep the flat band (flat_low, flat_high). Channels above the
+    reference capacity get a symmetrically wider band (0.5 +/- small_half_width
+    * scale, scale capped at _BAND_MAX_SIZE_SCALE), so large channels tolerate
+    more imbalance in either direction and are rebalanced less often -- acting
+    as buffers rather than being force-balanced. Small channels keep the flat
+    band. Bounds clamped to (0.05, 0.45)/(0.55, 0.95).
+    Returns {channel_id: (low, high)}.
+    """
+    if not capacities:
+        return {}
+    caps_sorted = sorted(capacities.values())
+    idx = min(len(caps_sorted) - 1, max(0, int(percentile * (len(caps_sorted) - 1))))
+    reference = max(1, caps_sorted[idx])
+    bands: dict[str, Tuple[float, float]] = {}
+    for cid, cap in capacities.items():
+        cap = max(1, int(cap))
+        if cap <= reference:
+            low, high = flat_low, flat_high
+        else:
+            scale = min(_BAND_MAX_SIZE_SCALE, cap / float(reference))
+            widen = small_half_width * scale
+            low = 0.5 - widen
+            high = 0.5 + widen
+        bands[cid] = (
+            round(max(0.05, min(low, 0.45)), 6),
+            round(min(0.95, max(high, 0.55)), 6),
+        )
+    return bands
 # Phase 3 emergency-depleted threshold: below this local ratio a cooldown-held
 # destination is still refill-eligible. Default chosen to match the Polar S9
 # 6.6% local case while leaving normal under-band depletion (~10-30%) blocked.
@@ -271,10 +329,19 @@ def build_state_snapshot(
     target_band_high: float = _DEFAULT_TARGET_BAND_HIGH,
     target_emergency_low: float = _DEFAULT_TARGET_EMERGENCY_LOW,
     hive_bootstrap_budget_sats: int = 0,
+    flow_facts: Mapping[str, Any] | None = None,
+    target_bands: Mapping[str, Tuple[float, float]] | None = None,
+    cfg: Any = None,
 ) -> StateSnapshot:
     """Build a normalized, immutable v2 state snapshot."""
 
     budget_by_channel = _budget_lookup(capex_allocations)
+    if cfg is not None:
+        default_band_low = getattr(cfg, "low_liquidity_threshold", 0.35)
+        default_band_high = getattr(cfg, "high_liquidity_threshold", 0.65)
+    else:
+        default_band_low = 0.35
+        default_band_high = 0.65
     normalized_channels = []
     total_capacity_sats = 0
     total_remaining_budget_sats = 0
@@ -317,6 +384,16 @@ def build_state_snapshot(
             cooldown_override=cooldown_override,
         )
 
+        facts = (flow_facts or {}).get(channel.channel_id)
+        band = (target_bands or {}).get(channel.channel_id)
+        # FIX 2(b): dest_urgency/source_drain_score must be scored against
+        # THIS channel's own per-channel band (when one exists) so scoring
+        # stays coherent with band-based classification (Task 7). Fall back
+        # to the flat function-scope kwargs when the channel has no
+        # per-channel band -- identical to pre-feature behavior.
+        scoring_band_low = band[0] if band else target_band_low
+        scoring_band_high = band[1] if band else target_band_high
+
         normalized_channels.append(
             ChannelState(
                 channel_id=channel.channel_id,
@@ -339,10 +416,16 @@ def build_state_snapshot(
                 dest_eligible=dest_eligible,
                 source_reason=source_reason,
                 dest_reason=dest_reason,
-                dest_urgency=_refill_urgency(local_ratio, target_band_low),
-                source_drain_score=_drain_score(local_ratio, target_band_high),
+                dest_urgency=_refill_urgency(local_ratio, scoring_band_low),
+                source_drain_score=_drain_score(local_ratio, scoring_band_high),
                 budget_source=budget_source,
                 rebalance_bias=channel.rebalance_bias,
+                realized_utilization=(facts.realized_utilization if facts else 0.5),
+                utilization_is_realized=(facts.utilization_is_realized if facts else False),
+                activity_out_sats=(facts.out_sats_window if facts else 0),
+                activity_in_sats=(facts.in_sats_window if facts else 0),
+                target_band_low=(band[0] if band else default_band_low),
+                target_band_high=(band[1] if band else default_band_high),
             )
         )
         total_capacity_sats += capacity_sats

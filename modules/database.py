@@ -5161,6 +5161,50 @@ class Database:
 
         return row['forward_count'] if row else 0
 
+    def get_channel_flow_window(
+        self, channel_id: str, since_timestamp: int
+    ) -> Tuple[int, int, int]:
+        """
+        Directional forwarded volume + count for a channel since a timestamp.
+
+        Mirrors get_volume_since / get_forward_count_since (no status column
+        exists on `forwards` — all rows in the table represent settled
+        forwards, so no status filter is applied here either). Related to
+        get_channel_forwards (same directional shape) but adds a COUNT and
+        sat conversion for the rebalancer's ChannelFlowFacts. Note: a
+        self-referential forward (in_channel == out_channel == channel_id)
+        is counted in both directions.
+
+        Args:
+            channel_id: Channel to get flow facts for
+            since_timestamp: Unix timestamp to start counting from (exclusive)
+
+        Returns:
+            Tuple of (out_sats, in_sats, forward_count):
+                out_sats: Total volume sent out through channel_id (sats)
+                in_sats: Total volume received into channel_id (sats)
+                forward_count: Combined count of outbound + inbound forwards
+        """
+        conn = self._get_connection()
+
+        out_row = conn.execute("""
+            SELECT COALESCE(SUM(out_msat), 0) AS m, COUNT(*) AS c
+            FROM forwards
+            WHERE out_channel = ? AND timestamp > ?
+        """, (channel_id, since_timestamp)).fetchone()
+
+        in_row = conn.execute("""
+            SELECT COALESCE(SUM(in_msat), 0) AS m, COUNT(*) AS c
+            FROM forwards
+            WHERE in_channel = ? AND timestamp > ?
+        """, (channel_id, since_timestamp)).fetchone()
+
+        out_sats = base_to_sats_floor(out_row['m']) if out_row else 0
+        in_sats = base_to_sats_floor(in_row['m']) if in_row else 0
+        count = (out_row['c'] if out_row else 0) + (in_row['c'] if in_row else 0)
+
+        return out_sats, in_sats, count
+
     def get_last_forward_time(self, channel_id: str) -> Optional[int]:
         """
         Get the timestamp of the most recent forward through a channel.

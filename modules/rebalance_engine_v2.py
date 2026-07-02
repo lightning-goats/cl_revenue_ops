@@ -22,6 +22,7 @@ from .rebalance_coordination_overlay import (
     suppress_leased_pairs,
 )
 from .rebalance_execution import ExecutionResult
+from .rebalance_flow_facts import ChannelFlowFacts, compute_channel_flow_facts
 from .rebalance_native_executor_v2 import NativeRouteExecutor
 from .rebalance_hive_router import RebalanceHiveRouter
 from .rebalance_planner_v2 import RebalancePlanner
@@ -499,14 +500,28 @@ class RebalanceEngine:
         )
         dest_value_fee_ppm = max(dest_out_fee_ppm, dest_historical_direct_fee_ppm)
         source_opportunity_fee_ppm = max(source_out_fee_ppm, source_historical_direct_fee_ppm)
+        # Audit RE-H1/H2: use each channel's MEASURED utilization when
+        # available; otherwise fall back to the flat EXPECTED_UTILIZATION
+        # prior so pairs with no realized flow history score identically
+        # to pre-feature behavior.
+        dest_u = (
+            float(getattr(pair, "dest_realized_utilization", EXPECTED_UTILIZATION))
+            if getattr(pair, "dest_utilization_is_realized", False)
+            else EXPECTED_UTILIZATION
+        )
+        source_u = (
+            float(getattr(pair, "source_realized_utilization", EXPECTED_UTILIZATION))
+            if getattr(pair, "source_utilization_is_realized", False)
+            else EXPECTED_UTILIZATION
+        )
         destination_refill_value_sats = (
-            amount_sats * dest_value_fee_ppm / 1_000_000.0 * EXPECTED_UTILIZATION
+            amount_sats * dest_value_fee_ppm / 1_000_000.0 * dest_u
         )
         source_drain_value_sats = (
             amount_sats
             * source_historical_sourced_fee_ppm
             / 1_000_000.0
-            * EXPECTED_UTILIZATION
+            * source_u
         )
         expected_future_value_sats = (
             destination_refill_value_sats + source_drain_value_sats
@@ -515,17 +530,34 @@ class RebalanceEngine:
             amount_sats
             * source_opportunity_fee_ppm
             / 1_000_000.0
-            * EXPECTED_UTILIZATION
+            * source_u
             * SOURCE_UTILIZATION_DISCOUNT
         )
         failure_penalty_sats = (
             failure_count * expected_fee_sats * FAILURE_COST_RATE
         )
+
+        # Feature #1: soft, capped penalty for pairs whose channels are
+        # ALREADY being moved the "helpful" way by live forwarding (source
+        # draining outbound / dest refilling inbound) -- rebalancing them
+        # further is wasteful. Scales by the dest fee (same basis as the
+        # value term) and is capped so a strongly-EV pair still runs. With
+        # no activity facts (the default), helpful_flow_sats == 0 and this
+        # term is exactly 0.0, leaving final_score_sats unchanged.
+        activity_coeff = float(getattr(cfg, "rebalance_activity_penalty_coeff", 0.5) or 0.0)
+        activity_cap_frac = float(getattr(cfg, "rebalance_activity_penalty_cap_frac", 0.5) or 0.0)
+        helpful_flow_sats = int(getattr(pair, "source_activity_out_sats", 0) or 0) + \
+                            int(getattr(pair, "dest_activity_in_sats", 0) or 0)
+        raw_activity_penalty = activity_coeff * helpful_flow_sats * dest_value_fee_ppm / 1_000_000.0
+        activity_penalty_cap = activity_cap_frac * max(0.0, expected_future_value_sats)
+        activity_penalty_sats = round(min(raw_activity_penalty, activity_penalty_cap), 6)
+
         final_score_sats = round(
             p_success * expected_future_value_sats
             - expected_fee_sats
             - source_opportunity_sats
-            - failure_penalty_sats,
+            - failure_penalty_sats
+            - activity_penalty_sats,
             6,
         )
 
@@ -567,8 +599,23 @@ class RebalanceEngine:
             "expected_fee_sats": expected_fee_sats,
             "source_opportunity_sats": round(source_opportunity_sats, 6),
             "failure_penalty_sats": round(failure_penalty_sats, 6),
+            "activity_penalty_sats": activity_penalty_sats,
             "final_score_sats": final_score_sats,
-            "expected_utilization": EXPECTED_UTILIZATION,
+            # Reports the DEST utilization only; kept as `expected_utilization`
+            # for backward-compat with existing consumers. Source side is
+            # reported separately below via `source_utilization`.
+            "expected_utilization": round(dest_u, 6),
+            "utilization_source": (
+                "realized"
+                if getattr(pair, "dest_utilization_is_realized", False)
+                else "prior"
+            ),
+            "source_utilization": round(source_u, 6),
+            "source_utilization_source": (
+                "realized"
+                if getattr(pair, "source_utilization_is_realized", False)
+                else "prior"
+            ),
             "source_utilization_discount": SOURCE_UTILIZATION_DISCOUNT,
             "beats_do_nothing": beats_do_nothing,
             "rejection_reason": rejection_reason,
@@ -968,6 +1015,31 @@ class RebalanceEngine:
         fill_fraction = amount_sats / float(amount_sats + remaining_gap)
         return int(base_cooldown_secs * min(1.0, fill_fraction * 2.0))
 
+    def _build_flow_facts_map(
+        self, channels: List[Dict[str, Any]], cfg: Any, now_ts: int
+    ) -> Dict[str, ChannelFlowFacts]:
+        """Build the per-channel ChannelFlowFacts map for this cycle's snapshot.
+
+        Fail-open: with no database handle this returns an empty map, and
+        build_state_snapshot then falls back to neutral (prior) utilization
+        facts for every channel — identical to today's behavior.
+        compute_channel_flow_facts is itself fail-open per channel, so a
+        single bad DB read degrades that channel to neutral facts rather
+        than aborting the cycle.
+        """
+        if self.database is None:
+            return {}
+        flow_facts: Dict[str, ChannelFlowFacts] = {}
+        for ch in channels:
+            channel_id = ch.get("channel_id")
+            if not channel_id:
+                continue
+            capacity_sats = int(ch.get("capacity_sats") or 0)
+            flow_facts[channel_id] = compute_channel_flow_facts(
+                self.database, channel_id, capacity_sats, now_ts, cfg
+            )
+        return flow_facts
+
     def _build_snapshot(self) -> Optional[StateSnapshot]:
         """Build a normalized state snapshot from live data."""
         cfg = self.config if not hasattr(self.config, 'snapshot') else self.config.snapshot()
@@ -1185,6 +1257,30 @@ class RebalanceEngine:
                 "cooldown_override": cooldown_override,
             })
 
+        now_ts = int(time.time())
+        flow_facts = self._build_flow_facts_map(normalized, cfg, now_ts)
+
+        target_bands = None
+        if bool(getattr(cfg, "rebalance_size_tiered_targets", True)):
+            from modules.rebalance_state_v2 import compute_size_tiered_bands
+
+            caps = {
+                ch["channel_id"]: int(ch.get("capacity_sats") or 0)
+                for ch in normalized
+                if ch.get("channel_id")
+            }
+            target_bands = compute_size_tiered_bands(
+                caps,
+                percentile=float(
+                    getattr(cfg, "rebalance_size_reference_percentile", 0.5)
+                ),
+                small_half_width=float(
+                    getattr(cfg, "rebalance_small_channel_band_half_width", 0.15)
+                ),
+                flat_low=target_band_low,
+                flat_high=target_band_high,
+            )
+
         return build_state_snapshot(
             normalized,
             capex_allocations,
@@ -1194,6 +1290,9 @@ class RebalanceEngine:
             hive_bootstrap_budget_sats=int(
                 getattr(cfg, "hive_rebalance_bootstrap_budget_sats", 0) or 0
             ),
+            flow_facts=flow_facts,
+            target_bands=target_bands,
+            cfg=cfg,
         )
 
     def _is_hive_member(self, peer_id: str) -> bool:

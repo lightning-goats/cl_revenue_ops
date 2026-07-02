@@ -1295,6 +1295,119 @@ def test_engine_build_snapshot_carries_hive_rebalance_bias(
     hive_hints.get_rebalance_bias.assert_called_once_with(peer_id)
 
 
+def test_engine_build_snapshot_toggle_off_carries_flat_bands_for_all_channels(
+    mock_plugin, mock_database
+):
+    """FIX 3: with rebalance_size_tiered_targets=False, the engine must not
+    build a target_bands map at all -- every channel's per-channel band
+    falls back to the flat cfg thresholds, identical to pre-feature
+    behavior, even when channel capacities differ wildly."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(
+        dry_run=True,
+        rebalance_router="v3",
+        rebalance_size_tiered_targets=False,
+    )
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "03" + "b" * 64,
+                "short_channel_id": "100x1x0",
+                "total_msat": "2000000msat",
+                "our_amount_msat": "1000000msat",
+                "updates": {"remote": {"fee_proportional_millionths": 123}},
+            },
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "03" + "c" * 64,
+                "short_channel_id": "200x2x0",
+                # 20x the capacity of the first channel -- would get a
+                # size-tiered wider band if the toggle were honored.
+                "total_msat": "40000000msat",
+                "our_amount_msat": "20000000msat",
+                "updates": {"remote": {"fee_proportional_millionths": 123}},
+            },
+        ]
+    }
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot is not None
+    assert len(snapshot.channels) == 2
+    flat_low = cfg.low_liquidity_threshold
+    flat_high = cfg.high_liquidity_threshold
+    for channel in snapshot.channels:
+        assert channel.target_band_low == flat_low
+        assert channel.target_band_high == flat_high
+
+
+def test_engine_build_snapshot_toggle_on_gives_big_channel_wider_band_than_small(
+    mock_plugin, mock_database
+):
+    """FIX 3: with the toggle ON and a mixed-size channel set, a big
+    channel's ChannelState must carry a wider per-channel band than a
+    small channel's."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(
+        dry_run=True,
+        rebalance_router="v3",
+        rebalance_size_tiered_targets=True,
+    )
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "03" + "b" * 64,
+                "short_channel_id": "100x1x0",
+                "total_msat": "2000000msat",
+                "our_amount_msat": "1000000msat",
+                "updates": {"remote": {"fee_proportional_millionths": 123}},
+            },
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "03" + "c" * 64,
+                "short_channel_id": "200x2x0",
+                "total_msat": "40000000msat",
+                "our_amount_msat": "20000000msat",
+                "updates": {"remote": {"fee_proportional_millionths": 123}},
+            },
+        ]
+    }
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot is not None
+    by_id = {c.channel_id: c for c in snapshot.channels}
+    small = by_id["100x1x0"]
+    big = by_id["200x2x0"]
+    small_half_width = small.target_band_high - small.target_band_low
+    big_half_width = big.target_band_high - big.target_band_low
+    assert big_half_width > small_half_width
+    assert small.target_band_low == cfg.low_liquidity_threshold
+    assert small.target_band_high == cfg.high_liquidity_threshold
+
+
 def test_v2_planner_uses_hive_rebalance_bias_for_pair_roles():
     from modules.rebalance_planner_v2 import RebalancePlanner
     from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
@@ -3628,3 +3741,608 @@ def test_engine_threads_pair_fee_cap_into_coordination_overlay(
         engine.find_candidates()
 
     assert overlay_builder.call_args.kwargs["pair_fee_cap_ppm"] == 1_000
+
+
+def test_build_flow_facts_map_computes_realized_utilization_from_db(
+    mock_plugin, mock_database
+):
+    """_build_flow_facts_map is the seam Task 5 adds between the engine's
+    per-cycle channel list and compute_channel_flow_facts. It must turn a
+    DB-reported flow window into a ChannelFlowFacts with realized
+    utilization, keyed by channel_id, without touching the rest of the
+    snapshot build."""
+    mock_database.get_channel_flow_window.return_value = (600_000, 0, 6)
+    engine = _make_engine(mock_plugin, mock_database)
+
+    channels = [{"channel_id": "A", "capacity_sats": 1_000_000}]
+    now_ts = int(time.time())
+
+    flow_facts = engine._build_flow_facts_map(channels, engine.config, now_ts)
+
+    assert flow_facts["A"].realized_utilization == pytest.approx(0.6)
+    assert flow_facts["A"].utilization_is_realized is True
+
+
+def test_build_flow_facts_map_returns_empty_when_no_database(mock_plugin):
+    """Fail-open: with no database handle at all, the map-build must not
+    raise, and build_state_snapshot's neutral defaults take over."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "u" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+    engine = RebalanceEngine(plugin=mock_plugin, config=cfg, database=None)
+
+    flow_facts = engine._build_flow_facts_map(
+        [{"channel_id": "A", "capacity_sats": 1_000_000}],
+        cfg,
+        int(time.time()),
+    )
+
+    assert flow_facts == {}
+
+
+def test_realized_utilization_used_for_hot_channel(mock_plugin, mock_database):
+    """Feature #2: when the destination carries MEASURED (realized)
+    utilization, the EV gate's refill term uses that measured value instead
+    of the flat EXPECTED_UTILIZATION prior, and the decomposition reports
+    the source as 'realized'."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_500
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+        dest_realized_utilization=0.8,
+        dest_utilization_is_realized=True,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    expected_refill = amount_sats * dest_out_fee_ppm / 1_000_000.0 * 0.8
+    assert decomp["destination_refill_value_sats"] == pytest.approx(expected_refill)
+    assert decomp["expected_utilization"] == pytest.approx(0.8)
+    assert decomp["utilization_source"] == "realized"
+
+
+def test_thin_history_uses_prior(mock_plugin, mock_database):
+    """Feature #2 fallback: when the destination has NO realized data
+    (thin history / no facts), the EV gate's refill term must fall back to
+    the flat EXPECTED_UTILIZATION prior (0.5) -- identical to pre-feature
+    behavior -- and the decomposition reports the source as 'prior'."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_500
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+        dest_realized_utilization=0.8,
+        dest_utilization_is_realized=False,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    expected_refill = amount_sats * dest_out_fee_ppm / 1_000_000.0 * 0.5
+    assert decomp["destination_refill_value_sats"] == pytest.approx(expected_refill)
+    assert decomp["expected_utilization"] == pytest.approx(0.5)
+    assert decomp["utilization_source"] == "prior"
+
+
+def test_realized_utilization_used_for_source_side(mock_plugin, mock_database):
+    """Feature #2, source side: when the SOURCE carries MEASURED (realized)
+    utilization, the EV gate's drain/opportunity terms use that measured
+    value instead of the flat EXPECTED_UTILIZATION prior, and the
+    decomposition reports the source-side provenance as 'realized' via the
+    (new) symmetric 'source_utilization_source' key. Mirrors
+    test_realized_utilization_used_for_hot_channel but exercises source_u."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+
+    amount_sats = 1_000_000
+    # Values kept below the default max_fee_ppm=2000 historical-fee cap
+    # (_bounded_historical_fee_ppm) so they aren't clipped before use.
+    source_out_fee_ppm = 1_200
+    source_historical_sourced_fee_ppm = 1_800
+
+    def build_pair(realized_utilization, is_realized):
+        return PairCandidate(
+            source_channel_id="100x1x0",
+            dest_channel_id="200x2x0",
+            source_peer_id="03" + "b" * 64,
+            dest_peer_id="03" + "c" * 64,
+            amount_sats=amount_sats,
+            pair_budget_sats=5_000,
+            source_capacity_sats=1_000_000,
+            dest_capacity_sats=1_000_000,
+            score=2.0,
+            source_local_ratio=0.85,
+            dest_local_ratio=0.10,
+            source_out_fee_ppm=source_out_fee_ppm,
+            source_historical_sourced_fee_ppm=source_historical_sourced_fee_ppm,
+            source_realized_utilization=realized_utilization,
+            source_utilization_is_realized=is_realized,
+        )
+
+    # --- realized branch: source_u should be 0.8, not the 0.5 prior. ---
+    realized_pair = build_pair(0.8, True)
+    realized_decomp = engine._build_score_decomposition(
+        realized_pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    expected_drain = (
+        amount_sats * source_historical_sourced_fee_ppm / 1_000_000.0 * 0.8
+    )
+    expected_opportunity = (
+        amount_sats * source_out_fee_ppm / 1_000_000.0 * 0.8 * 0.5
+    )
+    assert realized_decomp["source_utilization"] == pytest.approx(0.8)
+    assert realized_decomp["source_drain_value_sats"] == pytest.approx(expected_drain)
+    assert realized_decomp["source_opportunity_sats"] == pytest.approx(
+        expected_opportunity
+    )
+    assert realized_decomp["source_utilization_source"] == "realized"
+
+    # --- prior branch: source_utilization_is_realized False must fall back
+    # to the flat 0.5 EXPECTED_UTILIZATION prior, identical to pre-feature
+    # behavior, even though the same 0.8 measured value is present. ---
+    prior_pair = build_pair(0.8, False)
+    prior_decomp = engine._build_score_decomposition(
+        prior_pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    expected_drain_prior = (
+        amount_sats * source_historical_sourced_fee_ppm / 1_000_000.0 * 0.5
+    )
+    expected_opportunity_prior = (
+        amount_sats * source_out_fee_ppm / 1_000_000.0 * 0.5 * 0.5
+    )
+    assert prior_decomp["source_utilization"] == pytest.approx(0.5)
+    assert prior_decomp["source_drain_value_sats"] == pytest.approx(
+        expected_drain_prior
+    )
+    assert prior_decomp["source_opportunity_sats"] == pytest.approx(
+        expected_opportunity_prior
+    )
+    assert prior_decomp["source_utilization_source"] == "prior"
+
+
+def test_activity_penalty_lowers_score_for_helpful_flow(mock_plugin, mock_database):
+    """Feature #1: when live forwarding is already moving the pair's
+    channels the 'helpful' way (source draining outbound / dest refilling
+    inbound), the sats-EV gate applies a soft, capped penalty proportional
+    to that helpful flow -- so a pair a router is already fixing scores
+    lower than an otherwise-identical pair with no such activity."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_activity_penalty_coeff = 0.5
+    engine.config.rebalance_activity_penalty_cap_frac = 0.5
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_000
+    source_activity_out_sats = 100_000
+
+    def build_pair(source_activity_out_sats):
+        return PairCandidate(
+            source_channel_id="100x1x0",
+            dest_channel_id="200x2x0",
+            source_peer_id="03" + "b" * 64,
+            dest_peer_id="03" + "c" * 64,
+            amount_sats=amount_sats,
+            pair_budget_sats=5_000,
+            source_capacity_sats=1_000_000,
+            dest_capacity_sats=1_000_000,
+            score=2.0,
+            source_local_ratio=0.85,
+            dest_local_ratio=0.10,
+            dest_out_fee_ppm=dest_out_fee_ppm,
+            source_activity_out_sats=source_activity_out_sats,
+        )
+
+    base_pair = build_pair(0)
+    activity_pair = build_pair(source_activity_out_sats)
+
+    base_decomp = engine._build_score_decomposition(
+        base_pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+    activity_decomp = engine._build_score_decomposition(
+        activity_pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    dest_value_fee_ppm = base_decomp["inputs"]["dest_value_fee_ppm"]
+    expected_future_value_sats = base_decomp["expected_future_value_sats"]
+    raw_penalty = 0.5 * source_activity_out_sats * dest_value_fee_ppm / 1_000_000.0
+    cap = 0.5 * max(0.0, expected_future_value_sats)
+    expected_penalty = round(min(raw_penalty, cap), 6)
+
+    assert base_decomp["activity_penalty_sats"] == 0.0
+    assert activity_decomp["activity_penalty_sats"] == pytest.approx(expected_penalty)
+    assert expected_penalty > 0
+    assert activity_decomp["final_score_sats"] < base_decomp["final_score_sats"]
+    assert activity_decomp["final_score_sats"] == pytest.approx(
+        base_decomp["final_score_sats"] - expected_penalty
+    )
+
+
+def test_activity_penalty_is_capped(mock_plugin, mock_database):
+    """Feature #1 cap: a pair with a huge helpful live-flow figure must
+    have its penalty capped at cap_frac * expected_future_value_sats, so a
+    strongly-EV pair still beats do-nothing instead of being zeroed out."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_activity_penalty_coeff = 0.5
+    engine.config.rebalance_activity_penalty_cap_frac = 0.5
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_000
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+        source_activity_out_sats=10**12,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    expected_future_value_sats = decomp["expected_future_value_sats"]
+    expected_cap = round(0.5 * max(0.0, expected_future_value_sats), 6)
+
+    assert decomp["activity_penalty_sats"] == pytest.approx(expected_cap)
+    assert decomp["final_score_sats"] >= 0
+    assert decomp["beats_do_nothing"] is True
+
+
+def test_no_activity_no_penalty(mock_plugin, mock_database):
+    """KEY INVARIANT: a pair with no activity facts (activity sats = 0, the
+    default) must get a zero activity penalty and a final_score_sats
+    IDENTICAL to the pre-feature value -- existing engine tests with no
+    activity must stay green."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_activity_penalty_coeff = 0.5
+    engine.config.rebalance_activity_penalty_cap_frac = 0.5
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_000
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    p_success = decomp["p_success"]
+    expected_future_value_sats = decomp["expected_future_value_sats"]
+    expected_fee_sats = decomp["expected_fee_sats"]
+    source_opportunity_sats = decomp["source_opportunity_sats"]
+    failure_penalty_sats = decomp["failure_penalty_sats"]
+    pre_feature_final_score_sats = round(
+        p_success * expected_future_value_sats
+        - expected_fee_sats
+        - source_opportunity_sats
+        - failure_penalty_sats,
+        6,
+    )
+
+    assert decomp["activity_penalty_sats"] == 0.0
+    assert decomp["final_score_sats"] == pytest.approx(pre_feature_final_score_sats)
+
+
+def test_activity_penalty_includes_dest_side_contribution(mock_plugin, mock_database):
+    """Task 8 coverage gap: helpful_flow_sats = source_activity_out_sats +
+    dest_activity_in_sats. Existing tests only ever set
+    source_activity_out_sats, so a bug that dropped the dest_activity_in_sats
+    addend from the sum would still pass them. Set only
+    dest_activity_in_sats > 0 (source_activity_out_sats == 0, the default)
+    and prove it alone produces a nonzero, correctly-computed penalty."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_activity_penalty_coeff = 0.5
+    engine.config.rebalance_activity_penalty_cap_frac = 0.5
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_000
+    dest_activity_in_sats = 100_000
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+        dest_activity_in_sats=dest_activity_in_sats,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    dest_value_fee_ppm = decomp["inputs"]["dest_value_fee_ppm"]
+    expected_future_value_sats = decomp["expected_future_value_sats"]
+    raw_penalty = 0.5 * dest_activity_in_sats * dest_value_fee_ppm / 1_000_000.0
+    cap = 0.5 * max(0.0, expected_future_value_sats)
+    expected_penalty = round(min(raw_penalty, cap), 6)
+
+    assert expected_penalty > 0
+    assert decomp["activity_penalty_sats"] == pytest.approx(expected_penalty)
+
+
+def test_all_three_features_compose_on_one_pair(mock_plugin, mock_database):
+    """Composition guard (final review): the branch ships live default-ON
+    and every existing test above exercises realized utilization (#2),
+    the activity penalty (#1), or size-tiered bands (#3) in ISOLATION.
+    Nothing proves the three coexist correctly on a single channel/pair --
+    e.g. that #2 feeding a bigger expected_future_value_sats doesn't
+    silently change how #1's cap or #3's sizing behave, or that the terms
+    don't double-count.
+
+    This pair models a single big channel pair where BOTH sides carry
+    realized (measured) utilization AND live "helpful" forwarding
+    activity, with a nonzero dest fee so the value term is real. (The
+    size-tiered per-channel band, #3, lives on ChannelState and is
+    threaded through the planner -- not a PairCandidate field consumed by
+    _build_score_decomposition -- so its coexistence with #2/#1 on one
+    big channel is proven at the planner-threading layer by the
+    companion test
+    test_all_three_features_thread_onto_one_big_channel_pair in
+    tests/test_rebalance_planner_v2.py, which reuses this same big-channel
+    wide-band scenario.)
+    """
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_activity_penalty_coeff = 0.5
+    engine.config.rebalance_activity_penalty_cap_frac = 0.5
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_000
+    # Kept below the default max_fee_ppm=2000 historical-fee cap
+    # (_bounded_historical_fee_ppm) so they aren't clipped before use.
+    source_out_fee_ppm = 1_200
+    source_historical_sourced_fee_ppm = 1_800
+    # Moderate helpful-flow figures: nonzero on BOTH legs, but small enough
+    # relative to expected_future_value_sats that the penalty is real
+    # without swallowing the pair's EV (still beats do-nothing).
+    source_activity_out_sats = 50_000
+    dest_activity_in_sats = 50_000
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        source_out_fee_ppm=source_out_fee_ppm,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+        source_historical_sourced_fee_ppm=source_historical_sourced_fee_ppm,
+        # Feature #2 on BOTH legs, so both sides' value/opportunity terms
+        # use the measured 0.8 instead of the flat 0.5 prior.
+        source_realized_utilization=0.8,
+        source_utilization_is_realized=True,
+        dest_realized_utilization=0.8,
+        dest_utilization_is_realized=True,
+        # Feature #1 on BOTH legs.
+        source_activity_out_sats=source_activity_out_sats,
+        dest_activity_in_sats=dest_activity_in_sats,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    # --- #2 is active: realized utilization feeds expected_utilization/
+    # utilization_source AND the destination refill value term. ---
+    assert decomp["expected_utilization"] == pytest.approx(0.8)
+    assert decomp["utilization_source"] == "realized"
+    expected_refill = amount_sats * dest_out_fee_ppm / 1_000_000.0 * 0.8
+    assert decomp["destination_refill_value_sats"] == pytest.approx(expected_refill)
+
+    # --- #1 is active: a nonzero, capped activity penalty. ---
+    dest_value_fee_ppm = decomp["inputs"]["dest_value_fee_ppm"]
+    expected_future_value_sats = decomp["expected_future_value_sats"]
+    helpful_flow_sats = source_activity_out_sats + dest_activity_in_sats
+    raw_penalty = 0.5 * helpful_flow_sats * dest_value_fee_ppm / 1_000_000.0
+    activity_cap = 0.5 * max(0.0, expected_future_value_sats)
+    expected_penalty = round(min(raw_penalty, activity_cap), 6)
+    assert expected_penalty > 0
+    assert expected_penalty <= activity_cap + 1e-9
+    assert decomp["activity_penalty_sats"] == pytest.approx(expected_penalty)
+
+    # --- No double-count / no missing term: final_score_sats must equal
+    # the full composed formula, RECOMPUTED from the decision's own
+    # exposed terms (not re-derived independently), proving #2's bigger
+    # value term and #1's penalty (proportional to that same value term)
+    # combine additively with nothing dropped or counted twice. ---
+    recomposed_final_score_sats = round(
+        decomp["p_success"] * decomp["expected_future_value_sats"]
+        - decomp["expected_fee_sats"]
+        - decomp["source_opportunity_sats"]
+        - decomp["failure_penalty_sats"]
+        - decomp["activity_penalty_sats"],
+        6,
+    )
+    assert decomp["final_score_sats"] == pytest.approx(recomposed_final_score_sats)
+
+    # --- Sanity: composing all three features still yields a coherent,
+    # positive-EV decision -- not nonsensically rejected or accepted. ---
+    assert decomp["final_score_sats"] > 0
+    assert decomp["beats_do_nothing"] is True
+
+
+def test_activity_penalty_sums_source_and_dest_activity(mock_plugin, mock_database):
+    """Task 8 coverage gap: when BOTH source_activity_out_sats and
+    dest_activity_in_sats are set, the penalty must be based on their SUM
+    (helpful_flow_sats = source_activity_out_sats + dest_activity_in_sats),
+    not either term alone."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_activity_penalty_coeff = 0.5
+    engine.config.rebalance_activity_penalty_cap_frac = 0.5
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_000
+    source_activity_out_sats = 60_000
+    dest_activity_in_sats = 40_000
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+        source_activity_out_sats=source_activity_out_sats,
+        dest_activity_in_sats=dest_activity_in_sats,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    dest_value_fee_ppm = decomp["inputs"]["dest_value_fee_ppm"]
+    expected_future_value_sats = decomp["expected_future_value_sats"]
+    helpful_flow_sats = source_activity_out_sats + dest_activity_in_sats
+    raw_penalty = 0.5 * helpful_flow_sats * dest_value_fee_ppm / 1_000_000.0
+    cap = 0.5 * max(0.0, expected_future_value_sats)
+    expected_penalty = round(min(raw_penalty, cap), 6)
+
+    assert expected_penalty > 0
+    assert decomp["activity_penalty_sats"] == pytest.approx(expected_penalty)

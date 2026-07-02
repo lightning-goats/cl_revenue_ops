@@ -1136,6 +1136,95 @@ class TestHiveEqualizationConfigSurface:
         assert RebalanceReasonCode.HIVE_EQUALIZATION.value == "hive_equalization"
 
 
+class TestRebalanceUtilizationFloorCeilingGuard:
+    """rebalance_utilization_floor/ceiling must mirror the low/high_liquidity_threshold
+    cross-field guard idiom: no __post_init__ raise, repaired in load_overrides,
+    rejected in update_runtime.
+    """
+
+    def test_direct_construction_does_not_raise_for_inverted_pair(self):
+        # Matches low_liquidity_threshold/high_liquidity_threshold: no
+        # __post_init__ invariant is enforced for this pair (repair/reject
+        # happen in load_overrides/update_runtime instead).
+        from modules.config import Config
+
+        cfg = Config(
+            rebalance_utilization_floor=0.9,
+            rebalance_utilization_ceiling=0.1,
+        )
+        assert cfg.rebalance_utilization_floor == 0.9
+        assert cfg.rebalance_utilization_ceiling == 0.1
+
+    def test_runtime_updates_reject_inverted_pair(self):
+        from modules.config import Config
+
+        cfg = Config()
+        stored_values = {}
+        database = MagicMock()
+
+        def set_config_override(key, value):
+            stored_values[key] = value
+            return 99
+
+        def get_config_override(key):
+            return stored_values.get(key)
+
+        database.set_config_override.side_effect = set_config_override
+        database.get_config_override.side_effect = get_config_override
+        database.delete_config_override.return_value = True
+
+        result = cfg.update_runtime(database, "rebalance_utilization_ceiling", "0.6")
+        assert result["status"] == "success"
+        assert cfg.rebalance_utilization_ceiling == 0.6
+
+        result = cfg.update_runtime(database, "rebalance_utilization_floor", "0.3")
+        assert result["status"] == "success"
+        assert cfg.rebalance_utilization_floor == 0.3
+
+        result = cfg.update_runtime(database, "rebalance_utilization_floor", "0.9")
+        assert "must be less than" in result["error"]
+
+        result = cfg.update_runtime(database, "rebalance_utilization_ceiling", "0.1")
+        assert "must be greater than" in result["error"]
+
+    def test_load_overrides_repairs_invalid_band(self):
+        from modules.config import Config
+
+        cfg = Config()
+        database = MagicMock()
+        database.get_all_config_overrides.return_value = {
+            "rebalance_utilization_floor": "0.9",
+            "rebalance_utilization_ceiling": "0.1",
+        }
+        database.get_config_version.return_value = 7
+
+        warnings = cfg.load_overrides(database)
+
+        assert warnings == []
+        assert cfg.rebalance_utilization_ceiling == 0.1
+        assert cfg.rebalance_utilization_floor == pytest.approx(0.05)
+        assert cfg.snapshot().rebalance_utilization_floor == pytest.approx(0.05)
+
+
+class TestRebalanceSmallChannelBandHalfWidthRange:
+    def test_field_range_is_tightened_to_half_width(self):
+        from modules.config import CONFIG_FIELD_RANGES
+
+        assert CONFIG_FIELD_RANGES["rebalance_small_channel_band_half_width"] == (0.0, 0.5)
+
+    def test_runtime_update_rejects_value_above_half(self):
+        from modules.config import Config
+
+        cfg = Config()
+        database = MagicMock()
+
+        result = cfg.update_runtime(
+            database, "rebalance_small_channel_band_half_width", "0.6"
+        )
+        assert "error" in result
+        assert "out of range" in result["error"]
+
+
 class TestGetLastHopFeeFleetMember:
     """_get_last_hop_fee always uses actual peer fees, even for fleet members."""
 
@@ -1206,3 +1295,82 @@ class TestConfigOptionDefaultAlignment:
         option_default = int(self._plugin_option_default("revenue-ops-max-fee-ppm"))
         assert Config().max_fee_ppm == option_default
         assert Config().max_fee_ppm == 2000
+
+
+def test_upstream_pattern_defaults():
+    from modules.config import Config
+    c = Config()
+    assert c.rebalance_activity_window_seconds == 3600
+    assert c.rebalance_activity_penalty_coeff == 0.5
+    assert c.rebalance_activity_penalty_cap_frac == 0.5
+    assert c.rebalance_utilization_window_days == 7
+    assert c.rebalance_utilization_floor == 0.05
+    assert c.rebalance_utilization_ceiling == 1.0
+    assert c.rebalance_utilization_min_forwards == 5
+    assert c.rebalance_size_tiered_targets is True
+    assert c.rebalance_size_reference_percentile == 0.5
+    assert c.rebalance_small_channel_band_half_width == 0.15
+
+
+class TestUpstreamPatternOptionsRegistered:
+    """P6-002 regression guard: a config knob added to the Config dataclass
+    without a matching plugin.add_option(...) registration is a silent
+    no-op at startup (the operator-supplied value is never read). Verify
+    each of the 10 upstream-pattern knobs is (a) present in CONFIG_FIELD_TYPES
+    and (b) actually registered as a plugin option with a default that
+    matches the Config dataclass default, using the same AST-based
+    extraction as TestConfigOptionDefaultAlignment above (avoids importing
+    the plugin module, which would register the whole plugin surface)."""
+
+    FIELD_TO_OPTION = {
+        "rebalance_activity_window_seconds": "revenue-ops-rebalance-activity-window-seconds",
+        "rebalance_activity_penalty_coeff": "revenue-ops-rebalance-activity-penalty-coeff",
+        "rebalance_activity_penalty_cap_frac": "revenue-ops-rebalance-activity-penalty-cap-frac",
+        "rebalance_utilization_window_days": "revenue-ops-rebalance-utilization-window-days",
+        "rebalance_utilization_floor": "revenue-ops-rebalance-utilization-floor",
+        "rebalance_utilization_ceiling": "revenue-ops-rebalance-utilization-ceiling",
+        "rebalance_utilization_min_forwards": "revenue-ops-rebalance-utilization-min-forwards",
+        "rebalance_size_tiered_targets": "revenue-ops-rebalance-size-tiered-targets",
+        "rebalance_size_reference_percentile": "revenue-ops-rebalance-size-reference-percentile",
+        "rebalance_small_channel_band_half_width": "revenue-ops-rebalance-small-channel-band-half-width",
+    }
+
+    def _plugin_option_default(self, name):
+        import ast
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tree = ast.parse(open(os.path.join(root, "cl-revenue-ops.py")).read())
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and getattr(node.func, "attr", "") == "add_option"):
+                continue
+            kw = {k.arg: k.value for k in node.keywords}
+            name_node = kw.get("name")
+            if isinstance(name_node, ast.Constant) and name_node.value == name:
+                default_node = kw.get("default")
+                if isinstance(default_node, ast.Constant):
+                    return default_node.value
+        raise AssertionError(f"option {name} not found")
+
+    def test_all_ten_knobs_in_config_field_types(self):
+        from modules.config import CONFIG_FIELD_TYPES
+        for field in self.FIELD_TO_OPTION:
+            assert field in CONFIG_FIELD_TYPES, f"{field} missing from CONFIG_FIELD_TYPES"
+
+    def test_all_ten_knobs_registered_as_plugin_options(self):
+        from modules.config import Config
+        cfg = Config()
+        for field, option_name in self.FIELD_TO_OPTION.items():
+            option_default = self._plugin_option_default(option_name)
+            field_default = getattr(cfg, field)
+            if isinstance(field_default, bool):
+                parsed_bool = str(option_default).lower() in ("true", "1", "yes")
+                assert parsed_bool is field_default, (
+                    f"{option_name} default {option_default!r} does not match "
+                    f"{field}={field_default!r}"
+                )
+            else:
+                assert type(field_default)(option_default) == field_default, (
+                    f"{option_name} default {option_default!r} does not match "
+                    f"{field}={field_default!r}"
+                )

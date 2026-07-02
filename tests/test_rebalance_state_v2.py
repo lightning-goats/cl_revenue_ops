@@ -455,3 +455,202 @@ def test_rebalancer_build_state_v2_delegates_to_builder(mock_plugin, mock_databa
 
     assert result == "snapshot"
     builder.assert_called_once_with(["channels"], "allocations")
+
+
+def test_channel_state_has_flow_fact_fields_with_neutral_defaults():
+    from modules.rebalance_state_v2 import ChannelState
+
+    ch = ChannelState(
+        channel_id="A", peer_id="B", capacity_sats=1_000_000, local_ratio=0.5,
+        actual_inbound_fee_ppm=0, value_class="neutral", is_valuable=False,
+        remaining_budget_sats=0, cooldown_active=False,
+    )
+    assert ch.realized_utilization == 0.5
+    assert ch.utilization_is_realized is False
+    assert ch.activity_out_sats == 0
+    assert ch.activity_in_sats == 0
+    assert ch.target_band_low == 0.35
+    assert ch.target_band_high == 0.65
+
+
+def test_build_state_snapshot_injects_flow_facts():
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_flow_facts import ChannelFlowFacts
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "A": ChannelCapexBudget(channel_id="A", budget_msat=250_000),
+        }
+    )
+    facts = {
+        "A": ChannelFlowFacts(
+            channel_id="A", out_sats_window=1000, in_sats_window=0,
+            forward_count_window=9, realized_utilization=0.7,
+            utilization_is_realized=True,
+        )
+    }
+
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="A",
+                peer_id="02" + "a" * 64,
+                capacity_sats=1_000_000,
+                local_sats=650_000,
+                actual_inbound_fee_ppm=120,
+                is_hive_member=True,
+                is_profitable=True,
+                is_active=True,
+                cooldown_active=False,
+            ),
+        ],
+        allocations,
+        flow_facts=facts,
+    )
+
+    channel = state.channels[0]
+    assert channel.realized_utilization == 0.7
+    assert channel.utilization_is_realized is True
+    assert channel.activity_out_sats == 1000
+
+
+def test_build_state_snapshot_injects_target_band():
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "A": ChannelCapexBudget(channel_id="A", budget_msat=250_000),
+        }
+    )
+    bands = {"A": (0.20, 0.80)}
+
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="A",
+                peer_id="02" + "a" * 64,
+                capacity_sats=1_000_000,
+                local_sats=650_000,
+                actual_inbound_fee_ppm=120,
+                is_hive_member=True,
+                is_profitable=True,
+                is_active=True,
+                cooldown_active=False,
+            ),
+        ],
+        allocations,
+        target_bands=bands,
+    )
+
+    channel = state.channels[0]
+    assert channel.target_band_low == 0.20
+    assert channel.target_band_high == 0.80
+
+
+def test_build_state_snapshot_band_falls_back_to_cfg_thresholds():
+    """When no target_bands map is given but a cfg is, the per-channel band
+    falls back to cfg.low_liquidity_threshold / high_liquidity_threshold."""
+    from types import SimpleNamespace
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={"A": ChannelCapexBudget(channel_id="A", budget_msat=250_000)}
+    )
+    cfg = SimpleNamespace(low_liquidity_threshold=0.25, high_liquidity_threshold=0.75)
+
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="A", peer_id="02" + "a" * 64, capacity_sats=1_000_000,
+                local_sats=650_000, actual_inbound_fee_ppm=120, is_hive_member=True,
+                is_profitable=True, is_active=True, cooldown_active=False,
+            ),
+        ],
+        allocations,
+        cfg=cfg,
+    )
+    channel = state.channels[0]
+    assert channel.target_band_low == 0.25
+    assert channel.target_band_high == 0.75
+
+
+def test_build_state_snapshot_scores_use_per_channel_band():
+    """FIX 2(b) coherence: dest_urgency/source_drain_score must be computed
+    against the channel's OWN per-channel band (from target_bands), not the
+    flat function-scope target_band_low/high kwargs -- otherwise a channel
+    classified "inside its own wider band" would still carry a nonzero
+    source_drain_score/dest_urgency computed against the narrower flat band,
+    which is incoherent with classification (Task 7)."""
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={"A": ChannelCapexBudget(channel_id="A", budget_msat=250_000)}
+    )
+    bands = {"A": (0.20, 0.80)}
+
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="A",
+                peer_id="02" + "a" * 64,
+                capacity_sats=1_000_000,
+                # ratio 0.75: above the flat high (0.65) but comfortably
+                # inside this channel's own wider band (0.20, 0.80).
+                local_sats=750_000,
+                is_hive_member=True,
+                is_profitable=True,
+                is_active=True,
+            ),
+        ],
+        allocations,
+        target_band_low=0.35,
+        target_band_high=0.65,
+        target_bands=bands,
+    )
+
+    channel = state.channels[0]
+    assert channel.local_ratio == 0.75
+    # Against the OWN band (0.20, 0.80) the channel is inside band: zero
+    # drain score / urgency, NOT the flat-band answer (source_drain_score
+    # would be > 0 against the narrower flat 0.65 high bound).
+    assert channel.source_drain_score == 0.0
+    assert channel.dest_urgency == 0.0
+
+
+def test_build_state_snapshot_scores_fall_back_to_flat_band_when_no_per_channel_band():
+    """Invariant: when a channel has no per-channel band entry, dest_urgency/
+    source_drain_score must fall back to the flat function-scope
+    target_band_low/high kwargs -- identical to pre-feature behavior."""
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={"A": ChannelCapexBudget(channel_id="A", budget_msat=250_000)}
+    )
+
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="A",
+                peer_id="02" + "a" * 64,
+                capacity_sats=1_000_000,
+                local_sats=750_000,  # ratio 0.75, above flat high 0.65
+                is_hive_member=True,
+                is_profitable=True,
+                is_active=True,
+            ),
+        ],
+        allocations,
+        target_band_low=0.35,
+        target_band_high=0.65,
+        # no target_bands map -- must use the flat kwargs.
+    )
+
+    channel = state.channels[0]
+    assert channel.local_ratio == 0.75
+    assert channel.source_drain_score > 0.0
+    assert channel.dest_urgency == 0.0

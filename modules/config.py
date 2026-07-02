@@ -127,6 +127,17 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hive_equalization_max_candidates_per_cycle': int,
     'hive_rebalance_bootstrap_budget_sats': int,
     'rebalance_coordination_reserved_slots': int,
+    # Upstream rebalancer patterns
+    'rebalance_activity_window_seconds': int,
+    'rebalance_activity_penalty_coeff': float,
+    'rebalance_activity_penalty_cap_frac': float,
+    'rebalance_utilization_window_days': int,
+    'rebalance_utilization_floor': float,
+    'rebalance_utilization_ceiling': float,
+    'rebalance_utilization_min_forwards': int,
+    'rebalance_size_tiered_targets': bool,
+    'rebalance_size_reference_percentile': float,
+    'rebalance_small_channel_band_half_width': float,
     'hive_push_enabled': bool,
     'hive_push_trigger_ratio': float,
     'hive_push_target_ratio': float,
@@ -281,6 +292,16 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'hive_equalization_max_candidates_per_cycle': (1, 10),
     'hive_rebalance_bootstrap_budget_sats': (0, 10_000),
     'rebalance_coordination_reserved_slots': (0, 10),
+    # Upstream rebalancer patterns
+    'rebalance_activity_window_seconds': (60, 86400),
+    'rebalance_activity_penalty_coeff': (0.0, 1.0),
+    'rebalance_activity_penalty_cap_frac': (0.0, 1.0),
+    'rebalance_utilization_window_days': (1, 90),
+    'rebalance_utilization_floor': (0.0, 1.0),
+    'rebalance_utilization_ceiling': (0.0, 1.0),
+    'rebalance_utilization_min_forwards': (0, 1000),
+    'rebalance_size_reference_percentile': (0.0, 1.0),
+    'rebalance_small_channel_band_half_width': (0.0, 0.5),
     'futility_cooldown_hours': (1, 168),
     'target_flow': (1000, 100000000),
     'estimated_open_cost_sats': (0, 1000000),
@@ -489,6 +510,39 @@ class Config:
     # letting coordination dominate arbitrarily. Set to 0 to restore the
     # strict-cap behavior.
     rebalance_coordination_reserved_slots: int = 2
+
+    # Upstream rebalancer patterns (flow-facts / EV / planner tuning).
+    # Consumed by ChannelFlowFacts (activity + utilization knobs) and by
+    # the rebalance engine EV / capacity planner (size-tiering knobs).
+    # Window over which recent forwarding activity is measured for the
+    # activity-recency penalty (seconds). Default 3600 = 1 hour.
+    rebalance_activity_window_seconds: int = 3600
+    # Coefficient applied to the activity-recency penalty when scoring a
+    # rebalance candidate. 0 disables the penalty.
+    rebalance_activity_penalty_coeff: float = 0.5
+    # Upper bound (fraction of score) that the activity-recency penalty may
+    # ever remove, so a stale channel is deprioritized but never zeroed out.
+    rebalance_activity_penalty_cap_frac: float = 0.5
+    # Trailing window (days) over which forwarding utilization is measured
+    # for the utilization-based sizing/target logic.
+    rebalance_utilization_window_days: int = 7
+    # Minimum utilization ratio floor used when normalizing observed flow.
+    rebalance_utilization_floor: float = 0.05
+    # Maximum utilization ratio ceiling used when normalizing observed flow.
+    rebalance_utilization_ceiling: float = 1.0
+    # Minimum number of forwards in the utilization window required before
+    # utilization-based sizing is trusted; below this, fall back to defaults.
+    rebalance_utilization_min_forwards: int = 5
+    # Enable size-tiered rebalance targets (bucket target amounts by channel
+    # capacity percentile instead of a single flat target).
+    rebalance_size_tiered_targets: bool = True
+    # Percentile (0.0-1.0) of the channel-capacity distribution used as the
+    # reference point for size-tiered target amounts.
+    rebalance_size_reference_percentile: float = 0.5
+    # Half-width (fraction) of the "small channel" band around the reference
+    # percentile; channels within this band are treated as small/reference
+    # sized for target-sizing purposes.
+    rebalance_small_channel_band_half_width: float = 0.15
 
     futility_cooldown_hours: int = 48   # Hours before retrying after 10+ consecutive failures
     inbound_fee_estimate_ppm: int = 50  # Route cost buffer added on top of last-hop fee (PPM)
@@ -705,6 +759,14 @@ class Config:
                 # M-R6-1 FIX: Clamp to 0.0 to prevent negative values when
                 # high_liquidity_threshold is very small (e.g., < 0.05).
                 self.low_liquidity_threshold = max(0.0, self.high_liquidity_threshold - 0.05)
+        if hasattr(self, 'rebalance_utilization_floor') and hasattr(self, 'rebalance_utilization_ceiling'):
+            if self.rebalance_utilization_floor >= self.rebalance_utilization_ceiling:
+                # Mirrors the low_liquidity_threshold/high_liquidity_threshold
+                # repair: an inverted floor/ceiling pair would otherwise pin
+                # realized utilization to the (wrong) floor for every channel.
+                self.rebalance_utilization_floor = max(
+                    0.0, self.rebalance_utilization_ceiling - 0.05
+                )
         if hasattr(self, 'hive_equalization_low_pct') and hasattr(self, 'hive_equalization_high_pct'):
             if self.hive_equalization_low_pct >= self.hive_equalization_high_pct:
                 self.hive_equalization_low_pct = max(
@@ -818,6 +880,14 @@ class Config:
                 return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
             if key == 'high_liquidity_threshold' and typed_value <= self.low_liquidity_threshold:
                 return {"error": f"high_liquidity_threshold ({typed_value}) must be greater than low_liquidity_threshold ({self.low_liquidity_threshold})"}
+            # Utilization floor/ceiling: mirrors the low/high_liquidity_threshold
+            # guard above. Without this, an inverted pair (e.g. floor=0.9,
+            # ceiling=0.1) silently pins realized utilization to 0.9 for every
+            # channel via modules/rebalance_flow_facts.py's clamp.
+            if key == 'rebalance_utilization_floor' and typed_value >= self.rebalance_utilization_ceiling:
+                return {"error": f"rebalance_utilization_floor ({typed_value}) must be less than rebalance_utilization_ceiling ({self.rebalance_utilization_ceiling})"}
+            if key == 'rebalance_utilization_ceiling' and typed_value <= self.rebalance_utilization_floor:
+                return {"error": f"rebalance_utilization_ceiling ({typed_value}) must be greater than rebalance_utilization_floor ({self.rebalance_utilization_floor})"}
             if key == 'hive_equalization_low_pct' and typed_value >= self.hive_equalization_high_pct:
                 return {"error": f"hive_equalization_low_pct ({typed_value}) must be less than hive_equalization_high_pct ({self.hive_equalization_high_pct})"}
             if key == 'hive_equalization_high_pct' and typed_value <= self.hive_equalization_low_pct:
@@ -953,6 +1023,17 @@ class ConfigSnapshot:
     rebalance_coordination_reserved_slots: int
     futility_cooldown_hours: int
     inbound_fee_estimate_ppm: int
+    # Upstream rebalancer patterns
+    rebalance_activity_window_seconds: int
+    rebalance_activity_penalty_coeff: float
+    rebalance_activity_penalty_cap_frac: float
+    rebalance_utilization_window_days: int
+    rebalance_utilization_floor: float
+    rebalance_utilization_ceiling: float
+    rebalance_utilization_min_forwards: int
+    rebalance_size_tiered_targets: bool
+    rebalance_size_reference_percentile: float
+    rebalance_small_channel_band_half_width: float
 
     # Profitability tracking
     estimated_open_cost_sats: int
