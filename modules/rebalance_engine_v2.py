@@ -2317,10 +2317,28 @@ class RebalanceEngine:
             return
         try:
             if result is not None and getattr(result, "payment_pending", False):
-                # Payment unresolved: keep the reservation active so the
-                # budget stays held until the reconciliation sweep confirms
-                # settlement or failure. Releasing here would let the next
-                # cycle spend the same budget while the HTLC can still settle.
+                # P4-007: only HOLD the reservation for a pending payment that
+                # is actually sweepable — i.e. one that carries a payment_hash.
+                # _record_rebalance_result parks such a row as
+                # 'pending_settlement', and reconcile_pending_settlements later
+                # releases (or spends) the reservation once listsendpays reports
+                # a terminal state. A pending result WITHOUT a payment_hash is
+                # recorded as 'failed' (not sweepable), so the reconcile sweep —
+                # which scans only 'pending_settlement' — would never touch it
+                # and the reservation would strand 'active' forever. Treat the
+                # no-hash edge as a failure for budget purposes and release now
+                # (conservative: release-on-failure keeps the row status and the
+                # budget consistent).
+                failure_data = getattr(result, "failure_data", {}) or {}
+                payment_hash = str(failure_data.get("payment_hash", "") or "")
+                if payment_hash:
+                    # Payment unresolved but sweepable: keep the reservation
+                    # active so the budget stays held until the reconciliation
+                    # sweep confirms settlement or failure. Releasing here would
+                    # let the next cycle spend the same budget while the HTLC
+                    # can still settle.
+                    return
+                self.database.release_budget_reservation(reservation_id)
                 return
             if result is not None and result.success:
                 self.database.mark_budget_spent(
