@@ -11,8 +11,9 @@
 # INTEGRATION
 # ============================================================================
 
-# Safety switch - log actions but don't execute (set false for production)
-#revenue-ops-dry-run=true
+# Safety switch - if true, log actions but don't execute.
+# Default is false (executes); set true to preview without acting.
+#revenue-ops-dry-run=false
 
 # ============================================================================
 # FLOW ANALYSIS
