@@ -61,3 +61,52 @@ class TestRebalancerDryRun:
         result = r.execute_rebalance(cand)
 
         assert result["success"] is True
+
+
+class TestFutilityKeyPeerScoped:
+    """DEF-063: the destination futility/failure-count breaker must be keyed
+    on the peer pubkey (stable across splices), not the SCID (which a splice
+    mints anew, resetting the history and evading the breaker)."""
+
+    PEER = "02" + "d" * 64
+
+    def test_futility_key_uses_peer_id(self):
+        from modules.rebalancer import EVRebalancer
+        cand = _candidate(to_channel="222x333x0", to_peer_id=self.PEER)
+        assert EVRebalancer._futility_key(cand) == self.PEER
+
+    def test_futility_key_falls_back_to_scid_without_peer(self):
+        from modules.rebalancer import EVRebalancer
+        cand = _candidate(to_channel="222x333x0", to_peer_id="")
+        assert EVRebalancer._futility_key(cand) == "222x333x0"
+
+    def test_failure_history_survives_splice(self, tmp_path):
+        """A pair fails repeatedly under SCID A, then splices to SCID B (same
+        peer). The failure count and the futility breaker must persist."""
+        import os
+        from unittest.mock import MagicMock
+        from modules.database import Database
+        from modules.rebalancer import EVRebalancer
+
+        db = Database(os.path.join(tmp_path, "def063.db"), MagicMock())
+        db.initialize()
+
+        before = _candidate(to_channel="AAAx1x0", to_peer_id=self.PEER)
+        after_splice = _candidate(to_channel="BBBx9x0", to_peer_id=self.PEER)
+
+        # Four no_route failures accrue while the channel is SCID A.
+        for _ in range(4):
+            db.increment_failure_count(
+                EVRebalancer._futility_key(before),
+                attempted_ppm=1000, attempted_amount=50000, error_type="no_route",
+            )
+
+        # The splice mints SCID B. Keyed on the SCID this would read 0; keyed
+        # on the peer it must still see the accrued history.
+        count, _ = db.get_failure_count(EVRebalancer._futility_key(after_splice))
+        assert count == 4
+        assert EVRebalancer._should_skip_futility(count, "no_route") is True
+
+        # Sanity: the raw new SCID has no independent record.
+        scid_count, _ = db.get_failure_count("BBBx9x0")
+        assert scid_count == 0

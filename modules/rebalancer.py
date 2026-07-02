@@ -1114,6 +1114,18 @@ class EVRebalancer:
         return "other"
 
     @staticmethod
+    def _futility_key(candidate) -> str:
+        """Key for the destination futility / failure-count breaker.
+
+        DEF-063: the breaker was keyed on the destination SCID. A splice
+        mints a NEW SCID for the same peer, which reset the failure history
+        to zero and let a chronically-failing pair evade the breaker. Key on
+        the destination peer pubkey instead — it is stable across splices —
+        falling back to the SCID only when the peer id is unknown.
+        """
+        return getattr(candidate, "to_peer_id", "") or candidate.to_channel
+
+    @staticmethod
     def _apply_fee_escalation(ev_max_fee_ppm: int, fail_count: int, last_attempted_ppm: int) -> int:
         """
         Escalate fee budget based on failure history.
@@ -2167,7 +2179,7 @@ class EVRebalancer:
                                         f"{exec_result.parts} parts, {exec_result.attempts} attempts)"
                                     ),
                                 }
-                                self.database.reset_failure_count(candidate.to_channel)
+                                self.database.reset_failure_count(self._futility_key(candidate))
                                 self._report_coordination_outcome(
                                     candidate,
                                     coordination_context,
@@ -2212,7 +2224,7 @@ class EVRebalancer:
                                     )
                                 error_type = self._classify_error(error_str)
                                 self.database.increment_failure_count(
-                                    candidate.to_channel,
+                                    self._futility_key(candidate),
                                     attempted_ppm=candidate.max_fee_ppm,
                                     attempted_amount=candidate.amount_sats,
                                     error_type=error_type,
@@ -2239,7 +2251,7 @@ class EVRebalancer:
                             error_type = self._classify_error(str(e))
                             try:
                                 self.database.increment_failure_count(
-                                    candidate.to_channel,
+                                    self._futility_key(candidate),
                                     attempted_ppm=candidate.max_fee_ppm,
                                     attempted_amount=candidate.amount_sats,
                                     error_type=error_type,
@@ -2277,7 +2289,7 @@ class EVRebalancer:
                                 ),
                             }
                             # Success resets failure count so channel re-enters rotation
-                            self.database.reset_failure_count(candidate.to_channel)
+                            self.database.reset_failure_count(self._futility_key(candidate))
                         else:
                             error_str = exec_result.error or "no_routes"
                             res = {
@@ -2309,7 +2321,7 @@ class EVRebalancer:
                             # Record failure for futility breaker
                             error_type = self._classify_error(error_str)
                             self.database.increment_failure_count(
-                                candidate.to_channel,
+                                self._futility_key(candidate),
                                 attempted_ppm=candidate.max_fee_ppm,
                                 attempted_amount=candidate.amount_sats,
                                 error_type=error_type,
@@ -2324,7 +2336,7 @@ class EVRebalancer:
                         error_type = self._classify_error(str(e))
                         try:
                             self.database.increment_failure_count(
-                                candidate.to_channel,
+                                self._futility_key(candidate),
                                 attempted_ppm=candidate.max_fee_ppm,
                                 attempted_amount=candidate.amount_sats,
                                 error_type=error_type,
