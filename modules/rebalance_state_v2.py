@@ -222,6 +222,12 @@ _DEFAULT_TARGET_BAND_LOW = 0.35
 _DEFAULT_TARGET_BAND_HIGH = 0.65
 
 
+# Cap on how far a large channel's band half-width can scale relative to the
+# small-channel half-width (e.g. 2.0 -> at most double the small-channel
+# widen amount), so extremely large channels don't get an unbounded band.
+_BAND_MAX_SIZE_SCALE = 2.0
+
+
 def compute_size_tiered_bands(
     capacities: Mapping[str, Any],
     percentile: float = 0.5,
@@ -232,9 +238,12 @@ def compute_size_tiered_bands(
     """Per-channel (band_low, band_high) from the node's capacity distribution.
 
     Channels at/below the reference capacity (a percentile of the size
-    distribution) keep the flat band (flat_low, flat_high). Larger channels get
-    a wider, downward-skewed band so they hold outbound residual as a buffer
-    rather than being force-balanced. Bounds clamped to (0.05, 0.95).
+    distribution) keep the flat band (flat_low, flat_high). Channels above the
+    reference capacity get a symmetrically wider band (0.5 +/- small_half_width
+    * scale, scale capped at _BAND_MAX_SIZE_SCALE), so large channels tolerate
+    more imbalance in either direction and are rebalanced less often -- acting
+    as buffers rather than being force-balanced. Small channels keep the flat
+    band. Bounds clamped to (0.05, 0.45)/(0.55, 0.95).
     Returns {channel_id: (low, high)}.
     """
     if not capacities:
@@ -248,10 +257,10 @@ def compute_size_tiered_bands(
         if cap <= reference:
             low, high = flat_low, flat_high
         else:
-            scale = min(2.0, cap / float(reference))
+            scale = min(_BAND_MAX_SIZE_SCALE, cap / float(reference))
             widen = small_half_width * scale
-            low = 0.5 - widen * 1.3
-            high = 0.5 + widen * 0.7
+            low = 0.5 - widen
+            high = 0.5 + widen
         bands[cid] = (
             round(max(0.05, min(low, 0.45)), 6),
             round(min(0.95, max(high, 0.55)), 6),
@@ -377,6 +386,13 @@ def build_state_snapshot(
 
         facts = (flow_facts or {}).get(channel.channel_id)
         band = (target_bands or {}).get(channel.channel_id)
+        # FIX 2(b): dest_urgency/source_drain_score must be scored against
+        # THIS channel's own per-channel band (when one exists) so scoring
+        # stays coherent with band-based classification (Task 7). Fall back
+        # to the flat function-scope kwargs when the channel has no
+        # per-channel band -- identical to pre-feature behavior.
+        scoring_band_low = band[0] if band else target_band_low
+        scoring_band_high = band[1] if band else target_band_high
 
         normalized_channels.append(
             ChannelState(
@@ -400,8 +416,8 @@ def build_state_snapshot(
                 dest_eligible=dest_eligible,
                 source_reason=source_reason,
                 dest_reason=dest_reason,
-                dest_urgency=_refill_urgency(local_ratio, target_band_low),
-                source_drain_score=_drain_score(local_ratio, target_band_high),
+                dest_urgency=_refill_urgency(local_ratio, scoring_band_low),
+                source_drain_score=_drain_score(local_ratio, scoring_band_high),
                 budget_source=budget_source,
                 rebalance_bias=channel.rebalance_bias,
                 realized_utilization=(facts.realized_utilization if facts else 0.5),

@@ -535,12 +535,16 @@ def test_small_channel_keeps_flat_band():
     assert bands["s1"] == (0.35, 0.65)
 
 
-def test_large_channel_gets_wider_asymmetric_band():
+def test_large_channel_gets_wider_band():
     caps = {"s1": 1_000_000, "s2": 1_000_000, "s3": 1_000_000, "big": 20_000_000}
     bands = compute_size_tiered_bands(caps, percentile=0.5, small_half_width=0.15, flat_low=0.35, flat_high=0.65)
     low, high = bands["big"]
     assert low < 0.35 and high > 0.65
     assert 0.0 < low < high < 1.0
+    # Symmetric widening: the distance below 0.5 must equal the distance
+    # above 0.5 (big channels tolerate more imbalance in EITHER direction,
+    # they are not skewed to tolerate more remote-heaviness than local).
+    assert abs((high - 0.5) - (0.5 - low)) < 1e-9
 
 
 def test_empty_capacities_returns_empty():
@@ -619,3 +623,85 @@ class TestSizeTieredPlannerClassification:
         assert len(result.selected) == 1
         assert result.selected[0].source_channel_id == "src"
         assert result.selected[0].dest_channel_id == "dest"
+
+
+class TestSizeTieredPlannerSizingAndScoring:
+    """FIX 2(a): sizing (source_excess/dest_need) and diagnostics must use
+    each channel's OWN per-channel band, not the planner's flat
+    self.target_band_low/high scalars -- coherent with classification."""
+
+    def test_drain_demand_excess_uses_source_own_band_not_flat(self):
+        """A big over-local channel with no over-remote partner publishes its
+        residual via DrainDemand. Its excess_sats must be measured against
+        ITS OWN target_band_high (0.80), not the planner's flat 0.65 --
+        giving a smaller excess than the old flat-band math would."""
+        planner = RebalancePlanner(target_band_low=0.35, target_band_high=0.65)
+
+        big = _ch(
+            channel_id="big",
+            peer_id="02" + "aa" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.85,
+            value_class="active",
+            target_band_low=0.20,
+            target_band_high=0.80,
+        )
+        snap = _snap(big)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 0
+        assert result.drain_demand.total_excess_sats > 0
+        entry = result.drain_demand.entries[0]
+        assert entry.channel_id == "big"
+        # Correct (own band 0.80): (0.85 - 0.80) * 20_000_000 = 1_000_000.
+        # Old flat-band bug (0.65): (0.85 - 0.65) * 20_000_000 = 4_000_000.
+        assert entry.excess_sats == 1_000_000
+
+    def test_pair_amount_uses_source_own_high_and_dest_own_low(self):
+        """A big source/dest pair whose per-channel bands are wider than the
+        flat planner scalars must have their sizing capped by the OWN
+        bands, not the flat 0.35/0.65 -- giving a smaller amount than the
+        pre-fix flat-band math would."""
+        planner = RebalancePlanner(
+            target_band_low=0.35, target_band_high=0.65, max_chunk_sats=10_000_000,
+        )
+
+        src = _ch(
+            channel_id="big_src",
+            peer_id="02" + "aa" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.85,
+            value_class="active",
+            target_band_low=0.20,
+            target_band_high=0.80,
+        )
+        dest = _ch(
+            channel_id="big_dest",
+            peer_id="02" + "bb" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.05,
+            value_class="active",
+            target_band_low=0.35,
+            target_band_high=0.65,
+        )
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        pair = result.selected[0]
+        assert pair.source_channel_id == "big_src"
+        assert pair.dest_channel_id == "big_dest"
+        # source_excess (own high 0.80): (0.85-0.80)*20_000_000 = 1_000_000.
+        # dest_need (own low 0.35, unchanged): (0.35-0.05)*20_000_000 = 6_000_000.
+        # amount = min(source_excess, dest_need, max_chunk) = 1_000_000.
+        # The pre-fix flat-band bug would have used source high=0.65,
+        # giving source_excess=4_000_000 and thus amount=4_000_000.
+        assert pair.amount_sats == 1_000_000
+
+        # Diagnostics (score_decomposition inputs) must also reflect the
+        # source's own band, not the flat one.
+        imbalance_score = pair.score_decomposition["inputs"]["imbalance_score"]
+        # src_imbalance = 0.85-0.80=0.05; dest_imbalance = 0.35-0.05=0.30.
+        assert imbalance_score == pytest.approx((0.05 + 0.30) / 2.0)

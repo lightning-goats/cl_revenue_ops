@@ -1295,6 +1295,119 @@ def test_engine_build_snapshot_carries_hive_rebalance_bias(
     hive_hints.get_rebalance_bias.assert_called_once_with(peer_id)
 
 
+def test_engine_build_snapshot_toggle_off_carries_flat_bands_for_all_channels(
+    mock_plugin, mock_database
+):
+    """FIX 3: with rebalance_size_tiered_targets=False, the engine must not
+    build a target_bands map at all -- every channel's per-channel band
+    falls back to the flat cfg thresholds, identical to pre-feature
+    behavior, even when channel capacities differ wildly."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(
+        dry_run=True,
+        rebalance_router="v3",
+        rebalance_size_tiered_targets=False,
+    )
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "03" + "b" * 64,
+                "short_channel_id": "100x1x0",
+                "total_msat": "2000000msat",
+                "our_amount_msat": "1000000msat",
+                "updates": {"remote": {"fee_proportional_millionths": 123}},
+            },
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "03" + "c" * 64,
+                "short_channel_id": "200x2x0",
+                # 20x the capacity of the first channel -- would get a
+                # size-tiered wider band if the toggle were honored.
+                "total_msat": "40000000msat",
+                "our_amount_msat": "20000000msat",
+                "updates": {"remote": {"fee_proportional_millionths": 123}},
+            },
+        ]
+    }
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot is not None
+    assert len(snapshot.channels) == 2
+    flat_low = cfg.low_liquidity_threshold
+    flat_high = cfg.high_liquidity_threshold
+    for channel in snapshot.channels:
+        assert channel.target_band_low == flat_low
+        assert channel.target_band_high == flat_high
+
+
+def test_engine_build_snapshot_toggle_on_gives_big_channel_wider_band_than_small(
+    mock_plugin, mock_database
+):
+    """FIX 3: with the toggle ON and a mixed-size channel set, a big
+    channel's ChannelState must carry a wider per-channel band than a
+    small channel's."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(
+        dry_run=True,
+        rebalance_router="v3",
+        rebalance_size_tiered_targets=True,
+    )
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "03" + "b" * 64,
+                "short_channel_id": "100x1x0",
+                "total_msat": "2000000msat",
+                "our_amount_msat": "1000000msat",
+                "updates": {"remote": {"fee_proportional_millionths": 123}},
+            },
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "03" + "c" * 64,
+                "short_channel_id": "200x2x0",
+                "total_msat": "40000000msat",
+                "our_amount_msat": "20000000msat",
+                "updates": {"remote": {"fee_proportional_millionths": 123}},
+            },
+        ]
+    }
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+
+    snapshot = engine._build_snapshot()
+
+    assert snapshot is not None
+    by_id = {c.channel_id: c for c in snapshot.channels}
+    small = by_id["100x1x0"]
+    big = by_id["200x2x0"]
+    small_half_width = small.target_band_high - small.target_band_low
+    big_half_width = big.target_band_high - big.target_band_low
+    assert big_half_width > small_half_width
+    assert small.target_band_low == cfg.low_liquidity_threshold
+    assert small.target_band_high == cfg.high_liquidity_threshold
+
+
 def test_v2_planner_uses_hive_rebalance_bias_for_pair_roles():
     from modules.rebalance_planner_v2 import RebalancePlanner
     from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot

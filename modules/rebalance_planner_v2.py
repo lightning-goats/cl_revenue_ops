@@ -219,7 +219,9 @@ class RebalancePlanner:
                 channel_id=ch.channel_id,
                 peer_id=ch.peer_id,
                 excess_sats=_sats_from_ratio_delta(
-                    ch.local_ratio - self.target_band_high, ch.capacity_sats
+                    ch.local_ratio
+                    - getattr(ch, "target_band_high", self.target_band_high),
+                    ch.capacity_sats,
                 ),
                 drain_score=float(ch.source_drain_score),
                 value_class=ch.value_class,
@@ -250,12 +252,19 @@ class RebalancePlanner:
                 if src.peer_id == dest.peer_id:
                     continue
 
+                # FIX 2(a): size against each channel's OWN band -- a source
+                # drains down toward its own target_band_high, a destination
+                # refills up toward its own target_band_low. Falls back to
+                # the planner's flat scalars when a channel carries no
+                # per-channel band (toggle-off / small-channel parity).
+                source_band_high = getattr(src, "target_band_high", self.target_band_high)
+                dest_band_low = getattr(dest, "target_band_low", self.target_band_low)
                 source_excess = _sats_from_ratio_delta(
-                    src.local_ratio - self.target_band_high,
+                    src.local_ratio - source_band_high,
                     src.capacity_sats,
                 )
                 dest_need = _sats_from_ratio_delta(
-                    self.target_band_low - dest.local_ratio,
+                    dest_band_low - dest.local_ratio,
                     dest.capacity_sats,
                 )
                 amount = min(
@@ -304,8 +313,8 @@ class RebalancePlanner:
 
                 # Imbalance retained as derived diagnostic, not a scoring
                 # input -- urgency + drain already encode it.
-                src_imbalance = max(0.0, src.local_ratio - self.target_band_high)
-                dest_imbalance = max(0.0, self.target_band_low - dest.local_ratio)
+                src_imbalance = max(0.0, src.local_ratio - source_band_high)
+                dest_imbalance = max(0.0, dest_band_low - dest.local_ratio)
                 imbalance_score = (src_imbalance + dest_imbalance) / 2.0
 
                 score = (
