@@ -26,6 +26,9 @@ What it does
     - Boltz-swap reservations via the P4-014 atomic path
       (``category="boltz"`` reserve_spend against the live unified budget) so
       the budget invariant now covers the boltz leg of DD1's cross-category rail
+    - capacity-planner channel_open reservations via the P4-018 atomic path
+      (``category="channel_open"`` reserve_spend against the live unified budget)
+      so budget-never-exceeded now covers the FOURTH (planner) daemon spend path
     - ``revenue-config set`` reloads (config._lock / _version churn)
 
 Asserted invariants (soak)
@@ -425,6 +428,65 @@ class StressHarness:
                 self.record_exception(f"boltz_reserve[{wid}]", exc)
             self.bump()
 
+    def worker_planner_open_reserve(self, wid):
+        """Firehose: capacity-planner channel_open reservations via the P4-018
+        atomic path.
+
+        Mirrors modules.capacity_planner.CapacityPlanner._execute_open — a
+        category="channel_open" reserve_spend against the LIVE unified budget
+        (effective_budget_sats passed) inside BEGIN IMMEDIATE, then settle
+        (mark spent + spend event) on "success" or release on "failure". This is
+        the fourth (planner) leg of DD1's cross-category rail: a planner open
+        reservation must be counted by (and count) the rebalance, generic, and
+        boltz reservations, so budget-never-exceeded now covers ALL FOUR
+        autonomous daemon spend paths.
+        """
+        mod = self.mod
+        db = mod.database
+        rng = random.Random(self.rng_seed * 5000 + wid)
+        counter = 0
+        live = deque()
+        while not self.stop.is_set():
+            counter += 1
+            roll = rng.random()
+            try:
+                if roll < 0.7 or not live:
+                    rid = f"planner-open-{wid}-{counter}"
+                    amt = rng.randint(200, max(300, self.budget_sats // 3))
+                    try:
+                        prov = mod._total_cost_budget_limit_provider()
+                        eff = int(prov.get("effective_budget_sats", self.budget_sats) or 0)
+                    except Exception:
+                        eff = self.budget_sats
+                    ok = db.reserve_spend(
+                        reservation_id=rid,
+                        amount_sats=amt,
+                        category="channel_open",
+                        subcategory="automated",
+                        effective_budget_sats=eff,
+                        since_timestamp=self._since_24h(),
+                    )
+                    if ok:
+                        live.append(rid)
+                    self.journal(f"planner{wid}", "planner_open_reserve", amt,
+                                 "channel_open", f"ok={ok},eff={eff}")
+                elif roll < 0.85:
+                    rid = live.popleft()
+                    ok = db.mark_spend_reservation_spent(
+                        reservation_id=rid, actual_spent_sats=None,
+                        source="capacity_planner", record_event=True,
+                    )
+                    self.journal(f"planner{wid}", "planner_open_settle", None,
+                                 "channel_open", f"ok={ok}")
+                else:
+                    rid = live.popleft()
+                    ok = db.release_spend_reservation(rid)
+                    self.journal(f"planner{wid}", "planner_open_release", None,
+                                 "channel_open", f"ok={ok}")
+            except Exception as exc:
+                self.record_exception(f"planner_open_reserve[{wid}]", exc)
+            self.bump()
+
     def worker_config_reload(self, wid):
         """setconfig churn on non-budget public keys (config._lock / _version)."""
         mod = self.mod
@@ -578,6 +640,8 @@ class StressHarness:
             spawn(self.worker_rebalance_reserve, f"rebalance-{i}", i)
         for i in range(n):
             spawn(self.worker_boltz_reserve, f"boltz-{i}", i)
+        for i in range(n):
+            spawn(self.worker_planner_open_reserve, f"planner-{i}", i)
         for i in range(max(1, n // 2)):
             spawn(self.worker_config_reload, f"config-{i}", i)
 
