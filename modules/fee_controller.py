@@ -2839,11 +2839,14 @@ class FeeController:
             self._clear_hive_member_cache(peer_id, release=True)
             return False
 
-        last_set = self._hive_member_set_at.get(peer_id)
-        if last_set is not None:
-            if int(time.time()) - int(last_set) <= self._hive_hint_effective_ttl() * 2:
-                return True
-            self._clear_hive_member_cache(peer_id, release=False)
+        # P4-001: route the cache read through the locked helper (as
+        # _classify_channel_role already does) rather than a lock-free
+        # _hive_member_set_at.get(); this money-gate site was the one converted
+        # collection reader the P2-006 sweep missed.
+        if self._cached_hive_membership_active(peer_id):
+            return True
+        # Not fresh: evict any stale entry so we don't keep re-checking it.
+        self._clear_hive_member_cache(peer_id, release=False)
 
         return False
 
