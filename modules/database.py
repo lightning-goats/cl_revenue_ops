@@ -137,10 +137,15 @@ def _reserve_budget_atomic(conn, reservation_id: str, amount_sats: int,
     ).fetchone()
     daily_spent = spent_row[0] if spent_row else 0
 
+    # P4-017: active reservations are currently-HELD budget and must count in
+    # full regardless of age. Filtering by ``reserved_at >= since_timestamp``
+    # dropped an aged-but-active reservation from committed, under-counting held
+    # budget in the overspend direction (and compounding P4-015's hold-on-pending
+    # for a >window-old pending payment). The generic reserve_spend path already
+    # sums active reservations with no time filter; mirror it here.
     reserved_row = conn.execute(
         "SELECT COALESCE(SUM(reserved_sats), 0) FROM budget_reservations "
-        "WHERE status = 'active' AND reserved_at >= ?",
-        (since_timestamp,),
+        "WHERE status = 'active'",
     ).fetchone()
     daily_reserved = reserved_row[0] if reserved_row else 0
 
@@ -165,10 +170,11 @@ def _reserve_budget_atomic(conn, reservation_id: str, amount_sats: int,
         ).fetchone()
         weekly_spent = weekly_spent_row[0] if weekly_spent_row else 0
 
+        # P4-017: active reservations count in full regardless of age (see the
+        # daily sum above); no ``reserved_at`` filter on the held-budget sum.
         weekly_reserved_row = conn.execute(
             "SELECT COALESCE(SUM(reserved_sats), 0) FROM budget_reservations "
-            "WHERE status = 'active' AND reserved_at >= ?",
-            (weekly_since_timestamp,),
+            "WHERE status = 'active'",
         ).fetchone()
         weekly_reserved = weekly_reserved_row[0] if weekly_reserved_row else 0
 
