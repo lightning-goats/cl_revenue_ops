@@ -4990,23 +4990,29 @@ class Database:
                   resolution_time, ts, rt))
             duplicate = (cursor.rowcount == 0)
 
-            # Same upsert SQL as update_peer_reputation()
-            if success:
-                conn.execute("""
-                    INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
-                    VALUES (?, 1, 0, ?)
-                    ON CONFLICT(peer_id) DO UPDATE SET
-                        success_count = success_count + 1,
-                        last_update = excluded.last_update
-                """, (peer_id, now))
-            else:
-                conn.execute("""
-                    INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
-                    VALUES (?, 0, 1, ?)
-                    ON CONFLICT(peer_id) DO UPDATE SET
-                        failure_count = failure_count + 1,
-                        last_update = excluded.last_update
-                """, (peer_id, now))
+            # P4-004: only touch reputation when the forward was actually new.
+            # The fee side is deduped by the unique index (INSERT OR IGNORE),
+            # but the reputation upsert used to run unconditionally, so a
+            # duplicate forward (startup-hydration vs live overlap) would
+            # re-increment success/failure counts on replay. Guard it.
+            if not duplicate:
+                # Same upsert SQL as update_peer_reputation()
+                if success:
+                    conn.execute("""
+                        INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
+                        VALUES (?, 1, 0, ?)
+                        ON CONFLICT(peer_id) DO UPDATE SET
+                            success_count = success_count + 1,
+                            last_update = excluded.last_update
+                    """, (peer_id, now))
+                else:
+                    conn.execute("""
+                        INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
+                        VALUES (?, 0, 1, ?)
+                        ON CONFLICT(peer_id) DO UPDATE SET
+                            failure_count = failure_count + 1,
+                            last_update = excluded.last_update
+                    """, (peer_id, now))
 
             conn.execute("COMMIT")
         except Exception:
