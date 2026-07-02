@@ -758,3 +758,256 @@ def test_the_test_detects_an_injected_new_reserve_spender():
     assert injected in sites, "scanner failed to detect an injected new spender"
     assert injected not in ALLOWLIST
     assert _guard_would_trip({injected}), "the enumeration guard is toothless on a new spender"
+
+
+# ===========================================================================
+# RPC-HANDLE-ALIAS FORBID-PATTERN LINT (P4-028).
+#
+# The enumeration scanner above only SEES a money RPC when it is issued
+# directly on a syntactic rpc handle -- a bare name ``rpc`` or an attribute
+# chain ending ``.rpc`` (``rpc.call('sendpay')``, ``self.rpc.sendpay(...)``,
+# ``self._plugin.rpc.sendpay(...)``). An ALIASED handle evades it silently and
+# emits NO site:
+#
+#     h = self.rpc;                 h.sendpay(route, ph)          # (1) local alias
+#     getattr(self.rpc, 'sendpay')(route, ph)                    # (2) getattr dispatch
+#     m = self.rpc.sendpay;         m(...)                        # (3) stashed bound method
+#     p = self._plugin.rpc;         p.pay(params)                # (4) attr alias
+#
+# No live instance of any of these exists today (the P4-028 refuter confirmed
+# zero live aliases), so this is a THEORETICAL gap -- but the guard's whole
+# purpose is to stop a FUTURE silent spender. Rather than track dataflow, this
+# is a complete FORBID-PATTERN lint: it FAILS the build if any runtime source
+# file binds an rpc handle to a non-canonical name (or stashes a bound money
+# method, or getattrs a handle) in a way that would let a money RPC be issued
+# off a name the scanner cannot recognise. The author must EITHER call the money
+# RPC directly on the rpc handle (so the scanner sees it) OR add an explicit,
+# justified RPC_ALIAS_ALLOWLIST entry.
+#
+# A canonical REBIND (``self.rpc = rpc`` -- target is itself a canonical handle)
+# is NOT an evasion: the scanner still sees ``self.rpc.<method>(...)``. Only
+# binding to a NON-canonical name hides the handle, so only that is flagged.
+# ---------------------------------------------------------------------------
+
+# Aliasing forms the lint recognises.
+FORM_ASSIGN_HANDLE = "alias-assign-rpc-handle"                 # x = self.rpc
+FORM_GETATTR_HANDLE = "alias-getattr-rpc-handle"              # getattr(self.rpc, ...)
+FORM_ASSIGN_BOUND_METHOD = "alias-assign-bound-money-method"  # self._sp = self.rpc.sendpay
+
+# Accepted rpc-handle-alias sites. Keyed (filename, enclosing_function, form,
+# detail); value is a justification. Near-empty by design: the ONLY accepted
+# alias is the single generic pyln transport proxy.
+RPC_ALIAS_ALLOWLIST = {
+    ("cl-revenue-ops.py", "__init__", FORM_ASSIGN_HANDLE, "_rpc"): (
+        "ThreadSafeRpcProxy.__init__ binds ``self._rpc = plugin_instance.rpc`` -- "
+        "the ONE generic pyln transport proxy. Every money RPC dispatched through it "
+        "is forwarded BY NAME via ThreadSafeRpcProxy.__getattr__/call (which does "
+        "``getattr(self._rpc, name)`` -- not flagged because ``self._rpc`` is not a "
+        "canonical handle), and the concrete-method spend sites are enumerated on the "
+        "``self.rpc`` proxy handle every caller actually uses (self.rpc = "
+        "ThreadSafeRpcProxy(...)). This alias is pure transport plumbing, not a spend "
+        "decision, and cannot hide a money RPC from the scanner (P4-028)."
+    ),
+}
+
+
+def _is_canonical_rpc_target(t: ast.AST) -> bool:
+    """True iff assignment target ``t`` is itself a canonical rpc handle name
+    (bare ``rpc`` or an attribute ending ``.rpc``). Binding the handle to such a
+    name (``self.rpc = rpc``) is a legitimate rebind -- the scanner still sees
+    money calls on it -- so it is NOT an evasion and is not flagged."""
+    if isinstance(t, ast.Name):
+        return t.id == "rpc"
+    if isinstance(t, ast.Attribute):
+        return t.attr == "rpc"
+    return False
+
+
+def _is_bound_money_method(v: ast.AST) -> bool:
+    """True iff ``v`` is ``<rpc-handle>.<money-method>`` -- a bound money-RPC
+    method being stashed (e.g. ``self._sp = self.rpc.sendpay``)."""
+    return (isinstance(v, ast.Attribute)
+            and v.attr in _MONEY_RPC_METHODS
+            and _is_rpc_handle(v.value))
+
+
+def _target_detail(t: ast.AST) -> str:
+    if isinstance(t, ast.Name):
+        return t.id
+    if isinstance(t, ast.Attribute):
+        return t.attr
+    return "<expr>"
+
+
+def _scan_rpc_aliases(fname: str, tree: ast.AST):
+    """Yield (filename, enclosing_function, form, detail, lineno) for every
+    rpc-handle-alias construct in ``tree`` that could hide a money RPC from the
+    enumeration scanner."""
+    encl = _enclosing_func_resolver(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            if value is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            # Pair each target with its value (elementwise for a shape-matching
+            # tuple/list unpack, else each target with the whole value).
+            if (isinstance(value, (ast.Tuple, ast.List)) and len(targets) == 1
+                    and isinstance(targets[0], (ast.Tuple, ast.List))
+                    and len(targets[0].elts) == len(value.elts)):
+                pairs = list(zip(targets[0].elts, value.elts))
+            else:
+                pairs = [(t, value) for t in targets]
+            for tgt, val in pairs:
+                # (1)/(4): assignment VALUE is an rpc handle bound to a
+                # non-canonical name -> the handle is hidden behind that name.
+                if _is_rpc_handle(val) and not _is_canonical_rpc_target(tgt):
+                    yield (fname, encl(node), FORM_ASSIGN_HANDLE,
+                           _target_detail(tgt), node.lineno)
+                # (3): assignment VALUE stashes a bound money method.
+                if _is_bound_money_method(val):
+                    yield (fname, encl(node), FORM_ASSIGN_BOUND_METHOD,
+                           val.attr, node.lineno)
+        # (2): getattr(<rpc-handle>, ...) -- dynamic method resolution off a
+        # canonical handle can dispatch any money RPC by string.
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name) and node.func.id == "getattr"
+                and node.args and _is_rpc_handle(node.args[0])):
+            yield (fname, encl(node), FORM_GETATTR_HANDLE, "getattr", node.lineno)
+
+
+def collect_rpc_alias_sites(extra_sources=None):
+    """Return the list of rpc-handle-alias sites (with line numbers) across
+    production source. ``extra_sources`` (list of (filename, source)) lets the
+    test-the-test inject each evasion form and assert the lint trips."""
+    sites = []
+    files = sorted(MODULES_DIR.glob("*.py")) + [MAIN_PLUGIN]
+    for path in files:
+        sites.extend(_scan_rpc_aliases(
+            path.name, ast.parse(path.read_text(), filename=path.name)))
+    for fname, source in (extra_sources or []):
+        sites.extend(_scan_rpc_aliases(fname, ast.parse(source, filename=fname)))
+    return sites
+
+
+def _rpc_alias_violations(extra_sources=None):
+    """Alias sites NOT in RPC_ALIAS_ALLOWLIST (keyed on
+    (filename, enclosing_function, form, detail))."""
+    return [
+        s for s in collect_rpc_alias_sites(extra_sources)
+        if (s[0], s[1], s[2], s[3]) not in RPC_ALIAS_ALLOWLIST
+    ]
+
+
+def _format_alias_violations(violations):
+    return "\n".join(
+        f"  {f}:{lineno} [{form}] alias detail={detail!r} in {func}()"
+        for (f, func, form, detail, lineno) in sorted(violations)
+    )
+
+
+def test_no_aliased_rpc_handle_hides_a_money_rpc():
+    """P4-028 forbid-pattern lint: the real tree must be GREEN. Any assignment
+    that binds an rpc handle to a NON-canonical name, any stashed bound money
+    method, or any getattr on an rpc handle -- unless explicitly justified in
+    RPC_ALIAS_ALLOWLIST -- fails here, because it could issue a money RPC off a
+    name the enumeration scanner cannot see (a silent future spender)."""
+    violations = _rpc_alias_violations()
+    assert not violations, (
+        "rpc-handle-alias construct(s) that could hide a money RPC from the "
+        "enumeration scanner -- EITHER call the money RPC directly on the rpc "
+        "handle (so the scanner sees the site) OR add a justified "
+        "RPC_ALIAS_ALLOWLIST entry:\n" + _format_alias_violations(violations)
+    )
+
+
+def test_alias_lint_allowlists_only_the_known_generic_proxy():
+    """The alias allowlist must stay near-empty: the ONLY accepted alias is the
+    single generic ThreadSafeRpcProxy transport, and every entry must carry a
+    non-empty justification. A stale entry (no longer in source) also fails so
+    the allowlist stays an honest mirror."""
+    scanned_keys = {(s[0], s[1], s[2], s[3]) for s in collect_rpc_alias_sites()}
+    stale = set(RPC_ALIAS_ALLOWLIST) - scanned_keys
+    assert not stale, f"stale RPC_ALIAS_ALLOWLIST entries no longer in source: {sorted(stale)}"
+    unjustified = [k for k, why in RPC_ALIAS_ALLOWLIST.items() if not str(why).strip()]
+    assert not unjustified, f"alias allowlist entries missing justification: {unjustified}"
+
+
+def test_alias_lint_ignores_canonical_rpc_rebind():
+    """A canonical rebind (``self.rpc = rpc`` -- target is itself a canonical
+    handle) is NOT an evasion and must not be flagged: the scanner still sees
+    money calls on ``self.rpc``. (BoltzCliManager.__init__ does exactly this.)"""
+    rebind = (
+        "class Mgr:\n"
+        "    def __init__(self, plugin, rpc):\n"
+        "        self.rpc = rpc\n"
+    )
+    violations = _rpc_alias_violations(extra_sources=[("rebind_mod.py", rebind)])
+    assert not any(v[0] == "rebind_mod.py" for v in violations), (
+        f"canonical rpc rebind wrongly flagged as an alias evasion: "
+        f"{[v for v in violations if v[0] == 'rebind_mod.py']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TEST-THE-TEST for the alias lint: each of the four evasion forms, injected
+# into a scratch fixture, MUST trip the lint (be a violation). An incomplete
+# lint would silently miss one and leave the aliasing evasion open.
+# ---------------------------------------------------------------------------
+def test_the_test_alias_lint_trips_on_local_handle_alias():
+    """(1) ``h = self.rpc; h.sendpay(route, ph)`` -- local alias of the handle."""
+    rogue = (
+        "class RogueLocal:\n"
+        "    def _rogue(self, route, ph):\n"
+        "        h = self.rpc\n"
+        "        return h.sendpay(route, ph)\n"
+    )
+    violations = _rpc_alias_violations(extra_sources=[("rogue_local.py", rogue)])
+    hit = [v for v in violations if v[0] == "rogue_local.py"]
+    assert any(v[2] == FORM_ASSIGN_HANDLE and v[3] == "h" for v in hit), (
+        f"alias lint blind to a local rpc-handle alias (h = self.rpc): {hit}"
+    )
+
+
+def test_the_test_alias_lint_trips_on_getattr_dispatch():
+    """(2) ``getattr(self.rpc, 'sendpay')(route, ph)`` -- getattr dispatch."""
+    rogue = (
+        "class RogueGetattr:\n"
+        "    def _rogue(self, route, ph):\n"
+        "        return getattr(self.rpc, 'sendpay')(route, ph)\n"
+    )
+    violations = _rpc_alias_violations(extra_sources=[("rogue_getattr.py", rogue)])
+    hit = [v for v in violations if v[0] == "rogue_getattr.py"]
+    assert any(v[2] == FORM_GETATTR_HANDLE for v in hit), (
+        f"alias lint blind to a getattr(rpc-handle, ...) dispatch: {hit}"
+    )
+
+
+def test_the_test_alias_lint_trips_on_stashed_bound_method():
+    """(3) ``m = self.rpc.sendpay; m(...)`` -- stashed bound money method."""
+    rogue = (
+        "class RogueBound:\n"
+        "    def _rogue(self):\n"
+        "        m = self.rpc.sendpay\n"
+        "        return m\n"
+    )
+    violations = _rpc_alias_violations(extra_sources=[("rogue_bound.py", rogue)])
+    hit = [v for v in violations if v[0] == "rogue_bound.py"]
+    assert any(v[2] == FORM_ASSIGN_BOUND_METHOD and v[3] == "sendpay" for v in hit), (
+        f"alias lint blind to a stashed bound money method (m = self.rpc.sendpay): {hit}"
+    )
+
+
+def test_the_test_alias_lint_trips_on_plugin_rpc_attr_alias():
+    """(4) ``p = self._plugin.rpc; p.pay(params)`` -- attribute-chain alias."""
+    rogue = (
+        "class RoguePlugin:\n"
+        "    def _rogue(self, params):\n"
+        "        p = self._plugin.rpc\n"
+        "        return p.pay(params)\n"
+    )
+    violations = _rpc_alias_violations(extra_sources=[("rogue_plugin.py", rogue)])
+    hit = [v for v in violations if v[0] == "rogue_plugin.py"]
+    assert any(v[2] == FORM_ASSIGN_HANDLE and v[3] == "p" for v in hit), (
+        f"alias lint blind to a self._plugin.rpc alias (p = self._plugin.rpc): {hit}"
+    )
