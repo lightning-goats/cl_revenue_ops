@@ -1550,6 +1550,9 @@ class BoltzCliManager:
                 pass
             else:
                 cmd.extend(["--to-wallet", str(wallet_name)])
+            # `--` terminates option parsing so the free-form on-chain address
+            # (and other positionals) cannot be reparsed by boltzcli as flags.
+            cmd.append("--")
             cmd.extend([self._swap_cli_currency(target_cur, target_cur), str(amount_sats)])
             if address:
                 cmd.append(address)
@@ -1666,6 +1669,9 @@ class BoltzCliManager:
                 pass
             else:
                 cmd.extend(["--to-wallet", str(wallet_name)])
+            # `--` terminates option parsing so the free-form on-chain address
+            # (and other positionals) cannot be reparsed by boltzcli as flags.
+            cmd.append("--")
             cmd.extend([self._swap_cli_currency(target_cur, target_cur), str(amount_sats)])
             if address:
                 cmd.append(address)
@@ -1758,7 +1764,9 @@ class BoltzCliManager:
 
     def swap_status(self, swap_id: str) -> Dict[str, Any]:
         swap_id = str(swap_id)
-        raw = self._run(["swapinfo", swap_id], timeout=max(self.cfg.timeout_seconds, 120))
+        # `--` terminates option parsing so a swap_id beginning with '-' is
+        # treated as a positional value, not reparsed by boltzcli as a flag.
+        raw = self._run(["swapinfo", "--", swap_id], timeout=max(self.cfg.timeout_seconds, 120))
         list_json = None
         list_match = None
         try:
@@ -1823,7 +1831,9 @@ class BoltzCliManager:
 
     def refund(self, swap_id: str, destination: Optional[str] = None) -> Dict[str, Any]:
         dest = destination or "wallet"
-        raw = self._run(["refundswap", str(swap_id), str(dest)], timeout=max(self.cfg.timeout_seconds, 120))
+        # `--` terminates option parsing so a swap_id/dest beginning with '-'
+        # is treated as a positional value, not reparsed by boltzcli as a flag.
+        raw = self._run(["refundswap", "--", str(swap_id), str(dest)], timeout=max(self.cfg.timeout_seconds, 120))
         return {"swap_id": swap_id, "destination": dest, "result_raw": raw}
 
     def claim(self, swap_ids: List[str], destination: Optional[str] = None) -> Dict[str, Any]:
@@ -1831,7 +1841,9 @@ class BoltzCliManager:
         if not ids:
             raise BoltzCliError("swap_ids is required")
         dest = destination or "wallet"
-        raw = self._run(["claimswaps", str(dest)] + ids, timeout=max(self.cfg.timeout_seconds, 120))
+        # `--` terminates option parsing so a dest/swap-id beginning with '-'
+        # is treated as a positional value, not reparsed by boltzcli as a flag.
+        raw = self._run(["claimswaps", "--", str(dest)] + ids, timeout=max(self.cfg.timeout_seconds, 120))
         return {"swap_ids": ids, "destination": dest, "result_raw": raw}
 
     def chainswap(self, amount_sats: int, from_currency: Optional[str] = None, to_currency: Optional[str] = None,
@@ -1885,11 +1897,15 @@ class BoltzCliManager:
         amt = 0 if sweep else int(amount_sats or 0)
         if not sweep and amt <= 0:
             raise BoltzCliError("amount_sats must be > 0 unless sweep=true")
-        args: List[str] = ["wallet", "send", wallet_name, destination, str(amt)]
+        # Flags first, then a `--` terminator before the free-form positional
+        # args (wallet/destination/amount). This keeps a destination beginning
+        # with '-' from being reparsed by boltzcli as a flag.
+        args: List[str] = ["wallet", "send"]
         if sat_per_vbyte is not None:
             args.extend(["--sat-per-vbyte", str(int(sat_per_vbyte))])
         if sweep:
             args.append("--sweep")
+        args.extend(["--", wallet_name, destination, str(amt)])
         raw = self._run(args, timeout=max(self.cfg.timeout_seconds, 180))
         return {
             "wallet": wallet_name,
