@@ -536,11 +536,28 @@ class RebalanceEngine:
         failure_penalty_sats = (
             failure_count * expected_fee_sats * FAILURE_COST_RATE
         )
+
+        # Feature #1: soft, capped penalty for pairs whose channels are
+        # ALREADY being moved the "helpful" way by live forwarding (source
+        # draining outbound / dest refilling inbound) -- rebalancing them
+        # further is wasteful. Scales by the dest fee (same basis as the
+        # value term) and is capped so a strongly-EV pair still runs. With
+        # no activity facts (the default), helpful_flow_sats == 0 and this
+        # term is exactly 0.0, leaving final_score_sats unchanged.
+        activity_coeff = float(getattr(cfg, "rebalance_activity_penalty_coeff", 0.5) or 0.0)
+        activity_cap_frac = float(getattr(cfg, "rebalance_activity_penalty_cap_frac", 0.5) or 0.0)
+        helpful_flow_sats = int(getattr(pair, "source_activity_out_sats", 0) or 0) + \
+                            int(getattr(pair, "dest_activity_in_sats", 0) or 0)
+        raw_activity_penalty = activity_coeff * helpful_flow_sats * dest_value_fee_ppm / 1_000_000.0
+        activity_penalty_cap = activity_cap_frac * max(0.0, expected_future_value_sats)
+        activity_penalty_sats = round(min(raw_activity_penalty, activity_penalty_cap), 6)
+
         final_score_sats = round(
             p_success * expected_future_value_sats
             - expected_fee_sats
             - source_opportunity_sats
-            - failure_penalty_sats,
+            - failure_penalty_sats
+            - activity_penalty_sats,
             6,
         )
 
@@ -582,6 +599,7 @@ class RebalanceEngine:
             "expected_fee_sats": expected_fee_sats,
             "source_opportunity_sats": round(source_opportunity_sats, 6),
             "failure_penalty_sats": round(failure_penalty_sats, 6),
+            "activity_penalty_sats": activity_penalty_sats,
             "final_score_sats": final_score_sats,
             # Reports the DEST utilization only; kept as `expected_utilization`
             # for backward-compat with existing consumers. Source side is

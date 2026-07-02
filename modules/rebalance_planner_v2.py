@@ -383,6 +383,8 @@ class RebalancePlanner:
                     source_utilization_is_realized=bool(
                         getattr(src, "utilization_is_realized", False)
                     ),
+                    source_activity_out_sats=int(getattr(src, "activity_out_sats", 0) or 0),
+                    dest_activity_in_sats=int(getattr(dest, "activity_in_sats", 0) or 0),
                     hive_source_rebalance_bias=source_rebalance_bias,
                     hive_dest_rebalance_bias=dest_rebalance_bias,
                     hive_hint_score_multiplier=hint_multiplier,

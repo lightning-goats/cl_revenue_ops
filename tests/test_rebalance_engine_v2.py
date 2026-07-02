@@ -3960,3 +3960,171 @@ def test_realized_utilization_used_for_source_side(mock_plugin, mock_database):
         expected_opportunity_prior
     )
     assert prior_decomp["source_utilization_source"] == "prior"
+
+
+def test_activity_penalty_lowers_score_for_helpful_flow(mock_plugin, mock_database):
+    """Feature #1: when live forwarding is already moving the pair's
+    channels the 'helpful' way (source draining outbound / dest refilling
+    inbound), the sats-EV gate applies a soft, capped penalty proportional
+    to that helpful flow -- so a pair a router is already fixing scores
+    lower than an otherwise-identical pair with no such activity."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_activity_penalty_coeff = 0.5
+    engine.config.rebalance_activity_penalty_cap_frac = 0.5
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_000
+    source_activity_out_sats = 100_000
+
+    def build_pair(source_activity_out_sats):
+        return PairCandidate(
+            source_channel_id="100x1x0",
+            dest_channel_id="200x2x0",
+            source_peer_id="03" + "b" * 64,
+            dest_peer_id="03" + "c" * 64,
+            amount_sats=amount_sats,
+            pair_budget_sats=5_000,
+            source_capacity_sats=1_000_000,
+            dest_capacity_sats=1_000_000,
+            score=2.0,
+            source_local_ratio=0.85,
+            dest_local_ratio=0.10,
+            dest_out_fee_ppm=dest_out_fee_ppm,
+            source_activity_out_sats=source_activity_out_sats,
+        )
+
+    base_pair = build_pair(0)
+    activity_pair = build_pair(source_activity_out_sats)
+
+    base_decomp = engine._build_score_decomposition(
+        base_pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+    activity_decomp = engine._build_score_decomposition(
+        activity_pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    dest_value_fee_ppm = base_decomp["inputs"]["dest_value_fee_ppm"]
+    expected_future_value_sats = base_decomp["expected_future_value_sats"]
+    raw_penalty = 0.5 * source_activity_out_sats * dest_value_fee_ppm / 1_000_000.0
+    cap = 0.5 * max(0.0, expected_future_value_sats)
+    expected_penalty = round(min(raw_penalty, cap), 6)
+
+    assert base_decomp["activity_penalty_sats"] == 0.0
+    assert activity_decomp["activity_penalty_sats"] == pytest.approx(expected_penalty)
+    assert expected_penalty > 0
+    assert activity_decomp["final_score_sats"] < base_decomp["final_score_sats"]
+    assert activity_decomp["final_score_sats"] == pytest.approx(
+        base_decomp["final_score_sats"] - expected_penalty
+    )
+
+
+def test_activity_penalty_is_capped(mock_plugin, mock_database):
+    """Feature #1 cap: a pair with a huge helpful live-flow figure must
+    have its penalty capped at cap_frac * expected_future_value_sats, so a
+    strongly-EV pair still beats do-nothing instead of being zeroed out."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_activity_penalty_coeff = 0.5
+    engine.config.rebalance_activity_penalty_cap_frac = 0.5
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_000
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+        source_activity_out_sats=10**12,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    expected_future_value_sats = decomp["expected_future_value_sats"]
+    expected_cap = round(0.5 * max(0.0, expected_future_value_sats), 6)
+
+    assert decomp["activity_penalty_sats"] == pytest.approx(expected_cap)
+    assert decomp["final_score_sats"] >= 0
+    assert decomp["beats_do_nothing"] is True
+
+
+def test_no_activity_no_penalty(mock_plugin, mock_database):
+    """KEY INVARIANT: a pair with no activity facts (activity sats = 0, the
+    default) must get a zero activity penalty and a final_score_sats
+    IDENTICAL to the pre-feature value -- existing engine tests with no
+    activity must stay green."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_activity_penalty_coeff = 0.5
+    engine.config.rebalance_activity_penalty_cap_frac = 0.5
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_000
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    p_success = decomp["p_success"]
+    expected_future_value_sats = decomp["expected_future_value_sats"]
+    expected_fee_sats = decomp["expected_fee_sats"]
+    source_opportunity_sats = decomp["source_opportunity_sats"]
+    failure_penalty_sats = decomp["failure_penalty_sats"]
+    pre_feature_final_score_sats = round(
+        p_success * expected_future_value_sats
+        - expected_fee_sats
+        - source_opportunity_sats
+        - failure_penalty_sats,
+        6,
+    )
+
+    assert decomp["activity_penalty_sats"] == 0.0
+    assert decomp["final_score_sats"] == pytest.approx(pre_feature_final_score_sats)
