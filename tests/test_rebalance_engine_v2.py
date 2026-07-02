@@ -3759,3 +3759,91 @@ def test_thin_history_uses_prior(mock_plugin, mock_database):
     assert decomp["destination_refill_value_sats"] == pytest.approx(expected_refill)
     assert decomp["expected_utilization"] == pytest.approx(0.5)
     assert decomp["utilization_source"] == "prior"
+
+
+def test_realized_utilization_used_for_source_side(mock_plugin, mock_database):
+    """Feature #2, source side: when the SOURCE carries MEASURED (realized)
+    utilization, the EV gate's drain/opportunity terms use that measured
+    value instead of the flat EXPECTED_UTILIZATION prior, and the
+    decomposition reports the source-side provenance as 'realized' via the
+    (new) symmetric 'source_utilization_source' key. Mirrors
+    test_realized_utilization_used_for_hot_channel but exercises source_u."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+
+    amount_sats = 1_000_000
+    # Values kept below the default max_fee_ppm=2000 historical-fee cap
+    # (_bounded_historical_fee_ppm) so they aren't clipped before use.
+    source_out_fee_ppm = 1_200
+    source_historical_sourced_fee_ppm = 1_800
+
+    def build_pair(realized_utilization, is_realized):
+        return PairCandidate(
+            source_channel_id="100x1x0",
+            dest_channel_id="200x2x0",
+            source_peer_id="03" + "b" * 64,
+            dest_peer_id="03" + "c" * 64,
+            amount_sats=amount_sats,
+            pair_budget_sats=5_000,
+            source_capacity_sats=1_000_000,
+            dest_capacity_sats=1_000_000,
+            score=2.0,
+            source_local_ratio=0.85,
+            dest_local_ratio=0.10,
+            source_out_fee_ppm=source_out_fee_ppm,
+            source_historical_sourced_fee_ppm=source_historical_sourced_fee_ppm,
+            source_realized_utilization=realized_utilization,
+            source_utilization_is_realized=is_realized,
+        )
+
+    # --- realized branch: source_u should be 0.8, not the 0.5 prior. ---
+    realized_pair = build_pair(0.8, True)
+    realized_decomp = engine._build_score_decomposition(
+        realized_pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    expected_drain = (
+        amount_sats * source_historical_sourced_fee_ppm / 1_000_000.0 * 0.8
+    )
+    expected_opportunity = (
+        amount_sats * source_out_fee_ppm / 1_000_000.0 * 0.8 * 0.5
+    )
+    assert realized_decomp["source_utilization"] == pytest.approx(0.8)
+    assert realized_decomp["source_drain_value_sats"] == pytest.approx(expected_drain)
+    assert realized_decomp["source_opportunity_sats"] == pytest.approx(
+        expected_opportunity
+    )
+    assert realized_decomp["source_utilization_source"] == "realized"
+
+    # --- prior branch: source_utilization_is_realized False must fall back
+    # to the flat 0.5 EXPECTED_UTILIZATION prior, identical to pre-feature
+    # behavior, even though the same 0.8 measured value is present. ---
+    prior_pair = build_pair(0.8, False)
+    prior_decomp = engine._build_score_decomposition(
+        prior_pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    expected_drain_prior = (
+        amount_sats * source_historical_sourced_fee_ppm / 1_000_000.0 * 0.5
+    )
+    expected_opportunity_prior = (
+        amount_sats * source_out_fee_ppm / 1_000_000.0 * 0.5 * 0.5
+    )
+    assert prior_decomp["source_utilization"] == pytest.approx(0.5)
+    assert prior_decomp["source_drain_value_sats"] == pytest.approx(
+        expected_drain_prior
+    )
+    assert prior_decomp["source_opportunity_sats"] == pytest.approx(
+        expected_opportunity_prior
+    )
+    assert prior_decomp["source_utilization_source"] == "prior"

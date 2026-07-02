@@ -188,6 +188,38 @@ class TestPairGeneration:
         # Destination budget caps spend even when source has more.
         assert result.selected[0].pair_budget_sats == 500
 
+    def test_generate_pairs_threads_realized_utilization_without_transpose(self):
+        """Upstream pattern #2 regression guard: _generate_pairs must map
+        src.realized_utilization -> PairCandidate.source_realized_utilization
+        and dest.realized_utilization -> PairCandidate.dest_realized_utilization
+        (and the matching *_is_realized flags) WITHOUT swapping src/dest. Use
+        distinct, asymmetric values on each side so a transpose bug (source
+        and dest utilization silently swapped) would fail this assertion."""
+        import dataclasses
+
+        planner = RebalancePlanner()
+        src = dataclasses.replace(
+            _ch(channel_id="src", peer_id="02" + "aa" * 32, local_ratio=0.90),
+            realized_utilization=0.7,
+            utilization_is_realized=True,
+        )
+        dest = dataclasses.replace(
+            _ch(channel_id="dest", peer_id="02" + "bb" * 32, local_ratio=0.10),
+            realized_utilization=0.3,
+            utilization_is_realized=False,
+        )
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        pair = result.selected[0]
+        assert pair.source_channel_id == "src"
+        assert pair.dest_channel_id == "dest"
+        assert pair.source_realized_utilization == pytest.approx(0.7)
+        assert pair.source_utilization_is_realized is True
+        assert pair.dest_realized_utilization == pytest.approx(0.3)
+        assert pair.dest_utilization_is_realized is False
+
 
 class TestSkipReasons:
     def test_destination_skipped_when_not_valuable(self):

@@ -583,6 +583,9 @@ class RebalanceEngine:
             "source_opportunity_sats": round(source_opportunity_sats, 6),
             "failure_penalty_sats": round(failure_penalty_sats, 6),
             "final_score_sats": final_score_sats,
+            # Reports the DEST utilization only; kept as `expected_utilization`
+            # for backward-compat with existing consumers. Source side is
+            # reported separately below via `source_utilization`.
             "expected_utilization": round(dest_u, 6),
             "utilization_source": (
                 "realized"
@@ -590,6 +593,11 @@ class RebalanceEngine:
                 else "prior"
             ),
             "source_utilization": round(source_u, 6),
+            "source_utilization_source": (
+                "realized"
+                if getattr(pair, "source_utilization_is_realized", False)
+                else "prior"
+            ),
             "source_utilization_discount": SOURCE_UTILIZATION_DISCOUNT,
             "beats_do_nothing": beats_do_nothing,
             "rejection_reason": rejection_reason,
