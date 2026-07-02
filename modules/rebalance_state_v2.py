@@ -67,6 +67,13 @@ class ChannelState:
     local_out_fee_ppm: int = 0
     historical_direct_fee_ppm: float = 0.0
     historical_sourced_fee_ppm: float = 0.0
+    # Upstream-pattern fields (#1 activity, #2 realized util, #3 per-channel band).
+    realized_utilization: float = 0.5
+    utilization_is_realized: bool = False
+    activity_out_sats: int = 0
+    activity_in_sats: int = 0
+    target_band_low: float = 0.35
+    target_band_high: float = 0.65
 
 
 @dataclass(frozen=True)
@@ -271,10 +278,19 @@ def build_state_snapshot(
     target_band_high: float = _DEFAULT_TARGET_BAND_HIGH,
     target_emergency_low: float = _DEFAULT_TARGET_EMERGENCY_LOW,
     hive_bootstrap_budget_sats: int = 0,
+    flow_facts: Mapping[str, Any] | None = None,
+    target_bands: Mapping[str, Tuple[float, float]] | None = None,
+    cfg: Any = None,
 ) -> StateSnapshot:
     """Build a normalized, immutable v2 state snapshot."""
 
     budget_by_channel = _budget_lookup(capex_allocations)
+    if cfg is not None:
+        default_band_low = getattr(cfg, "low_liquidity_threshold", 0.35)
+        default_band_high = getattr(cfg, "high_liquidity_threshold", 0.65)
+    else:
+        default_band_low = 0.35
+        default_band_high = 0.65
     normalized_channels = []
     total_capacity_sats = 0
     total_remaining_budget_sats = 0
@@ -317,6 +333,9 @@ def build_state_snapshot(
             cooldown_override=cooldown_override,
         )
 
+        facts = (flow_facts or {}).get(channel.channel_id)
+        band = (target_bands or {}).get(channel.channel_id)
+
         normalized_channels.append(
             ChannelState(
                 channel_id=channel.channel_id,
@@ -343,6 +362,12 @@ def build_state_snapshot(
                 source_drain_score=_drain_score(local_ratio, target_band_high),
                 budget_source=budget_source,
                 rebalance_bias=channel.rebalance_bias,
+                realized_utilization=(facts.realized_utilization if facts else 0.5),
+                utilization_is_realized=(facts.utilization_is_realized if facts else False),
+                activity_out_sats=(facts.out_sats_window if facts else 0),
+                activity_in_sats=(facts.in_sats_window if facts else 0),
+                target_band_low=(band[0] if band else default_band_low),
+                target_band_high=(band[1] if band else default_band_high),
             )
         )
         total_capacity_sats += capacity_sats
