@@ -547,3 +547,31 @@ def test_build_state_snapshot_injects_target_band():
     channel = state.channels[0]
     assert channel.target_band_low == 0.20
     assert channel.target_band_high == 0.80
+
+
+def test_build_state_snapshot_band_falls_back_to_cfg_thresholds():
+    """When no target_bands map is given but a cfg is, the per-channel band
+    falls back to cfg.low_liquidity_threshold / high_liquidity_threshold."""
+    from types import SimpleNamespace
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={"A": ChannelCapexBudget(channel_id="A", budget_msat=250_000)}
+    )
+    cfg = SimpleNamespace(low_liquidity_threshold=0.25, high_liquidity_threshold=0.75)
+
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="A", peer_id="02" + "a" * 64, capacity_sats=1_000_000,
+                local_sats=650_000, actual_inbound_fee_ppm=120, is_hive_member=True,
+                is_profitable=True, is_active=True, cooldown_active=False,
+            ),
+        ],
+        allocations,
+        cfg=cfg,
+    )
+    channel = state.channels[0]
+    assert channel.target_band_low == 0.25
+    assert channel.target_band_high == 0.75
