@@ -232,6 +232,9 @@ class BoltzCliConfig:
     btc_wallet: str = "CLN"
     lbtc_wallet: str = "LOOP-LBTC"
     routing_fee_limit_ppm: int = 0  # 0 = no limit (boltzcli default)
+    # DD3 / P1-006: hard cap on a single on-chain withdraw so a typo or
+    # automation bug cannot sweep the wallet in one call. 0 disables the cap.
+    max_withdraw_sats: int = 10_000_000
 
 
 class BoltzCliManager:
@@ -2082,7 +2085,8 @@ class BoltzCliManager:
         }
 
     def withdraw(self, amount_sats: Optional[int], destination: str, currency: Optional[str] = None,
-                 sat_per_vbyte: Optional[int] = None, sweep: bool = False) -> Dict[str, Any]:
+                 sat_per_vbyte: Optional[int] = None, sweep: bool = False,
+                 confirm_sweep: bool = False) -> Dict[str, Any]:
         if not destination:
             raise BoltzCliError("destination is required")
         cur = self._norm_currency(currency, "LBTC")
@@ -2098,6 +2102,27 @@ class BoltzCliManager:
         amt = 0 if sweep else int(amount_sats or 0)
         if not sweep and amt <= 0:
             raise BoltzCliError("amount_sats must be > 0 unless sweep=true")
+        # DD3 / P1-006: enforce the hard single-withdraw cap BEFORE the
+        # subprocess call so a typo/automation bug cannot drain the wallet.
+        try:
+            max_withdraw = int(getattr(self.cfg, "max_withdraw_sats", 0) or 0)
+        except (ValueError, TypeError):
+            max_withdraw = 0
+        if sweep:
+            # Sweep intentionally empties the wallet and cannot be bounded by
+            # the amount cap (the amount is unknown until boltzcli runs), so it
+            # is the exact "drain the wallet" action the cap guards against.
+            # Safer choice: require an explicit confirmation flag.
+            if not confirm_sweep:
+                raise BoltzCliError(
+                    "sweep withdraws the entire wallet balance and bypasses the "
+                    "max_withdraw_sats cap; pass confirm_sweep=true to proceed"
+                )
+        elif max_withdraw > 0 and amt > max_withdraw:
+            raise BoltzCliError(
+                f"withdraw amount {amt} exceeds max_withdraw_sats cap {max_withdraw}: "
+                "refusing to withdraw"
+            )
         # Flags first, then a `--` terminator before the free-form positional
         # args (wallet/destination/amount). This keeps a destination beginning
         # with '-' from being reparsed by boltzcli as a flag.

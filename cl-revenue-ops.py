@@ -1313,6 +1313,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-boltz-max-withdraw-sats',
+    default='10000000',
+    description='Hard cap on a single Boltz on-chain withdraw in sats (default: 10000000; 0 disables). A sweep withdraw bypasses this cap and requires confirm_sweep=true.'
+)
+
+plugin.add_option(
     name='revenue-ops-boltz-auto-cycle-enabled',
     default='false',
     description='Enable in-plugin periodic profit-gated Boltz balance cycles (default: false; automated spending must be opted into explicitly)'
@@ -2177,6 +2183,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             btc_wallet=options.get('revenue-ops-boltz-btc-wallet', 'CLN'),
             lbtc_wallet=options.get('revenue-ops-boltz-lbtc-wallet', 'LOOP-LBTC'),
             routing_fee_limit_ppm=int(options.get('revenue-ops-boltz-routing-fee-limit-ppm', '0')),
+            max_withdraw_sats=int(options.get('revenue-ops-boltz-max-withdraw-sats', '10000000')),
         )
         boltz_manager = BoltzCliManager(safe_plugin, safe_plugin.rpc, boltz_cfg)
         if boltz_cfg.enabled:
@@ -6637,11 +6644,12 @@ def revenue_boltz_chainswap(plugin: Plugin, amount_sats: int, from_currency: str
 
 @plugin.method("revenue-boltz-withdraw")
 def revenue_boltz_withdraw(plugin: Plugin, amount_sats: int = None, destination: str = None, currency: str = None,
-                           sat_per_vbyte: int = None, sweep: bool = False) -> Dict[str, Any]:
+                           sat_per_vbyte: int = None, sweep: bool = False,
+                           confirm_sweep: bool = False) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().withdraw(
             amount_sats=amount_sats, destination=destination, currency=currency,
-            sat_per_vbyte=sat_per_vbyte, sweep=sweep
+            sat_per_vbyte=sat_per_vbyte, sweep=sweep, confirm_sweep=bool(confirm_sweep)
         )
     except Exception as e:
         return {"error": str(e)}
