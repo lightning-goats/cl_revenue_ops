@@ -849,6 +849,28 @@ capex_engine: Optional[CapexBudgetEngine] = None  # Unified capex budget engine
 hive_router = None  # HiveRouter: shared askrene fleet route discovery
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
 _boltz_balance_lock = threading.Lock()
+# Resource-growth bound: _boltz_balance_last_action only stores per-channel
+# cooldown timestamps. Nothing evicted closed-channel entries, so the dict grew
+# one entry per channel ever swapped for the process lifetime. Prune entries far
+# older than any realistic cooldown (default 4h; hint overrides are hours). A
+# 30-day TTL dwarfs every cooldown window, so eviction is provably
+# non-behavioral: any pruned entry is already treated as expired by the cooldown
+# check (now - last_ts >> any cooldown_seconds).
+_BOLTZ_BALANCE_ACTION_TTL_SECONDS: int = 30 * 86400
+
+
+def _prune_boltz_balance_actions(now: int) -> int:
+    """Evict cooldown entries older than the TTL. Returns entries removed.
+
+    Acquires _boltz_balance_lock internally; callers must NOT already hold it.
+    """
+    cutoff = int(now) - _BOLTZ_BALANCE_ACTION_TTL_SECONDS
+    with _boltz_balance_lock:
+        stale = [k for k, ts in _boltz_balance_last_action.items()
+                 if int(ts or 0) < cutoff]
+        for k in stale:
+            _boltz_balance_last_action.pop(k, None)
+    return len(stale)
 _boltz_auto_cycle_run_lock = threading.Lock()
 _boltz_auto_cycle_state_lock = threading.Lock()
 _boltz_auto_cycle_state: Dict[str, Any] = {
@@ -8571,6 +8593,9 @@ def _execute_boltz_balance_cycle(
     executed: List[Dict[str, Any]] = []
     skipped_exec: List[Dict[str, Any]] = []
     now = int(time.time())
+    # Bound _boltz_balance_last_action: drop cooldown entries for channels not
+    # touched within the TTL (e.g. closed channels) so it can't grow unbounded.
+    _prune_boltz_balance_actions(now)
 
     for rec in recommendations:
         if len(executed) >= max(0, int(max_actions)):
@@ -8956,6 +8981,8 @@ def _execute_boltz_expansion_treasury_cycle(
     executed = []
     skipped_exec = []
     now = int(time.time())
+    # Bound _boltz_balance_last_action (see _prune_boltz_balance_actions).
+    _prune_boltz_balance_actions(now)
 
     for rec in recs:
         if len(executed) >= max_exec:
