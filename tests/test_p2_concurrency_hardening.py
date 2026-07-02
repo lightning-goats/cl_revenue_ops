@@ -375,3 +375,55 @@ def test_p2_004_get_budget_status_immediate_and_consistent(tmp_path):
     assert status["spent"] == 40
     assert status["reserved"] == 60
     assert status["total_committed"] == 100
+
+
+# ---------------------------------------------------------------------------
+# P2-005 — rebalancer fee caches guarded by a lock
+# ---------------------------------------------------------------------------
+def test_p2_005_fee_cache_lock_serializes_access():
+    """Concurrent _get_last_hop_fee reads/writes must not tear against a
+    concurrent _fee_cache reset (KeyError / partial read)."""
+    from modules.rebalancer import EVRebalancer
+
+    r = object.__new__(EVRebalancer)
+    r.plugin = MagicMock()
+    r.plugin.log = lambda *a, **k: None
+    r._cache_lock = threading.Lock()
+    r._fee_cache = {}
+    r._peer_inbound_fees = {"peerA": {"fee_ppm": 50, "base_msat": 1000}}
+
+    errors = []
+    stop = threading.Event()
+
+    def reader():
+        i = 0
+        try:
+            while not stop.is_set():
+                v = r._get_last_hop_fee("peerA", 100000 + (i % 5))
+                assert v is not None
+                i += 1
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    def resetter():
+        try:
+            while not stop.is_set():
+                # Mirrors the per-cycle reset in find_rebalance_candidates.
+                with r._cache_lock:
+                    r._fee_cache = {}
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    threads = [threading.Thread(target=reader) for _ in range(3)]
+    threads += [threading.Thread(target=resetter) for _ in range(2)]
+    for t in threads:
+        t.start()
+    time.sleep(0.5)
+    stop.set()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"fee-cache access raced: {errors}"
+
+    # _get_last_hop_fee must NOT hold _cache_lock across the PRIORITY-2 RPC.
+    assert not r._cache_lock.locked()
