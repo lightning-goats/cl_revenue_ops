@@ -360,6 +360,7 @@ class EVRebalancer:
         candidate: RebalanceCandidate,
         rebalance_id: Optional[int] = None,
         reserve_budget: bool = False,
+        account_costs: bool = False,
     ):
         """Execute one candidate through the shared v2 engine.
 
@@ -371,11 +372,18 @@ class EVRebalancer:
         defibrillation diagnostic shock reserves its fee cap atomically on the
         unified cross-category rail (the auto cycle's path). Manual/explicit
         callers leave it False and own their own accounting.
+
+        ``account_costs`` (P4-025): when True the engine records the settled
+        fee into rebalance_costs BEFORE it marks the reservation spent (the
+        auto-cycle ordering), closing the transient window where a shock fee is
+        counted by neither the reservation nor rebalance_costs. The caller must
+        then NOT record the cost itself (double count).
         """
         if self.rebalance_engine_v2 is None:
             raise RuntimeError("no rebalance engine available")
         return self.rebalance_engine_v2.execute_candidate(
-            candidate, rebalance_id=rebalance_id, reserve_budget=reserve_budget
+            candidate, rebalance_id=rebalance_id, reserve_budget=reserve_budget,
+            account_costs=account_costs,
         )
 
     def _set_last_decision_summary(
@@ -2564,17 +2572,21 @@ class EVRebalancer:
                 # cross-category rail (reserve_budget=True). If the budget is
                 # exhausted by other categories' reservations the engine returns
                 # a 'local_budget_block' result and never pays.
+                # P4-025: account_costs=True makes the engine record the settled
+                # fee into rebalance_costs BEFORE it marks the reservation spent
+                # (the auto-cycle ordering), so there is no instant where the
+                # shock fee is counted by neither the reservation nor
+                # rebalance_costs. The engine also updates the shared history row
+                # to 'success' with the actual fee, so this path must NOT call
+                # _record_successful_rebalance_fee again (it would double-count
+                # the cost).
                 exec_result = self._execute_candidate_v2(
-                    candidate, rebalance_id=rebalance_id, reserve_budget=True
+                    candidate, rebalance_id=rebalance_id, reserve_budget=True,
+                    account_costs=True,
                 )
                 if exec_result.success:
-                    actual_fee_sats = self._record_successful_rebalance_fee(
-                        rebalance_id,
-                        status='success',
-                        channel_id=channel_id,
-                        peer_id=dest_info.get('peer_id', ''),
-                        amount_sats=shock_amount,
-                        fee_msat=exec_result.fee_msat,
+                    actual_fee_sats = base_to_sats_ceil(
+                        max(0, int(getattr(exec_result, "fee_msat", 0) or 0))
                     )
                 elif not getattr(exec_result, "payment_pending", False):
                     # Engine shares this history row; leave its

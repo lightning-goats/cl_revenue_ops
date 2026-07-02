@@ -3215,6 +3215,7 @@ class RebalanceEngine:
         candidate: Any,
         rebalance_id: Optional[int] = None,
         reserve_budget: bool = False,
+        account_costs: bool = False,
     ) -> ExecutionResult:
         """Price and execute one explicit candidate on the v2 stack.
 
@@ -3250,7 +3251,8 @@ class RebalanceEngine:
             )
         try:
             return self._execute_candidate_locked(
-                candidate, rebalance_id=rebalance_id, reserve_budget=reserve_budget
+                candidate, rebalance_id=rebalance_id, reserve_budget=reserve_budget,
+                account_costs=account_costs,
             )
         finally:
             self._cycle_lock.release()
@@ -3260,6 +3262,7 @@ class RebalanceEngine:
         candidate: Any,
         rebalance_id: Optional[int] = None,
         reserve_budget: bool = False,
+        account_costs: bool = False,
     ) -> ExecutionResult:
         source_channel_id = str(getattr(candidate, "from_channel", "") or "")
         dest_channel_id = str(getattr(candidate, "to_channel", "") or "")
@@ -3351,7 +3354,7 @@ class RebalanceEngine:
             pair,
             executor,
             reserve_budget=reserve_budget,
-            account_costs=False,
+            account_costs=account_costs,
             rebalance_id=rebalance_id,
         )
 
