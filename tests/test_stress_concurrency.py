@@ -66,12 +66,12 @@ def test_no_unhandled_thread_exception(report):
     assert report["results"]["no_thread_exception"], report["thread_exceptions"][:3]
 
 
-@pytest.mark.xfail(
-    reason="P1-003: cross-category budget reserve is a TOCTOU (open finding); "
-    "the stress harness reproduces overspend. xpass here means it was closed.",
-    strict=False,
-)
 def test_budget_never_exceeded_P1_003(report):
+    """DD1 / P1-003 CLOSED: the cross-category budget rail is now enforced inside
+    each reserve's BEGIN IMMEDIATE transaction (generic spend_reservations +
+    rebalance budget_reservations + committed spends), so the stress firehose can
+    no longer make the two categories jointly exceed the budget.
+    """
     assert report["results"]["budget_never_exceeded"], (
         f"budget exceeded: {report['budget_violations'][:1]}"
     )

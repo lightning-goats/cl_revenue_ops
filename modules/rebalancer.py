@@ -2584,6 +2584,20 @@ class EVRebalancer:
         # Normalize SCIDs to 'x' format for consistent DB storage and queries
         from_channel = from_channel.replace(':', 'x')
         to_channel = to_channel.replace(':', 'x')
+        # DD2 / P1-004: the hard maximum rebalance amount binds regardless of
+        # force. Defense-in-depth backstop (the RPC layer rejects over-cap
+        # first) — clamp here so any caller is bounded by the absolute rail.
+        try:
+            _hard_max = int(getattr(self.config, "rebalance_max_amount", 0) or 0)
+        except (ValueError, TypeError):
+            _hard_max = 0
+        if _hard_max > 0 and int(amount_sats) > _hard_max:
+            self.plugin.log(
+                f"manual_rebalance: clamping amount {amount_sats} to hard cap {_hard_max} "
+                f"(rebalance_max_amount)",
+                level='warn',
+            )
+            amount_sats = _hard_max
         # Warn if capital controls would block this (but don't enforce for manual)
         capital_ok = self._check_capital_controls()
         if not capital_ok and not force:
