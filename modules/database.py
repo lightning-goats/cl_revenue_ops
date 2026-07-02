@@ -3750,6 +3750,23 @@ class Database:
             return False
         meta_json = json.dumps(metadata or {}, sort_keys=True) if metadata else None
         try:
+            # Guard: INSERT OR REPLACE would otherwise resurrect a terminal
+            # ('spent'/'released') reservation_id back to 'active', double
+            # counting it against the budget. Reject re-reservation of a
+            # reservation_id that has already reached a terminal state.
+            existing = conn.execute(
+                "SELECT status FROM spend_reservations WHERE reservation_id = ?",
+                (rid,),
+            ).fetchone()
+            if existing is not None:
+                status = existing["status"] if not isinstance(existing, tuple) else existing[0]
+                if str(status) in ("spent", "released"):
+                    self.plugin.log(
+                        f"Spend reservation {rid} already {status}; refusing to "
+                        "resurrect to active",
+                        level='warn',
+                    )
+                    return False
             conn.execute("""
                 INSERT OR REPLACE INTO spend_reservations
                 (reservation_id, category, subcategory, reserved_sats, reserved_at, reference_id, channel_id, status, metadata_json)
