@@ -182,6 +182,27 @@ class TestPolicyBatchOperations:
 
         assert "peer_id" in str(exc_info.value).lower() or "invalid" in str(exc_info.value).lower()
 
+    def test_failed_batch_commit_leaves_no_rate_limit_entry(
+        self, mock_database, mock_plugin, sample_peer_ids
+    ):
+        """DEF-037: rate-limit timestamps are recorded only AFTER a successful
+        upsert commit. A failed commit must not leave a phantom entry that
+        throttles retries of a change that never persisted."""
+        pm = PolicyManager(mock_database, mock_plugin)
+        mock_database.upsert_policies_batch.side_effect = RuntimeError("commit boom")
+
+        updates = [
+            {"peer_id": sample_peer_ids[0], "strategy": "dynamic"},
+            {"peer_id": sample_peer_ids[1], "strategy": "dynamic"},
+        ]
+        with pytest.raises(RuntimeError, match="commit boom"):
+            pm.set_policies_batch(updates)
+
+        for peer_id in sample_peer_ids[:2]:
+            assert not pm._change_timestamps.get(peer_id), (
+                f"phantom rate-limit entry left for {peer_id} after failed commit"
+            )
+
     def test_batch_update_invalid_strategy_raises(self, mock_database, mock_plugin, sample_peer_ids):
         """Batch update with invalid strategy raises ValueError."""
         pm = PolicyManager(mock_database, mock_plugin)

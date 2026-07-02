@@ -5310,3 +5310,40 @@ class TestDefibrillationStatusHonesty:
             "100x1x0", self.PEER, _make_cycle_cfg(), "STAGNANT")
 
         assert result["status"] == "failed"
+
+
+class TestRedeploymentEVSign:
+    """P5-002: the loser's forgone-loss sign in _calculate_redeployment_ev
+    must mirror _calculate_recycle_ev — a bleeding loser (marginal < 0) ADDS
+    the avoided loss to the close EV rather than penalizing it."""
+
+    def _planner(self, best_ev, closure_cost):
+        planner = CapacityPlanner.__new__(CapacityPlanner)
+        planner._calculate_open_ev = MagicMock(return_value=best_ev)
+        planner._estimate_close_cost = MagicMock(return_value=closure_cost)
+        return planner
+
+    def test_bleeding_loser_close_ev_higher_than_breakeven(self):
+        planner = self._planner(best_ev=10_000, closure_cost=1_000)
+        winners = [{"peer_id": "03" + "b" * 64}]
+
+        bleeding = {"capacity": 2_000_000, "marginal_profit_30d_sats": -500}
+        breakeven = {"capacity": 2_000_000, "marginal_profit_30d_sats": 0}
+
+        bleed_ev, _, _ = planner._calculate_redeployment_ev(bleeding, winners, None)
+        flat_ev, _, _ = planner._calculate_redeployment_ev(breakeven, winners, None)
+
+        # A channel that is actively bleeding should be MORE attractive to
+        # close/redeploy, not less. Sign-inverted code made bleed_ev < flat_ev.
+        assert bleed_ev > flat_ev
+        # Exact: best_ev - (marginal*6) - closure = 10000 - (-3000) - 1000
+        assert bleed_ev == 12_000
+        assert flat_ev == 9_000
+
+    def test_profitable_loser_residual_subtracted(self):
+        planner = self._planner(best_ev=10_000, closure_cost=1_000)
+        winners = [{"peer_id": "03" + "c" * 64}]
+        profitable = {"capacity": 2_000_000, "marginal_profit_30d_sats": 400}
+        ev, _, _ = planner._calculate_redeployment_ev(profitable, winners, None)
+        # 10000 - (400*6) - 1000 = 6600 — forgoing a profitable channel costs EV.
+        assert ev == 6_600

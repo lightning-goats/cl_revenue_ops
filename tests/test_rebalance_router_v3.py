@@ -536,13 +536,13 @@ def test_price_pair_picks_cheapest_when_multiple_routes():
     plugin.rpc.getroutes.return_value = {
         "probability_ppm": 990000,
         "routes": [
-            # Expensive middle path: 500 msat fee
-            {"probability_ppm": 990000, "amount_msat": 100000, "final_cltv": 40, "path": [
-                {"short_channel_id_dir": "111x1x1/0", "next_node_id": "03" + "x" * 64, "amount_msat": 100500, "delay": 106},
+            # Expensive middle path: 2000 msat first-hop fee.
+            {"probability_ppm": 111_000, "amount_msat": 100000, "final_cltv": 40, "path": [
+                {"short_channel_id_dir": "111x1x1/0", "next_node_id": "03" + "x" * 64, "amount_msat": 102000, "delay": 106},
                 {"short_channel_id_dir": "222x2x2/0", "next_node_id": DST_PEER, "amount_msat": 100000, "delay": 40},
             ]},
-            # Cheap middle path: 100 msat fee
-            {"probability_ppm": 990000, "amount_msat": 100000, "final_cltv": 40, "path": [
+            # Cheap middle path: 100 msat first-hop fee — must win.
+            {"probability_ppm": 888_000, "amount_msat": 100000, "final_cltv": 40, "path": [
                 {"short_channel_id_dir": "111x1x1/0", "next_node_id": "03" + "x" * 64, "amount_msat": 100100, "delay": 106},
                 {"short_channel_id_dir": "222x2x2/0", "next_node_id": DST_PEER, "amount_msat": 100000, "delay": 40},
             ]},
@@ -558,7 +558,13 @@ def test_price_pair_picks_cheapest_when_multiple_routes():
         amount_sats=100,
     )
     assert result.success is True
-    assert result.route_cost_sats <= 1  # cheapest middle was 100 msat fee -> rounds to 1 sat
+    # DEF-084: the two routes differ by 1900 msat in first-hop fee (well above
+    # sub-1-sat rounding). _reprice_middle_route_amounts overwrites the
+    # getroutes amounts, so route_cost_sats is NOT a reliable discriminator;
+    # the chosen route's probability_ppm flows straight through, so asserting
+    # on it kills the min->max mutant (the prior ``<= 1`` was tautological —
+    # both routes rounded to 1 sat).
+    assert result.probability_ppm == 888_000
 
 
 def test_price_pair_adds_source_peer_forwarding_fee_to_first_hop():

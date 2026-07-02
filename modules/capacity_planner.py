@@ -3207,9 +3207,15 @@ class CapacityPlanner:
         closure_cost = self._estimate_close_cost()
         loser_capacity = loser.get("capacity", 0)
 
-        # Ongoing cost: projected 6-month loss (0 if channel is profitable)
+        # Residual value: the loser's foregone earnings over the SAME 180-day
+        # horizon the winner EV is measured against. P5-002 (audit): this must
+        # mirror _calculate_recycle_ev exactly — residual = marginal_30d * 6
+        # with NO max/negation. A bleeding loser (marginal_30d < 0) has a
+        # NEGATIVE residual, so subtracting it ADDS the avoided ongoing loss
+        # (favoring close). The prior max(0, -marginal_30d * 6) inverted the
+        # sign, penalizing closure of a channel that was actively bleeding.
         marginal_30d = loser.get("marginal_profit_30d_sats", 0)
-        ongoing_cost = max(0, -marginal_30d * 6)
+        residual_value = marginal_30d * 6  # 180 days, matching winner_ev
 
         # Find the best winner by EV
         best_ev = 0
@@ -3223,7 +3229,7 @@ class CapacityPlanner:
             except Exception:
                 continue
 
-        redeployment_ev = best_ev - ongoing_cost - closure_cost
+        redeployment_ev = best_ev - residual_value - closure_cost
         return (redeployment_ev, best_peer, best_ev)
 
     def _estimate_open_cost(self) -> int:

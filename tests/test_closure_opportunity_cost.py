@@ -84,32 +84,36 @@ class TestCalculateRedeploymentEv:
             loser, winners, planner.config
         )
 
-        # ongoing_cost = max(0, -(-500) * 6) = 3000
-        # ev = 20000 - 3000 - 3000 = 14000
-        assert ev == 14000.0
+        # P5-002: residual = marginal_30d * 6 = -500 * 6 = -3000 (a bleeding
+        # loser). ev = 20000 - (-3000) - 3000 = 20000 — the avoided loss ADDS
+        # to the close EV.
+        assert ev == 20000.0
         assert best_peer == winners[0]["peer_id"]
         assert winner_ev == 20000.0
 
     def test_negative_ev_when_no_good_winner(self):
-        """Weak winner makes redeployment EV negative."""
+        """Weak winner + a PROFITABLE loser makes redeployment EV negative —
+        closing a channel that still earns to chase a weak winner is a bad
+        trade. (P5-002: the loser's positive residual is forgone by closing.)"""
         planner = _make_planner()
         # Winner returns low EV
         planner._calculate_open_ev = MagicMock(return_value=1000.0)
 
-        loser = _loser(marginal_profit_30d_sats=-1000, capacity=2_000_000)
+        loser = _loser(marginal_profit_30d_sats=1000, capacity=2_000_000)
         winners = [_winner()]
 
         ev, best_peer, winner_ev = planner._calculate_redeployment_ev(
             loser, winners, planner.config
         )
 
-        # ongoing_cost = max(0, 1000 * 6) = 6000
+        # residual = 1000 * 6 = 6000 (forgone by closing a profitable loser)
         # ev = 1000 - 6000 - 3000 = -8000
         assert ev == -8000.0
         assert best_peer == winners[0]["peer_id"]
 
-    def test_ongoing_cost_zero_for_positive_profit(self):
-        """Profitable loser has ongoing_cost=0 (not losing money by staying)."""
+    def test_profitable_loser_residual_subtracted(self):
+        """P5-002: a profitable loser's forgone residual (marginal_30d * 6) is
+        SUBTRACTED from the close EV — mirroring _calculate_recycle_ev."""
         planner = _make_planner()
         planner._calculate_open_ev = MagicMock(return_value=5000.0)
 
@@ -120,9 +124,9 @@ class TestCalculateRedeploymentEv:
             loser, winners, planner.config
         )
 
-        # ongoing_cost = max(0, -200 * 6) = 0
-        # ev = 5000 - 0 - 3000 = 2000
-        assert ev == 2000.0
+        # residual = 200 * 6 = 1200
+        # ev = 5000 - 1200 - 3000 = 800
+        assert ev == 800.0
 
     def test_no_winners_returns_negative_ev(self):
         """Empty winners list yields negative EV (just closure cost)."""
@@ -135,9 +139,9 @@ class TestCalculateRedeploymentEv:
             loser, winners, planner.config
         )
 
-        # ongoing_cost = max(0, 100 * 6) = 600
-        # ev = 0 - 600 - 3000 = -3600
-        assert ev == -3600.0
+        # P5-002: residual = -100 * 6 = -600 (bleeding loser).
+        # ev = 0 - (-600) - 3000 = -2400
+        assert ev == -2400.0
         assert best_peer is None
         assert winner_ev == 0
 

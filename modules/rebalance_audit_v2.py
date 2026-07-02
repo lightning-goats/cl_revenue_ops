@@ -44,6 +44,9 @@ VALID_SKIP_REASONS: frozenset[str] = frozenset({
     "route_over_budget",
     # Produced by the engine's pair-level futility tracker
     "pair_futility",
+    # Produced by the engine when the native route executor's RPC surface is
+    # unavailable (rebalance_engine_v2._executor_unavailable_reason). DEF-077.
+    "native_unavailable",
     # Produced by the engine's gates and cycle lock (RA2-1)
     "pair_cooldown",
     "below_hold_margin",

@@ -28,6 +28,23 @@ def _parse_msat(value: Any) -> int:
     return int(value)
 
 
+def _route_fee_msat(route: Dict[str, Any]) -> int:
+    """Fee (msat) of a getroutes route: first-hop send amount minus the
+    delivered amount.
+
+    P5-004 / DEF-084: mirrors rebalance_router_v3._route_fee_msat. An empty
+    or missing ``path`` returns a 10**18 sentinel so such a route can never
+    be picked as cheapest AND can never raise IndexError/KeyError out of the
+    ``min(...)`` selector (which sits outside price_pair's try/except).
+    """
+    path = route.get("path", [])
+    if not path:
+        return 10 ** 18
+    first_amt = _parse_msat(path[0].get("amount_msat", 0))
+    delivered = _parse_msat(route.get("amount_msat", 0))
+    return max(0, first_amt - delivered)
+
+
 def _channel_direction(start_node_id: str, end_node_id: str) -> int:
     return 1 if start_node_id > end_node_id else 0
 
@@ -600,7 +617,7 @@ class RebalanceHiveRouter:
         if not routes:
             return RouteResult(success=False, error="no_fleet_route: empty")
 
-        cheapest = min(routes, key=lambda route: _parse_msat(route["path"][0]["amount_msat"]) - _parse_msat(route.get("amount_msat", 0)))
+        cheapest = min(routes, key=_route_fee_msat)
         path = cheapest.get("path", [])
         if not path:
             return RouteResult(success=False, error="no_fleet_route: empty_path")

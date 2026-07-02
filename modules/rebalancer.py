@@ -1114,6 +1114,18 @@ class EVRebalancer:
         return "other"
 
     @staticmethod
+    def _futility_key(candidate) -> str:
+        """Key for the destination futility / failure-count breaker.
+
+        DEF-063: the breaker was keyed on the destination SCID. A splice
+        mints a NEW SCID for the same peer, which reset the failure history
+        to zero and let a chronically-failing pair evade the breaker. Key on
+        the destination peer pubkey instead — it is stable across splices —
+        falling back to the SCID only when the peer id is unknown.
+        """
+        return getattr(candidate, "to_peer_id", "") or candidate.to_channel
+
+    @staticmethod
     def _apply_fee_escalation(ev_max_fee_ppm: int, fail_count: int, last_attempted_ppm: int) -> int:
         """
         Escalate fee budget based on failure history.
@@ -1618,9 +1630,16 @@ class EVRebalancer:
             elif confidence == 'medium':
                 # 5-9 samples: blend historical with last-hop if available
                 if last_hop is not None:
-                    # Weighted average: 70% historical, 30% last-hop based
-                    last_hop_estimate = last_hop + self.config.inbound_fee_estimate_ppm
-                    estimate = int(median_ppm * 0.7 + last_hop_estimate * 0.3)
+                    # Weighted average: 70% historical, 30% last-hop.
+                    # DEF-067-S4: the historical median already captures the
+                    # FULL multi-hop route cost. The inbound_fee_estimate_ppm
+                    # buffer is a proxy for that same multi-hop portion, so
+                    # adding it to last_hop here double-counted the multi-hop
+                    # cost (once in the 0.7*median term, again in the 0.3*
+                    # buffer term). Blend the median against the raw last-hop
+                    # fee. (The Priority-5 fallback still adds the buffer —
+                    # there is no historical term there to carry it.)
+                    estimate = int(median_ppm * 0.7 + last_hop * 0.3)
                 else:
                     estimate = median_ppm
                 self.plugin.log(
@@ -2167,7 +2186,7 @@ class EVRebalancer:
                                         f"{exec_result.parts} parts, {exec_result.attempts} attempts)"
                                     ),
                                 }
-                                self.database.reset_failure_count(candidate.to_channel)
+                                self.database.reset_failure_count(self._futility_key(candidate))
                                 self._report_coordination_outcome(
                                     candidate,
                                     coordination_context,
@@ -2212,7 +2231,7 @@ class EVRebalancer:
                                     )
                                 error_type = self._classify_error(error_str)
                                 self.database.increment_failure_count(
-                                    candidate.to_channel,
+                                    self._futility_key(candidate),
                                     attempted_ppm=candidate.max_fee_ppm,
                                     attempted_amount=candidate.amount_sats,
                                     error_type=error_type,
@@ -2239,7 +2258,7 @@ class EVRebalancer:
                             error_type = self._classify_error(str(e))
                             try:
                                 self.database.increment_failure_count(
-                                    candidate.to_channel,
+                                    self._futility_key(candidate),
                                     attempted_ppm=candidate.max_fee_ppm,
                                     attempted_amount=candidate.amount_sats,
                                     error_type=error_type,
@@ -2277,7 +2296,7 @@ class EVRebalancer:
                                 ),
                             }
                             # Success resets failure count so channel re-enters rotation
-                            self.database.reset_failure_count(candidate.to_channel)
+                            self.database.reset_failure_count(self._futility_key(candidate))
                         else:
                             error_str = exec_result.error or "no_routes"
                             res = {
@@ -2309,7 +2328,7 @@ class EVRebalancer:
                             # Record failure for futility breaker
                             error_type = self._classify_error(error_str)
                             self.database.increment_failure_count(
-                                candidate.to_channel,
+                                self._futility_key(candidate),
                                 attempted_ppm=candidate.max_fee_ppm,
                                 attempted_amount=candidate.amount_sats,
                                 error_type=error_type,
@@ -2324,7 +2343,7 @@ class EVRebalancer:
                         error_type = self._classify_error(str(e))
                         try:
                             self.database.increment_failure_count(
-                                candidate.to_channel,
+                                self._futility_key(candidate),
                                 attempted_ppm=candidate.max_fee_ppm,
                                 attempted_amount=candidate.amount_sats,
                                 error_type=error_type,

@@ -146,6 +146,7 @@ INDIRECT_REASON_PRODUCERS = {
     "_destination_eligibility",      # rebalance_state_v2: dest gate reasons
     "_translate_getroutes_error",    # rebalance_router_v3: askrene error map
     "_validate_getroutes_middle_path",  # rebalance_router_v3: path validation
+    "_executor_unavailable_reason",  # rebalance_engine_v2: native_unavailable (DEF-077)
 }
 
 
@@ -228,15 +229,24 @@ def collect_emitted_skip_reasons() -> set:
                         _collect_string_literals(kw.value, reasons)
 
     # Pass 3: indirect producers — string constants in their return tuples
-    # become SkipRecord reasons downstream.
+    # become SkipRecord reasons downstream. These producers return either
+    # ``(bool, reason)`` (state-layer eligibility) or ``(reason, detail)``
+    # (engine executor-unavailable). A bucketing reason is always a single
+    # grep-friendly token, so drop any whitespace-bearing string (the human-
+    # readable detail leg) to avoid polluting the vocabulary. (DEF-077)
     for tree in trees.values():
         for func in (n for n in ast.walk(tree)
                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                      and n.name in INDIRECT_REASON_PRODUCERS):
             for node in ast.walk(func):
                 if isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple):
+                    tuple_strings: set = set()
                     for elt in node.value.elts:
-                        _collect_string_literals(elt, reasons)
+                        _collect_string_literals(elt, tuple_strings)
+                    reasons |= {
+                        s for s in tuple_strings
+                        if s and not any(ch.isspace() for ch in s)
+                    }
 
     return reasons
 
@@ -256,6 +266,7 @@ def test_scraper_finds_known_production_emitters():
         "hive_equalization_cooldown", "pair_cooldown", "pair_futility",
         "below_hold_margin", "cycle_already_running", "fleet_lease_held",
         "max_pairs_reached", "route_over_budget", "no_route",
+        "native_unavailable",
         # state-layer eligibility strings
         "cooldown", "not_valuable", "no_budget",
         # v3 router
@@ -277,6 +288,23 @@ def test_all_emitted_skip_reasons_are_in_vocabulary():
         "SkipRecord emitters use reasons missing from VALID_SKIP_REASONS "
         f"(vocabulary drift): {sorted(unknown)}"
     )
+
+
+def test_native_unavailable_is_covered_by_drift_guard():
+    """DEF-077: 'native_unavailable' (emitted by the v3 engine when the
+    native executor RPC surface is down) must be both scraped by the drift
+    guard AND present in VALID_SKIP_REASONS. The drift guard now covers it
+    via the _executor_unavailable_reason producer, so removing it from
+    VALID_SKIP_REASONS would make test_all_emitted_skip_reasons_are_in_
+    vocabulary fail (it no longer passes silently)."""
+    from modules.rebalance_audit_v2 import VALID_SKIP_REASONS
+
+    scraped = collect_emitted_skip_reasons()
+    assert "native_unavailable" in scraped, (
+        "drift guard does not see native_unavailable — _executor_unavailable_"
+        "reason missing from INDIRECT_REASON_PRODUCERS"
+    )
+    assert "native_unavailable" in VALID_SKIP_REASONS
 
 
 def test_non_actionable_reasons_are_subset_of_vocabulary():

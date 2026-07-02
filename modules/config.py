@@ -381,7 +381,7 @@ class Config:
     
     # Fee parameters
     min_fee_ppm: int = 10          # Floor fee in PPM (matches plugin option default)
-    max_fee_ppm: int = 5000        # Ceiling fee in PPM
+    max_fee_ppm: int = 2000        # Ceiling fee in PPM (matches revenue-ops-max-fee-ppm option default; P6-010/DEF-042)
     base_fee_msat: int = 0         # Base fee fallback when base_fee_policy = "off"
 
     # Adaptive base_fee (Upgrade A, 2026-04-22) — per-channel-role base_fee_msat.
