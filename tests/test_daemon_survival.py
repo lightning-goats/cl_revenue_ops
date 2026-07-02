@@ -229,8 +229,14 @@ def _build_namespace(event, work_name, work_callable, randint_mock):
         "run_flow_analysis",
         "run_fee_adjustment",
         "run_rebalance_check",
+        # DD5 / P1-010: the canonical guard records a per-thread heartbeat.
+        "_record_loop_heartbeat",
     ):
         ns[helper] = MagicMock(return_value={})
+
+    # DD5 / P1-010: bounded backoff constant used by the canonical guard's
+    # except-clause (shutdown_event.wait(_LOOP_BACKOFF_SECONDS)).
+    ns["_LOOP_BACKOFF_SECONDS"] = 0
 
     # Wire the work callable into its slot.
     if isinstance(work_name, tuple):
@@ -279,18 +285,17 @@ def _while_node(func_node):
 
 
 @pytest.mark.parametrize("loop_name", WHILE_LOOPS)
-def test_p1010_tail_is_outside_loop_body_try(loop_name):
-    """P1-010: the per-iteration sleep/interval tail sits OUTSIDE the body try.
+def test_p1010_tail_is_inside_canonical_guard(loop_name):
+    """DD5 / P1-010 FIXED: the per-iteration sleep/interval tail now sits INSIDE
+    the canonical guard.
 
     Structural assertion on the shipped source: each `while not
-    shutdown_event.is_set()` body contains a Try (the guarded work) AND, as a
-    sibling of that Try, the sleep-computation tail (random.randint / a
-    shutdown_event.wait) that is therefore unguarded. An exception in that tail
-    escapes the loop and kills the daemon thread.
+    shutdown_event.is_set()` body wraps its ENTIRE iteration (work AND the
+    interval/sleep tail) in one try/except, so there is NO unguarded
+    sleep-computation sibling at the top level of the while body. An exception
+    anywhere in the iteration is therefore caught and the daemon survives.
 
-    FLIP WHEN THE FIX LANDS: once the tail is moved inside a per-iteration
-    try/except, there will be no unguarded sleep-computation sibling and this
-    assertion should be inverted to require the tail be try-guarded.
+    (Flipped from the pre-fix assertion that required the tail to be unguarded.)
     """
     func = _find_funcdef(loop_name)
     wnode = _while_node(func)
@@ -298,10 +303,9 @@ def test_p1010_tail_is_outside_loop_body_try(loop_name):
 
     body = wnode.body
 
-    # A Try guards the work somewhere in the loop body (it may be nested inside an
-    # `if enabled:` block, as in boltz_auto_cycle_loop -- still guarded).
+    # A Try guards the iteration.
     has_try = any(isinstance(n, ast.Try) for s in body for n in ast.walk(s))
-    assert has_try, f"{loop_name}: expected a try/except guarding the work in the loop body"
+    assert has_try, f"{loop_name}: expected a try/except guarding the loop iteration"
 
     def _mentions_tail(stmt):
         for n in ast.walk(stmt):
@@ -311,15 +315,15 @@ def test_p1010_tail_is_outside_loop_body_try(loop_name):
                     return True
         return False
 
-    # The defect: the interval/sleep tail is a DIRECT child of the while body
-    # (top level), i.e. NOT itself a Try and NOT nested inside the guarded try.
+    # The fix: the interval/sleep tail is NO LONGER a top-level sibling of the
+    # guard -- it lives inside the canonical try/except.
     unguarded_tail = [
         s for s in body if not isinstance(s, ast.Try) and _mentions_tail(s)
     ]
-    assert unguarded_tail, (
-        f"{loop_name}: expected the interval/sleep tail (random.randint / "
-        f"shutdown_event.wait) to live OUTSIDE the body try, as a top-level "
-        f"statement of the while body -- this is the P1-010 defect."
+    assert not unguarded_tail, (
+        f"{loop_name}: the interval/sleep tail (random.randint / "
+        f"shutdown_event.wait) must live INSIDE the canonical per-iteration "
+        f"try/except -- found an unguarded tail statement (P1-010 regression)."
     )
 
 
@@ -368,13 +372,12 @@ def test_body_exception_loop_survives(loop_name):
     )
 
 
-def test_body_exception_startup_snapshot_dies_one_shot():
-    """startup-snapshot is a one-shot with NO try around its single unit of work,
-    so an exception kills the thread with no retry and no heartbeat.
+def test_body_exception_startup_snapshot_is_now_guarded():
+    """DD5 / P1-010 FIXED -- the one-shot startup-snapshot's single run is now
+    guarded, so an exception in it no longer kills the thread silently.
 
-    Not the P1-010 tail pattern (there is no loop), but the same silent-death
-    class. Documented here for completeness; assertion stands after the P1-010
-    loop fix (a one-shot fix would be a separate change).
+    (Flipped from the pre-fix assertion that the one-shot dies on an unguarded
+    exception; DD5 explicitly guards the single run.)
     """
     event = FakeShutdownEvent()
     randint = MagicMock(return_value=1)
@@ -385,48 +388,45 @@ def test_body_exception_startup_snapshot_dies_one_shot():
     alive, exc = _run_loop_thread(loop_fn)
 
     assert not alive
-    assert isinstance(exc, InjectedBodyError), (
-        "startup-snapshot one-shot should die on an unguarded exception "
-        f"(captured {exc!r})."
+    assert exc is None, (
+        "startup-snapshot one-shot should now swallow its unguarded exception "
+        f"(captured {exc!r}); DD5 guards the single run."
     )
+    assert work.called, "the one-shot work should still have been invoked once"
 
 
 # ===========================================================================
 # GROUP 2b -- Tail-exception: thread DIES (documents the P1-010 defect)
 # ===========================================================================
 @pytest.mark.parametrize("loop_name", WHILE_LOOPS)
-def test_tail_exception_kills_thread_CURRENT_DEFECT(loop_name):
-    """P1-010 DEFECT DEMONSTRATION -- asserts the CURRENT (buggy) behavior.
+def test_tail_exception_no_longer_kills_thread(loop_name):
+    """DD5 / P1-010 FIXED -- the canonical guard swallows a tail exception and the
+    loop SURVIVES to the next iteration.
 
-    An exception in the unguarded interval/sleep tail (here: random.randint,
-    which lives in the sleep-computation tail of every loop, OUTSIDE the body
-    try) propagates out of the loop and KILLS the daemon thread. The death is
-    silent: it reaches only threading.excepthook (stderr), never the plugin, and
-    there is no respawn and no heartbeat (see GROUP 3).
+    An exception in the interval/sleep tail (here: random.randint) is now caught
+    by the per-iteration try/except that wraps the whole body incl. the tail, so
+    it never escapes to threading.excepthook and never kills the daemon thread.
+    The loop keeps ticking (work runs each iteration) until the shutdown event's
+    escape hatch terminates it cleanly.
 
-    >>> FLIP THIS ASSERTION WHEN THE FIX LANDS <<<
-    After a per-iteration try/except wraps the whole body incl. the tail, the
-    injected tail error will be swallowed and the loop will survive. This test
-    will then FAIL on `isinstance(exc, InjectedTailError)`; change it to assert
-    survival (exc is None, work.calls >= 1, not alive) -- mirroring
-    test_body_exception_loop_survives.
+    (Flipped from test_tail_exception_kills_thread_CURRENT_DEFECT, which asserted
+    the pre-fix silent-death behavior.)
     """
     spec = LOOP_SPECS[loop_name]
     event = FakeShutdownEvent(auto_set_after=8)  # escape hatch keeps a fixed loop from hanging
-    randint = MagicMock(side_effect=InjectedTailError(f"P1-010 unguarded tail in {loop_name}"))
+    randint = MagicMock(side_effect=InjectedTailError(f"P1-010 tail in {loop_name}"))
     work = WorkController(event, raise_first=False, stop_after=None)  # body succeeds
     ns = _build_namespace(event, spec["work"], work, randint)
     loop_fn = _extract_callable(loop_name, ns)
 
     alive, exc = _run_loop_thread(loop_fn)
 
-    assert not alive, f"{loop_name}: thread neither died nor terminated within timeout"
-    assert isinstance(exc, InjectedTailError), (
-        f"{loop_name}: EXPECTED the unguarded tail to kill the thread (P1-010). "
-        f"Got exc={exc!r}. If this fails because exc is None, the P1-010 fix has "
-        f"landed -- FLIP this test to assert survival."
+    assert not alive, f"{loop_name}: thread neither survived-then-stopped nor terminated within timeout"
+    assert exc is None, (
+        f"{loop_name}: a tail exception escaped the canonical guard and killed "
+        f"the thread (got {exc!r}); the whole iteration is supposed to be guarded."
     )
-    assert work.calls >= 1, f"{loop_name}: work should have run once before the tail killed the loop"
+    assert work.calls >= 1, f"{loop_name}: work should have run at least once while the loop survived the tail errors"
 
 
 # ===========================================================================
@@ -439,50 +439,39 @@ def _health_func_source():
     raise AssertionError("revenue_health handler not found")
 
 
-def test_revenue_health_reports_no_thread_liveness():
-    """P1-010 detection gap: revenue-health exposes NO per-thread/loop liveness.
+def test_revenue_health_reports_thread_liveness():
+    """DD5 / P1-010 FIXED: revenue-health now exposes per-thread/loop liveness so
+    a dead or stalled daemon loop is operator-detectable.
 
-    A dead daemon loop (from the tail defect above) is therefore invisible to an
-    operator -- revenue-health returns financials/fees/rebalance/budget/etc. but
-    nothing about whether the 7 loops are still running.
-
-    FLIP WHEN THE FIX LANDS: the recommended fix adds a per-thread heartbeat
-    surfaced on revenue-health. Once present, invert this to REQUIRE a liveness
-    section (e.g. result['loops'] / heartbeat timestamps per thread).
+    (Flipped from the pre-fix assertion that no liveness surface existed.)
     """
     src = _health_func_source()
     lowered = src.lower()
     liveness_markers = [
-        "is_alive",
         "heartbeat",
-        "threading.enumerate",
-        "last_iteration",
-        "loop_health",
-        "thread_health",
-        "loops_alive",
         "liveness",
+        "last_tick",
+        "loops",
+        "stalled",
     ]
     present = [m for m in liveness_markers if m in lowered]
-    assert not present, (
-        "revenue-health now appears to expose loop liveness "
-        f"({present}); the P1-010 heartbeat fix may have landed -- FLIP this test "
-        "to REQUIRE a per-thread liveness surface."
+    assert present, (
+        "revenue-health must expose a per-thread loop liveness surface "
+        "(e.g. result['loops'] with per-thread heartbeat age / alive-stalled)."
     )
 
 
-def test_no_heartbeat_anywhere_in_plugin():
-    """P1-010 detection gap (whole-file): the plugin records no per-loop heartbeat
-    and never inspects thread liveness for monitoring.
+def test_heartbeat_mechanism_present_in_plugin():
+    """DD5 / P1-010 FIXED (whole-file): the plugin now records a per-loop
+    heartbeat that the canonical guard updates every iteration, and surfaces it.
 
-    Confirms there is no self-healing / watchdog either: nothing enumerates the
-    daemon threads or checks is_alive() to detect and act on a dead loop.
-
-    FLIP WHEN THE FIX LANDS: when a heartbeat/watchdog is added, invert to
-    require its presence.
+    (Flipped from the pre-fix assertion that no heartbeat mechanism existed.)
     """
     lowered = _SOURCE.lower()
-    for marker in ("heartbeat", "is_alive(", "threading.enumerate"):
-        assert marker not in lowered, (
-            f"found {marker!r} in cl-revenue-ops.py -- a heartbeat/liveness "
-            f"mechanism may have been added; FLIP this test to require it."
-        )
+    assert "heartbeat" in lowered, (
+        "expected a per-loop heartbeat mechanism in cl-revenue-ops.py (DD5)."
+    )
+    assert "_record_loop_heartbeat" in _SOURCE, (
+        "expected the canonical guard to record a per-thread heartbeat via "
+        "_record_loop_heartbeat(...)."
+    )

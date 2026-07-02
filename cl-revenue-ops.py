@@ -178,6 +178,53 @@ FORWARD_HYDRATION_EVENT_JITTER_SECONDS = 300
 
 
 # =============================================================================
+# DD5 / P1-010: daemon per-thread heartbeat + canonical loop guard
+# =============================================================================
+# Each daemon loop records a last-iteration timestamp so a stalled or dead loop
+# becomes operator-detectable on revenue-health. The canonical guard wraps the
+# ENTIRE per-iteration body (work AND the interval/jitter/sleep tail) so a tail
+# exception can no longer silently kill the thread; on failure it logs and does
+# a bounded, interruptible backoff before the next iteration.
+_loop_heartbeats: Dict[str, Dict[str, Any]] = {}
+_loop_heartbeats_lock = threading.Lock()
+# Bounded backoff after an unhandled per-iteration failure so a hot failure loop
+# cannot spin the CPU. The wait is interruptible (exits on shutdown).
+_LOOP_BACKOFF_SECONDS = 30
+# A loop is considered "stalled" if its last tick is older than this many
+# multiples of its own interval is not tracked here (intervals vary); instead
+# revenue-health reports the raw age and a coarse threshold flag.
+_LOOP_STALL_SECONDS = 3600
+
+
+def _record_loop_heartbeat(name: str) -> None:
+    """Record a per-thread heartbeat for daemon loop ``name`` (best-effort)."""
+    try:
+        with _loop_heartbeats_lock:
+            _loop_heartbeats[name] = {
+                "last_tick_monotonic": time.monotonic(),
+                "last_tick_ts": int(time.time()),
+            }
+    except Exception:
+        pass
+
+
+def _loop_liveness_snapshot() -> Dict[str, Any]:
+    """Snapshot of daemon-loop liveness for revenue-health (thread -> age/state)."""
+    now_mono = time.monotonic()
+    out: Dict[str, Any] = {}
+    with _loop_heartbeats_lock:
+        items = {k: dict(v) for k, v in _loop_heartbeats.items()}
+    for name, hb in items.items():
+        age = max(0.0, now_mono - float(hb.get("last_tick_monotonic", now_mono)))
+        out[name] = {
+            "last_tick_ts": int(hb.get("last_tick_ts", 0) or 0),
+            "last_tick_age_seconds": int(age),
+            "state": "stalled" if age > _LOOP_STALL_SECONDS else "alive",
+        }
+    return out
+
+
+# =============================================================================
 # OPERATOR-PARAM VALIDATION HELPERS
 # =============================================================================
 # RPC handlers accept raw operator-supplied params (via lightning-cli or the
@@ -2523,41 +2570,53 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return
         
         while not shutdown_event.is_set():
+            # DD5 / P1-010: canonical guard wraps the ENTIRE iteration (work AND
+            # the interval/sleep tail) so no exception can kill the thread.
             try:
-                plugin.log("Running scheduled flow analysis...")
-                run_flow_analysis()
-                
-                # Run cleanup on each iteration (it's a fast DELETE query)
-                # Keeps history tables from growing unbounded over months
-                # Use flow_window_days + 1 day buffer, minimum 8 days
-                if database:
-                    cleanup_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-                    days_to_keep = max(8, cleanup_snap.flow_window_days + 1)
-                    database.cleanup_old_data(days_to_keep=days_to_keep)
+                _record_loop_heartbeat("flow-analysis")
+                try:
+                    plugin.log("Running scheduled flow analysis...")
+                    run_flow_analysis()
 
-                # AUDIT FIX PM-5: Clean up expired time-limited policies
-                if policy_manager:
-                    try:
-                        policy_manager.cleanup_expired_policies()
-                    except Exception as e:
-                        plugin.log(f"Error cleaning expired policies: {e}", level='debug')
-                
-            except (RPCTimeoutError, RPCBreakerOpen) as e:
-                plugin.log(f"RPC degraded in flow analysis: {e}. Skipping this cycle.", level='warn')
+                    # Run cleanup on each iteration (it's a fast DELETE query)
+                    # Keeps history tables from growing unbounded over months
+                    # Use flow_window_days + 1 day buffer, minimum 8 days
+                    if database:
+                        cleanup_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+                        days_to_keep = max(8, cleanup_snap.flow_window_days + 1)
+                        database.cleanup_old_data(days_to_keep=days_to_keep)
+
+                    # AUDIT FIX PM-5: Clean up expired time-limited policies
+                    if policy_manager:
+                        try:
+                            policy_manager.cleanup_expired_policies()
+                        except Exception as e:
+                            plugin.log(f"Error cleaning expired policies: {e}", level='debug')
+
+                except (RPCTimeoutError, RPCBreakerOpen) as e:
+                    plugin.log(f"RPC degraded in flow analysis: {e}. Skipping this cycle.", level='warn')
+                except Exception as e:
+                    plugin.log(f"Error in flow analysis: {e}", level='error')
+
+                # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
+                cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+                interval = max(60, cfg_snap.flow_interval)
+                jitter_seconds = int(interval * 0.2)
+                sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
+                plugin.log(f"Flow analysis sleeping for {sleep_time}s")
+
+                # Interruptible sleep: wait for timeout OR shutdown signal
+                if shutdown_event.wait(sleep_time):
+                    plugin.log("Flow analysis loop stopping due to shutdown signal")
+                    break
             except Exception as e:
-                plugin.log(f"Error in flow analysis: {e}", level='error')
-
-            # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
-            cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-            interval = max(60, cfg_snap.flow_interval)
-            jitter_seconds = int(interval * 0.2)
-            sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
-            plugin.log(f"Flow analysis sleeping for {sleep_time}s")
-            
-            # Interruptible sleep: wait for timeout OR shutdown signal
-            if shutdown_event.wait(sleep_time):
-                plugin.log("Flow analysis loop stopping due to shutdown signal")
-                break
+                plugin.log(f"Unhandled error in flow-analysis loop iteration: {e}", level='error')
+                try:
+                    plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+                except Exception:
+                    pass
+                if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
+                    break
     
     def fee_adjustment_loop():
         """Background loop for fee adjustment."""
@@ -2567,27 +2626,38 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return
 
         while not shutdown_event.is_set():
-            _refresh_fee_cycle_hive_inputs()
-
+            # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
             try:
-                plugin.log("Running scheduled fee adjustment...")
-                run_fee_adjustment()
-            except (RPCTimeoutError, RPCBreakerOpen) as e:
-                plugin.log(f"RPC degraded in fee adjustment: {e}. Skipping this cycle.", level='warn')
+                _record_loop_heartbeat("fee-adjustment")
+                _refresh_fee_cycle_hive_inputs()
+
+                try:
+                    plugin.log("Running scheduled fee adjustment...")
+                    run_fee_adjustment()
+                except (RPCTimeoutError, RPCBreakerOpen) as e:
+                    plugin.log(f"RPC degraded in fee adjustment: {e}. Skipping this cycle.", level='warn')
+                except Exception as e:
+                    plugin.log(f"Error in fee adjustment: {e}", level='error')
+
+                # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
+                cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+                interval = max(60, cfg_snap.fee_interval)
+                jitter_seconds = int(interval * 0.2)
+                sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
+                plugin.log(f"Fee adjustment sleeping for {sleep_time}s")
+
+                # Interruptible sleep: wait for timeout OR shutdown signal
+                if shutdown_event.wait(sleep_time):
+                    plugin.log("Fee adjustment loop stopping due to shutdown signal")
+                    break
             except Exception as e:
-                plugin.log(f"Error in fee adjustment: {e}", level='error')
-
-            # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
-            cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-            interval = max(60, cfg_snap.fee_interval)
-            jitter_seconds = int(interval * 0.2)
-            sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
-            plugin.log(f"Fee adjustment sleeping for {sleep_time}s")
-
-            # Interruptible sleep: wait for timeout OR shutdown signal
-            if shutdown_event.wait(sleep_time):
-                plugin.log("Fee adjustment loop stopping due to shutdown signal")
-                break
+                plugin.log(f"Unhandled error in fee-adjustment loop iteration: {e}", level='error')
+                try:
+                    plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+                except Exception:
+                    pass
+                if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
+                    break
     
     def rebalance_check_loop():
         """Background loop for rebalance checks."""
@@ -2597,29 +2667,40 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return
         
         while not shutdown_event.is_set():
+            # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
             try:
-                refresh_hive_runtime(hive_hints=hive_hints, hive_router=hive_router, log=plugin.log)
-            except Exception:
-                pass  # fail-open
-            try:
-                plugin.log("Running scheduled rebalance check...")
-                run_rebalance_check()
-            except (RPCTimeoutError, RPCBreakerOpen) as e:
-                plugin.log(f"RPC degraded in rebalance check: {e}. Skipping this cycle.", level='warn')
-            except Exception as e:
-                plugin.log(f"Error in rebalance check: {e}", level='error')
+                _record_loop_heartbeat("rebalance-check")
+                try:
+                    refresh_hive_runtime(hive_hints=hive_hints, hive_router=hive_router, log=plugin.log)
+                except Exception:
+                    pass  # fail-open
+                try:
+                    plugin.log("Running scheduled rebalance check...")
+                    run_rebalance_check()
+                except (RPCTimeoutError, RPCBreakerOpen) as e:
+                    plugin.log(f"RPC degraded in rebalance check: {e}. Skipping this cycle.", level='warn')
+                except Exception as e:
+                    plugin.log(f"Error in rebalance check: {e}", level='error')
 
-            # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
-            cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-            interval = max(60, cfg_snap.rebalance_interval)
-            jitter_seconds = int(interval * 0.2)
-            sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
-            plugin.log(f"Rebalance check sleeping for {sleep_time}s")
-            
-            # Interruptible sleep: wait for timeout OR shutdown signal
-            if shutdown_event.wait(sleep_time):
-                plugin.log("Rebalance check loop stopping due to shutdown signal")
-                break
+                # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
+                cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+                interval = max(60, cfg_snap.rebalance_interval)
+                jitter_seconds = int(interval * 0.2)
+                sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
+                plugin.log(f"Rebalance check sleeping for {sleep_time}s")
+
+                # Interruptible sleep: wait for timeout OR shutdown signal
+                if shutdown_event.wait(sleep_time):
+                    plugin.log("Rebalance check loop stopping due to shutdown signal")
+                    break
+            except Exception as e:
+                plugin.log(f"Unhandled error in rebalance-check loop iteration: {e}", level='error')
+                try:
+                    plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+                except Exception:
+                    pass
+                if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
+                    break
     
     def boltz_auto_cycle_loop():
         """Background loop for profit-gated Boltz auto-balance cycles."""
@@ -2639,32 +2720,43 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 return
 
         while not shutdown_event.is_set():
-            enabled = bool(getattr(config, 'boltz_auto_cycle_enabled', False))
-            _boltz_auto_cycle_mark_state(enabled=enabled)
+            # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
+            try:
+                _record_loop_heartbeat("boltz-auto-cycle")
+                enabled = bool(getattr(config, 'boltz_auto_cycle_enabled', False))
+                _boltz_auto_cycle_mark_state(enabled=enabled)
 
-            if enabled:
+                if enabled:
+                    try:
+                        _refresh_dynamic_config()
+                        result = _run_boltz_auto_cycle_once(trigger='scheduler')
+                        _boltz_auto_cycle_mark_state(last_result=result)
+                        summary = ''
+                        if isinstance(result, dict):
+                            summary = f"status={result.get('status')} executed={result.get('executed_count', 0)} skipped={result.get('skipped_count', 0)}"
+                        plugin.log(f"Boltz auto-cycle completed ({summary})", level='debug')
+                    except Exception as e:
+                        plugin.log(f"Error in Boltz auto-cycle: {e}", level='warn')
+                        plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+                else:
+                    _boltz_auto_cycle_mark_state(last_result={'status': 'disabled', 'reason': 'boltz auto-cycle disabled by config', 'trigger': 'scheduler'})
+
+                interval_min = max(1, int(getattr(config, 'boltz_auto_cycle_interval_minutes', 15) or 15))
+                interval_sec = interval_min * 60
+                jitter = max(0, int(interval_sec * 0.1))
+                sleep_time = interval_sec + (random.randint(-jitter, jitter) if jitter > 0 else 0)
+                _boltz_auto_cycle_mark_state(next_run_ts=int(time.time()) + max(1, sleep_time))
+                if shutdown_event.wait(max(1, sleep_time)):
+                    plugin.log("Boltz auto-cycle loop stopping due to shutdown signal")
+                    break
+            except Exception as e:
+                plugin.log(f"Unhandled error in boltz-auto-cycle loop iteration: {e}", level='error')
                 try:
-                    _refresh_dynamic_config()
-                    result = _run_boltz_auto_cycle_once(trigger='scheduler')
-                    _boltz_auto_cycle_mark_state(last_result=result)
-                    summary = ''
-                    if isinstance(result, dict):
-                        summary = f"status={result.get('status')} executed={result.get('executed_count', 0)} skipped={result.get('skipped_count', 0)}"
-                    plugin.log(f"Boltz auto-cycle completed ({summary})", level='debug')
-                except Exception as e:
-                    plugin.log(f"Error in Boltz auto-cycle: {e}", level='warn')
                     plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
-            else:
-                _boltz_auto_cycle_mark_state(last_result={'status': 'disabled', 'reason': 'boltz auto-cycle disabled by config', 'trigger': 'scheduler'})
-
-            interval_min = max(1, int(getattr(config, 'boltz_auto_cycle_interval_minutes', 15) or 15))
-            interval_sec = interval_min * 60
-            jitter = max(0, int(interval_sec * 0.1))
-            sleep_time = interval_sec + (random.randint(-jitter, jitter) if jitter > 0 else 0)
-            _boltz_auto_cycle_mark_state(next_run_ts=int(time.time()) + max(1, sleep_time))
-            if shutdown_event.wait(max(1, sleep_time)):
-                plugin.log("Boltz auto-cycle loop stopping due to shutdown signal")
-                break
+                except Exception:
+                    pass
+                if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
+                    break
 
         _boltz_auto_cycle_mark_state(next_run_ts=None, running=False)
 
@@ -2698,26 +2790,37 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return
 
         while not shutdown_event.is_set():
+            # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
             try:
-                _refresh_dynamic_config()
-                plugin.log("Running scheduled capacity planner cycle...")
-                result = capacity_planner.execute_cycle()
-                if result.get("skipped"):
-                    plugin.log(f"Planner cycle skipped: {result.get('reason')}", level='debug')
-                else:
-                    opens = len(result.get("opens", []))
-                    closes = len(result.get("closes", []))
-                    plugin.log(f"Planner cycle complete: {opens} opens, {closes} closes")
-            except Exception as e:
-                plugin.log(f"Error in capacity planner cycle: {e}", level='error')
-                plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+                _record_loop_heartbeat("capacity-planner")
+                try:
+                    _refresh_dynamic_config()
+                    plugin.log("Running scheduled capacity planner cycle...")
+                    result = capacity_planner.execute_cycle()
+                    if result.get("skipped"):
+                        plugin.log(f"Planner cycle skipped: {result.get('reason')}", level='debug')
+                    else:
+                        opens = len(result.get("opens", []))
+                        closes = len(result.get("closes", []))
+                        plugin.log(f"Planner cycle complete: {opens} opens, {closes} closes")
+                except Exception as e:
+                    plugin.log(f"Error in capacity planner cycle: {e}", level='error')
+                    plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
 
-            cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-            interval = max(600, cfg_snap.planner_interval)
-            jitter = int(interval * 0.2)
-            sleep_time = interval + random.randint(-jitter, jitter)
-            if shutdown_event.wait(sleep_time):
-                break
+                cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+                interval = max(600, cfg_snap.planner_interval)
+                jitter = int(interval * 0.2)
+                sleep_time = interval + random.randint(-jitter, jitter)
+                if shutdown_event.wait(sleep_time):
+                    break
+            except Exception as e:
+                plugin.log(f"Unhandled error in capacity-planner loop iteration: {e}", level='error')
+                try:
+                    plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+                except Exception:
+                    pass
+                if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
+                    break
 
     def snapshot_peers_delayed():
         """
@@ -2736,7 +2839,17 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
         # P1-021: delegate to the extracted helper, which closes the
         # thread-local DB connection before this one-shot thread exits.
-        _snapshot_peers_once()
+        # DD5 / P1-010: guard the single run so an exception cannot kill the
+        # thread silently; record a heartbeat so the one-shot is observable.
+        _record_loop_heartbeat("startup-snapshot")
+        try:
+            _snapshot_peers_once()
+        except Exception as e:
+            plugin.log(f"Startup snapshot failed: {e}", level='error')
+            try:
+                plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+            except Exception:
+                pass
 
     def financial_snapshot_loop():
         """
@@ -2759,22 +2872,34 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log(f"Error taking initial financial snapshot: {e}", level='warn')
 
         while not shutdown_event.is_set():
-            # Calculate +/- 10% jitter (about 2.4 hours variance)
-            jitter_seconds = int(SNAPSHOT_INTERVAL * 0.1)
-            sleep_time = SNAPSHOT_INTERVAL + random.randint(-jitter_seconds, jitter_seconds)
-            plugin.log(f"Financial snapshot sleeping for {sleep_time // 3600}h {(sleep_time % 3600) // 60}m")
-
-            # Interruptible sleep
-            if shutdown_event.wait(sleep_time):
-                plugin.log("Financial snapshot loop stopping due to shutdown signal")
-                break
-
+            # DD5 / P1-010: canonical guard over the ENTIRE iteration. This loop
+            # is inverted (sleep-tail at the TOP), so the guard wraps it too.
             try:
-                _take_financial_snapshot()
-            except (RPCTimeoutError, RPCBreakerOpen) as e:
-                plugin.log(f"RPC degraded in financial snapshot: {e}. Skipping this cycle.", level='warn')
+                _record_loop_heartbeat("financial-snapshot")
+                # Calculate +/- 10% jitter (about 2.4 hours variance)
+                jitter_seconds = int(SNAPSHOT_INTERVAL * 0.1)
+                sleep_time = SNAPSHOT_INTERVAL + random.randint(-jitter_seconds, jitter_seconds)
+                plugin.log(f"Financial snapshot sleeping for {sleep_time // 3600}h {(sleep_time % 3600) // 60}m")
+
+                # Interruptible sleep
+                if shutdown_event.wait(sleep_time):
+                    plugin.log("Financial snapshot loop stopping due to shutdown signal")
+                    break
+
+                try:
+                    _take_financial_snapshot()
+                except (RPCTimeoutError, RPCBreakerOpen) as e:
+                    plugin.log(f"RPC degraded in financial snapshot: {e}. Skipping this cycle.", level='warn')
+                except Exception as e:
+                    plugin.log(f"Error in financial snapshot: {e}", level='error')
             except Exception as e:
-                plugin.log(f"Error in financial snapshot: {e}", level='error')
+                plugin.log(f"Unhandled error in financial-snapshot loop iteration: {e}", level='error')
+                try:
+                    plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+                except Exception:
+                    pass
+                if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
+                    break
 
     def _take_financial_snapshot():
         """Take a single financial snapshot and record it to the database."""
@@ -5259,6 +5384,21 @@ def revenue_health(plugin: Plugin) -> Dict[str, Any]:
             ]
         except Exception:
             result["top_routes"] = []
+
+    # --- 9. Daemon-loop liveness (DD5 / P1-010 heartbeat surface) ---
+    # Per-thread last-iteration age + alive/stalled so a dead or stalled daemon
+    # loop is operator-detectable instead of failing silently.
+    try:
+        loops = _loop_liveness_snapshot()
+        stalled = sorted(n for n, v in loops.items() if v.get("state") == "stalled")
+        result["loops"] = {
+            "threads": loops,
+            "stalled": stalled,
+            "all_alive": len(stalled) == 0,
+            "stall_threshold_seconds": _LOOP_STALL_SECONDS,
+        }
+    except Exception as e:
+        result["loops"] = {"error": str(e)}
 
     return result
 
