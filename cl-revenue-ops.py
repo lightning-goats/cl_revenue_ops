@@ -1194,6 +1194,69 @@ plugin.add_option(
     )
 )
 
+# Upstream rebalancer patterns (flow-facts / EV / planner tuning). Consumed
+# by ChannelFlowFacts (activity + utilization knobs) and by the rebalance
+# engine EV / capacity planner (size-tiering knobs).
+plugin.add_option(
+    name='revenue-ops-rebalance-activity-window-seconds',
+    default='3600',
+    description='Window in seconds over which recent forwarding activity is measured for the activity-recency penalty (default: 3600 = 1 hour)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-activity-penalty-coeff',
+    default='0.5',
+    description='Coefficient applied to the activity-recency penalty when scoring a rebalance candidate (default: 0.5; 0 disables)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-activity-penalty-cap-frac',
+    default='0.5',
+    description='Maximum fraction of score the activity-recency penalty may remove (default: 0.5)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-utilization-window-days',
+    default='7',
+    description='Trailing window in days over which forwarding utilization is measured for utilization-based sizing (default: 7)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-utilization-floor',
+    default='0.05',
+    description='Minimum utilization ratio floor used when normalizing observed flow (default: 0.05)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-utilization-ceiling',
+    default='1.0',
+    description='Maximum utilization ratio ceiling used when normalizing observed flow (default: 1.0)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-utilization-min-forwards',
+    default='5',
+    description='Minimum number of forwards in the utilization window required before utilization-based sizing is trusted (default: 5)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-size-tiered-targets',
+    default='true',
+    description='Enable size-tiered rebalance targets (bucket target amounts by channel capacity percentile instead of a single flat target) (default: true)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-size-reference-percentile',
+    default='0.5',
+    description='Percentile (0.0-1.0) of the channel-capacity distribution used as the reference point for size-tiered target amounts (default: 0.5)'
+)
+
+plugin.add_option(
+    name='revenue-ops-rebalance-small-channel-band-half-width',
+    default='0.15',
+    description='Half-width (fraction) of the "small channel" band around the reference percentile (default: 0.15)'
+)
+
 
 plugin.add_option(
     name='revenue-ops-flow-window-days',
@@ -2193,6 +2256,36 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         ),
         rebalance_coordination_reserved_slots=_safe_int_opt(
             'revenue-ops-rebalance-coordination-reserved-slots', '2'
+        ),
+        rebalance_activity_window_seconds=_safe_int_opt(
+            'revenue-ops-rebalance-activity-window-seconds', '3600'
+        ),
+        rebalance_activity_penalty_coeff=_safe_float_opt(
+            'revenue-ops-rebalance-activity-penalty-coeff', '0.5'
+        ),
+        rebalance_activity_penalty_cap_frac=_safe_float_opt(
+            'revenue-ops-rebalance-activity-penalty-cap-frac', '0.5'
+        ),
+        rebalance_utilization_window_days=_safe_int_opt(
+            'revenue-ops-rebalance-utilization-window-days', '7'
+        ),
+        rebalance_utilization_floor=_safe_float_opt(
+            'revenue-ops-rebalance-utilization-floor', '0.05'
+        ),
+        rebalance_utilization_ceiling=_safe_float_opt(
+            'revenue-ops-rebalance-utilization-ceiling', '1.0'
+        ),
+        rebalance_utilization_min_forwards=_safe_int_opt(
+            'revenue-ops-rebalance-utilization-min-forwards', '5'
+        ),
+        rebalance_size_tiered_targets=options.get(
+            'revenue-ops-rebalance-size-tiered-targets', 'true'
+        ).lower() in ('true', '1', 'yes'),
+        rebalance_size_reference_percentile=_safe_float_opt(
+            'revenue-ops-rebalance-size-reference-percentile', '0.5'
+        ),
+        rebalance_small_channel_band_half_width=_safe_float_opt(
+            'revenue-ops-rebalance-small-channel-band-half-width', '0.15'
         ),
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
