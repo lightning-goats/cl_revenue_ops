@@ -179,7 +179,7 @@ Saved artifacts:
 ## Day-1 Operator Workflow
 
 1. Start the plugin and check `revenue-status`.
-2. Set only the safety rails you actually want to constrain: `paused`, `daily_budget_sats`, `min_fee_ppm`, `max_fee_ppm`, `fee_profile`, and the `fee_market_boundary_*` controls.
+2. Set only the safety rails you actually want to constrain: `paused`, `daily_budget_sats`, `min_fee_ppm`, `max_fee_ppm`, and `fee_profile`. (The `fee_market_boundary_*` controls are deprecated no-ops kept only for config compatibility; they have no effect.)
 3. Let the executor run.
 4. Use `revenue-fee-debug` and `revenue-rebalance-debug` to understand holds, clamps, and actions before touching anything else.
 Example runtime adjustments:
@@ -188,7 +188,6 @@ Example runtime adjustments:
 lightning-cli revenue-config get
 lightning-cli revenue-config set fee_profile conservative
 lightning-cli revenue-config set min_fee_ppm 75
-lightning-cli revenue-config set fee_market_boundary_margin_ratio 0.03
 lightning-cli revenue-config set daily_budget_sats 10000
 ```
 

@@ -49,11 +49,11 @@
 # RECOMMENDATION: 1500-2500 ppm for most routing nodes; raise only for special positioning
 #revenue-ops-max-fee-ppm=2000
 
-# Competitive market boundary guard
-# Caps fee targets below the cheapest active competitor to the same destination
-# so a single cheaper rival cannot silently take all route quotes.
-#revenue-ops-fee-market-boundary-enabled=true
-#revenue-ops-fee-market-boundary-min-competitors=1
+# DEPRECATED no-op compatibility flags. The fee market boundary guard was
+# removed; these options are retained only so existing configs keep loading.
+# Setting them has NO effect (the boundary logic is ignored). Default: disabled.
+#revenue-ops-fee-market-boundary-enabled=false
+#revenue-ops-fee-market-boundary-min-competitors=3
 #revenue-ops-fee-market-boundary-margin-ppm=5
 #revenue-ops-fee-market-boundary-margin-ratio=0.05
 #revenue-ops-fee-market-boundary-max-downshift-ratio=0.35
