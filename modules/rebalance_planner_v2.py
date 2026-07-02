@@ -126,7 +126,9 @@ class RebalancePlanner:
         # Phase 2 of the post-Polar remediation: a neutral over-local channel is
         # a valid drain source even though it can never be a refill destination.
         for ch in snapshot.channels:
-            if ch.local_ratio > self.target_band_high:
+            band_high = getattr(ch, "target_band_high", self.target_band_high)
+            band_low = getattr(ch, "target_band_low", self.target_band_low)
+            if ch.local_ratio > band_high:
                 if ch.source_eligible:
                     over_local.append(ch)
                 else:
@@ -136,7 +138,7 @@ class RebalancePlanner:
                         value_class=ch.value_class,
                         remaining_budget_sats=ch.remaining_budget_sats,
                     ))
-            elif ch.local_ratio < self.target_band_low:
+            elif ch.local_ratio < band_low:
                 if ch.dest_eligible:
                     over_remote.append(ch)
                 else:

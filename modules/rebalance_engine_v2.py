@@ -1242,6 +1242,27 @@ class RebalanceEngine:
         now_ts = int(time.time())
         flow_facts = self._build_flow_facts_map(normalized, cfg, now_ts)
 
+        target_bands = None
+        if bool(getattr(cfg, "rebalance_size_tiered_targets", True)):
+            from modules.rebalance_state_v2 import compute_size_tiered_bands
+
+            caps = {
+                ch["channel_id"]: int(ch.get("capacity_sats") or 0)
+                for ch in normalized
+                if ch.get("channel_id")
+            }
+            target_bands = compute_size_tiered_bands(
+                caps,
+                percentile=float(
+                    getattr(cfg, "rebalance_size_reference_percentile", 0.5)
+                ),
+                small_half_width=float(
+                    getattr(cfg, "rebalance_small_channel_band_half_width", 0.15)
+                ),
+                flat_low=target_band_low,
+                flat_high=target_band_high,
+            )
+
         return build_state_snapshot(
             normalized,
             capex_allocations,
@@ -1252,6 +1273,7 @@ class RebalanceEngine:
                 getattr(cfg, "hive_rebalance_bootstrap_budget_sats", 0) or 0
             ),
             flow_facts=flow_facts,
+            target_bands=target_bands,
             cfg=cfg,
         )
 

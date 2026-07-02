@@ -220,6 +220,43 @@ def _value_class(channel: ChannelInput, remaining_budget_sats: int = 0) -> str:
 # planner defaults so role metadata stays consistent without coupling modules.
 _DEFAULT_TARGET_BAND_LOW = 0.35
 _DEFAULT_TARGET_BAND_HIGH = 0.65
+
+
+def compute_size_tiered_bands(
+    capacities: Mapping[str, Any],
+    percentile: float = 0.5,
+    small_half_width: float = 0.15,
+    flat_low: float = _DEFAULT_TARGET_BAND_LOW,
+    flat_high: float = _DEFAULT_TARGET_BAND_HIGH,
+) -> dict[str, Tuple[float, float]]:
+    """Per-channel (band_low, band_high) from the node's capacity distribution.
+
+    Channels at/below the reference capacity (a percentile of the size
+    distribution) keep the flat band (flat_low, flat_high). Larger channels get
+    a wider, downward-skewed band so they hold outbound residual as a buffer
+    rather than being force-balanced. Bounds clamped to (0.05, 0.95).
+    Returns {channel_id: (low, high)}.
+    """
+    if not capacities:
+        return {}
+    caps_sorted = sorted(capacities.values())
+    idx = min(len(caps_sorted) - 1, max(0, int(percentile * (len(caps_sorted) - 1))))
+    reference = max(1, caps_sorted[idx])
+    bands: dict[str, Tuple[float, float]] = {}
+    for cid, cap in capacities.items():
+        cap = max(1, int(cap))
+        if cap <= reference:
+            low, high = flat_low, flat_high
+        else:
+            scale = min(2.0, cap / float(reference))
+            widen = small_half_width * scale
+            low = 0.5 - widen * 1.3
+            high = 0.5 + widen * 0.7
+        bands[cid] = (
+            round(max(0.05, min(low, 0.45)), 6),
+            round(min(0.95, max(high, 0.55)), 6),
+        )
+    return bands
 # Phase 3 emergency-depleted threshold: below this local ratio a cooldown-held
 # destination is still refill-eligible. Default chosen to match the Polar S9
 # 6.6% local case while leaving normal under-band depletion (~10-30%) blocked.

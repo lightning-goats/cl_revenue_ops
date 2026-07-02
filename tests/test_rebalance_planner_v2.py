@@ -3,7 +3,11 @@
 import pytest
 
 from modules.rebalance_planner_v2 import RebalancePlanner
-from modules.rebalance_state_v2 import ChannelState, StateSnapshot
+from modules.rebalance_state_v2 import (
+    ChannelState,
+    StateSnapshot,
+    compute_size_tiered_bands,
+)
 
 
 def _ch(
@@ -16,6 +20,8 @@ def _ch(
     is_valuable=True,
     remaining_budget_sats=500,
     cooldown_active=False,
+    target_band_low=0.35,
+    target_band_high=0.65,
 ):
     # Mirror the Phase 2 role-aware eligibility derived in build_state_snapshot
     # so planner unit tests describe the same semantics as the live snapshot.
@@ -57,6 +63,8 @@ def _ch(
         dest_reason=dest_reason,
         dest_urgency=dest_urgency,
         source_drain_score=source_drain_score,
+        target_band_low=target_band_low,
+        target_band_high=target_band_high,
     )
 
 
@@ -519,3 +527,95 @@ class TestScoring:
 
         assert len(result.selected) == 1
         assert result.selected[0].source_channel_id == "very_full"
+
+
+def test_small_channel_keeps_flat_band():
+    caps = {"s1": 1_000_000, "s2": 1_000_000, "s3": 1_000_000, "big": 20_000_000}
+    bands = compute_size_tiered_bands(caps, percentile=0.5, small_half_width=0.15, flat_low=0.35, flat_high=0.65)
+    assert bands["s1"] == (0.35, 0.65)
+
+
+def test_large_channel_gets_wider_asymmetric_band():
+    caps = {"s1": 1_000_000, "s2": 1_000_000, "s3": 1_000_000, "big": 20_000_000}
+    bands = compute_size_tiered_bands(caps, percentile=0.5, small_half_width=0.15, flat_low=0.35, flat_high=0.65)
+    low, high = bands["big"]
+    assert low < 0.35 and high > 0.65
+    assert 0.0 < low < high < 1.0
+
+
+def test_empty_capacities_returns_empty():
+    assert compute_size_tiered_bands({}, percentile=0.5, small_half_width=0.15, flat_low=0.35, flat_high=0.65) == {}
+
+
+class TestSizeTieredPlannerClassification:
+    """Task 7: the planner must classify each channel against ITS OWN
+    per-channel target_band_low/target_band_high, not the planner's flat
+    self.target_band_low/high scalars."""
+
+    def test_large_channel_classified_by_its_own_wider_band_not_flat(self):
+        """A large channel sitting at local_ratio=0.70 would be classified
+        over_local under the flat 0.65 band, but its own asymmetric
+        per-channel band (e.g. high=0.80) says it's still inside band --
+        the planner must honor the per-channel band."""
+        planner = RebalancePlanner(target_band_low=0.35, target_band_high=0.65)
+
+        # Big channel: local_ratio 0.70 is > flat 0.65 (would be over_local
+        # under the OLD flat-band logic) but its own per-channel band
+        # (0.20, 0.80) says it is still comfortably inside band.
+        big = _ch(
+            channel_id="big",
+            peer_id="02" + "aa" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.70,
+            value_class="active",
+            target_band_low=0.20,
+            target_band_high=0.80,
+        )
+        # Small channel at the SAME 0.70 ratio, flat band -- over_local.
+        small = _ch(
+            channel_id="small",
+            peer_id="02" + "bb" * 32,
+            capacity_sats=1_000_000,
+            local_ratio=0.70,
+            value_class="active",
+            target_band_low=0.35,
+            target_band_high=0.65,
+        )
+        dest = _ch(
+            channel_id="dest",
+            peer_id="02" + "cc" * 32,
+            local_ratio=0.10,
+            target_band_low=0.35,
+            target_band_high=0.65,
+        )
+        snap = _snap(big, small, dest)
+
+        result = planner.plan(snap)
+
+        # Only the small channel should be selected as an over_local source;
+        # the big channel is inside its own (wider) band and should be
+        # skipped as "inside_band", not paired as a drain source.
+        assert len(result.selected) == 1
+        assert result.selected[0].source_channel_id == "small"
+        skip_reasons = {s.channel_id: s.reason for s in result.skipped}
+        assert skip_reasons.get("big") == "inside_band"
+
+    def test_toggle_off_matches_flat_band_behavior(self):
+        """When rebalance_size_tiered_targets is False, the engine builds no
+        target_bands map, so build_state_snapshot defaults every channel's
+        per-channel band to the flat cfg/default band. Classification with
+        all channels carrying (0.35, 0.65) must be identical to the
+        pre-feature flat-band behavior."""
+        planner = RebalancePlanner(target_band_low=0.35, target_band_high=0.65)
+
+        src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
+                  local_ratio=0.90, target_band_low=0.35, target_band_high=0.65)
+        dest = _ch(channel_id="dest", peer_id="02" + "bb" * 32,
+                   local_ratio=0.10, target_band_low=0.35, target_band_high=0.65)
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        assert len(result.selected) == 1
+        assert result.selected[0].source_channel_id == "src"
+        assert result.selected[0].dest_channel_id == "dest"
