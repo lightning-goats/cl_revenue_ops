@@ -2762,6 +2762,27 @@ class RebalanceEngine:
                 retry_result.failure_data = merged_data
                 return retry_result
 
+            if getattr(retry_result, "payment_pending", False):
+                # P8-001: an intermediate partial attempt whose sendpay/
+                # waitsendpay merely timed out is NOT a definitive failure —
+                # the HTLC is still in flight against this reservation. Mirror
+                # _retry_native_pair_with_exclusions ("never pay again on top"):
+                # BREAK and return the pending result rather than dispatching
+                # another executor.execute at a smaller amount (which would
+                # double-fill the same budget reservation). The reservation is
+                # held per the P4-007 hold-on-pending semantics.
+                retry_result.attempts = total_attempts
+                merged_data = dict(getattr(retry_result, "failure_data", {}) or {})
+                merged_data.setdefault("previous_failure", prior_result.error)
+                merged_data["partial_fill"] = {
+                    "planned_amount_sats": original_amount,
+                    "executed_amount_sats": 0,
+                    "attempts": partial_attempts
+                    + [{"amount_sats": amount_sats, "status": "payment_pending"}],
+                }
+                retry_result.failure_data = merged_data
+                return retry_result
+
             partial_attempts.append(
                 {
                     "amount_sats": amount_sats,
