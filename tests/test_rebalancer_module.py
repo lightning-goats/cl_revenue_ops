@@ -1175,3 +1175,34 @@ class TestGetLastHopFeeFleetMember:
         result = r._get_last_hop_fee("03a93b" + "0" * 58)
         # Should NOT have short-circuited to 0
         assert result != 0 or result is None
+
+
+class TestConfigOptionDefaultAlignment:
+    """P6-010 / DEF-042: the Config dataclass default for max_fee_ppm must
+    agree with the plugin-option default (which wins at runtime). A bare
+    Config() previously got 5000 while the option default was 2000."""
+
+    def _plugin_option_default(self, name):
+        """Extract a plugin.add_option default without importing the plugin
+        module (which would register the whole plugin surface)."""
+        import ast
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tree = ast.parse(open(os.path.join(root, "cl-revenue-ops.py")).read())
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and getattr(node.func, "attr", "") == "add_option"):
+                continue
+            kw = {k.arg: k.value for k in node.keywords}
+            name_node = kw.get("name")
+            if isinstance(name_node, ast.Constant) and name_node.value == name:
+                default_node = kw.get("default")
+                if isinstance(default_node, ast.Constant):
+                    return default_node.value
+        raise AssertionError(f"option {name} not found")
+
+    def test_config_max_fee_ppm_default_matches_option(self):
+        from modules.config import Config
+        option_default = int(self._plugin_option_default("revenue-ops-max-fee-ppm"))
+        assert Config().max_fee_ppm == option_default
+        assert Config().max_fee_ppm == 2000
