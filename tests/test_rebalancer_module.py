@@ -1136,6 +1136,95 @@ class TestHiveEqualizationConfigSurface:
         assert RebalanceReasonCode.HIVE_EQUALIZATION.value == "hive_equalization"
 
 
+class TestRebalanceUtilizationFloorCeilingGuard:
+    """rebalance_utilization_floor/ceiling must mirror the low/high_liquidity_threshold
+    cross-field guard idiom: no __post_init__ raise, repaired in load_overrides,
+    rejected in update_runtime.
+    """
+
+    def test_direct_construction_does_not_raise_for_inverted_pair(self):
+        # Matches low_liquidity_threshold/high_liquidity_threshold: no
+        # __post_init__ invariant is enforced for this pair (repair/reject
+        # happen in load_overrides/update_runtime instead).
+        from modules.config import Config
+
+        cfg = Config(
+            rebalance_utilization_floor=0.9,
+            rebalance_utilization_ceiling=0.1,
+        )
+        assert cfg.rebalance_utilization_floor == 0.9
+        assert cfg.rebalance_utilization_ceiling == 0.1
+
+    def test_runtime_updates_reject_inverted_pair(self):
+        from modules.config import Config
+
+        cfg = Config()
+        stored_values = {}
+        database = MagicMock()
+
+        def set_config_override(key, value):
+            stored_values[key] = value
+            return 99
+
+        def get_config_override(key):
+            return stored_values.get(key)
+
+        database.set_config_override.side_effect = set_config_override
+        database.get_config_override.side_effect = get_config_override
+        database.delete_config_override.return_value = True
+
+        result = cfg.update_runtime(database, "rebalance_utilization_ceiling", "0.6")
+        assert result["status"] == "success"
+        assert cfg.rebalance_utilization_ceiling == 0.6
+
+        result = cfg.update_runtime(database, "rebalance_utilization_floor", "0.3")
+        assert result["status"] == "success"
+        assert cfg.rebalance_utilization_floor == 0.3
+
+        result = cfg.update_runtime(database, "rebalance_utilization_floor", "0.9")
+        assert "must be less than" in result["error"]
+
+        result = cfg.update_runtime(database, "rebalance_utilization_ceiling", "0.1")
+        assert "must be greater than" in result["error"]
+
+    def test_load_overrides_repairs_invalid_band(self):
+        from modules.config import Config
+
+        cfg = Config()
+        database = MagicMock()
+        database.get_all_config_overrides.return_value = {
+            "rebalance_utilization_floor": "0.9",
+            "rebalance_utilization_ceiling": "0.1",
+        }
+        database.get_config_version.return_value = 7
+
+        warnings = cfg.load_overrides(database)
+
+        assert warnings == []
+        assert cfg.rebalance_utilization_ceiling == 0.1
+        assert cfg.rebalance_utilization_floor == pytest.approx(0.05)
+        assert cfg.snapshot().rebalance_utilization_floor == pytest.approx(0.05)
+
+
+class TestRebalanceSmallChannelBandHalfWidthRange:
+    def test_field_range_is_tightened_to_half_width(self):
+        from modules.config import CONFIG_FIELD_RANGES
+
+        assert CONFIG_FIELD_RANGES["rebalance_small_channel_band_half_width"] == (0.0, 0.5)
+
+    def test_runtime_update_rejects_value_above_half(self):
+        from modules.config import Config
+
+        cfg = Config()
+        database = MagicMock()
+
+        result = cfg.update_runtime(
+            database, "rebalance_small_channel_band_half_width", "0.6"
+        )
+        assert "error" in result
+        assert "out of range" in result["error"]
+
+
 class TestGetLastHopFeeFleetMember:
     """_get_last_hop_fee always uses actual peer fees, even for fleet members."""
 

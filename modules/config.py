@@ -301,7 +301,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_utilization_ceiling': (0.0, 1.0),
     'rebalance_utilization_min_forwards': (0, 1000),
     'rebalance_size_reference_percentile': (0.0, 1.0),
-    'rebalance_small_channel_band_half_width': (0.0, 1.0),
+    'rebalance_small_channel_band_half_width': (0.0, 0.5),
     'futility_cooldown_hours': (1, 168),
     'target_flow': (1000, 100000000),
     'estimated_open_cost_sats': (0, 1000000),
@@ -759,6 +759,14 @@ class Config:
                 # M-R6-1 FIX: Clamp to 0.0 to prevent negative values when
                 # high_liquidity_threshold is very small (e.g., < 0.05).
                 self.low_liquidity_threshold = max(0.0, self.high_liquidity_threshold - 0.05)
+        if hasattr(self, 'rebalance_utilization_floor') and hasattr(self, 'rebalance_utilization_ceiling'):
+            if self.rebalance_utilization_floor >= self.rebalance_utilization_ceiling:
+                # Mirrors the low_liquidity_threshold/high_liquidity_threshold
+                # repair: an inverted floor/ceiling pair would otherwise pin
+                # realized utilization to the (wrong) floor for every channel.
+                self.rebalance_utilization_floor = max(
+                    0.0, self.rebalance_utilization_ceiling - 0.05
+                )
         if hasattr(self, 'hive_equalization_low_pct') and hasattr(self, 'hive_equalization_high_pct'):
             if self.hive_equalization_low_pct >= self.hive_equalization_high_pct:
                 self.hive_equalization_low_pct = max(
@@ -872,6 +880,14 @@ class Config:
                 return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
             if key == 'high_liquidity_threshold' and typed_value <= self.low_liquidity_threshold:
                 return {"error": f"high_liquidity_threshold ({typed_value}) must be greater than low_liquidity_threshold ({self.low_liquidity_threshold})"}
+            # Utilization floor/ceiling: mirrors the low/high_liquidity_threshold
+            # guard above. Without this, an inverted pair (e.g. floor=0.9,
+            # ceiling=0.1) silently pins realized utilization to 0.9 for every
+            # channel via modules/rebalance_flow_facts.py's clamp.
+            if key == 'rebalance_utilization_floor' and typed_value >= self.rebalance_utilization_ceiling:
+                return {"error": f"rebalance_utilization_floor ({typed_value}) must be less than rebalance_utilization_ceiling ({self.rebalance_utilization_ceiling})"}
+            if key == 'rebalance_utilization_ceiling' and typed_value <= self.rebalance_utilization_floor:
+                return {"error": f"rebalance_utilization_ceiling ({typed_value}) must be greater than rebalance_utilization_floor ({self.rebalance_utilization_floor})"}
             if key == 'hive_equalization_low_pct' and typed_value >= self.hive_equalization_high_pct:
                 return {"error": f"hive_equalization_low_pct ({typed_value}) must be less than hive_equalization_high_pct ({self.hive_equalization_high_pct})"}
             if key == 'hive_equalization_high_pct' and typed_value <= self.hive_equalization_low_pct:
