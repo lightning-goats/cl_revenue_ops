@@ -1550,14 +1550,18 @@ class HiveHintAdapter:
 
     @staticmethod
     def _metabolic_ttl_for(payload: dict, snapshot: dict | None) -> int:
+        # Clamp to the same upper bound the outer snapshot uses so a huge
+        # section ttl_seconds cannot defeat section-freshness (an old
+        # generated_at with ttl=1yr would otherwise read as fresh forever).
+        cap = HiveHintAdapter.HINT_MAX_TTL_SECONDS
         if isinstance(payload, dict):
             ttl = HiveHintAdapter._finite_number(payload.get("ttl_seconds"))
             if ttl is not None:
-                return max(0, int(ttl))
+                return max(0, min(int(ttl), cap))
         if isinstance(snapshot, dict):
             ttl = HiveHintAdapter._finite_number(snapshot.get("ttl_seconds"))
             if ttl is not None:
-                return max(0, int(ttl))
+                return max(0, min(int(ttl), cap))
         return 300
 
     def _metabolic_peer_in_scope(self, peer_id: str, snapshot: dict | None, scope: str) -> bool:
