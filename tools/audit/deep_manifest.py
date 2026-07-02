@@ -371,24 +371,46 @@ def check_drift() -> int:
         return 2
     chunks = parse_manifest(MANIFEST_PATH)
     # Compute current blob per distinct file once.
-    files = sorted({c.file for c in chunks})
-    current = blob_hashes(files)
-    for f in files:
+    manifest_files = sorted({c.file for c in chunks})
+    current = blob_hashes(manifest_files)
+    for f in manifest_files:
         if f not in current:
             current[f] = current_blob_hash(f) or "MISSING"
 
+    # (P5-006) Reconcile the recorded manifest against the LIVE tracked source
+    # set. Parsing the manifest alone is blind to a source file added after the
+    # last generate (never chunked, so never audited) or a manifest file that
+    # has since been deleted. Enumerate live sources and diff the file sets.
+    manifest_set = set(manifest_files)
+    live_set = set(enumerate_source_files())
+    added = sorted(live_set - manifest_set)      # tracked source, not in manifest
+    removed = sorted(manifest_set - live_set)    # in manifest, no longer a source
+
     drifted = [c for c in chunks if current.get(c.file) != c.blob]
-    if not drifted:
-        print(f"CLEAN: {len(chunks)} chunks across {len(files)} files; "
-              "no blob drift since manifest was written.")
+
+    if not drifted and not added and not removed:
+        print(f"CLEAN: {len(chunks)} chunks across {len(manifest_files)} files; "
+              "no blob drift and manifest file set matches live tracked "
+              "sources.")
         return 0
 
-    drifted_files = sorted({c.file for c in drifted})
-    print(f"DRIFT: {len(drifted)} chunk(s) across {len(drifted_files)} file(s) "
-          "need re-attestation (file blob changed since manifest):")
-    for c in drifted:
-        print(f"  {c.chunk_id}  manifest={c.blob[:12]}  "
-              f"current={(current.get(c.file) or 'MISSING')[:12]}")
+    if added:
+        print(f"NEW SOURCE: {len(added)} tracked source file(s) absent from the "
+              "manifest (regenerate to chunk + audit them):")
+        for f in added:
+            print(f"  + {f}")
+    if removed:
+        print(f"REMOVED SOURCE: {len(removed)} manifest file(s) no longer a "
+              "tracked source (regenerate to drop them):")
+        for f in removed:
+            print(f"  - {f}")
+    if drifted:
+        drifted_files = sorted({c.file for c in drifted})
+        print(f"DRIFT: {len(drifted)} chunk(s) across {len(drifted_files)} "
+              "file(s) need re-attestation (file blob changed since manifest):")
+        for c in drifted:
+            print(f"  {c.chunk_id}  manifest={c.blob[:12]}  "
+                  f"current={(current.get(c.file) or 'MISSING')[:12]}")
     return 1
 
 
