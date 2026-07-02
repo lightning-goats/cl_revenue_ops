@@ -21,7 +21,7 @@ All cited tests pass on HEAD (2026-07-01).
 | RB-I7 automatic find_rebalance_candidates() always returns [] | **verified (code-only)** | spot-checked on HEAD: both exit paths return [] (rebalancer.py:1332, :1377); structurally enforced, **no covering test** |
 | RB-I8 coordinated candidate with rejected hive intent not executed; transport failure fails open | **verified (code-only)** | REFUTED (test evidence, both halves misattributed): the cited test is a *budget* decline — `reserve_budget=(False,0)` blocks before intent reporting and the test itself asserts `len(intent_calls) == 0`, so the intent-rejection branch (rebalancer.py:2068-2081) is never reached; no test anywhere injects `intent_response={"status":"rejected"}` and asserts non-execution. The doc's gap note is also backwards: the fail-open transport side IS tested (test_execute_rebalance_continues_when_optional_intent_report_fails — intent RPC raises, `intent_status="report_failed"`, execution proceeds). Rejected-intent blocking is code-confirmed only. |
 | RB-I9 manual rebalances bypass reservation; fees still recorded | **verified** | TestExecuteOnceManual::test_manual_rebalance_does_not_reserve_budget; corpus ledger cross-check clean (see RB-I4) |
-| RB-I10 diagnostic (defibrillator) bounded: 50k sats amount, 100 sats max fee, capital-controls gated | **verified** | TestExecuteOnceDiagnostic (2 tests) + code (rebalancer.py:2412-2442); **corpus: 37/37 diagnostic rows within bounds** |
+| RB-I10 diagnostic (defibrillator) bounded: 50k sats amount, fee ≤ configured `diagnostic_rebalance_max_fee_sats` cap (default 400; was hardcoded 100), capital-controls gated | **verified** | TestExecuteOnceDiagnostic (2 tests) + TestDiagnosticFeeCap (7 tests) + code; **corpus: 37/37 diagnostic rows within bounds** (pre-D4 rows, all at the old 100-sat cap). **Amended per operator ruling D4 in commit 1f8c36a (2026-07-01)**: cap configurable (default 400 sats, clamped to [1, min(daily_budget_sats, 10,000)]), ppm ceiling derived as ceil(cap/amount×1e6) so the sat cap is the single binding knob — fixes the corpus finding that all priced shocks (routes 118–363 sats) were rejected route_over_budget against the old 100-sat envelope. |
 | RB-I11 _normalize_rebalance_success_signal: rate ∈ [0.10,0.95], confidence=min(1,total/10), None <3 samples | **verified (code-only)** | code confirmed (rebalancer.py:1101-1114); **no covering test**; internal signal, not corpus-observable |
 | RB-I12 liquidity-state datastore payload only from real engine snapshot; suppression writes nothing | **verified** | test_hive_liquidity_state_report.py (3 tests); datastore key not captured by hermes (not corpus-observable) |
 
@@ -49,7 +49,9 @@ All cited tests pass on HEAD (2026-07-01).
    (completed | blocked | failed | pending) and `actual_fee_sats` on success —
    capital-controls blocks and failed/pending shocks are no longer collapsed
    into a success=True result that the planner recorded as completed. RB-I10
-   bounds (50k sats, 100-sat fee cap, capital-controls gate) are unchanged.
+   bounds (50k sats, 100-sat fee cap, capital-controls gate) were unchanged by
+   that fix; the fee cap was subsequently raised per operator ruling D4
+   (commit 1f8c36a, 2026-07-01 — configurable, default 400 sats, derived ppm).
    Pinned by new TestExecuteOnceDiagnostic tests in tests/test_rebalancer_module.py.
 2. One failed row records actual_fee_sats > max_fee_sats — executor-rejection
    bookkeeping, not overspend (see rebalance_engine_v2.md anomaly 2).
