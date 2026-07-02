@@ -601,7 +601,21 @@ class Database:
         """Create database tables if they don't exist."""
         conn = self._get_connection()
 
-        # Schema version tracking for migrations
+        # Schema version tracking for migrations.
+        #
+        # DD9/MIG-3 (operator ruling 2026-07-02): schema_version is WRITE-ONLY by
+        # design today — we record a version but do NOT gate on it. Every
+        # migration in this file is additive and idempotent (CREATE TABLE IF NOT
+        # EXISTS / ADD COLUMN guards), so a database written by a NEWER code
+        # version opens without refusal: the newer code only added columns/tables
+        # this older code simply ignores, and re-running the older init is a
+        # no-op. There is therefore no "schema_version > known → refuse" check.
+        #
+        # Add real version gating (refuse to open when the on-disk
+        # schema_version exceeds the highest version this code knows) only when a
+        # migration first becomes DESTRUCTIVE or RENAMING — i.e. when opening a
+        # newer DB with older code could misread or corrupt data. Until then,
+        # gating would only add false-positive refusals with no safety benefit.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
