@@ -2902,6 +2902,40 @@ class CapacityPlanner:
         except Exception as e:
             return False, f"Budget check failed: {e}"
 
+    def _unified_reserve_budget_params(self) -> tuple:
+        """Read the LIVE unified budget for an atomic spend reservation.
+
+        DD1 / P4-018: opens and closes must reserve their committed cost against
+        the SAME cross-category budget the rebalance/boltz paths use, so that
+        reserve_spend's BEGIN IMMEDIATE (serialized by the WAL single-writer
+        lock) counts them against — and rejects them past — the unified total.
+        Returns (effective_budget_sats, since_timestamp): effective_budget_sats
+        is None when no positive budget is resolvable (reserve stays best-effort,
+        preserving prior direct-caller behavior for un-wired test/edge paths).
+        """
+        provider = getattr(self, "global_budget_limit_provider", None)
+        if not callable(provider):
+            return None, None
+        try:
+            info = provider()
+        except Exception:
+            return None, None
+        if not isinstance(info, dict):
+            return None, None
+        try:
+            eff = int(info.get("effective_budget_sats", 0) or 0)
+        except (TypeError, ValueError):
+            return None, None
+        if eff <= 0:
+            return None, None
+        try:
+            window_hours = int(info.get("window_hours", 24) or 24)
+        except (TypeError, ValueError):
+            window_hours = 24
+        window_hours = max(1, min(168, window_hours))
+        since_ts = int(time.time()) - (window_hours * 3600)
+        return eff, since_ts
+
     def _check_safety_guards(self, cfg, action_type: str, peer_id: str,
                               amount_sats: int = 0) -> tuple:
         """Run all safety checks. Returns (ok, reason)."""
@@ -3303,7 +3337,11 @@ class CapacityPlanner:
             )
             return {"action_id": action_id, "status": "dry_run", "peer_id": peer_id, "amount_sats": amount_sats}
 
-        # Reserve budget
+        # Reserve budget (BEFORE the on-chain fundchannel RPC).
+        # DD1 / P4-018: pass the LIVE unified budget so the atomic cross-category
+        # rejection inside reserve_spend's BEGIN IMMEDIATE runs — a concurrent
+        # rebalance/boltz reserve and this open cannot jointly overshoot.
+        eff_budget, budget_since = self._unified_reserve_budget_params()
         reservation_id = f"planner-open-{peer_id[:16]}-{int(time.time())}"
         reservation_active = False
         if db:
@@ -3314,6 +3352,8 @@ class CapacityPlanner:
                     category="channel_open",
                     subcategory="automated",
                     metadata={"peer_id": peer_id, "amount_sats": amount_sats},
+                    effective_budget_sats=eff_budget,
+                    since_timestamp=budget_since,
                 ))
             except Exception as e:
                 self.plugin.log(f"Budget reservation failed: {e}", level='warn')
@@ -3646,6 +3686,53 @@ class CapacityPlanner:
                     level='warn',
                 )
 
+        # DD1 / P4-018: reserve the close fee against the LIVE unified budget
+        # BEFORE the on-chain close RPC, passing effective_budget_sats so the
+        # atomic cross-category rejection inside reserve_spend's BEGIN IMMEDIATE
+        # runs. A concurrent rebalance/boltz/open reserve and this close can then
+        # never jointly overshoot the budget. Reserve-before-spend; settle the
+        # actual cost on success; release on failure (no leak, no double-spend).
+        close_reservation_id = f"planner-close-{channel_id}-{int(time.time())}"
+        close_reservation_active = False
+        if db:
+            eff_budget, budget_since = self._unified_reserve_budget_params()
+            try:
+                close_reservation_active = bool(db.reserve_spend(
+                    reservation_id=close_reservation_id,
+                    amount_sats=reserved_close_fee_sats,
+                    category="channel_close",
+                    subcategory=reason if reason else "automated",
+                    metadata={
+                        "channel_id": channel_id,
+                        "peer_id": peer_id,
+                        "estimated_close_cost_sats": estimated_cost,
+                        "reserved_close_fee_sats": reserved_close_fee_sats,
+                        "close_fee_cap_source": fee_plan.get("source"),
+                    },
+                    effective_budget_sats=eff_budget,
+                    since_timestamp=budget_since,
+                ))
+            except Exception as e:
+                self.plugin.log(f"Close budget reservation failed: {e}", level='warn')
+                close_reservation_active = False
+            if not close_reservation_active:
+                if action_id:
+                    try:
+                        db.update_planner_action(action_id, status="failed")
+                    except Exception:
+                        pass
+                self.plugin.log(
+                    f"Planner close blocked by unified budget reservation for {channel_id}",
+                    level='warn',
+                )
+                return {
+                    "action_id": action_id,
+                    "status": "failed",
+                    "channel_id": channel_id,
+                    "peer_id": peer_id,
+                    "error": "Close budget reservation failed",
+                }
+
         try:
             result = self._rpc_close(channel_id, feerange=fee_plan.get("feerange"))
 
@@ -3655,35 +3742,20 @@ class CapacityPlanner:
                 except Exception:
                     pass
 
-            # Record close cost in spend_events (matches open cost tracking pattern)
-            if db:
+            # Settle the pre-close reservation with the ACTUAL close fee (falling
+            # back to the reserved cap when the RPC did not report one).
+            if db and close_reservation_active:
                 try:
                     actual_close_fee_sats = self._extract_actual_close_fee_sats(result)
                     close_cost = actual_close_fee_sats if actual_close_fee_sats is not None else reserved_close_fee_sats
-                    close_reservation_id = f"planner-close-{channel_id}-{int(time.time())}"
-                    reserved = db.reserve_spend(
+                    db.mark_spend_reservation_spent(
                         reservation_id=close_reservation_id,
-                        amount_sats=reserved_close_fee_sats,
-                        category="channel_close",
-                        subcategory=reason if reason else "automated",
-                        metadata={
-                            "channel_id": channel_id,
-                            "peer_id": peer_id,
-                            "estimated_close_cost_sats": estimated_cost,
-                            "reserved_close_fee_sats": reserved_close_fee_sats,
-                            "close_fee_cap_source": fee_plan.get("source"),
-                            "actual_close_fee_source": "close_rpc" if actual_close_fee_sats is not None else "reserved_cap_fallback",
-                        },
+                        actual_spent_sats=close_cost,
+                        source="capacity_planner",
+                        record_event=True,
                     )
-                    if reserved:
-                        db.mark_spend_reservation_spent(
-                            reservation_id=close_reservation_id,
-                            actual_spent_sats=close_cost,
-                            source="capacity_planner",
-                            record_event=True,
-                        )
                 except Exception as e:
-                    self.plugin.log(f"Failed to record close cost: {e}", level='debug')
+                    self.plugin.log(f"Failed to settle close cost: {e}", level='debug')
 
             self.plugin.log(
                 f"Channel closed: {channel_id} (peer: {peer_id[:16]}...)",
@@ -3705,6 +3777,13 @@ class CapacityPlanner:
             if db and action_id:
                 try:
                     db.update_planner_action(action_id, status="failed")
+                except Exception:
+                    pass
+            # Release the pre-close reservation so a failed close does not hold
+            # the budget (release-on-failure).
+            if db and close_reservation_active:
+                try:
+                    db.release_spend_reservation(close_reservation_id)
                 except Exception:
                     pass
             self.plugin.log(

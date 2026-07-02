@@ -7344,7 +7344,15 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
 
 
 def _total_cost_budget_limit_provider() -> Dict[str, Any]:
-    status = _total_cost_budget_status()
+    # DD1 / P4-018: this provider feeds the GATING path of every autonomous
+    # spender (rebalance capital controls, boltz gate, and the capacity-planner
+    # open/close + defibrillation gates via _check_unified_budget /
+    # _check_capital_controls). Gating callers must read the LIVE unified total,
+    # not the 30s telemetry memo — otherwise N gate checks in one window admit
+    # against the same stale snapshot (the P2-011 mechanism, uncovered on the
+    # planner path). force_fresh; the authoritative rail remains the atomic
+    # reserve, but the gate must not admit against a stale budget.
+    status = _total_cost_budget_status(force_fresh=True)
     if "error" in status:
         # Fall back to fixed budget floor if unavailable.
         floor = int(getattr(config, "daily_budget_sats", 0) or 0) if config is not None else 0
