@@ -838,6 +838,270 @@ def render(card: dict) -> str:
     return "\n".join(lines)
 
 
+# ===========================================================================
+# Deep-audit standing checks (Phase 8)
+# ===========================================================================
+#
+# Beyond the corpus sweeps above, the deep-audit campaign (Phases 1-7) shipped
+# a set of repo-local guarantees that must not silently rot: the DD5 daemon
+# heartbeat, the six-spender atomicity enumeration guard, the RPC param-
+# validation matrix, the supply-chain pins, the cross-category budget invariant
+# under concurrency, the doc-vs-code default agreement, and the DB migration
+# integrity tests. Wiring them into the scorecard makes it a ONE-COMMAND health
+# gate for the whole deep audit -- a regression in any of these flips a row to
+# WARN/ERROR and the scorecard's exit code.
+#
+# These checks are repo-local: they need no corpus root, so they run even when
+# --deep-only is passed. Each shells exactly its own pytest module / tool so the
+# section stays fast (a few seconds), never the full suite.
+
+DEEP_TIMEOUT = 300
+
+
+@dataclass
+class DeepCheck:
+    key: str
+    title: str
+    status: str            # PASS / WARN / KNOWN / INCONCLUSIVE / ERROR
+    detail: str = ""
+
+
+def _run_pytest_module(modpath: str):
+    """Run a single pytest module quietly. Returns (ok, summary_line, rc)."""
+    cmd = [sys.executable, "-m", "pytest", modpath, "-q",
+           "-p", "no:cacheprovider"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              cwd=str(REPO), timeout=DEEP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, f"pytest timed out after {DEEP_TIMEOUT}s", -1
+    lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
+    summary = lines[-1] if lines else (proc.stderr.strip()[-200:] or "no output")
+    return proc.returncode == 0, summary, proc.returncode
+
+
+def _run_audit_tool(argv):
+    """Run a tools/audit/<x>.py helper. Returns (rc, stdout, stderr)."""
+    cmd = [sys.executable, str(HERE / argv[0]), *argv[1:]]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              cwd=str(REPO), timeout=DEEP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return -1, "", f"timeout after {DEEP_TIMEOUT}s"
+    except Exception as exc:  # noqa: BLE001
+        return -2, "", f"launch failed: {exc}"
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def deep_check_heartbeat() -> DeepCheck:
+    key, title = "heartbeat", ("daemon heartbeat present (DD5 per-thread "
+                               "heartbeat surfaced on revenue-health)")
+    src = REPO / "cl-revenue-ops.py"
+    try:
+        text = src.read_text()
+    except OSError as exc:
+        return DeepCheck(key, title, "ERROR", f"cannot read cl-revenue-ops.py: {exc}")
+    # Code surface: the recorder must exist, be called from the core daemon
+    # loops, and be surfaced on revenue-health as a liveness section.
+    missing = []
+    if "def _record_loop_heartbeat" not in text:
+        missing.append("_record_loop_heartbeat() recorder absent")
+    core_loops = ("fee-adjustment", "rebalance-check", "flow-analysis")
+    called = [lp for lp in core_loops
+              if f'_record_loop_heartbeat("{lp}")' in text]
+    if len(called) < len(core_loops):
+        missing.append("core loops not heartbeating: "
+                       + ",".join(lp for lp in core_loops if lp not in called))
+    if "DD5" not in text or "heartbeat" not in text.lower():
+        missing.append("DD5/heartbeat marker absent on revenue-health surface")
+    if missing:
+        return DeepCheck(key, title, "WARN", "; ".join(missing))
+    ok, summary, _ = _run_pytest_module("tests/test_loop_heartbeat_surface.py")
+    if not ok:
+        return DeepCheck(key, title, "WARN",
+                         f"surface present but test red: {summary}")
+    return DeepCheck(key, title, "PASS",
+                     f"recorder+{len(called)} core loops+revenue-health surface; "
+                     f"{summary}")
+
+
+def deep_check_spend_atomicity() -> DeepCheck:
+    key, title = "spend_atomicity", ("spend-atomicity enumeration guard "
+                                     "(6-spender atomic-or-rail-counted)")
+    ok, summary, rc = _run_pytest_module("tests/test_all_spenders_atomic.py")
+    if rc < 0:
+        return DeepCheck(key, title, "ERROR", summary)
+    return DeepCheck(key, title, "PASS" if ok else "WARN", summary)
+
+
+def deep_check_param_matrix() -> DeepCheck:
+    key, title = "param_matrix", ("RPC param-validation matrix present + "
+                                  "covers the @plugin.method surface")
+    if not (REPO / "tests" / "test_rpc_param_validation.py").is_file():
+        return DeepCheck(key, title, "WARN",
+                         "tests/test_rpc_param_validation.py missing")
+    ok, summary, rc = _run_pytest_module("tests/test_rpc_param_validation.py")
+    if rc < 0:
+        return DeepCheck(key, title, "ERROR", summary)
+    return DeepCheck(key, title, "PASS" if ok else "WARN", summary)
+
+
+def deep_check_pins() -> DeepCheck:
+    key, title = "pins", "supply-chain pins green (check_pins.py exit 0)"
+    rc, out, err = _run_audit_tool(["check_pins.py"])
+    if rc == 0:
+        last = [ln for ln in out.strip().splitlines() if ln.strip()]
+        return DeepCheck(key, title, "PASS",
+                         last[-1] if last else "all requirements exactly pinned")
+    if rc == 2:
+        return DeepCheck(key, title, "ERROR",
+                         (err.strip() or out.strip())[-200:] or "requirements unreadable")
+    if rc < 0:
+        return DeepCheck(key, title, "ERROR", err.strip()[-200:])
+    bad = [ln for ln in out.strip().splitlines()
+           if ln.strip() and not ln.startswith("OK")]
+    return DeepCheck(key, title, "WARN",
+                     "; ".join(bad[-3:]) or "pin drift (exit 1)")
+
+
+def deep_check_concurrency_soak(soak_seconds: int) -> DeepCheck:
+    key, title = "concurrency_soak", ("concurrency soak smoke "
+                                      "(budget-never-exceeded under load)")
+    tmp = Path(tempfile.mkdtemp(prefix="scorecard-soak-"))
+    jpath = tmp / "soak.json"
+    try:
+        rc, out, err = _run_audit_tool(
+            ["stress_concurrency.py", "--soak", str(soak_seconds),
+             "--seed", "1337", "--json", str(jpath)])
+        try:
+            report = json.loads(jpath.read_text())
+        except Exception as exc:  # noqa: BLE001
+            return DeepCheck(key, title, "ERROR",
+                             f"soak produced no parseable report "
+                             f"(rc={rc}): {exc}; {err.strip()[-160:]}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    r = report.get("results", {})
+    structural = ("integrity", "no_deadlock", "no_thread_exception")
+    struct_bad = [k for k in structural if not r.get(k)]
+    if struct_bad:
+        return DeepCheck(key, title, "ERROR",
+                         "structural invariant failed: " + ",".join(struct_bad))
+    if not r.get("budget_never_exceeded"):
+        v = (report.get("budget_violations") or [{}])[0]
+        return DeepCheck(key, title, "WARN",
+                         "budget invariant VIOLATED (P1-003 regression): "
+                         f"overshoot {v.get('overshoot_sats')} sats "
+                         f"(soak={soak_seconds}s)")
+    return DeepCheck(key, title, "PASS",
+                     f"soak={report.get('config', {}).get('soak_seconds')}s "
+                     f"progress_ops={report.get('progress_ops')} "
+                     f"max_reserved={report.get('max_reserved_observed_sats')} "
+                     f"max_overshoot={report.get('max_overshoot_sats')} "
+                     "(integrity+no-deadlock+no-thread-exc+budget all PASS)")
+
+
+DOC_CODE_DEFAULTS = ("fee_interval", "max_fee_ppm")
+
+
+def deep_check_doc_default_vs_code() -> DeepCheck:
+    key, title = "doc_default", ("doc-default-vs-code (config.py defaults == "
+                                 "conf.full for fee_interval/max_fee_ppm)")
+    cfg = REPO / "modules" / "config.py"
+    conf = REPO / "config" / "cl-revenue-ops.conf.full"
+    try:
+        cfg_text = cfg.read_text()
+        conf_text = conf.read_text()
+    except OSError as exc:
+        return DeepCheck(key, title, "ERROR", f"cannot read config sources: {exc}")
+    mismatches, checked = [], []
+    for field in DOC_CODE_DEFAULTS:
+        cm = re.search(rf"^\s*{field}:\s*int\s*=\s*(\d+)", cfg_text, re.M)
+        # canonical documented default: the commented `#revenue-ops-<opt>=<n>`
+        # line (no space after '#'); the profile examples use '# revenue-ops-'.
+        opt = "revenue-ops-" + field.replace("_", "-")
+        dm = re.search(rf"^#{re.escape(opt)}=(\d+)", conf_text, re.M)
+        if not cm or not dm:
+            mismatches.append(f"{field}: "
+                              f"{'code default not found' if not cm else ''}"
+                              f"{'/' if not cm and not dm else ''}"
+                              f"{'doc default not found' if not dm else ''}")
+            continue
+        code_v, doc_v = int(cm.group(1)), int(dm.group(1))
+        checked.append(f"{field}={code_v}")
+        if code_v != doc_v:
+            mismatches.append(f"{field}: code={code_v} != conf.full={doc_v}")
+    if mismatches:
+        return DeepCheck(key, title, "WARN", "; ".join(mismatches))
+    return DeepCheck(key, title, "PASS",
+                     "agree: " + ", ".join(checked))
+
+
+def deep_check_migrations() -> DeepCheck:
+    key, title = "migrations", "DB migration integrity tests present + green"
+    if not (REPO / "tests" / "test_migrations.py").is_file():
+        return DeepCheck(key, title, "WARN", "tests/test_migrations.py missing")
+    ok, summary, rc = _run_pytest_module("tests/test_migrations.py")
+    if rc < 0:
+        return DeepCheck(key, title, "ERROR", summary)
+    return DeepCheck(key, title, "PASS" if ok else "WARN", summary)
+
+
+def run_deep_checks(soak_seconds: int) -> list:
+    """Run the deep-audit standing checks (parallel; subprocess-bound)."""
+    jobs = [
+        ("heartbeat", deep_check_heartbeat),
+        ("spend_atomicity", deep_check_spend_atomicity),
+        ("param_matrix", deep_check_param_matrix),
+        ("pins", deep_check_pins),
+        ("concurrency_soak", lambda: deep_check_concurrency_soak(soak_seconds)),
+        ("doc_default", deep_check_doc_default_vs_code),
+        ("migrations", deep_check_migrations),
+    ]
+    results: dict[str, DeepCheck] = {}
+    with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as pool:
+        futs = {pool.submit(fn): key for key, fn in jobs}
+        for fut in futs:
+            try:
+                dc = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                key = futs[fut]
+                dc = DeepCheck(key, key, "ERROR", f"check raised: {exc}")
+            results[dc.key] = dc
+    return [results[key] for key, _ in jobs]
+
+
+def render_deep(checks: list) -> str:
+    lines = []
+    lines.append("")
+    lines.append("=" * 100)
+    lines.append("DEEP-AUDIT STANDING CHECKS (Phase 8 -- repo-local regression "
+                 "armor; no corpus required)")
+    lines.append("=" * 100)
+    lines.append(f"{'CHECK':<20} {'STATUS':<13} DETAIL")
+    lines.append("-" * 100)
+    for c in checks:
+        lines.append(f"{c.key:<20} {c.status:<13} {c.title}")
+        if c.detail:
+            lines.append(" " * 34 + c.detail)
+    lines.append("-" * 100)
+    counts = defaultdict(int)
+    for c in checks:
+        counts[c.status] += 1
+    lines.append("deep summary: " + "  ".join(f"{k}={v}"
+                                              for k, v in sorted(counts.items())))
+    return "\n".join(lines)
+
+
+def deep_exit_code(checks: list) -> int:
+    statuses = {c.status for c in checks}
+    if "ERROR" in statuses:
+        return 2
+    if "WARN" in statuses:
+        return 1
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--root", default=DEFAULT_ROOT, help="corpus root")
@@ -845,7 +1109,28 @@ def main() -> int:
                     help="only snapshot days >= this (incremental scorecard)")
     ap.add_argument("--json", metavar="FILE",
                     help="also write machine-readable scorecard JSON")
+    ap.add_argument("--deep-only", action="store_true",
+                    help="run ONLY the repo-local deep-audit standing checks "
+                         "(no corpus root required); skip the corpus sweeps")
+    ap.add_argument("--no-deep", action="store_true",
+                    help="skip the deep-audit standing checks section")
+    ap.add_argument("--soak-seconds", type=int, default=3,
+                    help="concurrency-soak smoke duration (default 3; keep it "
+                         "short -- this is a smoke, not the 30-min soak)")
     args = ap.parse_args()
+
+    if args.deep_only and args.no_deep:
+        ap.error("--deep-only and --no-deep are mutually exclusive")
+
+    # --deep-only: repo-local gate, no corpus needed.
+    if args.deep_only:
+        deep = run_deep_checks(args.soak_seconds)
+        print(render_deep(deep))
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump({"deep_checks": [vars(c) for c in deep]}, f, indent=2)
+            print(f"\njson scorecard written: {args.json}")
+        return deep_exit_code(deep)
 
     if args.since and not re.match(r"^\d{8}$", args.since):
         ap.error("--since must be YYYYMMDD")
@@ -855,13 +1140,19 @@ def main() -> int:
         return 2
 
     card = build_scorecard(root, args.since)
+    deep = [] if args.no_deep else run_deep_checks(args.soak_seconds)
+    if not args.no_deep:
+        card["deep_checks"] = [vars(c) for c in deep]
     print(render(card))
+    if deep:
+        print(render_deep(deep))
     if args.json:
         with open(args.json, "w") as f:
             json.dump(card, f, indent=2)
         print(f"\njson scorecard written: {args.json}")
 
     statuses = {r["status"] for r in card["modules"]}
+    statuses |= {c.status for c in deep}
     if "ERROR" in statuses:
         return 2
     if "WARN" in statuses:
