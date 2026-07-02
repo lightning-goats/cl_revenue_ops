@@ -4054,14 +4054,33 @@ class Database:
             ).fetchone()
         return int(row['total'])
 
+    # P4-021: categories whose reservation represents a COMMITTED on-chain spend
+    # (a channel open/close). These are settled explicitly
+    # (mark_spend_reservation_spent) or released on RPC failure by the planner —
+    # they must NEVER be blind-released by the stale timeout sweep. Opens/closes
+    # are counted on the unified rail ONLY via spend_events, so if a settle's
+    # spend-event write persistently fails the reservation legitimately stays
+    # 'active' to keep the committed fee counted; blind-releasing it here would
+    # make that committed cost vanish in the overspend-permitting direction.
+    # Mirrors P4-015's protection of pending_settlement budget reservations.
+    _COMMITTED_ONCHAIN_SPEND_CATEGORIES = ("channel_open", "channel_close")
+
     def cleanup_stale_spend_reservations(self, max_age_seconds: int = 86400, category: Optional[str] = None) -> int:
         conn = self._get_connection()
         cutoff = int(time.time()) - max_age_seconds
         params = [cutoff]
-        category_clause = ""
         if category:
+            # Explicit category sweep (operator recovery) reaches EVERY category,
+            # including the committed on-chain spends — the operator is asking for
+            # exactly this reservation kind by name.
             category_clause = " AND category = ?"
             params.append(str(category).strip().lower())
+        else:
+            # P4-021: the blind (no-category) sweep must skip committed on-chain
+            # spends so a persistently-failed capex settle cannot vanish.
+            placeholders = ",".join(["?"] * len(self._COMMITTED_ONCHAIN_SPEND_CATEGORIES))
+            category_clause = f" AND category NOT IN ({placeholders})"
+            params.extend(self._COMMITTED_ONCHAIN_SPEND_CATEGORIES)
         cursor = conn.execute(f"""
             UPDATE spend_reservations
             SET status = 'released'
