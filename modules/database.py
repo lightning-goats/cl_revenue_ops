@@ -1248,6 +1248,15 @@ class Database:
         except Exception as e:
             self.plugin.log(f"DB migration warning: {e}", level='debug')
 
+        # Drop pid_state table (PID controller replaced by DTS+PID JSON state
+        # inside fee_strategy_state.v2_state_json). Without this drop, DBs
+        # migrated from a pre-refactor schema carry an orphan pid_state table
+        # that a fresh install never has (fresh != migrated divergence).
+        try:
+            conn.execute("DROP TABLE IF EXISTS pid_state")
+        except Exception as e:
+            self.plugin.log(f"DB migration warning: {e}", level='debug')
+
         # Rebalancer efficiency: failure-informed routing columns
         for col, col_type, default in [
             ("last_attempted_ppm", "INTEGER", "0"),
@@ -1347,6 +1356,16 @@ class Database:
                 if "resolved_time" not in cols:
                     self.plugin.log("DB migration: adding forwards.resolved_time column", level="info")
                     conn.execute("ALTER TABLE forwards ADD COLUMN resolved_time INTEGER")
+
+                # The backfill below references resolution_time. On DBs created
+                # before resolution_time existed (earliest schema), that column
+                # is added later in initialize() — so ensure it exists HERE, or
+                # the backfill throws "no such column: resolution_time" and the
+                # whole BEGIN IMMEDIATE rolls back, silently undoing the
+                # resolved_time ADD and the idx_forwards_unique dedup index.
+                if "resolution_time" not in cols:
+                    self.plugin.log("DB migration: adding forwards.resolution_time column", level="info")
+                    conn.execute("ALTER TABLE forwards ADD COLUMN resolution_time REAL DEFAULT 0")
 
                 # Backfill resolved_time where missing/zero (best-effort).
                 # resolution_time is stored as REAL seconds; round down to int seconds for stable keying.
