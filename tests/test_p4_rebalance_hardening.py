@@ -392,3 +392,56 @@ class TestP4009ExecuteRebalanceHoldOnPending:
 
         assert res["success"] is False
         mock_database.release_budget_reservation.assert_called_once_with("901")
+
+
+# =========================================================================
+# P4-011: gossip base-fee ppm-equivalent must be capped at 1_000_000
+# =========================================================================
+
+class TestP4011GossipBaseFeeCap:
+    def _rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r._get_our_node_id = MagicMock(return_value="02" + "f" * 64)
+        r.data_service = MagicMock()
+        return r
+
+    def test_huge_gossip_base_fee_is_capped(self, mock_plugin, mock_database):
+        r = self._rebalancer(mock_plugin, mock_database)
+        # PRIORITY-2 gossip path (peer not in _peer_inbound_fees). A garbage
+        # base fee must not inflate the inbound-fee estimate past 100% ppm.
+        r.data_service.get_channels.return_value = {
+            "channels": [
+                {
+                    "destination": "02" + "f" * 64,
+                    "fee_per_millionth": 100,
+                    "base_fee_millisatoshi": 10 ** 18,
+                }
+            ]
+        }
+
+        result = r._get_last_hop_fee("02" + "a" * 64, amount_msat=100_000_000)
+
+        # ppm(100) + capped base ppm-equivalent (1_000_000), never the raw
+        # ~1e16 the uncapped math would produce.
+        assert result == 100 + 1_000_000
+
+    def test_small_gossip_base_fee_not_capped(self, mock_plugin, mock_database):
+        r = self._rebalancer(mock_plugin, mock_database)
+        r.data_service.get_channels.return_value = {
+            "channels": [
+                {
+                    "destination": "02" + "f" * 64,
+                    "fee_per_millionth": 100,
+                    "base_fee_millisatoshi": 1_000,  # 1 sat base
+                }
+            ]
+        }
+
+        result = r._get_last_hop_fee("02" + "a" * 64, amount_msat=100_000_000)
+
+        # base_ppm = 1000*1e6//1e8 = 10; well under the cap.
+        assert result == 110

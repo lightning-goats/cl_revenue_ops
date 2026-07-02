@@ -1743,6 +1743,11 @@ class EVRebalancer:
                             base_fee_msat = int(ch.get("base_fee_millisatoshi", 0) or 0)
                             # Convert the base fee (msat) into a ppm-equivalent at amount_msat.
                             base_ppm = int((base_fee_msat * 1_000_000) // max(int(amount_msat or 0), 1))
+                            # P4-011: cap the gossip base-fee ppm-equivalent at
+                            # 100% like the PRIORITY-1 peer path (~L1727) —
+                            # garbage gossip base_fee must not inflate the
+                            # inbound-fee estimate.
+                            base_ppm = min(base_ppm, 1_000_000)
                             result = ppm + base_ppm
                             self.plugin.log(
                                 f"LAST_HOP_FEE [{peer_id[:12]}...]: Using gossip fee {result} PPM "
