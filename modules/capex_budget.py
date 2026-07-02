@@ -473,16 +473,39 @@ class CapexBudgetEngine:
         """Swap created: persist the estimated committed cost as a spend event
         keyed by swap id (later REPLACED by the actual fee when the swap settles
         via record_boltz_spend — same boltz:{sid} event id) and release the
-        pre-create reservation so the cost is not double-counted."""
+        pre-create reservation so the cost is not double-counted.
+
+        P4-019 (mirrors the P2-008 loud-write requirement): the reservation must
+        NOT be released unconditionally. If the spend-event write FAILS, releasing
+        the reservation would leave the created swap with NO reservation AND NO
+        spend event — its committed cost would vanish from the unified budget in
+        the overspend-permitting direction. So we release ONLY once the event has
+        persisted; on write failure the reservation stays active (the cost keeps
+        being counted) and we return False so the caller logs/retries. The event
+        write is idempotent (INSERT OR REPLACE on boltz:{sid}), so a later journal
+        update for the same swap re-settles and then releases.
+        """
+        try:
+            fee = int(estimated_fee_sats)
+        except (TypeError, ValueError):
+            fee = 0
+        if fee <= 0:
+            # Nothing to commit — release the (zero-cost) reservation.
+            self.release_boltz_swap_reservation(reservation_id)
+            return True
         recorded = self.record_boltz_spend(
             swap_id=swap_id,
-            fee_sats=estimated_fee_sats,
+            fee_sats=fee,
             channel_id=channel_id,
             source="boltz_swap_estimate",
             subcategory=subcategory,
         )
+        if not recorded:
+            # Loud write failed: keep the reservation so the committed cost stays
+            # visible to the unified budget. Do NOT release.
+            return False
         self.release_boltz_swap_reservation(reservation_id)
-        return bool(recorded)
+        return True
 
     def release_boltz_swap_reservation(self, reservation_id: str) -> bool:
         """Swap failed/never created (or superseded by its spend event): release
