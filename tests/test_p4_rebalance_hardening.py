@@ -507,3 +507,117 @@ class TestP4012HistoricalFeeCapZeroDisablesBenefit:
         assert decomp["source_drain_value_sats"] == 0.0
         assert decomp["inputs"]["dest_historical_direct_fee_ppm"] == 0.0
         assert decomp["inputs"]["source_historical_sourced_fee_ppm"] == 0.0
+
+
+# =========================================================================
+# Mutation guards for the sats-EV gate in _build_score_decomposition
+# (beats_do_nothing = not rejection_reason and
+#                     (expected_fee_sats <= 0 or final_score_sats >= 0.0))
+# =========================================================================
+
+def _negative_score_zero_cost_pair():
+    """A zero-cost pair whose sats-EV final score is strictly negative.
+
+    dest earns nothing (dest_out_fee_ppm=0) while the source forgoes a large
+    outbound fee, so final_score_sats < 0. Because the route costs nothing
+    (route_cost_sats=0 -> expected_fee_sats=0), the do-nothing gate's
+    zero-cost bypass must still let it beat do-nothing.
+    """
+    from modules.rebalance_types_v2 import PairCandidate
+
+    return PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x9x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=1_000_000,
+        pair_budget_sats=10_000,
+        dest_out_fee_ppm=0,
+        source_out_fee_ppm=5_000,
+    )
+
+
+class TestSatsEVGateMutationGuards:
+    def test_zero_cost_route_beats_do_nothing_even_when_score_negative(
+        self, mock_plugin, mock_database
+    ):
+        # Kills the `expected_fee_sats <= 0` -> `< 0` mutation: a zero-cost
+        # route (expected_fee_sats == 0) must bypass the score gate.
+        engine = _make_engine(mock_plugin, mock_database)
+        pair = _negative_score_zero_cost_pair()
+
+        decomp = engine._build_score_decomposition(pair, route_cost_sats=0)
+
+        assert decomp["expected_fee_sats"] == 0
+        assert decomp["final_score_sats"] < 0.0
+        assert decomp["beats_do_nothing"] is True
+
+    def test_rejected_pair_never_beats_do_nothing(
+        self, mock_plugin, mock_database
+    ):
+        # Kills dropping the `not rejection_reason` guard: even a zero-cost
+        # pair (which would otherwise bypass the score gate) must NOT beat
+        # do-nothing once it carries a rejection reason.
+        engine = _make_engine(mock_plugin, mock_database)
+        pair = _negative_score_zero_cost_pair()
+
+        decomp = engine._build_score_decomposition(
+            pair, route_cost_sats=0, rejection_reason="no_route"
+        )
+
+        assert decomp["expected_fee_sats"] == 0
+        assert decomp["beats_do_nothing"] is False
+
+
+# =========================================================================
+# Mutation guard for diagnostic_rebalance honesty: a still-pending shock
+# delivered no confirmed liquidity and must read 'pending', not 'completed'.
+# =========================================================================
+
+class TestDiagnosticRebalancePendingHonesty:
+    def _make_diag_rebalancer(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+
+        cfg = Config(dry_run=False)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        channel_id = "111x222x0"
+        r._get_channels_with_balances = MagicMock(return_value={
+            channel_id: {
+                "capacity": 1_000_000,
+                "spendable_sats": 50_000,
+                "peer_id": "02" + "b" * 64,
+                "fee_ppm": 100,
+            },
+            "333x444x0": {
+                "capacity": 2_000_000,
+                "spendable_sats": 1_500_000,
+                "peer_id": "02" + "c" * 64,
+                "fee_ppm": 200,
+            },
+        })
+        r._estimate_inbound_fee = MagicMock(return_value=50)
+        r._check_capital_controls = MagicMock(return_value=True)
+        mock_database.record_rebalance = MagicMock(return_value=99)
+        mock_database.update_rebalance_result = MagicMock()
+        return r, channel_id
+
+    def test_pending_shock_reports_shock_status_pending(
+        self, mock_plugin, mock_database
+    ):
+        r, channel_id = self._make_diag_rebalancer(mock_plugin, mock_database)
+        r.rebalance_engine_v2 = MagicMock()
+        r.rebalance_engine_v2.execute_candidate.return_value = _exec_result(
+            success=False,
+            payment_pending=True,
+            failure_data={"payment_hash": "ef" * 32},
+            error="payment_pending_timeout",
+        )
+
+        result = r.diagnostic_rebalance(channel_id)
+
+        # An unresolved shock delivered no confirmed liquidity; it must NOT
+        # read as 'completed'.
+        assert result["shock_status"] == "pending"
+        # The engine owns the shared 'pending_settlement' row — don't clobber.
+        mock_database.update_rebalance_result.assert_not_called()
