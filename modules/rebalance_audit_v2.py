@@ -50,6 +50,9 @@ VALID_SKIP_REASONS: frozenset[str] = frozenset({
     "hive_equalization_cooldown",
     "cycle_already_running",
     "fleet_lease_held",
+    # P4-008 in-flight-destination guard: a prior cycle's still-running
+    # (possibly orphaned) worker holds an unresolved payment to this dest.
+    "dest_inflight",
     # Produced by the coordination overlay (RA2-1)
     "not_designated_executor",
     "coordination_unavailable",

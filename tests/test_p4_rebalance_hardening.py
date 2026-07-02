@@ -126,3 +126,156 @@ class TestP4007PendingWithoutHashReleases:
         )
         mock_database.mark_budget_spent.assert_called_once_with("777", 3)
         mock_database.release_budget_reservation.assert_not_called()
+
+
+# =========================================================================
+# P4-008: in-flight-destination guard blocks double-pay after cycle timeout
+# =========================================================================
+
+def _market_pair(dest="200x9x0"):
+    from modules.rebalance_route_policy import RoutePolicy
+
+    return SimpleNamespace(
+        source_channel_id="100x1x0",
+        dest_channel_id=dest,
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        dest_out_fee_ppm=1_000,  # sats-EV gate: refill earns expected value
+        score=1.0,
+        route_decision=SimpleNamespace(
+            policy=RoutePolicy.MARKET_ONLY,
+            allow_market_fallback=True,
+            reason="ev_positive",
+        ),
+        route_cost_sats=None,
+        route=None,
+    )
+
+
+def _engine_for_find_candidates(mock_plugin, mock_database):
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._audit = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=1,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+    route_result = SimpleNamespace(
+        success=True,
+        route_cost_sats=1,
+        route=[],
+        probability_ppm=0,
+        error="",
+    )
+    engine.router_v3.price_pair.return_value = route_result
+    return engine
+
+
+class TestP4008InflightDestGuard:
+    def test_find_candidates_selects_dest_when_not_inflight(
+        self, mock_plugin, mock_database
+    ):
+        engine = _engine_for_find_candidates(mock_plugin, mock_database)
+        pair = _market_pair("200x9x0")
+
+        with patch(
+            "modules.rebalance_engine_v2.RebalancePlanner"
+        ) as planner_cls:
+            planner_cls.return_value.plan.return_value = SimpleNamespace(
+                selected=[pair], skipped=[]
+            )
+            selected = engine.find_candidates()
+
+        assert [p.dest_channel_id for p in selected] == ["200x9x0"]
+
+    def test_find_candidates_excludes_inflight_dest(
+        self, mock_plugin, mock_database
+    ):
+        engine = _engine_for_find_candidates(mock_plugin, mock_database)
+        pair = _market_pair("200x9x0")
+
+        # Simulate an orphaned worker from a prior cycle still paying this dest.
+        engine._register_inflight_dest("200x9x0")
+
+        with patch(
+            "modules.rebalance_engine_v2.RebalancePlanner"
+        ) as planner_cls:
+            planner_cls.return_value.plan.return_value = SimpleNamespace(
+                selected=[pair], skipped=[]
+            )
+            selected = engine.find_candidates()
+
+        # The in-flight dest must not be re-selected -> no second payment.
+        assert selected == []
+        # It must never be priced/paid while in-flight.
+        engine.router_v3.price_pair.assert_not_called()
+
+    def test_execute_pair_registers_dest_during_execution_and_clears_after(
+        self, mock_plugin, mock_database
+    ):
+        from modules.rebalance_types_v2 import PairCandidate
+
+        engine = _make_engine(mock_plugin, mock_database)
+        pair = PairCandidate(
+            source_channel_id="100x1x0",
+            dest_channel_id="200x9x0",
+            source_peer_id="03" + "b" * 64,
+            dest_peer_id="03" + "c" * 64,
+            amount_sats=50_000,
+            pair_budget_sats=10_000,
+            route=[],
+        )
+
+        seen = {}
+
+        class _FakeExecutor:
+            def execute(self, **kwargs):
+                seen["during"] = engine._inflight_dest_snapshot()
+                return _exec_result(success=True, fee_sats=1)
+
+        engine._execute_pair(
+            pair,
+            _FakeExecutor(),
+            reserve_budget=False,
+            account_costs=False,
+            rebalance_id=5,
+        )
+
+        # Registered while the payment is in flight ...
+        assert "200x9x0" in seen["during"]
+        # ... and cleared once the worker finishes (so a later cycle can retry).
+        assert "200x9x0" not in engine._inflight_dest_snapshot()
+
+    def test_execute_pair_unregisters_dest_even_on_executor_exception(
+        self, mock_plugin, mock_database
+    ):
+        from modules.rebalance_types_v2 import PairCandidate
+
+        engine = _make_engine(mock_plugin, mock_database)
+        pair = PairCandidate(
+            source_channel_id="100x1x0",
+            dest_channel_id="200x9x0",
+            source_peer_id="03" + "b" * 64,
+            dest_peer_id="03" + "c" * 64,
+            amount_sats=50_000,
+            pair_budget_sats=10_000,
+            route=[],
+        )
+
+        class _BoomExecutor:
+            def execute(self, **kwargs):
+                raise RuntimeError("boom")
+
+        engine._execute_pair(
+            pair,
+            _BoomExecutor(),
+            reserve_budget=False,
+            account_costs=False,
+            rebalance_id=5,
+        )
+        assert "200x9x0" not in engine._inflight_dest_snapshot()
