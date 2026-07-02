@@ -1655,8 +1655,16 @@ def _select_boltz_currency(direction: str, amount_sats: int) -> str:
     return chosen
 
 
-def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> Dict[str, Any]:
-    """Run one in-plugin Boltz auto-cycle using existing RPC logic (single-flight)."""
+def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False,
+                               dry_run: bool = False) -> Dict[str, Any]:
+    """Run one in-plugin Boltz auto-cycle using existing RPC logic (single-flight).
+
+    DD4 / P1-018: dry_run defaults False so the scheduled daemon path keeps
+    executing live. The manual RPC (revenue-boltz-auto-cycle-run-now) defaults
+    dry_run True (safe preview) and forwards the operator's choice here; when
+    True the cycle previews (builds the plan, computes profitability) without
+    creating any swap.
+    """
     if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
         result = {
             'status': 'disabled',
@@ -1788,7 +1796,7 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                     # Reuse the plan built above for mode selection — rebuilding
                     # it would repeat every per-candidate boltzcli quote call.
                     result = _execute_boltz_balance_cycle(
-                        dry_run=False,
+                        dry_run=dry_run,
                         max_actions=max_actions,
                         allow_concurrent_swaps=False,
                         loop_in_currency='auto',
@@ -1818,7 +1826,7 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
             # the cycle would repeat the nested balance-plan build (quotes,
             # budget, listswaps subprocesses) a second time per cycle.
             result = _execute_boltz_expansion_treasury_cycle(
-                dry_run=False,
+                dry_run=dry_run,
                 max_actions=treasury_max_actions,
                 allow_concurrent_swaps=False,
                 precomputed_plan=treasury_plan,
@@ -1855,7 +1863,7 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False) -> 
                         selection = dict(fallback_selection)
                         selection["reason"] = "treasury_executed_zero_fallback_to_balance"
                         result = _execute_boltz_balance_cycle(
-                            dry_run=False,
+                            dry_run=dry_run,
                             max_actions=max_actions,
                             allow_concurrent_swaps=False,
                             loop_in_currency='auto',
@@ -8315,10 +8323,20 @@ def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
 
 
 @plugin.method("revenue-boltz-auto-cycle-run-now")
-def revenue_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False) -> Dict[str, Any]:
-    """Trigger one immediate Boltz auto-cycle run using scheduler settings."""
+def revenue_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False,
+                                     dry_run: bool = True) -> Dict[str, Any]:
+    """Trigger one immediate Boltz auto-cycle run using scheduler settings.
+
+    DD4 / P1-018: dry_run defaults True (SAFE preview) so an operator can see
+    what the cycle would do without creating any swap. Pass dry_run=false to
+    execute live. force=true still bypasses the boltz_auto_cycle_enabled toggle
+    (run one cycle while the scheduler is off); to run a LIVE cycle while
+    disabled, combine force=true with dry_run=false.
+    """
     try:
-        result = _run_boltz_auto_cycle_once(trigger="manual", force=bool(force))
+        result = _run_boltz_auto_cycle_once(
+            trigger="manual", force=bool(force), dry_run=bool(dry_run)
+        )
         _boltz_auto_cycle_mark_state(last_result=result)
         return result
     except Exception as e:
