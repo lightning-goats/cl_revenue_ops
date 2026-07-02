@@ -786,6 +786,16 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-diagnostic-rebalance-max-fee-sats',
+    default='400',
+    description=(
+        'Fee cap in sats for the diagnostic (defibrillator) shock rebalance; '
+        'the shock ppm ceiling is derived from this cap. Clamped to '
+        '[1, min(daily budget, 10000)] (default: 400)'
+    )
+)
+
+plugin.add_option(
     name='revenue-ops-allow-zero-cost-auto-rebalance-when-budget-zero',
     default='false',
     description='Allow automatic zero-fee rebalances when daily_budget_sats is zero (default: false)'
@@ -1745,6 +1755,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
+        diagnostic_rebalance_max_fee_sats=_safe_int_opt(
+            'revenue-ops-diagnostic-rebalance-max-fee-sats', '400'
+        ),
         allow_zero_cost_auto_rebalance_when_budget_zero=options.get(
             'revenue-ops-allow-zero-cost-auto-rebalance-when-budget-zero', 'false'
         ).lower() in ('true', '1', 'yes'),

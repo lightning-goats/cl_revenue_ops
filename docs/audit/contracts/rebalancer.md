@@ -101,13 +101,22 @@ signal), capacity planner (defibrillator), cl-hive via datastore + report RPCs.
 - **RB-I9** — Manual rebalances bypass reservation but their fees are still recorded into
   `rebalance_history` + `rebalance_costs` and thus reduce the automated budget. Enforced:
   `manual_rebalance` (modules/rebalancer.py:2564-2590) + `_record_successful_rebalance_fee` (:1836).
-- **RB-I10** — Diagnostic ("defibrillator") rebalances are bounded: 50,000 sats amount,
-  100 sats max fee, blocked by capital controls. Enforced: modules/rebalancer.py:2411-2447.
+- **RB-I10** — Diagnostic ("defibrillator") rebalances are bounded: amount ≤ 50,000 sats,
+  fee ≤ the configured `diagnostic_rebalance_max_fee_sats` cap (default 400 sats), blocked
+  by capital controls. The effective cap is clamped to [1, min(daily_budget_sats, 10,000)]
+  and the shock's ppm ceiling is DERIVED from it (ceil(cap/amount×1e6), 8000 ppm at
+  defaults), so the sat cap is the single binding knob. Enforced: `diagnostic_rebalance`
+  (modules/rebalancer.py) + `CONFIG_FIELD_RANGES` (modules/config.py).
+  Amended (operator ruling D4, 2026-07-01, defib fee cap): previously hardcoded at
+  100 sats max fee AND 2000 ppm — both bounds bound at exactly 100 sats on the 50k
+  shock, and every observed market route (118–363 sats) was rejected
+  route_over_budget, so the shock could never land. Amount and capital-controls
+  gating are unchanged.
   Amended (commit e2fbdca, 2026-07-01, defibrillation status honesty): the result dict
   now carries an explicit `shock_status` ∈ {completed, blocked, failed, pending} plus
   `actual_fee_sats` on success — a capital-controls block or a failed/pending shock is
   no longer reported as a bare success=True that downstream (capacity_planner) recorded
-  as status="completed". Bounds and capital-controls gating are unchanged.
+  as status="completed".
 - **RB-I11** — The normalized success signal is bounded: rate ∈ [0.10, 0.95], confidence
   = min(1, total/10) ∈ [0, 1] and non-decreasing in sample count; None below 3 samples.
   Enforced: `_normalize_rebalance_success_signal` (modules/rebalancer.py:1100-1114).

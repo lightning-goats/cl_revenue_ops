@@ -73,6 +73,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'fee_market_boundary_max_downshift_ratio': float,
     'fee_market_boundary_cache_seconds': int,
     'daily_budget_sats': int,
+    'diagnostic_rebalance_max_fee_sats': int,
     'allow_zero_cost_auto_rebalance_when_budget_zero': bool,
     'weekly_budget_sats': int,
     'hot_channel_protection_enabled': bool,
@@ -207,6 +208,10 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'fee_market_boundary_max_downshift_ratio': (0.05, 1.0),
     'fee_market_boundary_cache_seconds': (10, 3600),
     'daily_budget_sats': (0, 10000000),
+    # Operator ruling D4: diagnostic fee cap must stay a small, bounded
+    # diagnostic spend — never 0 (would disable the defibrillator envelope)
+    # and never above 10k sats (a typo must not authorize huge spend).
+    'diagnostic_rebalance_max_fee_sats': (1, 10_000),
     'weekly_budget_sats': (0, 70_000_000),
     'boltz_auto_cycle_interval_minutes': (1, 1440),
     'boltz_auto_cycle_max_actions': (1, 10),
@@ -495,6 +500,13 @@ class Config:
     daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period (fixed floor)
     allow_zero_cost_auto_rebalance_when_budget_zero: bool = False
     weekly_budget_sats: int = 35000        # Max rebalancing fees per 7-day window (hard ceiling)
+    # Operator ruling D4 (2026-07-01): fee cap (sats) for the diagnostic
+    # ("defibrillator") shock rebalance. The shock's ppm ceiling is DERIVED
+    # from this cap (ceil(cap/amount*1e6)), so this is the single binding
+    # knob. Default 400 covers observed market route prices (118-363 sats)
+    # that the old hardcoded 100-sat envelope rejected route_over_budget.
+    # At use it is clamped to [1, min(daily_budget_sats, 10_000)].
+    diagnostic_rebalance_max_fee_sats: int = 400
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
 
     # RPC Hardening
@@ -1003,6 +1015,9 @@ class ConfigSnapshot:
 
     # Weekly budget cap (hard ceiling over daily burst)
     weekly_budget_sats: int = 35000
+
+    # Diagnostic (defibrillator) shock fee cap — operator ruling D4
+    diagnostic_rebalance_max_fee_sats: int = 400
 
     # Capacity Planner
     planner_enabled: bool = False

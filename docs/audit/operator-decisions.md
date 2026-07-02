@@ -52,3 +52,24 @@ rather than by falsifying the profitability class. Until then, Phase 2/4 must tr
 BREAK_EVEN on hive-member/corridor/central channels as potentially masked
 UNDERWATER, and the contribution analysis (Phase 4) should quantify how many sats of
 loss the mask currently hides.
+
+## D4 — Defibrillation fee cap (rebalancer, RB-I10)
+
+**Question:** The diagnostic ("defibrillator") shock's fee envelope was hardcoded at
+max_budget_sats=100 AND max_fee_ppm=2000 — both bounds bind at exactly 100 sats on
+the 50k shock. The corpus shows every priced route into a defib target cost 118–363
+sats, so all priced shocks were rejected `route_over_budget` (0/22 recorded shocks
+succeeded): the diagnostic could never fire. Raise the cap?
+
+**Ruling (Sat, 2026-07-01):** Raise the defib cap so the diagnostic functions.
+Default 400 sats. Rationale: observed market route prices were 118–363 sats; the
+ppm ceiling is now derived from the sat cap (ceil(cap/amount×1e6), 8000 ppm at
+defaults) so the sat cap is the single binding knob.
+
+**Implementation:** new config option `diagnostic_rebalance_max_fee_sats`
+(plugin option `revenue-ops-diagnostic-rebalance-max-fee-sats`, default 400),
+range-validated to [1, 10,000] and clamped at use to
+[1, min(daily_budget_sats, 10,000)] so a typo cannot authorize huge diagnostic
+spend. Shock amount (50k sats) and capital-controls gating unchanged. Pinned by
+TestDiagnosticFeeCap in tests/test_rebalancer_module.py; RB-I10 amended in
+docs/audit/contracts/rebalancer.md.

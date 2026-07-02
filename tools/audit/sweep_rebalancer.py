@@ -14,7 +14,11 @@ Sweepable here:
   RB-I4/RB-I9 - accounting cross-check: ledger rebalance spent_24h vs the sum of
            visible success-row fees in the trailing 24h (reported as anomaly
            material, not a strict invariant: recent_rebalances is a bounded list).
-  RB-I10 - diagnostic rows bounded: amount_sats <= 50_000, max_fee_sats <= 100.
+  RB-I10 - diagnostic rows bounded: amount_sats <= 50_000, max_fee_sats <= the
+           configured diagnostic_rebalance_max_fee_sats cap (D4, 2026-07-01:
+           default 400, hard ceiling 10_000; the frozen corpus predates D4 and
+           all its rows carry the old 100-sat cap, so the 10_000 ceiling is the
+           config-independent invariant checked here).
 
 Engine (RE-I*) checks over revenue-rebalance-debug.json last_cycle decompositions
 and revenue-status recent_rebalances (added by Phase 2 verifier; the original
@@ -102,7 +106,7 @@ def main():
     c_consist = Check("RB-I1a", "total-cost-budget: remaining == max(0, effective - spent - reserved)")
     c_suppress = Check("RB-I1b", "no automated success rebalance inside suppressed+budget_blocked windows")
     c_capped = Check("RB-I1c", "24h rebalance-category spend <= effective budget")
-    c_diag = Check("RB-I10", "diagnostic rebalances bounded: amount<=50000 sats, max_fee<=100 sats")
+    c_diag = Check("RB-I10", "diagnostic rebalances bounded: amount<=50000 sats, max_fee<=configured cap (D4 static ceiling 10000 sats)")
     c_envelope = Check("RE-I2a", "priced candidates: route cost <= effective budget unless rejected route_over_budget")
     c_fee_cap = Check("RE-I2b", "success rows: actual_fee_sats <= max_fee_sats")
     c_hold = Check("RE-I3", "below_hold_margin only on positive-cost routes; no selected pair with final_score_sats<0 and cost>0")
@@ -235,7 +239,10 @@ def main():
             if row.get("rebalance_type") == "diagnostic":
                 amt = row.get("amount_sats") or 0
                 mf = row.get("max_fee_sats")
-                if amt <= 50_000 and (mf is None or mf <= 100):
+                # D4 (2026-07-01): the per-row fee bound is the configured cap
+                # (default 400), which the sweep cannot observe; 10_000 is the
+                # static ceiling no configuration can exceed.
+                if amt <= 50_000 and (mf is None or mf <= 10_000):
                     c_diag.ok()
                 else:
                     c_diag.bad(cmds, f"row id={rid} amount={amt} max_fee={mf}")

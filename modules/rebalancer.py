@@ -32,6 +32,13 @@ if TYPE_CHECKING:
     from .capex_budget import CapexBudgetEngine
 
 
+# Operator ruling D4 (2026-07-01): static ceiling on the diagnostic
+# ("defibrillator") shock fee cap. Whatever diagnostic_rebalance_max_fee_sats
+# is configured to, the effective envelope never exceeds this (nor the daily
+# budget) — a typo cannot authorize huge diagnostic spend.
+DIAGNOSTIC_FEE_CAP_CEILING_SATS = 10_000
+
+
 # =============================================================================
 # REASON CODES FOR EXPLAINABILITY
 # =============================================================================
@@ -2415,7 +2422,24 @@ class EVRebalancer:
             
             # Construct a diagnostic candidate (50k sats - small enough to be OpEx)
             shock_amount = 50_000
-            
+
+            # Operator ruling D4 (2026-07-01): the shock fee envelope is the
+            # configured diagnostic_rebalance_max_fee_sats (default 400),
+            # clamped to [1, min(daily_budget_sats, 10_000)] so a typo can't
+            # authorize huge diagnostic spend. The ppm ceiling is DERIVED from
+            # the sat cap (ceil(cap/amount*1e6)) so the sat cap is the single
+            # binding knob — under the old hardcoded pair (100 sats, 2000 ppm)
+            # both bounds bound at exactly 100 sats on the 50k shock and every
+            # observed market route (118-363 sats) was rejected
+            # route_over_budget, so the diagnostic could never fire.
+            max_fee_sats = max(1, min(
+                int(getattr(self.config, 'diagnostic_rebalance_max_fee_sats', 400)),
+                int(getattr(self.config, 'daily_budget_sats', 0) or 0),
+                DIAGNOSTIC_FEE_CAP_CEILING_SATS,
+            ))
+            max_fee_ppm = math.ceil(max_fee_sats / shock_amount * 1_000_000)
+
+
             # Estimate inbound fee (we accept a loss here, it's a diagnostic cost)
             # Note: outbound_fee is 0 because the active shock itself is not the
             # fee-controller path; the controller-side exploration remains non-zero.
@@ -2433,9 +2457,9 @@ class EVRebalancer:
                 source_fee_ppm=best_source_info.get('fee_ppm', 0),
                 weighted_opp_cost_ppm=0,
                 spread_ppm=0,  # Likely negative, we don't care for diagnostic
-                max_budget_sats=100,  # Cap the diagnostic cost at 100 sats
-                max_budget_msat=100_000,
-                max_fee_ppm=2000,  # Allow up to 2000ppm for the shock packet
+                max_budget_sats=max_fee_sats,  # Configured diagnostic fee cap (D4)
+                max_budget_msat=sats_to_base(max_fee_sats),
+                max_fee_ppm=max_fee_ppm,  # Derived from the sat cap (D4)
                 expected_profit_sats=-50,  # Expect a small loss (diagnostic cost)
                 liquidity_ratio=0.5,
                 dest_flow_state="diagnostic",
@@ -2459,7 +2483,7 @@ class EVRebalancer:
                 from_channel=best_source_id,
                 to_channel=channel_id,
                 amount_sats=shock_amount,
-                max_fee_sats=100,
+                max_fee_sats=max_fee_sats,
                 expected_profit_sats=-50,
                 rebalance_type='diagnostic',
                 reason_code='defibrillator'

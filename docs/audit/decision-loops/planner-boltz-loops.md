@@ -170,6 +170,10 @@ complete — so id continuity proves where no row exists):
   `route_pricing_failed` (askrene RPC, nexus-02 June 2–3). No diagnostic row
   has a settled fee — the defib program spent ~0 sats and delivered 0 sats of
   liquidity corpus-wide.
+  **ADDRESSED (operator ruling D4, 2026-07-01):** the 100-sat cap finding is fixed —
+  the cap is now configurable (`diagnostic_rebalance_max_fee_sats`, default 400 sats,
+  covering the observed 118–363 sat routes) with the ppm ceiling derived from it;
+  see docs/audit/operator-decisions.md D4 and RB-I10 in contracts/rebalancer.md.
 
 **Per-channel outcome table** (settled forwards from the deduplicated
 listforwards chain, lossless through 2026-07-01T20:35Z, so 7d windows are fully
