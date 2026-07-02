@@ -1306,19 +1306,24 @@ class PolicyManager:
                     raise RuntimeError(
                         f"Rate limited: max {MAX_POLICY_CHANGES_PER_MINUTE} changes/minute for {peer_id[:12]}..."
                     )
-            # All passed - now record timestamps atomically
-            for peer_id, *_ in validated:
-                timestamps = self._change_timestamps.get(peer_id, [])
-                timestamps = [ts for ts in timestamps if ts > window_start]
-                timestamps.append(now)
-                self._change_timestamps[peer_id] = timestamps
 
-        # Execute batch insert atomically
+        # Execute batch insert atomically. DEF-037: the rate-limit timestamps
+        # are recorded ONLY after this commit succeeds (mirroring set_policy).
+        # Recording them before meant a failed commit left phantom rate-limit
+        # entries that throttled retries of a change that never persisted.
         self.database.upsert_policies_batch([
             (peer_id, strategy.value, mode.value, fee_ppm, json.dumps(tags), now,
              mult_min, mult_max, expires_at)
             for peer_id, strategy, mode, fee_ppm, tags, mult_min, mult_max, expires_at in validated
         ])
+
+        # Commit succeeded — now record the rate-limit timestamps atomically.
+        with self._cache_lock:
+            for peer_id, *_ in validated:
+                timestamps = self._change_timestamps.get(peer_id, [])
+                timestamps = [ts for ts in timestamps if ts > window_start]
+                timestamps.append(now)
+                self._change_timestamps[peer_id] = timestamps
 
         # Build results and update cache
         for peer_id, strategy, mode, fee_ppm, tags, mult_min, mult_max, expires_at in validated:
