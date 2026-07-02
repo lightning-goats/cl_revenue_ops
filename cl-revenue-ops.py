@@ -206,6 +206,44 @@ def _clamp_query_limit(value, default=20, lo=1, hi=_QUERY_LIMIT_MAX):
     return max(lo, min(ivalue, hi))
 
 
+def _snapshot_peers_once():
+    """Record a one-shot connection snapshot for currently connected peers.
+
+    Extracted from ``snapshot_peers_delayed`` so it can be unit-tested and so
+    the thread-local SQLite connection it opens is always released.
+
+    P1-021: this runs on a one-shot startup thread. Without an explicit
+    ``close_connection()`` the thread-local SQLite connection stays referenced
+    (via the DB's thread-connection tracking) until process shutdown. Close it
+    in a ``finally`` so the one-shot thread does not retain a connection.
+    """
+    try:
+        peers = data_service.get_peers() if data_service else safe_plugin.rpc.listpeers()
+        connected_count = 0
+        snapshot_count = 0
+
+        for peer in peers.get("peers", []):
+            if peer.get("connected", False):
+                connected_count += 1
+                peer_id = peer["id"]
+                # Only snapshot if no recent history exists
+                if not database.has_recent_connection_history(peer_id, 3600):
+                    database.record_connection_event(peer_id, "snapshot")
+                    snapshot_count += 1
+
+        plugin.log(f"Startup snapshot: Recorded {snapshot_count} of {connected_count} connected peers")
+    except Exception as e:
+        plugin.log(f"Error in delayed snapshot: {e}", level='warn')
+        plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')  # SEC-2: Stack traces at debug level
+    finally:
+        # P1-021: release this one-shot thread's thread-local DB connection.
+        if database is not None:
+            try:
+                database.close_connection()
+            except Exception:
+                pass
+
+
 def _compute_forward_hydration_start(
     last_forward_ts: Optional[int],
     flow_window_days: int,
@@ -2416,25 +2454,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         if shutdown_event.wait(delay_seconds):
             plugin.log("Startup snapshot cancelled due to shutdown signal")
             return
-        
-        try:
-            peers = data_service.get_peers() if data_service else safe_plugin.rpc.listpeers()
-            connected_count = 0
-            snapshot_count = 0
 
-            for peer in peers.get("peers", []):
-                if peer.get("connected", False):
-                    connected_count += 1
-                    peer_id = peer["id"]
-                    # Only snapshot if no recent history exists
-                    if not database.has_recent_connection_history(peer_id, 3600):
-                        database.record_connection_event(peer_id, "snapshot")
-                        snapshot_count += 1
-            
-            plugin.log(f"Startup snapshot: Recorded {snapshot_count} of {connected_count} connected peers")
-        except Exception as e:
-            plugin.log(f"Error in delayed snapshot: {e}", level='warn')
-            plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')  # SEC-2: Stack traces at debug level
+        # P1-021: delegate to the extracted helper, which closes the
+        # thread-local DB connection before this one-shot thread exits.
+        _snapshot_peers_once()
 
     def financial_snapshot_loop():
         """
