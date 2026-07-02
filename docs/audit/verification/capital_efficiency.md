@@ -185,3 +185,39 @@ cl-hive HEAD 53bc7c1:**
    source_notes on 20260609T034120Z show `burn:revenue_profitability_summary`, i.e. the
    spend-payload-missing fallback, exactly the mechanism the doc describes — the
    mechanism claim is right, the date scoping was narrow).
+
+> **Remediation (2026-07-01, cl-hive commits b264663 + 4350cc4):** the
+> still-standing metabolism-ledger anomalies in Anomaly 3 (`ML-INTAKE-IDENT`,
+> `ML-RESERVE-IDENT`, `ML-BURN-IDENT`/`ML-DEV-IDENT`) are FIXED on the cl-hive
+> side in `_build_canonical_metabolism_ledger` (cl-hive
+> modules/organism/runtime.py). Chosen semantics:
+> - **Intake (flow, per-window)**: `energy_intake_msat` is now measured per
+>   window from settled `listforwards` fees inside each trailing window
+>   (`_ledger_windowed_intake_msat`), never copied from lifetime
+>   profitability/dashboard/local-economics aggregates. When no forwards
+>   source is readable, windows emit `energy_intake_msat: null` with
+>   `energy_intake_status: "unavailable"` and a new `sources.listforwards`
+>   status block (`available: false`, `freshness: "missing"`), consistent
+>   with the existing coverage/unknown mechanism.
+> - **Burn/development (flows)**: windowed spend ledger only; a missing
+>   window reports `null` + `burn:unavailable`/`development:unavailable`
+>   source notes — the lifetime `burn:revenue_profitability_summary` fallback
+>   that produced ML-BURN/DEV-IDENT is removed. A present spend-ledger
+>   payload reporting zero spend counts as a genuine measurement of 0.
+> - **Reserves (stock)**: kept per-window for consumer compatibility
+>   (cl-hive metabolic arbitration reads `energy_reserves_msat` from the
+>   primary window) but explicitly marked — `energy_reserves` and
+>   `stranded_liquidity` now carry `semantics: "point_in_time"` +
+>   `observed_at`, and source notes read
+>   `reserves:listpeerchannels:point_in_time`. Identical-across-windows is
+>   now declared by design, not fake-windowed flow data.
+> - **Coverage contract intact**: `_ledger_window_coverage` still reads
+>   `covered_hours`/`coverage_hours` from this plugin's spend-ledger summary
+>   (measured since commit 9ad0b59); regression-tested on the cl-hive side
+>   (`test_metabolism_ledger_coverage_consumer_contract_intact`).
+> `net_usable_energy_msat` is `null` whenever any component is unmeasured.
+> cl-hive suite: 2,316 passed / 28 skipped. (Companion cl-hive commit
+> 4350cc4 only guards an optional pyln.testing import so the suite collects.)
+> Future corpus sweeps should expect ML-INTAKE-IDENT to pass on genuinely
+> differing windows and treat reserve identity across windows as declared
+> point-in-time semantics rather than a defect.
