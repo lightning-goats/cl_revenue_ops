@@ -9,6 +9,7 @@ manual quotes/swaps and enforce a local daily fee budget for swap fees.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -24,6 +25,198 @@ from .utils import parse_msat
 
 class BoltzCliError(RuntimeError):
     """Raised when boltzcli execution fails."""
+
+
+# ---------------------------------------------------------------------------
+# On-chain address validation (P1-006, address-validation part)
+#
+# Self-contained (no third-party dependency) structural validation of a
+# withdrawal destination. Its purpose is defensive: reject an obviously
+# malformed / wrong-network destination before it is handed to boltzcli.
+# It is intentionally conservative and does NOT attempt to enumerate every
+# exotic address encoding.
+#
+#   * bech32 / bech32m (BIP173/BIP350): full checksum + witness-program
+#     validation. Covers BTC (bc/tb/bcrt) and Liquid unconfidential segwit
+#     (ex/tex/ert).
+#   * base58check: full double-SHA256 checksum + version-byte gating. Covers
+#     BTC legacy/P2SH (mainnet + test/regtest).
+#   * Liquid confidential segwit (blech32: lq/tlq/el) uses a distinct 12-symbol
+#     checksum we do not fully verify; we accept it on a strict prefix +
+#     charset + length structural check (documented limitation). Combined with
+#     the `--` argv terminator (P1-015) this still blocks flag-injection and
+#     junk input.
+#
+# "network" here means the asset network (Bitcoin vs Liquid), which is what
+# the wallet currency selects; mainnet/testnet/regtest are all accepted for a
+# given currency (the configured boltzd instance is bound to one chain).
+# ---------------------------------------------------------------------------
+
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+_BTC_BECH32_HRPS = {"bc", "tb", "bcrt"}
+_LBTC_BECH32_HRPS = {"ex", "tex", "ert"}          # unconfidential Liquid segwit
+_LBTC_BLECH32_HRPS = {"lq", "tlq", "el"}          # confidential Liquid segwit
+# BTC base58 version bytes: P2PKH/P2SH for mainnet and test/regtest.
+_BTC_BASE58_VERSIONS = {0x00, 0x05, 0x6f, 0xc4}
+
+
+def _bech32_polymod(values) -> int:
+    generator = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = ((chk & 0x1ffffff) << 5) ^ v
+        for i in range(5):
+            chk ^= generator[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def _bech32_hrp_expand(hrp: str):
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+
+def _bech32_decode(addr: str):
+    """Return (hrp, data_without_checksum, spec) or (None, None, None).
+
+    spec is 'bech32' or 'bech32m'. Mixed-case input is rejected per BIP173.
+    """
+    if any(ord(c) < 33 or ord(c) > 126 for c in addr):
+        return None, None, None
+    if addr.lower() != addr and addr.upper() != addr:
+        return None, None, None
+    addr = addr.lower()
+    if len(addr) > 90:
+        return None, None, None
+    pos = addr.rfind("1")
+    if pos < 1 or pos + 7 > len(addr):
+        return None, None, None
+    hrp = addr[:pos]
+    try:
+        data = [_BECH32_CHARSET.index(c) for c in addr[pos + 1:]]
+    except ValueError:
+        return None, None, None
+    const = _bech32_polymod(_bech32_hrp_expand(hrp) + data)
+    if const == 1:
+        spec = "bech32"
+    elif const == 0x2bc830a3:
+        spec = "bech32m"
+    else:
+        return None, None, None
+    return hrp, data[:-6], spec
+
+
+def _convertbits(data, frombits, tobits, pad=True):
+    acc = 0
+    bits = 0
+    ret = []
+    maxv = (1 << tobits) - 1
+    max_acc = (1 << (frombits + tobits - 1)) - 1
+    for value in data:
+        if value < 0 or (value >> frombits):
+            return None
+        acc = ((acc << frombits) | value) & max_acc
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            ret.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        return None
+    return ret
+
+
+def _valid_segwit_program(data) -> bool:
+    """data is the 5-bit payload (witver + program), checksum already stripped."""
+    if not data:
+        return False
+    witver = data[0]
+    if witver < 0 or witver > 16:
+        return False
+    prog = _convertbits(data[1:], 5, 8, False)
+    if prog is None:
+        return False
+    if len(prog) < 2 or len(prog) > 40:
+        return False
+    if witver == 0 and len(prog) not in (20, 32):
+        return False
+    return True
+
+
+def _base58check_decode(s: str):
+    """Return the decoded payload (version byte + data, checksum stripped) or None."""
+    if not s:
+        return None
+    num = 0
+    for ch in s:
+        idx = _B58_ALPHABET.find(ch)
+        if idx == -1:
+            return None
+        num = num * 58 + idx
+    combined = num.to_bytes((num.bit_length() + 7) // 8, "big") if num else b""
+    n_pad = len(s) - len(s.lstrip("1"))
+    raw = (b"\x00" * n_pad) + combined
+    if len(raw) < 5:
+        return None
+    payload, checksum = raw[:-4], raw[-4:]
+    if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != checksum:
+        return None
+    return payload
+
+
+def _validate_onchain_address(address: str, currency: str) -> bool:
+    """Structurally validate an on-chain withdrawal destination for currency.
+
+    Returns True only for a well-formed address of the correct asset network.
+    """
+    if not isinstance(address, str):
+        return False
+    addr = address.strip()
+    if not addr or any(c.isspace() for c in addr):
+        return False
+
+    cur = (currency or "").strip().upper()
+    if cur in ("L-BTC", "LBTC"):
+        cur = "LBTC"
+
+    lower = addr.lower()
+
+    # Confidential Liquid segwit (blech32): strict structural check only.
+    if cur == "LBTC":
+        for hrp in _LBTC_BLECH32_HRPS:
+            if lower.startswith(hrp + "1"):
+                body = lower[len(hrp) + 1:]
+                if 6 <= len(body) <= 200 and all(c in _BECH32_CHARSET for c in body):
+                    return True
+                return False
+
+    # bech32 / bech32m segwit.
+    hrp, data, spec = _bech32_decode(addr)
+    if hrp is not None:
+        if cur == "BTC" and hrp not in _BTC_BECH32_HRPS:
+            return False
+        if cur == "LBTC" and hrp not in _LBTC_BECH32_HRPS:
+            return False
+        if cur not in ("BTC", "LBTC"):
+            return False
+        return _valid_segwit_program(data)
+
+    # base58check legacy / P2SH.
+    payload = _base58check_decode(addr)
+    if payload is not None and len(payload) >= 1:
+        version = payload[0]
+        if cur == "BTC":
+            return version in _BTC_BASE58_VERSIONS
+        if cur == "LBTC":
+            # Liquid uses distinct version bytes; a BTC-network version byte
+            # here would be a wrong-network address.
+            return version not in _BTC_BASE58_VERSIONS
+        return False
+
+    return False
 
 
 @dataclass
@@ -1893,6 +2086,14 @@ class BoltzCliManager:
         if not destination:
             raise BoltzCliError("destination is required")
         cur = self._norm_currency(currency, "LBTC")
+        # P1-006: validate the destination address format for the wallet
+        # currency/network BEFORE any subprocess call. A malformed or
+        # wrong-network destination is rejected cleanly and never reaches
+        # boltzcli.
+        if not _validate_onchain_address(destination, cur):
+            raise BoltzCliError(
+                f"invalid {cur} on-chain destination address: refusing to withdraw"
+            )
         wallet_name = self._resolve_wallet_name(cur)
         amt = 0 if sweep else int(amount_sats or 0)
         if not sweep and amt <= 0:
