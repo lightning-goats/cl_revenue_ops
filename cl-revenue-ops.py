@@ -177,6 +177,35 @@ force_rate_limiter = ForceRateLimiter(max_calls=10, window_seconds=60)
 FORWARD_HYDRATION_EVENT_JITTER_SECONDS = 300
 
 
+# =============================================================================
+# OPERATOR-PARAM VALIDATION HELPERS
+# =============================================================================
+# RPC handlers accept raw operator-supplied params (via lightning-cli or the
+# JSON-RPC surface). These helpers coerce/clamp them BEFORE they reach SQL or
+# regex so a hostile/typo'd value cannot crash a handler or run unbounded.
+
+_QUERY_LIMIT_MAX = 1000
+
+
+class _ParamError(ValueError):
+    """Raised when an operator param cannot be coerced to the expected type."""
+
+
+def _clamp_query_limit(value, default=20, lo=1, hi=_QUERY_LIMIT_MAX):
+    """Coerce ``value`` to an int and clamp it into [lo, hi].
+
+    Raises ``_ParamError`` for non-integer input so the caller can return a
+    clean error dict rather than leaking a ValueError/TypeError. A negative
+    limit is clamped to ``lo`` (never passed to SQLite, where LIMIT -1 means
+    "unbounded" and would return the whole table).
+    """
+    try:
+        ivalue = int(value)
+    except (ValueError, TypeError) as e:
+        raise _ParamError(f"limit must be an integer, got {value!r}") from e
+    return max(lo, min(ivalue, hi))
+
+
 def _compute_forward_hydration_start(
     last_forward_ts: Optional[int],
     flow_window_days: int,
@@ -3558,6 +3587,10 @@ def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any
     """List scored peer candidates for channel opens."""
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
+    try:
+        limit = _clamp_query_limit(limit)
+    except _ParamError as e:
+        return {"error": str(e)}
     candidates = database.get_planner_candidates(limit=limit)
     metabolic_planner_influence = {}
     try:
@@ -3586,6 +3619,10 @@ def revenue_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
     """Get audit log of past planner actions."""
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
+    try:
+        limit = _clamp_query_limit(limit)
+    except _ParamError as e:
+        return {"error": str(e)}
     actions = database.get_planner_actions(limit=limit)
     return {"actions": actions, "count": len(actions)}
 
