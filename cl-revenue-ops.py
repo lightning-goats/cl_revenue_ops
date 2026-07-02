@@ -244,6 +244,53 @@ def _snapshot_peers_once():
                 pass
 
 
+# =============================================================================
+# INIT-TIME CONFIG OPTION VALIDATION (P1-008 / P1-009 / P1-026)
+# =============================================================================
+# Config(**kwargs) is constructed once at init from operator-supplied options.
+# The upstream _safe_int/_safe_float parsers validate type but not range; a
+# 0/negative/out-of-band numeric or a typo'd enum would otherwise be accepted
+# and fail open (e.g. rpc-timeout-seconds=0 breaks every RPC). These helpers
+# clamp/correct such values with a loud warning, matching the warn+repair
+# style used by Config._apply_override / load_overrides for the runtime path.
+
+# Numeric options range-checked at init. Ranges mirror CONFIG_FIELD_RANGES so
+# init and the runtime-override path agree on what is in-band.
+_INIT_NUMERIC_RANGES = {
+    'rpc_timeout_seconds': (1, 300),
+    'daily_budget_sats': (0, 10_000_000),
+    'weekly_budget_sats': (0, 70_000_000),
+    'reputation_decay': (0.0, 1.0),
+    'htlc_congestion_threshold': (0.0, 1.0),
+}
+
+
+def _init_warn(log, msg):
+    if log is not None:
+        try:
+            log(msg, level='warn')
+        except Exception:
+            pass
+
+
+def _validate_numeric_config_options(kwargs, log=None):
+    """P1-008: clamp init numeric options into safe ranges (warn on clamp)."""
+    for key, (lo, hi) in _INIT_NUMERIC_RANGES.items():
+        if key not in kwargs:
+            continue
+        val = kwargs[key]
+        try:
+            num = float(val) if isinstance(lo, float) or isinstance(hi, float) else int(val)
+        except (ValueError, TypeError):
+            # Type is enforced upstream by _safe_int/_safe_float; leave as-is.
+            continue
+        clamped = max(lo, min(num, hi))
+        if clamped != num:
+            _init_warn(log, f"Config option {key}={num} out of range [{lo}, {hi}]; clamped to {clamped}")
+            kwargs[key] = clamped
+    return kwargs
+
+
 def _compute_forward_hydration_start(
     last_forward_ts: Optional[int],
     flow_window_days: int,
@@ -1865,6 +1912,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalance_router='v3',
         askrene_layers=str(options.get('revenue-ops-askrene-layers', '') or '').strip() or 'hive-fleet',
     )
+    # P1-008: range-validate numeric options before Config construction so a
+    # 0/negative/out-of-band value can never fail open.
+    _validate_numeric_config_options(config_kwargs, log=plugin.log)
+
     configured_router = str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower()
     if configured_router != 'v3':
         plugin.log(
