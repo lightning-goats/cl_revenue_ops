@@ -225,12 +225,13 @@ def test_spend_reserve_serializes_check_and_reserve():
     release = threading.Event()
     call_times = []
 
-    def budget_status():
+    def budget_status(window_hours=None, force_fresh=False):
+        # DD1/P2-011: the gating path now calls with force_fresh=True (live).
         call_times.append(time.monotonic())
         if len(call_times) == 1:
             in_check.set()
             release.wait(timeout=5)
-        return {"remaining_sats": 1000}
+        return {"remaining_sats": 1000, "effective_budget_sats": 1000, "window_hours": 24}
 
     mod._total_cost_budget_status = budget_status
 
