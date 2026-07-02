@@ -1197,12 +1197,40 @@ class BoltzCliManager:
             return []
         return []
 
+    # DD8/RES-3: keep-last-180-days retention window plus a generous keep-last-N
+    # count cap. Completed-swap records are historical only, so pruning entries
+    # older than the window on the next write bounds on-disk growth without any
+    # behavioral effect.
+    _SWAP_JOURNAL_MAX_AGE_SECONDS = 180 * 24 * 60 * 60
+    _SWAP_JOURNAL_MAX_ENTRIES = 200
+
+    def _prune_swap_journal_entries(self, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Drop entries older than the retention window; cap the count.
+
+        Age is measured by the newest available timestamp on the record
+        (recorded_at or created_at). Entries with no usable timestamp are kept
+        (age is unknown) but are still subject to the keep-last-N count cap.
+        """
+        cutoff = int(time.time()) - self._SWAP_JOURNAL_MAX_AGE_SECONDS
+        kept: List[Dict[str, Any]] = []
+        for rec in entries:
+            if not isinstance(rec, dict):
+                continue
+            newest = max(
+                self._parse_int(rec.get("recorded_at"), 0),
+                self._parse_int(rec.get("created_at"), 0),
+            )
+            if newest and newest < cutoff:
+                continue  # older than the retention window
+            kept.append(rec)
+        return kept[-self._SWAP_JOURNAL_MAX_ENTRIES:]
+
     def _save_swap_journal(self, entries: List[Dict[str, Any]]) -> None:
         try:
             os.makedirs(os.path.dirname(self._swap_journal_file), exist_ok=True)
             tmp = self._swap_journal_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(entries[-200:], f, sort_keys=True)
+                json.dump(self._prune_swap_journal_entries(entries), f, sort_keys=True)
             os.replace(tmp, self._swap_journal_file)
         except Exception as e:
             self.plugin.log(f"BOLTZ: failed to write swap journal: {e}", level="warn")
