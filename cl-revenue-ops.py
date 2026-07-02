@@ -2831,7 +2831,12 @@ def _hive_hints_status_for_debug(plugin: Plugin, max_segment_scores: int = 20) -
             int(entry.get("direction", 0) or 0),
         )
     )
-    max_segment_scores = max(0, int(max_segment_scores or 0))
+    # P1-012: coerce operator-supplied max_segment_scores; a non-int must not
+    # raise ValueError out of a diagnostic handler.
+    try:
+        max_segment_scores = max(0, int(max_segment_scores or 0))
+    except (ValueError, TypeError):
+        max_segment_scores = 0
     if max_segment_scores:
         segment_scores = segment_scores[:max_segment_scores]
     hive_status["segment_scores_count"] = len(segment_scores)
@@ -3511,6 +3516,10 @@ def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[st
         return {"error": "Plugin not fully initialized"}
 
     # L-22: Validate SCID format if provided
+    # P1-012: guard against non-str channel_id (re.match on a non-str raises
+    # TypeError and leaks a traceback instead of a clean error dict).
+    if channel_id is not None and not isinstance(channel_id, str):
+        return {"error": "channel_id must be a string SCID (e.g., 123x456x789)."}
     if channel_id and not re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id):
         return {"error": f"Invalid channel format: {channel_id}. Use SCID format (e.g., 123x456x789)."}
 
@@ -3652,6 +3661,9 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
         return {"status": "error", "error": "fee_ppm must be an integer"}
 
     # SCID, full channel_id, or peer ID format check
+    # P1-012: guard against non-str channel_id before regex matching.
+    if not isinstance(channel_id, str):
+        return {"status": "error", "error": "channel_id must be a string"}
     if not (
         re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id)
         or re.match(r'^[0-9a-fA-F]{64}$', channel_id)
@@ -3706,9 +3718,10 @@ def revenue_rebalance(plugin: Plugin,
     # Native route execution is handled by RebalanceEngineV2.
 
     # L-21: Validate SCID format
+    # P1-012: guard against non-str channel args before regex matching.
     for cid in (from_channel, to_channel):
-        if not re.match(r'^\d+[x:]\d+[x:]\d+$', cid):
-            return {"status": "error", "error": f"Invalid channel format for {cid}. Use SCID format (e.g., 123x456x789)."}
+        if not isinstance(cid, str) or not re.match(r'^\d+[x:]\d+[x:]\d+$', cid):
+            return {"status": "error", "error": f"Invalid channel format for {cid!r}. Use SCID format (e.g., 123x456x789)."}
 
     # 1. Validation
     try:
@@ -4665,7 +4678,12 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
         return {"error": "Database not initialized"}
 
     # L-23: Clamp window_days to sane range
-    window_days = max(1, min(int(window_days), 365))
+    # P1-012: coerce operator-supplied window_days; a non-int must return a
+    # clean error dict, not leak a ValueError traceback.
+    try:
+        window_days = max(1, min(int(window_days), 365))
+    except (ValueError, TypeError):
+        return {"error": "window_days must be an integer"}
 
     try:
         # Get TLV (Total Liquidating Value)
