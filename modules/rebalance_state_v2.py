@@ -73,10 +73,10 @@ class ChannelState:
     activity_out_sats: int = 0
     activity_in_sats: int = 0
     # Per-channel target band (from the target_bands map / cfg thresholds).
-    # NOTE: distinct from build_state_snapshot's function-scope target_band_low/
-    # target_band_high kwargs, which drive dest_urgency/source_drain_score. These
-    # per-channel fields are consumed by the planner's band classification (Task 7);
-    # until then they are carried but not yet used for urgency scoring.
+    # Consumed by the planner's band classification AND pair sizing, and by
+    # dest_urgency/source_drain_score in build_state_snapshot (scoring_band_*).
+    # build_state_snapshot's function-scope target_band_low/high kwargs are the
+    # fallback used only when a channel has no per-channel band (flat behavior).
     target_band_low: float = 0.35
     target_band_high: float = 0.65
 
