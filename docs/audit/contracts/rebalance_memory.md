@@ -1,5 +1,11 @@
 # Intent Contract: modules/rebalance_memory.py
 
+> **REMOVED (2026):** `modules/rebalance_memory.py` was deleted in commit
+> `9bc0953` ("chore: remove dead legacy rebalance executor and routing memory")
+> together with its only consumer `modules/rebalance_executor.py`. The module no
+> longer exists in the tree. The present-tense description below is retained for
+> historical reference only.
+
 ## Purpose
 `RebalanceRoutingMemory`: a small thread-safe, in-process store of short-lived routing exclusions
 learned from recent payment failures — channel bans, node bans, and per-channel max-amount

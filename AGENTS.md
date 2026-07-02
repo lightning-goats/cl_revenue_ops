@@ -50,6 +50,14 @@ The following are action/mutation RPCs and must not be called in read-only tests
 - `revenue-spend-release`
 - `revenue-spend-release-stale`
 - `revenue-spend-settle`
+- `revenue-analyze`
+- `revenue-wake-all`
+- `revenue-ignore`
+- `revenue-unignore`
+- `revenue-cleanup-closed`
+- `revenue-clear-reservations`
+- `revenue-policy set`
+- `revenue-config set`
 - any Boltz action RPC
 - any CLN open/close/pay/withdraw RPC
 

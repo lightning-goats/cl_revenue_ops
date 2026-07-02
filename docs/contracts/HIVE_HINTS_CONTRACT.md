@@ -22,6 +22,11 @@ cl-hive / cl-mycelium produces this payload by writing the compact hint snapshot
 
 Amounts named `*_sats` are satoshis. Route segment `amount_bucket_sats` values use the standard bucket set: 50k, 100k, 250k, 500k, 1M, 2M, 5M, 10M sats. Scores, confidence, centrality, quality, and multipliers are unitless floats clamped by the consumer. Fee estimates are ppm.
 
+The consumer enforces hard rails on two hive-influence channels that are separate from the ±10% bounded fee-bias clamp:
+
+- `fee_elasticity` maps to the DTS exploration multiplier, clamped to `[0.75, 2.0]` (`EXPLORATION_BOOST_MIN`/`EXPLORATION_BOOST_MAX`, `modules/fee_controller.py`).
+- `fleet_fee_prior` and `optimal_fee_estimate_ppm` seed a fleet fee prior, clamped to `[1, 10000]` ppm (`MAX_FLEET_FEE_PRIOR_PPM`, `modules/hive_hints.py`); an out-of-range value neutralizes to no hint rather than being pinned to the bound.
+
 ## Required Fields
 
 - `generated_at`: Unix epoch seconds.
