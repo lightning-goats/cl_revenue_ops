@@ -181,14 +181,6 @@ class RebalanceRouter:
         return None
 
     @staticmethod
-    def _get_final_hop_fee_ppm(self, dest_peer_id: str) -> Optional[int]:
-        """Return the final-hop proportional fee for legacy callers/tests."""
-        policy = self._get_final_hop_policy(dest_peer_id)
-        if policy is None:
-            return None
-        return int(policy["fee_ppm"])
-
-    @staticmethod
     def _compute_final_hop_fee_sats(
         amount_sats: int,
         fee_ppm: int,
