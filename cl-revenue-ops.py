@@ -3203,7 +3203,12 @@ def revenue_rebalance_debug(
     filter_peer_id = str(peer_id or "").strip().lower()
     summary_only = bool(summary_only)
     include_hot_markers = bool(include_hot_markers) and not summary_only
-    max_candidates = max(0, int(max_candidates or 0))
+    # P1-012 class: coerce operator-supplied max_candidates; a non-int must not
+    # raise ValueError/TypeError out of a diagnostic handler.
+    try:
+        max_candidates = max(0, int(max_candidates or 0))
+    except (ValueError, TypeError):
+        max_candidates = 0
 
     result = {
         "executor_available": True,
@@ -4869,6 +4874,11 @@ def revenue_config(
     """
     if config is None or database is None:
         return {"error": "Plugin not initialized"}
+
+    # P1-012 class: guard non-str key before hasattr/getattr(config, key),
+    # which raise TypeError for a non-string attribute name.
+    if key is not None and not isinstance(key, str):
+        return {"error": "config key must be a string"}
 
     def _not_public_error(runtime_key: str) -> Dict[str, Any]:
         return {"error": f"Key '{runtime_key}' is not a public runtime control"}
@@ -8328,7 +8338,12 @@ def _execute_boltz_balance_cycle(
     recommendations = list(plan.get("recommendations", []))
     budget = plan.get("budget", {}) if isinstance(plan.get("budget"), dict) else {}
     remaining_budget = int(budget.get("remaining_24h_sats_estimate", 0) or 0)
-    cooldown_seconds = max(0, int(float(cooldown_hours) * 3600))
+    # P1-012 class: coerce operator-supplied cooldown_hours; a non-numeric must
+    # not raise out of the balance-cycle path. Fall back to the 4h default.
+    try:
+        cooldown_seconds = max(0, int(float(cooldown_hours) * 3600))
+    except (ValueError, TypeError):
+        cooldown_seconds = 4 * 3600
 
     executed: List[Dict[str, Any]] = []
     skipped_exec: List[Dict[str, Any]] = []
