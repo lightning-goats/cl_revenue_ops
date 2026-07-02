@@ -3628,3 +3628,48 @@ def test_engine_threads_pair_fee_cap_into_coordination_overlay(
         engine.find_candidates()
 
     assert overlay_builder.call_args.kwargs["pair_fee_cap_ppm"] == 1_000
+
+
+def test_build_flow_facts_map_computes_realized_utilization_from_db(
+    mock_plugin, mock_database
+):
+    """_build_flow_facts_map is the seam Task 5 adds between the engine's
+    per-cycle channel list and compute_channel_flow_facts. It must turn a
+    DB-reported flow window into a ChannelFlowFacts with realized
+    utilization, keyed by channel_id, without touching the rest of the
+    snapshot build."""
+    mock_database.get_channel_flow_window.return_value = (600_000, 0, 6)
+    engine = _make_engine(mock_plugin, mock_database)
+
+    channels = [{"channel_id": "A", "capacity_sats": 1_000_000}]
+    now_ts = int(time.time())
+
+    flow_facts = engine._build_flow_facts_map(channels, engine.config, now_ts)
+
+    assert flow_facts["A"].realized_utilization == pytest.approx(0.6)
+    assert flow_facts["A"].utilization_is_realized is True
+
+
+def test_build_flow_facts_map_returns_empty_when_no_database(mock_plugin):
+    """Fail-open: with no database handle at all, the map-build must not
+    raise, and build_state_snapshot's neutral defaults take over."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "u" * 64}
+    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listchannels.return_value = {"channels": []}
+    mock_plugin.rpc.listconfigs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+    engine = RebalanceEngine(plugin=mock_plugin, config=cfg, database=None)
+
+    flow_facts = engine._build_flow_facts_map(
+        [{"channel_id": "A", "capacity_sats": 1_000_000}],
+        cfg,
+        int(time.time()),
+    )
+
+    assert flow_facts == {}

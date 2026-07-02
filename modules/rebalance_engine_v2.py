@@ -22,6 +22,7 @@ from .rebalance_coordination_overlay import (
     suppress_leased_pairs,
 )
 from .rebalance_execution import ExecutionResult
+from .rebalance_flow_facts import ChannelFlowFacts, compute_channel_flow_facts
 from .rebalance_native_executor_v2 import NativeRouteExecutor
 from .rebalance_hive_router import RebalanceHiveRouter
 from .rebalance_planner_v2 import RebalancePlanner
@@ -968,6 +969,31 @@ class RebalanceEngine:
         fill_fraction = amount_sats / float(amount_sats + remaining_gap)
         return int(base_cooldown_secs * min(1.0, fill_fraction * 2.0))
 
+    def _build_flow_facts_map(
+        self, channels: List[Dict[str, Any]], cfg: Any, now_ts: int
+    ) -> Dict[str, ChannelFlowFacts]:
+        """Build the per-channel ChannelFlowFacts map for this cycle's snapshot.
+
+        Fail-open: with no database handle this returns an empty map, and
+        build_state_snapshot then falls back to neutral (prior) utilization
+        facts for every channel — identical to today's behavior.
+        compute_channel_flow_facts is itself fail-open per channel, so a
+        single bad DB read degrades that channel to neutral facts rather
+        than aborting the cycle.
+        """
+        if self.database is None:
+            return {}
+        flow_facts: Dict[str, ChannelFlowFacts] = {}
+        for ch in channels:
+            channel_id = ch.get("channel_id")
+            if not channel_id:
+                continue
+            capacity_sats = int(ch.get("capacity_sats") or 0)
+            flow_facts[channel_id] = compute_channel_flow_facts(
+                self.database, channel_id, capacity_sats, now_ts, cfg
+            )
+        return flow_facts
+
     def _build_snapshot(self) -> Optional[StateSnapshot]:
         """Build a normalized state snapshot from live data."""
         cfg = self.config if not hasattr(self.config, 'snapshot') else self.config.snapshot()
@@ -1185,6 +1211,9 @@ class RebalanceEngine:
                 "cooldown_override": cooldown_override,
             })
 
+        now_ts = int(time.time())
+        flow_facts = self._build_flow_facts_map(normalized, cfg, now_ts)
+
         return build_state_snapshot(
             normalized,
             capex_allocations,
@@ -1194,6 +1223,8 @@ class RebalanceEngine:
             hive_bootstrap_budget_sats=int(
                 getattr(cfg, "hive_rebalance_bootstrap_budget_sats", 0) or 0
             ),
+            flow_facts=flow_facts,
+            cfg=cfg,
         )
 
     def _is_hive_member(self, peer_id: str) -> bool:
