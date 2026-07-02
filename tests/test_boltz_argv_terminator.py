@@ -52,11 +52,17 @@ class TestRefundTerminator:
         _assert_dash_after_terminator(calls[0], "--sweep")
         assert calls[0][0] == "refundswap"
 
-    def test_dash_dest_after_terminator(self):
+    def test_dash_swap_id_and_valid_dest_after_terminator(self):
+        # P4-005 now rejects a dash-leading destination as a bad address, so
+        # the destination cannot smuggle a flag. The swap_id (not an address)
+        # is still free-form, so the `--` terminator still matters for it; a
+        # valid destination address is placed after the terminator too.
         mgr = _make_manager()
         calls = _capture_run(mgr)
-        mgr.refund("abc123", "--to-wallet")
-        _assert_dash_after_terminator(calls[0], "--to-wallet")
+        valid_dest = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        mgr.refund("--sweep", valid_dest)
+        _assert_dash_after_terminator(calls[0], "--sweep")
+        _assert_dash_after_terminator(calls[0], valid_dest)
 
 
 class TestClaimTerminator:
@@ -95,10 +101,14 @@ class TestLoopOutAddressTerminator:
         mgr._enforce_budget_for_quote = lambda q: {"allowed": True, "estimated_fee_sats": 80, "budget": {}}
         mgr._detect_reverse_chanids_support = lambda: True
         mgr._record_swap_result = lambda *a, **k: None
-        # Malicious address beginning with '-' must be passed as data.
-        mgr.loop_out(amount_sats=50_000, address="--sweep", currency="BTC")
+        # P4-005 rejects a dash-leading address as a bad address before the
+        # subprocess, so the address can no longer smuggle a flag. The `--`
+        # terminator remains for the currency/amount positionals; a valid
+        # address is placed after it.
+        valid_addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        mgr.loop_out(amount_sats=50_000, address=valid_addr, currency="BTC")
         create_call = next(c for c in captured if c and c[0] == "createreverseswap")
-        _assert_dash_after_terminator(create_call, "--sweep")
+        _assert_dash_after_terminator(create_call, valid_addr)
 
 
 class TestWithdrawTerminator:
