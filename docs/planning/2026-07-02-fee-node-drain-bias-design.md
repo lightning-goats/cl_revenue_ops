@@ -43,6 +43,14 @@ Default OFF → no behavior change on merge/deploy. Only touches the fee *discou
 raises fees, never removes the `min_fee_ppm` rail). No spend/budget path touched. Reversible via
 config at runtime.
 
+## Invariant: no double-count with the fleet drain hint
+The organism's per-peer `drain_direction` hint applies DIRECTIONAL pressure through cl-hive's
+askrene TRAFFIC/ROUTING layer (`hive_hints.get_drain_direction` docstring: the fee controller
+"intentionally does not use this directly ... to avoid double-counting"). This node_drain_bias
+operates on a DIFFERENT axis — node-aggregate receivable-ratio starvation, on the FEE layer,
+extending `_drain_fee_multiplier`. It MUST NOT read `drain_direction` or any per-peer directional
+hint. Keeping it a node-level fee-layer signal preserves the existing routing-vs-fee separation.
+
 ## Plan (TDD, each task red-first, spec+quality review, config-gated)
 1. **Pure helpers** `compute_node_receivable_ratio(channels)` + `node_drain_pressure(R, target, floor)`
    in fee_controller (or a small helper) + unit tests (starved→P=1, target→P=0, mid→ramp,
