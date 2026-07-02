@@ -45,6 +45,15 @@ class PairCandidate:
     source_historical_sourced_fee_ppm: float = 0.0
     dest_historical_direct_fee_ppm: float = 0.0
     dest_historical_sourced_fee_ppm: float = 0.0
+    # Per-channel MEASURED utilization (audit RE-H1/H2): the fraction of
+    # refilled/drained liquidity actually routed, observed from recent flow
+    # history. Falls back to the flat EXPECTED_UTILIZATION prior in the
+    # engine's sats-EV gate when *_utilization_is_realized is False (thin
+    # history or no facts) so pre-feature behavior is unchanged.
+    dest_realized_utilization: float = 0.5
+    source_realized_utilization: float = 0.5
+    dest_utilization_is_realized: bool = False
+    source_utilization_is_realized: bool = False
     hive_source_rebalance_bias: float = 1.0
     hive_dest_rebalance_bias: float = 1.0
     hive_hint_score_multiplier: float = 1.0

@@ -3673,3 +3673,89 @@ def test_build_flow_facts_map_returns_empty_when_no_database(mock_plugin):
     )
 
     assert flow_facts == {}
+
+
+def test_realized_utilization_used_for_hot_channel(mock_plugin, mock_database):
+    """Feature #2: when the destination carries MEASURED (realized)
+    utilization, the EV gate's refill term uses that measured value instead
+    of the flat EXPECTED_UTILIZATION prior, and the decomposition reports
+    the source as 'realized'."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_500
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+        dest_realized_utilization=0.8,
+        dest_utilization_is_realized=True,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    expected_refill = amount_sats * dest_out_fee_ppm / 1_000_000.0 * 0.8
+    assert decomp["destination_refill_value_sats"] == pytest.approx(expected_refill)
+    assert decomp["expected_utilization"] == pytest.approx(0.8)
+    assert decomp["utilization_source"] == "realized"
+
+
+def test_thin_history_uses_prior(mock_plugin, mock_database):
+    """Feature #2 fallback: when the destination has NO realized data
+    (thin history / no facts), the EV gate's refill term must fall back to
+    the flat EXPECTED_UTILIZATION prior (0.5) -- identical to pre-feature
+    behavior -- and the decomposition reports the source as 'prior'."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_500
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+        dest_realized_utilization=0.8,
+        dest_utilization_is_realized=False,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    expected_refill = amount_sats * dest_out_fee_ppm / 1_000_000.0 * 0.5
+    assert decomp["destination_refill_value_sats"] == pytest.approx(expected_refill)
+    assert decomp["expected_utilization"] == pytest.approx(0.5)
+    assert decomp["utilization_source"] == "prior"

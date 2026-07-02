@@ -500,14 +500,28 @@ class RebalanceEngine:
         )
         dest_value_fee_ppm = max(dest_out_fee_ppm, dest_historical_direct_fee_ppm)
         source_opportunity_fee_ppm = max(source_out_fee_ppm, source_historical_direct_fee_ppm)
+        # Audit RE-H1/H2: use each channel's MEASURED utilization when
+        # available; otherwise fall back to the flat EXPECTED_UTILIZATION
+        # prior so pairs with no realized flow history score identically
+        # to pre-feature behavior.
+        dest_u = (
+            float(getattr(pair, "dest_realized_utilization", EXPECTED_UTILIZATION))
+            if getattr(pair, "dest_utilization_is_realized", False)
+            else EXPECTED_UTILIZATION
+        )
+        source_u = (
+            float(getattr(pair, "source_realized_utilization", EXPECTED_UTILIZATION))
+            if getattr(pair, "source_utilization_is_realized", False)
+            else EXPECTED_UTILIZATION
+        )
         destination_refill_value_sats = (
-            amount_sats * dest_value_fee_ppm / 1_000_000.0 * EXPECTED_UTILIZATION
+            amount_sats * dest_value_fee_ppm / 1_000_000.0 * dest_u
         )
         source_drain_value_sats = (
             amount_sats
             * source_historical_sourced_fee_ppm
             / 1_000_000.0
-            * EXPECTED_UTILIZATION
+            * source_u
         )
         expected_future_value_sats = (
             destination_refill_value_sats + source_drain_value_sats
@@ -516,7 +530,7 @@ class RebalanceEngine:
             amount_sats
             * source_opportunity_fee_ppm
             / 1_000_000.0
-            * EXPECTED_UTILIZATION
+            * source_u
             * SOURCE_UTILIZATION_DISCOUNT
         )
         failure_penalty_sats = (
@@ -569,7 +583,13 @@ class RebalanceEngine:
             "source_opportunity_sats": round(source_opportunity_sats, 6),
             "failure_penalty_sats": round(failure_penalty_sats, 6),
             "final_score_sats": final_score_sats,
-            "expected_utilization": EXPECTED_UTILIZATION,
+            "expected_utilization": round(dest_u, 6),
+            "utilization_source": (
+                "realized"
+                if getattr(pair, "dest_utilization_is_realized", False)
+                else "prior"
+            ),
+            "source_utilization": round(source_u, 6),
             "source_utilization_discount": SOURCE_UTILIZATION_DISCOUNT,
             "beats_do_nothing": beats_do_nothing,
             "rejection_reason": rejection_reason,

@@ -360,6 +360,18 @@ class RebalancePlanner:
                     dest_historical_sourced_fee_ppm=max(
                         0.0, float(getattr(dest, "historical_sourced_fee_ppm", 0.0) or 0.0)
                     ),
+                    dest_realized_utilization=float(
+                        getattr(dest, "realized_utilization", 0.5) or 0.5
+                    ),
+                    source_realized_utilization=float(
+                        getattr(src, "realized_utilization", 0.5) or 0.5
+                    ),
+                    dest_utilization_is_realized=bool(
+                        getattr(dest, "utilization_is_realized", False)
+                    ),
+                    source_utilization_is_realized=bool(
+                        getattr(src, "utilization_is_realized", False)
+                    ),
                     hive_source_rebalance_bias=source_rebalance_bias,
                     hive_dest_rebalance_bias=dest_rebalance_bias,
                     hive_hint_score_multiplier=hint_multiplier,
