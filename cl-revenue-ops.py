@@ -1706,11 +1706,11 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False,
                                dry_run: bool = False) -> Dict[str, Any]:
     """Run one in-plugin Boltz auto-cycle using existing RPC logic (single-flight).
 
-    DD4 / P1-018: dry_run defaults False so the scheduled daemon path keeps
-    executing live. The manual RPC (revenue-boltz-auto-cycle-run-now) defaults
-    dry_run True (safe preview) and forwards the operator's choice here; when
-    True the cycle previews (builds the plan, computes profitability) without
-    creating any swap.
+    DD4 / P1-018 (operator ruling 2026-07-02): dry_run defaults False so both
+    the scheduled daemon path AND the manual RPC (revenue-boltz-auto-cycle-run-now)
+    run live by default — force=true alone runs one live cycle. dry_run=true is
+    an opt-in preview (builds the plan, computes profitability) without creating
+    any swap.
     """
     if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
         result = {
@@ -8464,14 +8464,15 @@ def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
 
 @plugin.method("revenue-boltz-auto-cycle-run-now")
 def revenue_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False,
-                                     dry_run: bool = True) -> Dict[str, Any]:
+                                     dry_run: bool = False) -> Dict[str, Any]:
     """Trigger one immediate Boltz auto-cycle run using scheduler settings.
 
-    DD4 / P1-018: dry_run defaults True (SAFE preview) so an operator can see
-    what the cycle would do without creating any swap. Pass dry_run=false to
-    execute live. force=true still bypasses the boltz_auto_cycle_enabled toggle
-    (run one cycle while the scheduler is off); to run a LIVE cycle while
-    disabled, combine force=true with dry_run=false.
+    DD4 / P1-018 (operator ruling 2026-07-02): dry_run defaults False —
+    `force=true` alone runs a LIVE cycle (preserves the prior "run one now"
+    semantics and bypasses the boltz_auto_cycle_enabled toggle). The dry_run
+    option is exposed so an operator CAN preview with dry_run=true, but the
+    default is not a preview. All economic gates (budget/cooldown/profit/
+    pending-swap) still apply to the live run.
     """
     try:
         result = _run_boltz_auto_cycle_once(

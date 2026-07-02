@@ -85,16 +85,29 @@ def test_live_run_executes_swap():
     bm.loop_out.assert_called_once()
 
 
-def test_rpc_defaults_to_dry_run():
+def test_rpc_defaults_to_live_run():
+    # DD4 operator ruling 2026-07-02: dry_run defaults False; force=true alone
+    # runs live (prior "run one now" semantics). Preview is opt-in (dry_run=true).
     mod = load_plugin_module()
-    mod._run_boltz_auto_cycle_once = MagicMock(return_value={"status": "dry_run"})
+    mod._run_boltz_auto_cycle_once = MagicMock(return_value={"status": "executed"})
     mod._boltz_auto_cycle_mark_state = MagicMock()
 
     mod.revenue_boltz_auto_cycle_run_now(mod.plugin)
 
     _, kwargs = mod._run_boltz_auto_cycle_once.call_args
-    assert kwargs["dry_run"] is True
+    assert kwargs["dry_run"] is False
     assert kwargs["force"] is False
+
+
+def test_rpc_dry_run_opt_in_previews():
+    mod = load_plugin_module()
+    mod._run_boltz_auto_cycle_once = MagicMock(return_value={"status": "dry_run"})
+    mod._boltz_auto_cycle_mark_state = MagicMock()
+
+    mod.revenue_boltz_auto_cycle_run_now(mod.plugin, dry_run=True)
+
+    _, kwargs = mod._run_boltz_auto_cycle_once.call_args
+    assert kwargs["dry_run"] is True
 
 
 def test_rpc_force_live_when_explicitly_requested():
