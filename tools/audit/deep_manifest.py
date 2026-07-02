@@ -371,24 +371,46 @@ def check_drift() -> int:
         return 2
     chunks = parse_manifest(MANIFEST_PATH)
     # Compute current blob per distinct file once.
-    files = sorted({c.file for c in chunks})
-    current = blob_hashes(files)
-    for f in files:
+    manifest_files = sorted({c.file for c in chunks})
+    current = blob_hashes(manifest_files)
+    for f in manifest_files:
         if f not in current:
             current[f] = current_blob_hash(f) or "MISSING"
 
+    # (P5-006) Reconcile the recorded manifest against the LIVE tracked source
+    # set. Parsing the manifest alone is blind to a source file added after the
+    # last generate (never chunked, so never audited) or a manifest file that
+    # has since been deleted. Enumerate live sources and diff the file sets.
+    manifest_set = set(manifest_files)
+    live_set = set(enumerate_source_files())
+    added = sorted(live_set - manifest_set)      # tracked source, not in manifest
+    removed = sorted(manifest_set - live_set)    # in manifest, no longer a source
+
     drifted = [c for c in chunks if current.get(c.file) != c.blob]
-    if not drifted:
-        print(f"CLEAN: {len(chunks)} chunks across {len(files)} files; "
-              "no blob drift since manifest was written.")
+
+    if not drifted and not added and not removed:
+        print(f"CLEAN: {len(chunks)} chunks across {len(manifest_files)} files; "
+              "no blob drift and manifest file set matches live tracked "
+              "sources.")
         return 0
 
-    drifted_files = sorted({c.file for c in drifted})
-    print(f"DRIFT: {len(drifted)} chunk(s) across {len(drifted_files)} file(s) "
-          "need re-attestation (file blob changed since manifest):")
-    for c in drifted:
-        print(f"  {c.chunk_id}  manifest={c.blob[:12]}  "
-              f"current={(current.get(c.file) or 'MISSING')[:12]}")
+    if added:
+        print(f"NEW SOURCE: {len(added)} tracked source file(s) absent from the "
+              "manifest (regenerate to chunk + audit them):")
+        for f in added:
+            print(f"  + {f}")
+    if removed:
+        print(f"REMOVED SOURCE: {len(removed)} manifest file(s) no longer a "
+              "tracked source (regenerate to drop them):")
+        for f in removed:
+            print(f"  - {f}")
+    if drifted:
+        drifted_files = sorted({c.file for c in drifted})
+        print(f"DRIFT: {len(drifted)} chunk(s) across {len(drifted_files)} "
+              "file(s) need re-attestation (file blob changed since manifest):")
+        for c in drifted:
+            print(f"  {c.chunk_id}  manifest={c.blob[:12]}  "
+                  f"current={(current.get(c.file) or 'MISSING')[:12]}")
     return 1
 
 
@@ -398,7 +420,15 @@ def check_drift() -> int:
 
 # findings-ledger row: ID | severity | dimension | file:line@blob | ...
 _LEDGER_ROW_RE = re.compile(r"^\|(?P<cells>.+)\|\s*$")
-_FILELINE_RE = re.compile(r"(?P<file>[^\s|@]+):(?P<line>\d+)(?:@[0-9a-fA-F]+)?")
+# The canonical citation is the PINNED column: `file:line@<blob>`. Only a
+# citation carrying the `@<blob>` suffix is a real pin; a bare `file:line`
+# in a description cell is an incidental cross-reference and must NOT count
+# toward coverage (P5-005). blob may be a hex object id or a symbolic tag
+# such as `map` / `campaign`, so accept any alnum run after `@`.
+_PIN_CITATION_RE = re.compile(r"(?P<file>[^\s|@]+):(?P<line>\d+)@[0-9A-Za-z]+")
+# Column index of the pinned `file:line@blob` cell in a findings-ledger row
+# (ID | severity | dimension | file:line@blob | description | status | ...).
+_PIN_COLUMN_INDEX = 3
 
 # attestation heading: "### <chunk_id>" (EXAMPLE-prefixed headings are skipped).
 _ATTEST_HEADING_RE = re.compile(r"^#{2,4}\s+(?P<rest>.+?)\s*$")
@@ -406,7 +436,14 @@ _ATTEST_FIELD_RE = re.compile(r"^\s*[-*]?\s*chunk_id\s*:\s*(?P<id>\S+)")
 
 
 def parse_ledger_citations(path: str) -> List[Tuple[str, int]]:
-    """Return (file, line) citations from real (non-EXAMPLE) ledger rows."""
+    """Return (file, line) pins from real (non-EXAMPLE) ledger rows.
+
+    Only the canonical pinned column (`file:line@blob`, column index
+    ``_PIN_COLUMN_INDEX``) is scanned, and only citations carrying an
+    ``@<blob>`` suffix count. An incidental ``file:line`` mentioned in a
+    description cell is deliberately ignored so it cannot mark an unrelated
+    chunk COVERED (P5-005).
+    """
     citations: List[Tuple[str, int]] = []
     abs_path = os.path.join(REPO_ROOT, path)
     if not os.path.exists(abs_path):
@@ -424,10 +461,12 @@ def parse_ledger_citations(path: str) -> List[Tuple[str, int]]:
                 continue
             if "EXAMPLE" in raw.upper():
                 continue
-            # Search all cells for file:line@blob citations.
-            for cell in cells:
-                for fm in _FILELINE_RE.finditer(cell):
-                    citations.append((fm.group("file"), int(fm.group("line"))))
+            if len(cells) <= _PIN_COLUMN_INDEX:
+                continue
+            # Scan ONLY the pinned file:line@blob column.
+            pin_cell = cells[_PIN_COLUMN_INDEX]
+            for fm in _PIN_CITATION_RE.finditer(pin_cell):
+                citations.append((fm.group("file"), int(fm.group("line"))))
     return citations
 
 
@@ -493,13 +532,14 @@ def coverage() -> int:
         if cid in by_id and cid not in covered:
             covered[cid] = "attestation"
 
-    # (a) finding citations
+    # (a) finding citations. Match by FULL repo-relative path, not basename,
+    # so a pin to modules/foo.py cannot cover a same-named tools/foo.py chunk
+    # (P5-005).
     for f, line in parse_ledger_citations(LEDGER_PATH):
-        base = os.path.basename(f)
         for c in chunks:
             if c.chunk_id in covered:
                 continue
-            if (c.file == f or os.path.basename(c.file) == base) and c.contains(line):
+            if c.file == f and c.contains(line):
                 covered[c.chunk_id] = "finding"
 
     total = len(chunks)
