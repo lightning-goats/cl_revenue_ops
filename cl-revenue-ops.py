@@ -177,6 +177,211 @@ force_rate_limiter = ForceRateLimiter(max_calls=10, window_seconds=60)
 FORWARD_HYDRATION_EVENT_JITTER_SECONDS = 300
 
 
+# =============================================================================
+# OPERATOR-PARAM VALIDATION HELPERS
+# =============================================================================
+# RPC handlers accept raw operator-supplied params (via lightning-cli or the
+# JSON-RPC surface). These helpers coerce/clamp them BEFORE they reach SQL or
+# regex so a hostile/typo'd value cannot crash a handler or run unbounded.
+
+_QUERY_LIMIT_MAX = 1000
+
+
+class _ParamError(ValueError):
+    """Raised when an operator param cannot be coerced to the expected type."""
+
+
+def _clamp_query_limit(value, default=20, lo=1, hi=_QUERY_LIMIT_MAX):
+    """Coerce ``value`` to an int and clamp it into [lo, hi].
+
+    Raises ``_ParamError`` for non-integer input so the caller can return a
+    clean error dict rather than leaking a ValueError/TypeError. A negative
+    limit is clamped to ``lo`` (never passed to SQLite, where LIMIT -1 means
+    "unbounded" and would return the whole table).
+    """
+    try:
+        ivalue = int(value)
+    except (ValueError, TypeError) as e:
+        raise _ParamError(f"limit must be an integer, got {value!r}") from e
+    return max(lo, min(ivalue, hi))
+
+
+def _snapshot_peers_once():
+    """Record a one-shot connection snapshot for currently connected peers.
+
+    Extracted from ``snapshot_peers_delayed`` so it can be unit-tested and so
+    the thread-local SQLite connection it opens is always released.
+
+    P1-021: this runs on a one-shot startup thread. Without an explicit
+    ``close_connection()`` the thread-local SQLite connection stays referenced
+    (via the DB's thread-connection tracking) until process shutdown. Close it
+    in a ``finally`` so the one-shot thread does not retain a connection.
+    """
+    try:
+        peers = data_service.get_peers() if data_service else safe_plugin.rpc.listpeers()
+        connected_count = 0
+        snapshot_count = 0
+
+        for peer in peers.get("peers", []):
+            if peer.get("connected", False):
+                connected_count += 1
+                peer_id = peer["id"]
+                # Only snapshot if no recent history exists
+                if not database.has_recent_connection_history(peer_id, 3600):
+                    database.record_connection_event(peer_id, "snapshot")
+                    snapshot_count += 1
+
+        plugin.log(f"Startup snapshot: Recorded {snapshot_count} of {connected_count} connected peers")
+    except Exception as e:
+        plugin.log(f"Error in delayed snapshot: {e}", level='warn')
+        plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')  # SEC-2: Stack traces at debug level
+    finally:
+        # P1-021: release this one-shot thread's thread-local DB connection.
+        if database is not None:
+            try:
+                database.close_connection()
+            except Exception:
+                pass
+
+
+# =============================================================================
+# INIT-TIME CONFIG OPTION VALIDATION (P1-008 / P1-009 / P1-026)
+# =============================================================================
+# Config(**kwargs) is constructed once at init from operator-supplied options.
+# The upstream _safe_int/_safe_float parsers validate type but not range; a
+# 0/negative/out-of-band numeric or a typo'd enum would otherwise be accepted
+# and fail open (e.g. rpc-timeout-seconds=0 breaks every RPC). These helpers
+# clamp/correct such values with a loud warning, matching the warn+repair
+# style used by Config._apply_override / load_overrides for the runtime path.
+
+# Numeric options range-checked at init. Ranges mirror CONFIG_FIELD_RANGES so
+# init and the runtime-override path agree on what is in-band.
+_INIT_NUMERIC_RANGES = {
+    'rpc_timeout_seconds': (1, 300),
+    'daily_budget_sats': (0, 10_000_000),
+    'weekly_budget_sats': (0, 70_000_000),
+    'reputation_decay': (0.0, 1.0),
+    'htlc_congestion_threshold': (0.0, 1.0),
+}
+
+
+def _init_warn(log, msg):
+    if log is not None:
+        try:
+            log(msg, level='warn')
+        except Exception:
+            pass
+
+
+def _validate_numeric_config_options(kwargs, log=None):
+    """P1-008: clamp init numeric options into safe ranges (warn on clamp)."""
+    for key, (lo, hi) in _INIT_NUMERIC_RANGES.items():
+        if key not in kwargs:
+            continue
+        val = kwargs[key]
+        try:
+            num = float(val) if isinstance(lo, float) or isinstance(hi, float) else int(val)
+        except (ValueError, TypeError):
+            # Type is enforced upstream by _safe_int/_safe_float; leave as-is.
+            continue
+        clamped = max(lo, min(num, hi))
+        if clamped != num:
+            _init_warn(log, f"Config option {key}={num} out of range [{lo}, {hi}]; clamped to {clamped}")
+            kwargs[key] = clamped
+    return kwargs
+
+
+def _enforce_fee_bound_invariant(kwargs, log=None):
+    """P1-009: enforce min_fee_ppm <= max_fee_ppm (swap with warning).
+
+    Inverted bounds would otherwise silently pin fees to a low ceiling and
+    suppress revenue with no crash or warning.
+    """
+    if 'min_fee_ppm' not in kwargs or 'max_fee_ppm' not in kwargs:
+        return kwargs
+    try:
+        mn = int(kwargs['min_fee_ppm'])
+        mx = int(kwargs['max_fee_ppm'])
+    except (ValueError, TypeError):
+        return kwargs
+    if mn > mx:
+        _init_warn(log, f"Config min_fee_ppm ({mn}) > max_fee_ppm ({mx}); swapping to keep min <= max")
+        kwargs['min_fee_ppm'], kwargs['max_fee_ppm'] = mx, mn
+    return kwargs
+
+
+# Enum-style options validated at init and their documented defaults. Valid
+# value sets come from Config.STRING_ENUM_VALID_VALUES where present;
+# base_fee_policy is not registered there and only means off/adaptive.
+_INIT_ENUM_DEFAULTS = {
+    'market_fee_mode': 'undercut',
+    'base_fee_policy': 'off',
+    'fee_profile': 'active',
+    'expansion_treasury_preferred_currency': 'BTC',
+}
+_BASE_FEE_POLICY_VALID = ('off', 'adaptive')
+
+
+def _valid_enum_values(key):
+    """Return the valid value tuple for an enum option, or None if unknown."""
+    try:
+        from modules.config import STRING_ENUM_VALID_VALUES
+        if key in STRING_ENUM_VALID_VALUES:
+            return STRING_ENUM_VALID_VALUES[key]
+    except Exception:
+        pass
+    if key == 'base_fee_policy':
+        return _BASE_FEE_POLICY_VALID
+    return None
+
+
+def _validate_enum_config_options(kwargs, log=None):
+    """P1-026: validate enum-style string options; unknown -> warn + default."""
+    for key, default in _INIT_ENUM_DEFAULTS.items():
+        if key not in kwargs:
+            continue
+        valid = _valid_enum_values(key)
+        if not valid:
+            continue
+        val = kwargs[key]
+        if val not in valid:
+            _init_warn(log, f"Config option {key}={val!r} not one of {tuple(valid)}; using default {default!r}")
+            kwargs[key] = default
+    return kwargs
+
+
+_ATEXIT_SHUTDOWN_TIMEOUT = 10.0
+
+
+def _bounded_executor_shutdown(executor, timeout=_ATEXIT_SHUTDOWN_TIMEOUT):
+    """Shut down a ThreadPoolExecutor without blocking process exit forever.
+
+    P1-029: ``executor.shutdown(wait=True, cancel_futures=True)`` can only
+    cancel QUEUED futures; an in-flight worker blocked on a wedged lightningd
+    ``recv()`` cannot be cancelled, so a plain ``wait=True`` call blocks atexit
+    indefinitely (relies on external SIGKILL). Run the draining shutdown on a
+    daemon thread and join with a timeout: on a healthy node the join returns
+    immediately (unchanged behavior); on a wedged node atexit proceeds after
+    ``timeout`` and lets the process exit.
+
+    Returns True if the executor drained within the timeout, else False.
+    """
+    if executor is None:
+        return True
+    done = threading.Event()
+
+    def _drain():
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=_drain, name="rpc-shutdown", daemon=True).start()
+    return done.wait(timeout)
+
+
 def _compute_forward_hydration_start(
     last_forward_ts: Optional[int],
     flow_window_days: int,
@@ -297,6 +502,98 @@ class RPCOverloadedError(RPCTimeoutError):
         RpcError.__init__(self, method, {}, f"RPC worker pool saturated for method: {method}")
 
 
+# =============================================================================
+# RPC SOCKET-LEVEL TIMEOUT (P1-007)
+# =============================================================================
+# pyln opens a fresh Unix socket per call and blocks in recv() with no timeout.
+# When lightningd wedges, every worker thread blocks on recv() forever and the
+# 16-thread pool is permanently consumed with no self-recovery. The proxy's
+# future.result(timeout) frees the *caller* but not the *worker*.
+#
+# Fix: apply a socket-level recv timeout to the per-call socket. pyln creates
+# the socket internally, so we patch UnixSocket.connect once to read a
+# per-thread desired timeout (set by the worker before it runs the RPC) and
+# apply it via socket.settimeout(). Long-poll methods (wait*) intentionally
+# block indefinitely and are exempted so healthy-node behavior is unchanged.
+
+# Per-worker-thread desired socket timeout (seconds) or None to disable.
+_rpc_socket_timeout = threading.local()
+
+# Backstop buffer added on top of the proxy timeout: the caller-side
+# future.result(proxy_timeout) fires first (preserving the RPCTimeoutError the
+# caller already expects); the socket timeout is the slightly-later backstop
+# that frees the wedged worker.
+_RPC_SOCKET_TIMEOUT_BUFFER = 5.0
+
+# Methods that legitimately block for a long time; never given a socket
+# timeout so their behavior is unchanged.
+_LONG_POLL_RPC_METHODS = frozenset({
+    "wait", "waitanyinvoice", "waitinvoice", "waitsendpay",
+    "waitblockheight", "waitrune",
+})
+
+
+def _socket_timeout_for(method_name, proxy_timeout):
+    """Return the socket recv timeout for a method, or None to leave unbounded.
+
+    Long-poll (wait*) methods return None. All others return
+    ``proxy_timeout + _RPC_SOCKET_TIMEOUT_BUFFER`` so the caller-side timeout
+    fires first and the socket timeout is a backstop that frees the worker.
+    """
+    name = str(method_name or "")
+    if name in _LONG_POLL_RPC_METHODS or name.startswith("wait"):
+        return None
+    try:
+        base = float(proxy_timeout)
+    except (ValueError, TypeError):
+        base = 30.0
+    if base <= 0:
+        return None
+    return base + _RPC_SOCKET_TIMEOUT_BUFFER
+
+
+def _install_rpc_socket_timeout(log=None):
+    """Patch pyln's UnixSocket.connect to honor the per-thread socket timeout.
+
+    Best-effort and idempotent. Returns True if the patch is installed (or was
+    already), False if pyln's internals are not the expected shape in this
+    version — in which case the caller-side future timeout remains the only
+    guard (documented residual for P1-007).
+    """
+    try:
+        from pyln.client import lightning as _pyln_lightning
+    except Exception:
+        return False
+    unix_socket_cls = getattr(_pyln_lightning, "UnixSocket", None)
+    if unix_socket_cls is None or not hasattr(unix_socket_cls, "connect"):
+        return False
+    if getattr(unix_socket_cls, "_revops_timeout_patched", False):
+        return True
+    try:
+        _orig_connect = unix_socket_cls.connect
+
+        def _connect_with_timeout(self, *args, **kwargs):
+            _orig_connect(self, *args, **kwargs)
+            desired = getattr(_rpc_socket_timeout, "value", None)
+            sock = getattr(self, "sock", None)
+            if desired and sock is not None:
+                try:
+                    sock.settimeout(float(desired))
+                except Exception:
+                    pass
+
+        unix_socket_cls.connect = _connect_with_timeout
+        unix_socket_cls._revops_timeout_patched = True
+        if log is not None:
+            try:
+                log("RPC socket-level timeout guard installed", level="debug")
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
 class ThreadSafeRpcProxy:
     """
     Thread-safe RPC proxy using a ThreadPoolExecutor for timeout protection.
@@ -331,6 +628,11 @@ class ThreadSafeRpcProxy:
         self._async_submit_slots = threading.Semaphore(4 + 64)   # explicit async pushes only
         self._async_fail_count = 0
         self._async_lock = threading.Lock()  # L-4: Protect _async_fail_count
+        # P1-007: install the pyln socket-level timeout guard so a wedged
+        # lightningd cannot permanently consume all worker threads.
+        self._socket_timeout_installed = _install_rpc_socket_timeout(
+            getattr(plugin_instance, "log", None)
+        )
 
     def __getattr__(self, name):
         if name in ("_plugin", "_rpc", "_executor", "_async_executor",
@@ -378,8 +680,23 @@ class ThreadSafeRpcProxy:
                 level="warn"
             )
             raise RPCOverloadedError(method_name)
+
+        # P1-007: run the RPC in a wrapper that sets a per-thread desired
+        # socket timeout before the call opens its pyln socket, so a wedged
+        # lightningd surfaces socket.timeout in the worker and frees it rather
+        # than blocking recv() forever. Long-poll methods get None (unbounded).
+        sock_timeout = _socket_timeout_for(method_name, proxy_timeout)
+
+        def _worker():
+            prev = getattr(_rpc_socket_timeout, "value", None)
+            _rpc_socket_timeout.value = sock_timeout
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _rpc_socket_timeout.value = prev
+
         try:
-            future = self._executor.submit(fn, *args, **kwargs)
+            future = self._executor.submit(_worker)
         except Exception:
             self._main_submit_slots.release()
             raise
@@ -1622,10 +1939,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             pass
         if safe_plugin and hasattr(safe_plugin, 'rpc'):
             try:
-                # cancel_futures drops queued-but-unstarted RPC work so exit
-                # only waits on in-flight calls, which the proxy timeouts bound.
-                safe_plugin.rpc._executor.shutdown(wait=True, cancel_futures=True)
-                safe_plugin.rpc._async_executor.shutdown(wait=True, cancel_futures=True)
+                # P1-029: cancel_futures drops queued-but-unstarted RPC work,
+                # but an in-flight worker blocked on a wedged lightningd cannot
+                # be cancelled. Bound the drain so atexit can never block the
+                # process exit forever waiting on such a worker.
+                if not _bounded_executor_shutdown(safe_plugin.rpc._executor):
+                    plugin.log(
+                        "RPC executor did not drain within shutdown timeout; proceeding with exit",
+                        level='warn'
+                    )
+                _bounded_executor_shutdown(safe_plugin.rpc._async_executor)
             except Exception:
                 pass
 
@@ -1798,6 +2121,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalance_router='v3',
         askrene_layers=str(options.get('revenue-ops-askrene-layers', '') or '').strip() or 'hive-fleet',
     )
+    # P1-008: range-validate numeric options before Config construction so a
+    # 0/negative/out-of-band value can never fail open.
+    _validate_numeric_config_options(config_kwargs, log=plugin.log)
+    # P1-009: enforce min_fee_ppm <= max_fee_ppm before construction.
+    _enforce_fee_bound_invariant(config_kwargs, log=plugin.log)
+    # P1-026: validate enum-style options before construction.
+    _validate_enum_config_options(config_kwargs, log=plugin.log)
+
     configured_router = str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower()
     if configured_router != 'v3':
         plugin.log(
@@ -2387,25 +2718,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         if shutdown_event.wait(delay_seconds):
             plugin.log("Startup snapshot cancelled due to shutdown signal")
             return
-        
-        try:
-            peers = data_service.get_peers() if data_service else safe_plugin.rpc.listpeers()
-            connected_count = 0
-            snapshot_count = 0
 
-            for peer in peers.get("peers", []):
-                if peer.get("connected", False):
-                    connected_count += 1
-                    peer_id = peer["id"]
-                    # Only snapshot if no recent history exists
-                    if not database.has_recent_connection_history(peer_id, 3600):
-                        database.record_connection_event(peer_id, "snapshot")
-                        snapshot_count += 1
-            
-            plugin.log(f"Startup snapshot: Recorded {snapshot_count} of {connected_count} connected peers")
-        except Exception as e:
-            plugin.log(f"Error in delayed snapshot: {e}", level='warn')
-            plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')  # SEC-2: Stack traces at debug level
+        # P1-021: delegate to the extracted helper, which closes the
+        # thread-local DB connection before this one-shot thread exits.
+        _snapshot_peers_once()
 
     def financial_snapshot_loop():
         """
@@ -2802,7 +3118,12 @@ def _hive_hints_status_for_debug(plugin: Plugin, max_segment_scores: int = 20) -
             int(entry.get("direction", 0) or 0),
         )
     )
-    max_segment_scores = max(0, int(max_segment_scores or 0))
+    # P1-012: coerce operator-supplied max_segment_scores; a non-int must not
+    # raise ValueError out of a diagnostic handler.
+    try:
+        max_segment_scores = max(0, int(max_segment_scores or 0))
+    except (ValueError, TypeError):
+        max_segment_scores = 0
     if max_segment_scores:
         segment_scores = segment_scores[:max_segment_scores]
     hive_status["segment_scores_count"] = len(segment_scores)
@@ -2882,7 +3203,12 @@ def revenue_rebalance_debug(
     filter_peer_id = str(peer_id or "").strip().lower()
     summary_only = bool(summary_only)
     include_hot_markers = bool(include_hot_markers) and not summary_only
-    max_candidates = max(0, int(max_candidates or 0))
+    # P1-012 class: coerce operator-supplied max_candidates; a non-int must not
+    # raise ValueError/TypeError out of a diagnostic handler.
+    try:
+        max_candidates = max(0, int(max_candidates or 0))
+    except (ValueError, TypeError):
+        max_candidates = 0
 
     result = {
         "executor_available": True,
@@ -3482,6 +3808,10 @@ def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[st
         return {"error": "Plugin not fully initialized"}
 
     # L-22: Validate SCID format if provided
+    # P1-012: guard against non-str channel_id (re.match on a non-str raises
+    # TypeError and leaks a traceback instead of a clean error dict).
+    if channel_id is not None and not isinstance(channel_id, str):
+        return {"error": "channel_id must be a string SCID (e.g., 123x456x789)."}
     if channel_id and not re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id):
         return {"error": f"Invalid channel format: {channel_id}. Use SCID format (e.g., 123x456x789)."}
 
@@ -3558,6 +3888,10 @@ def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any
     """List scored peer candidates for channel opens."""
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
+    try:
+        limit = _clamp_query_limit(limit)
+    except _ParamError as e:
+        return {"error": str(e)}
     candidates = database.get_planner_candidates(limit=limit)
     metabolic_planner_influence = {}
     try:
@@ -3586,6 +3920,10 @@ def revenue_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
     """Get audit log of past planner actions."""
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
+    try:
+        limit = _clamp_query_limit(limit)
+    except _ParamError as e:
+        return {"error": str(e)}
     actions = database.get_planner_actions(limit=limit)
     return {"actions": actions, "count": len(actions)}
 
@@ -3615,6 +3953,9 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
         return {"status": "error", "error": "fee_ppm must be an integer"}
 
     # SCID, full channel_id, or peer ID format check
+    # P1-012: guard against non-str channel_id before regex matching.
+    if not isinstance(channel_id, str):
+        return {"status": "error", "error": "channel_id must be a string"}
     if not (
         re.match(r'^\d+[x:]\d+[x:]\d+$', channel_id)
         or re.match(r'^[0-9a-fA-F]{64}$', channel_id)
@@ -3669,9 +4010,10 @@ def revenue_rebalance(plugin: Plugin,
     # Native route execution is handled by RebalanceEngineV2.
 
     # L-21: Validate SCID format
+    # P1-012: guard against non-str channel args before regex matching.
     for cid in (from_channel, to_channel):
-        if not re.match(r'^\d+[x:]\d+[x:]\d+$', cid):
-            return {"status": "error", "error": f"Invalid channel format for {cid}. Use SCID format (e.g., 123x456x789)."}
+        if not isinstance(cid, str) or not re.match(r'^\d+[x:]\d+[x:]\d+$', cid):
+            return {"status": "error", "error": f"Invalid channel format for {cid!r}. Use SCID format (e.g., 123x456x789)."}
 
     # 1. Validation
     try:
@@ -4533,6 +4875,11 @@ def revenue_config(
     if config is None or database is None:
         return {"error": "Plugin not initialized"}
 
+    # P1-012 class: guard non-str key before hasattr/getattr(config, key),
+    # which raise TypeError for a non-string attribute name.
+    if key is not None and not isinstance(key, str):
+        return {"error": "config key must be a string"}
+
     def _not_public_error(runtime_key: str) -> Dict[str, Any]:
         return {"error": f"Key '{runtime_key}' is not a public runtime control"}
     
@@ -4628,7 +4975,12 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
         return {"error": "Database not initialized"}
 
     # L-23: Clamp window_days to sane range
-    window_days = max(1, min(int(window_days), 365))
+    # P1-012: coerce operator-supplied window_days; a non-int must return a
+    # clean error dict, not leak a ValueError traceback.
+    try:
+        window_days = max(1, min(int(window_days), 365))
+    except (ValueError, TypeError):
+        return {"error": "window_days must be an integer"}
 
     try:
         # Get TLV (Total Liquidating Value)
@@ -7986,7 +8338,12 @@ def _execute_boltz_balance_cycle(
     recommendations = list(plan.get("recommendations", []))
     budget = plan.get("budget", {}) if isinstance(plan.get("budget"), dict) else {}
     remaining_budget = int(budget.get("remaining_24h_sats_estimate", 0) or 0)
-    cooldown_seconds = max(0, int(float(cooldown_hours) * 3600))
+    # P1-012 class: coerce operator-supplied cooldown_hours; a non-numeric must
+    # not raise out of the balance-cycle path. Fall back to the 4h default.
+    try:
+        cooldown_seconds = max(0, int(float(cooldown_hours) * 3600))
+    except (ValueError, TypeError):
+        cooldown_seconds = 4 * 3600
 
     executed: List[Dict[str, Any]] = []
     skipped_exec: List[Dict[str, Any]] = []
