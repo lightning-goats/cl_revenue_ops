@@ -291,6 +291,25 @@ def _validate_numeric_config_options(kwargs, log=None):
     return kwargs
 
 
+def _enforce_fee_bound_invariant(kwargs, log=None):
+    """P1-009: enforce min_fee_ppm <= max_fee_ppm (swap with warning).
+
+    Inverted bounds would otherwise silently pin fees to a low ceiling and
+    suppress revenue with no crash or warning.
+    """
+    if 'min_fee_ppm' not in kwargs or 'max_fee_ppm' not in kwargs:
+        return kwargs
+    try:
+        mn = int(kwargs['min_fee_ppm'])
+        mx = int(kwargs['max_fee_ppm'])
+    except (ValueError, TypeError):
+        return kwargs
+    if mn > mx:
+        _init_warn(log, f"Config min_fee_ppm ({mn}) > max_fee_ppm ({mx}); swapping to keep min <= max")
+        kwargs['min_fee_ppm'], kwargs['max_fee_ppm'] = mx, mn
+    return kwargs
+
+
 def _compute_forward_hydration_start(
     last_forward_ts: Optional[int],
     flow_window_days: int,
@@ -1915,6 +1934,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # P1-008: range-validate numeric options before Config construction so a
     # 0/negative/out-of-band value can never fail open.
     _validate_numeric_config_options(config_kwargs, log=plugin.log)
+    # P1-009: enforce min_fee_ppm <= max_fee_ppm before construction.
+    _enforce_fee_bound_invariant(config_kwargs, log=plugin.log)
 
     configured_router = str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower()
     if configured_router != 'v3':
