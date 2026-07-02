@@ -3967,10 +3967,27 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
     if not force:
         if fee_ppm < config.min_fee_ppm or fee_ppm > config.max_fee_ppm:
             return {
-                "status": "error", 
+                "status": "error",
                 "error": f"Fee {fee_ppm} is outside configured range [{config.min_fee_ppm}, {config.max_fee_ppm}]. Use force=true to override."
             }
-    
+
+    # DD2 / P1-001, P1-004: the [min_fee_ppm, max_fee_ppm] rail and the absolute
+    # ceiling bind even under force. force may bypass soft gates (deadband,
+    # cooldown, sleep) but NEVER the hard fee rails — an above-max force set is
+    # clamped to max, a below-min force set is raised to min, and fee_ppm can
+    # never be set to 0 below min_fee_ppm.
+    hard_min = int(config.min_fee_ppm)
+    hard_max = min(int(config.max_fee_ppm), int(FeeController.ABS_MAX_FEE_PPM))
+    requested_fee_ppm = fee_ppm
+    fee_ppm = max(hard_min, min(hard_max, fee_ppm))
+    fee_rail_clamped = fee_ppm != requested_fee_ppm
+    if fee_rail_clamped:
+        plugin.log(
+            f"revenue-set-fee: clamped requested {requested_fee_ppm} to hard rail "
+            f"[{hard_min}, {hard_max}] ppm for {channel_id[:16]}",
+            level='warn',
+        )
+
     try:
         result = fee_controller.set_channel_fee(channel_id, fee_ppm, manual=True, enforce_limits=(not force))
         if not result.get("success"):
@@ -3981,7 +3998,11 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
             }
         applied_fee = result.get("fee_ppm", fee_ppm)
         resolved_channel = result.get("channel_id", channel_id)
-        return {"status": "success", "channel": resolved_channel, "new_fee_ppm": applied_fee, **result}
+        out = {"status": "success", "channel": resolved_channel, "new_fee_ppm": applied_fee, **result}
+        if fee_rail_clamped:
+            out["requested_fee_ppm"] = requested_fee_ppm
+            out["clamped_to_rail"] = [hard_min, hard_max]
+        return out
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -4001,11 +4022,11 @@ def revenue_rebalance(plugin: Plugin,
     if rebalancer is None:
         return {"error": "Plugin not fully initialized"}
 
-    # MAJOR-09 FIX: Rate limit force operations
-    if force:
-        allowed, msg = force_rate_limiter.check_rate_limit("revenue-rebalance")
-        if not allowed:
-            return {"status": "error", "error": msg}
+    # DD2 / P1-001: rate-limit BOTH force and non-force manual rebalances (the
+    # prior force-only asymmetry let force=false spam the money path un-gated).
+    allowed, msg = force_rate_limiter.check_rate_limit("revenue-rebalance")
+    if not allowed:
+        return {"status": "error", "error": msg}
 
     # Native route execution is handled by RebalanceEngineV2.
 
@@ -4022,7 +4043,24 @@ def revenue_rebalance(plugin: Plugin,
             return {"status": "error", "error": "amount_sats must be at least 1"}
     except (ValueError, TypeError):
         return {"status": "error", "error": "amount_sats must be an integer"}
-        
+
+    # DD2 / P1-004: a hard maximum rebalance amount binds regardless of force.
+    # force may bypass soft budget/cooldown gates but never the absolute amount
+    # rail — an over-cap amount is rejected under both force values.
+    try:
+        hard_max_amount = int(getattr(config, "rebalance_max_amount", 0) or 0) if config is not None else 0
+    except (ValueError, TypeError):
+        hard_max_amount = 0
+    if hard_max_amount > 0 and amount_sats > hard_max_amount:
+        return {
+            "status": "error",
+            "error": f"amount_sats {amount_sats} exceeds hard rebalance cap "
+                     f"{hard_max_amount} (rebalance_max_amount); rejected even under force.",
+            "requested_sats": amount_sats,
+            "max_amount_sats": hard_max_amount,
+        }
+
+
     if max_fee_sats is not None:
         try:
             max_fee_sats = int(max_fee_sats)
