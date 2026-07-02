@@ -3757,6 +3757,11 @@ class Database:
         if not cat:
             return False
         meta_json = json.dumps(metadata or {}, sort_keys=True) if metadata else None
+        # P2-003: The terminal-state guard SELECT and the INSERT OR REPLACE are a
+        # read-then-write pair. Wrap them in one BEGIN IMMEDIATE so the status
+        # check and the write cannot interleave with (or be split by a crash
+        # from) another writer touching the same reservation_id.
+        conn.execute("BEGIN IMMEDIATE")
         try:
             # Guard: INSERT OR REPLACE would otherwise resurrect a terminal
             # ('spent'/'released') reservation_id back to 'active', double
@@ -3769,6 +3774,7 @@ class Database:
             if existing is not None:
                 status = existing["status"] if not isinstance(existing, tuple) else existing[0]
                 if str(status) in ("spent", "released"):
+                    conn.execute("COMMIT")
                     self.plugin.log(
                         f"Spend reservation {rid} already {status}; refusing to "
                         "resurrect to active",
@@ -3780,8 +3786,13 @@ class Database:
                 (reservation_id, category, subcategory, reserved_sats, reserved_at, reference_id, channel_id, status, metadata_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
             """, (rid, cat, subcategory, amount, now, reference_id, channel_id, meta_json))
+            conn.execute("COMMIT")
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(f"Spend reservation failed: {e}", level='error')
             return False
 
@@ -3801,30 +3812,51 @@ class Database:
         rid = str(reservation_id or "").strip()
         if not rid:
             return False
-        row = conn.execute("""
-            SELECT * FROM spend_reservations WHERE reservation_id = ?
-        """, (rid,)).fetchone()
-        if not row:
-            return False
-        cursor = conn.execute("""
-            UPDATE spend_reservations
-            SET status = 'spent'
-            WHERE reservation_id = ? AND status = 'active'
-        """, (rid,))
-        changed = cursor.rowcount > 0
-        if changed and record_event:
-            amount = self._sanitize_amount(actual_spent_sats if actual_spent_sats is not None else row["reserved_sats"], "actual_spent_sats")
-            self.record_spend_event(
-                event_id=f"resv:{rid}",
-                category=row["category"],
-                amount_sats=amount,
-                subcategory=row["subcategory"],
-                reference_id=row["reference_id"],
-                channel_id=row["channel_id"],
-                source=source or "reservation_settlement",
-                metadata={"reservation_id": rid},
-            )
-        return changed
+        # P2-003: The SELECT → UPDATE → record_spend_event sequence is atomic.
+        # Previously each ran in its own autocommit statement, so a crash (or an
+        # interleaving writer) between the UPDATE (status='spent') and the
+        # spend-event INSERT could leave a reservation marked spent with no
+        # matching spend_event (or the reverse). Wrap all three in one
+        # BEGIN IMMEDIATE; record_spend_event runs on the same connection so its
+        # INSERT joins this transaction. If it fails we roll the UPDATE back.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("""
+                SELECT * FROM spend_reservations WHERE reservation_id = ?
+            """, (rid,)).fetchone()
+            if not row:
+                conn.execute("COMMIT")
+                return False
+            cursor = conn.execute("""
+                UPDATE spend_reservations
+                SET status = 'spent'
+                WHERE reservation_id = ? AND status = 'active'
+            """, (rid,))
+            changed = cursor.rowcount > 0
+            if changed and record_event:
+                amount = self._sanitize_amount(actual_spent_sats if actual_spent_sats is not None else row["reserved_sats"], "actual_spent_sats")
+                event_ok = self.record_spend_event(
+                    event_id=f"resv:{rid}",
+                    category=row["category"],
+                    amount_sats=amount,
+                    subcategory=row["subcategory"],
+                    reference_id=row["reference_id"],
+                    channel_id=row["channel_id"],
+                    source=source or "reservation_settlement",
+                    metadata={"reservation_id": rid},
+                )
+                if not event_ok:
+                    # Do not leave the reservation 'spent' without its event.
+                    conn.execute("ROLLBACK")
+                    return False
+            conn.execute("COMMIT")
+            return changed
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     def record_spend_event(self, event_id: str, category: str, amount_sats: int,
                           subcategory: Optional[str] = None, timestamp: Optional[int] = None,
@@ -3909,27 +3941,41 @@ class Database:
         where_sql = " AND ".join(where)
         limit_sql = f" LIMIT {int(limit)}" if limit is not None and int(limit) > 0 else ""
 
-        rows = conn.execute(
-            f"""
-            SELECT reservation_id, reserved_sats
-            FROM spend_reservations
-            WHERE {where_sql}
-            ORDER BY reserved_at ASC{limit_sql}
-            """,
-            tuple(params),
-        ).fetchall()
+        # P2-003: SELECT-then-UPDATE pair. Wrap in one BEGIN IMMEDIATE so the set
+        # we report as released is exactly the set we mark released, with no
+        # window where another writer settles one of these rows between the read
+        # and the bulk update.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT reservation_id, reserved_sats
+                FROM spend_reservations
+                WHERE {where_sql}
+                ORDER BY reserved_at ASC{limit_sql}
+                """,
+                tuple(params),
+            ).fetchall()
 
-        if not rows:
-            return {"released_count": 0, "released_sats": 0, "reservation_ids": []}
+            if not rows:
+                conn.execute("COMMIT")
+                return {"released_count": 0, "released_sats": 0, "reservation_ids": []}
 
-        ids = [str(r["reservation_id"]) for r in rows]
-        released_sats = int(sum(int(r["reserved_sats"] or 0) for r in rows))
+            ids = [str(r["reservation_id"]) for r in rows]
+            released_sats = int(sum(int(r["reserved_sats"] or 0) for r in rows))
 
-        qmarks = ",".join(["?"] * len(ids))
-        conn.execute(
-            f"UPDATE spend_reservations SET status = 'released' WHERE reservation_id IN ({qmarks})",
-            tuple(ids),
-        )
+            qmarks = ",".join(["?"] * len(ids))
+            conn.execute(
+                f"UPDATE spend_reservations SET status = 'released' WHERE reservation_id IN ({qmarks})",
+                tuple(ids),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         return {
             "released_count": len(ids),
             "released_sats": released_sats,

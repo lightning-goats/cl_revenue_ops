@@ -287,3 +287,64 @@ def test_p2_002_concurrent_small_write_during_bulk_insert(tmp_path):
     ).fetchone()["c"] == 600
 
 
+# ---------------------------------------------------------------------------
+# P2-003 — spend-ledger read-then-write pairs must be atomic
+# ---------------------------------------------------------------------------
+def test_p2_003_mark_spent_rolls_back_when_event_fails(tmp_path):
+    """If record_spend_event fails, the reservation must NOT be left 'spent'
+    (both-or-neither)."""
+    db = _make_db(tmp_path)
+    assert db.reserve_spend("r1", 500, "boltz")
+
+    # Force the event write to fail.
+    db.record_spend_event = lambda *a, **k: False
+
+    result = db.mark_spend_reservation_spent("r1", record_event=True)
+    assert result is False
+
+    conn = db._get_connection()
+    status = conn.execute(
+        "SELECT status FROM spend_reservations WHERE reservation_id = ?", ("r1",)
+    ).fetchone()["status"]
+    assert status == "active", "UPDATE was not rolled back when the event failed"
+    ev = conn.execute("SELECT COUNT(*) AS c FROM spend_events").fetchone()["c"]
+    assert ev == 0
+
+
+def test_p2_003_mark_spent_happy_path_atomic(tmp_path):
+    """Normal settlement records BOTH the status change AND the event."""
+    db = _make_db(tmp_path)
+    assert db.reserve_spend("r2", 700, "boltz")
+
+    assert db.mark_spend_reservation_spent("r2", record_event=True) is True
+
+    conn = db._get_connection()
+    status = conn.execute(
+        "SELECT status FROM spend_reservations WHERE reservation_id = ?", ("r2",)
+    ).fetchone()["status"]
+    assert status == "spent"
+    ev = conn.execute(
+        "SELECT amount_sats FROM spend_events WHERE event_id = ?", ("resv:r2",)
+    ).fetchone()
+    assert ev is not None and ev["amount_sats"] == 700
+
+
+def test_p2_003_reserve_and_release_use_transactions(tmp_path):
+    db = _make_db(tmp_path)
+    conn = db._get_connection()
+    counter = _BeginCounter(conn)
+
+    assert db.reserve_spend("r3", 300, "boltz")
+    assert counter.begins >= 1, "reserve_spend did not open a transaction"
+
+    counter.begins = 0
+    out = db.release_spend_reservations(category="boltz")
+    assert counter.begins >= 1, "release_spend_reservations did not open a transaction"
+    assert out["released_count"] == 1
+    assert out["reservation_ids"] == ["r3"]
+    status = conn.execute(
+        "SELECT status FROM spend_reservations WHERE reservation_id = ?", ("r3",)
+    ).fetchone()["status"]
+    assert status == "released"
+
+
