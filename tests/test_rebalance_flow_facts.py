@@ -55,3 +55,51 @@ def test_get_channel_flow_window_sums_directional(tmp_path):
     assert out_sats == 50_000
     assert in_sats == 15_030
     assert count == 3
+
+
+from modules.rebalance_flow_facts import ChannelFlowFacts, compute_channel_flow_facts
+
+
+class _Cfg:
+    rebalance_activity_window_seconds = 3600
+    rebalance_utilization_window_days = 7
+    rebalance_utilization_floor = 0.05
+    rebalance_utilization_ceiling = 1.0
+    rebalance_utilization_min_forwards = 5
+
+
+def test_realized_utilization_clamped_and_ratio(tmp_path):
+    db = _make_db(tmp_path)
+    now = 2_000_000
+    for i in range(6):
+        _seed(db, out_channel="A", in_channel="B", out_msat=100_000_000, in_msat=100_000_000, ts=now - 100 * (i + 1))
+    facts = compute_channel_flow_facts(db, "A", capacity_sats=1_000_000, now=now, cfg=_Cfg())
+    assert abs(facts.realized_utilization - 0.6) < 1e-6   # 600k out / 1M cap
+    assert facts.utilization_is_realized is True
+    assert facts.forward_count_window == 6
+
+
+def test_thin_history_falls_back_to_prior(tmp_path):
+    db = _make_db(tmp_path)
+    now = 2_000_000
+    _seed(db, out_channel="A", in_channel="B", out_msat=10_000_000, in_msat=10_000_000, ts=now - 50)
+    facts = compute_channel_flow_facts(db, "A", capacity_sats=1_000_000, now=now, cfg=_Cfg())
+    assert facts.utilization_is_realized is False   # 1 fwd < min_forwards 5
+    assert facts.realized_utilization == 0.5
+
+
+def test_zero_capacity_is_safe(tmp_path):
+    db = _make_db(tmp_path)
+    facts = compute_channel_flow_facts(db, "A", capacity_sats=0, now=2_000_000, cfg=_Cfg())
+    assert facts.realized_utilization == 0.5
+    assert facts.utilization_is_realized is False
+    assert facts.out_sats_window == 0 and facts.in_sats_window == 0
+
+
+def test_util_clamped_to_ceiling(tmp_path):
+    db = _make_db(tmp_path)
+    now = 2_000_000
+    for i in range(6):
+        _seed(db, out_channel="A", in_channel="B", out_msat=500_000_000, in_msat=500_000_000, ts=now - 10 * (i + 1))
+    facts = compute_channel_flow_facts(db, "A", capacity_sats=1_000_000, now=now, cfg=_Cfg())
+    assert facts.realized_utilization == 1.0   # 3M/1M clamped to ceiling
