@@ -103,3 +103,15 @@ def test_util_clamped_to_ceiling(tmp_path):
         _seed(db, out_channel="A", in_channel="B", out_msat=500_000_000, in_msat=500_000_000, ts=now - 10 * (i + 1))
     facts = compute_channel_flow_facts(db, "A", capacity_sats=1_000_000, now=now, cfg=_Cfg())
     assert facts.realized_utilization == 1.0   # 3M/1M clamped to ceiling
+
+
+def test_fail_open_on_db_error():
+    class _RaisingDb:
+        def get_channel_flow_window(self, channel_id, since):
+            raise RuntimeError("db exploded")
+    facts = compute_channel_flow_facts(_RaisingDb(), "A", capacity_sats=1_000_000, now=2_000_000, cfg=_Cfg())
+    assert facts.realized_utilization == 0.5
+    assert facts.utilization_is_realized is False
+    assert facts.out_sats_window == 0 and facts.in_sats_window == 0
+    assert facts.forward_count_window == 0
+    assert facts.channel_id == "A"
