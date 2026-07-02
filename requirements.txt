@@ -1,9 +1,39 @@
-# cl-revenue-ops dependencies
+# cl-revenue-ops runtime dependencies (Phase 3C: supply-chain pinned)
+#
+# EXACT PINS. Versions below are the ones actually installed in the local
+# development virtualenv (.venv, Python 3.12.3) that the passing test suite
+# proves compatible. See docs/audit/deep/sbom.cyclonedx.json for the full
+# software bill of materials and requirements.lock for a hash-pinned closure.
+#
+# !!! PRODUCTION DEPLOY GATE !!!
+# This plugin runs live on two production Core Lightning nodes. The pins below
+# were NOT verified against the interpreter those nodes launch the plugin under.
+# Before deploying these pins, confirm each node has the same versions installed
+# (read-only: `python3 -c "import pyln.client,yaml,numpy; ..."` in the node's
+# plugin runtime) OR relax the pin to the node's installed version. Pinning to a
+# version a node does not have will break the plugin on restart. See
+# tools/audit/check_pins.py (CI gate) and CORE_LIGHTNING_COMPATIBILITY.md.
+#
+# NOTE on bech32/base58: intentionally NOT listed. modules/boltz_manager.py
+# reimplements bech32/bech32m/base58check inline (see its address-validation
+# block) specifically to avoid these dependencies. `base58` appears in the venv
+# only as a transitive dep of pyln-proto; nothing in this codebase imports it.
+# `bech32` is neither installed nor imported.
+#
+# NOTE on scipy: tools/audit/contrib_fee_analysis.py and
+# contrib_capital_analysis.py import `scipy.stats`, but scipy is an offline
+# analysis tool, is NOT part of the plugin runtime, and is not installed in the
+# venv. It is deliberately excluded here; install scipy separately to run those
+# audit tools.
 
-# Core Lightning Python client library for Core Lightning v24.11.1+
-pyln-client>=24.11.1
+# Core Lightning Python client library for Core Lightning v24.11.1+.
+# Runtime floor is CLN v24.11.1 (CORE_LIGHTNING_COMPATIBILITY.md); pin is the
+# locally-installed pyln-client. Production nodes may run an older pyln-client
+# matching their CLN -- VERIFY before deploy (see gate above).
+pyln-client==26.4
 
-# Optional: better JSON handling
-# orjson>=3.9.0
-PyYAML>=6.0
-numpy
+# YAML config/validation parsing (tools/revenue_validation_common.py).
+PyYAML==6.0.3
+
+# Numeric flow-state analysis (modules/flow_analysis.py).
+numpy==2.4.2

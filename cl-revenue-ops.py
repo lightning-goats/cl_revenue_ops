@@ -93,6 +93,42 @@ from modules.utils import normalize_scid, parse_msat
 PLUGIN_VERSION = "2.10.0"
 HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
+# Supply-chain / runtime version floors (Phase 3C).
+# These drive NON-FATAL startup probes: a version below floor logs a warning but
+# never blocks init, so a running production node is not bricked by a skew.
+CLN_VERSION_FLOOR = "24.11.1"   # CORE_LIGHTNING_COMPATIBILITY.md minimum
+BOLTZCLI_MIN_VERSION = "2.11.0"  # documented in loop-out/loop-in help text
+
+
+def _parse_version_tuple(raw: Optional[str]):
+    """Extract a numeric (major, minor, patch, ...) tuple from a version string.
+
+    Tolerant of prefixes ("v24.11.1"), suffixes ("2.11.0-beta", "24.11.1gl"),
+    and build metadata. Returns () when no leading numeric component is found,
+    which callers treat as "unknown / skip the comparison".
+    """
+    if not raw:
+        return ()
+    text = str(raw).strip()
+    if text and text[0] in ('v', 'V'):
+        text = text[1:]
+    parts = []
+    for token in re.split(r'[.\-+_ ]', text):
+        m = re.match(r'^(\d+)', token)
+        if not m:
+            break
+        parts.append(int(m.group(1)))
+    return tuple(parts)
+
+
+def _version_below_floor(observed: Optional[str], floor: str) -> Optional[bool]:
+    """Return True if `observed` < `floor`, False if >=, None if undetermined."""
+    obs = _parse_version_tuple(observed)
+    flr = _parse_version_tuple(floor)
+    if not obs or not flr:
+        return None
+    return obs < flr
+
 
 # =============================================================================
 # RATE LIMITER FOR FORCE OPERATIONS (MAJOR-09 FIX)
@@ -2274,6 +2310,79 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     except Exception as e:
         boltz_manager = None
         plugin.log(f"Warning: Failed to initialize Boltz CLI integration: {e}", level='warn')
+
+    # =========================================================================
+    # STARTUP VERSION PROBES (Phase 3C supply-chain)
+    # NON-FATAL: a version below floor logs a warning but never aborts init.
+    # Hard-failing here would brick a running node on a benign version skew.
+    # =========================================================================
+    try:
+        cln_version = None
+        try:
+            cln_version = data_service._ensure_getinfo().get("version")
+        except Exception:
+            cln_version = None
+        below = _version_below_floor(cln_version, CLN_VERSION_FLOOR)
+        if below is True:
+            plugin.log(
+                f"Core Lightning version {cln_version} is BELOW the supported "
+                f"floor v{CLN_VERSION_FLOOR}. The askrene layer lifecycle this "
+                f"plugin depends on may be missing or partial; behavior is "
+                f"unsupported. Upgrade Core Lightning. Continuing anyway.",
+                level='warn'
+            )
+        elif below is None:
+            plugin.log(
+                f"Could not determine Core Lightning version (got {cln_version!r}); "
+                f"skipping the v{CLN_VERSION_FLOOR} floor check.",
+                level='debug'
+            )
+        else:
+            plugin.log(f"Core Lightning version check OK ({cln_version} >= v{CLN_VERSION_FLOOR})")
+    except Exception as e:
+        plugin.log(f"Core Lightning version probe failed (non-fatal): {e}", level='warn')
+
+    # boltzcli --version probe (only when the integration is enabled and a
+    # binary path is configured). Warning-only: a skew must not block init.
+    try:
+        if boltz_manager is not None and getattr(boltz_manager, "enabled", False):
+            import subprocess
+            cli_path = boltz_cfg.cli_path
+            try:
+                proc = subprocess.run(
+                    [cli_path, "--version"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=10,
+                    text=True,
+                )
+                boltz_version_raw = (proc.stdout or "").strip()
+                below = _version_below_floor(boltz_version_raw, BOLTZCLI_MIN_VERSION)
+                if below is True:
+                    plugin.log(
+                        f"boltzcli reports version '{boltz_version_raw}', below the "
+                        f"documented minimum v{BOLTZCLI_MIN_VERSION}. Loop-in/loop-out "
+                        f"channel-pinning and quote fields may differ. Continuing anyway.",
+                        level='warn'
+                    )
+                elif below is None:
+                    plugin.log(
+                        f"Could not parse boltzcli version from '{boltz_version_raw}'; "
+                        f"skipping the v{BOLTZCLI_MIN_VERSION} minimum check.",
+                        level='warn'
+                    )
+                else:
+                    plugin.log(f"boltzcli version check OK ({boltz_version_raw} >= v{BOLTZCLI_MIN_VERSION})")
+            except FileNotFoundError:
+                plugin.log(
+                    f"boltzcli not found at '{cli_path}' during version probe; "
+                    f"Boltz integration is enabled but the binary is missing.",
+                    level='warn'
+                )
+            except subprocess.TimeoutExpired:
+                plugin.log("boltzcli --version timed out (non-fatal); skipping version check", level='warn')
+    except Exception as e:
+        plugin.log(f"boltzcli version probe failed (non-fatal): {e}", level='warn')
 
     # =========================================================================
     # STARTUP DEPENDENCY CHECKS (Stability)
