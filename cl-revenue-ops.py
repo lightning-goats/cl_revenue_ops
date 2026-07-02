@@ -1566,6 +1566,18 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-node-drain-bias-enabled',
+    default='false',
+    description='Enable node-liquidity-aware auto-drain-bias on over-local channel fees when the node is source-heavy (default: false)'
+)
+
+plugin.add_option(
+    name='revenue-ops-node-drain-bias-max',
+    default='0.3',
+    description='Max node-scaled fee discount applied to over-local channels when node-drain-bias is enabled (0.0-0.5)'
+)
+
+plugin.add_option(
     name='revenue-ops-expansion-treasury-enabled',
     default='false',
     description='Enable expansion treasury mode (reverse-swap excess LN to on-chain for opens) (default: false)'
@@ -2234,6 +2246,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         receivable_ratio_floor=_safe_float_opt('revenue-ops-receivable-ratio-floor', '0.20'),
         boltz_structural_budget_sats_per_day=_safe_int_opt('revenue-ops-boltz-structural-budget-sats', '0'),
         drain_fee_discount_max=_safe_float_opt('revenue-ops-drain-fee-discount-max', '0.0'),
+        node_drain_bias_enabled=options.get('revenue-ops-node-drain-bias-enabled', 'false').lower() == 'true',
+        node_drain_bias_max=_safe_float_opt('revenue-ops-node-drain-bias-max', '0.3'),
         expansion_treasury_enabled=options.get('revenue-ops-expansion-treasury-enabled', 'false').lower() == 'true',
         expansion_treasury_onchain_target_sats=_safe_int_opt('revenue-ops-expansion-treasury-onchain-target-sats', '5000000'),
         expansion_treasury_min_deficit_sats=_safe_int_opt('revenue-ops-expansion-treasury-min-deficit-sats', '250000'),

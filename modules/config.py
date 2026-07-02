@@ -55,6 +55,8 @@ PUBLIC_RUNTIME_KEYS = (
     'receivable_ratio_target',
     'receivable_ratio_floor',
     'drain_fee_discount_max',
+    'node_drain_bias_enabled',
+    'node_drain_bias_max',
 )
 
 # Type mapping for config fields (for validation)
@@ -92,6 +94,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'receivable_ratio_floor': float,
     'boltz_structural_budget_sats_per_day': int,
     'drain_fee_discount_max': float,
+    'node_drain_bias_enabled': bool,
+    'node_drain_bias_max': float,
     'expansion_treasury_enabled': bool,
     'expansion_treasury_onchain_target_sats': int,
     'expansion_treasury_min_deficit_sats': int,
@@ -231,6 +235,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'receivable_ratio_floor': (0.0, 1.0),
     'boltz_structural_budget_sats_per_day': (0, 1_000_000),
     'drain_fee_discount_max': (0.0, 0.5),
+    'node_drain_bias_max': (0.0, 0.5),
     'min_wallet_reserve': (0, 100000000),
     'low_liquidity_threshold': (0.0, 1.0),
     'high_liquidity_threshold': (0.0, 1.0),
@@ -378,6 +383,14 @@ class Config:
     # Max bounded fee discount applied to stagnant over-local channels.
     # 0.0 = disabled. 0.10 means fees may be biased down by at most 10%.
     drain_fee_discount_max: float = 0.0
+    # Node-liquidity-aware auto-drain-bias: when the node as a whole is
+    # source-heavy (receivable ratio below target), automatically scale a
+    # drain discount on over-local channels' fees. Default OFF; the feature
+    # is inert until enabled (P6-002: must be wired end-to-end, not a
+    # silent no-op).
+    node_drain_bias_enabled: bool = False
+    # Max node-scaled drain discount (0.0-0.5); only active when enabled.
+    node_drain_bias_max: float = 0.3
     # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
     expansion_treasury_enabled: bool = False
     expansion_treasury_onchain_target_sats: int = 5_000_000
@@ -682,6 +695,7 @@ class Config:
             'receivable_ratio_floor',
             'boltz_structural_budget_sats_per_day',
             'drain_fee_discount_max',
+            'node_drain_bias_max',
         ):
             _min_val, _max_val = CONFIG_FIELD_RANGES[_key]
             _val = getattr(self, _key)
@@ -1135,6 +1149,8 @@ class ConfigSnapshot:
     receivable_ratio_floor: float = 0.20
     boltz_structural_budget_sats_per_day: int = 0
     drain_fee_discount_max: float = 0.0
+    node_drain_bias_enabled: bool = False
+    node_drain_bias_max: float = 0.3
     # Version tracking
     version: int = 0
     
