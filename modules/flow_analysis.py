@@ -89,6 +89,12 @@ DECAY_RANGE = 0.3      # Symmetric range: fast=0.65, slow=0.95
 # =============================================================================
 ENABLE_KALMAN_FILTER = True
 
+# P2-001: Bound (seconds) that the RPC analyze_channel path waits on the shared
+# _analysis_lock before proceeding without it. Fail-open so the pyln dispatch
+# thread is never blocked indefinitely behind a long daemon flow cycle; filter
+# corruption is still prevented by _kalman_lock regardless.
+FLOW_ANALYZE_LOCK_TIMEOUT_SECS = 5.0
+
 # Process noise (Q) - how much we expect flow to change naturally
 # Higher = more responsive but noisier, Lower = smoother but slower
 # All noise parameters are per-hour to avoid dt³ collapse at hourly updates.
@@ -944,70 +950,101 @@ class FlowAnalyzer:
 
         kf = self._get_kalman_filter(channel_id)
 
-        # Calculate time since last update (in hours)
-        now = int(time.time())
-        if kf.state.last_update > 0:
-            dt_hours = (now - kf.state.last_update) / 3600.0
-        else:
-            dt_hours = 24.0  # First run, assume 1 day
-
-        # Cap dt to prevent explosion after long gaps (7 days = 168 hours)
-        dt_hours = min(dt_hours, 168.0)
-
-        # Calculate volatility for process noise adaptation
+        # Calculate volatility for process noise adaptation. This reads the
+        # supplied observation buckets, not the filter state, so it is safe to
+        # compute before taking the lock.
         volatility = self._calculate_kalman_volatility(daily_buckets)
 
-        # Predict step (always runs — grows uncertainty over time)
-        kf.predict(dt_hours, volatility)
+        # P2-001: The entire read-modify-write of the filter (predict + update +
+        # the state reads that build the return value / persisted snapshot) runs
+        # under _kalman_lock. Previously _kalman_lock guarded only the dict
+        # lookup in _get_kalman_filter, leaving kf.predict()/kf.update() free to
+        # interleave when the flow daemon (T1) and the analyze RPC (T0) both hold
+        # the same filter — which torn the covariance and double-applied
+        # observations. The lock is released before any DB write / logging so it
+        # is not held across I/O.
+        nan_recovery_count = 0
+        with self._kalman_lock:
+            # Calculate time since last update (in hours)
+            now = int(time.time())
+            if kf.state.last_update > 0:
+                dt_hours = (now - kf.state.last_update) / 3600.0
+            else:
+                dt_hours = 24.0  # First run, assume 1 day
 
-        # Update step — only when we have real observation data.
-        # Without this guard, channels with no forwards get observation=0.0
-        # which actively pulls the filter toward BALANCED regardless of prior state.
-        innovation = 0.0
-        if has_observation:
-            innovation = kf.update(observed_ratio, confidence)
-        else:
-            # Predict-only: still record that we ran so dt_hours stays accurate
-            kf.state.last_update = int(time.time())
-            # AUDIT FIX I-3: Check for NaN after predict-only path
-            if kf._has_nan():
-                kf._reset_state()
+            # Cap dt to prevent explosion after long gaps (7 days = 168 hours)
+            dt_hours = min(dt_hours, 168.0)
 
-        # L-25: Log warning on NaN recovery
-        if kf._nan_recovery_count > 0:
+            # Predict step (always runs — grows uncertainty over time)
+            kf.predict(dt_hours, volatility)
+
+            # Update step — only when we have real observation data.
+            # Without this guard, channels with no forwards get observation=0.0
+            # which actively pulls the filter toward BALANCED regardless of prior state.
+            innovation = 0.0
+            if has_observation:
+                innovation = kf.update(observed_ratio, confidence)
+            else:
+                # Predict-only: still record that we ran so dt_hours stays accurate
+                kf.state.last_update = int(time.time())
+                # AUDIT FIX I-3: Check for NaN after predict-only path
+                if kf._has_nan():
+                    kf._reset_state()
+
+            # Snapshot the NaN-recovery counter and reset it while we still hold
+            # the lock, then log outside the critical section.
+            nan_recovery_count = kf._nan_recovery_count
+            kf._nan_recovery_count = 0
+
+            # Detect regime change
+            regime_change = kf.is_regime_change(threshold=2.5)
+
+            # Read every value we return / persist while holding the lock so the
+            # caller sees a mutually-consistent snapshot of this filter.
+            uncertainty = kf.get_uncertainty()
+            result_flow_ratio = kf.state.flow_ratio
+            result_flow_velocity = kf.state.flow_velocity
+            result_observation_count = kf.state.observation_count
+            state_snapshot = kf.state.to_dict()
+
+        # L-25: Log warning on NaN recovery (outside the lock)
+        if nan_recovery_count > 0:
             self.plugin.log(
-                f"KALMAN: NaN recovery triggered {kf._nan_recovery_count} time(s) "
+                f"KALMAN: NaN recovery triggered {nan_recovery_count} time(s) "
                 f"for {channel_id[:12]}... — filter state was reset",
                 level='warn'
             )
-            kf._nan_recovery_count = 0
-
-        # Detect regime change
-        regime_change = kf.is_regime_change(threshold=2.5)
 
         if regime_change:
             self.plugin.log(
                 f"KALMAN: Regime change detected for {channel_id[:12]}... "
-                f"(innovation={innovation:.3f}, uncertainty={kf.get_uncertainty():.3f})",
+                f"(innovation={innovation:.3f}, uncertainty={uncertainty:.3f})",
                 level='debug'
             )
 
         # Save state. Predict-only runs are saved too: the predict step still
         # changes covariance (uncertainty growth) and last_update, both of
-        # which must survive restarts for dt accounting to stay correct.
+        # which must survive restarts for dt accounting to stay correct. The
+        # DB write happens outside _kalman_lock using the snapshot taken above.
         if pending_kalman_saves is not None:
             pending_kalman_saves.append(
-                {"channel_id": channel_id, "state": kf.state.to_dict()}
+                {"channel_id": channel_id, "state": state_snapshot}
             )
         else:
-            self._save_kalman_filter(channel_id, kf)
+            try:
+                self.database.save_kalman_state(channel_id, state_snapshot)
+            except Exception as e:
+                self.plugin.log(
+                    f"KALMAN: Failed to save filter state for {channel_id[:12]}...: {e}",
+                    level="warn",
+                )
 
         return (
-            kf.state.flow_ratio,
-            kf.state.flow_velocity,
-            kf.get_uncertainty(),
+            result_flow_ratio,
+            result_flow_velocity,
+            uncertainty,
             regime_change,
-            kf.state.observation_count
+            result_observation_count
         )
 
     def _compute_raw_kalman_observation(
@@ -1682,6 +1719,26 @@ class FlowAnalyzer:
         Returns:
             FlowMetrics for the channel, or None if not found
         """
+        # P2-001: Serialize the RPC analyze path against the flow daemon's bulk
+        # analyze_all_channels cycle using the SAME _analysis_lock, so the two
+        # cannot run a fresh Kalman predict/update on the same filter at the
+        # same instant (concurrent double-applied observation). The acquire is
+        # bounded and fail-open: analyze_channel runs on the pyln dispatch
+        # thread (T0), which also handles forward_event notifications, so we
+        # must not block it indefinitely behind a long bulk cycle held by the
+        # daemon (T1). If we cannot get the lock within the bound we proceed
+        # anyway — corruption is still prevented because every filter mutation
+        # runs under _kalman_lock (see _apply_kalman_filter).
+        acquired_analysis_lock = self._analysis_lock.acquire(
+            timeout=FLOW_ANALYZE_LOCK_TIMEOUT_SECS
+        )
+        try:
+            return self._analyze_channel_impl(channel_id)
+        finally:
+            if acquired_analysis_lock:
+                self._analysis_lock.release()
+
+    def _analyze_channel_impl(self, channel_id: str) -> Optional[FlowMetrics]:
         # Get channel info
         channel = self._get_channel(channel_id)
         if not channel:

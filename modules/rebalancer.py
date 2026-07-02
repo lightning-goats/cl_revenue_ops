@@ -303,6 +303,15 @@ class EVRebalancer:
         self._pending_lock = threading.Lock()  # L-14: Protect _pending dict
         self._our_node_id: Optional[str] = None
         self._fee_cache: Dict[Tuple[str, int], Optional[int]] = {}  # F11 FIX: Initialize in __init__
+        # P2-005: Guards _fee_cache and _peer_inbound_fees. The rebalance daemon
+        # (T3) and a manual force=false rebalance (T0, which bypasses the engine
+        # cycle single-flight) both read/write these instance caches. Without a
+        # lock a `= {}` reset can clear the dict mid-read on the other thread,
+        # raising KeyError or returning a torn/partial fee. The lock is only ever
+        # held for O(1) dict ops — never across an RPC — so it cannot stall the
+        # other thread.
+        self._cache_lock = threading.Lock()
+        self._peer_inbound_fees: Dict[str, Dict[str, int]] = {}
         self._profitability_analyzer: Optional['ChannelProfitabilityAnalyzer'] = None
         self._capex_engine: Optional['CapexBudgetEngine'] = None
 
@@ -1252,7 +1261,8 @@ class EVRebalancer:
         # _report_liquidity_state_from_cycle.
 
         # Initialize ephemeral fee cache for this run (cleared at end)
-        self._fee_cache: Dict[Tuple[str, int], Optional[int]] = {}
+        with self._cache_lock:  # P2-005
+            self._fee_cache = {}
 
         # Thread-safe config snapshot for this rebalance cycle
         cfg = self.config.snapshot()
@@ -1384,7 +1394,8 @@ class EVRebalancer:
             return []
 
         finally:
-            self._fee_cache = {}
+            with self._cache_lock:  # P2-005
+                self._fee_cache = {}
 
     def _calculate_turnover_rate(self, channel_id: str, capacity: int) -> float:
         if capacity <= 0: 
@@ -1694,15 +1705,21 @@ class EVRebalancer:
 
         # Check cache first (memoization for this run)
         cache_key = (peer_id, int(amount_msat or 0))
-        if cache_key in self._fee_cache:
-            return self._fee_cache[cache_key]
+        # P2-005: Read the memo hit and the peer-inbound-fee snapshot atomically,
+        # then compute (possibly with an RPC) OUTSIDE the lock, then store the
+        # memo atomically. The lock is never held across the PRIORITY-2 RPC.
+        with self._cache_lock:
+            if cache_key in self._fee_cache:
+                return self._fee_cache[cache_key]
+            peer_fee_info = self._peer_inbound_fees.get(peer_id)
+            if peer_fee_info is not None:
+                peer_fee_info = dict(peer_fee_info)  # detached copy
 
         result = None
-        
+
         # PRIORITY 1: Use actual peer inbound fee from listpeerchannels.updates.remote
         # This is the most accurate source - directly from our channel state, not gossip
-        if hasattr(self, '_peer_inbound_fees') and peer_id in self._peer_inbound_fees:
-            peer_fee_info = self._peer_inbound_fees[peer_id]
+        if peer_fee_info is not None:
             ppm = int(peer_fee_info.get("fee_ppm", 0) or 0)
             base_msat = int(peer_fee_info.get("base_msat", 0) or 0)
             # Convert base fee to ppm-equivalent at amount_msat
@@ -1737,8 +1754,9 @@ class EVRebalancer:
                 self.plugin.log(f"Failed to query gossip for last-hop fee: {e}", level='debug')
 
         # Cache the result (even if None, to avoid re-querying)
-        self._fee_cache[cache_key] = result
-        
+        with self._cache_lock:  # P2-005
+            self._fee_cache[cache_key] = result
+
         return result
 
 
@@ -1812,15 +1830,20 @@ class EVRebalancer:
                     }
 
                 # Populate peer_id -> peer inbound fee cache for _get_last_hop_fee()
-                # This allows _estimate_inbound_fee() to use actual fees instead of gossip
-                self._peer_inbound_fees = {}
+                # This allows _estimate_inbound_fee() to use actual fees instead of gossip.
+                # P2-005: Build the new map locally, then swap it in under the lock
+                # so a concurrent _get_last_hop_fee never sees a half-populated map
+                # (no RPC inside the lock — channels is already materialised).
+                rebuilt: Dict[str, Dict[str, int]] = {}
                 for scid, info in channels.items():
                     peer_id = info.get("peer_id")
                     if peer_id and info.get("peer_inbound_fee_ppm") is not None:
-                        self._peer_inbound_fees[peer_id] = {
+                        rebuilt[peer_id] = {
                             "fee_ppm": info["peer_inbound_fee_ppm"],
                             "base_msat": info.get("peer_inbound_base_msat", 0) or 0
                         }
+                with self._cache_lock:
+                    self._peer_inbound_fees = rebuilt
 
                 return channels
 

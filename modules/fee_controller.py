@@ -2604,6 +2604,13 @@ class FeeController:
         self._hive_member_set_at: Dict[str, int] = {}
         self._hive_member_released_peers: set[str] = set()
         self._hive_member_advisory_peers: set[str] = set()
+        # P2-006: These three hive-gate collections are mutated by the fee cycle
+        # (T2) and by hint-update / forward_event paths (T0) via check-then-act
+        # sequences (`if x in s: s.discard(x)`, get+set+add). A dedicated
+        # fine-grained lock — NOT _state_lock, which the cycle holds across
+        # RPC+DB for a long time — keeps each composite op atomic without
+        # coupling a fast T0 caller to the long cycle lock.
+        self._hive_member_lock = threading.Lock()
 
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
@@ -2735,23 +2742,26 @@ class FeeController:
             return 900
 
     def _cached_hive_membership_active(self, peer_id: str) -> bool:
-        last_set = self._hive_member_set_at.get(peer_id)
+        with self._hive_member_lock:  # P2-006
+            last_set = self._hive_member_set_at.get(peer_id)
         if last_set is None:
             return False
         return int(time.time()) - int(last_set) <= self._hive_hint_effective_ttl() * 2
 
     def _remember_hive_member(self, peer_id: str) -> bool:
-        previous_seen_at = self._hive_member_set_at.get(peer_id)
-        self._hive_member_set_at[peer_id] = int(time.time())
-        if previous_seen_at is None:
-            self._hive_member_advisory_peers.add(peer_id)
+        with self._hive_member_lock:  # P2-006
+            previous_seen_at = self._hive_member_set_at.get(peer_id)
+            self._hive_member_set_at[peer_id] = int(time.time())
+            if previous_seen_at is None:
+                self._hive_member_advisory_peers.add(peer_id)
         return previous_seen_at is None
 
     def _clear_hive_member_cache(self, peer_id: str, *, release: bool) -> None:
-        if release and peer_id in self._hive_member_set_at:
-            self._hive_member_released_peers.add(peer_id)
-        self._hive_member_set_at.pop(peer_id, None)
-        self._hive_member_advisory_peers.discard(peer_id)
+        with self._hive_member_lock:  # P2-006
+            if release and peer_id in self._hive_member_set_at:
+                self._hive_member_released_peers.add(peer_id)
+            self._hive_member_set_at.pop(peer_id, None)
+            self._hive_member_advisory_peers.discard(peer_id)
 
     def _get_hive_membership_status(self, peer_id: str) -> Dict[str, Any]:
         if self.hive_hints is None:
@@ -3474,15 +3484,17 @@ class FeeController:
         return 0 if self._hive_member_zero_fee_active(peer_id) else None
 
     def _consume_hive_member_release(self, peer_id: str) -> bool:
-        if peer_id in self._hive_member_released_peers:
-            self._hive_member_released_peers.discard(peer_id)
-            return True
+        with self._hive_member_lock:  # P2-006
+            if peer_id in self._hive_member_released_peers:
+                self._hive_member_released_peers.discard(peer_id)
+                return True
         return False
 
     def _consume_hive_member_advisory(self, peer_id: str) -> bool:
-        if peer_id in self._hive_member_advisory_peers:
-            self._hive_member_advisory_peers.discard(peer_id)
-            return True
+        with self._hive_member_lock:  # P2-006
+            if peer_id in self._hive_member_advisory_peers:
+                self._hive_member_advisory_peers.discard(peer_id)
+                return True
         return False
 
     def _get_context_with_values(
@@ -4966,8 +4978,10 @@ class FeeController:
             self._save_cycle_state(channel_id, state)
 
         # Keep DTS state coherent too, if already present.
-        if channel_id in self._channel_fee_states:
-            ts_state = self._channel_fee_states[channel_id]
+        # P2-007: atomic .get() (reference snapshot) instead of a check-then-
+        # index, so a concurrent stale-key eviction can't raise KeyError.
+        ts_state = self._channel_fee_states.get(channel_id)
+        if ts_state is not None:
             ts_state.last_gossip_refresh = current_time
             ts_state.last_fee_ppm = nudge_fee
             ts_state.last_broadcast_fee_ppm = nudge_fee
@@ -6556,9 +6570,9 @@ class FeeController:
             cycle.last_update = now
             self._save_cycle_state(channel_id, cycle)
 
-            if channel_id in self._channel_fee_states:
+            ts_state = self._channel_fee_states.get(channel_id)  # P2-007
+            if ts_state is not None:
                 try:
-                    ts_state = self._channel_fee_states[channel_id]
                     ts_state.last_revenue_rate = current_revenue_rate
                     ts_state.last_fee_ppm = current_fee_ppm
                     ts_state.last_update = now
@@ -6648,9 +6662,9 @@ class FeeController:
             # was already updated with the current observation window's data (at the
             # update_posterior call above). If we don't reset the timer, the next cycle
             # would re-use the same accumulated volume/revenue, double-counting observations.
-            if channel_id in self._channel_fee_states:
+            ts_state = self._channel_fee_states.get(channel_id)  # P2-007
+            if ts_state is not None:
                 try:
-                    ts_state = self._channel_fee_states[channel_id]
                     ts_state.last_fee_ppm = new_fee_ppm
                     ts_state.last_revenue_rate = current_revenue_rate
                     ts_state.last_state = decision_reason
@@ -6726,8 +6740,8 @@ class FeeController:
             self._save_cycle_state(channel_id, cycle)
 
             # Save channel fee state
-            if channel_id in self._channel_fee_states:
-                ts_state = self._channel_fee_states[channel_id]
+            ts_state = self._channel_fee_states.get(channel_id)  # P2-007
+            if ts_state is not None:
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = raw_chain_fee
                 ts_state.last_broadcast_fee_ppm = new_fee_ppm
@@ -6784,8 +6798,8 @@ class FeeController:
             self._save_cycle_state(channel_id, cycle)
 
             # Save channel fee state
-            if channel_id in self._channel_fee_states:
-                ts_state = self._channel_fee_states[channel_id]
+            ts_state = self._channel_fee_states.get(channel_id)  # P2-007
+            if ts_state is not None:
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = current_fee_ppm
                 ts_state.last_broadcast_fee_ppm = new_fee_ppm
@@ -6864,9 +6878,9 @@ class FeeController:
         cycle.last_update = now
         self._save_cycle_state(channel_id, cycle)
 
-        if channel_id in self._channel_fee_states:
+        ts_state = self._channel_fee_states.get(channel_id)  # P2-007
+        if ts_state is not None:
             try:
-                ts_state = self._channel_fee_states[channel_id]
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = current_fee_ppm
                 ts_state.last_update = now
@@ -7145,8 +7159,8 @@ class FeeController:
                             f"MANUAL_WAKE: Channel {resolved_channel_id[:12]}... woken due to manual fee change",
                             level='debug'
                         )
-                if manual and resolved_channel_id in self._channel_fee_states:
-                    ts_state = self._channel_fee_states[resolved_channel_id]
+                ts_state = self._channel_fee_states.get(resolved_channel_id)  # P2-007
+                if manual and ts_state is not None:
                     if ts_state.is_sleeping:
                         ts_state.is_sleeping = False
                         ts_state.sleep_until = 0

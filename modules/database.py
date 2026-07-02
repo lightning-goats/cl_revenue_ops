@@ -258,7 +258,15 @@ class Database:
     - Each thread gets its own isolated SQLite connection via threading.local()
     - WAL mode enabled for better concurrent read/write performance
     """
-    
+
+    # P2-002: Upper bound on rows mutated per WAL write transaction for the long
+    # batch paths (bulk_insert_forwards, cleanup_old_data). Committing per chunk
+    # keeps any single BEGIN IMMEDIATE from holding the single WAL writer longer
+    # than busy_timeout (5000ms), so a contending writer no longer sees
+    # "database is locked". Net effect is identical (idempotent inserts /
+    # additive aggregation), only the lock-hold duration is bounded.
+    BULK_WRITE_BATCH_SIZE = 2000
+
     def __init__(self, db_path: str, plugin):
         """
         Initialize the database manager.
@@ -3749,6 +3757,11 @@ class Database:
         if not cat:
             return False
         meta_json = json.dumps(metadata or {}, sort_keys=True) if metadata else None
+        # P2-003: The terminal-state guard SELECT and the INSERT OR REPLACE are a
+        # read-then-write pair. Wrap them in one BEGIN IMMEDIATE so the status
+        # check and the write cannot interleave with (or be split by a crash
+        # from) another writer touching the same reservation_id.
+        conn.execute("BEGIN IMMEDIATE")
         try:
             # Guard: INSERT OR REPLACE would otherwise resurrect a terminal
             # ('spent'/'released') reservation_id back to 'active', double
@@ -3761,6 +3774,7 @@ class Database:
             if existing is not None:
                 status = existing["status"] if not isinstance(existing, tuple) else existing[0]
                 if str(status) in ("spent", "released"):
+                    conn.execute("COMMIT")
                     self.plugin.log(
                         f"Spend reservation {rid} already {status}; refusing to "
                         "resurrect to active",
@@ -3772,8 +3786,13 @@ class Database:
                 (reservation_id, category, subcategory, reserved_sats, reserved_at, reference_id, channel_id, status, metadata_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
             """, (rid, cat, subcategory, amount, now, reference_id, channel_id, meta_json))
+            conn.execute("COMMIT")
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(f"Spend reservation failed: {e}", level='error')
             return False
 
@@ -3793,30 +3812,51 @@ class Database:
         rid = str(reservation_id or "").strip()
         if not rid:
             return False
-        row = conn.execute("""
-            SELECT * FROM spend_reservations WHERE reservation_id = ?
-        """, (rid,)).fetchone()
-        if not row:
-            return False
-        cursor = conn.execute("""
-            UPDATE spend_reservations
-            SET status = 'spent'
-            WHERE reservation_id = ? AND status = 'active'
-        """, (rid,))
-        changed = cursor.rowcount > 0
-        if changed and record_event:
-            amount = self._sanitize_amount(actual_spent_sats if actual_spent_sats is not None else row["reserved_sats"], "actual_spent_sats")
-            self.record_spend_event(
-                event_id=f"resv:{rid}",
-                category=row["category"],
-                amount_sats=amount,
-                subcategory=row["subcategory"],
-                reference_id=row["reference_id"],
-                channel_id=row["channel_id"],
-                source=source or "reservation_settlement",
-                metadata={"reservation_id": rid},
-            )
-        return changed
+        # P2-003: The SELECT → UPDATE → record_spend_event sequence is atomic.
+        # Previously each ran in its own autocommit statement, so a crash (or an
+        # interleaving writer) between the UPDATE (status='spent') and the
+        # spend-event INSERT could leave a reservation marked spent with no
+        # matching spend_event (or the reverse). Wrap all three in one
+        # BEGIN IMMEDIATE; record_spend_event runs on the same connection so its
+        # INSERT joins this transaction. If it fails we roll the UPDATE back.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("""
+                SELECT * FROM spend_reservations WHERE reservation_id = ?
+            """, (rid,)).fetchone()
+            if not row:
+                conn.execute("COMMIT")
+                return False
+            cursor = conn.execute("""
+                UPDATE spend_reservations
+                SET status = 'spent'
+                WHERE reservation_id = ? AND status = 'active'
+            """, (rid,))
+            changed = cursor.rowcount > 0
+            if changed and record_event:
+                amount = self._sanitize_amount(actual_spent_sats if actual_spent_sats is not None else row["reserved_sats"], "actual_spent_sats")
+                event_ok = self.record_spend_event(
+                    event_id=f"resv:{rid}",
+                    category=row["category"],
+                    amount_sats=amount,
+                    subcategory=row["subcategory"],
+                    reference_id=row["reference_id"],
+                    channel_id=row["channel_id"],
+                    source=source or "reservation_settlement",
+                    metadata={"reservation_id": rid},
+                )
+                if not event_ok:
+                    # Do not leave the reservation 'spent' without its event.
+                    conn.execute("ROLLBACK")
+                    return False
+            conn.execute("COMMIT")
+            return changed
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     def record_spend_event(self, event_id: str, category: str, amount_sats: int,
                           subcategory: Optional[str] = None, timestamp: Optional[int] = None,
@@ -3901,27 +3941,41 @@ class Database:
         where_sql = " AND ".join(where)
         limit_sql = f" LIMIT {int(limit)}" if limit is not None and int(limit) > 0 else ""
 
-        rows = conn.execute(
-            f"""
-            SELECT reservation_id, reserved_sats
-            FROM spend_reservations
-            WHERE {where_sql}
-            ORDER BY reserved_at ASC{limit_sql}
-            """,
-            tuple(params),
-        ).fetchall()
+        # P2-003: SELECT-then-UPDATE pair. Wrap in one BEGIN IMMEDIATE so the set
+        # we report as released is exactly the set we mark released, with no
+        # window where another writer settles one of these rows between the read
+        # and the bulk update.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT reservation_id, reserved_sats
+                FROM spend_reservations
+                WHERE {where_sql}
+                ORDER BY reserved_at ASC{limit_sql}
+                """,
+                tuple(params),
+            ).fetchall()
 
-        if not rows:
-            return {"released_count": 0, "released_sats": 0, "reservation_ids": []}
+            if not rows:
+                conn.execute("COMMIT")
+                return {"released_count": 0, "released_sats": 0, "reservation_ids": []}
 
-        ids = [str(r["reservation_id"]) for r in rows]
-        released_sats = int(sum(int(r["reserved_sats"] or 0) for r in rows))
+            ids = [str(r["reservation_id"]) for r in rows]
+            released_sats = int(sum(int(r["reserved_sats"] or 0) for r in rows))
 
-        qmarks = ",".join(["?"] * len(ids))
-        conn.execute(
-            f"UPDATE spend_reservations SET status = 'released' WHERE reservation_id IN ({qmarks})",
-            tuple(ids),
-        )
+            qmarks = ",".join(["?"] * len(ids))
+            conn.execute(
+                f"UPDATE spend_reservations SET status = 'released' WHERE reservation_id IN ({qmarks})",
+                tuple(ids),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         return {
             "released_count": len(ids),
             "released_sats": released_sats,
@@ -4200,8 +4254,15 @@ class Database:
         # AUDIT FIX C-1: Wrap in transaction for consistent snapshot.
         # Without this, a rebalance completing between the two reads
         # could move sats from reserved to spent, skewing the total.
+        # P2-004: Use BEGIN IMMEDIATE (not deferred BEGIN) for consistency with
+        # every other transaction in this module (which all acquire the WAL
+        # writer up-front). The two SUM reads are trivially short, so the writer
+        # hold is negligible; taking it up-front means this budget-gating
+        # snapshot is read while no writer is mid-transaction, and avoids the
+        # lazy read→writer upgrade that raises SQLITE_BUSY more often under
+        # contention. The computed value is identical on the healthy path.
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             spent_row = conn.execute("""
                 SELECT COALESCE(SUM(cost_sats), 0) as spent
                 FROM rebalance_costs
@@ -4438,44 +4499,55 @@ class Database:
             conn = self._get_connection()
             inserted = 0
 
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                for fwd in forwards:
-                    try:
-                        in_chan = normalize_scid(fwd.get('in_channel', '') or '')
-                        out_chan = normalize_scid(fwd.get('out_channel', '') or '')
-                        ts = int(fwd.get('received_time', 0) or 0)
-                        rt = int(fwd.get('resolved_time', 0) or 0)
-                        res_dur = float(fwd.get('resolution_time', 0) or 0)
-                        if rt <= 0 and res_dur and ts:
-                            rt = ts + int(res_dur)
-
-                        cur = conn.execute("""
-                            INSERT OR IGNORE INTO forwards
-                            (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp, resolved_time)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            in_chan,
-                            out_chan,
-                            int(fwd.get('in_msat', 0) or 0),
-                            int(fwd.get('out_msat', 0) or 0),
-                            int(fwd.get('fee_msat', 0) or 0),
-                            res_dur,
-                            ts,
-                            rt
-                        ))
-                        # sqlite3 cursor.rowcount is 1 for inserted, 0 for ignored
-                        if getattr(cur, "rowcount", 0) == 1:
-                            inserted += 1
-                    except Exception as e:
-                        self.plugin.log(f"bulk_insert_forwards: skipped invalid record: {e}", level='debug')
-                conn.execute("COMMIT")
-            except Exception:
+            # P2-002: Chunk into bounded BEGIN IMMEDIATE transactions (commit per
+            # chunk) instead of one long transaction over the whole set (which on
+            # startup hydration can be up to millions of rows and hold the WAL
+            # writer far beyond busy_timeout, forcing a contending writer to raise
+            # "database is locked"). The insert is idempotent (INSERT OR IGNORE
+            # under a UNIQUE index), so committing in chunks yields the identical
+            # final table.
+            batch_size = self.BULK_WRITE_BATCH_SIZE
+            total = len(forwards)
+            for start in range(0, total, batch_size):
+                chunk = forwards[start:start + batch_size]
+                conn.execute("BEGIN IMMEDIATE")
                 try:
-                    conn.execute("ROLLBACK")
-                except Exception as rb_err:
-                    self.plugin.log(f"ROLLBACK failed in bulk_insert_forwards: {rb_err}", level='error')
-                raise
+                    for fwd in chunk:
+                        try:
+                            in_chan = normalize_scid(fwd.get('in_channel', '') or '')
+                            out_chan = normalize_scid(fwd.get('out_channel', '') or '')
+                            ts = int(fwd.get('received_time', 0) or 0)
+                            rt = int(fwd.get('resolved_time', 0) or 0)
+                            res_dur = float(fwd.get('resolution_time', 0) or 0)
+                            if rt <= 0 and res_dur and ts:
+                                rt = ts + int(res_dur)
+
+                            cur = conn.execute("""
+                                INSERT OR IGNORE INTO forwards
+                                (in_channel, out_channel, in_msat, out_msat, fee_msat, resolution_time, timestamp, resolved_time)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                in_chan,
+                                out_chan,
+                                int(fwd.get('in_msat', 0) or 0),
+                                int(fwd.get('out_msat', 0) or 0),
+                                int(fwd.get('fee_msat', 0) or 0),
+                                res_dur,
+                                ts,
+                                rt
+                            ))
+                            # sqlite3 cursor.rowcount is 1 for inserted, 0 for ignored
+                            if getattr(cur, "rowcount", 0) == 1:
+                                inserted += 1
+                        except Exception as e:
+                            self.plugin.log(f"bulk_insert_forwards: skipped invalid record: {e}", level='debug')
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception as rb_err:
+                        self.plugin.log(f"ROLLBACK failed in bulk_insert_forwards: {rb_err}", level='error')
+                    raise
 
             return inserted
 
@@ -6263,80 +6335,109 @@ class Database:
         pruned_revenue = 0
         pruned_count = 0
 
-        # Atomic aggregation + deletion to avoid double-counting if interrupted.
-        # If we update lifetime_aggregates but fail before deleting forwards, we'd
-        # count the same forwards again later. Using a transaction prevents this.
-        # NOTE: We use explicit BEGIN/COMMIT because isolation_level=None
-        # (autocommit) makes `with conn:` a no-op for transaction control.
+        # P2-002: The forwards prune is the long-hold offender (millions of rows
+        # on a high-volume node, run every flow cycle). Previously it aggregated
+        # and deleted the WHOLE set inside ONE BEGIN IMMEDIATE, holding the single
+        # WAL writer far beyond busy_timeout=5000ms and forcing a contending
+        # writer (record_fee_change on T2, record_forward on T0) to raise
+        # "database is locked". We now aggregate+delete in bounded chunks, one
+        # transaction per chunk.
+        #
+        # Crash-consistency / no-double-count is PRESERVED: each chunk aggregates
+        # exactly the rows it deletes, in the SAME transaction, so a row is never
+        # counted into daily_forwarding_stats without also being deleted from
+        # forwards (or vice versa). Aggregation is additive (ON CONFLICT ... +=),
+        # so the sum over chunks equals the original single-pass total.
+        batch_size = self.BULK_WRITE_BATCH_SIZE
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            # Count rows before deletion for logging
-            forwards_count = conn.execute(
-                "SELECT COUNT(*) as cnt FROM forwards WHERE timestamp < ?", (cutoff,)
-            ).fetchone()["cnt"]
+            while True:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    rows = conn.execute(
+                        "SELECT rowid AS rid, in_channel, out_channel, in_msat, "
+                        "out_msat, fee_msat, timestamp FROM forwards "
+                        "WHERE timestamp < ? ORDER BY rowid LIMIT ?",
+                        (cutoff, batch_size),
+                    ).fetchall()
 
-            # LIFETIME PRESERVATION: Aggregate revenue from forwards about to be pruned
-            # and store in daily_forwarding_stats for granular history.
-            if forwards_count > 0:
-                # Group by channel and day (86400s)
-                # SQLite integer division floor handles the day bucket
-                rows = conn.execute("""
-                    SELECT 
-                        out_channel,
-                        (timestamp / 86400) * 86400 as day_ts,
-                        COALESCE(SUM(in_msat), 0) as sum_in,
-                        COALESCE(SUM(out_msat), 0) as sum_out,
-                        COALESCE(SUM(fee_msat), 0) as sum_fee,
-                        COUNT(*) as count
-                    FROM forwards 
-                    WHERE timestamp < ?
-                    GROUP BY out_channel, day_ts
-                """, (cutoff,)).fetchall()
-                
-                for r in rows:
-                    pruned_revenue += r['sum_fee']
-                    pruned_count += r['count']
-                    
-                    # Upsert into daily stats
-                    conn.execute("""
-                        INSERT INTO daily_forwarding_stats 
-                        (channel_id, date, total_in_msat, total_out_msat, total_fee_msat, forward_count)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(channel_id, date) DO UPDATE SET
-                            total_in_msat = total_in_msat + excluded.total_in_msat,
-                            total_out_msat = total_out_msat + excluded.total_out_msat,
-                            total_fee_msat = total_fee_msat + excluded.total_fee_msat,
-                            forward_count = forward_count + excluded.forward_count
-                    """, (r['out_channel'], r['day_ts'], r['sum_in'], r['sum_out'], r['sum_fee'], r['count']))
+                    if not rows:
+                        conn.execute("COMMIT")
+                        break
 
-                # Also preserve entry-side contribution metrics (in_channel aggregation).
-                inbound_rows = conn.execute("""
-                    SELECT
-                        in_channel,
-                        (timestamp / 86400) * 86400 as day_ts,
-                        COALESCE(SUM(in_msat), 0) as sum_in,
-                        COALESCE(SUM(fee_msat), 0) as sum_fee,
-                        COUNT(*) as count
-                    FROM forwards
-                    WHERE timestamp < ?
-                    GROUP BY in_channel, day_ts
-                """, (cutoff,)).fetchall()
+                    # SQLite integer division floors to the day bucket; mirror it.
+                    out_agg: Dict[Any, list] = {}
+                    in_agg: Dict[Any, list] = {}
+                    rowids = []
+                    for r in rows:
+                        rowids.append(r["rid"])
+                        day_ts = (int(r["timestamp"]) // 86400) * 86400
+                        in_msat = int(r["in_msat"] or 0)
+                        out_msat = int(r["out_msat"] or 0)
+                        fee_msat = int(r["fee_msat"] or 0)
 
-                for r in inbound_rows:
-                    conn.execute("""
-                        INSERT INTO daily_forwarding_stats_inbound
-                        (channel_id, date, total_in_msat, total_fee_msat, forward_count)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(channel_id, date) DO UPDATE SET
-                            total_in_msat = total_in_msat + excluded.total_in_msat,
-                            total_fee_msat = total_fee_msat + excluded.total_fee_msat,
-                            forward_count = forward_count + excluded.forward_count
-                    """, (r['in_channel'], r['day_ts'], r['sum_in'], r['sum_fee'], r['count']))
-                
-                # We NO LONGER update lifetime_aggregates for new data, 
-                # but we leave the table alone as it contains legacy history.
+                        o = out_agg.setdefault((r["out_channel"], day_ts), [0, 0, 0, 0])
+                        o[0] += in_msat
+                        o[1] += out_msat
+                        o[2] += fee_msat
+                        o[3] += 1
 
-            conn.execute("DELETE FROM forwards WHERE timestamp < ?", (cutoff,))
+                        i = in_agg.setdefault((r["in_channel"], day_ts), [0, 0, 0])
+                        i[0] += in_msat
+                        i[1] += fee_msat
+                        i[2] += 1
+
+                        pruned_revenue += fee_msat
+                        pruned_count += 1
+
+                    for (out_channel, day_ts), (s_in, s_out, s_fee, cnt) in out_agg.items():
+                        conn.execute("""
+                            INSERT INTO daily_forwarding_stats
+                            (channel_id, date, total_in_msat, total_out_msat, total_fee_msat, forward_count)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(channel_id, date) DO UPDATE SET
+                                total_in_msat = total_in_msat + excluded.total_in_msat,
+                                total_out_msat = total_out_msat + excluded.total_out_msat,
+                                total_fee_msat = total_fee_msat + excluded.total_fee_msat,
+                                forward_count = forward_count + excluded.forward_count
+                        """, (out_channel, day_ts, s_in, s_out, s_fee, cnt))
+
+                    for (in_channel, day_ts), (s_in, s_fee, cnt) in in_agg.items():
+                        conn.execute("""
+                            INSERT INTO daily_forwarding_stats_inbound
+                            (channel_id, date, total_in_msat, total_fee_msat, forward_count)
+                            VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(channel_id, date) DO UPDATE SET
+                                total_in_msat = total_in_msat + excluded.total_in_msat,
+                                total_fee_msat = total_fee_msat + excluded.total_fee_msat,
+                                forward_count = forward_count + excluded.forward_count
+                        """, (in_channel, day_ts, s_in, s_fee, cnt))
+
+                    conn.executemany(
+                        "DELETE FROM forwards WHERE rowid = ?",
+                        [(rid,) for rid in rowids],
+                    )
+                    conn.execute("COMMIT")
+
+                    # Last (partial) chunk — no more rows below the cutoff.
+                    if len(rows) < batch_size:
+                        break
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+        except Exception as e:
+            self.plugin.log(f"cleanup_old_data forwards prune failed: {e}", level='error')
+            return  # Skip the rest on failure; the next cycle retries.
+
+        forwards_count = pruned_count
+
+        # Secondary prunes have NO cross-table atomicity requirement (only the
+        # forwards→daily_stats pair does), so each runs as its own short
+        # autocommit DELETE. This releases the WAL writer between statements
+        # instead of holding it across the whole set.
+        try:
             conn.execute("DELETE FROM peer_connection_history WHERE timestamp < ?", (cutoff,))
 
             # AUDIT LOG CLEANUP: Prevent unbounded growth of operational logs
@@ -6373,15 +6474,8 @@ class Database:
                 "WHERE cooldown_until < ? AND last_failure_at < ?",
                 (ledger_cutoff, ledger_cutoff)
             )
-
-            conn.execute("COMMIT")
         except Exception as e:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            self.plugin.log(f"cleanup_old_data transaction failed: {e}", level='error')
-            return  # Skip vacuum and stats logging on failure
+            self.plugin.log(f"cleanup_old_data secondary prune failed: {e}", level='warn')
 
         # L-20: Use incremental_vacuum instead of full VACUUM to avoid blocking readers.
         # Full VACUUM requires exclusive lock and copies the entire database.
