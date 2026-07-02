@@ -139,12 +139,16 @@
 # ============================================================================
 # LIQUIDITY THRESHOLDS
 # ============================================================================
-
-# Below this ratio, channel is considered depleted (rebalance target)
-#revenue-ops-low-liquidity-threshold=0.2
-
-# Above this ratio, channel is a source for rebalancing
-#revenue-ops-high-liquidity-threshold=0.8
+#
+# NOTE: These are RUNTIME-ONLY controls. They are NOT registered as plugin
+# options, so setting them in this config file is a silent no-op. Change them
+# at runtime instead:
+#   lightning-cli revenue-config set low_liquidity_threshold 0.3
+#   lightning-cli revenue-config set high_liquidity_threshold 0.7
+#
+# Defaults (from modules/config.py): low=0.3, high=0.7
+# Below low_liquidity_threshold (0.3): channel is considered depleted (rebalance target)
+# Above high_liquidity_threshold (0.7): channel is a source for rebalancing
 
 # ============================================================================
 # DATABASE
