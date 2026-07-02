@@ -310,6 +310,46 @@ def _enforce_fee_bound_invariant(kwargs, log=None):
     return kwargs
 
 
+# Enum-style options validated at init and their documented defaults. Valid
+# value sets come from Config.STRING_ENUM_VALID_VALUES where present;
+# base_fee_policy is not registered there and only means off/adaptive.
+_INIT_ENUM_DEFAULTS = {
+    'market_fee_mode': 'undercut',
+    'base_fee_policy': 'off',
+    'fee_profile': 'active',
+    'expansion_treasury_preferred_currency': 'BTC',
+}
+_BASE_FEE_POLICY_VALID = ('off', 'adaptive')
+
+
+def _valid_enum_values(key):
+    """Return the valid value tuple for an enum option, or None if unknown."""
+    try:
+        from modules.config import STRING_ENUM_VALID_VALUES
+        if key in STRING_ENUM_VALID_VALUES:
+            return STRING_ENUM_VALID_VALUES[key]
+    except Exception:
+        pass
+    if key == 'base_fee_policy':
+        return _BASE_FEE_POLICY_VALID
+    return None
+
+
+def _validate_enum_config_options(kwargs, log=None):
+    """P1-026: validate enum-style string options; unknown -> warn + default."""
+    for key, default in _INIT_ENUM_DEFAULTS.items():
+        if key not in kwargs:
+            continue
+        valid = _valid_enum_values(key)
+        if not valid:
+            continue
+        val = kwargs[key]
+        if val not in valid:
+            _init_warn(log, f"Config option {key}={val!r} not one of {tuple(valid)}; using default {default!r}")
+            kwargs[key] = default
+    return kwargs
+
+
 def _compute_forward_hydration_start(
     last_forward_ts: Optional[int],
     flow_window_days: int,
@@ -1936,6 +1976,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     _validate_numeric_config_options(config_kwargs, log=plugin.log)
     # P1-009: enforce min_fee_ppm <= max_fee_ppm before construction.
     _enforce_fee_bound_invariant(config_kwargs, log=plugin.log)
+    # P1-026: validate enum-style options before construction.
+    _validate_enum_config_options(config_kwargs, log=plugin.log)
 
     configured_router = str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower()
     if configured_router != 'v3':
