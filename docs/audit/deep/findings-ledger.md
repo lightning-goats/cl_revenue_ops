@@ -259,3 +259,14 @@ No Critical/High/Medium in module decision/routing logic; the one Medium is in t
 | ID | severity | dimension | file:line@blob | description | status | fix_commit | test |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | P7-001 | Info | performance | docs/audit/deep/perf-baseline.md@653ab81 | Profiling CLEAN at T0 scale: codebase adequately indexed, no O(n^2)/full-scan/per-cycle-rescan/unbounded-build. Every scale-sensitive read EXPLAINs to USING INDEX. Fee cycle ~1.2ms, rebalance ~0.8ms, profitability ~4.6ms, heaviest DB read ~1.6ms. Baseline + regression guard added. One informational N+1 in profitability (36 tiny indexed queries, ~1-2ms) below the fix bar. No fix required. | CLOSED-CLEAN | fe85a80 | tests/test_perf_regression_guard.py |
+
+## Phase 8 — coverage-reconciliation findings (2026-07-02)
+
+Persisting attestations (99.45% coverage) surfaced 1 real money-path bug + 3 low. The withheld chunk (rebalance_engine_v2.py#7) is the double-pay below.
+
+| ID | severity | dimension | file:line@blob | description | status | fix_commit | test |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| P8-001 | Medium | money-path/double-pay | modules/rebalance_engine_v2.py:2740@6d65ee3 | _retry_native_pair_with_partial_amounts (loop 2661-2774, executor.execute 2730, reachable from the live cycle 2871): the entry guard checks prior_result.payment_pending (2639) but the per-iteration loop only tests retry_result.success (2740) — a payment_pending intermediate partial attempt (sendpay/waitsendpay timeout, HTLC still in flight) is treated as definitive failure and the loop dispatches ANOTHER payment at a smaller amount -> double-fill against the same budget reservation. Sibling _retry_native_pair_with_exclusions guards exactly this (2491-2492 "never pay again on top"). P4-007/008 covered the main paths, not this partial-retry loop. Fix: per-iteration payment_pending break (mirror the exclusions path). | OPEN | | |
+| P8-002 | Low | fee-floor/undercharge | modules/fee_controller.py:7721@f29dd7a | _calculate_floor applies the 20% stall markup BEFORE the congestion risk-premium max(), diverging from the documented max(base_floor, risk_premium)*stall_multiplier; effect is under-charge only. Fix: apply stall multiplier after the risk-premium max. | OPEN | | |
+| P8-003 | Info | dead-code | modules/rebalance_router_v2.py:183@d5de22d | _get_final_hop_fee_ppm is @staticmethod yet declares self (broken as written) but is provably DEAD (zero callers). Remove or fix signature. | OPEN | | |
+| P8-004 | Low | lab-only | tools/long_fee_tournament.py:328@campaign | Falsy-'or' replaces a legitimately-resolved 0-ppm competitor fee with the 150 fallback, corrupting a REGTEST-LAB scenario. Lab-only, non-production. Fix: use an explicit None check. | OPEN | | |
