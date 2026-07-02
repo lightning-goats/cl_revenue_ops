@@ -4254,8 +4254,15 @@ class Database:
         # AUDIT FIX C-1: Wrap in transaction for consistent snapshot.
         # Without this, a rebalance completing between the two reads
         # could move sats from reserved to spent, skewing the total.
+        # P2-004: Use BEGIN IMMEDIATE (not deferred BEGIN) for consistency with
+        # every other transaction in this module (which all acquire the WAL
+        # writer up-front). The two SUM reads are trivially short, so the writer
+        # hold is negligible; taking it up-front means this budget-gating
+        # snapshot is read while no writer is mid-transaction, and avoids the
+        # lazy read→writer upgrade that raises SQLITE_BUSY more often under
+        # contention. The computed value is identical on the healthy path.
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             spent_row = conn.execute("""
                 SELECT COALESCE(SUM(cost_sats), 0) as spent
                 FROM rebalance_costs

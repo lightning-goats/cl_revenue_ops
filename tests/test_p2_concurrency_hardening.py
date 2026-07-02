@@ -348,3 +348,30 @@ def test_p2_003_reserve_and_release_use_transactions(tmp_path):
     assert status == "released"
 
 
+# ---------------------------------------------------------------------------
+# P2-004 — get_budget_status uses BEGIN IMMEDIATE, value unchanged
+# ---------------------------------------------------------------------------
+def test_p2_004_get_budget_status_immediate_and_consistent(tmp_path):
+    db = _make_db(tmp_path)
+    now = int(time.time())
+
+    db.record_rebalance_cost(
+        channel_id="c1", peer_id="p1", cost_sats=40, amount_sats=1000,
+    )
+    conn = db._get_connection()
+    conn.execute(
+        "INSERT INTO budget_reservations "
+        "(reservation_id, reserved_sats, reserved_at, job_channel_id, status) "
+        "VALUES (?, ?, ?, ?, 'active')",
+        ("b1", 60, now, "c1"),
+    )
+
+
+    counter = _BeginCounter(conn)
+    status = db.get_budget_status(since_timestamp=now - 3600)
+    conn.set_trace_callback(None)
+
+    assert counter.begins == 1, "get_budget_status must use BEGIN IMMEDIATE"
+    assert status["spent"] == 40
+    assert status["reserved"] == 60
+    assert status["total_committed"] == 100
