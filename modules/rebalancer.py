@@ -2166,6 +2166,12 @@ class EVRebalancer:
                                     "payment_pending": bool(
                                         getattr(exec_result, "payment_pending", False)
                                     ),
+                                    "payment_hash": str(
+                                        (getattr(exec_result, "failure_data", {}) or {}).get(
+                                            "payment_hash", ""
+                                        )
+                                        or ""
+                                    ),
                                 }
                                 # The engine shares our history row; when the
                                 # payment is parked as 'pending_settlement' for
@@ -2256,6 +2262,12 @@ class EVRebalancer:
                                 ),
                                 "payment_pending": bool(
                                     getattr(exec_result, "payment_pending", False)
+                                ),
+                                "payment_hash": str(
+                                    (getattr(exec_result, "failure_data", {}) or {}).get(
+                                        "payment_hash", ""
+                                    )
+                                    or ""
                                 ),
                             }
                             # Engine shares our history row; keep its
@@ -2351,7 +2363,20 @@ class EVRebalancer:
                 result["error"] = error
                 result["message"] = f"Failed: {error}"
                 self.plugin.log(f"Failed to start rebalance job: {error}", level='warn')
-                if reserved_budget:
+                # P4-009: mirror the engine's hold-on-pending. A payment that is
+                # still pending settlement AND sweepable (carries a
+                # payment_hash) keeps its reservation held — the engine parked
+                # the shared history row as 'pending_settlement' and
+                # reconcile_pending_settlements owns the terminal release/spend.
+                # Releasing here would let the next cycle spend the same budget
+                # while the HTLC can still settle (double-spend). A pending
+                # result WITHOUT a payment_hash is not sweepable (the row was
+                # marked 'failed'), so it is released here like any terminal
+                # failure — otherwise the reservation would strand 'active'.
+                sweepable_pending = bool(
+                    res.get("payment_pending") and res.get("payment_hash")
+                )
+                if reserved_budget and not sweepable_pending:
                     self.database.release_budget_reservation(str(rebalance_id))
                 with self._pending_lock:
                     self._pending.pop(candidate.to_channel, None)

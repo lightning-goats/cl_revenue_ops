@@ -279,3 +279,116 @@ class TestP4008InflightDestGuard:
             rebalance_id=5,
         )
         assert "200x9x0" not in engine._inflight_dest_snapshot()
+
+
+# =========================================================================
+# P4-009: execute_rebalance mirrors the engine's hold-on-pending
+# =========================================================================
+
+def _rebalancer_with_engine(mock_plugin, mock_database):
+    from modules.config import Config
+    from modules.rebalancer import EVRebalancer
+
+    cfg = Config(dry_run=False)
+    r = EVRebalancer(mock_plugin, cfg, mock_database)
+    r.data_service = MagicMock()
+    r.data_service.invalidate = MagicMock()
+    r.data_service.datastore_push.return_value = True
+    r._check_capital_controls = MagicMock(return_value=True)
+    r._get_peer_connection_status = MagicMock(return_value={})
+    r._calculate_turnover_rate = MagicMock(return_value=0.05)
+    r.rebalance_engine_v2 = MagicMock()
+
+    mock_database.record_rebalance = MagicMock(return_value=901)
+    mock_database.update_rebalance_result = MagicMock()
+    mock_database.reserve_budget = MagicMock(return_value=(True, 9999))
+    mock_database.release_budget_reservation = MagicMock(return_value=True)
+    mock_database.increment_failure_count = MagicMock()
+    return r
+
+
+def _rebalance_candidate(amount_sats=50_000):
+    from modules.rebalancer import RebalanceCandidate
+
+    return RebalanceCandidate(
+        source_candidates=["111x1x0"],
+        to_channel="222x2x0",
+        primary_source_peer_id="02" + "a" * 64,
+        to_peer_id="02" + "b" * 64,
+        amount_sats=amount_sats,
+        amount_msat=amount_sats * 1000,
+        outbound_fee_ppm=1000,
+        inbound_fee_ppm=100,
+        source_fee_ppm=100,
+        weighted_opp_cost_ppm=100,
+        spread_ppm=800,
+        max_budget_sats=10,
+        max_budget_msat=10_000,
+        max_fee_ppm=2000,
+        expected_profit_sats=1,
+        liquidity_ratio=0.1,
+        dest_flow_state="balanced",
+        dest_turnover_rate=0.0,
+        source_turnover_rate=0.0,
+    )
+
+
+class TestP4009ExecuteRebalanceHoldOnPending:
+    def test_pending_with_payment_hash_holds_reservation(
+        self, mock_plugin, mock_database
+    ):
+        r = _rebalancer_with_engine(mock_plugin, mock_database)
+        r.rebalance_engine_v2.execute_candidate.return_value = _exec_result(
+            success=False,
+            payment_pending=True,
+            failure_data={"payment_hash": "cd" * 32},
+            error="payment_pending_timeout",
+            route_type="native",
+            attempts=1,
+        )
+
+        res = r.execute_rebalance(_rebalance_candidate(), enforce_budget=True)
+
+        assert res["success"] is False
+        # Sweepable pending: the engine parked the shared row as
+        # 'pending_settlement' and reconcile_pending_settlements owns the
+        # release. execute_rebalance must NOT release here (double-spend risk).
+        mock_database.release_budget_reservation.assert_not_called()
+
+    def test_pending_without_payment_hash_releases_reservation(
+        self, mock_plugin, mock_database
+    ):
+        r = _rebalancer_with_engine(mock_plugin, mock_database)
+        r.rebalance_engine_v2.execute_candidate.return_value = _exec_result(
+            success=False,
+            payment_pending=True,
+            failure_data={},
+            error="payment_pending_timeout",
+            route_type="native",
+            attempts=1,
+        )
+
+        res = r.execute_rebalance(_rebalance_candidate(), enforce_budget=True)
+
+        assert res["success"] is False
+        # Non-sweepable pending (no payment_hash): the engine marked the row
+        # 'failed'; reconcile never touches it, so the reservation must be
+        # released here or it strands 'active'.
+        mock_database.release_budget_reservation.assert_called_once_with("901")
+
+    def test_terminal_failure_releases_reservation(
+        self, mock_plugin, mock_database
+    ):
+        r = _rebalancer_with_engine(mock_plugin, mock_database)
+        r.rebalance_engine_v2.execute_candidate.return_value = _exec_result(
+            success=False,
+            payment_pending=False,
+            error="no_route",
+            route_type="native",
+            attempts=1,
+        )
+
+        res = r.execute_rebalance(_rebalance_candidate(), enforce_budget=True)
+
+        assert res["success"] is False
+        mock_database.release_budget_reservation.assert_called_once_with("901")
