@@ -253,3 +253,9 @@ No Critical/High/Medium in module decision/routing logic; the one Medium is in t
 | DEF-051 | Low | concurrency/accepted | modules/fee_controller.py:4407@c0f88d6 | _state_lock (RLock) held across DB I/O + set_channel_fee RPC for the whole fee cycle. Heavily mitigated (pre-lock warming, non-blocking acquire, P2-007 atomic reads). Likely ACCEPT-AS-DESIGN; else narrow to per-channel critical sections. | WONTFIX | | |
 | DEF-028 | Low | statistics/accepted | modules/flow_analysis.py:1066@c0f88d6 | 24h Kalman window sampled hourly → 23/24 overlap → correlated observations (white-noise independence violated). Subsample/inflate R, or formally accept. Low. | OPEN | | |
 | DEF-088 | Low | dead-code | modules/demand_flow.py:97@cbc7e8e | classify_candidate + keyword-scoring + fee_extractive signal are production-dead (live path uses classify_peers/find_sink_adjacent_candidates), exercised only by 12 tests. Remove or wire in. | OPEN | | |
+
+## Phase 7 — performance profiling (2026-07-02)
+
+| ID | severity | dimension | file:line@blob | description | status | fix_commit | test |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| P7-001 | Info | performance | docs/audit/deep/perf-baseline.md@653ab81 | Profiling CLEAN at T0 scale: codebase adequately indexed, no O(n^2)/full-scan/per-cycle-rescan/unbounded-build. Every scale-sensitive read EXPLAINs to USING INDEX. Fee cycle ~1.2ms, rebalance ~0.8ms, profitability ~4.6ms, heaviest DB read ~1.6ms. Baseline + regression guard added. One informational N+1 in profitability (36 tiny indexed queries, ~1-2ms) below the fix bar. No fix required. | CLOSED-CLEAN | fe85a80 | tests/test_perf_regression_guard.py |
