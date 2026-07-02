@@ -567,7 +567,14 @@ class ChannelProfitabilityAnalyzer:
     UNDERWATER_ROI_THRESHOLD = -0.10   # < -10% ROI
     ZOMBIE_DAYS_INACTIVE = 30          # No routing for 30 days
     ZOMBIE_MIN_LOSS_SATS = 1000        # Minimum loss to be zombie
-    
+    # P5-003: opening fees are NOT routine routing fees. A legitimate open in
+    # a high-feerate environment or a batched funding tx can far exceed the
+    # 50000-sat routing-fee cap. Reject only truly absurd values using the
+    # same 10 BTC ceiling database._sanitize_amount applies to closure costs
+    # (P4-002). The principal check (fee >= 90% of capacity) still catches a
+    # funding-amount mistakenly returned as a fee.
+    MAX_OPEN_FEE_SATS = 10_000_000_000  # 10 BTC
+
     def __init__(self, plugin: Plugin, config, database):
         """
         Initialize the profitability analyzer.
@@ -2398,7 +2405,7 @@ class ChannelProfitabilityAnalyzer:
         needing heuristic rejection.
         
         Validation rules (returns False if ANY match):
-        - fee_sats > 50,000 (Hard Cap - no mining fee should ever be this high)
+        - fee_sats > 10 BTC (Hard Cap - no mining fee should ever be this high)
         - fee_sats >= 90% of capacity (Principal Check - funding amount)
         - fee_sats > capacity (clearly invalid - fee can't exceed capacity)
         
@@ -2410,12 +2417,16 @@ class ChannelProfitabilityAnalyzer:
         Returns:
             True if fee appears valid, False if it looks like funding amount
         """
-        # Hard Cap: Reject any fee above 50,000 sats
-        # No legitimate channel opening fee should ever be this high.
-        # This catches data artifacts like change outputs or batch fee totals.
-        if fee_sats > 50000:
+        # Hard Cap: reject only truly absurd fees using the 10 BTC ceiling
+        # (P5-003). The prior 50,000-sat cap rejected legitimate large open
+        # fees (high-feerate opens, batched funding txs), forcing a fallback
+        # to the 5,000-sat estimate and overstating profit. The 90%-of-
+        # capacity principal check below still rejects a funding amount
+        # returned in the fee slot.
+        if fee_sats > self.MAX_OPEN_FEE_SATS:
             self.plugin.log(
-                f"Rejected absurd fee: {fee_sats} > 50,000 hard cap for {funding_txid}",
+                f"Rejected absurd fee: {fee_sats} > {self.MAX_OPEN_FEE_SATS} "
+                f"(10 BTC ceiling) for {funding_txid}",
                 level='debug'
             )
             return False

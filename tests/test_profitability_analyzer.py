@@ -115,3 +115,30 @@ class TestEffectiveCost:
         d = bc.to_dict()
         assert d["effective_rebalance_cost_30d"] == 2000
         assert d["rebalance_cost_30d"] == 1000
+
+
+class TestOpenFeeCeiling:
+    """P5-003: _is_valid_fee_amount must accept legitimately large open fees
+    (up to the 10 BTC sanitize ceiling) instead of rejecting anything over
+    50,000 sats and falling back to the 5,000-sat estimate."""
+
+    def _analyzer(self):
+        from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
+        a = ChannelProfitabilityAnalyzer.__new__(ChannelProfitabilityAnalyzer)
+        a.plugin = MagicMock()
+        return a
+
+    def test_large_open_fee_accepted_not_clamped(self):
+        a = self._analyzer()
+        # 120,000-sat open fee on a 5M-sat channel: well under 90% of capacity,
+        # far over the old 50,000 hard cap. Must validate (recorded in full).
+        assert a._is_valid_fee_amount(120_000, 5_000_000, "txabc") is True
+
+    def test_absurd_fee_still_rejected_at_10btc(self):
+        a = self._analyzer()
+        assert a._is_valid_fee_amount(10_000_000_001, 0, "txabc") is False
+
+    def test_principal_check_still_rejects_funding_amount(self):
+        a = self._analyzer()
+        # A "fee" that is 95% of capacity is really the funding amount.
+        assert a._is_valid_fee_amount(1_900_000, 2_000_000, "txabc") is False
