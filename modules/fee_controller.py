@@ -74,6 +74,117 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
+# NODE-LIQUIDITY HELPERS (pure functions, no I/O)
+# =============================================================================
+# Node-wide receivable-ratio / drain-pressure helpers for the node-liquidity-aware
+# auto-drain-bias feature. These mirror the aggregate-liquidity pattern used in
+# capacity_planner.py (_check_portfolio_balance_gate, ~lines 312-325) but expressed
+# as the REMOTE/receivable fraction rather than local percentage. Kept pure and
+# side-effect free so later wiring into _drain_fee_multiplier stays unit-testable
+# in isolation. Per the design's no-double-count invariant, these must never read
+# any per-peer drain_direction hint — node-aggregate liquidity only.
+# =============================================================================
+
+def compute_node_receivable_ratio(channels) -> float:
+    """Compute the node-wide receivable ratio over active (CHANNELD_NORMAL) channels.
+
+    receivable_ratio = total_remote / total_capacity = 1 - (total_local / total_capacity)
+
+    A source-heavy node (mostly local balance) has a LOW receivable ratio; a
+    sink-heavy node (mostly remote balance) has a HIGH receivable ratio.
+
+    Non-dict entries and channels not in CHANNELD_NORMAL are skipped defensively.
+    Returns 1.0 (neutral/no-drain-pressure) when there is no active capacity.
+    """
+    total_local = 0
+    total_capacity = 0
+    for ch in channels:
+        if not isinstance(ch, dict):
+            continue
+        if ch.get("state") != "CHANNELD_NORMAL":
+            continue
+        local = parse_msat(ch.get("to_us_msat", 0))
+        total = parse_msat(ch.get("total_msat", 0))
+        total_local += local
+        total_capacity += total
+
+    if total_capacity == 0:
+        return 1.0
+
+    return (total_capacity - total_local) / total_capacity
+
+
+def node_drain_pressure(receivable_ratio: float, target: float, floor: float) -> float:
+    """Linear ramp of node-level drain pressure in [0.0, 1.0].
+
+    0.0 when receivable_ratio >= target (node healthy/balanced — no drain pressure).
+    1.0 when receivable_ratio <= floor (node starved/source-heavy — full drain pressure).
+    Linear in between: (target - receivable_ratio) / (target - floor), clamped to [0, 1].
+
+    Degenerate guard: if target <= floor (misconfiguration), avoid div-by-zero by
+    returning 1.0 when at/below floor, else 0.0.
+    """
+    if target <= floor:
+        return 1.0 if receivable_ratio <= floor else 0.0
+
+    if receivable_ratio >= target:
+        return 0.0
+    if receivable_ratio <= floor:
+        return 1.0
+
+    pressure = (target - receivable_ratio) / (target - floor)
+    return max(0.0, min(1.0, pressure))
+
+
+def _cfg_bool(cfg_like, name: str, default: bool = False) -> bool:
+    """Read a bool-typed cfg attribute defensively.
+
+    Returns `default` unless the attribute is an ACTUAL bool. This guards
+    against loosely-mocked cfg objects (e.g. a bare unittest.mock.MagicMock
+    used by older tests) where accessing an unset attribute auto-vivifies a
+    truthy, non-bool Mock — plain `getattr(..., default)` would return that
+    Mock (never the default) and `bool(...)` on it is True, which would
+    silently activate a feature that's supposed to default OFF.
+    """
+    value = getattr(cfg_like, name, default)
+    return value if isinstance(value, bool) else default
+
+
+def _cfg_float(cfg_like, name: str, default: float) -> float:
+    """Read a numeric cfg attribute defensively (see `_cfg_bool`).
+
+    A bare MagicMock's `__float__` defaults to 1.0, so plain
+    `float(getattr(...))` on an unset attribute would silently coerce to
+    1.0 instead of falling back to `default`.
+    """
+    value = getattr(cfg_like, name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return float(value)
+
+
+def effective_drain_discount_max(cfg_like, node_pressure: float) -> float:
+    """Node-liquidity-scaled effective cap for the per-channel drain discount.
+
+    Extends the static, operator-set `drain_fee_discount_max` with a
+    node-aggregate starvation term: `node_drain_bias_max * node_pressure`.
+    The effective cap is the LARGER of the two, so a static discount the
+    operator already configured is never reduced by this feature, and a
+    source-heavy (starved) node auto-activates a discount even when the
+    static cap is 0.0.
+
+    When `node_drain_bias_enabled` is falsy, returns the static value
+    unchanged (byte-identical to the pre-Task-3 behavior) regardless of
+    `node_pressure` — this is the default-off invariant.
+    """
+    static_max = _cfg_float(cfg_like, "drain_fee_discount_max", 0.0)
+    if not _cfg_bool(cfg_like, "node_drain_bias_enabled", False):
+        return static_max
+    bias_max = _cfg_float(cfg_like, "node_drain_bias_max", 0.0)
+    return max(static_max, bias_max * float(node_pressure))
+
+
+# =============================================================================
 # REASON CODES FOR EXPLAINABILITY
 # =============================================================================
 # Structured reason codes for fee adjustment decisions. These codes enable
@@ -4527,7 +4638,48 @@ class FeeController:
             # P8: mempool spikes must reach sleeping channels too — their
             # sleep early-return runs before the Vegas floor computation.
             self._maybe_wake_for_vegas_spike()
-        
+
+        # Node-liquidity-aware auto-drain-bias (default off): compute the
+        # node-wide receivable ratio / drain pressure ONCE per cycle (never
+        # per channel — this is a node-aggregate fee-layer signal, not a
+        # per-peer one; see docs/planning/2026-07-02-fee-node-drain-bias-design.md).
+        # Wrapped defensively so a malformed cfg or a failed RPC can never
+        # abort the fee cycle: any failure falls back to
+        # effective_drain_discount_max=None, which _adjust_channel_fee
+        # treats identically to "feature not computed" (uses the static
+        # cfg.drain_fee_discount_max, i.e. today's behavior unchanged).
+        node_receivable_ratio_value: Optional[float] = None
+        node_drain_pressure_value: Optional[float] = None
+        node_drain_bias_effective_cap: Optional[float] = None
+        try:
+            pressure = 0.0
+            if _cfg_bool(cfg, "node_drain_bias_enabled", False):
+                try:
+                    raw_channels = (
+                        self.data_service.get_peer_channels()
+                        if self.data_service is not None
+                        else self.plugin.rpc.listpeerchannels()
+                    ).get("channels", [])
+                except Exception:
+                    raw_channels = []
+                node_receivable_ratio_value = compute_node_receivable_ratio(raw_channels)
+                pressure = node_drain_pressure(
+                    node_receivable_ratio_value,
+                    _cfg_float(cfg, "receivable_ratio_target", 0.30),
+                    _cfg_float(cfg, "receivable_ratio_floor", 0.20),
+                )
+                node_drain_pressure_value = pressure
+            node_drain_bias_effective_cap = effective_drain_discount_max(cfg, pressure)
+        except Exception as e:
+            self.plugin.log(
+                f"NODE_DRAIN_BIAS: computation failed, falling back to static "
+                f"drain_fee_discount_max: {e}",
+                level='debug'
+            )
+            node_receivable_ratio_value = None
+            node_drain_pressure_value = None
+            node_drain_bias_effective_cap = None
+
         # PERF: defer fee-strategy row persistence for the whole cycle and
         # flush once at the end (single batch write instead of ~2 full-row
         # writes per channel). Losing one cycle's posterior updates on a
@@ -4543,6 +4695,9 @@ class FeeController:
                 cfg=cfg,
                 adjustments=adjustments,
                 skip_reasons=skip_reasons,
+                node_drain_bias_effective_cap=node_drain_bias_effective_cap,
+                node_receivable_ratio_value=node_receivable_ratio_value,
+                node_drain_pressure_value=node_drain_pressure_value,
             )
         finally:
             self._cycle_batch_active = False
@@ -4620,8 +4775,17 @@ class FeeController:
         cfg: 'ConfigSnapshot',
         adjustments: List[FeeAdjustment],
         skip_reasons: Dict[str, int],
+        node_drain_bias_effective_cap: Optional[float] = None,
+        node_receivable_ratio_value: Optional[float] = None,
+        node_drain_pressure_value: Optional[float] = None,
     ) -> None:
-        """Per-channel body of the fee cycle (runs with batched persistence)."""
+        """Per-channel body of the fee cycle (runs with batched persistence).
+
+        node_drain_bias_effective_cap: cycle-level node-drain-bias discount
+        cap computed ONCE by the caller (None => feature not computed/
+        disabled/errored — _adjust_channel_fee falls back to the static
+        cfg.drain_fee_discount_max, i.e. pre-Task-3 behavior unchanged).
+        """
         for state in channel_states:
             channel_id = state.get("channel_id")
             peer_id = state.get("peer_id")
@@ -4786,6 +4950,9 @@ class FeeController:
                     force_reprice_reason=force_reprice_reason,
                     forward_count_hint=forward_count_hint,
                     forward_count_hint_since=pre_last_update,
+                    node_drain_bias_effective_cap=node_drain_bias_effective_cap,
+                    node_receivable_ratio_value=node_receivable_ratio_value,
+                    node_drain_pressure_value=node_drain_pressure_value,
                 )
 
                 if adjustment:
@@ -5330,7 +5497,10 @@ class FeeController:
                            cfg: Optional['ConfigSnapshot'] = None,
                            force_reprice_reason: Optional[str] = None,
                            forward_count_hint: Optional[int] = None,
-                           forward_count_hint_since: Optional[int] = None) -> Optional[FeeAdjustment]:
+                           forward_count_hint_since: Optional[int] = None,
+                           node_drain_bias_effective_cap: Optional[float] = None,
+                           node_receivable_ratio_value: Optional[float] = None,
+                           node_drain_pressure_value: Optional[float] = None) -> Optional[FeeAdjustment]:
         """
         Adjust fee for a single channel.
 
@@ -5391,6 +5561,8 @@ class FeeController:
         temporal_adj = 1.0
         composite_hint_bias = 1.0
         exploration_multiplier = 1.0
+        drain_multiplier = 1.0
+        effective_discount_max = float(getattr(cfg, "drain_fee_discount_max", 0.0))
 
         # Detect critical state.
         # F4 (2026-06 audit): live HTLC recomputation + staleness TTL instead
@@ -6130,20 +6302,40 @@ class FeeController:
             # clamp downstream. Off by default (drain_fee_discount_max=0.0).
             # outbound_ratio (spendable/capacity) is deliberately used here:
             # conservative vs spendable/(spendable+receivable).
+            # node_drain_bias_effective_cap (Task 3, default off): a cycle-level
+            # node-liquidity-aware discount cap computed ONCE per cycle by
+            # _adjust_all_fees_inner (see effective_drain_discount_max /
+            # docs/planning/2026-07-02-fee-node-drain-bias-design.md). None
+            # means "not computed" (feature disabled, errored, or this method
+            # was called directly without it) — falls back to the static
+            # cfg.drain_fee_discount_max, i.e. behavior unchanged.
+            effective_discount_max = (
+                node_drain_bias_effective_cap
+                if node_drain_bias_effective_cap is not None
+                else float(getattr(cfg, "drain_fee_discount_max", 0.0))
+            )
             drain_multiplier = self._drain_fee_multiplier(
                 local_ratio=outbound_ratio,
                 forward_count=forward_count,
                 high_threshold=float(getattr(cfg, "high_liquidity_threshold", 0.7)),
-                discount_max=float(getattr(cfg, "drain_fee_discount_max", 0.0)),
+                discount_max=effective_discount_max,
             )
             if drain_multiplier != 1.0:
                 pre_drain_target_ppm = post_pid_target_ppm
                 post_pid_target_ppm = int(post_pid_target_ppm * drain_multiplier)
+                node_bias_note = ""
+                if node_receivable_ratio_value is not None and node_drain_pressure_value is not None:
+                    node_bias_note = (
+                        f" [node_drain_bias: receivable_ratio="
+                        f"{node_receivable_ratio_value:.3f}, "
+                        f"pressure={node_drain_pressure_value:.3f}, "
+                        f"effective_cap={effective_discount_max:.3f}]"
+                    )
                 self.plugin.log(
                     f"DRAIN_DISCOUNT: {channel_id[:12]}... stagnant over-local "
                     f"(outbound_ratio={outbound_ratio:.2f}), target "
                     f"{pre_drain_target_ppm}->{post_pid_target_ppm}ppm "
-                    f"(multiplier={drain_multiplier:.3f})",
+                    f"(multiplier={drain_multiplier:.3f}){node_bias_note}",
                     level='debug'
                 )
             # Temporal fee adjustment is composed with the hive bias above
@@ -6869,6 +7061,10 @@ class FeeController:
                     "hive_composite_hint_bias": composite_hint_bias,
                     "hive_exploration_multiplier": exploration_multiplier,
                     "hive_membership": self._get_hive_membership_status(peer_id),
+                    "drain_multiplier": drain_multiplier,
+                    "drain_discount_max_effective": effective_discount_max,
+                    "node_receivable_ratio": node_receivable_ratio_value,
+                    "node_drain_pressure": node_drain_pressure_value,
                 },
                 reason_code=fee_reason_code,
             )

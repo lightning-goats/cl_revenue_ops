@@ -154,6 +154,8 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "receivable_ratio_target",
         "receivable_ratio_floor",
         "drain_fee_discount_max",
+        "node_drain_bias_enabled",
+        "node_drain_bias_max",
     ]
     assert result["operator_controls"]["values"] == {
         "paused": False,
@@ -179,6 +181,8 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "receivable_ratio_target": 0.3,
         "receivable_ratio_floor": 0.2,
         "drain_fee_discount_max": 0.0,
+        "node_drain_bias_enabled": False,
+        "node_drain_bias_max": 0.3,
     }
     assert "config" not in result
 

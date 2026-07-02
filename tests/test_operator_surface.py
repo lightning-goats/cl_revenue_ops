@@ -33,6 +33,8 @@ def test_public_runtime_keys_are_safety_only():
         "receivable_ratio_target",
         "receivable_ratio_floor",
         "drain_fee_discount_max",
+        "node_drain_bias_enabled",
+        "node_drain_bias_max",
     ]
 
 
@@ -72,6 +74,8 @@ def test_public_runtime_dict_returns_only_public_keys():
         "receivable_ratio_target": 0.3,
         "receivable_ratio_floor": 0.2,
         "drain_fee_discount_max": 0.0,
+        "node_drain_bias_enabled": False,
+        "node_drain_bias_max": 0.3,
     }
 
 
@@ -677,6 +681,8 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "fee_profile",
         "max_fee_ppm",
         "min_fee_ppm",
+        "node_drain_bias_enabled",
+        "node_drain_bias_max",
         "paused",
         "planner_dry_run",
         "planner_enabled",
@@ -687,7 +693,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_floor",
         "receivable_ratio_target",
     ]
-    assert result["count"] == 23
+    assert result["count"] == 25
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -719,6 +725,8 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "receivable_ratio_target": 0.3,
         "receivable_ratio_floor": 0.2,
         "drain_fee_discount_max": 0.0,
+        "node_drain_bias_enabled": False,
+        "node_drain_bias_max": 0.3,
     }
 
 
@@ -1175,6 +1183,8 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "receivable_ratio_target": 0.3,
         "receivable_ratio_floor": 0.2,
         "drain_fee_discount_max": 0.0,
+        "node_drain_bias_enabled": False,
+        "node_drain_bias_max": 0.3,
     }
     assert "config" not in result
     assert "hive_hints" not in result
