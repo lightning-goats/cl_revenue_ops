@@ -427,3 +427,88 @@ def test_p2_005_fee_cache_lock_serializes_access():
 
     # _get_last_hop_fee must NOT hold _cache_lock across the PRIORITY-2 RPC.
     assert not r._cache_lock.locked()
+
+
+# ---------------------------------------------------------------------------
+# P2-006 — hive-member gate collections must be mutated atomically
+# ---------------------------------------------------------------------------
+def _bare_fee_controller():
+    from modules.fee_controller import FeeController
+
+    fc = object.__new__(FeeController)
+    fc._hive_member_lock = threading.Lock()
+    fc._hive_member_set_at = {}
+    fc._hive_member_released_peers = set()
+    fc._hive_member_advisory_peers = set()
+    return fc
+
+
+def test_p2_006_remember_hive_member_first_add_is_atomic():
+    """Many threads racing _remember_hive_member on the SAME fresh peer must
+    yield exactly one 'first add' (True) — no double advisory insert."""
+    fc = _bare_fee_controller()
+    results = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()  # maximise contention on the composite get+set+add
+        results.append(fc._remember_hive_member("peerX"))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results.count(True) == 1, f"first-add not atomic: {results}"
+    assert fc._hive_member_advisory_peers == {"peerX"}
+
+
+def test_p2_006_concurrent_mutate_and_consume_no_error():
+    """Concurrent remember / clear / consume across many peers must never
+    raise (no set-changed / KeyError tear on the zero-fee hive gate)."""
+    fc = _bare_fee_controller()
+    peers = [f"peer{i}" for i in range(30)]
+    errors = []
+    stop = threading.Event()
+
+    def remember():
+        try:
+            while not stop.is_set():
+                for p in peers:
+                    fc._remember_hive_member(p)
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    def clear():
+        try:
+            while not stop.is_set():
+                for p in peers:
+                    fc._clear_hive_member_cache(p, release=True)
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    def consume():
+        try:
+            while not stop.is_set():
+                for p in peers:
+                    fc._consume_hive_member_advisory(p)
+                    fc._consume_hive_member_release(p)
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=remember),
+        threading.Thread(target=remember),
+        threading.Thread(target=clear),
+        threading.Thread(target=consume),
+    ]
+    for t in threads:
+        t.start()
+    time.sleep(0.4)
+    stop.set()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"hive-member collections raced: {errors}"
+
