@@ -217,7 +217,8 @@ lightning-cli revenue-config set daily_budget_sats 10000
 - Coordination hints now seed candidate generation before the active pair cap is applied. `rebalance_recommendations` / `rebalance_campaigns` can materialize coordinated pairs from peer IDs, local SCIDs, or route segments, and may steer policy via `route_policy`, `allow_market_fallback`, `prefer_hive_on_tie`, and `priority_score`.
 - `route_segment_leases` are honored during that overlay stage: overlapping foreign leases suppress the candidate with an explicit `lease_conflict` audit reason, while our own leases are allowed through.
 - Additional live hint consumers:
-  - `fee_elasticity` slightly widens or narrows DTS exploration variance
+  - `fee_elasticity` arms the DTS exploration multiplier, hard-clamped to `[0.75, 2.0]` (`EXPLORATION_BOOST_MIN/MAX` in `modules/fee_controller.py`)
+  - `fleet_fee_prior` / `optimal_fee_estimate_ppm` seed a fleet fee prior, clamped to `[1, 10000]` ppm (`MAX_FLEET_FEE_PRIOR_PPM` in `modules/hive_hints.py`); out-of-range values neutralize to no hint. These two are separate hive-influence channels with their own rails and are NOT the ±10% bounded fee-bias clamp
   - `reputation_score` and `corridor_utilization_bias` modestly bias capacity-planner open scoring
   - `drain_direction` remains askrene/diagnostic only; the fee controller intentionally does not apply it directly
 - `revenue-hive-hints-status` reports freshness and signal coverage for the currently cached cl-mycelium hint snapshot.
