@@ -226,19 +226,35 @@ _loop_heartbeats_lock = threading.Lock()
 # Bounded backoff after an unhandled per-iteration failure so a hot failure loop
 # cannot spin the CPU. The wait is interruptible (exits on shutdown).
 _LOOP_BACKOFF_SECONDS = 30
-# A loop is considered "stalled" if its last tick is older than this many
-# multiples of its own interval is not tracked here (intervals vary); instead
-# revenue-health reports the raw age and a coarse threshold flag.
+# A periodic loop is "stalled" only once its tick age exceeds a threshold
+# derived from its OWN interval: max(_LOOP_STALL_FLOOR_SECONDS,
+# _LOOP_STALL_INTERVAL_MULTIPLE * its_own_interval). This avoids false
+# positives for loops that legitimately run less than hourly (e.g. the
+# capacity-planner's default 24h cycle or the daily financial-snapshot).
+# A one-shot loop (ticks exactly once, e.g. startup-snapshot) is never
+# considered stalled. _LOOP_STALL_SECONDS remains the fallback used to
+# derive a threshold (~3600s, matching the multiple below) for any loop
+# that reports no interval.
 _LOOP_STALL_SECONDS = 3600
+_LOOP_STALL_INTERVAL_MULTIPLE = 3     # stalled only after 3x its own interval
+_LOOP_STALL_FLOOR_SECONDS = 900       # never flag a loop stalled under 15 min
 
 
-def _record_loop_heartbeat(name: str) -> None:
-    """Record a per-thread heartbeat for daemon loop ``name`` (best-effort)."""
+def _record_loop_heartbeat(name: str, interval_seconds: Optional[float] = None, one_shot: bool = False) -> None:
+    """Record a per-thread heartbeat for daemon loop ``name`` (best-effort).
+
+    ``interval_seconds`` is the loop's own base (pre-jitter) interval, used
+    by ``_loop_liveness_snapshot`` to derive a per-loop stall threshold.
+    ``one_shot`` marks a loop that ticks exactly once by design (e.g. the
+    startup-snapshot thread), which is never reported as stalled.
+    """
     try:
         with _loop_heartbeats_lock:
             _loop_heartbeats[name] = {
                 "last_tick_monotonic": time.monotonic(),
                 "last_tick_ts": int(time.time()),
+                "interval_seconds": interval_seconds,
+                "one_shot": bool(one_shot),
             }
     except Exception:
         pass
@@ -252,10 +268,25 @@ def _loop_liveness_snapshot() -> Dict[str, Any]:
         items = {k: dict(v) for k, v in _loop_heartbeats.items()}
     for name, hb in items.items():
         age = max(0.0, now_mono - float(hb.get("last_tick_monotonic", now_mono)))
+        if hb.get("one_shot"):
+            out[name] = {
+                "last_tick_ts": int(hb.get("last_tick_ts", 0) or 0),
+                "last_tick_age_seconds": int(age),
+                "state": "complete",
+                "one_shot": True,
+            }
+            continue
+        interval = hb.get("interval_seconds")
+        if not interval or interval <= 0:
+            # No reported interval: fall back to the flat threshold so the
+            # resulting threshold matches the historical ~3600s behavior.
+            interval = _LOOP_STALL_SECONDS / _LOOP_STALL_INTERVAL_MULTIPLE
+        threshold = max(_LOOP_STALL_FLOOR_SECONDS, _LOOP_STALL_INTERVAL_MULTIPLE * float(interval))
         out[name] = {
             "last_tick_ts": int(hb.get("last_tick_ts", 0) or 0),
             "last_tick_age_seconds": int(age),
-            "state": "stalled" if age > _LOOP_STALL_SECONDS else "alive",
+            "state": "stalled" if age > threshold else "alive",
+            "stall_threshold_seconds": int(threshold),
         }
     return out
 
@@ -2797,7 +2828,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             # DD5 / P1-010: canonical guard wraps the ENTIRE iteration (work AND
             # the interval/sleep tail) so no exception can kill the thread.
             try:
-                _record_loop_heartbeat("flow-analysis")
+                _hb_cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+                _record_loop_heartbeat("flow-analysis", interval_seconds=max(60, _hb_cfg_snap.flow_interval))
                 try:
                     plugin.log("Running scheduled flow analysis...")
                     run_flow_analysis()
@@ -2852,7 +2884,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         while not shutdown_event.is_set():
             # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
             try:
-                _record_loop_heartbeat("fee-adjustment")
+                _hb_cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+                _record_loop_heartbeat("fee-adjustment", interval_seconds=max(60, _hb_cfg_snap.fee_interval))
                 _refresh_fee_cycle_hive_inputs()
 
                 try:
@@ -2893,7 +2926,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         while not shutdown_event.is_set():
             # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
             try:
-                _record_loop_heartbeat("rebalance-check")
+                _hb_cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+                _record_loop_heartbeat("rebalance-check", interval_seconds=max(60, _hb_cfg_snap.rebalance_interval))
                 try:
                     refresh_hive_runtime(hive_hints=hive_hints, hive_router=hive_router, log=plugin.log)
                 except Exception:
@@ -2946,7 +2980,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         while not shutdown_event.is_set():
             # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
             try:
-                _record_loop_heartbeat("boltz-auto-cycle")
+                _hb_interval_min = max(1, int(getattr(config, 'boltz_auto_cycle_interval_minutes', 15) or 15))
+                _record_loop_heartbeat("boltz-auto-cycle", interval_seconds=_hb_interval_min * 60)
                 enabled = bool(getattr(config, 'boltz_auto_cycle_enabled', False))
                 _boltz_auto_cycle_mark_state(enabled=enabled)
 
@@ -3016,7 +3051,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         while not shutdown_event.is_set():
             # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
             try:
-                _record_loop_heartbeat("capacity-planner")
+                _hb_cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
+                _record_loop_heartbeat("capacity-planner", interval_seconds=max(600, _hb_cfg_snap.planner_interval))
                 try:
                     _refresh_dynamic_config()
                     plugin.log("Running scheduled capacity planner cycle...")
@@ -3065,7 +3101,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # thread-local DB connection before this one-shot thread exits.
         # DD5 / P1-010: guard the single run so an exception cannot kill the
         # thread silently; record a heartbeat so the one-shot is observable.
-        _record_loop_heartbeat("startup-snapshot")
+        _record_loop_heartbeat("startup-snapshot", one_shot=True)
         try:
             _snapshot_peers_once()
         except Exception as e:
@@ -3099,7 +3135,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             # DD5 / P1-010: canonical guard over the ENTIRE iteration. This loop
             # is inverted (sleep-tail at the TOP), so the guard wraps it too.
             try:
-                _record_loop_heartbeat("financial-snapshot")
+                _record_loop_heartbeat("financial-snapshot", interval_seconds=SNAPSHOT_INTERVAL)
                 # Calculate +/- 10% jitter (about 2.4 hours variance)
                 jitter_seconds = int(SNAPSHOT_INTERVAL * 0.1)
                 sleep_time = SNAPSHOT_INTERVAL + random.randint(-jitter_seconds, jitter_seconds)
