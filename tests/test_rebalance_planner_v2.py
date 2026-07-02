@@ -228,6 +228,36 @@ class TestPairGeneration:
         assert pair.dest_realized_utilization == pytest.approx(0.3)
         assert pair.dest_utilization_is_realized is False
 
+    def test_generate_pairs_threads_activity_sats_without_transpose(self):
+        """Task 8 coverage gap: _generate_pairs must map
+        src.activity_out_sats -> PairCandidate.source_activity_out_sats and
+        dest.activity_in_sats -> PairCandidate.dest_activity_in_sats WITHOUT
+        reading the wrong attribute (activity_out vs activity_in) or
+        swapping src/dest. Use distinct, asymmetric values on both fields of
+        both channels so either mistake would fail this assertion."""
+        import dataclasses
+
+        planner = RebalancePlanner()
+        src = dataclasses.replace(
+            _ch(channel_id="src", peer_id="02" + "aa" * 32, local_ratio=0.90),
+            activity_out_sats=700_000,
+            activity_in_sats=111,
+        )
+        dest = dataclasses.replace(
+            _ch(channel_id="dest", peer_id="02" + "bb" * 32, local_ratio=0.10),
+            activity_in_sats=900_000,
+            activity_out_sats=222,
+        )
+        snap = _snap(src, dest)
+
+        result = planner.plan(snap)
+
+        pair = result.selected[0]
+        assert pair.source_channel_id == "src"
+        assert pair.dest_channel_id == "dest"
+        assert pair.source_activity_out_sats == 700_000
+        assert pair.dest_activity_in_sats == 900_000
+
 
 class TestSkipReasons:
     def test_destination_skipped_when_not_valuable(self):

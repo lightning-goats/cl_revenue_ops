@@ -4128,3 +4128,108 @@ def test_no_activity_no_penalty(mock_plugin, mock_database):
 
     assert decomp["activity_penalty_sats"] == 0.0
     assert decomp["final_score_sats"] == pytest.approx(pre_feature_final_score_sats)
+
+
+def test_activity_penalty_includes_dest_side_contribution(mock_plugin, mock_database):
+    """Task 8 coverage gap: helpful_flow_sats = source_activity_out_sats +
+    dest_activity_in_sats. Existing tests only ever set
+    source_activity_out_sats, so a bug that dropped the dest_activity_in_sats
+    addend from the sum would still pass them. Set only
+    dest_activity_in_sats > 0 (source_activity_out_sats == 0, the default)
+    and prove it alone produces a nonzero, correctly-computed penalty."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_activity_penalty_coeff = 0.5
+    engine.config.rebalance_activity_penalty_cap_frac = 0.5
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_000
+    dest_activity_in_sats = 100_000
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+        dest_activity_in_sats=dest_activity_in_sats,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    dest_value_fee_ppm = decomp["inputs"]["dest_value_fee_ppm"]
+    expected_future_value_sats = decomp["expected_future_value_sats"]
+    raw_penalty = 0.5 * dest_activity_in_sats * dest_value_fee_ppm / 1_000_000.0
+    cap = 0.5 * max(0.0, expected_future_value_sats)
+    expected_penalty = round(min(raw_penalty, cap), 6)
+
+    assert expected_penalty > 0
+    assert decomp["activity_penalty_sats"] == pytest.approx(expected_penalty)
+
+
+def test_activity_penalty_sums_source_and_dest_activity(mock_plugin, mock_database):
+    """Task 8 coverage gap: when BOTH source_activity_out_sats and
+    dest_activity_in_sats are set, the penalty must be based on their SUM
+    (helpful_flow_sats = source_activity_out_sats + dest_activity_in_sats),
+    not either term alone."""
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine.config.rebalance_activity_penalty_coeff = 0.5
+    engine.config.rebalance_activity_penalty_cap_frac = 0.5
+
+    amount_sats = 1_000_000
+    dest_out_fee_ppm = 2_000
+    source_activity_out_sats = 60_000
+    dest_activity_in_sats = 40_000
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="03" + "b" * 64,
+        dest_peer_id="03" + "c" * 64,
+        amount_sats=amount_sats,
+        pair_budget_sats=5_000,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        score=2.0,
+        source_local_ratio=0.85,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=dest_out_fee_ppm,
+        source_activity_out_sats=source_activity_out_sats,
+        dest_activity_in_sats=dest_activity_in_sats,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    dest_value_fee_ppm = decomp["inputs"]["dest_value_fee_ppm"]
+    expected_future_value_sats = decomp["expected_future_value_sats"]
+    helpful_flow_sats = source_activity_out_sats + dest_activity_in_sats
+    raw_penalty = 0.5 * helpful_flow_sats * dest_value_fee_ppm / 1_000_000.0
+    cap = 0.5 * max(0.0, expected_future_value_sats)
+    expected_penalty = round(min(raw_penalty, cap), 6)
+
+    assert expected_penalty > 0
+    assert decomp["activity_penalty_sats"] == pytest.approx(expected_penalty)
