@@ -3973,6 +3973,12 @@ class Database:
             return False
         ts = int(timestamp or time.time())
         amount = self._sanitize_amount(amount_sats, "amount_sats")
+        # P4-003: mirror reserve_spend's amount<=0 guard. A non-positive amount
+        # would SUM() into committed spend and *lower* it (via a negative), which
+        # raises remaining budget in the overspend-permitting direction; a zero
+        # is a meaningless no-op event. Reject both before persisting.
+        if amount <= 0:
+            return False
         meta_json = json.dumps(metadata or {}, sort_keys=True) if metadata else None
         # P2-008: a spend event that fails to persist under-counts the unified
         # budget in the OVERSPEND-permitting direction. A transient
@@ -4984,23 +4990,29 @@ class Database:
                   resolution_time, ts, rt))
             duplicate = (cursor.rowcount == 0)
 
-            # Same upsert SQL as update_peer_reputation()
-            if success:
-                conn.execute("""
-                    INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
-                    VALUES (?, 1, 0, ?)
-                    ON CONFLICT(peer_id) DO UPDATE SET
-                        success_count = success_count + 1,
-                        last_update = excluded.last_update
-                """, (peer_id, now))
-            else:
-                conn.execute("""
-                    INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
-                    VALUES (?, 0, 1, ?)
-                    ON CONFLICT(peer_id) DO UPDATE SET
-                        failure_count = failure_count + 1,
-                        last_update = excluded.last_update
-                """, (peer_id, now))
+            # P4-004: only touch reputation when the forward was actually new.
+            # The fee side is deduped by the unique index (INSERT OR IGNORE),
+            # but the reputation upsert used to run unconditionally, so a
+            # duplicate forward (startup-hydration vs live overlap) would
+            # re-increment success/failure counts on replay. Guard it.
+            if not duplicate:
+                # Same upsert SQL as update_peer_reputation()
+                if success:
+                    conn.execute("""
+                        INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
+                        VALUES (?, 1, 0, ?)
+                        ON CONFLICT(peer_id) DO UPDATE SET
+                            success_count = success_count + 1,
+                            last_update = excluded.last_update
+                    """, (peer_id, now))
+                else:
+                    conn.execute("""
+                        INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
+                        VALUES (?, 0, 1, ?)
+                        ON CONFLICT(peer_id) DO UPDATE SET
+                            failure_count = failure_count + 1,
+                            last_update = excluded.last_update
+                    """, (peer_id, now))
 
             conn.execute("COMMIT")
         except Exception:
@@ -5674,10 +5686,16 @@ class Database:
                 )
                 return False
 
-            # Security: Sanitize fee values
-            closure_fee_sats = self._sanitize_fee(closure_fee_sats, "closure_fee")
-            htlc_sweep_fee_sats = self._sanitize_fee(htlc_sweep_fee_sats, "htlc_sweep_fee")
-            penalty_fee_sats = self._sanitize_fee(penalty_fee_sats, "penalty_fee")
+            # Security: Sanitize fee values.
+            # P4-002: closure costs are NOT routine routing fees — a real
+            # force-close (multi-HTLC sweep / mempool spike) legitimately
+            # exceeds the 50000-sat _sanitize_fee ceiling. Clamping it there
+            # under-counts closure cost and over-states lifetime P&L
+            # (optimistic direction). Use the closure-appropriate bound: still
+            # non-negative, but capped at the 10 BTC _sanitize_amount ceiling.
+            closure_fee_sats = max(0, self._sanitize_amount(closure_fee_sats, "closure_fee"))
+            htlc_sweep_fee_sats = max(0, self._sanitize_amount(htlc_sweep_fee_sats, "htlc_sweep_fee"))
+            penalty_fee_sats = max(0, self._sanitize_amount(penalty_fee_sats, "penalty_fee"))
 
             # Validate close_type
             valid_close_types = {'mutual', 'local_unilateral', 'remote_unilateral', 'unknown'}

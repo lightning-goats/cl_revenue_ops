@@ -219,6 +219,18 @@ def _validate_onchain_address(address: str, currency: str) -> bool:
     return False
 
 
+def _validate_swap_destination(destination: str) -> bool:
+    """Validate a swap destination address whose asset network is not known
+    from the call signature (refund/claim). Accept a structurally valid BTC or
+    Liquid address; reject garbage / flag-like values. The literal "wallet"
+    keyword (send to the internal wallet) is handled by the caller.
+    """
+    return (
+        _validate_onchain_address(destination, "BTC")
+        or _validate_onchain_address(destination, "LBTC")
+    )
+
+
 @dataclass
 class BoltzCliConfig:
     enabled: bool = False
@@ -1655,6 +1667,15 @@ class BoltzCliManager:
             raise BoltzCliError("amount_sats must be > 0")
         target_cur = self._norm_currency(currency, "BTC")
 
+        # P4-005: validate the operator-supplied on-chain destination for the
+        # settlement network BEFORE any subprocess call. A wrong-network/typo'd
+        # address on a reverse swap sends proceeds to an unrecoverable dest.
+        # (When no address is given, proceeds go to the internal wallet.)
+        if address and not _validate_onchain_address(address, target_cur):
+            raise BoltzCliError(
+                f"invalid {target_cur} on-chain destination address: refusing loop-out"
+            )
+
         # P0-1 FIX: Serialize budget-check + swap-create to prevent TOCTOU race
         with self._swap_creation_lock:
             return self._loop_out_locked(amount_sats, address, channel_id, peer_id, currency, target_cur,
@@ -2027,6 +2048,12 @@ class BoltzCliManager:
 
     def refund(self, swap_id: str, destination: Optional[str] = None) -> Dict[str, Any]:
         dest = destination or "wallet"
+        # P4-005: validate an explicit on-chain destination before the
+        # subprocess call (the "wallet" keyword targets the internal wallet).
+        if dest != "wallet" and not _validate_swap_destination(dest):
+            raise BoltzCliError(
+                "invalid on-chain refund destination address: refusing refund"
+            )
         # `--` terminates option parsing so a swap_id/dest beginning with '-'
         # is treated as a positional value, not reparsed by boltzcli as a flag.
         raw = self._run(["refundswap", "--", str(swap_id), str(dest)], timeout=max(self.cfg.timeout_seconds, 120))
@@ -2037,6 +2064,12 @@ class BoltzCliManager:
         if not ids:
             raise BoltzCliError("swap_ids is required")
         dest = destination or "wallet"
+        # P4-005: validate an explicit on-chain destination before the
+        # subprocess call (the "wallet" keyword targets the internal wallet).
+        if dest != "wallet" and not _validate_swap_destination(dest):
+            raise BoltzCliError(
+                "invalid on-chain claim destination address: refusing claim"
+            )
         # `--` terminates option parsing so a dest/swap-id beginning with '-'
         # is treated as a positional value, not reparsed by boltzcli as a flag.
         raw = self._run(["claimswaps", "--", str(dest)] + ids, timeout=max(self.cfg.timeout_seconds, 120))
@@ -2051,6 +2084,13 @@ class BoltzCliManager:
         to_cur = self._norm_currency(to_currency, "BTC")
         if from_cur == to_cur:
             raise BoltzCliError("from_currency and to_currency must differ")
+
+        # P4-005: validate the operator-supplied to_address for the destination
+        # network BEFORE any subprocess call. (No to_address => internal wallet.)
+        if to_address and not _validate_onchain_address(to_address, to_cur):
+            raise BoltzCliError(
+                f"invalid {to_cur} on-chain to_address: refusing chainswap"
+            )
 
         # P0-1 FIX: Serialize budget-check + swap-create to prevent TOCTOU race
         with self._swap_creation_lock:
@@ -2071,6 +2111,11 @@ class BoltzCliManager:
                 args.extend(["--to-address", str(to_address)])
             else:
                 args.extend(["--to-wallet", self._resolve_wallet_name(to_cur)])
+            # P4-006: `--` terminates option parsing so the positional amount
+            # (and any future free-form positional) is passed as data, never
+            # reparsed by boltzcli as a flag — matching the sibling P1-015
+            # commands (withdraw/refund/claim/loop_out).
+            args.append("--")
             args.append(str(amount_sats))
             result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 180))
             self._record_swap_result(result, source="chainswap")

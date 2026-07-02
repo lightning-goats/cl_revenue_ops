@@ -530,7 +530,10 @@ class TestRecordForwardAndReputation:
         assert rep["successes"] == 0
         assert rep["failures"] == 1
 
-    def test_duplicate_forward_is_idempotent_but_reputation_updates(self, tmp_path):
+    def test_duplicate_forward_is_idempotent_and_reputation_deduped(self, tmp_path):
+        # P4-004: a duplicate forward (INSERT OR IGNORE rowcount==0) must NOT
+        # re-increment reputation. Both the forward row and the reputation
+        # count are deduped on replay.
         db = _make_db(tmp_path)
         fwd = {
             "in_channel": "100x1x0", "out_channel": "200x2x0",
@@ -544,7 +547,7 @@ class TestRecordForwardAndReputation:
         count = conn.execute("SELECT COUNT(*) FROM forwards").fetchone()[0]
         assert count == 1  # INSERT OR IGNORE under idx_forwards_unique
         rep = db.get_peer_reputation(self.PEER)
-        assert rep["successes"] == 2
+        assert rep["successes"] == 1
 
     def test_derives_timestamps_like_record_forward(self, tmp_path):
         """resolved_time derived from received_time + resolution_time when absent."""
