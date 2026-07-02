@@ -29,6 +29,10 @@ What it does
     - capacity-planner channel_open reservations via the P4-018 atomic path
       (``category="channel_open"`` reserve_spend against the live unified budget)
       so budget-never-exceeded now covers the FOURTH (planner) daemon spend path
+    - defibrillation diagnostic-shock reservations via the P4-020 atomic path
+      (``reserve_budget`` category=rebalance against the live unified budget,
+      exactly the rail rebalancer.diagnostic_rebalance now reserves on) so the
+      budget invariant covers the FIFTH (defibrillation) daemon spend path
     - ``revenue-config set`` reloads (config._lock / _version churn)
 
 Asserted invariants (soak)
@@ -487,6 +491,62 @@ class StressHarness:
                 self.record_exception(f"planner_open_reserve[{wid}]", exc)
             self.bump()
 
+    def worker_defib_reserve(self, wid):
+        """Firehose: defibrillation diagnostic-shock reservations via the P4-020
+        atomic path.
+
+        Mirrors rebalancer.diagnostic_rebalance's active shock after P4-020: the
+        shock reserves its D4 fee cap through the SAME rail as the auto cycle —
+        db.reserve_budget (category=rebalance, budget_reservations) inside
+        _reserve_budget_atomic's BEGIN IMMEDIATE against the live unified budget.
+        This is the FIFTH (defibrillation) leg of DD1's cross-category rail: a
+        diagnostic shock's reservation must be counted by (and count) the
+        rebalance, generic, boltz, and planner reservations, so
+        budget-never-exceeded now covers ALL FIVE autonomous daemon spend paths.
+        The shock fee is small (D4-capped), so reserves stay bounded; reserve +
+        mark_spent/release churns the shock commitment against the shared budget.
+        """
+        mod = self.mod
+        db = mod.database
+        rng = random.Random(self.rng_seed * 6000 + wid)
+        counter = 0
+        live = deque()
+        while not self.stop.is_set():
+            counter += 1
+            roll = rng.random()
+            try:
+                if roll < 0.7 or not live:
+                    rid = f"defib-{wid}-{counter}"
+                    # D4 diagnostic fee cap envelope (bounded, 1/cycle in prod).
+                    amt = rng.randint(50, 400)
+                    try:
+                        prov = mod._total_cost_budget_limit_provider()
+                        budget_limit = int(prov.get("effective_budget_sats", self.budget_sats) or 0)
+                    except Exception:
+                        budget_limit = self.budget_sats
+                    ok, remaining = db.reserve_budget(
+                        reservation_id=rid,
+                        amount_sats=amt,
+                        channel_id=f"defib{wid}x{counter}x0",
+                        budget_limit=budget_limit,
+                        since_timestamp=self._since_24h(),
+                    )
+                    if ok:
+                        live.append(rid)
+                    self.journal(f"defib{wid}", "defib_reserve", amt, "rebalance",
+                                 f"ok={ok},limit={budget_limit}")
+                elif roll < 0.85:
+                    rid = live.popleft()
+                    ok = db.mark_budget_spent(rid, 0)
+                    self.journal(f"defib{wid}", "defib_mark_spent", None, "rebalance", f"ok={ok}")
+                else:
+                    rid = live.popleft()
+                    ok = db.release_budget_reservation(rid)
+                    self.journal(f"defib{wid}", "defib_release", None, "rebalance", f"ok={ok}")
+            except Exception as exc:
+                self.record_exception(f"defib_reserve[{wid}]", exc)
+            self.bump()
+
     def worker_config_reload(self, wid):
         """setconfig churn on non-budget public keys (config._lock / _version)."""
         mod = self.mod
@@ -642,6 +702,8 @@ class StressHarness:
             spawn(self.worker_boltz_reserve, f"boltz-{i}", i)
         for i in range(n):
             spawn(self.worker_planner_open_reserve, f"planner-{i}", i)
+        for i in range(n):
+            spawn(self.worker_defib_reserve, f"defib-{i}", i)
         for i in range(max(1, n // 2)):
             spawn(self.worker_config_reload, f"config-{i}", i)
 

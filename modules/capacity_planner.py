@@ -3403,15 +3403,10 @@ class CapacityPlanner:
                 except Exception:
                     pass
             if db:
-                try:
-                    db.mark_spend_reservation_spent(
-                        reservation_id=reservation_id,
-                        actual_spent_sats=estimated_cost,
-                        source="capacity_planner",
-                        record_event=True,
-                    )
-                except Exception:
-                    pass
+                self._settle_capex_reservation(
+                    db, reservation_id, estimated_cost,
+                    what=f"channel_open {channel_id or peer_id[:16]}",
+                )
 
             self.plugin.log(
                 f"Channel opened: {channel_id} to {peer_id[:16]}... ({amount_sats} sats)",
@@ -3458,6 +3453,52 @@ class CapacityPlanner:
 
             self.plugin.log(f"Channel open failed for {peer_id[:16]}...: {e}", level='error')
             return {"action_id": action_id, "status": "failed", "error": error_msg, "peer_id": peer_id}
+
+    def _settle_capex_reservation(self, db, reservation_id, actual_spent_sats, *, what):
+        """Settle a committed open/close reservation as a spend event.
+
+        P4-021 (mirrors P4-019's loud/retry): the on-chain tx already committed
+        the fee, so the settle must NOT silently drop the spend-event write.
+        mark_spend_reservation_spent is loud/idempotent — on a spend_events write
+        failure it rolls the UPDATE back (or returns False) and the reservation
+        stays 'active', keeping the committed fee counted on the unified rail
+        (opens/closes are counted ONLY via spend_events). We retry a bounded
+        number of times and, on persistent failure, log LOUDLY and leave the
+        reservation active — never release it. cleanup_stale_spend_reservations
+        protects channel_open/channel_close from the blind stale sweep so the
+        held reservation cannot later vanish either.
+        """
+        for attempt in range(3):
+            try:
+                if db.mark_spend_reservation_spent(
+                    reservation_id=reservation_id,
+                    actual_spent_sats=actual_spent_sats,
+                    source="capacity_planner",
+                    record_event=True,
+                ):
+                    return True
+            except Exception as e:
+                self.plugin.log(
+                    f"Capex settle write failed for {what} "
+                    f"(attempt {attempt + 1}/3): {e}",
+                    level='warn',
+                )
+                continue
+            self.plugin.log(
+                f"Capex settle write returned failure for {what} "
+                f"(attempt {attempt + 1}/3); retrying",
+                level='warn',
+            )
+        # Persistent failure: the committed fee stays counted via the still-active
+        # reservation (protected from the stale sweep). Surface it loudly so the
+        # operator can reconcile rather than silently losing the write.
+        self.plugin.log(
+            f"Capex settle write PERSISTENTLY FAILED for {what}: committed fee "
+            f"kept as an active reservation ({actual_spent_sats} sats) so it "
+            f"stays counted against the unified budget; investigate spend_events.",
+            level='error',
+        )
+        return False
 
     def _check_close_allowed(self, peer_id: str) -> tuple:
         """Check if a channel close is allowed for this peer.
@@ -3745,17 +3786,12 @@ class CapacityPlanner:
             # Settle the pre-close reservation with the ACTUAL close fee (falling
             # back to the reserved cap when the RPC did not report one).
             if db and close_reservation_active:
-                try:
-                    actual_close_fee_sats = self._extract_actual_close_fee_sats(result)
-                    close_cost = actual_close_fee_sats if actual_close_fee_sats is not None else reserved_close_fee_sats
-                    db.mark_spend_reservation_spent(
-                        reservation_id=close_reservation_id,
-                        actual_spent_sats=close_cost,
-                        source="capacity_planner",
-                        record_event=True,
-                    )
-                except Exception as e:
-                    self.plugin.log(f"Failed to settle close cost: {e}", level='debug')
+                actual_close_fee_sats = self._extract_actual_close_fee_sats(result)
+                close_cost = actual_close_fee_sats if actual_close_fee_sats is not None else reserved_close_fee_sats
+                self._settle_capex_reservation(
+                    db, close_reservation_id, close_cost,
+                    what=f"channel_close {channel_id}",
+                )
 
             self.plugin.log(
                 f"Channel closed: {channel_id} (peer: {peer_id[:16]}...)",

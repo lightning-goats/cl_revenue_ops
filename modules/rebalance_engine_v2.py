@@ -3211,7 +3211,10 @@ class RebalanceEngine:
             return False
 
     def execute_candidate(
-        self, candidate: Any, rebalance_id: Optional[int] = None
+        self,
+        candidate: Any,
+        rebalance_id: Optional[int] = None,
+        reserve_budget: bool = False,
     ) -> ExecutionResult:
         """Price and execute one explicit candidate on the v2 stack.
 
@@ -3224,6 +3227,14 @@ class RebalanceEngine:
 
         ``rebalance_id``: optional existing rebalance_history row id owned by
         the caller; see _execute_pair.
+
+        ``reserve_budget`` (P4-020): manual callers (revenue-rebalance) default
+        False and own their own accounting. The defibrillation diagnostic shock
+        passes True so it reserves its fee cap atomically through the SAME
+        cross-category rail as the auto cycle (``_reserve_execution_budget`` ->
+        ``reserve_budget`` inside ``_reserve_budget_atomic``'s BEGIN IMMEDIATE);
+        a shock is then rejected when the unified budget is exhausted by other
+        categories' reservations, closing the last autonomous-spender hole.
         """
         if not self._cycle_lock.acquire(blocking=False):
             self._log(
@@ -3239,13 +3250,16 @@ class RebalanceEngine:
             )
         try:
             return self._execute_candidate_locked(
-                candidate, rebalance_id=rebalance_id
+                candidate, rebalance_id=rebalance_id, reserve_budget=reserve_budget
             )
         finally:
             self._cycle_lock.release()
 
     def _execute_candidate_locked(
-        self, candidate: Any, rebalance_id: Optional[int] = None
+        self,
+        candidate: Any,
+        rebalance_id: Optional[int] = None,
+        reserve_budget: bool = False,
     ) -> ExecutionResult:
         source_channel_id = str(getattr(candidate, "from_channel", "") or "")
         dest_channel_id = str(getattr(candidate, "to_channel", "") or "")
@@ -3336,7 +3350,7 @@ class RebalanceEngine:
         return self._execute_pair(
             pair,
             executor,
-            reserve_budget=False,
+            reserve_budget=reserve_budget,
             account_costs=False,
             rebalance_id=rebalance_id,
         )

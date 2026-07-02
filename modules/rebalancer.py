@@ -359,17 +359,23 @@ class EVRebalancer:
         self,
         candidate: RebalanceCandidate,
         rebalance_id: Optional[int] = None,
+        reserve_budget: bool = False,
     ):
         """Execute one candidate through the shared v2 engine.
 
         ``rebalance_id``: the caller's existing rebalance_history row. The
         engine updates that row in place instead of inserting its own
         'pending' row, so each rebalance produces exactly one history row.
+
+        ``reserve_budget`` (P4-020): forwarded to the engine so the
+        defibrillation diagnostic shock reserves its fee cap atomically on the
+        unified cross-category rail (the auto cycle's path). Manual/explicit
+        callers leave it False and own their own accounting.
         """
         if self.rebalance_engine_v2 is None:
             raise RuntimeError("no rebalance engine available")
         return self.rebalance_engine_v2.execute_candidate(
-            candidate, rebalance_id=rebalance_id
+            candidate, rebalance_id=rebalance_id, reserve_budget=reserve_budget
         )
 
     def _set_last_decision_summary(
@@ -2552,9 +2558,14 @@ class EVRebalancer:
             )
 
             actual_fee_sats = None
+            shock_budget_blocked = False
             if self.rebalance_engine_v2:
+                # P4-020: reserve the shock's fee cap atomically on the unified
+                # cross-category rail (reserve_budget=True). If the budget is
+                # exhausted by other categories' reservations the engine returns
+                # a 'local_budget_block' result and never pays.
                 exec_result = self._execute_candidate_v2(
-                    candidate, rebalance_id=rebalance_id
+                    candidate, rebalance_id=rebalance_id, reserve_budget=True
                 )
                 if exec_result.success:
                     actual_fee_sats = self._record_successful_rebalance_fee(
@@ -2574,6 +2585,14 @@ class EVRebalancer:
                     )
                 shock_ok = exec_result.success
                 shock_pending = bool(getattr(exec_result, "payment_pending", False)) and not shock_ok
+                # A shock rejected by the atomic unified-budget reserve delivered
+                # no liquidity because the budget was full — that is a capital
+                # control block, not an execution failure, so report it honestly
+                # as 'blocked' (D4), same as the pre-reserve capital-controls gate.
+                shock_budget_blocked = (
+                    not shock_ok and not shock_pending
+                    and "local_budget_block" in str(getattr(exec_result, "error", "") or "")
+                )
             else:
                 self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no rebalance engine available")
                 shock_ok = False
@@ -2586,6 +2605,9 @@ class EVRebalancer:
                 shock_status = "completed"
             elif shock_pending:
                 shock_status = "pending"
+            elif shock_budget_blocked:
+                # P4-020: rejected by the atomic unified-budget reserve.
+                shock_status = "blocked"
             else:
                 shock_status = "failed"
             result = {
