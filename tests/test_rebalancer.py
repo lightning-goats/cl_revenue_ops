@@ -110,3 +110,38 @@ class TestFutilityKeyPeerScoped:
         # Sanity: the raw new SCID has no independent record.
         scid_count, _ = db.get_failure_count("BBBx9x0")
         assert scid_count == 0
+
+
+class TestInboundFeeBlendNoDoubleCount:
+    """DEF-067-S4: the medium-confidence inbound-fee blend must not add the
+    inbound_fee_estimate_ppm buffer on top of last_hop — the historical
+    median already carries the multi-hop cost, so the buffer double-counts
+    it in the blend."""
+
+    PEER = "03" + "e" * 64
+
+    def _rebalancer(self, mock_plugin, mock_database, buffer_ppm):
+        from modules.config import Config
+        from modules.rebalancer import EVRebalancer
+        cfg = Config(inbound_fee_estimate_ppm=buffer_ppm)
+        r = EVRebalancer(mock_plugin, cfg, mock_database)
+        r.hive_hints = None  # bypass the hive-member fast path
+        return r
+
+    def test_medium_confidence_blend_excludes_buffer(self, mock_plugin, mock_database):
+        from unittest.mock import MagicMock
+        r = self._rebalancer(mock_plugin, mock_database, buffer_ppm=50)
+        mock_database.get_historical_inbound_fee_ppm = MagicMock(return_value={
+            "confidence": "medium",
+            "median_fee_ppm": 200,
+            "avg_fee_ppm": 200,
+            "sample_count": 6,
+        })
+        r._get_last_hop_fee = MagicMock(return_value=150)
+
+        estimate = r._estimate_inbound_fee(self.PEER)
+
+        # Correct blend: 0.7*200 + 0.3*150 = 185 (raw last_hop, no buffer).
+        assert estimate == 185
+        # Double-counted blend would have been 0.7*200 + 0.3*(150+50) = 200.
+        assert estimate != 200

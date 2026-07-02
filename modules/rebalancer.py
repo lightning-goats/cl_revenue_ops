@@ -1630,9 +1630,16 @@ class EVRebalancer:
             elif confidence == 'medium':
                 # 5-9 samples: blend historical with last-hop if available
                 if last_hop is not None:
-                    # Weighted average: 70% historical, 30% last-hop based
-                    last_hop_estimate = last_hop + self.config.inbound_fee_estimate_ppm
-                    estimate = int(median_ppm * 0.7 + last_hop_estimate * 0.3)
+                    # Weighted average: 70% historical, 30% last-hop.
+                    # DEF-067-S4: the historical median already captures the
+                    # FULL multi-hop route cost. The inbound_fee_estimate_ppm
+                    # buffer is a proxy for that same multi-hop portion, so
+                    # adding it to last_hop here double-counted the multi-hop
+                    # cost (once in the 0.7*median term, again in the 0.3*
+                    # buffer term). Blend the median against the raw last-hop
+                    # fee. (The Priority-5 fallback still adds the buffer —
+                    # there is no historical term there to carry it.)
+                    estimate = int(median_ppm * 0.7 + last_hop * 0.3)
                 else:
                     estimate = median_ppm
                 self.plugin.log(
