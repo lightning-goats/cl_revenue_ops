@@ -445,3 +445,65 @@ class TestP4011GossipBaseFeeCap:
 
         # base_ppm = 1000*1e6//1e8 = 10; well under the cap.
         assert result == 110
+
+
+# =========================================================================
+# P4-012: max_fee_ppm == 0 must zero the historical-fee EV benefit
+# =========================================================================
+
+class TestP4012HistoricalFeeCapZeroDisablesBenefit:
+    def test_helper_zero_cap_returns_zero(self):
+        from modules.rebalance_engine_v2 import _bounded_historical_fee_ppm
+
+        # A configured max_fee_ppm of 0 means "no fee headroom": historical
+        # ratios must contribute NO EV benefit, not be left uncapped.
+        assert _bounded_historical_fee_ppm(9_999.0, 0.0) == 0.0
+        assert _bounded_historical_fee_ppm(1_000_000.0, 0.0) == 0.0
+
+    def test_helper_positive_cap_still_bounds(self):
+        from modules.rebalance_engine_v2 import _bounded_historical_fee_ppm
+
+        assert _bounded_historical_fee_ppm(9_999.0, 500.0) == 500.0
+        assert _bounded_historical_fee_ppm(200.0, 500.0) == 200.0
+
+    def test_rate_helper_zero_cap_returns_zero(self):
+        from modules.rebalance_engine_v2 import _historical_fee_rate_ppm
+
+        # fee/volume ratio would be huge, but cap 0 zeroes it.
+        assert _historical_fee_rate_ppm(1_000_000_000, 1_000, 0.0) == 0.0
+
+    def test_score_decomposition_zero_cap_gives_no_historical_benefit(
+        self, mock_plugin, mock_database
+    ):
+        from modules.rebalance_types_v2 import PairCandidate
+
+        engine = _make_engine(mock_plugin, mock_database)
+        # Config with max_fee_ppm == 0 (no P1-009 change needed: swap it in
+        # directly as the live config so the helper sees cap 0).
+        engine.config = SimpleNamespace(
+            max_fee_ppm=0,
+            high_liquidity_threshold=0.65,
+            low_liquidity_threshold=0.35,
+        )
+        pair = PairCandidate(
+            source_channel_id="100x1x0",
+            dest_channel_id="200x9x0",
+            source_peer_id="03" + "b" * 64,
+            dest_peer_id="03" + "c" * 64,
+            amount_sats=1_000_000,
+            pair_budget_sats=10_000,
+            dest_out_fee_ppm=0,  # only a freak historical ratio is available
+            source_out_fee_ppm=0,
+            dest_historical_direct_fee_ppm=9_999.0,
+            source_historical_sourced_fee_ppm=9_999.0,
+        )
+
+        decomp = engine._build_score_decomposition(pair, route_cost_sats=1)
+
+        # With cap 0 the historical ppm is zeroed, so it contributes no EV
+        # benefit and cannot clear the hold gate for a losing rebalance.
+        assert decomp["expected_future_value_sats"] == 0.0
+        assert decomp["destination_refill_value_sats"] == 0.0
+        assert decomp["source_drain_value_sats"] == 0.0
+        assert decomp["inputs"]["dest_historical_direct_fee_ppm"] == 0.0
+        assert decomp["inputs"]["source_historical_sourced_fee_ppm"] == 0.0

@@ -83,9 +83,14 @@ def _nonnegative_msat_int(value: Any) -> int:
 
 def _bounded_historical_fee_ppm(value: Any, cap_ppm: float) -> float:
     parsed = _nonnegative_float(value)
-    if cap_ppm > 0.0:
-        parsed = min(parsed, cap_ppm)
-    return parsed
+    # P4-012: the cap is derived from cfg.max_fee_ppm. A configured max of 0
+    # means "no fee headroom", so a historical fee ratio must contribute NO
+    # EV benefit — treat a non-positive cap as zero-benefit rather than
+    # leaving the historical ppm uncapped (a freak ratio could otherwise
+    # clear the sats-EV hold gate for a losing rebalance).
+    if cap_ppm <= 0.0:
+        return 0.0
+    return min(parsed, cap_ppm)
 
 
 def _historical_fee_rate_ppm(fee_msat: Any, volume_msat: Any, cap_ppm: float) -> float:
