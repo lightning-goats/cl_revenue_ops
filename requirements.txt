@@ -30,10 +30,10 @@
 # Runtime floor is CLN v24.11.1 (CORE_LIGHTNING_COMPATIBILITY.md); pin is the
 # locally-installed pyln-client. Production nodes may run an older pyln-client
 # matching their CLN -- VERIFY before deploy (see gate above).
-pyln-client==26.4
+pyln-client==25.12.1
 
 # YAML config/validation parsing (tools/revenue_validation_common.py).
-PyYAML==6.0.3
+PyYAML==6.0.1
 
 # Numeric flow-state analysis (modules/flow_analysis.py).
-numpy==2.4.2
+numpy==1.26.4
