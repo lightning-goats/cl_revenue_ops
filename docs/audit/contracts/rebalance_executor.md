@@ -1,5 +1,11 @@
 # Intent Contract: modules/rebalance_executor.py
 
+> **REMOVED (2026):** `modules/rebalance_executor.py` was deleted in commit
+> `9bc0953` ("chore: remove dead legacy rebalance executor and routing memory").
+> The module no longer exists in the tree. The present-tense description below
+> is retained for historical reference only; the live rebalance path is
+> `modules/rebalance_engine_v2.py` -> `modules/rebalance_native_executor_v2.py`.
+
 Tier 2 — medium treatment. Audited 2026-06-12.
 
 ## Purpose
