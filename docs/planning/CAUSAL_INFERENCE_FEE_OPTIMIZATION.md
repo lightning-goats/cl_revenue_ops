@@ -1,5 +1,10 @@
 # Plan: Advanced Fee Optimization for cl-revenue-ops and cl-hive
 
+> **SUPERSEDED / HISTORICAL:** This plan references Sling and the
+> `HillClimbingFeeController`, neither of which exists anymore. The live fee
+> controller is DTS+PID (`modules/fee_controller.py`) and rebalancing is
+> v3-native. Kept for historical context only.
+
 ## Overview
 
 Enhance fee optimization with **Causal Inference** and **Game-Theoretic** reasoning to account for competitor reactions. Primary focus on modeling strategic interactions rather than treating the market as a stationary optimization problem.

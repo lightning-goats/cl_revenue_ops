@@ -1,5 +1,11 @@
 # cl-revenue-ops Roadmap:
 
+> **SUPERSEDED / HISTORICAL:** Portions of this roadmap reference Sling and the
+> `HillClimbingFeeController`, neither of which exists anymore. The fee
+> controller is now DTS+PID (`modules/fee_controller.py`) and rebalancing is
+> v3-native (no Sling). Kept for historical context; do not treat as current
+> design.
+
 This document outlines the development path to move `cl-revenue-ops` from a "Power User" tool to an "Enterprise Grade" routing engine suitable for managing high-liquidity nodes.
 
 ## Phase 1: Capital Safety & Controls

@@ -1,5 +1,10 @@
 # Plan: Reinforcement Learning (DQN/PPO) for cl-revenue-ops and cl-hive
 
+> **SUPERSEDED / HISTORICAL:** This plan references Sling and the
+> `HillClimbingFeeController`, neither of which exists anymore. The live fee
+> controller is DTS+PID (`modules/fee_controller.py`) and rebalancing is
+> v3-native. Kept for historical context only.
+
 ## Overview
 
 Add Reinforcement Learning capabilities to learn exploration policies from experience, focusing on **Fee Controller** as the primary candidate due to clear reward signals and high impact.
