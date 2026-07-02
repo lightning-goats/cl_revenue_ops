@@ -31,7 +31,22 @@ Immune influence is optional, fresh-only, scope-checked, bounded, and neutral on
 
 Peer effects may include bounded `fee_bias_delta`, `rebalance_priority_delta`, `open_confidence_delta`, and `closure_watch_priority_delta`. These are scoring modifiers only. Under `channel_and_fleet_peers`, effects apply only to peers marked `direct_channel_peer=true` or `member=true` in the same hint snapshot.
 
-By design, immune influence carries no fee authority: the producer always emits `fee_bias_delta: 0.0`. Fee biasing belongs to metabolic influence and the local fee controller; immune effects are limited to rebalance priority, open confidence, and closure watch. The consumer must still clamp and bound any nonzero value it receives so a future schema revision cannot exceed documented bounds.
+By design, immune influence carries no fee authority: the producer always emits `fee_bias_delta: 0.0`. The immune fee-bias channel is therefore reserved / currently-neutral by producer choice — `get_immune_fee_bias` always returns `1.0` in practice, and the consumer machinery is wired up only for forward compatibility. Fee biasing belongs to metabolic influence and the local fee controller; immune effects are limited to rebalance priority, open confidence, and closure watch. The consumer must still clamp and bound any nonzero value it receives so a future schema revision cannot exceed documented bounds.
+
+## Consumer Caps
+
+The consumer applies these per-field caps to each peer delta (`modules/hive_hints.py`), converting additive deltas to bounded multiplicative biases:
+
+- Fee immune bias: `fee_bias_delta` clamped to `±0.05` → multiplier `[0.95, 1.05]` (`IMMUNE_FEE_BIAS_CAP`; currently always neutral, see above).
+- Rebalance immune bias: `rebalance_priority_delta` clamped to `±0.15` → multiplier `[0.85, 1.15]` (`IMMUNE_REBALANCE_BIAS_CAP`).
+- Planner/open immune bias: `open_confidence_delta` clamped to `[-0.15, +0.10]` → multiplier `[0.85, 1.10]` (`IMMUNE_OPEN_NEGATIVE_CAP` / `IMMUNE_OPEN_POSITIVE_CAP`).
+- Closure-watch immune bias: `closure_watch_priority_delta` clamped to `±0.15` → multiplier `[0.85, 1.15]` (`IMMUNE_CLOSURE_WATCH_CAP`); diagnostic/advisory only and cannot call close.
+
+The producer additionally bounds every peer effect by a configurable `max_peer_effect` (cl-hive `modules/organism/immune_influence.py`, `DEFAULT_MAX_PEER_EFFECT = 0.12`). This is defense-in-depth: because the producer value is configurable up to `1.0`, the per-field consumer caps above are what keep values in-contract.
+
+## Action Constraints Are Advisory Only
+
+`global_effects` fields — `max_rebalance_burn_sats`, `growth_allowed`, `rebalance_allowed`, `exploration_allowed` — are surfaced by `get_immune_action_constraints` as non-authorizing diagnostics only. They are never enforced as a spend, growth, or execution gate. `execution_authority` and `budget_authority` remain `cl_revenue_ops`: the consumer computes rebalance amounts and budgets locally and independently of these constraints.
 
 ## Neutralization
 

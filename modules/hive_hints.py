@@ -1352,13 +1352,6 @@ class HiveHintAdapter:
             self._validate_route_segment_lease,
         )
 
-    def get_route_segment_leases_fresh(self) -> list[dict]:
-        """Return route-segment leases only from a fresh snapshot."""
-        return self._get_section_entries_fresh(
-            "route_segment_leases",
-            self._validate_route_segment_lease,
-        )
-
     def get_rebalance_recommendations(self) -> list[dict]:
         """Return validated rebalance recommendations or [] if unavailable/stale."""
         return self._get_section_entries(
@@ -1519,16 +1512,6 @@ class HiveHintAdapter:
         """Return closure recommendation only from a fresh snapshot."""
         hint = self._get_peer_hint_fresh(peer_id, "closure_recommended")
         return bool(hint.get("closure_recommended", False))
-
-    def get_closure_reason(self, peer_id: str) -> str:
-        """Return closure reason string, or '' if no recommendation."""
-        hint = self._get_peer_hint(peer_id, "closure_reason")
-        return str(hint.get("closure_reason", ""))
-
-    def get_closure_reason_fresh(self, peer_id: str) -> str:
-        """Return closure reason only from a fresh snapshot."""
-        hint = self._get_peer_hint_fresh(peer_id, "closure_reason")
-        return str(hint.get("closure_reason", ""))
 
 
     # ------------------------------------------------------------------

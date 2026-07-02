@@ -25,7 +25,7 @@ Amounts named `*_sats` are satoshis. Route segment `amount_bucket_sats` values u
 The consumer enforces hard rails on two hive-influence channels that are separate from the ±10% bounded fee-bias clamp:
 
 - `fee_elasticity` maps to the DTS exploration multiplier, clamped to `[0.75, 2.0]` (`EXPLORATION_BOOST_MIN`/`EXPLORATION_BOOST_MAX`, `modules/fee_controller.py`).
-- `fleet_fee_prior` and `optimal_fee_estimate_ppm` seed a fleet fee prior, clamped to `[1, 10000]` ppm (`MAX_FLEET_FEE_PRIOR_PPM`, `modules/hive_hints.py`); an out-of-range value neutralizes to no hint rather than being pinned to the bound.
+- The `fleet_fee_median` wire field (inside a peer's `fleet_fee_prior` hint object) and `optimal_fee_estimate_ppm` seed a fleet fee prior, clamped to `[1, 10000]` ppm (`MAX_FLEET_FEE_PRIOR_PPM`, `modules/hive_hints.py`); an out-of-range value neutralizes to no hint rather than being pinned to the bound. Note: `fleet_fee_prior` is the consumer-side getter/scope label (`get_fleet_fee_prior`), not a wire field — the producer writes and the consumer reads the `fleet_fee_median` field.
 
 ## Required Fields
 
