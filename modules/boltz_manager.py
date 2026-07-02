@@ -2271,6 +2271,29 @@ class BoltzCliManager:
                     "budget": budget_check["budget"],
                 }
 
+            # P4-023 / DD1: chainswap is the 6th swap-create and was the ONLY one
+            # with no atomic pre-create reservation — its sole gate
+            # (_enforce_budget_for_quote above) is a soft advisory read (no
+            # reserve_spend / BEGIN IMMEDIATE, a no-op when enforce_budget=false)
+            # and the actual cost was recorded only after an up-to-180s
+            # subprocess, invisible to a concurrent daemon reserve for that whole
+            # window. Reserve the swap's estimated cost against the unified
+            # cross-category budget BEFORE createchainswap so a concurrent
+            # rebalance/boltz/capex reserve both sees and is counted by this
+            # commitment; reject the swap if the unified budget would be
+            # exceeded (mirrors loop_in / loop_out, P4-014).
+            est_fee = int(budget_check.get("estimated_fee_sats", 0) or 0)
+            reservation_id = self._open_swap_budget_reservation(
+                est_fee, channel_id=None, structural=False
+            )
+            if reservation_id is False:
+                return {
+                    "status": "rejected",
+                    "error": "unified_budget_exceeded",
+                    "quote": quote,
+                    "budget": budget_check.get("budget"),
+                }
+
             args: List[str] = ["createchainswap", "--json", "--from-wallet", self._resolve_wallet_name(from_cur)]
             if to_address:
                 args.extend(["--to-address", str(to_address)])
@@ -2282,8 +2305,17 @@ class BoltzCliManager:
             # commands (withdraw/refund/claim/loop_out).
             args.append("--")
             args.append(str(amount_sats))
-            result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 180))
-            self._record_swap_result(result, source="chainswap")
+            result = None
+            try:
+                result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 180))
+                self._record_swap_result(result, source="chainswap")
+            finally:
+                # Settle (swap created) or release (failed/exception) the
+                # pre-create reservation on every exit so the boltz commitment
+                # is counted while live and never held after it resolves.
+                self._finalize_swap_budget_reservation(
+                    reservation_id, result, est_fee, channel_id=None, structural=False
+                )
         return {
             "status": "accepted",
             "amount_sats": amount_sats,
