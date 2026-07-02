@@ -74,6 +74,69 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
+# NODE-LIQUIDITY HELPERS (pure functions, no I/O)
+# =============================================================================
+# Node-wide receivable-ratio / drain-pressure helpers for the node-liquidity-aware
+# auto-drain-bias feature. These mirror the aggregate-liquidity pattern used in
+# capacity_planner.py (_check_portfolio_balance_gate, ~lines 312-325) but expressed
+# as the REMOTE/receivable fraction rather than local percentage. Kept pure and
+# side-effect free so later wiring into _drain_fee_multiplier stays unit-testable
+# in isolation. Per the design's no-double-count invariant, these must never read
+# any per-peer drain_direction hint — node-aggregate liquidity only.
+# =============================================================================
+
+def compute_node_receivable_ratio(channels) -> float:
+    """Compute the node-wide receivable ratio over active (CHANNELD_NORMAL) channels.
+
+    receivable_ratio = total_remote / total_capacity = 1 - (total_local / total_capacity)
+
+    A source-heavy node (mostly local balance) has a LOW receivable ratio; a
+    sink-heavy node (mostly remote balance) has a HIGH receivable ratio.
+
+    Non-dict entries and channels not in CHANNELD_NORMAL are skipped defensively.
+    Returns 1.0 (neutral/no-drain-pressure) when there is no active capacity.
+    """
+    total_local = 0
+    total_capacity = 0
+    for ch in channels:
+        if not isinstance(ch, dict):
+            continue
+        if ch.get("state") != "CHANNELD_NORMAL":
+            continue
+        local = parse_msat(ch.get("to_us_msat", 0))
+        total = parse_msat(ch.get("total_msat", 0))
+        total_local += local
+        total_capacity += total
+
+    if total_capacity == 0:
+        return 1.0
+
+    return (total_capacity - total_local) / total_capacity
+
+
+def node_drain_pressure(receivable_ratio: float, target: float, floor: float) -> float:
+    """Linear ramp of node-level drain pressure in [0.0, 1.0].
+
+    0.0 when receivable_ratio >= target (node healthy/balanced — no drain pressure).
+    1.0 when receivable_ratio <= floor (node starved/source-heavy — full drain pressure).
+    Linear in between: (target - receivable_ratio) / (target - floor), clamped to [0, 1].
+
+    Degenerate guard: if target <= floor (misconfiguration), avoid div-by-zero by
+    returning 1.0 when at/below floor, else 0.0.
+    """
+    if target <= floor:
+        return 1.0 if receivable_ratio <= floor else 0.0
+
+    if receivable_ratio >= target:
+        return 0.0
+    if receivable_ratio <= floor:
+        return 1.0
+
+    pressure = (target - receivable_ratio) / (target - floor)
+    return max(0.0, min(1.0, pressure))
+
+
+# =============================================================================
 # REASON CODES FOR EXPLAINABILITY
 # =============================================================================
 # Structured reason codes for fee adjustment decisions. These codes enable
