@@ -735,3 +735,85 @@ class TestSizeTieredPlannerSizingAndScoring:
         imbalance_score = pair.score_decomposition["inputs"]["imbalance_score"]
         # src_imbalance = 0.85-0.80=0.05; dest_imbalance = 0.35-0.05=0.30.
         assert imbalance_score == pytest.approx((0.05 + 0.30) / 2.0)
+
+
+def test_all_three_features_thread_onto_one_big_channel_pair():
+    """Composition guard (final review): the branch ships live default-ON
+    and every existing threading test above proves #2 (realized
+    utilization) or #1 (activity sats) thread onto a PairCandidate without
+    transposition IN ISOLATION, and TestSizeTieredPlannerSizingAndScoring
+    proves #3 (size-tiered per-channel band) drives sizing IN ISOLATION.
+    Nothing proves a single big channel can carry all three at once and
+    have every field land correctly on the SAME resulting PairCandidate --
+    e.g. that adding realized-utilization/activity fields to a ChannelState
+    doesn't disturb the per-channel-band sizing math, or vice versa.
+
+    Reuses the exact big_src/big_dest wide-band scenario from
+    test_pair_amount_uses_source_own_high_and_dest_own_low (already proven
+    to size to 1_000_000 via the channels' OWN (0.20, 0.80)/(0.35, 0.65)
+    bands, not the planner's flat scalars) and additionally decorates both
+    channels with realized utilization and live-activity facts, asserting
+    ALL THREE thread onto the one resulting pair with nothing swapped or
+    dropped."""
+    import dataclasses
+
+    planner = RebalancePlanner(
+        target_band_low=0.35, target_band_high=0.65, max_chunk_sats=10_000_000,
+    )
+
+    src = dataclasses.replace(
+        _ch(
+            channel_id="big_src",
+            peer_id="02" + "aa" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.85,
+            value_class="active",
+            target_band_low=0.20,
+            target_band_high=0.80,
+        ),
+        realized_utilization=0.8,
+        utilization_is_realized=True,
+        activity_out_sats=150_000,
+        activity_in_sats=10,
+    )
+    dest = dataclasses.replace(
+        _ch(
+            channel_id="big_dest",
+            peer_id="02" + "bb" * 32,
+            capacity_sats=20_000_000,
+            local_ratio=0.05,
+            value_class="active",
+            target_band_low=0.35,
+            target_band_high=0.65,
+        ),
+        realized_utilization=0.3,
+        utilization_is_realized=False,
+        activity_in_sats=200_000,
+        activity_out_sats=20,
+    )
+    snap = _snap(src, dest)
+
+    result = planner.plan(snap)
+
+    assert len(result.selected) == 1
+    pair = result.selected[0]
+    assert pair.source_channel_id == "big_src"
+    assert pair.dest_channel_id == "big_dest"
+
+    # --- #3 (size-tiered band): sizing still uses the channels' OWN wide
+    # bands, not the planner's flat 0.35/0.65 -- identical to the
+    # single-feature test this scenario is copied from. ---
+    # source_excess (own high 0.80): (0.85-0.80)*20_000_000 = 1_000_000.
+    # dest_need (own low 0.35, unchanged): (0.35-0.05)*20_000_000 = 6_000_000.
+    # amount = min(source_excess, dest_need, max_chunk) = 1_000_000.
+    assert pair.amount_sats == 1_000_000
+
+    # --- #2 (realized utilization): threaded without transpose. ---
+    assert pair.source_realized_utilization == pytest.approx(0.8)
+    assert pair.source_utilization_is_realized is True
+    assert pair.dest_realized_utilization == pytest.approx(0.3)
+    assert pair.dest_utilization_is_realized is False
+
+    # --- #1 (activity): threaded without transpose. ---
+    assert pair.source_activity_out_sats == 150_000
+    assert pair.dest_activity_in_sats == 200_000
