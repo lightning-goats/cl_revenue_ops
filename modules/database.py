@@ -137,10 +137,15 @@ def _reserve_budget_atomic(conn, reservation_id: str, amount_sats: int,
     ).fetchone()
     daily_spent = spent_row[0] if spent_row else 0
 
+    # P4-017: active reservations are currently-HELD budget and must count in
+    # full regardless of age. Filtering by ``reserved_at >= since_timestamp``
+    # dropped an aged-but-active reservation from committed, under-counting held
+    # budget in the overspend direction (and compounding P4-015's hold-on-pending
+    # for a >window-old pending payment). The generic reserve_spend path already
+    # sums active reservations with no time filter; mirror it here.
     reserved_row = conn.execute(
         "SELECT COALESCE(SUM(reserved_sats), 0) FROM budget_reservations "
-        "WHERE status = 'active' AND reserved_at >= ?",
-        (since_timestamp,),
+        "WHERE status = 'active'",
     ).fetchone()
     daily_reserved = reserved_row[0] if reserved_row else 0
 
@@ -165,10 +170,11 @@ def _reserve_budget_atomic(conn, reservation_id: str, amount_sats: int,
         ).fetchone()
         weekly_spent = weekly_spent_row[0] if weekly_spent_row else 0
 
+        # P4-017: active reservations count in full regardless of age (see the
+        # daily sum above); no ``reserved_at`` filter on the held-budget sum.
         weekly_reserved_row = conn.execute(
             "SELECT COALESCE(SUM(reserved_sats), 0) FROM budget_reservations "
-            "WHERE status = 'active' AND reserved_at >= ?",
-            (weekly_since_timestamp,),
+            "WHERE status = 'active'",
         ).fetchone()
         weekly_reserved = weekly_reserved_row[0] if weekly_reserved_row else 0
 
@@ -3693,10 +3699,25 @@ class Database:
         """
         conn = self._get_connection()
         cutoff = int(time.time()) - max_age_seconds
+        # P4-015: never force-release a reservation whose payment is still
+        # in-flight. The rebalance engine holds the reservation (P4-007) while
+        # its HTLC is unresolved by parking the rebalance_history row as
+        # 'pending_settlement'; reconcile_pending_settlements owns the terminal
+        # release/spend once listsendpays reports a final state. The reservation
+        # is linked to that row by reservation_id == str(rebalance_history.id)
+        # (see rebalance_engine_v2._run_single / _reconcile_pending_row). Skip
+        # any active reservation matching a still-pending row so the budget stays
+        # held; a genuinely-abandoned reservation (no pending row, e.g. a crashed
+        # job) is still released, and a reservation whose pending row terminally
+        # resolves is releasable on the next sweep.
         cursor = conn.execute("""
             UPDATE budget_reservations
             SET status = 'released'
             WHERE status = 'active' AND reserved_at < ?
+              AND reservation_id NOT IN (
+                  SELECT CAST(id AS TEXT) FROM rebalance_history
+                  WHERE status = 'pending_settlement'
+              )
         """, (cutoff,))
         count = cursor.rowcount
         if count > 0:

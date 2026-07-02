@@ -16,6 +16,7 @@ import shlex
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -276,6 +277,10 @@ class BoltzCliManager:
         # Capability cache: some CLN+boltzd combinations reject reverse-swap chanIds.
         self._reverse_chanids_supported: Optional[bool] = None
         self._capex_engine = None
+        # P4-014: context for the in-flight swap's unified-budget reservation,
+        # stashed by _loop_out_locked (under _swap_creation_lock) so the loop_out
+        # wrapper can settle-or-release it on every exit including exceptions.
+        self._pending_swap_budget = None
 
     def set_capex_engine(self, engine):
         """Inject the unified capex budget engine."""
@@ -1532,6 +1537,102 @@ class BoltzCliManager:
         }
 
     # ---------------------------------------------------------------------
+    # P4-014 / DD1: atomic unified-budget reservation around swap creation
+    # ---------------------------------------------------------------------
+    def _open_swap_budget_reservation(
+        self,
+        estimated_fee_sats: int,
+        channel_id: Optional[str],
+        structural: bool = False,
+    ):
+        """Reserve the swap's estimated cost against the unified cross-category
+        budget BEFORE the swap is created, so a concurrent rebalance reserve both
+        sees and is counted by this boltz commitment (DD1). Returns:
+          * a reservation id (str) when a reservation was placed,
+          * ``None`` when enforcement does not apply (no capex engine / fee<=0 /
+            enforce_budget off / no unified budget) — behaviour unchanged, and
+          * ``False`` when the unified budget WOULD be exceeded — the caller must
+            reject the swap without creating it.
+        """
+        if self._capex_engine is None or not self.cfg.enforce_budget:
+            return None
+        try:
+            fee = max(0, int(estimated_fee_sats or 0))
+        except (TypeError, ValueError):
+            return None
+        if fee <= 0:
+            return None
+        try:
+            budget_info = self._get_global_budget_limit()
+            effective_budget = max(0, self._parse_int(budget_info.get("budget_sats"), 0))
+        except Exception:
+            return None
+        if effective_budget <= 0:
+            # No unified budget wired: leave gating to the (already-applied)
+            # advisory checks; fail-open preserves prior behaviour.
+            return None
+        reservation_id = f"boltz-swap:{uuid.uuid4().hex}"
+        subcat = "structural" if structural else "swap_fee"
+        try:
+            ok = self._capex_engine.reserve_boltz_swap_budget(
+                reservation_id=reservation_id,
+                estimated_fee_sats=fee,
+                channel_id=channel_id,
+                effective_budget_sats=effective_budget,
+                subcategory=subcat,
+            )
+        except Exception as e:
+            try:
+                self.plugin.log(f"BOLTZ: unified budget reserve error: {e}", level="warn")
+            except Exception:
+                pass
+            return None  # fail-open on infra error (advisory gate still applied)
+        return reservation_id if ok else False
+
+    def _finalize_swap_budget_reservation(
+        self,
+        reservation_id,
+        result: Any,
+        estimated_fee_sats: int,
+        channel_id: Optional[str],
+        structural: bool = False,
+    ) -> None:
+        """Settle (swap created) or release (swap failed) the pre-create
+        reservation. Called on every swap-method exit."""
+        if not reservation_id or self._capex_engine is None:
+            return
+        try:
+            fee = max(0, int(estimated_fee_sats or 0))
+        except (TypeError, ValueError):
+            fee = 0
+        subcat = "structural" if structural else "swap_fee"
+        sid = ""
+        created = False
+        try:
+            primary = self._primary_swap_entry(result) if result is not None else None
+            if primary is not None:
+                sid = str(primary.get("id") or "").strip()
+                created = bool(sid) and not self._is_error_swap(primary)
+        except Exception:
+            sid, created = "", False
+        try:
+            if created and sid:
+                self._capex_engine.settle_boltz_swap_reservation(
+                    reservation_id=reservation_id,
+                    swap_id=sid,
+                    estimated_fee_sats=fee,
+                    channel_id=channel_id,
+                    subcategory=subcat,
+                )
+            else:
+                self._capex_engine.release_boltz_swap_reservation(reservation_id)
+        except Exception as e:
+            try:
+                self.plugin.log(f"BOLTZ: swap budget finalize error: {e}", level="warn")
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------------
     # Public operations
     # ---------------------------------------------------------------------
     def wallet_balances(self) -> Dict[str, Any]:
@@ -1629,13 +1730,31 @@ class BoltzCliManager:
                     "boltzcli createswap (submarine/loop-in) on v2.11.0 does not support channel pinning; channel_id/peer_id used only as trigger metadata"
                 )
 
-            args = ["createswap", "--json", "--from-wallet", wallet_name, self._swap_cli_currency(source_cur, source_cur), str(amount_sats)]
-            result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 120))
-            self._record_swap_result(
-                result,
-                source="loop_in",
-                metadata={"trigger_channel_id": channel_id, "trigger_peer_id": peer_id},
-            )
+            # P4-014 / DD1: atomically reserve the swap's committed cost against
+            # the unified cross-category budget before creating it.
+            est_fee = int(budget_check.get("estimated_fee_sats", 0) or 0)
+            reservation_id = self._open_swap_budget_reservation(est_fee, channel_id, structural=False)
+            if reservation_id is False:
+                return {
+                    "status": "rejected",
+                    "error": "unified_budget_exceeded",
+                    "quote": quote,
+                    "budget": budget_check.get("budget"),
+                }
+
+            result = None
+            try:
+                args = ["createswap", "--json", "--from-wallet", wallet_name, self._swap_cli_currency(source_cur, source_cur), str(amount_sats)]
+                result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 120))
+                self._record_swap_result(
+                    result,
+                    source="loop_in",
+                    metadata={"trigger_channel_id": channel_id, "trigger_peer_id": peer_id},
+                )
+            finally:
+                self._finalize_swap_budget_reservation(
+                    reservation_id, result, est_fee, channel_id, structural=False
+                )
 
         return {
             "status": "accepted",
@@ -1678,8 +1797,35 @@ class BoltzCliManager:
 
         # P0-1 FIX: Serialize budget-check + swap-create to prevent TOCTOU race
         with self._swap_creation_lock:
-            return self._loop_out_locked(amount_sats, address, channel_id, peer_id, currency, target_cur,
-                                         routing_fee_limit_ppm, structural=structural)
+            # P4-014: _loop_out_locked reserves the swap's committed cost against
+            # the unified cross-category budget before creation and stashes the
+            # reservation context on self; settle (created) or release (failed /
+            # exception) it on every exit so the budget is never held after the
+            # swap resolves and a boltz commitment is always counted while live.
+            self._pending_swap_budget = None
+            out = None
+            try:
+                out = self._loop_out_locked(amount_sats, address, channel_id, peer_id, currency, target_cur,
+                                            routing_fee_limit_ppm, structural=structural)
+                ctx = self._pending_swap_budget
+                if ctx and ctx.get("reservation_id"):
+                    self._finalize_swap_budget_reservation(
+                        ctx["reservation_id"],
+                        out.get("result") if isinstance(out, dict) else None,
+                        ctx["estimated_fee_sats"], ctx["channel_id"], ctx["structural"],
+                    )
+                return out
+            except Exception:
+                ctx = self._pending_swap_budget
+                if ctx and ctx.get("reservation_id"):
+                    # Unknown result → release (no committed cost recorded).
+                    self._finalize_swap_budget_reservation(
+                        ctx["reservation_id"], None,
+                        ctx["estimated_fee_sats"], ctx["channel_id"], ctx["structural"],
+                    )
+                raise
+            finally:
+                self._pending_swap_budget = None
 
     def _loop_out_locked(self, amount_sats: int, address: Optional[str], channel_id: Optional[str],
                          peer_id: Optional[str], currency: Optional[str], target_cur: str,
@@ -1733,6 +1879,25 @@ class BoltzCliManager:
                     "budget": budget_check.get("budget"),
                     "channel_budget_check": channel_check,
                 }
+
+        # P4-014 / DD1: atomically reserve the swap's committed cost against the
+        # unified cross-category budget before creating it. Stash the context so
+        # the loop_out wrapper settles (created) or releases (failed/exception).
+        est_fee = int(budget_check.get("estimated_fee_sats", 0) or 0)
+        reservation_id = self._open_swap_budget_reservation(est_fee, channel_id, structural=structural)
+        if reservation_id is False:
+            return {
+                "status": "rejected",
+                "error": "unified_budget_exceeded",
+                "quote": quote,
+                "budget": budget_check.get("budget"),
+            }
+        self._pending_swap_budget = {
+            "reservation_id": reservation_id,
+            "estimated_fee_sats": est_fee,
+            "channel_id": channel_id,
+            "structural": structural,
+        }
 
         target_channel_id = (str(channel_id).replace(':', 'x') if channel_id else None)
         target_peer_id = str(peer_id).strip() if peer_id else None

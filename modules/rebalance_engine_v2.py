@@ -2341,10 +2341,16 @@ class RebalanceEngine:
             int(getattr(cfg, "total_cost_budget_window_hours", 24) or 24),
         )
         since_ts = now - (window_hours * 3600)
-        external = self._get_external_liquidity_costs()
-        ext_spent = int(external.get("spent_24h_sats", 0) or 0)
-        ext_reserved = int(external.get("reserved_24h_sats", 0) or 0)
-        budget_limit = max(0, effective_budget - ext_spent - ext_reserved)
+        # P4-016: pass the FULL unified budget and let _reserve_budget_atomic
+        # count each category exactly once inside its BEGIN IMMEDIATE. That
+        # transaction already SUMs the non-rebalance categories (generic
+        # spend_events + spend_reservations, which include boltz and settled
+        # channel open/close), so pre-subtracting them here via the external
+        # provider double-counted them (starving the rebalance budget on a
+        # capex-active node). This mirrors the generic reserve_spend path, which
+        # also passes the full effective budget and relies on the in-txn sum as
+        # the authoritative cross-category rail.
+        budget_limit = max(0, effective_budget)
 
         try:
             reserved, remaining = self.database.reserve_budget(
@@ -2376,7 +2382,7 @@ class RebalanceEngine:
             amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
             error=(
                 f"local_budget_block: {remaining} sats remaining "
-                f"of {budget_limit} after external costs"
+                f"of {budget_limit} unified budget"
             ),
             route_type=self._executor_mode(),
         )

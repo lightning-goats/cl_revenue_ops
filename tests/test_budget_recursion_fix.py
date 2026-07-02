@@ -89,10 +89,14 @@ class TestBudgetRecursionFix:
         # the Boltz cfg budget, so the cfg value survives as the daily budget.
         assert status["daily_budget_sats"] == 5000
         assert status["budget_source"] == "total_cost_budget"
-        # The whole evaluation must hit boltzcli listswaps at most twice
-        # (once via the unified status aggregation, once for the local
-        # component summary). Before the fix this recursed ~200 deep.
-        assert len(listswaps_calls) <= 2
+        # The whole evaluation must hit boltzcli listswaps a small BOUNDED
+        # number of times (before the recursion fix this recursed ~200 deep).
+        # P4-014: the boltz gate's non-boltz component now reads the LIVE total
+        # (force_fresh=True) so it never gates against the 30s-stale memo; that
+        # adds exactly one more bounded recompute (a third listswaps) on top of
+        # the unified-status aggregation and the local component summary. The
+        # re-entrancy guard still prevents any recursion.
+        assert len(listswaps_calls) <= 3
 
     def test_cost_components_never_call_global_provider(self):
         listswaps_calls = []
