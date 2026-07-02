@@ -502,6 +502,98 @@ class RPCOverloadedError(RPCTimeoutError):
         RpcError.__init__(self, method, {}, f"RPC worker pool saturated for method: {method}")
 
 
+# =============================================================================
+# RPC SOCKET-LEVEL TIMEOUT (P1-007)
+# =============================================================================
+# pyln opens a fresh Unix socket per call and blocks in recv() with no timeout.
+# When lightningd wedges, every worker thread blocks on recv() forever and the
+# 16-thread pool is permanently consumed with no self-recovery. The proxy's
+# future.result(timeout) frees the *caller* but not the *worker*.
+#
+# Fix: apply a socket-level recv timeout to the per-call socket. pyln creates
+# the socket internally, so we patch UnixSocket.connect once to read a
+# per-thread desired timeout (set by the worker before it runs the RPC) and
+# apply it via socket.settimeout(). Long-poll methods (wait*) intentionally
+# block indefinitely and are exempted so healthy-node behavior is unchanged.
+
+# Per-worker-thread desired socket timeout (seconds) or None to disable.
+_rpc_socket_timeout = threading.local()
+
+# Backstop buffer added on top of the proxy timeout: the caller-side
+# future.result(proxy_timeout) fires first (preserving the RPCTimeoutError the
+# caller already expects); the socket timeout is the slightly-later backstop
+# that frees the wedged worker.
+_RPC_SOCKET_TIMEOUT_BUFFER = 5.0
+
+# Methods that legitimately block for a long time; never given a socket
+# timeout so their behavior is unchanged.
+_LONG_POLL_RPC_METHODS = frozenset({
+    "wait", "waitanyinvoice", "waitinvoice", "waitsendpay",
+    "waitblockheight", "waitrune",
+})
+
+
+def _socket_timeout_for(method_name, proxy_timeout):
+    """Return the socket recv timeout for a method, or None to leave unbounded.
+
+    Long-poll (wait*) methods return None. All others return
+    ``proxy_timeout + _RPC_SOCKET_TIMEOUT_BUFFER`` so the caller-side timeout
+    fires first and the socket timeout is a backstop that frees the worker.
+    """
+    name = str(method_name or "")
+    if name in _LONG_POLL_RPC_METHODS or name.startswith("wait"):
+        return None
+    try:
+        base = float(proxy_timeout)
+    except (ValueError, TypeError):
+        base = 30.0
+    if base <= 0:
+        return None
+    return base + _RPC_SOCKET_TIMEOUT_BUFFER
+
+
+def _install_rpc_socket_timeout(log=None):
+    """Patch pyln's UnixSocket.connect to honor the per-thread socket timeout.
+
+    Best-effort and idempotent. Returns True if the patch is installed (or was
+    already), False if pyln's internals are not the expected shape in this
+    version — in which case the caller-side future timeout remains the only
+    guard (documented residual for P1-007).
+    """
+    try:
+        from pyln.client import lightning as _pyln_lightning
+    except Exception:
+        return False
+    unix_socket_cls = getattr(_pyln_lightning, "UnixSocket", None)
+    if unix_socket_cls is None or not hasattr(unix_socket_cls, "connect"):
+        return False
+    if getattr(unix_socket_cls, "_revops_timeout_patched", False):
+        return True
+    try:
+        _orig_connect = unix_socket_cls.connect
+
+        def _connect_with_timeout(self, *args, **kwargs):
+            _orig_connect(self, *args, **kwargs)
+            desired = getattr(_rpc_socket_timeout, "value", None)
+            sock = getattr(self, "sock", None)
+            if desired and sock is not None:
+                try:
+                    sock.settimeout(float(desired))
+                except Exception:
+                    pass
+
+        unix_socket_cls.connect = _connect_with_timeout
+        unix_socket_cls._revops_timeout_patched = True
+        if log is not None:
+            try:
+                log("RPC socket-level timeout guard installed", level="debug")
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
 class ThreadSafeRpcProxy:
     """
     Thread-safe RPC proxy using a ThreadPoolExecutor for timeout protection.
@@ -536,6 +628,11 @@ class ThreadSafeRpcProxy:
         self._async_submit_slots = threading.Semaphore(4 + 64)   # explicit async pushes only
         self._async_fail_count = 0
         self._async_lock = threading.Lock()  # L-4: Protect _async_fail_count
+        # P1-007: install the pyln socket-level timeout guard so a wedged
+        # lightningd cannot permanently consume all worker threads.
+        self._socket_timeout_installed = _install_rpc_socket_timeout(
+            getattr(plugin_instance, "log", None)
+        )
 
     def __getattr__(self, name):
         if name in ("_plugin", "_rpc", "_executor", "_async_executor",
@@ -583,8 +680,23 @@ class ThreadSafeRpcProxy:
                 level="warn"
             )
             raise RPCOverloadedError(method_name)
+
+        # P1-007: run the RPC in a wrapper that sets a per-thread desired
+        # socket timeout before the call opens its pyln socket, so a wedged
+        # lightningd surfaces socket.timeout in the worker and frees it rather
+        # than blocking recv() forever. Long-poll methods get None (unbounded).
+        sock_timeout = _socket_timeout_for(method_name, proxy_timeout)
+
+        def _worker():
+            prev = getattr(_rpc_socket_timeout, "value", None)
+            _rpc_socket_timeout.value = sock_timeout
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _rpc_socket_timeout.value = prev
+
         try:
-            future = self._executor.submit(fn, *args, **kwargs)
+            future = self._executor.submit(_worker)
         except Exception:
             self._main_submit_slots.release()
             raise
