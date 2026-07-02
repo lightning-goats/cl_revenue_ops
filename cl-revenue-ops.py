@@ -13,7 +13,7 @@ Dependencies:
 - Native rebalancer: prices pairs with askrene getroutes and executes explicit sendpay routes
 
 Author: Lightning Goats Team
-License: MIT
+License: BSD 3-Clause
 """
 
 import copy
