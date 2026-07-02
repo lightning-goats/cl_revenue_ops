@@ -3,10 +3,41 @@
 Each test pins a NON-BEHAVIORAL safety fix that adds locking / transactions /
 batching. They assert the race is closed without changing money decisions.
 """
+import os
+import sys
 import threading
 import time
+from unittest.mock import MagicMock
 
 import pytest
+
+# Mock pyln.client before importing modules (mirrors other DB tests).
+_mock_pyln = MagicMock()
+_mock_pyln.Plugin = MagicMock
+_mock_pyln.RpcError = Exception
+sys.modules.setdefault('pyln', _mock_pyln)
+sys.modules.setdefault('pyln.client', _mock_pyln)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _make_db(tmp_path, name="p2.db"):
+    from modules.database import Database
+
+    db = Database(os.path.join(str(tmp_path), name), MagicMock())
+    db.initialize()
+    return db
+
+
+class _BeginCounter:
+    """Count BEGIN IMMEDIATE statements via sqlite3 trace callback."""
+
+    def __init__(self, conn):
+        self.begins = 0
+        conn.set_trace_callback(self._trace)
+
+    def _trace(self, sql):
+        if sql and sql.strip().upper().startswith("BEGIN IMMEDIATE"):
+            self.begins += 1
 
 
 # ---------------------------------------------------------------------------
@@ -153,3 +184,106 @@ def test_p2_001_analyze_channel_takes_analysis_lock():
     finished.wait(3.0)
     assert finished.is_set(), "analyze_channel never completed after lock release"
     t.join(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# P2-002 — long batches must be chunked so the WAL writer is bounded
+# ---------------------------------------------------------------------------
+def _mk_fwd(i, ts, out_chan="A", fee=10):
+    return {
+        "in_channel": f"in{i}",
+        "out_channel": out_chan,
+        "in_msat": 1000,
+        "out_msat": 900,
+        "fee_msat": fee,
+        "received_time": ts,
+        "resolved_time": ts + 1,
+        "resolution_time": 1,
+    }
+
+
+def test_p2_002_bulk_insert_forwards_chunked(tmp_path):
+    db = _make_db(tmp_path)
+    db.BULK_WRITE_BATCH_SIZE = 3  # small batch to force chunking
+    now = int(time.time())
+    fwds = [_mk_fwd(i, now - i) for i in range(7)]
+
+    conn = db._get_connection()
+    counter = _BeginCounter(conn)
+    inserted = db.bulk_insert_forwards(fwds)
+    conn.set_trace_callback(None)
+
+    assert inserted == 7  # net effect preserved
+    # ceil(7/3) == 3 transactions => writer released between chunks
+    assert counter.begins == 3, f"expected 3 chunked transactions, got {counter.begins}"
+
+    row = conn.execute("SELECT COUNT(*) AS c FROM forwards").fetchone()
+    assert row["c"] == 7
+
+
+def test_p2_002_cleanup_old_data_chunked_same_net_effect(tmp_path):
+    db = _make_db(tmp_path)
+    now = int(time.time())
+    old_ts = now - (20 * 86400)  # older than the 8-day cutoff
+    day_ts = (old_ts // 86400) * 86400
+
+    # 7 old forwards, same out_channel + same day so they aggregate into one row.
+    fwds = [_mk_fwd(i, old_ts, out_chan="OUT", fee=100) for i in range(7)]
+    db.bulk_insert_forwards(fwds)
+
+    db.BULK_WRITE_BATCH_SIZE = 3
+    conn = db._get_connection()
+    counter = _BeginCounter(conn)
+    db.cleanup_old_data(days_to_keep=8)
+    conn.set_trace_callback(None)
+
+    # forwards prune ran in chunks (bounded writer hold)
+    assert counter.begins >= 3, f"forwards prune not chunked: {counter.begins} tx"
+
+    # net effect: all old forwards gone
+    remaining = conn.execute("SELECT COUNT(*) AS c FROM forwards").fetchone()["c"]
+    assert remaining == 0
+
+    # net effect: aggregation additive across chunks == single-pass total
+    agg = conn.execute(
+        "SELECT total_fee_msat, forward_count FROM daily_forwarding_stats "
+        "WHERE channel_id = ? AND date = ?",
+        ("OUT", day_ts),
+    ).fetchone()
+    assert agg["forward_count"] == 7
+    assert agg["total_fee_msat"] == 7 * 100
+
+
+def test_p2_002_concurrent_small_write_during_bulk_insert(tmp_path):
+    """A concurrent small write must not raise 'database is locked' while a
+    large chunked bulk insert runs."""
+    db = _make_db(tmp_path)
+    db.BULK_WRITE_BATCH_SIZE = 50
+    now = int(time.time())
+    big = [_mk_fwd(i, now - i) for i in range(600)]
+
+    errors = []
+
+    def small_writer():
+        try:
+            # Own thread => own connection. Hammer a small write repeatedly.
+            for k in range(200):
+                db.record_fee_change(
+                    channel_id=f"c{k}", peer_id="p", old_fee_ppm=1, new_fee_ppm=2,
+                    reason="test",
+                )
+                time.sleep(0)
+        except Exception as e:  # pragma: no cover - failure path
+            errors.append(e)
+
+    t = threading.Thread(target=small_writer)
+    t.start()
+    db.bulk_insert_forwards(big)
+    t.join()
+
+    assert not errors, f"concurrent small write failed: {errors}"
+    assert db._get_connection().execute(
+        "SELECT COUNT(*) AS c FROM forwards"
+    ).fetchone()["c"] == 600
+
+
