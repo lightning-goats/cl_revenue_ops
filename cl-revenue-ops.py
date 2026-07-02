@@ -7374,7 +7374,14 @@ def _non_rebalance_liquidity_cost_components(window_hours: Optional[int] = None)
 
 
 def _non_boltz_liquidity_cost_components(window_hours: Optional[int] = None) -> Dict[str, Any]:
-    status = _total_cost_budget_status(window_hours=window_hours)
+    # DD1 / P4-014: this feeds the Boltz budget GATE (get_budget_status ->
+    # _get_external_liquidity_costs). The P2-011 force_fresh fix only touched the
+    # generic spend-reserve gate (cro:6719) and left this boltz-side component on
+    # the 30s memo, so N boltz gate checks in one window read the same stale
+    # non-boltz total → cross-category overspend. Read the LIVE total here; the
+    # authoritative rail is the atomic reserve (reserve_boltz_swap_budget), but
+    # the gate must not admit against a stale snapshot.
+    status = _total_cost_budget_status(window_hours=window_hours, force_fresh=True)
     if "error" in status:
         return {"source": "non_boltz_total_costs", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
     actual = status.get("actual_spent_by_category", {}) if isinstance(status.get("actual_spent_by_category"), dict) else {}

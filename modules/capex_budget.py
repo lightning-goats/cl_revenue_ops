@@ -423,6 +423,75 @@ class CapexBudgetEngine:
         except Exception:
             return False
 
+    # --- P4-014: atomic unified-budget reservation for Boltz swaps ---------
+    #
+    # DD1: a Boltz swap must reserve its committed cost against the SAME unified
+    # cross-category budget the rebalance/generic paths use, BEFORE the swap is
+    # created, so a concurrent rebalance reserve both sees and is counted by the
+    # boltz commitment. reserve_spend enforces the full cross-category total
+    # inside its BEGIN IMMEDIATE (serialized by the WAL single-writer lock), so
+    # no interleaving can jointly overshoot the budget.
+
+    def reserve_boltz_swap_budget(
+        self,
+        reservation_id: str,
+        estimated_fee_sats: int,
+        channel_id: Optional[str] = None,
+        effective_budget_sats: int = 0,
+        subcategory: str = "swap_fee",
+    ) -> bool:
+        """Reserve a swap's estimated committed cost. False = budget would be
+        exceeded (caller must not create the swap)."""
+        try:
+            fee = int(estimated_fee_sats)
+        except (TypeError, ValueError):
+            return False
+        if fee <= 0:
+            return False
+        since = int(time.time()) - 24 * 3600
+        try:
+            return bool(self._database.reserve_spend(
+                reservation_id=str(reservation_id),
+                amount_sats=fee,
+                category="boltz",
+                subcategory=str(subcategory or "swap_fee"),
+                channel_id=str(channel_id).replace(':', 'x') if channel_id else None,
+                effective_budget_sats=int(effective_budget_sats),
+                since_timestamp=since,
+            ))
+        except Exception:
+            return False
+
+    def settle_boltz_swap_reservation(
+        self,
+        reservation_id: str,
+        swap_id: str,
+        estimated_fee_sats: int,
+        channel_id: Optional[str] = None,
+        subcategory: str = "swap_fee",
+    ) -> bool:
+        """Swap created: persist the estimated committed cost as a spend event
+        keyed by swap id (later REPLACED by the actual fee when the swap settles
+        via record_boltz_spend — same boltz:{sid} event id) and release the
+        pre-create reservation so the cost is not double-counted."""
+        recorded = self.record_boltz_spend(
+            swap_id=swap_id,
+            fee_sats=estimated_fee_sats,
+            channel_id=channel_id,
+            source="boltz_swap_estimate",
+            subcategory=subcategory,
+        )
+        self.release_boltz_swap_reservation(reservation_id)
+        return bool(recorded)
+
+    def release_boltz_swap_reservation(self, reservation_id: str) -> bool:
+        """Swap failed/never created (or superseded by its spend event): release
+        the reservation so the budget is not held."""
+        try:
+            return bool(self._database.release_spend_reservation(str(reservation_id)))
+        except Exception:
+            return False
+
     # --- Internal methods ---
 
     def _compute_channel_budget(

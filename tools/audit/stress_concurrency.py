@@ -23,6 +23,9 @@ What it does
     - direct rebalance-category reservations via ``Database.reserve_budget``
       (the OTHER budget table + OTHER lock — this is the P1-003 cross-category
       surface)
+    - Boltz-swap reservations via the P4-014 atomic path
+      (``category="boltz"`` reserve_spend against the live unified budget) so
+      the budget invariant now covers the boltz leg of DD1's cross-category rail
     - ``revenue-config set`` reloads (config._lock / _version churn)
 
 Asserted invariants (soak)
@@ -33,9 +36,10 @@ Asserted invariants (soak)
 3. no-thread-exc  -- ``threading.excepthook`` captured no unhandled exception
                      escaping any worker/loop thread.
 4. budget         -- total *active reserved* across ALL budget tables
-                     (spend_reservations + budget_reservations) never exceeds
-                     ``effective_budget_sats`` at any sampled instant. This is a
-                     direct test of P1-003's cross-category TOCTOU.
+                     (spend_reservations incl. boltz + budget_reservations)
+                     never exceeds ``effective_budget_sats`` at any sampled
+                     instant. This is a direct test of P1-003's / P4-014's
+                     cross-category TOCTOU, now WITH a boltz reserver in the mix.
 
 The budget invariant is EXPECTED to fail against the current tree (P1-003 is an
 open finding). Pass ``--allow-known-budget-toctou`` to treat a budget violation
@@ -373,6 +377,54 @@ class StressHarness:
                 self.record_exception(f"rebalance_reserve[{wid}]", exc)
             self.bump()
 
+    def worker_boltz_reserve(self, wid):
+        """Firehose: Boltz-swap reservations via the P4-014 atomic path.
+
+        Mirrors modules.capex_budget.reserve_boltz_swap_budget — a
+        category="boltz" reserve_spend against the LIVE unified budget inside
+        BEGIN IMMEDIATE. This is the boltz leg of DD1's cross-category rail: a
+        boltz reservation must be counted by (and count) the rebalance and
+        generic reservations, so the budget-never-exceeded invariant now covers
+        boltz too. reserve + release only (the settle-into-spend_event path is
+        unit-tested separately) keeps the boltz commitment churning against the
+        shared budget for the whole soak.
+        """
+        mod = self.mod
+        db = mod.database
+        rng = random.Random(self.rng_seed * 4000 + wid)
+        counter = 0
+        live = deque()
+        while not self.stop.is_set():
+            counter += 1
+            roll = rng.random()
+            try:
+                if roll < 0.75 or not live:
+                    rid = f"boltz-swap:{wid}-{counter}"
+                    amt = rng.randint(200, max(300, self.budget_sats // 3))
+                    try:
+                        prov = mod._total_cost_budget_limit_provider()
+                        eff = int(prov.get("effective_budget_sats", self.budget_sats) or 0)
+                    except Exception:
+                        eff = self.budget_sats
+                    ok = db.reserve_spend(
+                        reservation_id=rid,
+                        amount_sats=amt,
+                        category="boltz",
+                        subcategory="swap_fee",
+                        effective_budget_sats=eff,
+                        since_timestamp=self._since_24h(),
+                    )
+                    if ok:
+                        live.append(rid)
+                    self.journal(f"boltz{wid}", "boltz_reserve", amt, "boltz", f"ok={ok},eff={eff}")
+                else:
+                    rid = live.popleft()
+                    ok = db.release_spend_reservation(rid)
+                    self.journal(f"boltz{wid}", "boltz_release", None, "boltz", f"ok={ok}")
+            except Exception as exc:
+                self.record_exception(f"boltz_reserve[{wid}]", exc)
+            self.bump()
+
     def worker_config_reload(self, wid):
         """setconfig churn on non-budget public keys (config._lock / _version)."""
         mod = self.mod
@@ -437,12 +489,19 @@ class StressHarness:
         conn = db._get_connection()  # sampler's own thread-local connection
         while not self.stop.is_set():
             try:
-                gen = conn.execute(
-                    "SELECT COALESCE(SUM(reserved_sats),0) FROM spend_reservations WHERE status='active'"
-                ).fetchone()[0]
-                reb = conn.execute(
-                    "SELECT COALESCE(SUM(reserved_sats),0) FROM budget_reservations WHERE status='active'"
-                ).fetchone()[0]
+                # Read BOTH budget tables in ONE SELECT so the sample is a single
+                # consistent snapshot. Two separate autocommit SELECTs are a torn
+                # read: they can capture spend_reservations from one instant and
+                # budget_reservations from a later instant while reservations
+                # churn, producing a phantom sum > budget even though the atomic
+                # rail (BEGIN IMMEDIATE) keeps every COMMITTED instant <= budget.
+                row = conn.execute(
+                    "SELECT "
+                    "(SELECT COALESCE(SUM(reserved_sats),0) FROM spend_reservations WHERE status='active'), "
+                    "(SELECT COALESCE(SUM(reserved_sats),0) FROM budget_reservations WHERE status='active')"
+                ).fetchone()
+                gen = row[0]
+                reb = row[1]
                 total = int(gen or 0) + int(reb or 0)
                 budget = int(getattr(self.mod.config, "daily_budget_sats", self.budget_sats) or 0)
                 if total > self.max_reserved_observed:
@@ -517,6 +576,8 @@ class StressHarness:
             spawn(self.worker_generic_ledger, f"generic-{i}", i)
         for i in range(n):
             spawn(self.worker_rebalance_reserve, f"rebalance-{i}", i)
+        for i in range(n):
+            spawn(self.worker_boltz_reserve, f"boltz-{i}", i)
         for i in range(max(1, n // 2)):
             spawn(self.worker_config_reload, f"config-{i}", i)
 
