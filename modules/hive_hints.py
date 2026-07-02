@@ -183,6 +183,17 @@ class HiveHintAdapter:
     # ttl_seconds must not pin a snapshot as "fresh" indefinitely.
     HINT_CLOCK_SKEW_SECONDS = 300
     HINT_MAX_TTL_SECONDS = 86400
+    # Consumer-side defensive caps mirroring the producer (cl-hive), which
+    # bounds its output at DATASTORE_MAX_BYTES=900_000 and
+    # MAX_PEERS_IN_SNAPSHOT=200. The ["hive","hints"] datastore value is
+    # locally writable and producer-controlled, so we re-enforce both bounds
+    # on read: an oversized value is rejected *before* json.loads (so a
+    # multi-MB payload cannot make the fee path hang parsing), and a hint map
+    # over the entry cap is rejected via an O(1) len() check *before*
+    # _normalize_hint_map walks it. Either case is treated as absent/stale
+    # (fail-open neutral) and logged once.
+    DATASTORE_MAX_BYTES = 900_000
+    MAX_PEERS_IN_SNAPSHOT = 200
     # Total bitcoin supply in sats — an upper sanity bound for any fleet value.
     MAX_FLEET_CAPACITY_SATS = 21_000_000 * 100_000_000
     # Sanity ceiling for fleet_fee_median (ppm). Mirrors the gossip-prior
@@ -208,6 +219,7 @@ class HiveHintAdapter:
         self._snapshot_fetched_at = 0
         self._using_stale_fallback = False
         self._snapshot_source = "none"
+        self._oversized_payload_logged = False
         self.data_service = None
 
     # ------------------------------------------------------------------
@@ -236,11 +248,23 @@ class HiveHintAdapter:
             data_str = entry.get("string", "")
             data_hex = entry.get("hex", "")
             if data_str:
+                # O(1) length check rejects an oversized value before the
+                # O(n) json.loads + normalize. UTF-8 byte length is >= the
+                # character count, so a character count over the byte cap
+                # guarantees the byte size is over the cap too.
+                if len(data_str) > self.DATASTORE_MAX_BYTES:
+                    self._log_oversized_payload("string_bytes", len(data_str))
+                    info["reason"] = "oversized"
+                    return None, info
                 info["available"] = True
                 info["encoding"] = "string"
                 info["reason"] = ""
                 return _json_loads_strict(data_str), info
             if data_hex:
+                if (len(data_hex) // 2) > self.DATASTORE_MAX_BYTES:
+                    self._log_oversized_payload("hex_bytes", len(data_hex) // 2)
+                    info["reason"] = "oversized"
+                    return None, info
                 info["available"] = True
                 info["encoding"] = "hex"
                 info["reason"] = ""
@@ -412,8 +436,29 @@ class HiveHintAdapter:
             normalized[peer_id] = dict(hint) if isinstance(hint, dict) else {}
         return normalized
 
+    def _log_oversized_payload(self, kind: str, size: int) -> None:
+        """Log an oversized/over-cap hint payload rejection at most once."""
+        if self._oversized_payload_logged:
+            return
+        self._oversized_payload_logged = True
+        try:
+            self._plugin.log(
+                f"HIVE_HINTS: rejecting oversized hint payload ({kind}={size}); "
+                "treating as absent/stale (neutral)",
+                level='warn',
+            )
+        except Exception:
+            pass
+
     def _validate_and_normalize_snapshot(self, raw) -> dict | None:
         if not self._validate_snapshot(raw):
+            return None
+        # Entry-count cap: reject an over-cap hint map via an O(1) len() check
+        # before _normalize_hint_map walks every entry. _validate_snapshot has
+        # already confirmed raw["hints"] is a dict.
+        hints = raw.get("hints")
+        if isinstance(hints, dict) and len(hints) > self.MAX_PEERS_IN_SNAPSHOT:
+            self._log_oversized_payload("hint_entries", len(hints))
             return None
         snapshot = dict(raw)
         snapshot["hints"] = self._normalize_hint_map(raw.get("hints"))
@@ -1033,10 +1078,15 @@ class HiveHintAdapter:
         return 0.0
 
     def get_optimal_fee_estimate(self, peer_id: str) -> int:
-        """Return fleet-estimated optimal fee PPM (0 if unavailable)."""
+        """Return fleet-estimated optimal fee PPM (0 if unavailable).
+
+        Untrusted absolute value: bounded to [1, MAX_FLEET_FEE_PRIOR_PPM]
+        (same range as get_fleet_fee_prior). An out-of-range estimate
+        neutralizes to 0 so a poisoned hint cannot surface an absurd fee.
+        """
         hint = self._get_peer_hint(peer_id, "optimal_fee_estimate_ppm")
         val = self._finite_number(hint.get("optimal_fee_estimate_ppm"))
-        if val is not None and val > 0:
+        if val is not None and 1 <= val <= self.MAX_FLEET_FEE_PRIOR_PPM:
             return int(val)
         return 0
 
@@ -1505,14 +1555,18 @@ class HiveHintAdapter:
 
     @staticmethod
     def _metabolic_ttl_for(payload: dict, snapshot: dict | None) -> int:
+        # Clamp to the same upper bound the outer snapshot uses so a huge
+        # section ttl_seconds cannot defeat section-freshness (an old
+        # generated_at with ttl=1yr would otherwise read as fresh forever).
+        cap = HiveHintAdapter.HINT_MAX_TTL_SECONDS
         if isinstance(payload, dict):
             ttl = HiveHintAdapter._finite_number(payload.get("ttl_seconds"))
             if ttl is not None:
-                return max(0, int(ttl))
+                return max(0, min(int(ttl), cap))
         if isinstance(snapshot, dict):
             ttl = HiveHintAdapter._finite_number(snapshot.get("ttl_seconds"))
             if ttl is not None:
-                return max(0, int(ttl))
+                return max(0, min(int(ttl), cap))
         return 300
 
     def _metabolic_peer_in_scope(self, peer_id: str, snapshot: dict | None, scope: str) -> bool:
