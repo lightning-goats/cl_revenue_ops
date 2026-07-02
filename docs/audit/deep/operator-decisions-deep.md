@@ -52,3 +52,17 @@ heartbeat** (last-iteration timestamp) surfaced on `revenue-health`, and make it
 standing scorecard check so a stalled/dead loop becomes operator-detectable. Apply the
 canonical guard to all 7 daemon loops (incl. the one-shot startup-snapshot). The
 `tests/test_daemon_survival.py` tail-death assertions flip to assert survival.
+
+## DD6-DD9 — Phase 8 behavioral-hold rulings (Sat, 2026-07-02)
+
+- **DD6 / DEF-081:** `force=true` OVERRIDES the hive-member zero-fee policy. An explicit
+  operator force fee set is honored even on a hive peer — gate the zero-fee override on
+  `not manual` (fee_controller.py:7140 predicate :2823). CODE FIX.
+- **DD7 / RES-2:** Leave `fee_changes` retention at 90 days (bounded, healthy at current
+  scale). No change; RES-2 → accepted/WONTFIX.
+- **DD8 / RES-3:** Add a keep-last-180d (or count) cap to the Boltz swap-journal file
+  (boltz_manager.py:1425). CODE FIX.
+- **DD9 / MIG-3:** Leave schema_version write-only (no newer-schema refusal) — real gating
+  could brick a rolled-back node and the additive-migration model is safe today. Document
+  the assumption in database.py; add gating only when a migration first becomes destructive.
+  DOC/COMMENT only.
