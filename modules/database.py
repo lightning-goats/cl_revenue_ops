@@ -4063,7 +4063,11 @@ class Database:
     # 'active' to keep the committed fee counted; blind-releasing it here would
     # make that committed cost vanish in the overspend-permitting direction.
     # Mirrors P4-015's protection of pending_settlement budget reservations.
-    _COMMITTED_ONCHAIN_SPEND_CATEGORIES = ("channel_open", "channel_close")
+    # P4-022: "boltz" is included — a boltz reservation held active by the
+    # P4-019 loud-write path represents a real committed swap cost that the rail
+    # counts only via spend_events; the journal re-settle is not guaranteed
+    # within the 4h blind-sweep window, so the blind sweep must not release it.
+    _COMMITTED_ONCHAIN_SPEND_CATEGORIES = ("channel_open", "channel_close", "boltz")
 
     def cleanup_stale_spend_reservations(self, max_age_seconds: int = 86400, category: Optional[str] = None) -> int:
         conn = self._get_connection()
