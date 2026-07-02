@@ -63,6 +63,13 @@ DEFAULT_ROOT = "/home/sat/cl-mycelium-hermes"
 NODES = ("hive-nexus-01", "hive-nexus-02")
 SWEEP_TIMEOUT = 1800
 
+# ML-* metabolism-ledger checks read cl-hive's hive-organism-status.json, not
+# any cl_revenue_ops module. They are reported under this cl-hive-owned
+# pseudo-module so they never launder cl_revenue_ops's capital_efficiency
+# verdict (P5-001). The trailing "(cl-hive)" makes the ownership explicit in
+# the rendered scorecard.
+METABOLISM_LEDGER_MODULE = "metabolism_ledger (cl-hive)"
+
 # ---------------------------------------------------------------------------
 # Check model
 # ---------------------------------------------------------------------------
@@ -243,7 +250,12 @@ PREFIX_MODULES = [
     (None, "TCB-", "database"),
     (None, "DB", "database"),
     (None, "CB", "capex_budget"),
-    (None, "ML-", "capital_efficiency"),
+    # ML-* checks read cl-hive's hive-organism-status.json (metabolism ledger)
+    # and are allowlisted as cl-hive-owned. They exercise NONE of
+    # capital_efficiency's own code, so attributing them to capital_efficiency
+    # would launder that module's verdict into a PASS/KNOWN it never earned.
+    # Route them to a distinct cl-hive-owned pseudo-module instead; see P5-001.
+    (None, "ML-", METABOLISM_LEDGER_MODULE),
     (None, "SO", "segment_observations"),
     (None, "DF-", "demand_flow"),
     (None, "LF-", "fee_loop"),
@@ -257,6 +269,12 @@ NO_SWEEP_MODULES = {
                       "are code defects, see docs/audit/phase2-summary.md)",
     "demand_flow": "no corpus-observable DF-* checks (classify path is "
                    "production-dead; Phase 2 code/test verdicts only)",
+    "capital_efficiency": "no corpus-observable CE-* checks of its own; the "
+                          "ML-* metabolism-ledger anomalies read cl-hive's "
+                          "hive-organism-status.json and are reported under "
+                          "'metabolism_ledger (cl-hive)', not here (P5-001). "
+                          "A health verdict here would exercise none of this "
+                          "module's code.",
 }
 
 MODULE_ORDER = [
@@ -264,6 +282,7 @@ MODULE_ORDER = [
     "rebalancer", "rebalance_engine_v2", "profitability_analyzer",
     "capacity_planner", "boltz_manager", "hive_hints",
     "database", "capex_budget", "capital_efficiency",
+    METABOLISM_LEDGER_MODULE,
     "segment_observations", "demand_flow",
     "routing_stack",
     "fee_loop", "rebalance_loop", "planner_loop",
@@ -525,6 +544,7 @@ SWEEP_MODULES = {
     "sweep_planner_boltz_hints": ["capacity_planner", "boltz_manager",
                                   "hive_hints"],
     "sweep_data_budget": ["database", "capex_budget", "capital_efficiency",
+                          METABOLISM_LEDGER_MODULE,
                           "segment_observations", "demand_flow"],
     "sweep_routing_stack": ["routing_stack"],
     "loop_sweep_fee": ["fee_loop"],
