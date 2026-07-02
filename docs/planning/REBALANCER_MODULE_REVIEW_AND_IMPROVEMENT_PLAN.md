@@ -1,5 +1,11 @@
 # Rebalancer Module Review And Improvement Plan
 
+> **SUPERSEDED (historical):** This plan describes Sling/CLBoss-based rebalance
+> execution and `modules/clboss_manager.py`, none of which remain. The plugin no
+> longer uses Sling or CLBoss; rebalancing is DTS+PID with a v3-native executor
+> (`modules/rebalance_engine_v2.py` -> `modules/rebalance_native_executor_v2.py`),
+> and `clboss_manager.py` has been removed. Retained for historical context only.
+
 Targets:
 - `modules/rebalancer.py` (EV rebalancer + job manager)
 - `modules/database.py` (budget reservations + rebalance history)
