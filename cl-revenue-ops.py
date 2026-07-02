@@ -350,6 +350,38 @@ def _validate_enum_config_options(kwargs, log=None):
     return kwargs
 
 
+_ATEXIT_SHUTDOWN_TIMEOUT = 10.0
+
+
+def _bounded_executor_shutdown(executor, timeout=_ATEXIT_SHUTDOWN_TIMEOUT):
+    """Shut down a ThreadPoolExecutor without blocking process exit forever.
+
+    P1-029: ``executor.shutdown(wait=True, cancel_futures=True)`` can only
+    cancel QUEUED futures; an in-flight worker blocked on a wedged lightningd
+    ``recv()`` cannot be cancelled, so a plain ``wait=True`` call blocks atexit
+    indefinitely (relies on external SIGKILL). Run the draining shutdown on a
+    daemon thread and join with a timeout: on a healthy node the join returns
+    immediately (unchanged behavior); on a wedged node atexit proceeds after
+    ``timeout`` and lets the process exit.
+
+    Returns True if the executor drained within the timeout, else False.
+    """
+    if executor is None:
+        return True
+    done = threading.Event()
+
+    def _drain():
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=_drain, name="rpc-shutdown", daemon=True).start()
+    return done.wait(timeout)
+
+
 def _compute_forward_hydration_start(
     last_forward_ts: Optional[int],
     flow_window_days: int,
@@ -1795,10 +1827,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             pass
         if safe_plugin and hasattr(safe_plugin, 'rpc'):
             try:
-                # cancel_futures drops queued-but-unstarted RPC work so exit
-                # only waits on in-flight calls, which the proxy timeouts bound.
-                safe_plugin.rpc._executor.shutdown(wait=True, cancel_futures=True)
-                safe_plugin.rpc._async_executor.shutdown(wait=True, cancel_futures=True)
+                # P1-029: cancel_futures drops queued-but-unstarted RPC work,
+                # but an in-flight worker blocked on a wedged lightningd cannot
+                # be cancelled. Bound the drain so atexit can never block the
+                # process exit forever waiting on such a worker.
+                if not _bounded_executor_shutdown(safe_plugin.rpc._executor):
+                    plugin.log(
+                        "RPC executor did not drain within shutdown timeout; proceeding with exit",
+                        level='warn'
+                    )
+                _bounded_executor_shutdown(safe_plugin.rpc._async_executor)
             except Exception:
                 pass
 
