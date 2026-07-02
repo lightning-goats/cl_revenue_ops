@@ -1,0 +1,553 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:9e13bf9e-ffea-5bed-993a-b1cee11646f2",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2025-07-02T00:00:00Z",
+    "tools": [
+      {
+        "vendor": "cl_revenue_ops",
+        "name": "gen_sbom.py",
+        "version": "1.0.0"
+      }
+    ],
+    "component": {
+      "type": "application",
+      "bom-ref": "pkg:pypi/cl-revenue-ops@2.10.0",
+      "name": "cl-revenue-ops",
+      "version": "2.10.0",
+      "description": "Core Lightning revenue-operations plugin. SBOM captures the Python distributions installed in the plugin runtime interpreter."
+    },
+    "properties": [
+      {
+        "name": "python.version",
+        "value": "3.12.3"
+      },
+      {
+        "name": "python.executable",
+        "value": "/home/sat/bin/cl_revenue_ops/.venv/bin/python"
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/asn1crypto@1.5.1",
+      "name": "asn1crypto",
+      "version": "1.5.1",
+      "purl": "pkg:pypi/asn1crypto@1.5.1",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/attrs@26.1.0",
+      "name": "attrs",
+      "version": "26.1.0",
+      "purl": "pkg:pypi/attrs@26.1.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/base58@2.1.1",
+      "name": "base58",
+      "version": "2.1.1",
+      "purl": "pkg:pypi/base58@2.1.1",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/bitarray@3.8.1",
+      "name": "bitarray",
+      "version": "3.8.1",
+      "purl": "pkg:pypi/bitarray@3.8.1",
+      "licenses": [
+        {
+          "license": {
+            "name": "PSF-2.0"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/bitstring@4.4.0",
+      "name": "bitstring",
+      "version": "4.4.0",
+      "purl": "pkg:pypi/bitstring@4.4.0",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/blinker@1.9.0",
+      "name": "blinker",
+      "version": "1.9.0",
+      "purl": "pkg:pypi/blinker@1.9.0",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT License"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/certifi@2026.4.22",
+      "name": "certifi",
+      "version": "2026.4.22",
+      "purl": "pkg:pypi/certifi@2026.4.22",
+      "licenses": [
+        {
+          "license": {
+            "name": "MPL-2.0"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/cffi@2.0.0",
+      "name": "cffi",
+      "version": "2.0.0",
+      "purl": "pkg:pypi/cffi@2.0.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/charset-normalizer@3.4.7",
+      "name": "charset-normalizer",
+      "version": "3.4.7",
+      "purl": "pkg:pypi/charset-normalizer@3.4.7",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/cheroot@10.0.0",
+      "name": "cheroot",
+      "version": "10.0.0",
+      "purl": "pkg:pypi/cheroot@10.0.0",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD License"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/click@8.4.0",
+      "name": "click",
+      "version": "8.4.0",
+      "purl": "pkg:pypi/click@8.4.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/coincurve@20.0.0",
+      "name": "coincurve",
+      "version": "20.0.0",
+      "purl": "pkg:pypi/coincurve@20.0.0",
+      "licenses": [
+        {
+          "license": {
+            "name": "Apache Software License"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/cryptography@46.0.7",
+      "name": "cryptography",
+      "version": "46.0.7",
+      "purl": "pkg:pypi/cryptography@46.0.7"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/ephemeral-port-reserve@1.1.4",
+      "name": "ephemeral-port-reserve",
+      "version": "1.1.4",
+      "purl": "pkg:pypi/ephemeral-port-reserve@1.1.4",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/flask@3.1.3",
+      "name": "Flask",
+      "version": "3.1.3",
+      "purl": "pkg:pypi/flask@3.1.3"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/idna@3.15",
+      "name": "idna",
+      "version": "3.15",
+      "purl": "pkg:pypi/idna@3.15"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/iniconfig@2.3.0",
+      "name": "iniconfig",
+      "version": "2.3.0",
+      "purl": "pkg:pypi/iniconfig@2.3.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/itsdangerous@2.2.0",
+      "name": "itsdangerous",
+      "version": "2.2.0",
+      "purl": "pkg:pypi/itsdangerous@2.2.0",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD License"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/jaraco-functools@4.5.0",
+      "name": "jaraco.functools",
+      "version": "4.5.0",
+      "purl": "pkg:pypi/jaraco-functools@4.5.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/jinja2@3.1.6",
+      "name": "Jinja2",
+      "version": "3.1.6",
+      "purl": "pkg:pypi/jinja2@3.1.6",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD License"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/jsonschema@4.26.0",
+      "name": "jsonschema",
+      "version": "4.26.0",
+      "purl": "pkg:pypi/jsonschema@4.26.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/jsonschema-specifications@2025.9.1",
+      "name": "jsonschema-specifications",
+      "version": "2025.9.1",
+      "purl": "pkg:pypi/jsonschema-specifications@2025.9.1"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/markupsafe@3.0.3",
+      "name": "MarkupSafe",
+      "version": "3.0.3",
+      "purl": "pkg:pypi/markupsafe@3.0.3"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/mnemonic@0.21",
+      "name": "mnemonic",
+      "version": "0.21",
+      "purl": "pkg:pypi/mnemonic@0.21",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/more-itertools@11.0.2",
+      "name": "more-itertools",
+      "version": "11.0.2",
+      "purl": "pkg:pypi/more-itertools@11.0.2"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/numpy@2.4.2",
+      "name": "numpy",
+      "version": "2.4.2",
+      "purl": "pkg:pypi/numpy@2.4.2"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/packaging@26.0",
+      "name": "packaging",
+      "version": "26.0",
+      "purl": "pkg:pypi/packaging@26.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pip@25.3",
+      "name": "pip",
+      "version": "25.3",
+      "purl": "pkg:pypi/pip@25.3"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pluggy@1.6.0",
+      "name": "pluggy",
+      "version": "1.6.0",
+      "purl": "pkg:pypi/pluggy@1.6.0",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/psutil@7.2.2",
+      "name": "psutil",
+      "version": "7.2.2",
+      "purl": "pkg:pypi/psutil@7.2.2",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-3-Clause"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/psycopg2-binary@2.9.12",
+      "name": "psycopg2-binary",
+      "version": "2.9.12",
+      "purl": "pkg:pypi/psycopg2-binary@2.9.12",
+      "licenses": [
+        {
+          "license": {
+            "name": "LGPL with exceptions"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pycparser@3.0",
+      "name": "pycparser",
+      "version": "3.0",
+      "purl": "pkg:pypi/pycparser@3.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pygments@2.19.2",
+      "name": "Pygments",
+      "version": "2.19.2",
+      "purl": "pkg:pypi/pygments@2.19.2",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-2-Clause"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pyln-bolt7@1.0.246",
+      "name": "pyln-bolt7",
+      "version": "1.0.246",
+      "purl": "pkg:pypi/pyln-bolt7@1.0.246",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pyln-client@26.4",
+      "name": "pyln-client",
+      "version": "26.4",
+      "purl": "pkg:pypi/pyln-client@26.4",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pyln-proto@26.4",
+      "name": "pyln-proto",
+      "version": "26.4",
+      "purl": "pkg:pypi/pyln-proto@26.4",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pyln-testing@26.4.1",
+      "name": "pyln-testing",
+      "version": "26.4.1",
+      "purl": "pkg:pypi/pyln-testing@26.4.1",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pysocks@1.7.1",
+      "name": "PySocks",
+      "version": "1.7.1",
+      "purl": "pkg:pypi/pysocks@1.7.1",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pytest@9.0.2",
+      "name": "pytest",
+      "version": "9.0.2",
+      "purl": "pkg:pypi/pytest@9.0.2"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/python-bitcoinlib@0.12.2",
+      "name": "python-bitcoinlib",
+      "version": "0.12.2",
+      "purl": "pkg:pypi/python-bitcoinlib@0.12.2",
+      "licenses": [
+        {
+          "license": {
+            "name": "GNU Lesser General Public License v3 or later (LGPLv3+)"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pyyaml@6.0.3",
+      "name": "PyYAML",
+      "version": "6.0.3",
+      "purl": "pkg:pypi/pyyaml@6.0.3",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/referencing@0.37.0",
+      "name": "referencing",
+      "version": "0.37.0",
+      "purl": "pkg:pypi/referencing@0.37.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/requests@2.34.2",
+      "name": "requests",
+      "version": "2.34.2",
+      "purl": "pkg:pypi/requests@2.34.2",
+      "licenses": [
+        {
+          "license": {
+            "name": "Apache-2.0"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/rpds-py@0.30.0",
+      "name": "rpds-py",
+      "version": "0.30.0",
+      "purl": "pkg:pypi/rpds-py@0.30.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/tibs@0.5.7",
+      "name": "tibs",
+      "version": "0.5.7",
+      "purl": "pkg:pypi/tibs@0.5.7",
+      "licenses": [
+        {
+          "license": {
+            "name": "The MIT License\n\n\tCopyright (c) 2025 Scott Griffiths (dr.scottgriffiths@gmail.com)\n\n\tPermission is hereby granted, free of charge, to any person obtaining a copy\n\tof this software and associated documentation files (the \"Software\"), to deal\n\tin the Software without restriction, including without limitation the rights\n\tto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\n\tcopies of the Software, and to permit persons to whom the Software is\n\tfurnished to do so, subject to the following conditions:\n\n\tThe above copyright notice and this permission notice shall be included in\n\tall copies or substantial portions of the Software.\n\n\tTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n\tIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n\tFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\n\tAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\n\tLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\n\tOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN\n\tTHE SOFTWARE."
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/typing-extensions@4.15.0",
+      "name": "typing_extensions",
+      "version": "4.15.0",
+      "purl": "pkg:pypi/typing-extensions@4.15.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/urllib3@2.7.0",
+      "name": "urllib3",
+      "version": "2.7.0",
+      "purl": "pkg:pypi/urllib3@2.7.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/werkzeug@3.1.8",
+      "name": "Werkzeug",
+      "version": "3.1.8",
+      "purl": "pkg:pypi/werkzeug@3.1.8"
+    }
+  ]
+}
