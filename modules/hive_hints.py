@@ -1078,10 +1078,15 @@ class HiveHintAdapter:
         return 0.0
 
     def get_optimal_fee_estimate(self, peer_id: str) -> int:
-        """Return fleet-estimated optimal fee PPM (0 if unavailable)."""
+        """Return fleet-estimated optimal fee PPM (0 if unavailable).
+
+        Untrusted absolute value: bounded to [1, MAX_FLEET_FEE_PRIOR_PPM]
+        (same range as get_fleet_fee_prior). An out-of-range estimate
+        neutralizes to 0 so a poisoned hint cannot surface an absurd fee.
+        """
         hint = self._get_peer_hint(peer_id, "optimal_fee_estimate_ppm")
         val = self._finite_number(hint.get("optimal_fee_estimate_ppm"))
-        if val is not None and val > 0:
+        if val is not None and 1 <= val <= self.MAX_FLEET_FEE_PRIOR_PPM:
             return int(val)
         return 0
 
