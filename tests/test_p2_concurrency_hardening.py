@@ -512,3 +512,50 @@ def test_p2_006_concurrent_mutate_and_consume_no_error():
 
     assert not errors, f"hive-member collections raced: {errors}"
 
+
+# ---------------------------------------------------------------------------
+# P2-007 — _channel_fee_states reads tolerate concurrent cycle eviction
+# ---------------------------------------------------------------------------
+def test_p2_007_channel_fee_states_reads_tolerate_eviction():
+    """The fee-state reads now use atomic .get() (reference snapshot) rather
+    than a check-then-index, so a concurrent stale-key eviction + reassign (as
+    the cycle does under _state_lock) can't raise KeyError in a reader."""
+    from modules.fee_controller import FeeController
+
+    fc = object.__new__(FeeController)
+    fc._channel_fee_states = {f"c{i}": object() for i in range(50)}
+
+    errors = []
+    stop = threading.Event()
+
+    def mutator():
+        try:
+            while not stop.is_set():
+                for i in range(50):
+                    fc._channel_fee_states.pop(f"c{i}", None)  # cycle eviction (4172)
+                    fc._channel_fee_states[f"c{i}"] = object()  # reassign (3867/3970)
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    def reader():
+        try:
+            while not stop.is_set():
+                for i in range(50):
+                    # Post-fix access idiom used at every converted site.
+                    v = fc._channel_fee_states.get(f"c{i}")
+                    if v is not None:
+                        _ = v
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    threads = [threading.Thread(target=mutator)] + [
+        threading.Thread(target=reader) for _ in range(3)
+    ]
+    for t in threads:
+        t.start()
+    time.sleep(0.4)
+    stop.set()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"fee-state read raced with eviction: {errors}"

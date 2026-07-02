@@ -4978,8 +4978,10 @@ class FeeController:
             self._save_cycle_state(channel_id, state)
 
         # Keep DTS state coherent too, if already present.
-        if channel_id in self._channel_fee_states:
-            ts_state = self._channel_fee_states[channel_id]
+        # P2-007: atomic .get() (reference snapshot) instead of a check-then-
+        # index, so a concurrent stale-key eviction can't raise KeyError.
+        ts_state = self._channel_fee_states.get(channel_id)
+        if ts_state is not None:
             ts_state.last_gossip_refresh = current_time
             ts_state.last_fee_ppm = nudge_fee
             ts_state.last_broadcast_fee_ppm = nudge_fee
@@ -6568,9 +6570,9 @@ class FeeController:
             cycle.last_update = now
             self._save_cycle_state(channel_id, cycle)
 
-            if channel_id in self._channel_fee_states:
+            ts_state = self._channel_fee_states.get(channel_id)  # P2-007
+            if ts_state is not None:
                 try:
-                    ts_state = self._channel_fee_states[channel_id]
                     ts_state.last_revenue_rate = current_revenue_rate
                     ts_state.last_fee_ppm = current_fee_ppm
                     ts_state.last_update = now
@@ -6660,9 +6662,9 @@ class FeeController:
             # was already updated with the current observation window's data (at the
             # update_posterior call above). If we don't reset the timer, the next cycle
             # would re-use the same accumulated volume/revenue, double-counting observations.
-            if channel_id in self._channel_fee_states:
+            ts_state = self._channel_fee_states.get(channel_id)  # P2-007
+            if ts_state is not None:
                 try:
-                    ts_state = self._channel_fee_states[channel_id]
                     ts_state.last_fee_ppm = new_fee_ppm
                     ts_state.last_revenue_rate = current_revenue_rate
                     ts_state.last_state = decision_reason
@@ -6738,8 +6740,8 @@ class FeeController:
             self._save_cycle_state(channel_id, cycle)
 
             # Save channel fee state
-            if channel_id in self._channel_fee_states:
-                ts_state = self._channel_fee_states[channel_id]
+            ts_state = self._channel_fee_states.get(channel_id)  # P2-007
+            if ts_state is not None:
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = raw_chain_fee
                 ts_state.last_broadcast_fee_ppm = new_fee_ppm
@@ -6796,8 +6798,8 @@ class FeeController:
             self._save_cycle_state(channel_id, cycle)
 
             # Save channel fee state
-            if channel_id in self._channel_fee_states:
-                ts_state = self._channel_fee_states[channel_id]
+            ts_state = self._channel_fee_states.get(channel_id)  # P2-007
+            if ts_state is not None:
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = current_fee_ppm
                 ts_state.last_broadcast_fee_ppm = new_fee_ppm
@@ -6876,9 +6878,9 @@ class FeeController:
         cycle.last_update = now
         self._save_cycle_state(channel_id, cycle)
 
-        if channel_id in self._channel_fee_states:
+        ts_state = self._channel_fee_states.get(channel_id)  # P2-007
+        if ts_state is not None:
             try:
-                ts_state = self._channel_fee_states[channel_id]
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = current_fee_ppm
                 ts_state.last_update = now
@@ -7157,8 +7159,8 @@ class FeeController:
                             f"MANUAL_WAKE: Channel {resolved_channel_id[:12]}... woken due to manual fee change",
                             level='debug'
                         )
-                if manual and resolved_channel_id in self._channel_fee_states:
-                    ts_state = self._channel_fee_states[resolved_channel_id]
+                ts_state = self._channel_fee_states.get(resolved_channel_id)  # P2-007
+                if manual and ts_state is not None:
                     if ts_state.is_sleeping:
                         ts_state.is_sleeping = False
                         ts_state.sleep_until = 0
