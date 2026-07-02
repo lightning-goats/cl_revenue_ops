@@ -907,8 +907,11 @@ def deep_check_heartbeat() -> DeepCheck:
     if "def _record_loop_heartbeat" not in text:
         missing.append("_record_loop_heartbeat() recorder absent")
     core_loops = ("fee-adjustment", "rebalance-check", "flow-analysis")
+    # Match a call site with the loop name as the first arg, whether or not
+    # it also passes interval_seconds/one_shot kwargs (per-loop stall
+    # threshold fix), e.g. _record_loop_heartbeat("fee-adjustment", ...).
     called = [lp for lp in core_loops
-              if f'_record_loop_heartbeat("{lp}")' in text]
+              if f'_record_loop_heartbeat("{lp}"' in text]
     if len(called) < len(core_loops):
         missing.append("core loops not heartbeating: "
                        + ",".join(lp for lp in core_loops if lp not in called))
