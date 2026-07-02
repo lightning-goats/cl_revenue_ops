@@ -7706,6 +7706,12 @@ class FeeController:
                 floor_ppm = max(floor_ppm, int(base_floor))
         
         # 3. HTLC Hold Risk Premium (Stall Defense)
+        # P8-002: capture the stall multiplier here but DEFER applying it until
+        # after the congestion risk-premium max() below, so the documented
+        # formula `max(base_floor, risk_premium) * stall_multiplier` holds. The
+        # earlier code multiplied the base floor before the risk-premium max(),
+        # dropping the markup (an under-charge) whenever the risk premium won.
+        stall_multiplier = 1.0
         if peer_id:
             # PERF: during a fee cycle, parallel channels to the same peer
             # share one latency query (memo cleared at cycle start).
@@ -7727,8 +7733,8 @@ class FeeController:
                     f"(avg={avg_res:.1f}s, std={std_res:.1f}s). Applying 20% markup to floor.",
                     level='info'
                 )
-                floor_ppm = int(floor_ppm * 1.2)
-                
+                stall_multiplier = 1.2
+
         # 2. Calculate Risk Premium (Congestion Defense)
         # When mempool is congested, force-closing becomes expensive.
         # We must charge enough to justify the risk of smaller HTLCs getting stuck/trimmed.
@@ -7754,7 +7760,13 @@ class FeeController:
                 if AVG_HTLC_SIZE_SATS > 0:
                     risk_premium_ppm = (expected_enforcement_cost / AVG_HTLC_SIZE_SATS) * 1_000_000
                     floor_ppm = max(floor_ppm, int(risk_premium_ppm))
-        
+
+        # P8-002: apply the HTLC-hold stall markup to whichever floor term won
+        # (base floor OR congestion risk premium), per the documented
+        # `max(base_floor, risk_premium) * stall_multiplier`.
+        if stall_multiplier != 1.0:
+            floor_ppm = int(floor_ppm * stall_multiplier)
+
         return max(1, int(floor_ppm))
     
     def _get_dynamic_chain_costs(self) -> Optional[Dict[str, int]]:
