@@ -100,7 +100,7 @@ The capacity planner uses a multi-strategy candidate pipeline with portfolio-awa
 ```text
 pair selection / fee decisions
     ↓
-configured router (v3 askrene+mycelium/hive layers or v2 local)
+v3 router (askrene + mycelium/hive layers)
     ↓
 RebalanceEngineV2
     ↓
