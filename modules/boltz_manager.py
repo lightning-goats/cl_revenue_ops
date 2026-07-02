@@ -2111,6 +2111,11 @@ class BoltzCliManager:
                 args.extend(["--to-address", str(to_address)])
             else:
                 args.extend(["--to-wallet", self._resolve_wallet_name(to_cur)])
+            # P4-006: `--` terminates option parsing so the positional amount
+            # (and any future free-form positional) is passed as data, never
+            # reparsed by boltzcli as a flag — matching the sibling P1-015
+            # commands (withdraw/refund/claim/loop_out).
+            args.append("--")
             args.append(str(amount_sats))
             result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 180))
             self._record_swap_result(result, source="chainswap")
