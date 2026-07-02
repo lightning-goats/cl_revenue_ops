@@ -5161,13 +5161,19 @@ class Database:
 
         return row['forward_count'] if row else 0
 
-    def get_channel_flow_window(self, channel_id: str, since_timestamp: int):
+    def get_channel_flow_window(
+        self, channel_id: str, since_timestamp: int
+    ) -> Tuple[int, int, int]:
         """
         Directional forwarded volume + count for a channel since a timestamp.
 
         Mirrors get_volume_since / get_forward_count_since (no status column
         exists on `forwards` — all rows in the table represent settled
-        forwards, so no status filter is applied here either).
+        forwards, so no status filter is applied here either). Related to
+        get_channel_forwards (same directional shape) but adds a COUNT and
+        sat conversion for the rebalancer's ChannelFlowFacts. Note: a
+        self-referential forward (in_channel == out_channel == channel_id)
+        is counted in both directions.
 
         Args:
             channel_id: Channel to get flow facts for
