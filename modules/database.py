@@ -5674,10 +5674,16 @@ class Database:
                 )
                 return False
 
-            # Security: Sanitize fee values
-            closure_fee_sats = self._sanitize_fee(closure_fee_sats, "closure_fee")
-            htlc_sweep_fee_sats = self._sanitize_fee(htlc_sweep_fee_sats, "htlc_sweep_fee")
-            penalty_fee_sats = self._sanitize_fee(penalty_fee_sats, "penalty_fee")
+            # Security: Sanitize fee values.
+            # P4-002: closure costs are NOT routine routing fees — a real
+            # force-close (multi-HTLC sweep / mempool spike) legitimately
+            # exceeds the 50000-sat _sanitize_fee ceiling. Clamping it there
+            # under-counts closure cost and over-states lifetime P&L
+            # (optimistic direction). Use the closure-appropriate bound: still
+            # non-negative, but capped at the 10 BTC _sanitize_amount ceiling.
+            closure_fee_sats = max(0, self._sanitize_amount(closure_fee_sats, "closure_fee"))
+            htlc_sweep_fee_sats = max(0, self._sanitize_amount(htlc_sweep_fee_sats, "htlc_sweep_fee"))
+            penalty_fee_sats = max(0, self._sanitize_amount(penalty_fee_sats, "penalty_fee"))
 
             # Validate close_type
             valid_close_types = {'mutual', 'local_unilateral', 'remote_unilateral', 'unknown'}
