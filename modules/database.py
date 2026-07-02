@@ -3973,6 +3973,12 @@ class Database:
             return False
         ts = int(timestamp or time.time())
         amount = self._sanitize_amount(amount_sats, "amount_sats")
+        # P4-003: mirror reserve_spend's amount<=0 guard. A non-positive amount
+        # would SUM() into committed spend and *lower* it (via a negative), which
+        # raises remaining budget in the overspend-permitting direction; a zero
+        # is a meaningless no-op event. Reject both before persisting.
+        if amount <= 0:
+            return False
         meta_json = json.dumps(metadata or {}, sort_keys=True) if metadata else None
         # P2-008: a spend event that fails to persist under-counts the unified
         # budget in the OVERSPEND-permitting direction. A transient
