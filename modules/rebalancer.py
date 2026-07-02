@@ -1999,10 +1999,17 @@ class EVRebalancer:
                 if getattr(self, "global_budget_limit_provider", None) is not None:
                     effective_budget = self._get_global_budget_limit(cfg)
 
+                # P4-016: pass the FULL unified budget to reserve_budget; the
+                # atomic BEGIN IMMEDIATE already SUMs the non-rebalance categories
+                # (generic spend_events + spend_reservations, incl. boltz and
+                # settled open/close) exactly once. Pre-subtracting them here via
+                # the external provider double-counted them and starved the
+                # rebalance budget. ext_spent/ext_reserved are kept for the
+                # operator-facing log/error strings only.
                 ext_costs = self._get_external_liquidity_costs()
                 ext_spent = int(ext_costs.get("spent_24h_sats", 0) or 0)
                 ext_reserved = int(ext_costs.get("reserved_24h_sats", 0) or 0)
-                rebalance_budget_limit = max(0, effective_budget - ext_spent - ext_reserved)
+                rebalance_budget_limit = max(0, effective_budget)
                 # Capex candidates use per-channel budget as their limit.
                 # Global daily/weekly caps only apply as emergency overrides when > 0.
                 is_capex = getattr(candidate, 'reason_code', '') == RebalanceReasonCode.CAPEX_FALLBACK.value
@@ -2015,12 +2022,14 @@ class EVRebalancer:
                 hot_override_limit = int(getattr(candidate, 'dynamic_budget_override_sats', 0) or 0)
                 if hot_override_limit > 0:
                     # Candidate-specific protection budget can exceed the standard daily cap.
-                    protected_limit = max(0, hot_override_limit - ext_spent - ext_reserved)
+                    # P4-016: no external pre-subtraction here either — the atomic
+                    # reserve counts non-rebalance categories once.
+                    protected_limit = max(0, hot_override_limit)
                     # Cap aggregate hot channel spend at the configured daily budget.
                     # Hot channel protection provides per-channel priority within the budget,
                     # but never allows total spend to exceed the effective daily budget.
                     max_hot_budget = effective_budget
-                    protected_limit = min(protected_limit, max(0, max_hot_budget - ext_spent - ext_reserved))
+                    protected_limit = min(protected_limit, max(0, max_hot_budget))
                     if protected_limit > rebalance_budget_limit:
                         self.plugin.log(
                             f"HOT CHANNEL PROTECTION: Using protected rebalance budget limit {protected_limit} sats "
