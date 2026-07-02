@@ -537,6 +537,41 @@ SWEEP_RAN_MARKERS = {
     "check_hermes_forwards_chain": "forwards:",
 }
 
+_TRACEBACK_MARKER = "Traceback (most recent call last):"
+
+
+def sweep_completed_cleanly(name: str, rc: int, out: str, err: str):
+    """Distinguish a CLEAN sweep completion from a CRASH (P5-007).
+
+    Several sweeps exit 1 to signal "violations found", so exit code alone
+    cannot tell a legitimate finding from an uncaught exception that also
+    exits 1 and leaves partial output. A sweep is treated as clean ONLY when
+      * it exited 0 or 1 (not a timeout / launch failure / other signal),
+      * it emitted its explicit end-of-run marker (proof it reached the
+        results section rather than dying mid-run), AND
+      * neither stdout nor stderr contains a Python traceback.
+    Otherwise it is a crash and its modules must go ERROR, never PASS/KNOWN.
+
+    Returns (clean: bool, reason: str). reason is "" when clean.
+    """
+    if rc not in (0, 1):
+        detail = err.strip()[-400:]
+        if rc == -1:
+            return False, f"sweep timed out (exit={rc}){f'; {detail}' if detail else ''}"
+        return False, f"sweep did not exit cleanly (exit={rc}){f'; stderr: {detail}' if detail else ''}"
+    if _TRACEBACK_MARKER in out or _TRACEBACK_MARKER in err:
+        detail = (err if _TRACEBACK_MARKER in err else out).strip()[-400:]
+        return False, (f"sweep crashed mid-run (exit={rc}, traceback emitted); "
+                       f"tail: {detail}")
+    if SWEEP_RAN_MARKERS[name] not in out:
+        detail = err.strip()[-300:]
+        return False, ("sweep did not reach its clean-completion marker "
+                       f"({SWEEP_RAN_MARKERS[name]!r} absent; exit={rc}), "
+                       "treating as a crash"
+                       + (f"; stderr: {detail}" if detail else ""))
+    return True, ""
+
+
 SWEEP_MODULES = {
     "sweep_fee_stack": ["fee_controller", "flow_analysis", "policy_manager"],
     "sweep_rebalancer": ["rebalancer", "rebalance_engine_v2"],
@@ -657,18 +692,16 @@ def build_scorecard(root: Path, since: str | None):
         rc, out, err = sweep_runs[name]
         checks: list[Check] = []
         parse_err = None
-        if rc in (0, 1):     # 1 == "violations found" for several sweeps
+        clean, reason = sweep_completed_cleanly(name, rc, out, err)
+        if clean:
             try:
                 checks = parser(name, out)
             except Exception as exc:  # noqa: BLE001
                 parse_err = f"parser raised: {exc}"
         else:
-            parse_err = f"exit={rc} stderr: {err.strip()[-400:]}"
-        if not checks and parse_err is None \
-                and SWEEP_RAN_MARKERS[name] not in out:
-            parse_err = ("no checks parsed from sweep output"
-                         + (f"; stderr: {err.strip()[-300:]}"
-                            if err.strip() else ""))
+            # Crash / timeout / truncated output: never parse partial output
+            # into a health verdict. The owning modules go ERROR.
+            parse_err = reason
         if parse_err:
             for m in SWEEP_MODULES[name]:
                 modules.setdefault(m, {"checks": [], "errors": []})
