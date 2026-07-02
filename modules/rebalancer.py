@@ -1743,6 +1743,11 @@ class EVRebalancer:
                             base_fee_msat = int(ch.get("base_fee_millisatoshi", 0) or 0)
                             # Convert the base fee (msat) into a ppm-equivalent at amount_msat.
                             base_ppm = int((base_fee_msat * 1_000_000) // max(int(amount_msat or 0), 1))
+                            # P4-011: cap the gossip base-fee ppm-equivalent at
+                            # 100% like the PRIORITY-1 peer path (~L1727) —
+                            # garbage gossip base_fee must not inflate the
+                            # inbound-fee estimate.
+                            base_ppm = min(base_ppm, 1_000_000)
                             result = ppm + base_ppm
                             self.plugin.log(
                                 f"LAST_HOP_FEE [{peer_id[:12]}...]: Using gossip fee {result} PPM "
@@ -2166,6 +2171,12 @@ class EVRebalancer:
                                     "payment_pending": bool(
                                         getattr(exec_result, "payment_pending", False)
                                     ),
+                                    "payment_hash": str(
+                                        (getattr(exec_result, "failure_data", {}) or {}).get(
+                                            "payment_hash", ""
+                                        )
+                                        or ""
+                                    ),
                                 }
                                 # The engine shares our history row; when the
                                 # payment is parked as 'pending_settlement' for
@@ -2256,6 +2267,12 @@ class EVRebalancer:
                                 ),
                                 "payment_pending": bool(
                                     getattr(exec_result, "payment_pending", False)
+                                ),
+                                "payment_hash": str(
+                                    (getattr(exec_result, "failure_data", {}) or {}).get(
+                                        "payment_hash", ""
+                                    )
+                                    or ""
                                 ),
                             }
                             # Engine shares our history row; keep its
@@ -2351,7 +2368,20 @@ class EVRebalancer:
                 result["error"] = error
                 result["message"] = f"Failed: {error}"
                 self.plugin.log(f"Failed to start rebalance job: {error}", level='warn')
-                if reserved_budget:
+                # P4-009: mirror the engine's hold-on-pending. A payment that is
+                # still pending settlement AND sweepable (carries a
+                # payment_hash) keeps its reservation held — the engine parked
+                # the shared history row as 'pending_settlement' and
+                # reconcile_pending_settlements owns the terminal release/spend.
+                # Releasing here would let the next cycle spend the same budget
+                # while the HTLC can still settle (double-spend). A pending
+                # result WITHOUT a payment_hash is not sweepable (the row was
+                # marked 'failed'), so it is released here like any terminal
+                # failure — otherwise the reservation would strand 'active'.
+                sweepable_pending = bool(
+                    res.get("payment_pending") and res.get("payment_hash")
+                )
+                if reserved_budget and not sweepable_pending:
                     self.database.release_budget_reservation(str(rebalance_id))
                 with self._pending_lock:
                     self._pending.pop(candidate.to_channel, None)

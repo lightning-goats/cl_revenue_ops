@@ -83,9 +83,14 @@ def _nonnegative_msat_int(value: Any) -> int:
 
 def _bounded_historical_fee_ppm(value: Any, cap_ppm: float) -> float:
     parsed = _nonnegative_float(value)
-    if cap_ppm > 0.0:
-        parsed = min(parsed, cap_ppm)
-    return parsed
+    # P4-012: the cap is derived from cfg.max_fee_ppm. A configured max of 0
+    # means "no fee headroom", so a historical fee ratio must contribute NO
+    # EV benefit — treat a non-positive cap as zero-benefit rather than
+    # leaving the historical ppm uncapped (a freak ratio could otherwise
+    # clear the sats-EV hold gate for a losing rebalance).
+    if cap_ppm <= 0.0:
+        return 0.0
+    return min(parsed, cap_ppm)
 
 
 def _historical_fee_rate_ppm(fee_msat: Any, volume_msat: Any, cap_ppm: float) -> float:
@@ -226,6 +231,47 @@ class RebalanceEngine:
         # execute_candidate() fails fast with error='engine_busy' (same
         # non-blocking pattern as the fee controller's state lock).
         self._cycle_lock = threading.Lock()
+
+        # P4-008: in-flight-destination guard. After the as_completed(timeout)
+        # ceiling in _run_cycle_locked abandons an un-cancellable worker, the
+        # cycle lock is released while that orphan is still inside
+        # _execute_pair (reserving + paying). Without a guard, the next cycle
+        # could re-select the same destination and pay it a second time
+        # (double-pay + double budget, same family as P1-013). Each execution
+        # registers its destination channel here for the whole reserve+pay
+        # window and unregisters in a finally; find_candidates drops any
+        # destination that is still registered. Deadlock-free (brief lock, no
+        # nesting) and stall-free (a filter, never a wait) — the orphan clears
+        # its own entry when it finally completes, and the guard is empty on
+        # the healthy path so cycle latency is unchanged. Counts (not a set)
+        # so overlapping executions to the same dest release correctly.
+        self._inflight_lock = threading.Lock()
+        self._inflight_dests: Dict[str, int] = {}
+
+    def _register_inflight_dest(self, dest_channel_id: str) -> None:
+        """Mark a destination as having an outstanding reserve+pay in flight."""
+        if not dest_channel_id:
+            return
+        with self._inflight_lock:
+            self._inflight_dests[dest_channel_id] = (
+                self._inflight_dests.get(dest_channel_id, 0) + 1
+            )
+
+    def _unregister_inflight_dest(self, dest_channel_id: str) -> None:
+        """Clear one outstanding reserve+pay for a destination."""
+        if not dest_channel_id:
+            return
+        with self._inflight_lock:
+            remaining = self._inflight_dests.get(dest_channel_id, 0) - 1
+            if remaining > 0:
+                self._inflight_dests[dest_channel_id] = remaining
+            else:
+                self._inflight_dests.pop(dest_channel_id, None)
+
+    def _inflight_dest_snapshot(self) -> set:
+        """Return the set of destinations with an outstanding in-flight pay."""
+        with self._inflight_lock:
+            return set(self._inflight_dests)
 
     def _probe_askrene(self) -> bool:
         """One-shot probe: does this CLN instance have askrene loaded?"""
@@ -1413,6 +1459,35 @@ class RebalanceEngine:
             plan.selected = lease_result.selected
             plan.skipped.extend(lease_result.skipped)
 
+        # P4-008: in-flight-destination guard. Drop any selected pair whose
+        # destination still has an outstanding reserve+pay in flight (typically
+        # an orphaned worker abandoned by the previous cycle's as_completed
+        # timeout). Re-selecting it here would let this cycle pay the same
+        # destination a second time once the cycle lock is released. The orphan
+        # clears its own entry when it finally completes, so the dest becomes
+        # selectable again on a later cycle — no permanent suppression, no wait.
+        inflight_dests = self._inflight_dest_snapshot()
+        if inflight_dests and plan.selected:
+            kept_selected: List[PairCandidate] = []
+            for pair in plan.selected:
+                dest_id = str(getattr(pair, "dest_channel_id", "") or "")
+                if dest_id in inflight_dests:
+                    plan.skipped.append(SkipRecord(
+                        channel_id=pair.dest_channel_id,
+                        reason="dest_inflight",
+                        value_class="valuable",
+                        remaining_budget_sats=int(
+                            getattr(pair, "pair_budget_sats", 0) or 0
+                        ),
+                        detail=(
+                            f"src={pair.source_channel_id} dest has an "
+                            "in-flight/unresolved payment from a prior cycle"
+                        ),
+                    ))
+                    continue
+                kept_selected.append(pair)
+            plan.selected = kept_selected
+
         # Net the planner's residual drain demand against the final merged
         # selection. Overlay/equalization pairs drain sources the planner-
         # phase pairing reported as unplaceable; leaving those entries in
@@ -2317,10 +2392,28 @@ class RebalanceEngine:
             return
         try:
             if result is not None and getattr(result, "payment_pending", False):
-                # Payment unresolved: keep the reservation active so the
-                # budget stays held until the reconciliation sweep confirms
-                # settlement or failure. Releasing here would let the next
-                # cycle spend the same budget while the HTLC can still settle.
+                # P4-007: only HOLD the reservation for a pending payment that
+                # is actually sweepable — i.e. one that carries a payment_hash.
+                # _record_rebalance_result parks such a row as
+                # 'pending_settlement', and reconcile_pending_settlements later
+                # releases (or spends) the reservation once listsendpays reports
+                # a terminal state. A pending result WITHOUT a payment_hash is
+                # recorded as 'failed' (not sweepable), so the reconcile sweep —
+                # which scans only 'pending_settlement' — would never touch it
+                # and the reservation would strand 'active' forever. Treat the
+                # no-hash edge as a failure for budget purposes and release now
+                # (conservative: release-on-failure keeps the row status and the
+                # budget consistent).
+                failure_data = getattr(result, "failure_data", {}) or {}
+                payment_hash = str(failure_data.get("payment_hash", "") or "")
+                if payment_hash:
+                    # Payment unresolved but sweepable: keep the reservation
+                    # active so the budget stays held until the reconciliation
+                    # sweep confirms settlement or failure. Releasing here would
+                    # let the next cycle spend the same budget while the HTLC
+                    # can still settle.
+                    return
+                self.database.release_budget_reservation(reservation_id)
                 return
             if result is not None and result.success:
                 self.database.mark_budget_spent(
@@ -2735,49 +2828,58 @@ class RebalanceEngine:
         reserved_budget = False
         result: Optional[ExecutionResult] = None
 
-        if reserve_budget:
-            reserved_budget, budget_result = self._reserve_execution_budget(
-                pair,
-                reservation_id=reservation_id,
-            )
-            if budget_result is not None:
-                self._record_rebalance_result(
-                    rebalance_id,
-                    budget_result,
-                    pair=pair,
-                    account_costs=False,
-                )
-                return budget_result
-
+        # P4-008: register the destination for the entire reserve+pay window so
+        # a subsequent cycle (which may start after this worker is orphaned by
+        # the cycle timeout) cannot re-select and re-pay the same dest. Cleared
+        # in the finally below regardless of how execution ends.
+        dest_channel_id = str(getattr(pair, "dest_channel_id", "") or "")
+        self._register_inflight_dest(dest_channel_id)
         try:
-            result = executor.execute(**self._execution_kwargs(pair))
-        except Exception as exc:
-            result = ExecutionResult(
-                success=False,
-                amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
-                error=f"executor_error: {exc}",
-                route_type=self._executor_mode(),
+            if reserve_budget:
+                reserved_budget, budget_result = self._reserve_execution_budget(
+                    pair,
+                    reservation_id=reservation_id,
+                )
+                if budget_result is not None:
+                    self._record_rebalance_result(
+                        rebalance_id,
+                        budget_result,
+                        pair=pair,
+                        account_costs=False,
+                    )
+                    return budget_result
+
+            try:
+                result = executor.execute(**self._execution_kwargs(pair))
+            except Exception as exc:
+                result = ExecutionResult(
+                    success=False,
+                    amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
+                    error=f"executor_error: {exc}",
+                    route_type=self._executor_mode(),
+                )
+
+            if result is not None:
+                result = self._retry_native_pair_with_exclusions(pair, executor, result)
+            if result is not None:
+                result = self._retry_native_pair_with_partial_amounts(pair, executor, result)
+
+            self._record_rebalance_result(
+                rebalance_id,
+                result,
+                pair=pair,
+                account_costs=account_costs,
             )
-
-        if result is not None:
-            result = self._retry_native_pair_with_exclusions(pair, executor, result)
-        if result is not None:
-            result = self._retry_native_pair_with_partial_amounts(pair, executor, result)
-
-        self._record_rebalance_result(
-            rebalance_id,
-            result,
-            pair=pair,
-            account_costs=account_costs,
-        )
-        self._finish_execution_budget(
-            reservation_id=reservation_id,
-            reserved_budget=reserved_budget,
-            result=result,
-        )
-        if result is not None and not result.success:
-            self._push_segment_observation_snapshot()
-        return result
+            self._finish_execution_budget(
+                reservation_id=reservation_id,
+                reserved_budget=reserved_budget,
+                result=result,
+            )
+            if result is not None and not result.success:
+                self._push_segment_observation_snapshot()
+            return result
+        finally:
+            self._unregister_inflight_dest(dest_channel_id)
 
     def _record_rebalance_pending(self, pair: PairCandidate) -> Optional[int]:
         """Insert a 'pending' row into rebalance_history for this pair.
