@@ -768,3 +768,147 @@ def test_hive_router_get_routes_passes_timeout():
     assert data_service.get_routes.call_args.kwargs.get("timeout") == (
         RebalanceHiveRouter.GETROUTES_TIMEOUT_SEC
     )
+
+
+def _multi_route_data_service():
+    """data_service mirroring test_hive_router_uses_all_live_hive... but
+    parametrized so callers can inject a custom ``routes`` list."""
+    data_service = MagicMock()
+    data_service.get_askrene_layers.return_value = {"layers": [{"layer": "hive-fleet"}]}
+    data_service.get_peer_channels.side_effect = lambda peer_id=None: (
+        {
+            "channels": [{
+                "short_channel_id": "100x1x0",
+                "peer_id": SRC_PEER,
+                "state": "CHANNELD_NORMAL",
+            }]
+        }
+        if peer_id is None
+        else {
+            "channels": [{
+                "short_channel_id": "200x1x0",
+                "peer_id": DST_PEER,
+                "updates": {"remote": {
+                    "fee_base_msat": 0,
+                    "fee_proportional_millionths": 0,
+                    "cltv_expiry_delta": 6,
+                }},
+            }]
+        }
+    )
+    data_service.get_configs.return_value = {
+        "configs": {"cltv-final": {"value_int": 18}}
+    }
+
+    def get_channels(**kwargs):
+        scid = kwargs.get("short_channel_id")
+        if scid == "300x1x0":
+            return {"channels": [{
+                "short_channel_id": "300x1x0",
+                "source": SRC_PEER,
+                "destination": DST_PEER,
+                "fee_per_millionth": 0,
+                "base_fee_millisatoshi": 0,
+                "delay": 6,
+            }]}
+        return {"channels": []}
+
+    data_service.get_channels.side_effect = get_channels
+    return data_service
+
+
+def _two_hop_route(first_hop_amount_msat, probability_ppm):
+    return {
+        "probability_ppm": probability_ppm,
+        "amount_msat": 100000000,
+        "path": [
+            {
+                "short_channel_id_dir": "100x1x0/0",
+                "next_node_id": SRC_PEER,
+                "amount_msat": first_hop_amount_msat,
+                "delay": 24,
+            },
+            {
+                "short_channel_id_dir": "300x1x0/0",
+                "next_node_id": DST_PEER,
+                "amount_msat": 100000000,
+                "delay": 18,
+            },
+        ],
+    }
+
+
+def _router(data_service):
+    from modules.rebalance_hive_router import RebalanceHiveRouter
+    return RebalanceHiveRouter(
+        plugin=MagicMock(),
+        our_node_id=OUR_ID,
+        hive_hints=FakeHiveHints({SRC_PEER, MID_PEER, DST_PEER}),
+        data_service=data_service,
+        log=lambda m, l: None,
+    )
+
+
+def test_hive_router_picks_cheapest_of_multiple_routes():
+    """DEF-084 / P5-004b: with >=2 routes of differing cost the CHEAPEST
+    (lowest first-hop-fee) route must be selected. Kills the min->max mutant
+    that single-element route fixtures leave alive. Discriminated via the
+    per-route probability_ppm, which is read from the chosen route."""
+    data_service = _multi_route_data_service()
+    data_service.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [
+            # Expensive: 50,000 msat first-hop fee
+            _two_hop_route(100_050_000, probability_ppm=111_111),
+            # Cheap: 200 msat first-hop fee — must win
+            _two_hop_route(100_000_200, probability_ppm=888_888),
+        ],
+    }
+
+    result = _router(data_service).price_pair(
+        _pair(), _route_decision(RoutePolicy.HIVE_ONLY)
+    )
+
+    assert result.success is True
+    # min() picked the cheap route -> its probability flows through.
+    assert result.probability_ppm == 888_888
+
+
+def test_hive_router_empty_path_route_does_not_raise_and_is_not_chosen():
+    """P5-004a: an empty-path route must not IndexError out of the min()
+    selector (which sits outside price_pair's try/except). The sentinel keeps
+    it from ever being chosen when a real route is present."""
+    data_service = _multi_route_data_service()
+    data_service.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [
+            {"probability_ppm": 111_111, "amount_msat": 100000000, "path": []},
+            _two_hop_route(100_000_200, probability_ppm=888_888),
+        ],
+    }
+
+    result = _router(data_service).price_pair(
+        _pair(), _route_decision(RoutePolicy.HIVE_ONLY)
+    )
+
+    assert result.success is True
+    assert result.probability_ppm == 888_888
+
+
+def test_hive_router_only_empty_path_route_returns_failure_not_indexerror():
+    """P5-004a: a response whose only route has an empty path returns a clean
+    failure instead of raising IndexError."""
+    data_service = _multi_route_data_service()
+    data_service.get_routes.return_value = {
+        "probability_ppm": 990000,
+        "routes": [
+            {"probability_ppm": 111_111, "amount_msat": 100000000, "path": []},
+        ],
+    }
+
+    result = _router(data_service).price_pair(
+        _pair(), _route_decision(RoutePolicy.HIVE_ONLY)
+    )
+
+    assert result.success is False
+    assert "empty_path" in (result.error or "")
