@@ -1142,6 +1142,134 @@ class TestZeroFlowRatchetGuard:
         assert guarded < 2306
         assert reason == "zero_flow_downshift"
 
+    def test_streak_thresholds_scale_with_channel_cadence(self, mock_plugin, mock_database):
+        """A channel that earns every ~24h must not be treated as stalled
+        after 4 quiet hours: thresholds stretch to multiples of the observed
+        meaningful-revenue gap (in cycles)."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guard, downshift = fc._zero_flow_streak_thresholds(
+            gap_ema_hours=24.0, cycle_hours=0.5
+        )
+        # 24h gap = 48 cycles; guard at 2x gap, downshift at 4x gap.
+        assert guard == 96
+        assert downshift == 192
+
+    def test_streak_thresholds_default_without_history(self, mock_plugin, mock_database):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        assert fc._zero_flow_streak_thresholds(
+            gap_ema_hours=0.0, cycle_hours=0.5
+        ) == (
+            FeeController.ZERO_FLOW_GUARD_STREAK,
+            FeeController.ZERO_FLOW_DOWNSHIFT_STREAK,
+        )
+
+    def test_streak_thresholds_dense_channel_keeps_defaults(self, mock_plugin, mock_database):
+        """A channel forwarding every cycle keeps the tight default guards."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        assert fc._zero_flow_streak_thresholds(
+            gap_ema_hours=0.5, cycle_hours=0.5
+        ) == (
+            FeeController.ZERO_FLOW_GUARD_STREAK,
+            FeeController.ZERO_FLOW_DOWNSHIFT_STREAK,
+        )
+
+    def test_streak_thresholds_capped_for_very_sparse_channels(self, mock_plugin, mock_database):
+        """A once-a-month earner must not earn weeks of raise-freedom: the
+        stretch is capped at ZERO_FLOW_GAP_CAP_HOURS worth of cycles."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        guard, downshift = fc._zero_flow_streak_thresholds(
+            gap_ema_hours=720.0, cycle_hours=0.5
+        )
+        cap_cycles = int(FeeController.ZERO_FLOW_GAP_CAP_HOURS / 0.5)
+        assert guard <= cap_cycles * 2
+        assert downshift <= cap_cycles * 4
+
+    def test_guard_honors_scaled_thresholds(self, mock_plugin, mock_database):
+        """A 24-cycle silence on a daily-cadence channel must pass raises
+        through untouched when the scaled guard threshold is higher."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=100, target_fee=120, min_fee=10,
+            zero_revenue_streak=24,
+            forwards_since_update=0, revenue_rate=0.0,
+            supported_fee_ceiling=None,
+            guard_streak=96, downshift_streak=192,
+        )
+        assert guarded == 120
+        assert reason is None
+
+    def test_downshift_cap_rate_limited_between_steps(self, mock_plugin, mock_database):
+        """2026-07-03 nexus-01 floor-pinning: once streak >= 24 the 0.85x cap
+        used to re-apply EVERY 30-min cycle (-15%/cycle), crushing any sparse
+        channel to the floor overnight. The forced decay must step at most
+        once per ZERO_FLOW_DOWNSHIFT_INTERVAL_CYCLES; between steps the cap
+        holds at the current fee instead of compounding."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        ds = FeeController.ZERO_FLOW_DOWNSHIFT_STREAK
+
+        # Boundary cycle: the 0.85 step applies.
+        g1, r1 = fc._apply_zero_flow_ratchet_guard(
+            current_fee=100, target_fee=120, min_fee=10,
+            zero_revenue_streak=ds,
+            forwards_since_update=0, revenue_rate=0.0,
+            supported_fee_ceiling=None,
+        )
+        assert g1 == int(100 * FeeController.ZERO_FLOW_DOWNSHIFT_RATIO)
+        assert r1 == "zero_flow_downshift"
+
+        # One cycle later: no second 15% bite — hold at current.
+        g2, r2 = fc._apply_zero_flow_ratchet_guard(
+            current_fee=85, target_fee=120, min_fee=10,
+            zero_revenue_streak=ds + 1,
+            forwards_since_update=0, revenue_rate=0.0,
+            supported_fee_ceiling=None,
+        )
+        assert g2 == 85
+        assert r2 == "zero_flow_ratchet_guard"
+
+        # The next step fires one full interval after the boundary.
+        g3, r3 = fc._apply_zero_flow_ratchet_guard(
+            current_fee=85, target_fee=120, min_fee=10,
+            zero_revenue_streak=ds + FeeController.ZERO_FLOW_DOWNSHIFT_INTERVAL_CYCLES,
+            forwards_since_update=0, revenue_rate=0.0,
+            supported_fee_ceiling=None,
+        )
+        assert g3 == int(85 * FeeController.ZERO_FLOW_DOWNSHIFT_RATIO)
+        assert r3 == "zero_flow_downshift"
+
+    def test_downshift_decay_floors_at_earning_anchor(self, mock_plugin, mock_database):
+        """The forced decay must not push the fee below half the region that
+        historically earned — decaying below it is pointless (the silence is
+        temporal, not price elasticity) and creates the floor absorbing state."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=90, target_fee=120, min_fee=10,
+            zero_revenue_streak=FeeController.ZERO_FLOW_DOWNSHIFT_STREAK,
+            forwards_since_update=0, revenue_rate=0.0,
+            supported_fee_ceiling=None,
+            earning_anchor_ppm=160.0,
+        )
+        assert guarded == int(160 * FeeController.ZERO_FLOW_ANCHOR_FLOOR_FRAC)
+        assert reason == "zero_flow_downshift"
+
+    def test_earning_anchor_floor_never_raises(self, mock_plugin, mock_database):
+        """The anchor floor is soft: it stops decay but must never push the
+        fee UP during silence (only hard cost floors may raise)."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=50, target_fee=120, min_fee=10,
+            zero_revenue_streak=FeeController.ZERO_FLOW_DOWNSHIFT_STREAK,
+            forwards_since_update=0, revenue_rate=0.0,
+            supported_fee_ceiling=None,
+            earning_anchor_ppm=160.0,
+        )
+        assert guarded == 50
+        assert reason == "zero_flow_ratchet_guard"
+
     def test_severe_stall_respects_economic_floor(self, mock_plugin, mock_database):
         fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
 
@@ -1196,7 +1324,15 @@ class TestZeroFlowRatchetGuard:
             last_broadcast_fee_ppm=current_fee_ppm,
             last_state="dts_pid",
         )
-        ts_state.thompson.zero_revenue_streak = 198
+        # Streak lands on a downshift step boundary AFTER this cycle's zero
+        # window increments it: the forced decay is rate-limited to one 0.85x
+        # step per ZERO_FLOW_DOWNSHIFT_INTERVAL_CYCLES (2026-07-03
+        # floor-pinning fix), and this test pins the step itself.
+        ts_state.thompson.zero_revenue_streak = (
+            FeeController.ZERO_FLOW_DOWNSHIFT_STREAK
+            + 15 * FeeController.ZERO_FLOW_DOWNSHIFT_INTERVAL_CYCLES
+            - 1
+        )
         ts_state.thompson.posterior_mean = 2812.0
         ts_state.thompson.posterior_std = 200.0
         ts_state.thompson.observations = [
@@ -1225,6 +1361,80 @@ class TestZeroFlowRatchetGuard:
         assert int(current_fee_ppm * 0.80) <= result.new_fee_ppm < current_fee_ppm
         assert result.algorithm_values["zero_flow_guard_reason"] == "zero_flow_downshift"
         assert "zero_flow_downshift" in result.reason
+
+
+class TestUpwardProbeWiring:
+    def test_supported_cap_stretched_by_upward_probe(
+        self, mock_plugin, mock_database
+    ):
+        """2026-07-03 floor-pinning fix: when the supported ceiling clips a
+        DTS target, the controller must consult the upward probe and apply
+        the stretched cap when one is granted."""
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        cfg.min_fee_ppm = 30
+        cfg.max_fee_ppm = 2000
+        channel_id = "946628x754x0"
+        peer_id = "02" + "ab" * 32
+        current_fee_ppm = 40
+        now = int(time.time())
+
+        mock_database.get_volume_since.return_value = 0
+        mock_database.get_forward_count_since.return_value = 0
+        fc._calculate_floor = MagicMock(return_value=cfg.min_fee_ppm)
+        fc._get_rebalance_cost_floor = MagicMock(return_value=None)
+        fc._get_channel_rebalance_cost_ppm = MagicMock(return_value=0)
+        fc._get_neighbor_fee_median = MagicMock(return_value=None)
+        fc.set_channel_fee = MagicMock(
+            side_effect=lambda _channel_id, fee_ppm, **_kwargs: {
+                "success": True,
+                "fee_ppm": fee_ppm,
+            }
+        )
+
+        fc._cycle_states[channel_id] = ChannelCycleState(
+            last_revenue_rate=0.0,
+            last_fee_ppm=current_fee_ppm,
+            last_update=now - 7200,
+            last_broadcast_fee_ppm=current_fee_ppm,
+            last_state="dts_pid",
+        )
+        ts_state = ChannelFeeState(
+            last_revenue_rate=0.0,
+            last_fee_ppm=current_fee_ppm,
+            last_update=now - 7200,
+            last_broadcast_fee_ppm=current_fee_ppm,
+            last_state="dts_pid",
+        )
+        # Earning evidence pinned at the floor fee: supported ceiling would
+        # clip the 300 ppm DTS target.
+        ts_state.thompson.observations = [
+            (30, 5.0, 1.0, now - i * 1800, "normal") for i in range(10)
+        ]
+        ts_state.thompson.posterior_mean = 300.0
+        ts_state.thompson.posterior_std = 150.0
+        ts_state.thompson.sample_fee_contextual = MagicMock(return_value=300)
+        ts_state.thompson.maybe_upward_probe_cap = MagicMock(return_value=75.0)
+        ts_state.pid.calculate_multiplier = MagicMock(return_value=1.0)
+        fc._channel_fee_states[channel_id] = ts_state
+
+        result = fc._adjust_channel_fee(
+            channel_id,
+            peer_id,
+            {"state": "source", "forward_count": 0, "sats_out": 0},
+            {
+                "fee_proportional_millionths": current_fee_ppm,
+                "fee_base_msat": 0,
+                "capacity": 5_000_000,
+                "spendable_msat": "3000000000msat",
+                "receivable_msat": "2000000000msat",
+                "opener": "local",
+            },
+            cfg=cfg,
+        )
+
+        ts_state.thompson.maybe_upward_probe_cap.assert_called_once()
+        assert result is not None
+        assert result.algorithm_values["supported_fee_ceiling_ppm"] == 75
 
 
 class TestMarketBoundaryGuard:

@@ -308,6 +308,158 @@ class TestSupportedFeeCeiling:
         feed_windows(st, fee=100, rate=0.0, n=10)
         assert st.supported_fee_ceiling() is None
 
+    def test_floor_pinned_evidence_gets_escape_headroom(self, fake_time):
+        """Absorbing-state regression (2026-07-03 nexus-01): a channel forced
+        to the 30 ppm floor can only earn AT 30, so the ceiling locked at
+        30*1.25=37 forever and DTS targets of 300+ were unreachable. Evidence
+        at/below the floor was never a market choice, so the ceiling must
+        allow escape headroom above the floor instead of pinning to it."""
+        st = GaussianThompsonState()
+        feed_windows(st, fee=30, rate=5.0, n=48)
+        cap = st.supported_fee_ceiling(floor_ppm=30)
+        assert cap == pytest.approx(
+            30 * GaussianThompsonState.SUPPORTED_CEILING_FLOOR_ESCAPE
+        ), f"floor-pinned evidence must yield escape headroom, got {cap}"
+
+    def test_floor_escape_does_not_inflate_real_market_evidence(self, fake_time):
+        """Evidence genuinely above the floor keeps the proven-region cap —
+        the escape only applies when earnings sit at/below the floor."""
+        st = GaussianThompsonState()
+        feed_windows(st, fee=90, rate=500.0, n=20)
+        cap = st.supported_fee_ceiling(floor_ppm=30)
+        assert cap == pytest.approx(
+            90 * GaussianThompsonState.SUPPORTED_CEILING_HEADROOM
+        )
+
+    def test_ceiling_without_floor_arg_unchanged(self, fake_time):
+        """Backward compatibility: callers that pass no floor keep the
+        original proven-region behavior even for low-fee evidence."""
+        st = GaussianThompsonState()
+        feed_windows(st, fee=30, rate=5.0, n=48)
+        cap = st.supported_fee_ceiling()
+        assert cap == pytest.approx(
+            30 * GaussianThompsonState.SUPPORTED_CEILING_HEADROOM
+        )
+
+
+# =============================================================================
+# Meaningful-revenue cadence tracking (2026-07-03 floor-pinning fix)
+# =============================================================================
+
+class TestMeaningfulGapTracking:
+    """The zero-flow guards count 30-min cycles, so a channel that naturally
+    earns every ~24h was treated as 'stalled' after 4 quiet hours and
+    'severely stalled' after 12. The state now tracks the typical gap
+    between meaningful-revenue windows so thresholds can scale to each
+    channel's real cadence."""
+
+    def test_gap_ema_tracks_daily_cadence(self, fake_time):
+        st = GaussianThompsonState()
+        # One meaningful window a day, zeros in between.
+        for _ in range(5):
+            st.update_posterior(fee=100, revenue_rate=50.0, hours=0.5)
+            feed_windows(st, fee=100, rate=0.0, n=47)
+            FakeTime.advance(0.5)
+        assert st.meaningful_gap_ema_hours == pytest.approx(24.0, rel=0.15)
+
+    def test_zero_windows_do_not_update_gap(self, fake_time):
+        st = GaussianThompsonState()
+        st.update_posterior(fee=100, revenue_rate=50.0, hours=0.5)
+        ts_after_meaningful = st.last_meaningful_ts
+        feed_windows(st, fee=100, rate=0.0, n=10)
+        assert st.last_meaningful_ts == ts_after_meaningful
+        assert st.meaningful_gap_ema_hours == 0.0
+
+    def test_gap_fields_round_trip(self, fake_time):
+        st = GaussianThompsonState()
+        st.meaningful_gap_ema_hours = 26.5
+        st.last_meaningful_ts = int(FakeTime.t)
+        restored = GaussianThompsonState.from_dict(st.to_dict())
+        assert restored.meaningful_gap_ema_hours == pytest.approx(26.5)
+        assert restored.last_meaningful_ts == int(FakeTime.t)
+
+
+# =============================================================================
+# Bounded upward exploration probe (2026-07-03 floor-pinning fix)
+# =============================================================================
+
+class TestUpwardProbeCap:
+    """The supported ceiling only rises on proven earnings, and nothing ever
+    tested a higher fee — low_fee_exploration probes exclusively DOWN. So a
+    floor-pinned channel with a high, uncertain posterior (mean 318, std 167
+    on nexus-01) could never gather the evidence needed to raise its own cap.
+    The upward probe grants one bounded, rate-limited extra headroom step
+    when the channel is actively earning and the belief is untested."""
+
+    def _earning_state(self):
+        st = GaussianThompsonState()
+        feed_windows(st, fee=30, rate=5.0, n=8)
+        st.posterior_mean = 300.0
+        st.posterior_std = 150.0
+        return st
+
+    def test_probe_grants_bounded_stretch(self, fake_time):
+        st = self._earning_state()
+        now = int(FakeTime.t)
+        cap = st.maybe_upward_probe_cap(now, supported_cap=60.0)
+        assert cap == pytest.approx(
+            60.0 * GaussianThompsonState.UPWARD_PROBE_STRETCH
+        )
+        assert st.last_upward_probe_ts == now
+
+    def test_probe_rate_limited(self, fake_time):
+        st = self._earning_state()
+        now = int(FakeTime.t)
+        assert st.maybe_upward_probe_cap(now, supported_cap=60.0) is not None
+        FakeTime.advance(1.0)
+        assert st.maybe_upward_probe_cap(int(FakeTime.t), supported_cap=60.0) is None
+        FakeTime.advance(GaussianThompsonState.UPWARD_PROBE_INTERVAL_HOURS)
+        assert st.maybe_upward_probe_cap(int(FakeTime.t), supported_cap=75.0) is not None
+
+    def test_probe_denied_during_silence(self, fake_time):
+        """Never probe upward into a channel that is not currently earning —
+        the zero-flow guards exist precisely to stop that."""
+        st = self._earning_state()
+        feed_windows(st, fee=30, rate=0.0, n=3)
+        assert st.zero_revenue_streak > 0
+        assert st.maybe_upward_probe_cap(int(FakeTime.t), supported_cap=60.0) is None
+
+    def test_probe_denied_when_belief_settled(self, fake_time):
+        """A confident posterior needs no exploration; the proven-region
+        ratchet governs (anti-runaway: no faith-based climbing)."""
+        st = self._earning_state()
+        st.posterior_std = 20.0
+        assert st.maybe_upward_probe_cap(int(FakeTime.t), supported_cap=60.0) is None
+
+    def test_probe_denied_when_belief_below_cap(self, fake_time):
+        st = self._earning_state()
+        st.posterior_mean = 50.0
+        assert st.maybe_upward_probe_cap(int(FakeTime.t), supported_cap=60.0) is None
+
+    def test_probe_ts_round_trips(self, fake_time):
+        st = self._earning_state()
+        now = int(FakeTime.t)
+        st.maybe_upward_probe_cap(now, supported_cap=60.0)
+        restored = GaussianThompsonState.from_dict(st.to_dict())
+        assert restored.last_upward_probe_ts == now
+
+    def test_floor_escape_composes_into_a_climb(self, fake_time):
+        """The absorbing state end-to-end: evidence at the 30 ppm floor used
+        to lock the cap at 37 forever. With the floor escape the cap opens to
+        60; once the channel PROVES earnings inside the escape band, the
+        normal ratchet resumes above it."""
+        st = GaussianThompsonState()
+        feed_windows(st, fee=30, rate=5.0, n=48)
+        cap1 = st.supported_fee_ceiling(floor_ppm=30)
+        assert cap1 == pytest.approx(30 * GaussianThompsonState.SUPPORTED_CEILING_FLOOR_ESCAPE)
+
+        # The channel earns at the escaped fee: the proven region moves up
+        # and the ratchet takes over from there.
+        feed_windows(st, fee=55, rate=8.0, n=96)
+        cap2 = st.supported_fee_ceiling(floor_ppm=30)
+        assert cap2 == pytest.approx(55 * GaussianThompsonState.SUPPORTED_CEILING_HEADROOM)
+        assert cap2 > cap1
+
 
 # =============================================================================
 # 4b. Zero-probe pseudo-observation honesty (FC-I5 carve-out pinning)

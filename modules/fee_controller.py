@@ -288,6 +288,25 @@ class GaussianThompsonState:
     POSITIVE_RATE_EMA_ALPHA = 0.2
     POSITIVE_RATE_REF_HALF_LIFE_HOURS = 168.0
 
+    # Meaningful-revenue cadence (2026-07-03 floor-pinning fix): EMA of the
+    # gap between meaningful-revenue windows, used to scale the zero-flow
+    # streak thresholds to each channel's natural rhythm instead of a fixed
+    # cycle count (overnight silence is normal for a once-a-day earner).
+    MEANINGFUL_GAP_EMA_ALPHA = 0.3
+
+    # Bounded upward exploration (2026-07-03 floor-pinning fix): the
+    # supported ceiling only rises on proven earnings, and every exploration
+    # path probes DOWN, so a high uncertain posterior above the ceiling
+    # could never be market-tested. When the channel is actively earning
+    # (zero_revenue_streak == 0) and the belief is both above the ceiling
+    # and still uncertain, one extra headroom step is granted at most once
+    # per interval. Anti-runaway: the stretch is a single bounded step, the
+    # zero-flow guards still veto raises during silence, and a settled
+    # (confident) posterior gets nothing — no faith-based climbing.
+    UPWARD_PROBE_STRETCH = 1.25
+    UPWARD_PROBE_INTERVAL_HOURS = 24.0
+    UPWARD_PROBE_MIN_STD = 60.0
+
     # Supported-fee ceiling (climb governor): the fee below which
     # SUPPORTED_CEILING_MASS_QUANTILE of recency-weighted positive revenue
     # mass lies, times SUPPORTED_CEILING_HEADROOM. DTS+PID targets are capped
@@ -299,6 +318,14 @@ class GaussianThompsonState:
     SUPPORTED_CEILING_HEADROOM = 1.25
     SUPPORTED_CEILING_MASS_QUANTILE = 0.90
     SUPPORTED_CEILING_MIN_WEIGHT = 1e-3
+    # Floor-escape (2026-07-03 nexus-01 absorbing-state incident): a channel
+    # pinned at min_fee_ppm can only earn AT the floor, so the proven-region
+    # cap locked at floor*HEADROOM forever and no higher fee could ever be
+    # market-tested. Evidence at/below the floor is not a market choice —
+    # the fee was imposed — so the ceiling grants a bounded escape band above
+    # the floor instead. Still one proven step at a time: earnings inside the
+    # escape band move the quantile, and the normal ratchet resumes from there.
+    SUPPORTED_CEILING_FLOOR_ESCAPE = 2.0
     CONGESTION_OBS_FLAG = "congestion"  # 6th tuple element on congested windows
 
     # Directional zero-revenue probing: plain zero-revenue observations only
@@ -402,6 +429,13 @@ class GaussianThompsonState:
     # EMA of meaningful positive revenue rates + timestamp for time decay.
     positive_rate_ref: float = 0.0
     positive_rate_ref_ts: int = 0
+
+    # Meaningful-revenue cadence tracking (see MEANINGFUL_GAP_EMA_ALPHA)
+    meaningful_gap_ema_hours: float = 0.0
+    last_meaningful_ts: int = 0
+
+    # Last granted upward exploration probe (see UPWARD_PROBE_STRETCH)
+    last_upward_probe_ts: int = 0
 
     # One-shot exploration multiplier armed by scale_variance() and consumed
     # by the next sample_fee/sample_fee_contextual call (the pipeline re-arms
@@ -787,6 +821,18 @@ class GaussianThompsonState:
                     + self.POSITIVE_RATE_EMA_ALPHA * revenue_rate
                 )
             self.positive_rate_ref_ts = now
+            # Cadence tracking: EMA of gaps between meaningful windows.
+            if self.last_meaningful_ts > 0 and now > self.last_meaningful_ts:
+                gap_hours = (now - self.last_meaningful_ts) / 3600.0
+                if self.meaningful_gap_ema_hours <= 0:
+                    self.meaningful_gap_ema_hours = gap_hours
+                else:
+                    self.meaningful_gap_ema_hours = (
+                        (1.0 - self.MEANINGFUL_GAP_EMA_ALPHA)
+                        * self.meaningful_gap_ema_hours
+                        + self.MEANINGFUL_GAP_EMA_ALPHA * gap_hours
+                    )
+            self.last_meaningful_ts = now
         else:
             if self.zero_revenue_streak == 0:
                 self.zero_run_start_fee = float(fee)
@@ -880,7 +926,11 @@ class GaussianThompsonState:
             return None
         return sum(f * m for f, m in masses) / total
 
-    def supported_fee_ceiling(self, now: Optional[int] = None) -> Optional[float]:
+    def supported_fee_ceiling(
+        self,
+        now: Optional[int] = None,
+        floor_ppm: Optional[float] = None,
+    ) -> Optional[float]:
         """Highest fee the earning evidence supports, with headroom.
 
         Returns the fee below which SUPPORTED_CEILING_MASS_QUANTILE of the
@@ -890,6 +940,11 @@ class GaussianThompsonState:
         DTS+PID targets: the optimizer climbs one headroom step per proven
         earning level instead of extrapolating upward on faith. A bound,
         never an attractor.
+
+        When floor_ppm is given and the evidence quantile sits at/below it,
+        the earnings were made at an imposed fee, not a market-tested one, so
+        the cap widens to floor_ppm * SUPPORTED_CEILING_FLOOR_ESCAPE — enough
+        room to escape the floor absorbing state while staying bounded.
         """
         if now is None:
             now = int(time.time())
@@ -906,7 +961,40 @@ class GaussianThompsonState:
             if acc >= threshold:
                 quantile_fee = fee
                 break
-        return quantile_fee * self.SUPPORTED_CEILING_HEADROOM
+        ceiling = quantile_fee * self.SUPPORTED_CEILING_HEADROOM
+        if floor_ppm is not None and floor_ppm > 0 and quantile_fee <= floor_ppm:
+            ceiling = max(ceiling, floor_ppm * self.SUPPORTED_CEILING_FLOOR_ESCAPE)
+        return ceiling
+
+    def maybe_upward_probe_cap(
+        self, now: int, supported_cap: float
+    ) -> Optional[float]:
+        """One bounded extra headroom step above the supported ceiling.
+
+        Granted only when the channel is actively earning (streak 0), the
+        posterior believes the optimum lies ABOVE the ceiling, that belief
+        is still uncertain (needs a market test), and no probe was granted
+        within UPWARD_PROBE_INTERVAL_HOURS. Stamps the grant time. See
+        UPWARD_PROBE_STRETCH for the anti-runaway rationale.
+        """
+        try:
+            cap = float(supported_cap)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(cap) or cap <= 0:
+            return None
+        if self.zero_revenue_streak != 0:
+            return None
+        if self.posterior_mean <= cap:
+            return None
+        if self.posterior_std < self.UPWARD_PROBE_MIN_STD:
+            return None
+        if (self.last_upward_probe_ts > 0
+                and now - self.last_upward_probe_ts
+                < self.UPWARD_PROBE_INTERVAL_HOURS * 3600.0):
+            return None
+        self.last_upward_probe_ts = int(now)
+        return cap * self.UPWARD_PROBE_STRETCH
 
     @staticmethod
     def _time_similarity(bucket1: str, bucket2: str) -> float:
@@ -1707,6 +1795,9 @@ class GaussianThompsonState:
             "zero_run_start_ts": self.zero_run_start_ts,
             "positive_rate_ref": self.positive_rate_ref,
             "positive_rate_ref_ts": self.positive_rate_ref_ts,
+            "meaningful_gap_ema_hours": self.meaningful_gap_ema_hours,
+            "last_meaningful_ts": self.last_meaningful_ts,
+            "last_upward_probe_ts": self.last_upward_probe_ts,
             "weight_scheme": self.WEIGHT_SCHEME,
             "exploration_boost": self.exploration_boost,
             "last_sampled_fee": self.last_sampled_fee,
@@ -1854,6 +1945,27 @@ class GaussianThompsonState:
             state.positive_rate_ref_ts = max(0, int(d.get("positive_rate_ref_ts", 0)))
         except (TypeError, ValueError):
             state.positive_rate_ref_ts = 0
+
+        # Meaningful-revenue cadence tracking (legacy dicts: no history)
+        try:
+            state.meaningful_gap_ema_hours = float(
+                d.get("meaningful_gap_ema_hours", 0.0)
+            )
+        except (TypeError, ValueError):
+            state.meaningful_gap_ema_hours = 0.0
+        if (not math.isfinite(state.meaningful_gap_ema_hours)
+                or state.meaningful_gap_ema_hours < 0):
+            state.meaningful_gap_ema_hours = 0.0
+        try:
+            state.last_meaningful_ts = max(0, int(d.get("last_meaningful_ts", 0)))
+        except (TypeError, ValueError):
+            state.last_meaningful_ts = 0
+        try:
+            state.last_upward_probe_ts = max(
+                0, int(d.get("last_upward_probe_ts", 0))
+            )
+        except (TypeError, ValueError):
+            state.last_upward_probe_ts = 0
 
         # One-shot exploration boost (legacy dicts: neutral 1.0)
         try:
@@ -2519,6 +2631,27 @@ class FeeController:
     ZERO_FLOW_GUARD_STREAK = 8
     ZERO_FLOW_DOWNSHIFT_STREAK = 24
     ZERO_FLOW_DOWNSHIFT_RATIO = 0.85
+    # Rate limit for the forced decay (2026-07-03 nexus-01 floor-pinning):
+    # once streak >= ZERO_FLOW_DOWNSHIFT_STREAK the 0.85x cap used to
+    # re-apply EVERY 30-min cycle (-15%/cycle == floor within ~3 hours),
+    # so one overnight quiet spell erased any climb the optimizer had made.
+    # The step now fires once per interval; between steps the cap holds at
+    # the current fee. 12 cycles ~= 6h at the default 30-min fee interval.
+    ZERO_FLOW_DOWNSHIFT_INTERVAL_CYCLES = 12
+    # Soft decay floor: forced decay stops at this fraction of the earning
+    # anchor (the revenue-mass-weighted fee where the channel actually
+    # earned). Below that, further decay is pointless — the silence is
+    # temporal, not price elasticity. Soft: never raises a fee, and DTS
+    # remains free to choose lower targets on its own evidence.
+    ZERO_FLOW_ANCHOR_FLOOR_FRAC = 0.5
+    # Cadence scaling for the streak thresholds (2026-07-03 floor-pinning
+    # fix): a channel that earns every ~24h is not "stalled" after 4 quiet
+    # hours. Thresholds stretch to multiples of the observed meaningful-
+    # revenue gap, capped so a once-a-month earner cannot buy weeks of
+    # raise-freedom for a stale belief.
+    ZERO_FLOW_GAP_GUARD_MULT = 2.0
+    ZERO_FLOW_GAP_DOWNSHIFT_MULT = 4.0
+    ZERO_FLOW_GAP_CAP_HOURS = 168.0
 
     # ==========================================================================
     # Issue #32: Rebalance Cost-Aware Fee Floor
@@ -5394,6 +5527,36 @@ class FeeController:
             "wake_damping_applied": woke_from_sleep,
         }
 
+    def _zero_flow_streak_thresholds(
+        self,
+        gap_ema_hours: float,
+        cycle_hours: float,
+    ) -> Tuple[int, int]:
+        """(guard_streak, downshift_streak) scaled to the channel's cadence.
+
+        A channel whose meaningful-revenue windows arrive every ~gap hours
+        gets guard/downshift thresholds at 2x/4x that gap (in cycles), so
+        its natural quiet spells are not misread as demand collapse. No
+        cadence history (or a gap within one cycle) keeps the defaults.
+        """
+        guard = self.ZERO_FLOW_GUARD_STREAK
+        downshift = self.ZERO_FLOW_DOWNSHIFT_STREAK
+        try:
+            gap = float(gap_ema_hours)
+            cycle = float(cycle_hours)
+        except (TypeError, ValueError):
+            return guard, downshift
+        if not math.isfinite(gap) or gap <= 0 or not math.isfinite(cycle) or cycle <= 0:
+            return guard, downshift
+        gap = min(gap, self.ZERO_FLOW_GAP_CAP_HOURS)
+        gap_cycles = gap / cycle
+        guard = max(guard, int(math.ceil(gap_cycles * self.ZERO_FLOW_GAP_GUARD_MULT)))
+        downshift = max(
+            downshift,
+            int(math.ceil(gap_cycles * self.ZERO_FLOW_GAP_DOWNSHIFT_MULT)),
+        )
+        return guard, max(downshift, guard)
+
     def _apply_zero_flow_ratchet_guard(
         self,
         *,
@@ -5404,6 +5567,9 @@ class FeeController:
         forwards_since_update: int,
         revenue_rate: float,
         supported_fee_ceiling: Optional[float] = None,
+        earning_anchor_ppm: Optional[float] = None,
+        guard_streak: Optional[int] = None,
+        downshift_streak: Optional[int] = None,
     ) -> Tuple[int, Optional[str]]:
         """Prevent stale DTS belief from raising fees during current silence."""
         try:
@@ -5416,10 +5582,27 @@ class FeeController:
         except (TypeError, ValueError, OverflowError):
             return int(target_fee), None
 
-        if rate != 0.0 or forwards != 0 or streak < self.ZERO_FLOW_GUARD_STREAK:
+        guard_thresh = (
+            int(guard_streak) if guard_streak else self.ZERO_FLOW_GUARD_STREAK
+        )
+        downshift_thresh = (
+            int(downshift_streak) if downshift_streak
+            else self.ZERO_FLOW_DOWNSHIFT_STREAK
+        )
+
+        if rate != 0.0 or forwards != 0 or streak < guard_thresh:
             return target, None
 
-        if streak < self.ZERO_FLOW_DOWNSHIFT_STREAK:
+        # Forced decay is rate-limited: the 0.85x step fires only on interval
+        # boundaries past the downshift streak; every other silent cycle is a
+        # hold (raises still blocked, DTS's own lower targets still pass).
+        on_downshift_step = (
+            streak >= downshift_thresh
+            and (streak - downshift_thresh)
+            % self.ZERO_FLOW_DOWNSHIFT_INTERVAL_CYCLES == 0
+        )
+
+        if not on_downshift_step:
             guarded = max(floor, min(target, current))
             # Guard-tag honesty (fee-loop audit anomaly 3, 2026-07-01): when
             # the effective floor exceeds the current fee, the max(floor, ...)
@@ -5438,11 +5621,28 @@ class FeeController:
         if math.isfinite(supported_cap) and supported_cap > 0:
             downshift_cap = min(downshift_cap, int(supported_cap))
 
-        guarded = max(floor, min(target, downshift_cap))
+        # Soft decay floor at a fraction of the earning anchor: clamped to
+        # the current fee so it can stop decay but never force a raise.
+        soft_floor = floor
+        try:
+            anchor = float(earning_anchor_ppm) if earning_anchor_ppm else 0.0
+        except (TypeError, ValueError, OverflowError):
+            anchor = 0.0
+        if math.isfinite(anchor) and anchor > 0:
+            anchor_floor = min(
+                current, int(anchor * self.ZERO_FLOW_ANCHOR_FLOOR_FRAC)
+            )
+            soft_floor = max(soft_floor, anchor_floor)
+
+        guarded = max(soft_floor, min(target, downshift_cap))
         if guarded > current:
             # Floor arm fired on the downshift branch: an upward move must
             # not be stamped "downshift" (see guard-tag honesty note above).
             return guarded, "zero_flow_floor_override"
+        if guarded == current:
+            # Anchor floor absorbed the whole step: this is a hold, not a
+            # downshift (same tag-honesty rule).
+            return guarded, "zero_flow_ratchet_guard"
         return guarded, "zero_flow_downshift"
     
     def _detect_congestion(self, state: Optional[Dict[str, Any]],
@@ -6556,9 +6756,31 @@ class FeeController:
             # of waiting out a 10%-per-probe descent. Hard floors below
             # still win (cost floors are not negotiable).
             try:
-                supported_cap = ts_state.thompson.supported_fee_ceiling()
+                supported_cap = ts_state.thompson.supported_fee_ceiling(
+                    floor_ppm=floor_ppm
+                )
             except Exception:
                 supported_cap = None
+            if supported_cap is not None and post_pid_target_ppm > supported_cap:
+                # Bounded upward exploration (2026-07-03 floor-pinning fix):
+                # when the proven-region cap clips an uncertain high belief
+                # on an actively-earning channel, grant one rate-limited
+                # extra headroom step so the belief can be market-tested.
+                try:
+                    probe_cap = ts_state.thompson.maybe_upward_probe_cap(
+                        int(time.time()), supported_cap
+                    )
+                except Exception:
+                    probe_cap = None
+                if probe_cap is not None and probe_cap > supported_cap:
+                    self.plugin.log(
+                        f"UPWARD_PROBE: {channel_id[:12]}... supported cap "
+                        f"stretched {supported_cap:.0f} -> {probe_cap:.0f} ppm "
+                        f"(posterior_mean={ts_state.thompson.posterior_mean:.0f}, "
+                        f"std={ts_state.thompson.posterior_std:.0f})",
+                        level='debug'
+                    )
+                    supported_cap = probe_cap
             if supported_cap is not None and post_pid_target_ppm > supported_cap:
                 supported_cap_ppm = max(1, int(supported_cap))
                 self.plugin.log(
@@ -6620,6 +6842,19 @@ class FeeController:
             target_blend_ratio = blend_info["blend_ratio"]
             pre_guard_blended_target_ppm = blended_target_ppm
             zero_revenue_streak = ts_state.thompson.zero_revenue_streak
+            try:
+                earning_anchor_ppm = ts_state.thompson._earning_region_fee(
+                    int(time.time())
+                )
+            except Exception:
+                earning_anchor_ppm = None
+            cycle_hours = max(
+                float(getattr(cfg, "fee_interval", 1800) or 1800), 60.0
+            ) / 3600.0
+            guard_streak, downshift_streak = self._zero_flow_streak_thresholds(
+                gap_ema_hours=ts_state.thompson.meaningful_gap_ema_hours,
+                cycle_hours=cycle_hours,
+            )
             blended_target_ppm, zero_flow_guard_reason = self._apply_zero_flow_ratchet_guard(
                 current_fee=current_fee_ppm,
                 target_fee=blended_target_ppm,
@@ -6628,6 +6863,9 @@ class FeeController:
                 forwards_since_update=forward_count,
                 revenue_rate=current_revenue_rate,
                 supported_fee_ceiling=supported_cap_ppm,
+                earning_anchor_ppm=earning_anchor_ppm,
+                guard_streak=guard_streak,
+                downshift_streak=downshift_streak,
             )
             if zero_flow_guard_reason:
                 zero_flow_guard_target_ppm = blended_target_ppm
