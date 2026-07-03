@@ -156,6 +156,11 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "drain_fee_discount_max",
         "node_drain_bias_enabled",
         "node_drain_bias_max",
+        # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit)
+        "enable_dynamic_htlcmax",
+        "htlcmax_source_pct",
+        "htlcmax_sink_pct",
+        "htlcmax_balanced_pct",
     ]
     assert result["operator_controls"]["values"] == {
         "paused": False,
@@ -183,6 +188,10 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "drain_fee_discount_max": 0.0,
         "node_drain_bias_enabled": False,
         "node_drain_bias_max": 0.3,
+        "enable_dynamic_htlcmax": False,
+        "htlcmax_source_pct": 0.50,
+        "htlcmax_sink_pct": 0.25,
+        "htlcmax_balanced_pct": 0.45,
     }
     assert "config" not in result
 

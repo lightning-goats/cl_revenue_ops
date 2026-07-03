@@ -1578,6 +1578,30 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-enable-dynamic-htlcmax',
+    default='false',
+    description='Enable the dynamic htlc_max flow valve: scale each channel max HTLC by flow state (sinks tightest). Default: false'
+)
+
+plugin.add_option(
+    name='revenue-ops-htlcmax-source-pct',
+    default='0.50',
+    description='Max HTLC as a fraction of capacity for SOURCE channels when dynamic htlcmax is enabled (0.01-1.0)'
+)
+
+plugin.add_option(
+    name='revenue-ops-htlcmax-sink-pct',
+    default='0.25',
+    description='Max HTLC as a fraction of capacity for SINK channels when dynamic htlcmax is enabled (0.01-1.0)'
+)
+
+plugin.add_option(
+    name='revenue-ops-htlcmax-balanced-pct',
+    default='0.45',
+    description='Max HTLC as a fraction of capacity for balanced channels when dynamic htlcmax is enabled (0.01-1.0)'
+)
+
+plugin.add_option(
     name='revenue-ops-expansion-treasury-enabled',
     default='false',
     description='Enable expansion treasury mode (reverse-swap excess LN to on-chain for opens) (default: false)'
@@ -2248,6 +2272,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         drain_fee_discount_max=_safe_float_opt('revenue-ops-drain-fee-discount-max', '0.0'),
         node_drain_bias_enabled=options.get('revenue-ops-node-drain-bias-enabled', 'false').lower() == 'true',
         node_drain_bias_max=_safe_float_opt('revenue-ops-node-drain-bias-max', '0.3'),
+        enable_dynamic_htlcmax=options.get('revenue-ops-enable-dynamic-htlcmax', 'false').lower() == 'true',
+        htlcmax_source_pct=_safe_float_opt('revenue-ops-htlcmax-source-pct', '0.50'),
+        htlcmax_sink_pct=_safe_float_opt('revenue-ops-htlcmax-sink-pct', '0.25'),
+        htlcmax_balanced_pct=_safe_float_opt('revenue-ops-htlcmax-balanced-pct', '0.45'),
         expansion_treasury_enabled=options.get('revenue-ops-expansion-treasury-enabled', 'false').lower() == 'true',
         expansion_treasury_onchain_target_sats=_safe_int_opt('revenue-ops-expansion-treasury-onchain-target-sats', '5000000'),
         expansion_treasury_min_deficit_sats=_safe_int_opt('revenue-ops-expansion-treasury-min-deficit-sats', '250000'),

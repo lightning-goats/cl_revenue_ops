@@ -383,6 +383,17 @@ class TestMeaningfulGapTracking:
         assert st.last_meaningful_ts == ts_after_meaningful
         assert st.meaningful_gap_ema_hours == 0.0
 
+    def test_posterior_variance_serialized_for_flow_analysis(self, fake_time):
+        """SL-7 (2026-07-03): flow_analysis and profitability_analyzer read
+        ts['posterior_variance'] to widen SOURCE/SINK thresholds while DTS
+        explores, but to_dict never wrote it — the default (10000) failed
+        the > 10000 check, so the widening NEVER fired and fresh channels
+        got premature flow labels exactly when the posterior was weakest."""
+        st = GaussianThompsonState()
+        st.posterior_std = 150.0
+        d = st.to_dict()
+        assert d["posterior_variance"] == pytest.approx(150.0 ** 2)
+
     def test_gap_fields_round_trip(self, fake_time):
         st = GaussianThompsonState()
         st.meaningful_gap_ema_hours = 26.5

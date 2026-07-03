@@ -627,6 +627,43 @@ class TestUnroutableWindowGate:
         assert len(ts_state.thompson.observations) == obs_before + 1
 
 
+class TestSupportedCeilingTelemetry:
+    """Audit L9: supported_fee_ceiling_ppm was populated only when the cap
+    CLIPPED that cycle — a cap that existed but didn't bind reported None,
+    biasing any 'how often does the ceiling constrain us' analysis and
+    hiding the ceiling from the zero-flow guard's downshift bound."""
+
+    def test_ceiling_reported_even_when_not_clipping(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 60}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=60)
+        # Real earning history at 100 -> a supported ceiling exists (~125).
+        now = int(time.time())
+        ts_state.thompson.observations = [
+            (100, 50.0, 1.0, now - i * 1800, "normal") for i in range(10)
+        ]
+        # Sampled target below the cap so it cannot clip, but far enough
+        # from the current fee that the move is not gossip-gate suppressed.
+        ts_state.thompson.sample_fee_contextual = lambda *a, **k: 120
+        ts_state.thompson.sample_fee = lambda *a, **k: 120
+        ts_state.thompson.update_posterior = lambda *a, **k: None
+        ts_state.thompson.update_contextual = lambda *a, **k: None
+        ts_state.pid.calculate_multiplier = lambda **k: 1.0
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(60), cfg=cfg,
+        )
+        assert result is not None
+        assert result.new_fee_ppm < 125, "test setup: the cap must not clip"
+        assert result.algorithm_values["supported_fee_ceiling_ppm"] is not None
+
+
 class TestSleepEntryBurst:
     """Audit M1: rate_change_ratio was only computed when last_revenue_rate
     > 0, so revenue REAPPEARING after silence (0 -> positive, literally an

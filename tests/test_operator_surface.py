@@ -35,6 +35,11 @@ def test_public_runtime_keys_are_safety_only():
         "drain_fee_discount_max",
         "node_drain_bias_enabled",
         "node_drain_bias_max",
+        # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit)
+        "enable_dynamic_htlcmax",
+        "htlcmax_source_pct",
+        "htlcmax_sink_pct",
+        "htlcmax_balanced_pct",
     ]
 
 
@@ -76,6 +81,10 @@ def test_public_runtime_dict_returns_only_public_keys():
         "drain_fee_discount_max": 0.0,
         "node_drain_bias_enabled": False,
         "node_drain_bias_max": 0.3,
+        "enable_dynamic_htlcmax": False,
+        "htlcmax_source_pct": 0.50,
+        "htlcmax_sink_pct": 0.25,
+        "htlcmax_balanced_pct": 0.45,
     }
 
 
@@ -672,6 +681,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "capex_probability_budget_bonus",
         "daily_budget_sats",
         "drain_fee_discount_max",
+        "enable_dynamic_htlcmax",
         "fee_market_boundary_cache_seconds",
         "fee_market_boundary_enabled",
         "fee_market_boundary_margin_ppm",
@@ -679,6 +689,9 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "fee_market_boundary_max_downshift_ratio",
         "fee_market_boundary_min_competitors",
         "fee_profile",
+        "htlcmax_balanced_pct",
+        "htlcmax_sink_pct",
+        "htlcmax_source_pct",
         "max_fee_ppm",
         "min_fee_ppm",
         "node_drain_bias_enabled",
@@ -693,7 +706,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_floor",
         "receivable_ratio_target",
     ]
-    assert result["count"] == 25
+    assert result["count"] == 29
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -727,6 +740,10 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "drain_fee_discount_max": 0.0,
         "node_drain_bias_enabled": False,
         "node_drain_bias_max": 0.3,
+        "enable_dynamic_htlcmax": False,
+        "htlcmax_source_pct": 0.50,
+        "htlcmax_sink_pct": 0.25,
+        "htlcmax_balanced_pct": 0.45,
     }
 
 
@@ -1185,6 +1202,10 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "drain_fee_discount_max": 0.0,
         "node_drain_bias_enabled": False,
         "node_drain_bias_max": 0.3,
+        "enable_dynamic_htlcmax": False,
+        "htlcmax_source_pct": 0.50,
+        "htlcmax_sink_pct": 0.25,
+        "htlcmax_balanced_pct": 0.45,
     }
     assert "config" not in result
     assert "hive_hints" not in result

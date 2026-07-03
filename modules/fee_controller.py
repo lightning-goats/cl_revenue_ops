@@ -1867,6 +1867,10 @@ class GaussianThompsonState:
             "observations": self.observations,  # List of 5-tuples with time_bucket
             "posterior_mean": self.posterior_mean,
             "posterior_std": self.posterior_std,
+            # SL-7 (2026-07-03 audit): flow_analysis/profitability_analyzer
+            # read posterior_variance to widen flow thresholds while DTS
+            # explores; without this key the widening never fired.
+            "posterior_variance": float(self.posterior_std) ** 2,
             "posterior_coeffs": self.posterior_coeffs,
             "posterior_precision": self.posterior_precision,
             "noise_variance": self.noise_variance,
@@ -3284,6 +3288,20 @@ class FeeController:
             return _cfg_int('base_fee_msat', 0)
         return _cfg_int('base_fee_msat_non_hive', 1000)
 
+    @staticmethod
+    def _utc_hour() -> int:
+        """Current hour in UTC (SL-6, 2026-07-03 audit).
+
+        Hive hints publish peak_hours_utc; comparing them against the
+        host's LOCAL hour fired the temporal adjustment and peak context
+        buckets 6-7 hours off for every hinted peer.
+        """
+        try:
+            return int(time.gmtime().tm_hour)
+        except (AttributeError, TypeError, ValueError):
+            # Fallback for exotic time providers without gmtime.
+            return int(time.strftime("%H"))
+
     def _get_hive_exploration_multiplier(self, peer_id: str) -> float:
         """Return bounded DTS variance multiplier from hive intelligence."""
         if self.hive_hints is None:
@@ -3329,7 +3347,7 @@ class FeeController:
             if not isinstance(confidence, (int, float)) or confidence <= 0.5:
                 return 1.0
 
-            current_hour = int(time.strftime("%H"))
+            current_hour = self._utc_hour()  # peak_hours are UTC (SL-6)
 
             multiplier = 1.0
 
@@ -3940,7 +3958,7 @@ class FeeController:
         else:
             balance = "saturated"
 
-        current_hour = int(time.strftime("%H"))
+        current_hour = self._utc_hour()  # hive peak_hours are UTC (SL-6)
         time_bucket = "low" if current_hour < 6 else ("peak" if current_hour >= 18 else "normal")
         if self.hive_hints:
             try:
@@ -7056,8 +7074,13 @@ class FeeController:
                         level='debug'
                     )
                     supported_cap = probe_cap
-            if supported_cap is not None and post_pid_target_ppm > supported_cap:
+            # L9 (2026-07-03 audit): report the cap whenever it EXISTS, not
+            # only when it clipped — telemetry analysis of "how often does
+            # the ceiling constrain us" was biased, and the zero-flow
+            # guard's downshift bound rarely saw the ceiling at all.
+            if supported_cap is not None:
                 supported_cap_ppm = max(1, int(supported_cap))
+            if supported_cap is not None and post_pid_target_ppm > supported_cap:
                 self.plugin.log(
                     f"SUPPORTED_CEILING: {channel_id[:12]}... target "
                     f"{post_pid_target_ppm} -> {supported_cap_ppm} ppm "

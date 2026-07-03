@@ -1532,6 +1532,47 @@ class TestFleetSiblingExclusion:
         assert pct == pytest.approx(0.05)
 
 
+class TestTemporalHoursUseUtc:
+    """2026-07-03 audit SL-6: hive hints publish peak_hours_utc, but the
+    temporal fee adjustment and context buckets compared them against the
+    host's LOCAL hour (America/Denver = UTC-6/-7), firing the +/-5%
+    adjustment 6-7 hours off for every hinted peer."""
+
+    def test_temporal_adjustment_compares_utc_hours(
+        self, mock_plugin, mock_database, monkeypatch
+    ):
+        import modules.fee_controller as fc_mod
+
+        class SkewedTime:
+            t = 1_750_000_000.0
+
+            @classmethod
+            def time(cls):
+                return cls.t
+
+            @staticmethod
+            def strftime(fmt):
+                return "23"  # local hour — must NOT be used
+
+            @staticmethod
+            def gmtime():
+                import time as real_time
+                return real_time.gmtime(6 * 3600)  # UTC hour 6
+
+        monkeypatch.setattr(fc_mod, "time", SkewedTime)
+
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        fc.hive_hints = MagicMock()
+        fc.hive_hints.get_traffic_confidence.return_value = 0.9
+        fc.hive_hints.get_peak_hours.return_value = [6]  # UTC peak
+
+        adj = fc._get_temporal_fee_adjustment("02" + "e1" * 32)
+        assert adj == pytest.approx(1.05), (
+            f"peak-hour comparison used local time: got {adj} "
+            "(0.97 means the UTC peak hour was read as quiet)"
+        )
+
+
 class TestUndercutInventoryGate:
     """2026-07-03 audit M5: the market undercut clamp overrode the PID
     scarcity premium with no inventory condition — a depleted channel
@@ -2438,7 +2479,8 @@ class TestDTSPIDIntegration:
 
     def test_get_context_with_values_returns_current_3_part_key_shape(self, mock_plugin, mock_database, monkeypatch):
         fc, _ = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        monkeypatch.setattr(time, "strftime", lambda fmt: "12")
+        noon_utc = time.gmtime(12 * 3600)  # SL-6: buckets key on UTC hour
+        monkeypatch.setattr(time, "gmtime", lambda *a: noon_utc)
 
         context_key, time_bucket, role = fc._get_context_with_values(
             channel_id="123x456x0",
@@ -2454,7 +2496,8 @@ class TestDTSPIDIntegration:
         self, mock_plugin, mock_database, monkeypatch
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        monkeypatch.setattr(time, "strftime", lambda fmt: "12")
+        noon_utc = time.gmtime(12 * 3600)  # SL-6: buckets key on UTC hour
+        monkeypatch.setattr(time, "gmtime", lambda *a: noon_utc)
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
 

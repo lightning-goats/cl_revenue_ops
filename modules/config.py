@@ -57,6 +57,14 @@ PUBLIC_RUNTIME_KEYS = (
     'drain_fee_discount_max',
     'node_drain_bias_enabled',
     'node_drain_bias_max',
+    # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit): scales each
+    # channel's max HTLC by flow state so sinks throttle drain-through.
+    # CLN has no negative inbound fees; this is the inbound-side control
+    # surface. Default off.
+    'enable_dynamic_htlcmax',
+    'htlcmax_source_pct',
+    'htlcmax_sink_pct',
+    'htlcmax_balanced_pct',
 )
 
 # Type mapping for config fields (for validation)
@@ -96,6 +104,10 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'drain_fee_discount_max': float,
     'node_drain_bias_enabled': bool,
     'node_drain_bias_max': float,
+    'enable_dynamic_htlcmax': bool,
+    'htlcmax_source_pct': float,
+    'htlcmax_sink_pct': float,
+    'htlcmax_balanced_pct': float,
     'expansion_treasury_enabled': bool,
     'expansion_treasury_onchain_target_sats': int,
     'expansion_treasury_min_deficit_sats': int,
@@ -236,6 +248,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'boltz_structural_budget_sats_per_day': (0, 1_000_000),
     'drain_fee_discount_max': (0.0, 0.5),
     'node_drain_bias_max': (0.0, 0.5),
+    'htlcmax_source_pct': (0.01, 1.0),
+    'htlcmax_sink_pct': (0.01, 1.0),
+    'htlcmax_balanced_pct': (0.01, 1.0),
     'min_wallet_reserve': (0, 100000000),
     'low_liquidity_threshold': (0.0, 1.0),
     'high_liquidity_threshold': (0.0, 1.0),
@@ -391,6 +406,14 @@ class Config:
     node_drain_bias_enabled: bool = False
     # Max node-scaled drain discount (0.0-0.5); only active when enabled.
     node_drain_bias_max: float = 0.3
+    # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit). Off by
+    # default; when enabled, max HTLC = capacity * pct by flow state
+    # (sinks tightest: throttle drain-through; CLN's only inbound-side
+    # control surface). Bounds in fee_controller keep it >= 10k sats.
+    enable_dynamic_htlcmax: bool = False
+    htlcmax_source_pct: float = 0.50
+    htlcmax_sink_pct: float = 0.25
+    htlcmax_balanced_pct: float = 0.45
     # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
     expansion_treasury_enabled: bool = False
     expansion_treasury_onchain_target_sats: int = 5_000_000
@@ -1151,6 +1174,14 @@ class ConfigSnapshot:
     drain_fee_discount_max: float = 0.0
     node_drain_bias_enabled: bool = False
     node_drain_bias_max: float = 0.3
+    # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit). Off by
+    # default; when enabled, max HTLC = capacity * pct by flow state
+    # (sinks tightest: throttle drain-through; CLN's only inbound-side
+    # control surface). Bounds in fee_controller keep it >= 10k sats.
+    enable_dynamic_htlcmax: bool = False
+    htlcmax_source_pct: float = 0.50
+    htlcmax_sink_pct: float = 0.25
+    htlcmax_balanced_pct: float = 0.45
     # Version tracking
     version: int = 0
     
