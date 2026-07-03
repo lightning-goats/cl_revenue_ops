@@ -63,12 +63,20 @@ The current version is `metabolic-influence/v1`. Future versions must be neutral
 
 ## Consumer Caps
 
-- Fee metabolic bias: `[0.95, 1.05]`.
-- Rebalance metabolic bias: `[0.85, 1.15]`.
-- Planner/open metabolic bias: `[0.85, 1.10]`.
-- Closure-watch bias is diagnostic/advisory only and cannot call close.
+The consumer clamps each additive peer delta and converts it to a bounded multiplicative bias (`modules/hive_hints.py`):
+
+- Fee metabolic bias: `fee_bias_delta` clamped to `±0.05` → multiplier `[0.95, 1.05]` (`METABOLIC_FEE_BIAS_CAP`).
+- Rebalance metabolic bias: `rebalance_priority_delta` clamped to `±0.15` → multiplier `[0.85, 1.15]` (`METABOLIC_REBALANCE_BIAS_CAP`).
+- Planner/open metabolic bias: `open_confidence_delta` clamped to `[-0.15, +0.10]` → multiplier `[0.85, 1.10]` (`METABOLIC_OPEN_NEGATIVE_CAP` / `METABOLIC_OPEN_POSITIVE_CAP`).
+- Closure-watch bias: `closure_watch_priority_delta` clamped to `±0.15` → multiplier `[0.85, 1.15]` (`METABOLIC_CLOSURE_WATCH_CAP`); diagnostic/advisory only and cannot call close.
+
+The metabolic fee-bias channel is reserved / currently-neutral by producer choice: cl-hive emits `fee_bias_delta: 0.0` unconditionally, so `get_metabolic_fee_bias` always returns `1.0` in practice. The consumer machinery is wired up only for forward compatibility and will activate if the producer gains fee-advisory capability.
 
 Metabolic influence never overrides min/max fee rails, budget gates, route-cost gates, ROI floors, dry-run mode, planner enablement, close/open authorization, or local executor policy.
+
+## Action Constraints Are Advisory Only
+
+`global_effects` fields — `max_rebalance_burn_sats`, `growth_allowed`, `rebalance_allowed`, `exploration_allowed` — are surfaced by `get_metabolic_action_constraints` as non-authorizing diagnostics only. They are never enforced as a spend, growth, or execution gate. `execution_authority` and `budget_authority` remain `cl_revenue_ops`: rebalance amounts and budgets are computed locally and independently of these constraints.
 
 ## Example Payload
 

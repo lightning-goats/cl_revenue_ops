@@ -617,16 +617,6 @@ class EVRebalancer:
                 pass
         return False
 
-    def _get_hive_rebalance_bias(self, peer_id: str) -> float:
-        """Return bounded multiplicative rebalance score bias from hive hints. 1.0 if unavailable."""
-        if self.hive_hints is None:
-            return 1.0
-        try:
-            bias = self.hive_hints.get_rebalance_bias(peer_id)
-            return max(0.85, min(1.15, bias))
-        except Exception:
-            return 1.0
-
     def _fresh_hive_entries(self, getter_name: str) -> List[Dict[str, Any]]:
         """Return action-grade hive entries only when the snapshot is fresh."""
         if self.hive_hints is None:
