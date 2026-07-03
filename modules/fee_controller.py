@@ -354,6 +354,13 @@ class GaussianThompsonState:
     MAX_BIAS_NUDGES = 50            # Security: bounded out-of-band nudge memory
     BIAS_DECAY_HOURS = 24.0         # Advisory nudges fade with a 1-day half-life
     BIAS_MIN_WEIGHT = 1e-3          # Below this decayed weight a nudge is pruned
+    # M4 (2026-07-03 audit): a re-recorded advisory signal REFRESHES the
+    # existing nudge instead of appending. The per-cycle neighbor-median
+    # nudge used to accumulate ~48 live entries/day, each applied
+    # sequentially to every sample — sparse channels converged >95% of the
+    # way to the median instead of exploring. Targets within this relative
+    # tolerance are the same signal.
+    NUDGE_DEDUP_TOLERANCE = 0.05
 
     # Contextual sampling is advisory, not absorbing: the polynomial revenue
     # learner stays the base sampler and the context only applies a bounded
@@ -528,7 +535,7 @@ class GaussianThompsonState:
         posterior_mean, so expose it through the same accessor shape used by the
         controller.
         """
-        if len(self.observations) < self.MIN_OBSERVATIONS:
+        if self.real_observation_count() < self.MIN_OBSERVATIONS:
             return None
 
         optimal_fee = self.posterior_mean
@@ -536,6 +543,18 @@ class GaussianThompsonState:
             return None
 
         return int(max(floor_ppm, min(ceiling_ppm, round(optimal_fee))))
+
+    def real_observation_count(self) -> int:
+        """Count of genuine market windows (SL-3, 2026-07-03 audit).
+
+        Zero-probe pseudo-observations are fabricated points at fees never
+        charged; they must not satisfy 'enough data to trust the posterior'
+        gates. Congestion-flagged windows are real market windows and count.
+        """
+        return sum(
+            1 for obs in self.observations
+            if not (len(obs) >= 6 and obs[5] == self.ZERO_PROBE_FLAG)
+        )
 
     def scale_variance(self, factor: float) -> None:
         """Arm an exploration multiplier for the next sample.
@@ -609,7 +628,7 @@ class GaussianThompsonState:
         boost = self._resolve_exploration_boost(exploration_multiplier)
 
         # If not enough observations, explore more widely
-        if len(self.observations) < self.MIN_OBSERVATIONS:
+        if self.real_observation_count() < self.MIN_OBSERVATIONS:
             # Use prior with extra exploration (clamped to MIN_STD like normal path)
             explore_std = max(self.MIN_STD, self.prior_std_fee * 1.1) * boost
             sampled = random.gauss(self.prior_mean_fee, explore_std)
@@ -1212,7 +1231,29 @@ class GaussianThompsonState:
         if weight <= 0 or target_fee < 0:
             return
 
-        self.posterior_bias.append((target_fee, weight, int(time.time())))
+        now = int(time.time())
+        # Dedupe (M4): a nudge toward (approximately) the same target is the
+        # same advisory signal — refresh its timestamp/weight so it stays
+        # live, instead of accumulating entries that compound on every
+        # sample and recompute. No immediate re-blend on refresh: the
+        # original recording already blended, and _apply_posterior_bias
+        # re-applies the live nudge after every posterior rebuild.
+        for i, entry in enumerate(self.posterior_bias):
+            try:
+                existing_target = float(entry[0])
+                existing_weight = float(entry[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if abs(existing_target - target_fee) <= (
+                self.NUDGE_DEDUP_TOLERANCE
+                * max(existing_target, target_fee, 1.0)
+            ):
+                self.posterior_bias[i] = (
+                    target_fee, max(existing_weight, weight), now
+                )
+                return
+
+        self.posterior_bias.append((target_fee, weight, now))
         if len(self.posterior_bias) > self.MAX_BIAS_NUDGES:
             self.posterior_bias = self.posterior_bias[-self.MAX_BIAS_NUDGES:]
 
@@ -1315,10 +1356,17 @@ class GaussianThompsonState:
             self.charged_fee_mean = 0.0
             return
 
-        # Collect weighted observations with time decay
+        # Collect weighted observations with time decay.
+        # SL-3 (2026-07-03 audit): zero-probe pseudo-observations are
+        # fabricated points at fees never actually charged. They are
+        # excluded from the fit and the charged-fee reference (they
+        # asserted "no demand" at untested fees and inflated
+        # charged_fee_mean); their one coherent role is the zero-regime
+        # anchor's downward gradient, so they stay in the anchor pool.
         now = int(time.time())
         weighted_obs: List[Tuple[float, float, float]] = []  # (fee, revenue, weight)
         weighted_ts: List[int] = []  # Parallel timestamps (zero-regime filtering)
+        anchor_pool: List[Tuple[float, float, int]] = []  # (fee, weight, ts) incl. probes
         fee_min = float('inf')
         fee_max = float('-inf')
 
@@ -1331,6 +1379,9 @@ class GaussianThompsonState:
             decay = math.pow(0.5, age_hours / self.DECAY_HOURS)
             weight = base_weight * decay
             if weight < 1e-6:
+                continue
+            anchor_pool.append((float(fee), weight, int(timestamp)))
+            if len(obs) >= 6 and obs[5] == self.ZERO_PROBE_FLAG:
                 continue
             weighted_obs.append((float(fee), float(revenue_rate), weight))
             weighted_ts.append(int(timestamp))
@@ -1356,7 +1407,10 @@ class GaussianThompsonState:
             self.zero_revenue_streak >= self.ZERO_REGIME_STREAK_OVERRIDE
             and self.zero_run_start_ts > 0
         )
-        if total_w > 0 and (zero_mass or streak_override):
+        # Anchor gate uses the probe-inclusive pool: a dead channel whose
+        # surviving observations are mostly probes must still anchor.
+        anchor_w = sum(w for _, w, _ in anchor_pool)
+        if anchor_w > 0 and (zero_mass or streak_override):
             # 2026-06-12 incident fix: when the market has moved (sustained
             # dead run), the best available estimate of live demand is where
             # revenue LAST LIVED — the revenue-mass-weighted fee over earning
@@ -1397,7 +1451,7 @@ class GaussianThompsonState:
                     ),
                     ts,
                 )
-                for (f, _, w), ts in zip(weighted_obs, weighted_ts)
+                for f, w, ts in anchor_pool
             ]
             if streak_override:
                 # Stale positive history from before the run started would
@@ -1646,18 +1700,23 @@ class GaussianThompsonState:
                 "discovery_type": "high_revenue" | "optimal_fee"
             }
         """
-        # Need enough observations to claim discovery
-        if len(self.observations) < min_observations:
+        # Need enough observations to claim discovery (real market windows
+        # only — probe pseudo-observations are fabricated, SL-3)
+        if self.real_observation_count() < min_observations:
             return None
 
         # Need reasonable revenue to be a discovery
         if revenue_rate < min_revenue_rate:
             return None
 
-        # Calculate mean revenue from recent observations at similar fees
+        # Calculate mean revenue from recent observations at similar fees.
+        # Probe pseudo-observations are excluded: their fabricated zeros
+        # dragged avg_similar_revenue down, manufacturing fake 1.3x
+        # "discoveries" to share with the fleet (SL-3).
         similar_obs = [
             obs for obs in self.observations[-20:]
             if len(obs) >= 2 and abs(obs[0] - fee) < 50
+            and not (len(obs) >= 6 and obs[5] == self.ZERO_PROBE_FLAG)
         ]
 
         if len(similar_obs) < 3:
@@ -2318,6 +2377,12 @@ class ChannelCycleState:
     # take one undamped step to the congestion cap, later cycles are damped.
     congestion_active: bool = False
 
+    # M2 (2026-07-03 audit): consecutive quiet cycles inside an episode.
+    # The episode only ends (re-arming the undamped first-trip jump) after
+    # CONGESTION_EXIT_QUIET_CYCLES consecutive non-congested cycles, so a
+    # channel chattering around the threshold cannot sawtooth 2x jumps.
+    congestion_quiet_cycles: int = 0
+
     # Fee at congestion-episode entry (0 = no episode). The whole episode is
     # capped at entry * CONGESTION_EPISODE_MAX_MULTIPLIER: the per-cycle
     # 2x cap compounding on `current` let sustained episodes ratchet to the
@@ -2652,6 +2717,15 @@ class FeeController:
     ZERO_FLOW_GAP_GUARD_MULT = 2.0
     ZERO_FLOW_GAP_DOWNSHIFT_MULT = 4.0
     ZERO_FLOW_GAP_CAP_HOURS = 168.0
+    # Failure-nudge suppression (2026-07-03 audit SL-2): FEE_INSUFFICIENT
+    # failures inside the gossip-settle window after our own fee change are
+    # artifacts of the change (stale sender gossip), not demand evidence —
+    # without this, a raise on a busy channel emitted a nudge burst that
+    # moved the next sample ~99% of the way back to 0.8x (raises undid
+    # themselves on exactly the highest-demand channels). One nudge per
+    # channel per observation window otherwise.
+    FAILURE_NUDGE_GOSSIP_SETTLE_SECONDS = 3600
+    FAILURE_NUDGE_MIN_INTERVAL_SECONDS = 1800
 
     # ==========================================================================
     # Issue #32: Rebalance Cost-Aware Fee Floor
@@ -2702,6 +2776,16 @@ class FeeController:
     # capped relative to the fee at episode ENTRY: strong slot-pressure
     # deterrent, bounded blast radius. Entry re-arms when the episode ends.
     CONGESTION_EPISODE_MAX_MULTIPLIER = 4.0
+    # M2 (2026-07-03 audit): consecutive quiet cycles required to end a
+    # congestion episode. One quiet cycle used to re-arm the undamped 2x
+    # first-trip jump, so threshold chatter produced a fee sawtooth.
+    CONGESTION_EXIT_QUIET_CYCLES = 2
+    # SL-1 (2026-07-03 audit): a zero-revenue window on a channel whose
+    # spendable balance is below this cannot distinguish "no demand" from
+    # "couldn't route" — it is censored data and must not enter the
+    # posterior or the zero-revenue streak. Threshold chosen below the
+    # typical routed HTLC size so only genuinely unroutable channels skip.
+    UNROUTABLE_SPENDABLE_SATS = 25_000
 
     # ==========================================================================
     # P8 fix (2026-06-10): Vegas spike wake-up for sleeping channels
@@ -2833,6 +2917,14 @@ class FeeController:
 
         # Lock protecting state dict access across threads
         self._state_lock = threading.RLock()  # TS-1: RLock for re-entrant access from set_channel_fee
+        # 2026-07-03 audit SL-2: failure-nudge suppression bookkeeping.
+        # _last_fee_apply_ts marks our own successful fee applications so
+        # FEE_INSUFFICIENT failures during the gossip-settle window (senders
+        # routing on stale gossip after OUR change) don't get recorded as
+        # demand evidence. _last_failure_nudge_ts rate-limits to one nudge
+        # per channel per observation window.
+        self._last_fee_apply_ts: Dict[str, int] = {}
+        self._last_failure_nudge_ts: Dict[str, int] = {}
 
         # Preserve operator-advertised HTLC minimums while temporary defenses are active.
         self._dynamic_htlcmin_baselines: Dict[str, int] = {}
@@ -3523,6 +3615,8 @@ class FeeController:
             for ch in peer_channels:
                 if ch.get("source") == our_id:
                     continue
+                if self._is_fleet_sibling(ch.get("source")):
+                    continue
                 if not ch.get("active", False):
                     continue
                 fee_ppm = ch.get("fee_per_millionth", 0)
@@ -3563,6 +3657,20 @@ class FeeController:
             return result
         except Exception:
             return None
+
+    def _is_fleet_sibling(self, node_id: Optional[str]) -> bool:
+        """True when a gossip channel's source is another hive fleet member.
+
+        Siblings are allies, not competition: counting their advertised fees
+        in the competitor pools made fleet nodes sharing a peer undercut
+        each other 5-20% per cycle toward the floor (2026-07-03 audit H-1).
+        """
+        if not node_id or not self.hive_hints:
+            return False
+        try:
+            return bool(self.hive_hints.is_hive_member(node_id))
+        except Exception:
+            return False
 
     @staticmethod
     def _is_cln_default_fee(ch: dict) -> bool:
@@ -3614,6 +3722,8 @@ class FeeController:
             fees = []
             for ch in peer_channels:
                 if ch.get("source") == our_id:
+                    continue
+                if self._is_fleet_sibling(ch.get("source")):
                     continue
                 if not ch.get("active", False):
                     continue
@@ -3673,7 +3783,7 @@ class FeeController:
                     continue
                 if ch.get("source") == our_id:
                     our_capacity = max(our_capacity, cap)
-                elif ch.get("active", False):
+                elif ch.get("active", False) and not self._is_fleet_sibling(ch.get("source")):
                     competitor_capacities.append(cap)
 
             if not competitor_capacities or our_capacity <= 0:
@@ -3900,6 +4010,7 @@ class FeeController:
             "forward_count_since_update": state.forward_count_since_update,
             "last_volume_sats": state.last_volume_sats,
             "congestion_active": bool(state.congestion_active),
+            "congestion_quiet_cycles": int(state.congestion_quiet_cycles or 0),
             "congestion_entry_fee_ppm": int(state.congestion_entry_fee_ppm or 0),
             "pending_target_ppm": int(state.pending_target_ppm or 0),
             "last_gossip_refresh": state.last_gossip_refresh,
@@ -5645,6 +5756,24 @@ class FeeController:
             return guarded, "zero_flow_ratchet_guard"
         return guarded, "zero_flow_downshift"
     
+    def _is_unroutable_zero_window(
+        self, revenue_rate: float, spendable_sats: Union[int, float]
+    ) -> bool:
+        """True when a zero-revenue window is censored, not informative.
+
+        A channel whose spendable balance is below UNROUTABLE_SPENDABLE_SATS
+        cannot forward at ANY fee, so its zero windows say nothing about
+        demand (audit SL-1). Windows with revenue prove routability and are
+        always informative.
+        """
+        try:
+            return (
+                float(revenue_rate) <= 0
+                and float(spendable_sats) < self.UNROUTABLE_SPENDABLE_SATS
+            )
+        except (TypeError, ValueError):
+            return False
+
     def _detect_congestion(self, state: Optional[Dict[str, Any]],
                            channel_info: Optional[Dict[str, Any]],
                            cfg) -> bool:
@@ -6089,13 +6218,25 @@ class FeeController:
         # Priority 1: Congestion (Emergency High Fee)
         # P1 fix (2026-06-10): bounded + damped, observation always recorded.
         # See CONGESTION_FEE_* constants for the invariants.
+        # M3 (2026-07-03 audit): the observation recorded this cycle describes
+        # the PREVIOUS window, so the congestion flag on it must reflect the
+        # regime that window ran under — captured here, before transitions.
+        prev_congestion_active = cycle.congestion_active
+
         if not is_congested and cycle.congestion_active:
-            # Episode over — re-arm the one-shot fast step and the episode
-            # entry anchor for the next one.
-            cycle.congestion_active = False
-            cycle.congestion_entry_fee_ppm = 0
+            # M2: quiet cycles inside an episode don't end it immediately —
+            # threshold chatter used to re-arm the undamped first-trip jump
+            # every other cycle. The episode ends (re-arming the fast step
+            # and entry anchor) only after CONGESTION_EXIT_QUIET_CYCLES
+            # consecutive quiet cycles.
+            cycle.congestion_quiet_cycles += 1
+            if cycle.congestion_quiet_cycles >= self.CONGESTION_EXIT_QUIET_CYCLES:
+                cycle.congestion_active = False
+                cycle.congestion_entry_fee_ppm = 0
+                cycle.congestion_quiet_cycles = 0
 
         if is_congested:
+            cycle.congestion_quiet_cycles = 0
             decision_reason = "CONGESTION"
 
             # (c) ALWAYS feed this window's observation into the posterior
@@ -6111,17 +6252,24 @@ class FeeController:
                 _, congestion_time_bucket, _ = self._get_context_with_values(
                     channel_id, peer_id, outbound_ratio, flow_state=flow_state
                 )
-                # Flagged: real data for the fit, but congestion pricing is
-                # slot protection, not a market test — the supported-fee
-                # ceiling must not treat revenue at ratcheted fees as proof
-                # that the market bears them.
-                ts_state.thompson.update_posterior(
-                    fee=raw_chain_fee,
-                    revenue_rate=current_revenue_rate,
-                    hours=hours_elapsed,
-                    time_bucket=congestion_time_bucket,
-                    congested=True,
-                )
+                # Flag by the regime the recorded window RAN UNDER (M3): on
+                # episode entry the window ran at the normal fee — a genuine
+                # market test that stays earning evidence. Sustained-episode
+                # windows ran at ratcheted fees: slot protection, not a
+                # market test — the supported-fee ceiling must not treat
+                # revenue at those fees as proof the market bears them.
+                # SL-1: a zero-revenue window on an unroutable channel is
+                # censored data, not demand evidence — skip it.
+                if not self._is_unroutable_zero_window(
+                    current_revenue_rate, spendable
+                ):
+                    ts_state.thompson.update_posterior(
+                        fee=raw_chain_fee,
+                        revenue_rate=current_revenue_rate,
+                        hours=hours_elapsed,
+                        time_bucket=congestion_time_bucket,
+                        congested=prev_congestion_active,
+                    )
 
             first_trip = not cycle.congestion_active
             cycle.congestion_active = True
@@ -6207,6 +6355,28 @@ class FeeController:
             # Reuse volume/forward data already fetched above.
             # Success criteria: any forwards/volume observed during exploration.
             exploration_success = (volume_since_sats > 0) or (forward_count > 0)
+
+            # M6 (2026-07-03 audit): the exploration window is a real
+            # advertised fee with observed revenue — the most informative
+            # cheap-fee market test the controller ever runs. It used to be
+            # discarded on every exit path, so the supported ceiling and
+            # earning anchor could never learn from exploration successes.
+            # Same recording pattern as the congestion branch (P1).
+            exploration_ts_state = self._get_channel_fee_state(
+                channel_id, peer_id, actual_fee_ppm=raw_chain_fee
+            )
+            if raw_chain_fee > 0 and not self._is_unroutable_zero_window(
+                current_revenue_rate, spendable
+            ):
+                _, exploration_time_bucket, _ = self._get_context_with_values(
+                    channel_id, peer_id, outbound_ratio, flow_state=flow_state
+                )
+                exploration_ts_state.thompson.update_posterior(
+                    fee=raw_chain_fee,
+                    revenue_rate=current_revenue_rate,
+                    hours=hours_elapsed,
+                    time_bucket=exploration_time_bucket,
+                )
 
             if exploration_success:
                 # Exploration succeeded. Clear the flag and hold at a safe low fee
@@ -6404,12 +6574,20 @@ class FeeController:
             # 0 regardless of demand), so it is skipped entirely.
             # Invariant: every posterior observation pairs a fee that was
             # actually advertised with the revenue it actually produced.
-            if raw_chain_fee > 0:
+            # SL-1: unroutable zero windows are censored data — skipped.
+            # M3: the window being recorded ran under the PREVIOUS cycle's
+            # regime; if that was a congestion episode, its revenue was
+            # earned at ratcheted fees and must carry the congestion flag
+            # (excluded from the supported-ceiling earning evidence).
+            if raw_chain_fee > 0 and not self._is_unroutable_zero_window(
+                adjusted_revenue_rate, spendable
+            ):
                 ts_state.thompson.update_posterior(
                     fee=raw_chain_fee,
                     revenue_rate=adjusted_revenue_rate,
                     hours=hours_elapsed,
-                    time_bucket=time_bucket
+                    time_bucket=time_bucket,
+                    congested=prev_congestion_active,
                 )
 
                 # Update contextual posterior (time-aware weighting)
@@ -7669,6 +7847,8 @@ class FeeController:
             result["success"] = True
             result["old_fee_ppm"] = old_fee_ppm
             result["message"] = f"Fee set to {fee_ppm} PPM"
+            # Failure-nudge gossip-settle anchor (audit SL-2).
+            self._last_fee_apply_ts[resolved_channel_id] = int(time.time())
 
             # M-13: Removed per-channel sleep+verify+retry loop from hot path.
             # Fee verification is handled by the existing gossip refresh mechanism
@@ -8325,6 +8505,7 @@ class FeeController:
             forward_count_since_update=cycle_data.get("forward_count_since_update", 0),
             last_volume_sats=cycle_data.get("last_volume_sats", 0),
             congestion_active=bool(cycle_data.get("congestion_active", False)),
+            congestion_quiet_cycles=int(cycle_data.get("congestion_quiet_cycles", 0) or 0),
             congestion_entry_fee_ppm=_safe_entry_fee(
                 cycle_data.get("congestion_entry_fee_ppm", 0)
             ),
@@ -8503,6 +8684,15 @@ class FeeController:
             return
         if not self.is_fee_relevant_failure(failcode, failreason):
             return
+        now = int(time.time())
+        # Gossip-settle cooldown + per-window rate limit (audit SL-2, see
+        # FAILURE_NUDGE_GOSSIP_SETTLE_SECONDS).
+        applied_ts = self._last_fee_apply_ts.get(channel_id, 0)
+        if applied_ts and now - applied_ts < self.FAILURE_NUDGE_GOSSIP_SETTLE_SECONDS:
+            return
+        last_nudge_ts = self._last_failure_nudge_ts.get(channel_id, 0)
+        if last_nudge_ts and now - last_nudge_ts < self.FAILURE_NUDGE_MIN_INTERVAL_SECONDS:
+            return
         # Called from the forward_event hook thread; the fee loop mutates the
         # same Thompson state under _state_lock.
         with self._state_lock:
@@ -8528,5 +8718,6 @@ class FeeController:
                 # posterior_mean/std from observations + the fixed prior and
                 # would otherwise erase this signal before the next sample.
                 state.record_posterior_nudge(implied_fee, base_weight)
+                self._last_failure_nudge_ts[channel_id] = now
             except Exception:
                 pass

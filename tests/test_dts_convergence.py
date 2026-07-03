@@ -404,15 +404,22 @@ class TestNudgesReachSampling:
         )
 
     def test_nudges_shift_sampled_fee_on_both_paths(self, fake_time):
-        """Audit EXP 5b: 20 nudges toward 100 on an established state shifted
-        the contextual sampled mean by ~0 and the polynomial mean by ~50%.
-        Both paths must now move by at least 30% of the nudge distance."""
+        """Audit EXP 5b: nudges toward 100 on an established state shifted
+        the contextual sampled mean by ~0 (the signal never reached the
+        sample paths). Both paths must move by at least one nudge's blend
+        fraction of the distance.
+
+        M4 (2026-07-03): repeated same-target nudges now DEDUPE to one live
+        signal (accumulation made sparse channels converge to the neighbor
+        median), so the expected shift is a single w/(1+w) application
+        (0.2/1.2 ~= 17%), not the old 20-entry compounding."""
         import copy
         st, ctx = self._established_state()
         base = copy.deepcopy(st)
         nudged = copy.deepcopy(st)
         for _ in range(20):
             nudged.record_posterior_nudge(100.0, 0.2)
+        assert len(nudged.posterior_bias) == 1, "same-target nudges must dedupe"
 
         for contextual in (False, True):
             pre = self._mean_sample(copy.deepcopy(base), ctx, contextual)
@@ -420,10 +427,11 @@ class TestNudgesReachSampling:
             distance = pre - 100.0
             assert distance > 50, "test setup: posterior should sit well above 100"
             shift = pre - post
-            assert shift >= 0.30 * distance, (
+            single_nudge_frac = 0.2 / 1.2
+            assert shift >= 0.85 * single_nudge_frac * distance, (
                 f"nudges bypassed by {'contextual' if contextual else 'polynomial'} "
                 f"path: mean sample {pre:.0f} -> {post:.0f} "
-                f"(needed >= {0.30 * distance:.0f} of {distance:.0f})"
+                f"(needed >= {0.85 * single_nudge_frac * distance:.0f} of {distance:.0f})"
             )
 
     def test_nudge_durability_assertions_still_hold(self, fake_time):

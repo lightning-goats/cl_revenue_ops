@@ -182,6 +182,58 @@ class TestFailedForwardObservation:
 
         assert state.posterior_mean < original_mean
 
+    def test_nudge_suppressed_during_gossip_settle_after_our_fee_change(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        """2026-07-03 audit SL-2: FEE_INSUFFICIENT bursts right after our own
+        fee change are senders routing on stale gossip — an artifact of the
+        change, not demand evidence. A raise on a busy channel used to emit
+        ~50 nudges that moved the next sample ~99% of the way to 0.8x,
+        systematically undoing every raise on the busiest channels."""
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        state = self._seed_channel(fc)
+
+        fc._last_fee_apply_ts["123x1x0"] = int(time.time()) - 60
+        fc.record_failed_forward(
+            "123x1x0", 500,
+            failcode=self.WIRE_FEE_INSUFFICIENT,
+            failreason="WIRE_FEE_INSUFFICIENT",
+        )
+        assert state.posterior_bias == []
+
+    def test_nudge_allowed_after_gossip_settle_window(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        state = self._seed_channel(fc)
+
+        fc._last_fee_apply_ts["123x1x0"] = (
+            int(time.time())
+            - FeeController.FAILURE_NUDGE_GOSSIP_SETTLE_SECONDS - 10
+        )
+        fc.record_failed_forward(
+            "123x1x0", 500,
+            failcode=self.WIRE_FEE_INSUFFICIENT,
+            failreason="WIRE_FEE_INSUFFICIENT",
+        )
+        assert len(state.posterior_bias) == 1
+
+    def test_nudge_rate_limited_per_channel(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        """One nudge per channel per observation window — a burst of
+        failures within one window is one datapoint, not fifty."""
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        state = self._seed_channel(fc)
+
+        for _ in range(5):
+            fc.record_failed_forward(
+                "123x1x0", 500,
+                failcode=self.WIRE_FEE_INSUFFICIENT,
+                failreason="WIRE_FEE_INSUFFICIENT",
+            )
+        assert len(state.posterior_bias) == 1
+
     def test_liquidity_failcode_produces_no_nudge(
         self, mock_plugin, mock_config, mock_database
     ):

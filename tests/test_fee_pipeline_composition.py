@@ -226,7 +226,7 @@ class TestKalmanDemandFactorClamp:
 
         captured = {}
 
-        def spy_update(fee, revenue_rate, hours=1.0, time_bucket="normal"):
+        def spy_update(fee, revenue_rate, hours=1.0, time_bucket="normal", **kwargs):
             captured["fee"] = fee
             captured["revenue_rate"] = revenue_rate
 
@@ -351,7 +351,7 @@ class TestZeroFeeObservationAttribution:
 
         captured = {}
 
-        def spy_posterior(fee, revenue_rate, hours=1.0, time_bucket="normal"):
+        def spy_posterior(fee, revenue_rate, hours=1.0, time_bucket="normal", **kwargs):
             captured["posterior_fee"] = fee
 
         def spy_contextual(context_key, fee, revenue_rate, time_bucket="normal"):
@@ -549,6 +549,114 @@ class TestVegasSpikeWake:
 
 
 # =============================================================================
+# 2026-07-03 audit: censored-data and discarded-observation fixes
+# =============================================================================
+
+class TestUnroutableWindowGate:
+    """Audit SL-1: a zero-revenue window on a channel that physically could
+    not route (spendable below any plausible HTLC) is censored data, not
+    demand evidence. Recording it taught the model that the current fee
+    kills revenue — while the PID was simultaneously RAISING fees on
+    depleted channels, so the zeros landed at raised fees."""
+
+    def _depleted_info(self, fee_ppm):
+        info = _channel_info(fee_ppm)
+        info["spendable_msat"] = "5000000msat"  # 5k sats — unroutable
+        return info
+
+    def test_zero_revenue_unroutable_window_is_skipped(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_volume_since.return_value = 0
+        mock_database.get_forward_count_since.return_value = 0
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=150)
+        obs_before = len(ts_state.thompson.observations)
+        streak_before = ts_state.thompson.zero_revenue_streak
+
+        fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "sink", "forward_count": 0},
+            self._depleted_info(150), cfg=cfg,
+        )
+        assert len(ts_state.thompson.observations) == obs_before, (
+            "unroutable zero window entered the posterior as demand evidence"
+        )
+        assert ts_state.thompson.zero_revenue_streak == streak_before
+
+    def test_zero_revenue_routable_window_still_recorded(
+        self, mock_plugin, mock_database
+    ):
+        """A routable channel earning nothing IS demand evidence."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_volume_since.return_value = 0
+        mock_database.get_forward_count_since.return_value = 0
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=150)
+        obs_before = len(ts_state.thompson.observations)
+
+        fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 0},
+            _channel_info(150), cfg=cfg,
+        )
+        assert len(ts_state.thompson.observations) == obs_before + 1
+
+    def test_earning_window_recorded_even_when_now_depleted(
+        self, mock_plugin, mock_database
+    ):
+        """Revenue proves the window was routable — record it regardless of
+        the liquidity we happen to see at cycle time."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=150)
+        obs_before = len(ts_state.thompson.observations)
+
+        fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "sink", "forward_count": 10},
+            self._depleted_info(150), cfg=cfg,
+        )
+        assert len(ts_state.thompson.observations) == obs_before + 1
+
+
+class TestExplorationWindowsLearned:
+    """Audit M6: the low_fee_exploration branch observed real forwards at
+    the discovery fee and then discarded the observation — the controller
+    paid for the market test and threw away the result."""
+
+    def test_exploration_cycle_records_observation(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_channel_probe.return_value = {"probe": True}
+        chain = {"fee": 80}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=80)
+        obs_before = len(ts_state.thompson.observations)
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(80), cfg=cfg,
+        )
+        assert result is not None
+        assert "EXPLORATION" in result.reason.upper()
+        assert len(ts_state.thompson.observations) == obs_before + 1, (
+            "exploration window (real fee, real revenue) must reach the posterior"
+        )
+        assert ts_state.thompson.observations[-1][0] == 80
+
+
+# =============================================================================
 # P1: bounded, damped congestion response that still feeds the posterior
 # =============================================================================
 
@@ -691,7 +799,117 @@ class TestCongestionDamping:
         # Normal path: blended + delta-capped, never a jump to the 5000 sample
         step_cap = max(100, int(350 * 0.5) + 1)
         assert r2.new_fee_ppm <= 350 + step_cap
+        # M2 (2026-07-03): one quiet cycle no longer ends the episode (exit
+        # hysteresis — see CONGESTION_EXIT_QUIET_CYCLES); pricing is already
+        # normal above, and the flag clears after enough quiet cycles.
+        assert fc._cycle_states[CHANNEL_ID].congestion_active is True
+        for _ in range(FeeController.CONGESTION_EXIT_QUIET_CYCLES - 1):
+            _open_window(fc)
+            ts_state.thompson.posterior_std = 250.0
+            fc._adjust_channel_fee(
+                CHANNEL_ID, PEER_ID,
+                {"state": "balanced", "forward_count": 10},
+                _channel_info(chain["fee"]), cfg=cfg,
+            )
         assert fc._cycle_states[CHANNEL_ID].congestion_active is False
+
+    def test_entry_cycle_observation_is_not_congestion_flagged(
+        self, mock_plugin, mock_database
+    ):
+        """2026-07-03 audit M3: the observation recorded on a cycle describes
+        the PREVIOUS window. On congestion entry, that window ran at the
+        normal fee — a genuine market test that must NOT be excluded from
+        the earning evidence."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 100}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=100)
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, self._congested_state(),
+            _channel_info(100), cfg=cfg,
+        )
+        assert result is not None
+        last_obs = ts_state.thompson.observations[-1]
+        assert not (
+            len(last_obs) >= 6
+            and last_obs[5] == ts_state.thompson.CONGESTION_OBS_FLAG
+        ), "entry-cycle window (pre-congestion fee) must stay market evidence"
+
+    def test_exit_cycle_observation_is_congestion_flagged(
+        self, mock_plugin, mock_database
+    ):
+        """M3, other direction: the first cycle AFTER congestion records the
+        window that ran at the inflated congestion fee. It must be flagged,
+        or revenue at ratcheted fees extends the supported ceiling — the
+        exact leak the June runaway fix guards against."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 100}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=100)
+        r1 = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, self._congested_state(),
+            _channel_info(100), cfg=cfg,
+        )
+        assert r1 is not None
+
+        _open_window(fc)
+        r2 = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(chain["fee"]), cfg=cfg,
+        )
+        assert r2 is not None
+        last_obs = ts_state.thompson.observations[-1]
+        assert (
+            len(last_obs) >= 6
+            and last_obs[5] == ts_state.thompson.CONGESTION_OBS_FLAG
+        ), "post-congestion window earned at the inflated fee — must be flagged"
+
+    def test_congestion_exit_hysteresis_prevents_first_trip_rearm(
+        self, mock_plugin, mock_database
+    ):
+        """2026-07-03 audit M2: one quiet cycle used to end the episode and
+        re-arm the undamped 2x first-trip jump — a channel chattering around
+        the threshold sawtoothed between 2x and decay every cycle. The
+        episode must survive brief quiet gaps and only end after
+        CONGESTION_EXIT_QUIET_CYCLES consecutive quiet cycles."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 100}
+        _stub_broadcasts(fc, chain)
+
+        r1 = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, self._congested_state(),
+            _channel_info(100), cfg=cfg,
+        )
+        assert r1 is not None
+        cycle = fc._cycle_states[CHANNEL_ID]
+        assert cycle.congestion_active is True
+        entry_anchor = cycle.congestion_entry_fee_ppm
+
+        # One quiet cycle: episode must survive (no re-arm).
+        _open_window(fc)
+        fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(chain["fee"]), cfg=cfg,
+        )
+        assert cycle.congestion_active is True, (
+            "episode ended after a single quiet cycle — first trip re-armed"
+        )
+        assert cycle.congestion_entry_fee_ppm == entry_anchor
+
+        # Enough consecutive quiet cycles: episode genuinely over.
+        for _ in range(FeeController.CONGESTION_EXIT_QUIET_CYCLES):
+            _open_window(fc)
+            fc._adjust_channel_fee(
+                CHANNEL_ID, PEER_ID,
+                {"state": "balanced", "forward_count": 10},
+                _channel_info(chain["fee"]), cfg=cfg,
+            )
+        assert cycle.congestion_active is False
+        assert cycle.congestion_entry_fee_ppm == 0
 
     def test_congestion_active_round_trips_persistence(self, mock_plugin, mock_database):
         """congestion_active must survive the fee strategy row round trip."""

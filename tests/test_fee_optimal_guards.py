@@ -462,6 +462,116 @@ class TestUpwardProbeCap:
 
 
 # =============================================================================
+# 2026-07-03 audit SL-3: probe pseudo-observations must not poison the fit
+# =============================================================================
+
+class TestZeroProbeExclusionFromFit:
+    """Zero-probes are fabricated (0.9x fee, zero revenue) points at fees
+    never actually charged. Their only statistically coherent role is the
+    zero-regime anchor's downward gradient; in the polynomial fit, the
+    charged-fee mean, trust-gate counts, and discovery checks they assert
+    'no demand at fees we never tested'."""
+
+    def _real_earning_state(self, fee=100, n=6):
+        st = GaussianThompsonState()
+        feed_windows(st, fee=fee, rate=50.0, n=n)
+        return st
+
+    def _append_probes(self, st, fee, n):
+        now = int(FakeTime.t)
+        for _ in range(n):
+            st.observations.append(
+                (fee, 0.0, 1.0, now, "normal", st.ZERO_PROBE_FLAG)
+            )
+
+    def test_probes_excluded_from_charged_fee_mean(self, fake_time):
+        st = self._real_earning_state(fee=100)
+        self._append_probes(st, fee=30, n=10)
+        st._recompute_posterior()
+        assert st.charged_fee_mean == pytest.approx(100, rel=0.01), (
+            "never-charged probe fees dragged the charged-fee reference"
+        )
+
+    def test_probes_excluded_from_polynomial_fit(self, fake_time):
+        st = GaussianThompsonState()
+        feed_windows(st, fee=100, rate=30.0, n=10)
+        feed_windows(st, fee=200, rate=60.0, n=10)
+        feed_windows(st, fee=300, rate=40.0, n=10)
+        st._recompute_posterior()
+        baseline_mean = st.posterior_mean
+
+        self._append_probes(st, fee=50, n=15)
+        st._recompute_posterior()
+        assert st.posterior_mean == pytest.approx(baseline_mean, rel=0.02), (
+            "fabricated zero-revenue points at untested fees bent the curve"
+        )
+
+    def test_real_observation_count_excludes_probes(self, fake_time):
+        st = self._real_earning_state(n=3)
+        self._append_probes(st, fee=90, n=4)
+        assert st.real_observation_count() == 3
+
+    def test_probes_do_not_enable_false_discoveries(self, fake_time):
+        """Probes at the current fee drag avg_similar_revenue toward zero,
+        making ordinary revenue (120 < 1.3x the real 100/hr average) look
+        like a 'high_revenue' discovery to share with the fleet."""
+        st = GaussianThompsonState()
+        feed_windows(st, fee=100, rate=100.0, n=5)
+        baseline = st.check_for_discovery(fee=100, revenue_rate=120.0)
+        assert baseline is None or baseline["discovery_type"] != "high_revenue"
+
+        self._append_probes(st, fee=100, n=5)
+        poisoned = st.check_for_discovery(fee=100, revenue_rate=120.0)
+        assert poisoned is None or poisoned["discovery_type"] != "high_revenue", (
+            "probe zeros manufactured a fake high_revenue fleet discovery"
+        )
+
+
+# =============================================================================
+# 2026-07-03 audit M4: advisory nudges must dedupe, not accumulate
+# =============================================================================
+
+class TestNudgeDedupe:
+    """The neighbor-median nudge is re-recorded every 30-min cycle while a
+    channel is sparse; ~48 live nudges applied sequentially moved every
+    sample >95% of the way to the median — sparse channels priced at the
+    neighbor median instead of exploring."""
+
+    def test_same_target_nudges_dedupe_to_one_entry(self, fake_time):
+        st = GaussianThompsonState()
+        for _ in range(48):
+            st.record_posterior_nudge(200.0, 0.15)
+        assert len(st.posterior_bias) == 1
+
+    def test_nearby_target_refreshes_existing_entry(self, fake_time):
+        st = GaussianThompsonState()
+        st.record_posterior_nudge(200.0, 0.15)
+        FakeTime.advance(5.0)
+        st.record_posterior_nudge(205.0, 0.15)  # within 5% — same signal
+        assert len(st.posterior_bias) == 1
+        assert st.posterior_bias[0][2] == int(FakeTime.t), (
+            "refresh must renew the timestamp so the live signal persists"
+        )
+
+    def test_distinct_targets_still_append(self, fake_time):
+        st = GaussianThompsonState()
+        st.record_posterior_nudge(100.0, 0.10)
+        st.record_posterior_nudge(200.0, 0.10)
+        assert len(st.posterior_bias) == 2
+
+    def test_repeated_nudges_do_not_converge_mean_to_target(self, fake_time):
+        st = GaussianThompsonState()
+        st.posterior_mean = 500.0
+        st.record_posterior_nudge(200.0, 0.15)
+        after_one = st.posterior_mean
+        for _ in range(47):
+            st.record_posterior_nudge(200.0, 0.15)
+        assert st.posterior_mean == pytest.approx(after_one), (
+            "re-recording the same advisory signal must not compound"
+        )
+
+
+# =============================================================================
 # 4b. Zero-probe pseudo-observation honesty (FC-I5 carve-out pinning)
 # =============================================================================
 
@@ -638,8 +748,9 @@ class TestCongestionEpisodeCap:
         cyc = fc._get_cycle_state(channel_id)
         assert cyc.congestion_entry_fee_ppm == 100
 
-        # Congestion clears
-        cyc.last_update = int(real_time.time()) - 7200
+        # Congestion clears. M2 (2026-07-03): episode end requires
+        # CONGESTION_EXIT_QUIET_CYCLES consecutive quiet cycles (exit
+        # hysteresis) before the entry anchor re-arms.
         calm = {
             "fee_proportional_millionths": 200,
             "capacity": 17_000_000,
@@ -648,10 +759,12 @@ class TestCongestionEpisodeCap:
             "max_accepted_htlcs": 30,
             "our_htlcs_in_flight": 0,
         }
-        fc._adjust_channel_fee(
-            channel_id, peer_id, {"state": "balanced", "forward_count": 5},
-            calm, cfg=cfg)
-        cyc = fc._get_cycle_state(channel_id)
+        for _ in range(fc.CONGESTION_EXIT_QUIET_CYCLES):
+            cyc.last_update = int(real_time.time()) - 7200
+            fc._adjust_channel_fee(
+                channel_id, peer_id, {"state": "balanced", "forward_count": 5},
+                calm, cfg=cfg)
+            cyc = fc._get_cycle_state(channel_id)
         assert cyc.congestion_active is False
         assert cyc.congestion_entry_fee_ppm == 0
 

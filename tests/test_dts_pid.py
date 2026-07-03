@@ -1437,6 +1437,69 @@ class TestUpwardProbeWiring:
         assert result.algorithm_values["supported_fee_ceiling_ppm"] == 75
 
 
+class TestFleetSiblingExclusion:
+    """2026-07-03 fee audit H-1: hive fleet members were counted as
+    competitors in the neighbor-fee pools, so fleet nodes sharing a peer
+    undercut EACH OTHER 5-20% per cycle toward the floor. Siblings are
+    allies — their advertised fees must not enter the competitor pool."""
+
+    def _install_gossip_with_sibling(self, fc, *, peer_id, our_id="our-node"):
+        now_ts = int(time.time())
+        channels = [
+            {"source": our_id, "destination": peer_id, "active": True,
+             "fee_per_millionth": 112, "satoshis": 2_000_000,
+             "last_update": now_ts},
+            # Hive siblings: huge, cheap — would dominate the weighted pool.
+            {"source": "hive-sibling", "destination": peer_id, "active": True,
+             "fee_per_millionth": 10, "satoshis": 50_000_000,
+             "last_update": now_ts},
+            {"source": "hive-sibling-2", "destination": peer_id, "active": True,
+             "fee_per_millionth": 10, "satoshis": 40_000_000,
+             "last_update": now_ts},
+        ]
+        for idx, fee in enumerate((100, 200, 300)):
+            channels.append({
+                "source": f"competitor-{idx}", "destination": peer_id,
+                "active": True, "fee_per_millionth": fee,
+                "satoshis": 1_000_000, "last_update": now_ts,
+            })
+        fc.data_service = MagicMock()
+        fc.data_service.get_node_id.return_value = our_id
+        fc.data_service.get_channels.return_value = {"channels": channels}
+        fc._our_node_id = our_id
+        fc.hive_hints = MagicMock()
+        fc.hive_hints.is_hive_member.side_effect = (
+            lambda node_id: str(node_id).startswith("hive-sibling")
+        )
+
+    def test_median_excludes_hive_members(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        peer_id = "02" + "c1" * 32
+        self._install_gossip_with_sibling(fc, peer_id=peer_id)
+        median = fc._get_neighbor_fee_median(peer_id, cfg=cfg)
+        assert median == 200, (
+            f"sibling fee dragged the weighted median to {median}"
+        )
+
+    def test_percentile_excludes_hive_members(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        peer_id = "02" + "c2" * 32
+        self._install_gossip_with_sibling(fc, peer_id=peer_id)
+        p25 = fc._get_neighbor_fee_percentile(peer_id, 0.25, cfg=cfg)
+        assert p25 == 100, f"sibling fee entered the percentile pool: {p25}"
+
+    def test_undercut_rank_excludes_hive_members(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        peer_id = "02" + "c3" * 32
+        self._install_gossip_with_sibling(fc, peer_id=peer_id)
+        pct = fc._get_competitive_undercut_pct(
+            peer_id, "chan", neighbor_median=150, cfg=cfg
+        )
+        # Without the 50M sibling in the pool, we (2M) outrank every real
+        # competitor (1M) -> rank 0.0 -> base undercut 5%.
+        assert pct == pytest.approx(0.05)
+
+
 class TestMarketBoundaryGuard:
     def _install_competitor_gossip(self, fc, *, peer_id, our_id="our-node", competitor_fees=(80,)):
         channels = [
