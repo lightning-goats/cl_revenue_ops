@@ -423,22 +423,37 @@ class TestUpwardProbeCap:
         return st
 
     def test_probe_grants_bounded_stretch(self, fake_time):
+        """L1 (2026-07-03): the budget is consumed at CONSUME time, not at
+        grant — a grant whose move the blend/gossip gate then suppressed
+        used to lock the 24h budget without the market test ever running."""
         st = self._earning_state()
         now = int(FakeTime.t)
         cap = st.maybe_upward_probe_cap(now, supported_cap=60.0)
         assert cap == pytest.approx(
             60.0 * GaussianThompsonState.UPWARD_PROBE_STRETCH
         )
+        assert st.last_upward_probe_ts == 0, "grant must not consume the budget"
+        st.consume_upward_probe(now)
         assert st.last_upward_probe_ts == now
 
-    def test_probe_rate_limited(self, fake_time):
+    def test_probe_rate_limited_after_consume(self, fake_time):
         st = self._earning_state()
         now = int(FakeTime.t)
         assert st.maybe_upward_probe_cap(now, supported_cap=60.0) is not None
+        st.consume_upward_probe(now)
         FakeTime.advance(1.0)
         assert st.maybe_upward_probe_cap(int(FakeTime.t), supported_cap=60.0) is None
         FakeTime.advance(GaussianThompsonState.UPWARD_PROBE_INTERVAL_HOURS)
         assert st.maybe_upward_probe_cap(int(FakeTime.t), supported_cap=75.0) is not None
+
+    def test_unconsumed_grant_does_not_lock_budget(self, fake_time):
+        """A suppressed probe move must be retryable next cycle."""
+        st = self._earning_state()
+        now = int(FakeTime.t)
+        assert st.maybe_upward_probe_cap(now, supported_cap=60.0) is not None
+        # No consume: the applied fee never crossed the pre-stretch cap.
+        FakeTime.advance(0.5)
+        assert st.maybe_upward_probe_cap(int(FakeTime.t), supported_cap=60.0) is not None
 
     def test_probe_denied_during_silence(self, fake_time):
         """Never probe upward into a channel that is not currently earning —
@@ -464,8 +479,22 @@ class TestUpwardProbeCap:
         st = self._earning_state()
         now = int(FakeTime.t)
         st.maybe_upward_probe_cap(now, supported_cap=60.0)
+        st.consume_upward_probe(now)
         restored = GaussianThompsonState.from_dict(st.to_dict())
         assert restored.last_upward_probe_ts == now
+
+    def test_vegas_nudge_reaches_sample_paths(self, fake_time):
+        """L7 (2026-07-03): apply_vegas_adjustment nudged posterior_mean in
+        place, which the polynomial/contextual sample paths never read and
+        the next recompute erased. The nudge must go through the durable
+        posterior_bias channel the samplers actually consume."""
+        st = GaussianThompsonState()
+        st.posterior_mean = 100.0
+        st.apply_vegas_adjustment(1.5, new_floor=200)
+        assert st.posterior_bias, (
+            "vegas floor nudge never reached the sample paths"
+        )
+        assert st.posterior_bias[0][0] == pytest.approx(200.0)
 
     def test_floor_escape_composes_into_a_climb(self, fake_time):
         """The absorbing state end-to-end: evidence at the 30 ppm floor used

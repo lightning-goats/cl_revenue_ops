@@ -1035,8 +1035,16 @@ class GaussianThompsonState:
                 and now - self.last_upward_probe_ts
                 < self.UPWARD_PROBE_INTERVAL_HOURS * 3600.0):
             return None
-        self.last_upward_probe_ts = int(now)
+        # L1 (2026-07-03 audit): the budget is NOT consumed here — a grant
+        # whose move the blend/delta cap/gossip gate then suppressed used to
+        # lock the 24h budget without the market test ever running. The
+        # controller calls consume_upward_probe() once the applied fee
+        # actually crosses the pre-stretch cap.
         return cap * self.UPWARD_PROBE_STRETCH
+
+    def consume_upward_probe(self, now: int) -> None:
+        """Stamp the upward-probe budget: the market test actually ran."""
+        self.last_upward_probe_ts = int(now)
 
     @staticmethod
     def _time_similarity(bucket1: str, bucket2: str) -> float:
@@ -1797,7 +1805,13 @@ class GaussianThompsonState:
         boost = min(vegas_multiplier, 2.0)
         self.posterior_std = max(self.MIN_STD, self.posterior_std * boost)
         if new_floor > self.posterior_mean:
-            self.posterior_mean += (new_floor - self.posterior_mean) * 0.3
+            # L7 (2026-07-03 audit): an in-place posterior_mean shift is
+            # invisible to the polynomial/contextual sample paths and erased
+            # by the next recompute. Route through the durable nudge channel
+            # the samplers actually consume; 0.43 weight reproduces the old
+            # 0.3 blend fraction (w/(1+w) ~= 0.3), and the M4 dedupe keeps
+            # sustained mempool spikes from accumulating entries.
+            self.record_posterior_nudge(float(new_floor), 0.43)
 
     # Minimum posterior precision to prevent infinite variance on quiet channels.
     # Corresponds to max std ≈ 200 ppm.
@@ -2779,8 +2793,14 @@ class FeeController:
     # cycle.pending_target_ppm and the next blend starts FROM it, so
     # sub-threshold deltas accumulate across cycles. Without that, the gate
     # was an absorbing band: steady-state mispricing of ratio/blend (25% at
-    # blend 0.20, 8.3% at 0.60). Invariant: the gate limits broadcast RATE,
-    # never the eventual price level.
+    # blend 0.20, 8.3% at 0.60).
+    # Honest invariant (L10, 2026-07-03 audit): PERSISTENT targets beyond
+    # ~5% of the broadcast fee eventually escalate through the pending
+    # anchor; targets that stay inside the band are absorbed BY DESIGN
+    # (deliberate ±5% deadband — see the back_in_band clearing at the
+    # anchor site). The pending anchor is also cleared when a new Thompson
+    # sample lands on the other side of it, so escalation of 5-8% targets
+    # can take several cycles under a noisy posterior.
     GOSSIP_GATE_SUPPRESSION_RATIO = 0.05
 
     # ==========================================================================
@@ -5954,6 +5974,7 @@ class FeeController:
         zero_flow_guard_target_ppm = None
         zero_revenue_streak = None
         supported_cap_ppm = None
+        upward_probe_pre_cap_ppm = None  # L1: set when a probe stretch is granted
         bound_reason = "none"
         delta_cap_reason = "none"
         delta_cap_ppm = 0
@@ -6073,10 +6094,16 @@ class FeeController:
                     delta = abs(current_revenue_rate - _sleep_last_revenue_rate)
                     percent_change = delta / _sleep_last_revenue_rate
 
+                # L4 (2026-07-03 audit): HTLC-slot congestion produces no
+                # settled revenue, so the spike check alone let a sleeping
+                # channel ride out congestion at stale fees for up to an
+                # hour. is_congested is already computed above — wake on it.
+                if is_congested:
+                    percent_change = 1.0
                 if percent_change > self.WAKE_UP_THRESHOLD:
                     # Significant revenue spike detected - wake up immediately!
                     woke_from_sleep = True
-                    wake_reason = "revenue_spike"
+                    wake_reason = "congestion" if is_congested else "revenue_spike"
                     _ts_sleep_state.is_sleeping = False
                     _ts_sleep_state.sleep_until = 0
                     _ts_sleep_state.stable_cycles = 0
@@ -6101,8 +6128,17 @@ class FeeController:
         
         # RATE-BASED FEEDBACK: Get volume SINCE LAST FEE CHANGE (not 7-day average)
         # This eliminates the lag from averaging that made the controller blind
-        volume_since_sats = self.database.get_volume_since(channel_id, cycle.last_update)
-        
+        # L2 (2026-07-03 audit): a zero cursor (fee-strategy row lost — SCID
+        # format change, backup restore) queried LIFETIME volume, which the
+        # hours_elapsed<=0 clamp below compressed into a 1h window. That
+        # bogus rate seeded positive_rate_ref, so every real window read as
+        # a trickle and the zero-flow guard punished an earning channel for
+        # weeks. Bound the bootstrap lookback to one fee interval.
+        observation_cursor = cycle.last_update
+        if observation_cursor <= 0:
+            observation_cursor = now - int(getattr(cfg, "fee_interval", 1800) or 1800)
+        volume_since_sats = self.database.get_volume_since(channel_id, observation_cursor)
+
         # Calculate time elapsed since last update
         if cycle.last_update > 0:
             hours_elapsed = (now - cycle.last_update) / 3600.0
@@ -6124,10 +6160,14 @@ class FeeController:
         if (
             forward_count_hint is not None
             and forward_count_hint_since == cycle.last_update
+            and cycle.last_update > 0
         ):
             forward_count = forward_count_hint
         else:
-            forward_count = self.database.get_forward_count_since(channel_id, cycle.last_update)
+            # Same bounded bootstrap cursor as the volume query (L2).
+            forward_count = self.database.get_forward_count_since(
+                channel_id, observation_cursor
+            )
         cycle.forward_count_since_update = forward_count
 
         if cycle.last_update > 0:
@@ -6237,6 +6277,11 @@ class FeeController:
         rebalance_floor_ppm = self._get_rebalance_cost_floor(
             channel_id, peer_id, flow_state
         )
+        # L6 (2026-07-03 audit): pick ONE cost-recovery mechanism per
+        # channel. When the hard floor is active, the soft nudge below is
+        # skipped — the same cost data acting as both floor and target
+        # attractor double-weighted cost recovery.
+        rebalance_floor_active = rebalance_floor_ppm is not None
         if rebalance_floor_ppm is not None and rebalance_floor_ppm > base_floor_ppm:
             self.plugin.log(
                 f"REBALANCE_FLOOR: {channel_id[:12]}... floor raised from "
@@ -6249,12 +6294,15 @@ class FeeController:
         # Per-channel rebalance cost awareness (all flow states)
         # =====================================================================
         # If we spent X PPM rebalancing a channel, we want to recover that cost
-        # over time — but NOT by setting a hard floor that kills traffic.
-        # Instead, the rebalance cost biases the DTS target upward (applied
-        # later in the pipeline as a soft nudge, not a hard clamp).
-        rebalance_cost_ppm = self._get_channel_rebalance_cost_ppm(
-            channel_id, flow_state=flow_state
-        )
+        # over time. L6 (2026-07-03 audit): this soft nudge is the FALLBACK
+        # mechanism for channels the hard cost floor above does not cover —
+        # when the floor is active the nudge is disabled, otherwise the same
+        # cost data double-weighted cost recovery (floor + target attractor).
+        rebalance_cost_ppm = 0
+        if not rebalance_floor_active:
+            rebalance_cost_ppm = self._get_channel_rebalance_cost_ppm(
+                channel_id, flow_state=flow_state
+            )
 
         # =====================================================================
         # Issue #20: Flow-Based Ceiling Reduction
@@ -6269,6 +6317,29 @@ class FeeController:
         # Final bounds used by all paths (DTS+PID, congestion, exploration)
         floor_ppm = base_floor_ppm
         ceiling_ppm = base_ceiling_ppm
+
+        # M-3b (2026-07-03 audit): per-peer dynamic fee bounds. Operators
+        # could set fee_multiplier_min/max on a policy (documented as
+        # "dynamic floor/ceiling multiplier, anchored on fee_ppm_target",
+        # persisted, RPC-settable) but no consumer existed — the controller
+        # silently ignored them. Policies without BOTH an anchor and an
+        # explicit multiplier are unaffected; the inversion guard below
+        # still resolves conflicts with the discovery ceiling.
+        if self.policy_manager is not None:
+            try:
+                peer_policy = self.policy_manager.get_policy(peer_id)
+                policy_anchor = getattr(peer_policy, "fee_ppm_target", None)
+                if policy_anchor and policy_anchor > 0 and (
+                    getattr(peer_policy, "fee_multiplier_min", None) is not None
+                    or getattr(peer_policy, "fee_multiplier_max", None) is not None
+                ):
+                    mult_min, mult_max = peer_policy.get_fee_multiplier_bounds()
+                    if peer_policy.fee_multiplier_min is not None:
+                        floor_ppm = max(floor_ppm, int(policy_anchor * mult_min))
+                    if peer_policy.fee_multiplier_max is not None:
+                        ceiling_ppm = min(ceiling_ppm, int(policy_anchor * mult_max))
+            except Exception:
+                pass
 
         # Floor/ceiling inversion guard.
         # P3 fix (2026-06-10): prefer the ceiling. The old behavior
@@ -6829,7 +6900,21 @@ class FeeController:
                     f"(median={neighbor_median}ppm <= floor={floor_ppm}ppm)",
                     level='debug'
                 )
-            if neighbor_market_usable:
+            # L5 (2026-07-03 audit): the 2x-median pull-down is a soft market
+            # attraction for the median-following modes only. Ungated, it
+            # capped operator-chosen PREMIUM pricing at ~2.4x median and
+            # partially re-imposed the median clamp on exploring channels
+            # that Phase B.3 deliberately released.
+            median_pull_mode = getattr(cfg, 'market_fee_mode', 'undercut') if cfg else 'undercut'
+            median_pull_exploring = (
+                ts_state and ts_state.thompson and
+                ts_state.thompson.posterior_std >= self.UNDERCUT_EXPLORATION_STD_THRESHOLD
+            )
+            if (
+                neighbor_market_usable
+                and median_pull_mode in ('undercut', 'match', 'competition_aware')
+                and not median_pull_exploring
+            ):
                 if post_pid_target_ppm > neighbor_median * 2:
                     adjusted = int(post_pid_target_ppm * 0.8 + neighbor_median * 0.2)
                     self.plugin.log(
@@ -6839,8 +6924,11 @@ class FeeController:
                     )
                     post_pid_target_ppm = adjusted
 
-                # Sparse channel learning: feed neighbor median as weak DTS
-                # observation so the posterior tightens even without forwards.
+            # Sparse channel learning: feed neighbor median as weak DTS
+            # observation so the posterior tightens even without forwards.
+            # (Deliberately OUTSIDE the L5 mode/exploring gate above: its own
+            # arm condition is std >= 100, i.e. exactly the exploring case.)
+            if neighbor_market_usable:
                 if sparse_data_conservative and ts_state and ts_state.thompson:
                     ts = ts_state.thompson
                     if ts.posterior_std >= 100:  # Still very uncertain
@@ -6867,7 +6955,7 @@ class FeeController:
                         )
                         target = None
                     else:
-                        target = min(self.config.max_fee_ppm, target)
+                        target = min(int(getattr(cfg, 'max_fee_ppm', self.config.max_fee_ppm)), target)  # snapshot, not live config
                     # Pipeline: FLOOR target at premium level (only pulls UP)
                     if target is not None and post_pid_target_ppm < target:
                         pre = post_pid_target_ppm
@@ -6880,7 +6968,7 @@ class FeeController:
                         )
                 elif mode == 'match':
                     target = int(neighbor_median)
-                    target = min(self.config.max_fee_ppm, target)
+                    target = min(int(getattr(cfg, 'max_fee_ppm', self.config.max_fee_ppm)), target)  # snapshot, not live config
                     # Match mode: pull toward median regardless of direction
                     if abs(post_pid_target_ppm - target) > 0:
                         pre = post_pid_target_ppm
@@ -7073,6 +7161,10 @@ class FeeController:
                         f"std={ts_state.thompson.posterior_std:.0f})",
                         level='debug'
                     )
+                    # L1: remember the pre-stretch cap; the budget is
+                    # consumed in the broadcast-success path only when the
+                    # applied fee actually crosses it (the market test ran).
+                    upward_probe_pre_cap_ppm = int(supported_cap)
                     supported_cap = probe_cap
             # L9 (2026-07-03 audit): report the cap whenever it EXISTS, not
             # only when it clipped — telemetry analysis of "how often does
@@ -7303,6 +7395,24 @@ class FeeController:
             cycle.pending_target_ppm = (
                 int(new_fee_ppm) if int(new_fee_ppm) != int(current_fee_ppm) else 0
             )
+
+            # L3 (2026-07-03 audit): a converged channel exits HERE every
+            # cycle, so this path must also honor the gossip-refresh check —
+            # idle-frozen channels (the feature's stated target) previously
+            # never reached the check in the gossip-gate branch below. Same
+            # FC-I16 semantics: a successful refresh already reset the
+            # cursor; a None falls through to the reset below.
+            if self._should_force_gossip_refresh(channel_id, cycle, now):
+                refresh_adjustment = self._create_gossip_refresh_adjustment(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    state=cycle,
+                    current_fee_ppm=current_fee_ppm,
+                    current_time=now
+                )
+                if refresh_adjustment is not None:
+                    return refresh_adjustment
+
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = current_fee_ppm
             cycle.last_update = now
@@ -7420,7 +7530,9 @@ class FeeController:
         volatility_note = " [VOLATILITY_RESET]" if volatility_reset else ""
         applied_delta = int(new_fee_ppm) - int(current_fee_ppm)
         applied_dir = "up" if applied_delta > 0 else ("down" if applied_delta < 0 else "flat")
-        rebal_cost_tag = f", rebal_cost_floor:{rebalance_cost_ppm}ppm" if rebalance_cost_ppm > 0 else ""
+        # L6: label the mechanism honestly — this is the soft NUDGE input,
+        # not the hard floor (which logs via REBALANCE_FLOOR).
+        rebal_cost_tag = f", rebal_cost_nudge:{rebalance_cost_ppm}ppm" if rebalance_cost_ppm > 0 else ""
         target_summary = (
             f"targets=dts:{raw_dts_target_ppm}, post_pid:{post_pid_target_ppm}, "
             f"bounded:{bounded_target_ppm}, blended:{blended_target_ppm}, applied:{applied_target_ppm}, "
@@ -7523,6 +7635,20 @@ class FeeController:
             # Read back actual fee (may have been clamped by set_channel_fee)
             new_fee_ppm = result.get("fee_ppm", new_fee_ppm)
 
+            # L1: the upward-probe budget is spent only when the broadcast
+            # fee actually crossed the pre-stretch supported cap — i.e. the
+            # market test the probe exists to buy is now running.
+            if (
+                upward_probe_pre_cap_ppm is not None
+                and new_fee_ppm > upward_probe_pre_cap_ppm
+            ):
+                try:
+                    fee_state_for_probe = self._channel_fee_states.get(channel_id)
+                    if fee_state_for_probe is not None:
+                        fee_state_for_probe.thompson.consume_upward_probe(now)
+                except Exception:
+                    pass
+
             # Update state with new broadcast fee and refresh timer
             cycle.pending_target_ppm = 0  # P2: pending escalation broadcast
             cycle.last_revenue_rate = current_revenue_rate
@@ -7530,6 +7656,12 @@ class FeeController:
             cycle.last_broadcast_fee_ppm = new_fee_ppm
             cycle.last_broadcast_at = now
             cycle.last_state = decision_reason
+            # Telemetry honesty (2026-07-03 audit): the counter was persisted
+            # and emitted but never incremented anywhere.
+            if new_direction != 0 and new_direction == cycle.trend_direction:
+                cycle.consecutive_same_direction += 1
+            else:
+                cycle.consecutive_same_direction = 1 if new_direction != 0 else 0
             cycle.trend_direction = new_direction
             cycle.step_ppm = step_ppm
             cycle.last_update = now
@@ -7591,7 +7723,10 @@ class FeeController:
                     "wake_reason": wake_reason,
                     "sparse_data_conservative": sparse_data_conservative,
                     "exploration_mode": exploration_mode,
-                    "rebalance_cost_floor_ppm": rebalance_cost_ppm,
+                    # L6: honest attribution — the floor and the nudge are
+                    # distinct mechanisms (at most one active per cycle).
+                    "rebalance_cost_floor_ppm": rebalance_floor_ppm or 0,
+                    "rebalance_cost_nudge_ppm": rebalance_cost_ppm,
                     "fee_profile": fee_profile_name,
                     "fee_profile_settings": fee_profile.to_dict(),
                     "context_key": context_key,

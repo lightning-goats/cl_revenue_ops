@@ -627,6 +627,340 @@ class TestUnroutableWindowGate:
         assert len(ts_state.thompson.observations) == obs_before + 1
 
 
+class TestBootstrapWindowBound:
+    """Audit L2: when the fee-strategy row is lost (SCID format change,
+    restore from backup) cycle.last_update == 0 and get_volume_since(_, 0)
+    returns LIFETIME volume, compressed into a 1h window. That rate seeded
+    positive_rate_ref, so every genuine window afterwards read as a trickle
+    and the zero-flow guard punished an earning channel for weeks."""
+
+    def test_zero_cursor_lookback_is_bounded(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        row = dict(mock_database.get_fee_strategy_state.return_value)
+        row["last_update"] = 0
+        mock_database.get_fee_strategy_state.return_value = row
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+
+        fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(150), cfg=cfg,
+        )
+
+        now = int(time.time())
+        for call in mock_database.get_volume_since.call_args_list:
+            since = call.args[1] if len(call.args) > 1 else call.kwargs.get("since")
+            assert since and since > now - 7 * 86400, (
+                f"bootstrap window queried volume since {since} "
+                "(lifetime volume compressed into one window)"
+            )
+
+
+class TestCongestionWakesSleepers:
+    """Audit L4: HTLC-slot congestion with no settled revenue produced no
+    revenue spike, so a sleeping channel rode out congestion at stale fees
+    for up to an hour. is_congested is already computed before the sleep
+    check — it must be a wake trigger."""
+
+    def test_congested_sleeping_channel_wakes_and_reprices(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        now = int(time.time())
+        row = dict(mock_database.get_fee_strategy_state.return_value)
+        row["is_sleeping"] = 1
+        row["sleep_until"] = now + 3600
+        row["last_update"] = now - 1800
+        # Consistent fee state: the desync detector must not be the waker.
+        row["last_fee_ppm"] = 100
+        row["last_broadcast_fee_ppm"] = 100
+        row["last_revenue_rate"] = 0.0
+        mock_database.get_fee_strategy_state.return_value = row
+        mock_database.get_volume_since.return_value = 0  # no revenue spike
+        chain = {"fee": 100}
+        _stub_broadcasts(fc, chain)
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "congested", "forward_count": 50},
+            _channel_info(100), cfg=cfg,
+        )
+        assert result is not None, "channel slept through congestion"
+        assert result.reason_code == FeeReasonCode.CONGESTION.value
+
+
+class TestMedianPullModeGating:
+    """Audit L5: the '2x-median pull-down' ran before the market-mode
+    switch, ungated — in premium mode it capped operator-chosen premium
+    pricing, and in explore mode it partially re-imposed the median clamp
+    Phase B.3 deliberately removed."""
+
+    def _setup_market(self, fc, *, median=100):
+        peer_id = "02" + "f5" * 32
+        now_ts = int(time.time())
+        channels = [{"source": "our-node", "destination": peer_id, "active": True,
+                     "fee_per_millionth": 100, "satoshis": 2_000_000,
+                     "last_update": now_ts}]
+        for idx in range(3):
+            channels.append({
+                "source": f"competitor-{idx}", "destination": peer_id,
+                "active": True, "fee_per_millionth": median,
+                "satoshis": 1_000_000, "last_update": now_ts,
+            })
+        fc.data_service = MagicMock()
+        fc.data_service.get_node_id.return_value = "our-node"
+        fc.data_service.get_channels.return_value = {"channels": channels}
+        fc._our_node_id = "our-node"
+        return peer_id
+
+    def _run(self, fc, cfg, peer_id, *, sampled, posterior_std):
+        chain = {"fee": 100}
+        _stub_broadcasts(fc, chain)
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=100)
+        ts_state.thompson.sample_fee_contextual = lambda *a, **k: sampled
+        ts_state.thompson.sample_fee = lambda *a, **k: sampled
+        ts_state.thompson.update_posterior = lambda *a, **k: None
+        ts_state.thompson.update_contextual = lambda *a, **k: None
+        ts_state.thompson.posterior_std = posterior_std
+        ts_state.pid.calculate_multiplier = lambda **k: 1.0
+        return fc._adjust_channel_fee(
+            CHANNEL_ID, peer_id,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(100), cfg=cfg,
+        )
+
+    def test_premium_mode_not_pulled_toward_median(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc(mock_plugin, mock_database, market_fee_mode="premium")
+        peer_id = self._setup_market(fc)
+        result = self._run(fc, cfg, peer_id, sampled=300, posterior_std=50.0)
+        assert result is not None
+        assert ", post_pid:300," in result.reason, (
+            f"premium-mode target was median-pulled: {result.reason}"
+        )
+
+    def test_exploring_channel_not_pulled_toward_median(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc(mock_plugin, mock_database)  # default undercut
+        peer_id = self._setup_market(fc)
+        result = self._run(fc, cfg, peer_id, sampled=300, posterior_std=150.0)
+        assert result is not None
+        assert ", post_pid:300," in result.reason, (
+            f"exploring target was median-pulled: {result.reason}"
+        )
+
+
+class TestPolicyFeeMultiplierBounds:
+    """Audit M-3b: PeerPolicy fee_multiplier_min/max were settable via RPC,
+    documented ('Dynamic fee floor/ceiling multiplier, uses fee_ppm_target
+    as anchor'), persisted — and consumed by NOTHING. An operator setting a
+    per-peer fee ceiling was silently ignored."""
+
+    def _policy(self, *, target=200, mult_min=None, mult_max=None):
+        policy = MagicMock()
+        policy.fee_ppm_target = target
+        policy.fee_multiplier_min = mult_min
+        policy.fee_multiplier_max = mult_max
+        policy.get_fee_multiplier_bounds.return_value = (
+            mult_min if mult_min is not None else 0.1,
+            mult_max if mult_max is not None else 5.0,
+        )
+        policy.strategy = None  # not PASSIVE/STATIC
+        return policy
+
+    def _run(self, fc, cfg, *, sampled, current=200):
+        chain = {"fee": current}
+        _stub_broadcasts(fc, chain)
+        ts_state = _prepare_dts_stubs(fc, chain_fee=current, sampled_fee=sampled)
+        return fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(current), cfg=cfg,
+        )
+
+    def test_multiplier_max_caps_ceiling(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        fc.policy_manager = MagicMock()
+        fc.policy_manager.get_policy.return_value = self._policy(
+            target=200, mult_max=1.3
+        )
+        result = self._run(fc, cfg, sampled=1000)
+        assert result is not None
+        # Ceiling 260 binds BEFORE blending: blended = 200 + 0.2*(260-200).
+        # Without the policy bound the delta cap alone allows 300.
+        assert result.new_fee_ppm <= 260, (
+            f"operator ceiling (200 x 1.3 = 260) ignored: {result.new_fee_ppm}"
+        )
+
+    def test_multiplier_min_raises_floor(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        fc.policy_manager = MagicMock()
+        fc.policy_manager.get_policy.return_value = self._policy(
+            target=200, mult_min=0.9
+        )
+        result = self._run(fc, cfg, sampled=30)
+        assert result is None or result.new_fee_ppm >= 180, (
+            f"operator floor (200 x 0.9 = 180) ignored: {result}"
+        )
+
+    def test_no_anchor_means_no_bounds(self, mock_plugin, mock_database):
+        """Without a fee_ppm_target anchor the multipliers are undefined —
+        behavior unchanged."""
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        fc.policy_manager = MagicMock()
+        fc.policy_manager.get_policy.return_value = self._policy(
+            target=None, mult_max=1.3
+        )
+        result = self._run(fc, cfg, sampled=1000)
+        assert result is not None
+        assert result.new_fee_ppm > 260  # only the normal delta cap applies
+
+
+class TestCostRecoverySingleMechanism:
+    """Audit L6: the same rebalance-cost data acted twice — a hard floor
+    (cost x 1.2, source/router) AND a soft nudge toward cost — and the
+    telemetry attributed the floor's key to the nudge's input."""
+
+    def test_nudge_skipped_when_floor_already_active(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 300}
+        _stub_broadcasts(fc, chain)
+        fc._get_rebalance_cost_floor = lambda *a, **k: 240  # floor active
+        fc._get_channel_rebalance_cost_ppm = lambda *a, **k: 200  # nudge input
+        ts_state = _prepare_dts_stubs(fc, chain_fee=300, sampled_fee=100)
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "source", "forward_count": 10},
+            _channel_info(300), cfg=cfg,
+        )
+        assert result is not None
+        # Telemetry attributes each mechanism honestly.
+        assert result.algorithm_values["rebalance_cost_floor_ppm"] == 240
+        assert result.algorithm_values["rebalance_cost_nudge_ppm"] == 0, (
+            "nudge applied on top of an active cost floor (double recovery)"
+        )
+
+
+class TestConsecutiveSameDirection:
+    """Audit L9 leftover: consecutive_same_direction was persisted and
+    emitted in every FeeAdjustment but never incremented — always stale."""
+
+    def test_counter_increments_across_same_direction_moves(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        chain = {"fee": 100}
+        _stub_broadcasts(fc, chain)
+        ts_state = _prepare_dts_stubs(fc, chain_fee=100, sampled_fee=2000)
+
+        r1 = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(100), cfg=cfg,
+        )
+        assert r1 is not None
+        first = r1.algorithm_values["consecutive_same_direction"]
+
+        _open_window(fc)
+        ts_state.thompson.posterior_std = 250.0
+        r2 = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(chain["fee"]), cfg=cfg,
+        )
+        assert r2 is not None
+        second = r2.algorithm_values["consecutive_same_direction"]
+        assert second == first + 1, (
+            f"counter stale: {first} -> {second} across two upward moves"
+        )
+
+
+class TestGossipRefreshOnAlphaGuardPath:
+    """Audit L3: a converged channel exits via the alpha guard every cycle
+    (fee_change < min_change), which returned BEFORE the gossip-refresh
+    check — so idle-frozen channels, the feature's stated target, never got
+    refreshed."""
+
+    def test_converged_idle_channel_gets_gossip_refresh(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        now = int(time.time())
+        # Prime the in-memory cycle state (steady-state shape: loaded long
+        # ago, broadcast stale, channel idle).
+        fc._cycle_states[CHANNEL_ID] = ChannelCycleState(
+            last_revenue_rate=5.0,
+            last_fee_ppm=150,
+            last_update=now - 7200,
+            last_broadcast_at=now - 48 * 3600,  # stale broadcast
+            last_broadcast_fee_ppm=150,
+            last_state="dts_pid",
+        )
+        mock_database.get_last_forward_time.return_value = now - 48 * 3600  # idle
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=150)
+        # Converged: target == current -> alpha-guard suppression path.
+        ts_state.thompson.sample_fee_contextual = lambda *a, **k: 150
+        ts_state.thompson.sample_fee = lambda *a, **k: 150
+        ts_state.thompson.update_posterior = lambda *a, **k: None
+        ts_state.thompson.update_contextual = lambda *a, **k: None
+        ts_state.pid.calculate_multiplier = lambda **k: 1.0
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 0},
+            _channel_info(150), cfg=cfg,
+        )
+        assert result is not None, (
+            "idle-frozen channel exited via the alpha guard without a refresh"
+        )
+        assert result.reason_code == FeeReasonCode.GOSSIP_REFRESH.value
+
+
+class TestUpwardProbeBudgetConsume:
+    """Audit L1 wiring: the probe budget is consumed only when the applied
+    fee actually crosses the pre-stretch supported cap — the market test
+    the budget exists to buy."""
+
+    def _run(self, fc, cfg, ts_state, *, sampled):
+        chain = {"fee": 40}
+        _stub_broadcasts(fc, chain)
+        now = int(time.time())
+        ts_state.thompson.observations = [
+            (30, 5.0, 1.0, now - i * 1800, "normal") for i in range(10)
+        ]
+        ts_state.thompson.posterior_mean = 300.0
+        ts_state.thompson.posterior_std = 150.0
+        ts_state.thompson.sample_fee_contextual = lambda *a, **k: sampled
+        ts_state.thompson.sample_fee = lambda *a, **k: sampled
+        ts_state.thompson.update_posterior = lambda *a, **k: None
+        ts_state.thompson.update_contextual = lambda *a, **k: None
+        ts_state.thompson.maybe_upward_probe_cap = MagicMock(return_value=75.0)
+        ts_state.thompson.consume_upward_probe = MagicMock()
+        ts_state.pid.calculate_multiplier = lambda **k: 1.0
+        return fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(40), cfg=cfg,
+        )
+
+    def test_budget_consumed_only_when_market_test_happens(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database, min_fee_ppm=30)
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=40)
+        result = self._run(fc, cfg, ts_state, sampled=300)
+        assert ts_state.thompson.maybe_upward_probe_cap.called
+        # Pre-stretch cap here is 60 (floor escape 30*2); consume iff the
+        # applied fee actually crossed it.
+        crossed = result is not None and result.new_fee_ppm > 60
+        assert ts_state.thompson.consume_upward_probe.called == crossed
+
+
 class TestSupportedCeilingTelemetry:
     """Audit L9: supported_fee_ceiling_ppm was populated only when the cap
     CLIPPED that cycle — a cap that existed but didn't bind reported None,
@@ -684,6 +1018,11 @@ class TestSleepEntryBurst:
         ts_state.last_update = now - 7200
         ts_state.last_revenue_rate = 0.0  # silence until now
         ts_state.stable_cycles = FeeController.STABLE_CYCLES_REQUIRED
+        # Deterministic sampling (pytest-randomly reseeds `random` per run);
+        # update_posterior stays REAL — the test asserts the observation.
+        ts_state.thompson.sample_fee_contextual = lambda *a, **k: 300
+        ts_state.thompson.sample_fee = lambda *a, **k: 300
+        ts_state.pid.calculate_multiplier = lambda **k: 1.0
         obs_before = len(ts_state.thompson.observations)
 
         result = fc._adjust_channel_fee(

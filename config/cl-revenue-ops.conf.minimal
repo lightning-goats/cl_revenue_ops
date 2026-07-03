@@ -10,9 +10,10 @@ revenue-ops-max-fee-ppm=2500
 revenue-ops-fee-interval=3600
 # Use "conservative" if this node has sparse routing traffic.
 revenue-ops-fee-profile=active
-# Keep our target below the cheapest active competitor on the same destination.
-revenue-ops-fee-market-boundary-enabled=true
-revenue-ops-fee-market-boundary-margin-ratio=0.05
+# NOTE: the fee-market-boundary feature is DEPRECATED (providers are
+# hard-disabled after a production incident); its options are inert and
+# kept only for config back-compat. Competitive pricing is handled by the
+# neighbor-median undercut/match/premium market modes instead.
 
 # Fee defense
 revenue-ops-vegas-reflex=true
