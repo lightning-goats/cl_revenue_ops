@@ -337,6 +337,13 @@ class GaussianThompsonState:
     # posterior_mean has fallen below ZERO_PROBE_FLOOR_FRAC of the fee at
     # which the zero-run started (the state doesn't know the channel floor;
     # downstream rails still clamp regardless).
+    # SL-4 (2026-07-03 audit): relative uncertainty floor for the legacy
+    # Normal-Normal path. An absolute MIN_STD of 10 on a converged 800 ppm
+    # channel sat below every exploration threshold (undercut explore >=100,
+    # upward probe >=60) — the channel went revenue-blind with no mechanism
+    # left to ever test a different price. 4% of the posterior mean keeps
+    # converged channels minimally curious at every fee level.
+    REL_MIN_STD_FRAC = 0.04
     ZERO_REVENUE_STREAK_THRESHOLD = 4   # Consecutive zero windows before probing
     ZERO_PROBE_STEP_FRAC = 0.9          # Probe at 90% of the current fee
     ZERO_PROBE_FLOOR_FRAC = 0.3         # Cap on cumulative downward influence
@@ -893,6 +900,22 @@ class GaussianThompsonState:
 
         # Recompute posterior
         self._recompute_posterior()
+
+    def is_meaningful_rate(self, revenue_rate: float, now: Optional[int] = None) -> bool:
+        """Same trickle classification update_posterior uses for streaks.
+
+        L8 (2026-07-03 audit): the zero-flow guard's silence test must agree
+        with the streak's — a trickle extended the streak (silence for
+        descent) while bypassing the guard (activity for the raise-freeze).
+        """
+        try:
+            rate = float(revenue_rate)
+        except (TypeError, ValueError):
+            return False
+        if now is None:
+            now = int(time.time())
+        ref = self._effective_positive_rate_ref(now)
+        return rate > 0 and rate >= self.TRICKLE_RESET_FRAC * ref
 
     def _effective_positive_rate_ref(self, now: int) -> float:
         """Positive-rate reference with 7-day half-life decay applied."""
@@ -1657,7 +1680,12 @@ class GaussianThompsonState:
             self.posterior_mean = (
                 prior_precision * self.prior_mean_fee + data_precision * obs_mean
             ) / posterior_precision
-            self.posterior_std = max(self.MIN_STD, 1.0 / math.sqrt(posterior_precision))
+            # SL-4: relative floor — see REL_MIN_STD_FRAC.
+            self.posterior_std = max(
+                float(self.MIN_STD),
+                self.REL_MIN_STD_FRAC * abs(self.posterior_mean),
+                1.0 / math.sqrt(posterior_precision),
+            )
         else:
             self.posterior_mean = float(self.prior_mean_fee)
             self.posterior_std = float(self.prior_std_fee)
@@ -2854,6 +2882,12 @@ class FeeController:
     # clamping DTS's sampled target down to the undercut anchor locks in
     # a low-confidence guess. Let DTS explore until the posterior tightens.
     UNDERCUT_EXPLORATION_STD_THRESHOLD = 100.0
+    # M5 (2026-07-03 audit): below this outbound ratio the channel's
+    # remaining liquidity is scarce inventory — the PID prices it at a
+    # premium to slow the drain, and the market undercut clamp must not
+    # override that with a below-median price (which accelerated the drain
+    # and then paid rebalance costs to refill).
+    UNDERCUT_MIN_OUTBOUND_RATIO = 0.35
 
     # =============================================================================
     # GOSSIP REFRESH FOR FROZEN CHANNEL DETECTION
@@ -3814,23 +3848,43 @@ class FeeController:
         except Exception:
             return 0.10  # Default on error
 
-    def _get_channel_rebalance_cost_ppm(self, channel_id: str) -> int:
-        """Get the effective per-PPM rebalance cost for a channel.
+    def _get_channel_rebalance_cost_ppm(
+        self, channel_id: str, flow_state: str = ""
+    ) -> int:
+        """Effective per-PPM rebalance cost for a channel's REFILLS.
 
-        Uses the most recent successful rebalance to calculate what fee
-        is needed to break even. Returns 0 if no rebalance history.
+        M-1 (2026-07-03 audit): reads the dest-only rebalance_costs ledger
+        (windowed aggregate), like the cost floor does. The previous
+        get_last_rebalance_cost read matched source OR dest in
+        rebalance_history, so the DONOR channel of a rebalance was nudged
+        up toward another channel's refill cost — raising the price of
+        exactly the channel the system wants to drain — and a single
+        expensive rebalance jerked the value (LIMIT 1). Sink/dormant
+        channels don't pay outbound rebalance costs and are exempt,
+        mirroring _get_rebalance_cost_floor. Returns 0 when inapplicable.
         """
+        if flow_state in ("sink", "dormant"):
+            return 0
         if not self.database:
             return 0
         try:
-            row = self.database.get_last_rebalance_cost(channel_id)
-            if not row:
+            cutoff = int(time.time()) - (
+                self.REBALANCE_FLOOR_WINDOW_DAYS * 86400
+            )
+            try:
+                history = self.database.get_channel_cost_history(
+                    channel_id, since_timestamp=cutoff
+                )
+            except TypeError:
+                history = self.database.get_channel_cost_history(channel_id)
+            recent = [
+                c for c in history if int(c.get("timestamp", 0) or 0) >= cutoff
+            ]
+            total_cost = sum(int(c.get("cost_sats", 0) or 0) for c in recent)
+            total_volume = sum(int(c.get("amount_sats", 0) or 0) for c in recent)
+            if total_volume <= 0 or total_cost <= 0:
                 return 0
-            cost_sats = int(row.get("cost_sats", 0) or 0)
-            amount_sats = int(row.get("amount_sats", 0) or 0)
-            if amount_sats <= 0 or cost_sats <= 0:
-                return 0
-            cost_ppm = int((cost_sats * 1_000_000) / amount_sats)
+            cost_ppm = int((total_cost * 1_000_000) / total_volume)
             # Cap at 5000 PPM to prevent astronomical values from tiny rebalances
             return min(5000, cost_ppm)
         except Exception:
@@ -5681,6 +5735,7 @@ class FeeController:
         earning_anchor_ppm: Optional[float] = None,
         guard_streak: Optional[int] = None,
         downshift_streak: Optional[int] = None,
+        rate_is_meaningful: Optional[bool] = None,
     ) -> Tuple[int, Optional[str]]:
         """Prevent stale DTS belief from raising fees during current silence."""
         try:
@@ -5692,6 +5747,13 @@ class FeeController:
             rate = float(revenue_rate)
         except (TypeError, ValueError, OverflowError):
             return int(target_fee), None
+
+        # L8 (2026-07-03 audit): an economically-dead trickle already
+        # extends the zero-revenue streak; it must count as silence for the
+        # raise-freeze too, or the guard's two silence definitions disagree.
+        if rate_is_meaningful is False and rate > 0:
+            rate = 0.0
+            forwards = 0
 
         guard_thresh = (
             int(guard_streak) if guard_streak else self.ZERO_FLOW_GUARD_STREAK
@@ -6172,7 +6234,9 @@ class FeeController:
         # over time — but NOT by setting a hard floor that kills traffic.
         # Instead, the rebalance cost biases the DTS target upward (applied
         # later in the pipeline as a soft nudge, not a hard clamp).
-        rebalance_cost_ppm = self._get_channel_rebalance_cost_ppm(channel_id)
+        rebalance_cost_ppm = self._get_channel_rebalance_cost_ppm(
+            channel_id, flow_state=flow_state
+        )
 
         # =====================================================================
         # Issue #20: Flow-Based Ceiling Reduction
@@ -6497,6 +6561,20 @@ class FeeController:
                 if rate_change_ratio > self.VOLATILITY_THRESHOLD:
                     volatility_reset = True
                     ts_state.stable_cycles = 0
+            elif (
+                ts_state.last_update > 0
+                and ts_state.last_revenue_rate <= 0
+                and current_revenue_rate > 0
+            ):
+                # M1 (2026-07-03 audit): revenue REAPPEARING after silence is
+                # an (infinite-%) demand change, not market calm. The old
+                # last_revenue_rate > 0 gate left rate_change_ratio at 0.0,
+                # so the burst read as "stable" — the channel entered sleep
+                # at the exact moment a routing wave arrived and the burst
+                # observation was discarded before update_posterior.
+                volatility_reset = True
+                ts_state.stable_cycles = 0
+                rate_change_ratio = self.VOLATILITY_THRESHOLD + 1.0
 
             # Check for sleep mode entry
             if ts_state.last_update > 0 and rate_change_ratio < self.STABILITY_THRESHOLD:
@@ -6813,7 +6891,15 @@ class FeeController:
                         ts_state and ts_state.thompson and
                         ts_state.thompson.posterior_std >= self.UNDERCUT_EXPLORATION_STD_THRESHOLD
                     )
-                    if undercut_target <= floor_ppm:
+                    if outbound_ratio < self.UNDERCUT_MIN_OUTBOUND_RATIO:
+                        # M5: scarce inventory keeps its PID premium — never
+                        # undercut a channel that is nearly drained.
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... competition_aware skipped "
+                            f"(depleted: outbound_ratio={outbound_ratio:.2f})",
+                            level='debug'
+                        )
+                    elif undercut_target <= floor_ppm:
                         self.plugin.log(
                             f"FEE: {channel_id[:16]}... competition_aware ignored "
                             f"(undercut_target={undercut_target}ppm <= floor={floor_ppm}ppm)",
@@ -6854,7 +6940,17 @@ class FeeController:
                         ts_state and ts_state.thompson and
                         ts_state.thompson.posterior_std >= self.UNDERCUT_EXPLORATION_STD_THRESHOLD
                     )
-                    if undercut_target <= floor_ppm:
+                    if outbound_ratio < self.UNDERCUT_MIN_OUTBOUND_RATIO:
+                        # M5: scarce inventory keeps its PID premium — never
+                        # undercut a channel that is nearly drained. The
+                        # undercut posterior nudge below is skipped too: don't
+                        # teach the model below-median prices while starving.
+                        self.plugin.log(
+                            f"FEE: {channel_id[:16]}... undercut skipped "
+                            f"(depleted: outbound_ratio={outbound_ratio:.2f})",
+                            level='debug'
+                        )
+                    elif undercut_target <= floor_ppm:
                         self.plugin.log(
                             f"FEE: {channel_id[:16]}... competitive undercut ignored "
                             f"(undercut_target={undercut_target}ppm <= floor={floor_ppm}ppm)",
@@ -6882,6 +6978,7 @@ class FeeController:
                     # Posterior bias (undercut mode only — preserves prior behavior)
                     if (
                         undercut_target > floor_ppm
+                        and outbound_ratio >= self.UNDERCUT_MIN_OUTBOUND_RATIO
                         and sparse_data_conservative
                         and ts_state
                         and ts_state.thompson
@@ -7033,6 +7130,12 @@ class FeeController:
                 gap_ema_hours=ts_state.thompson.meaningful_gap_ema_hours,
                 cycle_hours=cycle_hours,
             )
+            try:
+                rate_is_meaningful = ts_state.thompson.is_meaningful_rate(
+                    current_revenue_rate
+                )
+            except Exception:
+                rate_is_meaningful = None
             blended_target_ppm, zero_flow_guard_reason = self._apply_zero_flow_ratchet_guard(
                 current_fee=current_fee_ppm,
                 target_fee=blended_target_ppm,
@@ -7044,6 +7147,7 @@ class FeeController:
                 earning_anchor_ppm=earning_anchor_ppm,
                 guard_streak=guard_streak,
                 downshift_streak=downshift_streak,
+                rate_is_meaningful=rate_is_meaningful,
             )
             if zero_flow_guard_reason:
                 zero_flow_guard_target_ppm = blended_target_ppm

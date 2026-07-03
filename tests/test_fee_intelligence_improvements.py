@@ -94,38 +94,69 @@ class TestNetworkInformedPriors:
 
 
 class TestRebalanceCostFloor:
-    def test_cost_ppm_from_rebalance(self, mock_plugin, mock_config, mock_database):
-        mock_database.get_last_rebalance_cost.return_value = {
-            "cost_sats": 500, "amount_sats": 1_000_000
-        }
+    """2026-07-03 audit M-1: the nudge cost read used get_last_rebalance_cost,
+    which matches source OR dest in rebalance_history — so after a rebalance
+    A->B, the DONOR channel A (often a sink the system wants to drain) was
+    nudged up toward another channel's refill cost, and a single expensive
+    rebalance jerked the value. The read now mirrors the floor path: the
+    dest-only rebalance_costs ledger, windowed aggregate, sink/dormant exempt."""
+
+    def _history(self, cost=500, amount=1_000_000, age_seconds=3600, n=1):
+        now = int(time.time())
+        return [
+            {"cost_sats": cost, "amount_sats": amount,
+             "timestamp": now - age_seconds}
+            for _ in range(n)
+        ]
+
+    def test_cost_ppm_from_dest_ledger(self, mock_plugin, mock_config, mock_database):
+        mock_database.get_channel_cost_history.return_value = self._history()
         fc = FeeController(mock_plugin, mock_config, mock_database)
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 500  # 500 sats / 1M sats * 1M = 500 PPM
+        mock_database.get_last_rebalance_cost.assert_not_called()
+
+    def test_cost_ppm_aggregates_window(self, mock_plugin, mock_config, mock_database):
+        """A windowed aggregate, not a single most-recent sample."""
+        now = int(time.time())
+        mock_database.get_channel_cost_history.return_value = [
+            {"cost_sats": 100, "amount_sats": 1_000_000, "timestamp": now - 3600},
+            {"cost_sats": 300, "amount_sats": 1_000_000, "timestamp": now - 7200},
+            # Ancient entry outside the window must not count
+            {"cost_sats": 5_000, "amount_sats": 1_000, "timestamp": now - 90 * 86400},
+        ]
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
+        assert cost == 200  # (100+300) / 2M * 1M
+
+    def test_cost_ppm_sink_and_dormant_exempt(self, mock_plugin, mock_config, mock_database):
+        """Sinks fill from inbound and dormant channels have no flow to
+        recover against — nudging their price up opposes the drain logic."""
+        mock_database.get_channel_cost_history.return_value = self._history()
+        fc = FeeController(mock_plugin, mock_config, mock_database)
+        assert fc._get_channel_rebalance_cost_ppm("123x1x0", flow_state="sink") == 0
+        assert fc._get_channel_rebalance_cost_ppm("123x1x0", flow_state="dormant") == 0
 
     def test_cost_ppm_zero_when_no_history(self, mock_plugin, mock_config, mock_database):
-        mock_database.get_last_rebalance_cost.return_value = None
+        mock_database.get_channel_cost_history.return_value = []
         fc = FeeController(mock_plugin, mock_config, mock_database)
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 0
 
     def test_cost_ppm_zero_on_error(self, mock_plugin, mock_config, mock_database):
-        mock_database.get_last_rebalance_cost.side_effect = Exception("DB error")
+        mock_database.get_channel_cost_history.side_effect = Exception("DB error")
         fc = FeeController(mock_plugin, mock_config, mock_database)
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 0
 
     def test_cost_ppm_handles_zero_amount(self, mock_plugin, mock_config, mock_database):
-        mock_database.get_last_rebalance_cost.return_value = {
-            "cost_sats": 500, "amount_sats": 0
-        }
+        mock_database.get_channel_cost_history.return_value = self._history(amount=0)
         fc = FeeController(mock_plugin, mock_config, mock_database)
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 0
 
     def test_cost_ppm_handles_none_cost(self, mock_plugin, mock_config, mock_database):
-        mock_database.get_last_rebalance_cost.return_value = {
-            "cost_sats": None, "amount_sats": 1_000_000
-        }
+        mock_database.get_channel_cost_history.return_value = self._history(cost=None)
         fc = FeeController(mock_plugin, mock_config, mock_database)
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 0

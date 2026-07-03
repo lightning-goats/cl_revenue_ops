@@ -627,6 +627,44 @@ class TestUnroutableWindowGate:
         assert len(ts_state.thompson.observations) == obs_before + 1
 
 
+class TestSleepEntryBurst:
+    """Audit M1: rate_change_ratio was only computed when last_revenue_rate
+    > 0, so revenue REAPPEARING after silence (0 -> positive, literally an
+    infinite % change) read as '0% change, stable' — the channel entered
+    sleep at the exact moment a routing wave arrived, and the burst window's
+    observation was discarded before update_posterior."""
+
+    def test_revenue_burst_after_silence_blocks_sleep_and_is_learned(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_volume_since.return_value = 500_000
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+
+        ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=150)
+        now = int(time.time())
+        ts_state.last_update = now - 7200
+        ts_state.last_revenue_rate = 0.0  # silence until now
+        ts_state.stable_cycles = FeeController.STABLE_CYCLES_REQUIRED
+        obs_before = len(ts_state.thompson.observations)
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(150), cfg=cfg,
+        )
+
+        assert ts_state.is_sleeping is False, (
+            "channel slept through the burst it should be repricing for"
+        )
+        assert ts_state.stable_cycles == 0, "0->positive is volatility, not calm"
+        assert len(ts_state.thompson.observations) == obs_before + 1, (
+            "the burst window's observation was discarded"
+        )
+        assert result is not None
+
+
 class TestExplorationWindowsLearned:
     """Audit M6: the low_fee_exploration branch observed real forwards at
     the discovery fee and then discarded the observation — the controller

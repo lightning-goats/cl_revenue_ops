@@ -1200,6 +1200,38 @@ class TestZeroFlowRatchetGuard:
         assert guarded == 120
         assert reason is None
 
+    def test_trickle_rate_counts_as_silence_for_guard(self, mock_plugin, mock_database):
+        """2026-07-03 audit L8: a trickle (rev < 10% of the positive-rate
+        reference) extends the zero-revenue streak but used to bypass the
+        guard entirely via `rate != 0` — silence for descent bookkeeping,
+        activity for the raise-freeze. The two definitions must agree."""
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=500, target_fee=800, min_fee=100,
+            zero_revenue_streak=FeeController.ZERO_FLOW_GUARD_STREAK,
+            forwards_since_update=2,
+            revenue_rate=0.3,
+            supported_fee_ceiling=None,
+            rate_is_meaningful=False,
+        )
+        assert guarded == 500
+        assert reason == "zero_flow_ratchet_guard"
+
+    def test_meaningful_rate_still_bypasses_guard(self, mock_plugin, mock_database):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=500, target_fee=800, min_fee=100,
+            zero_revenue_streak=200,
+            forwards_since_update=2,
+            revenue_rate=50.0,
+            supported_fee_ceiling=None,
+            rate_is_meaningful=True,
+        )
+        assert guarded == 800
+        assert reason is None
+
     def test_downshift_cap_rate_limited_between_steps(self, mock_plugin, mock_database):
         """2026-07-03 nexus-01 floor-pinning: once streak >= 24 the 0.85x cap
         used to re-apply EVERY 30-min cycle (-15%/cycle), crushing any sparse
@@ -1498,6 +1530,89 @@ class TestFleetSiblingExclusion:
         # Without the 50M sibling in the pool, we (2M) outrank every real
         # competitor (1M) -> rank 0.0 -> base undercut 5%.
         assert pct == pytest.approx(0.05)
+
+
+class TestUndercutInventoryGate:
+    """2026-07-03 audit M5: the market undercut clamp overrode the PID
+    scarcity premium with no inventory condition — a depleted channel
+    (5% outbound) computed a x2.0 PID premium, then had it thrown away
+    and priced BELOW the market median, accelerating its own drain and
+    then paying rebalance costs to refill. Scarce outbound must not be
+    undercut-priced."""
+
+    def _setup(self, fc, cfg, *, spendable_msat, current_fee=112):
+        peer_id = "02" + "d4" * 32
+        channel_id = "900000x1x0"
+        now_ts = int(time.time())
+        channels = [
+            {"source": "our-node", "destination": peer_id, "active": True,
+             "fee_per_millionth": current_fee, "satoshis": 2_000_000,
+             "last_update": now_ts},
+        ]
+        for idx in range(3):
+            channels.append({
+                "source": f"competitor-{idx}", "destination": peer_id,
+                "active": True, "fee_per_millionth": 100,
+                "satoshis": 1_000_000, "last_update": now_ts,
+            })
+        fc.data_service = MagicMock()
+        fc.data_service.get_node_id.return_value = "our-node"
+        fc.data_service.get_channels.return_value = {"channels": channels}
+        fc._our_node_id = "our-node"
+        fc._calculate_floor = MagicMock(return_value=cfg.min_fee_ppm)
+        fc._get_rebalance_cost_floor = MagicMock(return_value=None)
+        fc._get_channel_rebalance_cost_ppm = MagicMock(return_value=0)
+        fc.set_channel_fee = MagicMock(
+            side_effect=lambda _cid, fee_ppm, **_kw: {
+                "success": True, "fee_ppm": fee_ppm,
+            }
+        )
+        ts_state = fc._get_channel_fee_state(
+            channel_id, peer_id, actual_fee_ppm=current_fee
+        )
+        ts_state.thompson.sample_fee_contextual = MagicMock(return_value=300)
+        ts_state.thompson.sample_fee = MagicMock(return_value=300)
+        ts_state.thompson.update_posterior = MagicMock()
+        ts_state.thompson.update_contextual = MagicMock()
+        ts_state.thompson.posterior_std = 50.0  # confident -> clamp eligible
+        ts_state.pid.calculate_multiplier = MagicMock(return_value=2.0)
+        info = {
+            "fee_proportional_millionths": current_fee,
+            "fee_base_msat": 0,
+            "capacity": 2_000_000,
+            "spendable_msat": spendable_msat,
+            "opener": "local",
+        }
+        return channel_id, peer_id, info
+
+    def test_depleted_channel_not_undercut_clamped(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id, peer_id, info = self._setup(
+            fc, cfg, spendable_msat="100000000msat"  # 5% outbound
+        )
+        result = fc._adjust_channel_fee(
+            channel_id, peer_id,
+            {"state": "sink", "forward_count": 10}, info, cfg=cfg,
+        )
+        assert result is not None
+        assert result.new_fee_ppm > 112, (
+            "depleted channel was market-undercut instead of keeping its "
+            "PID scarcity premium"
+        )
+
+    def test_healthy_channel_still_undercut_clamped(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        channel_id, peer_id, info = self._setup(
+            fc, cfg, spendable_msat="1000000000msat"  # 50% outbound
+        )
+        result = fc._adjust_channel_fee(
+            channel_id, peer_id,
+            {"state": "balanced", "forward_count": 10}, info, cfg=cfg,
+        )
+        assert result is None or result.new_fee_ppm <= 112, (
+            "healthy-inventory channel should still be clamped toward the "
+            "market undercut target"
+        )
 
 
 class TestMarketBoundaryGuard:

@@ -255,6 +255,19 @@ class TestTrickleGuard:
         feed_windows(st, fee=100, rate=2.0, n=1)
         assert st.zero_revenue_streak == 0
 
+    def test_is_meaningful_rate_matches_trickle_classification(self, fake_time):
+        """L8 (2026-07-03): the guard call site needs the SAME meaningful
+        test update_posterior uses for streak accounting."""
+        st = GaussianThompsonState()
+        st.positive_rate_ref = 100.0
+        st.positive_rate_ref_ts = int(FakeTime.t)
+        assert st.is_meaningful_rate(1.0) is False   # trickle
+        assert st.is_meaningful_rate(50.0) is True   # real revenue
+        assert st.is_meaningful_rate(0.0) is False
+
+        fresh = GaussianThompsonState()
+        assert fresh.is_meaningful_rate(0.5) is True  # first revenue counts
+
     def test_positive_rate_ref_round_trips(self, fake_time):
         st = self._steady_state()
         assert st.positive_rate_ref > 0
@@ -525,6 +538,35 @@ class TestZeroProbeExclusionFromFit:
         assert poisoned is None or poisoned["discovery_type"] != "high_revenue", (
             "probe zeros manufactured a fake high_revenue fleet discovery"
         )
+
+
+# =============================================================================
+# 2026-07-03 audit SL-4: converged channels must keep relative uncertainty
+# =============================================================================
+
+class TestRelativeUncertaintyFloor:
+    """Once a channel's observations sit within <5 ppm, the legacy
+    Normal-Normal path collapsed posterior_std to the absolute MIN_STD (10),
+    below every exploration threshold (undercut explore >=100, upward probe
+    >=60). A converged high-fee channel became revenue-blind: no mechanism
+    left could ever test a different price. The std floor must scale with
+    the fee level."""
+
+    def test_converged_channel_keeps_relative_std(self, fake_time):
+        st = GaussianThompsonState()
+        feed_windows(st, fee=800, rate=50.0, n=40)  # single fee -> legacy path
+        assert st.posterior_std >= (
+            0.99 * GaussianThompsonState.REL_MIN_STD_FRAC * st.posterior_mean
+        ), (
+            f"std {st.posterior_std:.1f} collapsed below the relative floor "
+            f"at mean {st.posterior_mean:.0f}"
+        )
+
+    def test_low_fee_channel_keeps_absolute_floor(self, fake_time):
+        """At low fee levels the absolute MIN_STD still governs."""
+        st = GaussianThompsonState()
+        feed_windows(st, fee=50, rate=5.0, n=40)
+        assert st.posterior_std >= GaussianThompsonState.MIN_STD
 
 
 # =============================================================================
