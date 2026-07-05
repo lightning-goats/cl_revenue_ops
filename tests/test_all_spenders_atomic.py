@@ -808,6 +808,12 @@ RPC_ALIAS_ALLOWLIST = {
         "ThreadSafeRpcProxy(...)). This alias is pure transport plumbing, not a spend "
         "decision, and cannot hide a money RPC from the scanner (P4-028)."
     ),
+    ("lnplus_swaps.py", "__init__", FORM_ASSIGN_HANDLE, "_rpc"): (
+        "LNPlusClient.__init__ binds ``self._rpc = rpc`` to store the rpc handle "
+        "for internal use in authentication. The client only calls signmessage on it, "
+        "which is not a money RPC, never issues money RPCs directly, and cannot hide "
+        "a money RPC from the scanner. This is pure client-internal state storage."
+    ),
 }
 
 

@@ -120,3 +120,77 @@ class TestLnplusConfig:
         cfg = Config()
         result = cfg.update_runtime(db, "lnplus_swap_preference_margin", "-5")
         assert "error" in result or result.get("status") != "success"
+
+
+import json as _json
+from unittest.mock import patch
+
+from modules.lnplus_swaps import (
+    LNPlusClient, LNPlusError, _valid_pubkey, _parse_ts,
+)
+
+
+class _FakeHTTPResponse:
+    def __init__(self, payload):
+        self._raw = _json.dumps(payload).encode()
+    def read(self, n=-1):
+        out, self._raw = self._raw[:n if n and n > 0 else len(self._raw)], b""
+        return out
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+
+def _make_client(urlopen_payloads):
+    """urlopen_payloads: list of payloads returned per successive HTTP call."""
+    plugin = MagicMock()
+    rpc = MagicMock()
+    rpc.signmessage.return_value = {"zbase": "d75qtmgijm79rpooshmgzjwji9gj7dsdat8remuskyjp9oq0ygdd"}
+    client = LNPlusClient(plugin, rpc)
+    responses = [_FakeHTTPResponse(p) for p in urlopen_payloads]
+    patcher = patch("modules.lnplus_swaps.urllib.request.urlopen",
+                    side_effect=responses)
+    return client, rpc, patcher
+
+
+class TestLnplusClient:
+    def test_helpers(self):
+        assert _valid_pubkey("02" + "ab" * 32)
+        assert not _valid_pubkey("xx")
+        assert not _valid_pubkey(None)
+        assert _parse_ts("2026-08-01T00:00:00Z") == 1785542400
+        assert _parse_ts(1785542400) == 1785542400
+        assert _parse_ts("garbage") is None
+
+    def test_auth_flow_signs_challenge(self):
+        challenge = {"message": "lnplus-auth-abc123", "expires_at": "2099-01-01T00:00:00Z"}
+        client, rpc, patcher = _make_client([challenge, {"pending": [], "opening": [], "completed": []}])
+        with patcher:
+            result = client.get_my_swaps()
+        rpc.signmessage.assert_called_once_with("lnplus-auth-abc123")
+        assert result["pending"] == []
+
+    def test_auth_rejects_suspicious_challenge(self):
+        # Never sign something that looks like an invoice.
+        challenge = {"message": "lnbc1500n1p...", "expires_at": "2099-01-01T00:00:00Z"}
+        client, rpc, patcher = _make_client([challenge])
+        with patcher:
+            try:
+                client.get_my_swaps()
+                assert False, "should refuse to sign invoice-like challenge"
+            except LNPlusError:
+                pass
+        rpc.signmessage.assert_not_called()
+
+    def test_http_error_wrapped(self):
+        client = LNPlusClient(MagicMock(), MagicMock())
+        import urllib.error
+        err = urllib.error.HTTPError("u", 422, "Unprocessable", {}, None)
+        err.read = lambda n=-1: b'{"errors": {"id": ["already applied"]}}'
+        with patch("modules.lnplus_swaps.urllib.request.urlopen", side_effect=err):
+            try:
+                client.get_swap("s1")
+                assert False
+            except LNPlusError as e:
+                assert e.http_status == 422
