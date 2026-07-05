@@ -194,3 +194,13 @@ class TestLnplusClient:
                 assert False
             except LNPlusError as e:
                 assert e.http_status == 422
+
+    def test_get_swap_id_cannot_escape_path(self):
+        client = LNPlusClient(MagicMock(), MagicMock())
+        captured = {}
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            return _FakeHTTPResponse({"id": "x"})
+        with patch("modules.lnplus_swaps.urllib.request.urlopen", side_effect=fake_urlopen):
+            client.get_swap("../../evil")
+        assert "/api/2/get_swap/id=..%2F..%2Fevil" in captured["url"]

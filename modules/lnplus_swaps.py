@@ -13,12 +13,10 @@ executes obligations safely.
 
 import json
 import re
-import time
-import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 BASE_URL = "https://lightningnetwork.plus/api/2"
@@ -55,7 +53,7 @@ class LNPlusClient:
 
     def __init__(self, plugin, rpc, base_url: str = BASE_URL, timeout_seconds: int = 30):
         self._plugin = plugin
-        self._rpc = rpc
+        self.rpc = rpc
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
 
@@ -95,7 +93,7 @@ class LNPlusClient:
         challenge = self._request("get_message")
         message = challenge.get("message") if isinstance(challenge, dict) else None
         self._validate_challenge(message)
-        signed = self._rpc.signmessage(message)
+        signed = self.rpc.signmessage(message)
         signature = signed.get("zbase") if isinstance(signed, dict) else None
         if not signature:
             raise LNPlusError("signmessage returned no zbase signature")
@@ -122,7 +120,7 @@ class LNPlusClient:
         return swaps if isinstance(swaps, list) else []
 
     def get_swap(self, swap_id) -> Dict:
-        return self._request(f"get_swap/id={urllib.parse.quote(str(swap_id))}")
+        return self._request(f"get_swap/id={urllib.parse.quote(str(swap_id), safe='')}")
 
     def get_my_swaps(self) -> Dict:
         result = self._request("get_my_swaps", self._auth_params(), method="POST")
