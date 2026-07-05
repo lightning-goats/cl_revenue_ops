@@ -12,6 +12,7 @@ sys.modules['pyln.client'] = mock_pyln
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.database import Database
+from modules.config import Config
 
 
 def _make_db():
@@ -82,3 +83,40 @@ class TestLnplusSwapTables:
         assert peer["defections"] == 1
         assert peer["ratings_given_negative"] == 1
         assert peer["ratings_given_positive"] == 0
+
+
+class TestLnplusConfig:
+    def test_defaults(self):
+        cfg = Config()
+        assert cfg.lnplus_swaps_enabled is True
+        assert cfg.lnplus_execute_applications is True
+        assert cfg.lnplus_swap_preference_margin == 0.2
+        assert cfg.lnplus_max_duration_months == 3
+        assert cfg.lnplus_min_peer_positive_ratings == 5
+        assert cfg.lnplus_max_participants == 4
+        assert cfg.lnplus_apply_feerate_ceiling == 5000
+        assert cfg.lnplus_pending_timeout_days == 7
+        assert cfg.lnplus_inbound_credit_factor == 0.5
+        assert cfg.lnplus_fleet_pubkeys == ''
+        assert cfg.lnplus_watcher_interval == 3600
+
+    def test_public_runtime_keys(self):
+        cfg = Config()
+        for key in ("lnplus_swaps_enabled", "lnplus_execute_applications",
+                    "lnplus_swap_preference_margin", "lnplus_inbound_credit_factor",
+                    "lnplus_apply_feerate_ceiling", "lnplus_max_duration_months",
+                    "lnplus_min_peer_positive_ratings"):
+            assert Config.is_public_runtime_key(key), key
+
+    def test_runtime_update_roundtrip(self):
+        db = _make_db()
+        cfg = Config()
+        result = cfg.update_runtime(db, "lnplus_execute_applications", "false")
+        assert result.get("status") == "success"
+        assert cfg.lnplus_execute_applications is False
+
+    def test_margin_range_rejected(self):
+        db = _make_db()
+        cfg = Config()
+        result = cfg.update_runtime(db, "lnplus_swap_preference_margin", "-5")
+        assert "error" in result or result.get("status") != "success"
