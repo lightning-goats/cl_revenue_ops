@@ -37,6 +37,7 @@ from modules import flow_analysis as flow_analysis_mod
 from modules.fee_controller import FeeController
 from modules.rebalancer import EVRebalancer
 from modules.config import Config
+from modules.growth_budget import compute_growth_budget_status
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
@@ -373,6 +374,10 @@ def _snapshot_peers_once():
 _INIT_NUMERIC_RANGES = {
     'rpc_timeout_seconds': (1, 300),
     'daily_budget_sats': (0, 10_000_000),
+    'growth_budget_earned_fraction': (0.0, 1.0),
+    'growth_budget_experiment_fraction': (0.0, 1.0),
+    'growth_budget_max_extra_sats': (0, 1_000_000),
+    'growth_budget_hard_ceiling_sats': (0, 10_000_000),
     'weekly_budget_sats': (0, 70_000_000),
     'reputation_decay': (0.0, 1.0),
     'htlc_congestion_threshold': (0.0, 1.0),
@@ -1299,6 +1304,36 @@ plugin.add_option(
     name='revenue-ops-daily-budget-sats',
     default='5000',
     description='Max rebalancing fees to spend in 24 hours (default: 5000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-growth-budget-enabled',
+    default='false',
+    description='Enable dynamic growth budget: base daily budget plus bounded earned/growth credit (default: false)'
+)
+
+plugin.add_option(
+    name='revenue-ops-growth-budget-earned-fraction',
+    default='0.25',
+    description='Fraction of trailing net profit that can raise the effective daily budget when growth budget is enabled (default: 0.25)'
+)
+
+plugin.add_option(
+    name='revenue-ops-growth-budget-experiment-fraction',
+    default='0.10',
+    description='Fraction of trailing net profit available for fleet-learned growth experiments (default: 0.10)'
+)
+
+plugin.add_option(
+    name='revenue-ops-growth-budget-max-extra-sats',
+    default='2000',
+    description='Maximum extra sats unlocked by growth experiment credit per budget window (default: 2000)'
+)
+
+plugin.add_option(
+    name='revenue-ops-growth-budget-hard-ceiling-sats',
+    default='10000',
+    description='Local hard ceiling for dynamic effective daily budget; fleet hints cannot exceed this (default: 10000)'
 )
 
 plugin.add_option(
@@ -2363,6 +2398,21 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
+        growth_budget_enabled=options.get(
+            'revenue-ops-growth-budget-enabled', 'false'
+        ).lower() in ('true', '1', 'yes'),
+        growth_budget_earned_fraction=_safe_float_opt(
+            'revenue-ops-growth-budget-earned-fraction', '0.25'
+        ),
+        growth_budget_experiment_fraction=_safe_float_opt(
+            'revenue-ops-growth-budget-experiment-fraction', '0.10'
+        ),
+        growth_budget_max_extra_sats=_safe_int_opt(
+            'revenue-ops-growth-budget-max-extra-sats', '2000'
+        ),
+        growth_budget_hard_ceiling_sats=_safe_int_opt(
+            'revenue-ops-growth-budget-hard-ceiling-sats', '10000'
+        ),
         diagnostic_rebalance_max_fee_sats=_safe_int_opt(
             'revenue-ops-diagnostic-rebalance-max-fee-sats', '400'
         ),
@@ -7453,10 +7503,34 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
     reserved_total = sum(max(0, int(v or 0)) for v in reserved_by_category.values())
 
     daily_budget_sats = max(0, int(getattr(cfg, "daily_budget_sats", 0) or 0))
-    effective_budget_sats = daily_budget_sats
     net_profit_sats = int(revenue_sats - actual_total)
+    fleet_growth_prior = None
+    if bool(getattr(cfg, "growth_budget_enabled", False)) and hive_hints is not None:
+        try:
+            getter = getattr(hive_hints, "get_growth_spend_prior", None)
+            if callable(getter):
+                fleet_growth_prior = getter(action_type="rebalance")
+        except Exception as exc:
+            try:
+                plugin.log(f"growth budget prior unavailable: {exc}", level="debug")
+            except Exception:
+                pass
+            fleet_growth_prior = None
+    growth_budget = compute_growth_budget_status(
+        base_budget_sats=daily_budget_sats,
+        net_profit_sats=net_profit_sats,
+        actual_spent_sats=actual_total,
+        reserved_sats=reserved_total,
+        enabled=bool(getattr(cfg, "growth_budget_enabled", False)),
+        earned_fraction=float(getattr(cfg, "growth_budget_earned_fraction", 0.25) or 0.0),
+        growth_fraction=float(getattr(cfg, "growth_budget_experiment_fraction", 0.10) or 0.0),
+        growth_max_extra_sats=int(getattr(cfg, "growth_budget_max_extra_sats", 0) or 0),
+        hard_ceiling_sats=int(getattr(cfg, "growth_budget_hard_ceiling_sats", daily_budget_sats) or daily_budget_sats),
+        fleet_prior=fleet_growth_prior,
+    )
+    effective_budget_sats = int(growth_budget.get("effective_budget_sats", daily_budget_sats) or 0)
 
-    remaining_sats = max(0, int(effective_budget_sats) - actual_total - reserved_total)
+    remaining_sats = int(growth_budget.get("remaining_sats", max(0, int(effective_budget_sats) - actual_total - reserved_total)) or 0)
 
     # Measured window coverage (honest, never an echo of the request):
     # hours between the oldest cost-evidence row and now, capped at the
@@ -7493,7 +7567,7 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
         "covered_hours": covered_hours,
         "coverage_status": coverage_status,
         "since_timestamp": since,
-        "mode": "fixed",
+        "mode": growth_budget.get("mode", "fixed"),
         "daily_budget_sats": daily_budget_sats,
         "effective_budget_sats": int(effective_budget_sats),
         "revenue_sats": revenue_sats,
@@ -7501,6 +7575,7 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
         "reserved_sats": reserved_total,
         "remaining_sats": remaining_sats,
         "net_profit_sats_after_costs": net_profit_sats,
+        "growth_budget": growth_budget,
         "actual_spent_by_category": actual_by_category,
         "reserved_by_category": reserved_by_category,
         "open_close_cost_visibility": open_close_cost_visibility,

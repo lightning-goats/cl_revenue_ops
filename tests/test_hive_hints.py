@@ -1832,3 +1832,66 @@ class TestMemberLookup:
         adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
         adapter.poll()
         assert adapter.is_hive_member("02noflag") is False
+
+
+
+def _growth_prior_snapshot(*, age_seconds=0, ttl_seconds=900, entries=None, advisory_only=True):
+    return {
+        "generated_at": int(time.time()) - int(age_seconds),
+        "ttl_seconds": ttl_seconds,
+        "hints": {},
+        "growth_spend_priors": {
+            "schema_version": "growth-spend-priors/v1",
+            "generated_at": int(time.time()) - int(age_seconds),
+            "ttl_seconds": ttl_seconds,
+            "advisory_only": advisory_only,
+            "budget_authority": "local_cl_revenue_ops",
+            "fleet_prior_budget_authority": False,
+            "entries": entries if entries is not None else [
+                {
+                    "peer_id": "02" + "b" * 64,
+                    "action_type": "rebalance",
+                    "sample_count": 5,
+                    "beneficial_count": 4,
+                    "harmful_count": 1,
+                    "neutral_count": 0,
+                    "beneficial_ratio": 0.8,
+                    "advisory_only": True,
+                }
+            ],
+        },
+    }
+
+
+def test_growth_spend_prior_validates_fresh_advisory_section(mock_plugin):
+    mock_plugin.rpc.call.return_value = _growth_prior_snapshot()
+    adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+    adapter.poll()
+
+    prior = adapter.get_growth_spend_prior(action_type="rebalance")
+
+    assert prior["usable"] is True
+    assert prior["sample_count"] == 5
+    assert prior["beneficial_ratio"] == 0.8
+    assert prior["advisory_only"] is True
+    assert prior["fleet_prior_budget_authority"] is False
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        _growth_prior_snapshot(age_seconds=1_000, ttl_seconds=1),
+        _growth_prior_snapshot(advisory_only=False),
+        _growth_prior_snapshot(entries=[{"peer_id": "02bad", "action_type": "rebalance", "sample_count": 5, "beneficial_ratio": 0.9, "advisory_only": False}]),
+        {"generated_at": int(time.time()), "ttl_seconds": 900, "hints": {}, "growth_spend_priors": {"schema_version": "growth-spend-priors/v9", "entries": []}},
+    ],
+)
+def test_growth_spend_prior_malformed_or_stale_neutralizes(mock_plugin, snapshot):
+    mock_plugin.rpc.call.return_value = snapshot
+    adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+    adapter.poll()
+
+    prior = adapter.get_growth_spend_prior(action_type="rebalance")
+
+    assert prior["usable"] is False
+    assert prior["used"] is False

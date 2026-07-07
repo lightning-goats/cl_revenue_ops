@@ -27,6 +27,11 @@ IMMUTABLE_CONFIG_KEYS: FrozenSet[str] = frozenset({
 PUBLIC_RUNTIME_KEYS = (
     'paused',
     'daily_budget_sats',
+    'growth_budget_enabled',
+    'growth_budget_earned_fraction',
+    'growth_budget_experiment_fraction',
+    'growth_budget_max_extra_sats',
+    'growth_budget_hard_ceiling_sats',
     'min_fee_ppm',
     'max_fee_ppm',
     'fee_profile',
@@ -83,6 +88,11 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'fee_market_boundary_max_downshift_ratio': float,
     'fee_market_boundary_cache_seconds': int,
     'daily_budget_sats': int,
+    'growth_budget_enabled': bool,
+    'growth_budget_earned_fraction': float,
+    'growth_budget_experiment_fraction': float,
+    'growth_budget_max_extra_sats': int,
+    'growth_budget_hard_ceiling_sats': int,
     'diagnostic_rebalance_max_fee_sats': int,
     'allow_zero_cost_auto_rebalance_when_budget_zero': bool,
     'weekly_budget_sats': int,
@@ -235,6 +245,10 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'fee_market_boundary_max_downshift_ratio': (0.05, 1.0),
     'fee_market_boundary_cache_seconds': (10, 3600),
     'daily_budget_sats': (0, 10000000),
+    'growth_budget_earned_fraction': (0.0, 1.0),
+    'growth_budget_experiment_fraction': (0.0, 1.0),
+    'growth_budget_max_extra_sats': (0, 1_000_000),
+    'growth_budget_hard_ceiling_sats': (0, 10_000_000),
     # Operator ruling D4: diagnostic fee cap must stay a small, bounded
     # diagnostic spend — never 0 (would disable the defibrillator envelope)
     # and never above 10k sats (a typo must not authorize huge spend).
@@ -588,6 +602,11 @@ class Config:
     
     # Global Capital Controls
     daily_budget_sats: int = 5000          # Max rebalancing fees per 24h period (fixed floor)
+    growth_budget_enabled: bool = False    # Opt-in dynamic budget: base + bounded earned/growth credit
+    growth_budget_earned_fraction: float = 0.25
+    growth_budget_experiment_fraction: float = 0.10
+    growth_budget_max_extra_sats: int = 2_000
+    growth_budget_hard_ceiling_sats: int = 10_000
     allow_zero_cost_auto_rebalance_when_budget_zero: bool = False
     weekly_budget_sats: int = 35000        # Max rebalancing fees per 7-day window (hard ceiling)
     # Operator ruling D4 (2026-07-01): fee cap (sats) for the diagnostic
@@ -1077,6 +1096,11 @@ class ConfigSnapshot:
     
     # Global Capital Controls
     daily_budget_sats: int
+    growth_budget_enabled: bool
+    growth_budget_earned_fraction: float
+    growth_budget_experiment_fraction: float
+    growth_budget_max_extra_sats: int
+    growth_budget_hard_ceiling_sats: int
     allow_zero_cost_auto_rebalance_when_budget_zero: bool
     min_wallet_reserve: int
 

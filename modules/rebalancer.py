@@ -1075,6 +1075,85 @@ class EVRebalancer:
             )
 
 
+    @staticmethod
+    def _growth_spend_bucket(candidate: RebalanceCandidate) -> str:
+        """Classify whether a rebalance is normal earned spend or growth spend."""
+        try:
+            max_fee = max(0, int(getattr(candidate, "max_budget_sats", 0) or 0))
+        except Exception:
+            max_fee = 0
+        try:
+            expected_value = max(0, int(getattr(candidate, "expected_profit_sats", 0) or 0))
+        except Exception:
+            expected_value = 0
+        return "growth_experiment" if max_fee > expected_value else "earned_budget"
+
+    def _growth_spend_details(
+        self,
+        candidate: RebalanceCandidate,
+        *,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        payload = dict(details or {})
+        payload.update(
+            {
+                "schema_version": "growth-spend-outcome/v1",
+                "budget_bucket": self._growth_spend_bucket(candidate),
+                "action_type": "rebalance",
+                "source_scid": str(candidate.from_channel or ""),
+                "sink_scid": str(candidate.to_channel or ""),
+                "source_peer_id": str(candidate.primary_source_peer_id or ""),
+                "destination_peer_id": str(candidate.to_peer_id or ""),
+                "amount_sats": max(0, int(getattr(candidate, "amount_sats", 0) or 0)),
+                "expected_value_sats": max(0, int(getattr(candidate, "expected_profit_sats", 0) or 0)),
+                "max_fee_sats": max(0, int(getattr(candidate, "max_budget_sats", 0) or 0)),
+                "reason_code": str(getattr(candidate, "reason_code", "") or ""),
+                "advisory_only": True,
+                "budget_authority": "local_cl_revenue_ops",
+                "fleet_prior_budget_authority": False,
+                "executor_behavior_applied": False,
+            }
+        )
+        return payload
+
+    def _report_growth_spend_outcome(
+        self,
+        candidate: RebalanceCandidate,
+        *,
+        status: str,
+        reason: str = "",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self._is_coordinated_candidate(candidate):
+            return
+        outcome_details = self._growth_spend_details(candidate, details=details)
+        if outcome_details.get("budget_bucket") != "growth_experiment":
+            return
+
+        payload: Dict[str, Any] = {
+            "outcome_type": "growth_spend",
+            "status": str(status or "unknown"),
+            "reason": str(reason or ""),
+            "amount_sats": outcome_details.get("amount_sats"),
+            "details": outcome_details,
+            "source_scid": outcome_details.get("source_scid"),
+            "sink_scid": outcome_details.get("sink_scid"),
+            "primary_executor_member_id": "cl_revenue_ops",
+            "fallback_executor_member_ids": [],
+            "route_segments": [],
+            "priority_score": 0.0,
+            "campaign_goal_type": "growth_spend_learning",
+            "campaign_target_peer_or_corridor": outcome_details.get("destination_peer_id") or outcome_details.get("sink_scid") or "",
+        }
+        try:
+            self.plugin.rpc.call("hive-report-rebalance-outcome", payload)
+        except Exception as e:
+            self.plugin.log(
+                f"GROWTH_SPEND: outcome report failed for {candidate.to_channel}: {e}",
+                level='debug',
+            )
+
+
 
     @staticmethod
     def _should_skip_futility(fail_count: int, last_error_type: str) -> bool:
@@ -2121,6 +2200,15 @@ class EVRebalancer:
                                 "effective_budget_sats": effective_budget,
                             },
                         )
+                    self._report_growth_spend_outcome(
+                        candidate,
+                        status="declined",
+                        reason="local_budget_block",
+                        details={
+                            "remaining_budget_sats": remaining,
+                            "effective_budget_sats": effective_budget,
+                        },
+                    )
                     # Budget exhaustion is global; don't backoff a specific channel.
                     with self._pending_lock:
                         self._pending.pop(candidate.to_channel, None)
@@ -2380,6 +2468,12 @@ class EVRebalancer:
                     "message": res.get("message", "Rebalance completed"),
                     "rebalance_id": rebalance_id
                 })
+                self._report_growth_spend_outcome(
+                    candidate,
+                    status="succeeded",
+                    reason="completed",
+                    details={"actual_fee_sats": int(res.get("actual_fee_sats", 0) or 0)},
+                )
                 self.plugin.log(
                     f"Rebalance completed: {candidate.to_channel} — "
                     f"{res.get('message', '')}"
@@ -2399,6 +2493,12 @@ class EVRebalancer:
                     )
                 result["error"] = error
                 result["message"] = f"Failed: {error}"
+                self._report_growth_spend_outcome(
+                    candidate,
+                    status="failed",
+                    reason=str(error),
+                    details={"payment_pending": bool(res.get("payment_pending"))},
+                )
                 self.plugin.log(f"Failed to start rebalance job: {error}", level='warn')
                 # P4-009: mirror the engine's hold-on-pending. A payment that is
                 # still pending settlement AND sweepable (carries a

@@ -1374,3 +1374,58 @@ class TestUpstreamPatternOptionsRegistered:
                     f"{option_name} default {option_default!r} does not match "
                     f"{field}={field_default!r}"
                 )
+
+
+
+def test_growth_spend_outcome_reports_non_coordinated_rebalance():
+    from modules.config import Config
+    from modules.rebalancer import EVRebalancer
+
+    plugin = MagicMock()
+    plugin.rpc = MagicMock()
+    plugin.log = MagicMock()
+    rebalancer = EVRebalancer(plugin, Config(dry_run=True), MagicMock())
+    candidate = _candidate()
+
+    rebalancer._report_growth_spend_outcome(
+        candidate,
+        status="succeeded",
+        reason="completed",
+        details={"actual_fee_sats": 3, "route_type": "native"},
+    )
+
+    plugin.rpc.call.assert_called_once()
+    method, payload = plugin.rpc.call.call_args.args
+    assert method == "hive-report-rebalance-outcome"
+    assert payload["outcome_type"] == "growth_spend"
+    assert payload["status"] == "succeeded"
+    assert payload["reason"] == "completed"
+    assert payload["amount_sats"] == candidate.amount_sats
+    assert payload["source_scid"] == candidate.from_channel
+    assert payload["sink_scid"] == candidate.to_channel
+    details = payload["details"]
+    assert details["budget_bucket"] == "growth_experiment"
+    assert details["action_type"] == "rebalance"
+    assert details["source_peer_id"] == candidate.primary_source_peer_id
+    assert details["destination_peer_id"] == candidate.to_peer_id
+    assert details["expected_value_sats"] == candidate.expected_profit_sats
+    assert details["max_fee_sats"] == candidate.max_budget_sats
+    assert details["actual_fee_sats"] == 3
+    assert details["advisory_only"] is True
+    assert details["budget_authority"] == "local_cl_revenue_ops"
+
+
+def test_growth_spend_outcome_report_failure_is_debug_only():
+    from modules.config import Config
+    from modules.rebalancer import EVRebalancer
+
+    plugin = MagicMock()
+    plugin.rpc = MagicMock()
+    plugin.rpc.call.side_effect = Exception("hive unavailable")
+    plugin.log = MagicMock()
+    rebalancer = EVRebalancer(plugin, Config(dry_run=True), MagicMock())
+
+    rebalancer._report_growth_spend_outcome(_candidate(), status="failed", reason="route_failed")
+
+    plugin.log.assert_called()
+    assert plugin.log.call_args.kwargs.get("level") == "debug"

@@ -70,6 +70,7 @@ STALE_FALLBACK_NEUTRALIZED_FIELDS = (
     "segment_observations",
     "metabolic_influence",
     "immune_influence",
+    "growth_spend_priors",
 )
 M2_SENSITIVE_PEER_FIELDS = {
     "fee_bias",
@@ -99,6 +100,7 @@ M2_SENSITIVE_SECTIONS = {
     "rebalance_recommendations",
     "rebalance_campaigns",
     "segment_scores",
+    "growth_spend_priors",
 }
 PEER_IDENTIFIER_FIELDS = (
     "peer_id",
@@ -1345,6 +1347,100 @@ class HiveHintAdapter:
             bucket = candidate
         return bucket
 
+
+    @staticmethod
+    def _neutral_growth_spend_prior(reason: str) -> dict:
+        return {
+            "usable": False,
+            "used": False,
+            "reason": reason,
+            "sample_count": 0,
+            "beneficial_count": 0,
+            "harmful_count": 0,
+            "neutral_count": 0,
+            "beneficial_ratio": 0.0,
+            "advisory_only": True,
+            "fleet_prior_budget_authority": False,
+        }
+
+    def _growth_spend_prior_section(self, snapshot: dict | None) -> tuple[dict | None, str | None]:
+        if not isinstance(snapshot, dict):
+            return None, "missing_snapshot"
+        if not self._snapshot_is_fresh(snapshot) or self._using_stale_fallback:
+            return None, "stale"
+        section = snapshot.get("growth_spend_priors")
+        if not isinstance(section, dict):
+            return None, "missing"
+        if str(section.get("schema_version") or "") != "growth-spend-priors/v1":
+            return None, "unsupported_schema"
+        if section.get("advisory_only") is not True:
+            return None, "not_advisory"
+        if section.get("fleet_prior_budget_authority") is True:
+            return None, "authorizing_prior_rejected"
+        entries = section.get("entries")
+        if not isinstance(entries, list):
+            return None, "malformed_entries"
+        if len(entries) > 64:
+            return None, "too_many_entries"
+        return section, None
+
+    def _growth_spend_prior_for_snapshot(self, snapshot: dict | None, peer_id: str | None = None, action_type: str = "rebalance") -> dict:
+        section, reason = self._growth_spend_prior_section(snapshot)
+        if section is None:
+            return self._neutral_growth_spend_prior(reason or "missing")
+        wanted_peer = str(peer_id or "").strip()
+        wanted_action = str(action_type or "rebalance").strip()
+        sample = beneficial = harmful = neutral = 0
+        latest = 0
+        for raw in section.get("entries", [])[:64]:
+            if not isinstance(raw, dict) or raw.get("advisory_only") is not True:
+                continue
+            entry_peer = str(raw.get("peer_id") or "").strip()
+            entry_action = str(raw.get("action_type") or "rebalance").strip()
+            if wanted_peer and entry_peer != wanted_peer:
+                continue
+            if wanted_action and entry_action != wanted_action:
+                continue
+            try:
+                s = max(0, int(raw.get("sample_count", 0) or 0))
+                b = max(0, int(raw.get("beneficial_count", 0) or 0))
+                h = max(0, int(raw.get("harmful_count", 0) or 0))
+                n = max(0, int(raw.get("neutral_count", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            if s <= 0:
+                continue
+            sample += s
+            beneficial += b
+            harmful += h
+            neutral += n
+            try:
+                latest = max(latest, int(raw.get("last_observed_at", 0) or 0))
+            except (TypeError, ValueError):
+                pass
+        if sample <= 0:
+            return self._neutral_growth_spend_prior("no_matching_entries")
+        ratio = max(0.0, min(1.0, beneficial / max(1, sample)))
+        return {
+            "usable": True,
+            "used": False,
+            "reason": "usable_advisory_prior",
+            "sample_count": sample,
+            "beneficial_count": beneficial,
+            "harmful_count": harmful,
+            "neutral_count": neutral,
+            "beneficial_ratio": round(ratio, 4),
+            "last_observed_at": latest,
+            "advisory_only": True,
+            "fleet_prior_budget_authority": False,
+        }
+
+    def get_growth_spend_prior(self, peer_id: str | None = None, action_type: str = "rebalance") -> dict:
+        """Return a bounded advisory growth-spend prior, or neutral diagnostics."""
+        with self._lock:
+            snapshot = self._snapshot if isinstance(self._snapshot, dict) else None
+            return self._growth_spend_prior_for_snapshot(snapshot, peer_id=peer_id, action_type=action_type)
+
     def get_route_segment_leases(self) -> list[dict]:
         """Return validated route-segment leases or [] if unavailable/stale."""
         return self._get_section_entries(
@@ -2252,6 +2348,7 @@ class HiveHintAdapter:
                     "hints_count": 0,
                     "metabolic_influence": self._metabolic_payload_status_for(None),
                     "immune_influence": self._immune_payload_status_for(None),
+                    "growth_spend_priors": self._neutral_growth_spend_prior("missing_snapshot"),
                     **self._m2_scope_debug_for(None),
                     **self._stale_fallback_debug_for(active=False),
                 }
@@ -2280,6 +2377,7 @@ class HiveHintAdapter:
                 "route_segment_leases_count": len(self._get_section_entries("route_segment_leases", self._validate_route_segment_lease)),
                 "metabolic_influence": self._metabolic_payload_status_for(self._snapshot),
                 "immune_influence": self._immune_payload_status_for(self._snapshot),
+                "growth_spend_priors": self._growth_spend_prior_for_snapshot(self._snapshot, action_type="rebalance"),
             }
             status.update(self._m2_scope_debug_for(self._snapshot))
             status.update(self._stale_fallback_debug_for())
