@@ -155,6 +155,7 @@ def test_parse_version_tuple(plugin_mod):
     f = plugin_mod._parse_version_tuple
     assert f("v24.11.1") == (24, 11, 1)
     assert f("2.11.0-beta") == (2, 11, 0)
+    assert f("boltzcli version v2.12.0-9bf31be") == (2, 12, 0)
     assert f("24.11.1gl") == (24, 11, 1)
     assert f("") == ()
     assert f(None) == ()

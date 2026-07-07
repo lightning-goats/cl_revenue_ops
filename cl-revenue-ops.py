@@ -104,22 +104,18 @@ BOLTZCLI_MIN_VERSION = "2.11.0"  # documented in loop-out/loop-in help text
 def _parse_version_tuple(raw: Optional[str]):
     """Extract a numeric (major, minor, patch, ...) tuple from a version string.
 
-    Tolerant of prefixes ("v24.11.1"), suffixes ("2.11.0-beta", "24.11.1gl"),
-    and build metadata. Returns () when no leading numeric component is found,
+    Tolerant of command prefixes ("boltzcli version v2.12.0-9bf31be"),
+    leading "v", suffixes ("2.11.0-beta", "24.11.1gl"), and build
+    metadata. Returns () when no version-shaped numeric component is found,
     which callers treat as "unknown / skip the comparison".
     """
     if not raw:
         return ()
     text = str(raw).strip()
-    if text and text[0] in ('v', 'V'):
-        text = text[1:]
-    parts = []
-    for token in re.split(r'[.\-+_ ]', text):
-        m = re.match(r'^(\d+)', token)
-        if not m:
-            break
-        parts.append(int(m.group(1)))
-    return tuple(parts)
+    match = re.search(r'(?i)(?<![A-Za-z0-9])v?(\d+(?:\.\d+)*)', text)
+    if not match:
+        return ()
+    return tuple(int(token) for token in match.group(1).split('.'))
 
 
 def _version_below_floor(observed: Optional[str], floor: str) -> Optional[bool]:
