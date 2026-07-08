@@ -252,6 +252,7 @@ def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None
     planner = MagicMock()
     planner._calculate_open_ev.return_value = 1000.0
     planner._estimate_open_cost.return_value = 2000
+    planner._capex_engine.get_fleet_exploration_budget.return_value = 1_000_000_000
     lifecycle = MagicMock()
     lifecycle.breaker_tripped.return_value = breaker
     lifecycle.has_inflight.return_value = inflight
@@ -440,3 +441,13 @@ class TestSwapEvAndApply:
         row = ev._db.lnplus_get_swap("sw1")
         assert row["status"] == "failed"
         db.update_planner_action.assert_called_with(44, status="failed")
+
+    def test_capex_engine_error_fails_closed(self):
+        ev, cfg, client, _ = _make_evaluator()
+        ev._planner._calculate_open_ev.return_value = 5000.0
+        ev._planner._capex_engine.get_fleet_exploration_budget.side_effect = RuntimeError("boom")
+        result = ev.run_cycle(cfg, best_regular_ev=0.0)
+        assert result["applied"] is False
+        client.create_application.assert_not_called()
+        assert any(r["gate"] == "economics" and "capex" in r["reason"]
+                   for r in result["rejections"])

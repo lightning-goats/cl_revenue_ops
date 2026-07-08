@@ -384,18 +384,14 @@ class SwapEvaluator:
         capex = getattr(self._planner, "_capex_engine", None)
         if capex is not None:
             try:
-                raw_budget = capex.get_fleet_exploration_budget()
+                budget = int(capex.get_fleet_exploration_budget() or 0)
             except Exception:
-                raw_budget = None
-            # Only enforce the gate when the engine returns a real number —
-            # an unwired/mocked engine (no usable budget signal) doesn't block.
-            if isinstance(raw_budget, (int, float)) and not isinstance(raw_budget, bool):
-                budget = int(raw_budget)
-                if budget < open_cost:
-                    self._reject(summary, swap,
-                                 f"economics:capex budget {budget} below open cost {open_cost}")
-                    summary["swap_id"] = None
-                    return summary
+                budget = 0
+            if budget < open_cost:
+                self._reject(summary, swap,
+                             f"economics:capex budget {budget} below open cost {open_cost}")
+                summary["swap_id"] = None
+                return summary
 
         reason = (f"LN+ swap {swap.get('id')}: EV {value:.0f} vs regular {best_regular_ev:.0f}, "
                   f"{capacity} sats for {swap.get('duration_months')}mo")
