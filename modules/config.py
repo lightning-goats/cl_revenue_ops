@@ -1228,6 +1228,22 @@ class ConfigSnapshot:
     htlcmax_source_pct: float = 0.50
     htlcmax_sink_pct: float = 0.25
     htlcmax_balanced_pct: float = 0.45
+    # LN+ (lightningnetwork.plus) liquidity swap automation (C1 audit fix:
+    # these were missing from ConfigSnapshot entirely, so
+    # getattr(cfg, "lnplus_swaps_enabled", False) inside execute_cycle's
+    # snapshot always fell back to False in production — the evaluator was
+    # silently dead despite Config defaulting it on).
+    lnplus_swaps_enabled: bool = True
+    lnplus_execute_applications: bool = True
+    lnplus_swap_preference_margin: float = 0.2
+    lnplus_max_duration_months: int = 3
+    lnplus_min_peer_positive_ratings: int = 5
+    lnplus_max_participants: int = 4
+    lnplus_apply_feerate_ceiling: int = 5000
+    lnplus_pending_timeout_days: int = 7
+    lnplus_inbound_credit_factor: float = 0.5
+    lnplus_fleet_pubkeys: str = ''
+    lnplus_watcher_interval: int = 3600
     # Version tracking
     version: int = 0
     

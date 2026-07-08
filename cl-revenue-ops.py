@@ -7991,7 +7991,18 @@ def _get_confirmed_onchain_sats() -> Optional[int]:
         if str(o.get("status") or "") != "confirmed":
             continue
         total += _parse_msat(o.get("amount_msat", 0)) // 1000
-    return int(total)
+    # I6: on-chain capacity already committed (gate 7, apply time) to an
+    # in-flight LN+ swap open is not free for the Boltz auto-cycle to spend
+    # or plan around — mirrors capacity_planner's own
+    # `available_sats -= lnplus_reserved_sats` subtraction
+    # (capacity_planner.py ~515-519). This is the one place the auto-cycle
+    # (treasury deficit calc, status reporting) computes spendable on-chain
+    # sats, so the subtraction here covers every caller.
+    try:
+        lnplus_reserved = int(database.lnplus_reserved_sats()) if database is not None else 0
+    except Exception:
+        lnplus_reserved = 0
+    return max(0, int(total) - lnplus_reserved)
 
 
 def _filter_boltz_treasury_recommendations(

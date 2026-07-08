@@ -26,10 +26,19 @@ _MAX_RESPONSE_BYTES = 1_000_000
 _CHALLENGE_MAX_LEN = 500
 _CHALLENGE_FORBIDDEN_PREFIXES = ("lnbc", "lntb", "lnbcrt", "cbor", "psbt")
 _PUBKEY_RE = re.compile(r"^0[23][0-9a-fA-F]{64}$")
+# I3: sane host:port shape for a connect address sourced from the LN+ API —
+# no shell metacharacters, no whitespace; length-capped separately.
+_ADDR_RE = re.compile(r"^[A-Za-z0-9.\-_:\[\]]+$")
+_ADDR_MAX_LEN = 300
 
 
 def _valid_pubkey(value) -> bool:
     return isinstance(value, str) and bool(_PUBKEY_RE.match(value))
+
+
+def _valid_connect_addr(value) -> bool:
+    return (isinstance(value, str) and 0 < len(value) < _ADDR_MAX_LEN
+            and bool(_ADDR_RE.match(value)))
 
 
 def _parse_ts(value) -> Optional[int]:
@@ -206,12 +215,12 @@ class SwapEvaluator:
             reason = self._filter_swap(swap, cfg)
             if reason is None:
                 reason = self._check_participants(swap, cfg)
-                if reason is not None:
-                    self._reject(summary, swap, reason)
-                else:
-                    qualifying.append(swap)
-            else:
+            if reason is None:
+                reason = self._check_existing_channel(swap)
+            if reason is not None:
                 self._reject(summary, swap, reason)
+            else:
+                qualifying.append(swap)
 
         # EV + apply/recommend implemented in the ranking task.
         return self._select_and_apply(qualifying, cfg, best_regular_ev, summary)
@@ -240,6 +249,13 @@ class SwapEvaluator:
         min_chan = getattr(cfg, "planner_min_channel_sats", 0) or 0
         if capacity < min_chan:
             return f"terms:capacity {capacity} below planner min {min_chan}"
+        # I2(a): no upper capacity bound previously existed — an oversized
+        # swap (past the planner's own affordability/portfolio-concentration
+        # ceiling) would sail through terms and only get caught (or not) by
+        # the funds check below, well after evaluation cost was sunk.
+        max_chan = getattr(cfg, "planner_max_channel_sats", 0) or 0
+        if max_chan and capacity > max_chan:
+            return f"terms:capacity {capacity} above planner max {max_chan}"
         if int(swap.get("duration_months") or 99) > int(cfg.lnplus_max_duration_months):
             return "terms:duration exceeds cap"
         if int(swap.get("participant_max_count") or 99) > int(cfg.lnplus_max_participants):
@@ -288,6 +304,27 @@ class SwapEvaluator:
                 return f"peer_quality:{pk[:16]} planner score {enriched:.2f} below floor"
         return None
 
+    def _check_existing_channel(self, swap) -> Optional[str]:
+        """I5(a): reject a swap whose INFERRED outbound peer we already have
+        a channel to. Without this an idempotency check can later (I5b)
+        misread a coincidental pre-existing channel to that peer as "our
+        swap channel" and never open the one the swap actually requires;
+        pre-empting it here also avoids burning the one-application-per-node
+        serialization slot on a swap that cannot add new capacity anyway.
+        Fail-open on an RPC hiccup (matches _check_mid_contract_vanish /
+        _execute_swap_open's existing-channel lookups elsewhere in this
+        module) — real state is re-checked at open time regardless."""
+        outbound_peer = self._infer_assignment(swap).get("outbound_peer")
+        if not outbound_peer:
+            return None
+        try:
+            channels = self.rpc.listpeerchannels(outbound_peer).get("channels", []) or []
+        except Exception:
+            return None
+        if channels:
+            return "terms:existing channel to assigned outbound peer"
+        return None
+
     def _infer_assignment(self, swap) -> Dict:
         """LN+ convention: each participant opens to the next letter; last wraps to A.
         We join as the next free identifier. Authoritative assignment is re-read
@@ -318,6 +355,13 @@ class SwapEvaluator:
         duration = int(swap.get("duration_months") or 0)
         outbound_ev = float(self._planner._calculate_open_ev(
             assignment["outbound_peer"], capacity, cfg) or 0.0)
+        # I4: inbound_corridor deliberately reuses _calculate_open_ev, which
+        # already nets out open+close on-chain costs internally (see
+        # capacity_planner._calculate_open_ev's on_chain_cost term). Using it
+        # as a corridor-value proxy here — rather than a bespoke revenue-only
+        # estimate — is conservative: it silently charges the inbound side
+        # for a hypothetical open/close it will never pay, so inbound_credit
+        # is a lower bound on the corridor's true value.
         inbound_corridor = float(self._planner._calculate_open_ev(
             assignment["incoming_peer"], capacity, cfg) or 0.0)
         replacement = capacity * BOLTZ_REPLACEMENT_RATE
@@ -331,10 +375,19 @@ class SwapEvaluator:
             reliability *= TOR_RELIABILITY
 
         lockup_haircut = P_UNDERPERFORM * max(0.0, best_regular_ev) * (duration / 12.0)
-        open_cost = int(self._planner._estimate_open_cost() or 0)
+        # I4: _calculate_open_ev (outbound_ev, above) already nets out
+        # open_cost + close_cost internally via its on_chain_cost term — see
+        # capacity_planner._calculate_open_ev. Regular candidates'
+        # _planned_ev never re-subtracts open_cost on top of that (compare
+        # capacity_planner.execute_cycle's `ev = self._calculate_open_ev(...)`
+        # used as-is), so doing it here double-counted the same on-chain cost
+        # twice for swaps only, unfairly penalizing them against regular
+        # opens in the unified ranking. open_cost is still used (unmodified)
+        # by the capex/funds gates in _select_and_apply, where it correctly
+        # represents the swap's own upfront on-chain commitment.
         value = (outbound_ev
                  + inbound_credit * reliability * float(cfg.lnplus_inbound_credit_factor)
-                 - lockup_haircut - open_cost)
+                 - lockup_haircut)
         return value, assignment
 
     @staticmethod
@@ -377,10 +430,16 @@ class SwapEvaluator:
                 if o.get("status") == "confirmed" and not o.get("reserved"))
         except Exception:
             confirmed_sats = 0
-        if confirmed_sats < capacity + open_cost:
+        # I2(b): the confirmed-funds check ignored the planner's own on-chain
+        # reserve floor (min_wallet_reserve) — a swap could be applied for
+        # using funds the operator wants kept as an untouchable buffer, the
+        # same reserve the regular-open sizer respects
+        # (capacity_planner.py's `available_sats = confirmed - min_reserve`).
+        reserve = getattr(cfg, "min_wallet_reserve", 0) or 0
+        if confirmed_sats < capacity + open_cost + reserve:
             self._reject(summary, swap,
                          f"economics:confirmed funds {confirmed_sats} below "
-                         f"capacity+fees {capacity + open_cost}")
+                         f"capacity+fees+reserve {capacity + open_cost + reserve}")
             summary["swap_id"] = None
             return summary
         capex = getattr(self._planner, "_capex_engine", None)
@@ -527,6 +586,18 @@ class SwapLifecycle:
             if sid and sid not in local_ids:
                 self.trip_breaker(f"LN+ shows opening swap {sid} with no local record")
                 ok = False
+
+        # I1 fix: gate 0 was one-eyed — it only checked the opening list for
+        # LN+-side entries with no local row. A pending application LN+ knows
+        # about but we have no in-flight row for (applied/opening/opened) is
+        # an untracked live commitment (a "ghost") that the pending-timeout
+        # phase will never see (that phase only handles rows WE already know
+        # about), so it must trip the breaker here instead of going unnoticed
+        # forever.
+        for sid in pending_ids:
+            if sid and sid not in local_ids:
+                self.trip_breaker(f"LN+ shows pending swap {sid} with no local record")
+                ok = False
         return ok
 
     # -- watcher -----------------------------------------------------------
@@ -568,17 +639,53 @@ class SwapLifecycle:
             row = self._db.lnplus_get_swap(sid)
             if not row:
                 continue
-            if row.get("status") == "opened":
+            row_status = row.get("status")
+            if row_status == "opened":
                 # Already funded and locally marked opened on a prior pass —
                 # LN+ may still list it under "opening" for a cycle or two.
                 # Do not downgrade status back to "opening" or re-run
                 # complete_application; phase 4 handles activation once LN+
                 # reports it completed.
                 continue
+            if row_status not in ("applied", "opening"):
+                # C2 fix: a row we abandoned locally (e.g. status "failed" via
+                # revenue-lnplus-abandon) must stay terminal even if LN+ still
+                # lists the swap under "opening" for a stale cycle or two.
+                # Flipping it back to "opening" here would resurrect it and
+                # trigger a real fundchannel/complete_application against an
+                # application we deliberately walked away from — no write, no
+                # open attempt, for any terminal status (failed/withdrawn/
+                # ended/active).
+                self._plugin.log(
+                    f"LNPLUS: swap {sid} is terminal locally (status "
+                    f"{row_status!r}) but LN+ still lists it under 'opening' — "
+                    "ignoring, not resurrecting", level="warn")
+                continue
             try:
-                fields = {"status": "opening"}
+                # I3: LN+ is an untrusted API — never write an unvalidated
+                # pubkey into the row (it later feeds connect/fundchannel).
+                # An invalid value means we skip this row for the pass
+                # entirely: no write, no open attempt.
                 peer = entry.get("outgoing_peer_pubkey")
+                if peer is not None and not _valid_pubkey(peer):
+                    self._plugin.log(
+                        f"LNPLUS: swap {sid} — LN+ returned an invalid "
+                        f"outgoing_peer_pubkey ({peer!r}); refusing to write "
+                        "or open this pass", level="error")
+                    continue
+                fields = {"status": "opening"}
                 if peer:
+                    if row.get("outbound_peer") and row.get("outbound_peer") != peer:
+                        # LN+'s live assignment is authoritative — our
+                        # pre-apply letter inference (_infer_assignment) can
+                        # be wrong — but the change must be visible, not
+                        # silently swapped underneath the operator.
+                        self._plugin.log(
+                            f"LNPLUS: swap {sid} — LN+-assigned outbound "
+                            f"peer {peer[:16]}... differs from our "
+                            f"apply-time inference "
+                            f"{str(row.get('outbound_peer'))[:16]}...; "
+                            "LN+'s value is authoritative", level="warn")
                     fields["outbound_peer"] = peer
                 deadline_ts = _parse_ts(entry.get("deadline"))
                 if deadline_ts:
@@ -677,9 +784,20 @@ class SwapLifecycle:
         except Exception as e:
             self._plugin.log(f"LNPLUS: listpeerchannels failed for swap {sid}: {e}", level="error")
             channels = []
+        capacity_sats = int(row.get("capacity_sats") or 0)
+        # I5(b): a channel to this peer existing is not, by itself, proof
+        # it is OUR swap channel — the idempotency skip used to claim ANY
+        # open channel to `peer`, including an unrelated pre-existing one
+        # (e.g. from before the swap or from a regular planner open), and
+        # never fund the swap's own channel at all. Only trust a match by
+        # capacity (this row's committed swap terms) or because we already
+        # recorded our own funding txid for it (checked above, kept here for
+        # defense-in-depth against any future reordering of this method).
         existing = next(
             (ch for ch in channels
-             if ch.get("peer_id") == peer and ch.get("state") in _OPEN_STATES),
+             if ch.get("peer_id") == peer and ch.get("state") in _OPEN_STATES
+             and (int(ch.get("total_msat", 0) or 0) // 1000 == capacity_sats
+                  or bool(row.get("channel_funding_txid")))),
             None)
 
         first_fund = False
@@ -695,6 +813,15 @@ class SwapLifecycle:
             addr = None
             if entry:
                 addr = entry.get("outgoing_peer_clearnet_address") or entry.get("outgoing_peer_tor_address")
+            # I3: API-derived strings never reach an RPC call unvalidated
+            # (gate 16). A malformed/oversized address falls back to a bare
+            # pubkey connect rather than being interpolated into `target`.
+            if addr is not None and not _valid_connect_addr(addr):
+                self._plugin.log(
+                    f"LNPLUS: swap {sid} — LN+ returned a malformed connect "
+                    f"address ({addr!r}); falling back to bare-pubkey connect",
+                    level="warn")
+                addr = None
             target = f"{peer}@{addr}" if addr else peer
             try:
                 self.rpc.connect(target)

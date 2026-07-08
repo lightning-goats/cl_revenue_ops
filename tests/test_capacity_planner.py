@@ -4243,6 +4243,31 @@ class TestExecuteCycle:
         plugin.rpc.call.assert_not_called()
         prof.database.update_planner_action.assert_any_call(1, status="dry_run")
 
+    def test_execute_cycle_snapshot_carries_lnplus_fields_to_evaluator(self):
+        """C1 regression: ConfigSnapshot used to omit the lnplus_* fields
+        entirely, so getattr(cfg, "lnplus_swaps_enabled", False) inside the
+        evaluator always fell back to False in production even though
+        Config() defaults it True — the evaluator was silently dead. Uses a
+        REAL Config -> real ConfigSnapshot (not the MagicMock cfg the other
+        execute_cycle tests use) so a regression in ConfigSnapshot's field
+        list actually fails this test."""
+        planner, plugin, prof, flow, pm = _make_cycle_planner()
+        real_cfg = Config()
+        real_cfg.planner_enabled = True
+        planner.config = real_cfg
+        planner.lnplus_evaluator = MagicMock()
+        planner.lnplus_evaluator.run_cycle.return_value = {
+            "applied": False, "recommended": False, "swap_id": None,
+            "swap_ev": 0.0, "best_regular_ev": 0.0, "rejections": [],
+        }
+
+        planner.execute_cycle()  # no cfg arg -> internally self.config.snapshot()
+
+        planner.lnplus_evaluator.run_cycle.assert_called_once()
+        called_cfg = planner.lnplus_evaluator.run_cycle.call_args.args[0]
+        assert called_cfg.lnplus_swaps_enabled is True
+        assert isinstance(called_cfg.lnplus_swap_preference_margin, float)
+
 
 class TestPlannerIntegration:
     """End-to-end integration tests for the capacity planner pipeline."""

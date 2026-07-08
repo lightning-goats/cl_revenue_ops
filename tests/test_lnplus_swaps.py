@@ -246,6 +246,11 @@ def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None
     rpc.feerates.return_value = {"perkw": {"opening": 2500}}
     rpc.listfunds.return_value = {"outputs": [
         {"amount_msat": 100_000_000_000, "status": "confirmed", "reserved": False}]}
+    # I5(a): default to no pre-existing channel to the inferred outbound
+    # peer, so the new existing-channel gate does not spuriously reject
+    # every other evaluator test (a bare MagicMock's .get("channels", [])
+    # is itself a truthy MagicMock, not an empty list).
+    rpc.listpeerchannels.return_value = {"channels": []}
     db = _make_db()
     client = MagicMock()
     client.get_applicable_swaps.return_value = swaps if swaps is not None else [_swap_fixture()]
@@ -336,6 +341,30 @@ class TestSwapEvaluatorGates:
         assert any(r["gate"] == "peer_quality" and "score" in r["reason"]
                    for r in result["rejections"])
 
+    def test_rejects_oversized_capacity(self):
+        """I2(a): a swap above planner_max_channel_sats must be rejected at
+        the terms gate, not slip through to the funds/EV gates."""
+        cfg_tmp = Config()
+        swap = _swap_fixture(capacity_sats=cfg_tmp.planner_max_channel_sats + 1)
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "terms" and "above planner max" in r["reason"]
+                   for r in result["rejections"])
+
+    def test_rejects_existing_channel_to_assigned_outbound_peer(self):
+        """I5(a): a swap must be rejected if we already have a channel to
+        the inferred outbound peer (PK_A, per test_infer_assignment_triangle)
+        — joining would waste the serialization slot on a swap that cannot
+        add new capacity, and could later be misread as our swap channel."""
+        ev, cfg, _, _ = _make_evaluator()
+        ev.rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": PK_A, "state": "CHANNELD_NORMAL"}]}
+        result = ev.run_cycle(cfg, 0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "terms" and "existing channel" in r["reason"]
+                   for r in result["rejections"])
+
     def test_infer_assignment_triangle(self):
         ev, cfg, _, _ = _make_evaluator()
         a = ev._infer_assignment(_swap_fixture())
@@ -347,12 +376,16 @@ class TestSwapEvaluatorGates:
 class TestSwapEvAndApply:
     def test_swap_ev_computation(self):
         ev, cfg, _, _ = _make_evaluator()
-        # outbound_ev = inbound_corridor = 1000.0 (mocked), open cost 2000
+        # outbound_ev = inbound_corridor = 1000.0 (mocked)
+        # I4: no separate "- open_cost" term here — _calculate_open_ev (the
+        # mocked outbound_ev above) already nets open+close on-chain cost
+        # internally, same as a regular candidate's _planned_ev. open_cost
+        # is only re-used by the capex/funds gates in _select_and_apply.
         # replacement = 5M * 0.005 = 25000 -> inbound_credit = 1000
         # min pos ratings = 12 -> reliability = 0.6 + 0.4*(12/50) = 0.696 (clearnet)
         # haircut = 0.3 * 800 * (3/12) = 60 (best_regular_ev=800)
         value, assignment = ev._swap_ev(_swap_fixture(), cfg, best_regular_ev=800.0)
-        expected = 1000.0 + 1000.0 * 0.696 * 0.5 - 60.0 - 2000
+        expected = 1000.0 + 1000.0 * 0.696 * 0.5 - 60.0
         assert abs(value - expected) < 1.0
         assert assignment["outbound_peer"] == PK_A
 
@@ -385,8 +418,9 @@ class TestSwapEvAndApply:
 
     def test_regular_open_beats_margin(self):
         ev, cfg, client, _ = _make_evaluator()
-        # swap EV positive but small: 2500 + 2500*0.696*0.5 - 0.3*10000*(3/12) - 2000 = 620
-        # margin: 10000 > 620 * 1.2 -> regular open wins
+        # swap EV positive but small: 2500 + 2500*0.696*0.5 - 0.3*10000*(3/12) = 2620
+        # (I4: no "- open_cost" term — see test_swap_ev_computation)
+        # margin: 10000 > 2620 * 1.2 (=3144) -> regular open wins
         ev._planner._calculate_open_ev.return_value = 2500.0
         result = ev.run_cycle(cfg, best_regular_ev=10_000.0)
         assert result["applied"] is False
@@ -404,9 +438,28 @@ class TestSwapEvAndApply:
         assert any(r["gate"] == "economics" and "funds" in r["reason"]
                    for r in result["rejections"])
 
+    def test_funds_cover_capacity_but_not_reserve_blocks(self):
+        """I2(b): confirmed funds cover capacity+open_cost exactly but leave
+        nothing for the wallet reserve floor (min_wallet_reserve) — must be
+        rejected, mirroring the planner's own reserve-respecting sizer."""
+        ev, cfg, client, _ = _make_evaluator()
+        ev._planner._calculate_open_ev.return_value = 5000.0
+        # swap capacity 5_000_000 (fixture default) + open_cost 2000 covered
+        # exactly, but min_wallet_reserve (default 1_000_000) is not.
+        ev.rpc.listfunds.return_value = {"outputs": [
+            {"amount_msat": 5_002_000_000, "status": "confirmed", "reserved": False}]}
+        result = ev.run_cycle(cfg, best_regular_ev=0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "economics" and "reserve" in r["reason"]
+                   for r in result["rejections"])
+        client.create_application.assert_not_called()
+
     def test_negative_ev_rejected(self):
         ev, cfg, client, _ = _make_evaluator()
-        ev._planner._calculate_open_ev.return_value = 0.0   # ev = -open_cost < 0
+        # I4: with open_cost no longer subtracted here, an all-zero EV input
+        # computes to exactly 0 rather than a negative number — still
+        # non-positive, so _select_and_apply's `value <= 0` check rejects it.
+        ev._planner._calculate_open_ev.return_value = 0.0   # ev = 0 <= 0
         result = ev.run_cycle(cfg, best_regular_ev=0.0)
         assert result["applied"] is False
         assert any(r["gate"] == "economics" for r in result["rejections"])
@@ -492,6 +545,16 @@ class TestSwapLifecycle:
         assert lc.reconcile_ok() is False
         assert lc.breaker_tripped() is not None
 
+    def test_reconcile_trips_breaker_on_pending_ghost(self):
+        """I1 regression: gate 0 only checked the 'opening' list for
+        LN+-side entries with no local record. A pending application LN+
+        knows about, with no local row at all, is an untracked live
+        commitment ('ghost') and must trip the breaker too."""
+        lc, db, rpc, client, *_ = _make_lifecycle(
+            my_swaps={"pending": [{"id": "ghost1"}], "opening": [], "completed": []})
+        assert lc.reconcile_ok() is False
+        assert "ghost1" in lc.breaker_tripped()
+
     def test_opening_executes_fundchannel_and_completes(self):
         peer = PK_A
         deadline = int(time.time()) + 40 * 3600
@@ -512,6 +575,40 @@ class TestSwapLifecycle:
         assert row["status"] == "opened"
         assert row["channel_funding_txid"] == "ff" * 32
 
+    def test_invalid_outgoing_peer_pubkey_skips_row(self):
+        """I3: an invalid outgoing_peer_pubkey from LN+ must never be written
+        into the row or flow into connect/fundchannel — skip the row this
+        pass entirely."""
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": "not-a-real-pubkey",
+             "deadline": int(time.time()) + 40 * 3600, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3)])
+        rpc.listpeerchannels.return_value = {"channels": []}
+        lc.run_watcher_once()
+        rpc.fundchannel.assert_not_called()
+        rpc.connect.assert_not_called()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "applied"
+        assert row["outbound_peer"] is None
+
+    def test_malformed_connect_address_falls_back_to_bare_pubkey(self):
+        """I3: a malformed connect address from LN+ must not be interpolated
+        into the connect target — fall back to a bare-pubkey connect."""
+        peer = PK_A
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "outgoing_peer_clearnet_address": "1.2.3.4:9735; rm -rf /",
+             "deadline": int(time.time()) + 40 * 3600, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.fundchannel.return_value = {"txid": "ff" * 32}
+        lc.run_watcher_once()
+        rpc.connect.assert_called_once_with(peer)
+
     def test_open_is_idempotent_when_channel_exists(self):
         peer = PK_A
         my = {"pending": [], "completed": [], "opening": [
@@ -520,12 +617,42 @@ class TestSwapLifecycle:
         lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
             dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
                  duration_months=3, outbound_peer=peer)])
+        # I5(b): must match the row's committed capacity (2_000_000 sats) to
+        # be recognized as OUR swap channel, not just any open channel to peer.
         rpc.listpeerchannels.return_value = {"channels": [
             {"peer_id": peer, "state": "CHANNELD_AWAITING_LOCKIN",
-             "funding_txid": "aa" * 32}]}
+             "total_msat": 2_000_000_000, "funding_txid": "aa" * 32}]}
         lc.run_watcher_once()
         rpc.fundchannel.assert_not_called()
         client.complete_application.assert_called_once()
+
+    def test_opens_new_channel_when_only_wrong_capacity_channel_exists(self):
+        """I5(b): a pre-existing channel to the assigned peer that does NOT
+        match the swap's committed capacity must not be claimed as our swap
+        channel — the watcher must fund a NEW channel of the correct
+        capacity rather than silently skip the open."""
+        peer = PK_A
+        deadline = int(time.time()) + 40 * 3600
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "outgoing_peer_clearnet_address": "1.2.3.4:9735",
+             "deadline": deadline, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        # A pre-existing channel to `peer` exists, but at a DIFFERENT
+        # capacity than the swap terms (e.g. a regular planner open from
+        # before the swap) — must not be mistaken for our swap channel.
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": peer, "state": "CHANNELD_NORMAL",
+             "total_msat": 9_000_000_000}]}
+        rpc.fundchannel.return_value = {"txid": "ff" * 32}
+        lc.run_watcher_once()
+        rpc.fundchannel.assert_called_once()
+        assert rpc.fundchannel.call_args.args[1] == 2_000_000
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "opened"
+        assert row["channel_funding_txid"] == "ff" * 32
 
     def test_feerate_escalates_near_deadline(self):
         peer = PK_A
@@ -724,6 +851,26 @@ class TestSwapLifecycle:
         expected_high = after + 48 * 3600
         assert expected_low <= row["deadline_at"] <= expected_high
 
+    def test_abandoned_row_not_resurrected_by_stale_lnplus_opening(self):
+        """C2 regression: a row abandoned locally (status 'failed', e.g. via
+        revenue-lnplus-abandon) must stay terminal even if LN+ still lists
+        the swap under 'opening' for a stale cycle or two. The watcher used
+        to flip status back to 'opening' unconditionally and fund it."""
+        peer = PK_A
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "deadline": int(time.time()) + 40 * 3600, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="failed", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.fundchannel.return_value = {"txid": "ff" * 32}
+        lc.run_watcher_once()
+        rpc.fundchannel.assert_not_called()
+        client.complete_application.assert_not_called()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "failed"
+
     def test_opened_rows_skipped_in_opening_phase(self):
         peer = PK_A
         my = {"pending": [], "completed": [], "opening": [
@@ -754,6 +901,10 @@ class TestLnplusIntegration:
         # _make_evaluator fixture's listfunds shape).
         rpc.listfunds.return_value = {"outputs": [
             {"amount_msat": 100_000_000_000, "status": "confirmed", "reserved": False}]}
+        # I5(a): no pre-existing channel to the inferred outbound peer at
+        # apply time (overridden in phase 2 below for the watcher's own
+        # idempotency check).
+        rpc.listpeerchannels.return_value = {"channels": []}
         db = _make_db()
         client = MagicMock()
         planner = MagicMock()
