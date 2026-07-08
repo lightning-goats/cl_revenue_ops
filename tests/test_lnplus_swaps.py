@@ -252,6 +252,19 @@ class TestLnplusClient:
             client.get_swap("../../evil")
         assert "/api/2/get_swap/id=..%2F..%2Fevil" in captured["url"]
 
+    def test_get_my_swaps_normalizes_integer_ids_to_strings(self):
+        """ID normalization at client boundary: LN+ may return integer ids,
+        but local DB stores them as strings. Normalize on the way in."""
+        challenge = {"message": "lnplus-auth-abc123", "expires_at": "2099-01-01T00:00:00Z"}
+        client, rpc, patcher = _make_client(
+            [challenge, [{"pending": [{"id": 123}], "opening": [{"id": 456}], "completed": []}]])
+        with patcher:
+            result = client.get_my_swaps()
+        assert result["pending"][0]["id"] == "123"
+        assert result["opening"][0]["id"] == "456"
+        assert isinstance(result["pending"][0]["id"], str)
+        assert isinstance(result["opening"][0]["id"], str)
+
 
 from modules.lnplus_swaps import SwapEvaluator, NEG_RATIO_MAX, TOR_RELIABILITY, _IDENTIFIERS
 

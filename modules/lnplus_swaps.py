@@ -133,11 +133,20 @@ class LNPlusClient:
     def get_applicable_swaps(self) -> List[Dict]:
         result = self._request("get_applicable_swaps", self._auth_params(), method="POST")
         swaps = result.get("swaps", result) if isinstance(result, dict) else result
-        return swaps if isinstance(swaps, list) else []
+        swaps = swaps if isinstance(swaps, list) else []
+        # Normalize swap ids to strings at the client boundary
+        for swap in swaps:
+            if isinstance(swap, dict) and "id" in swap:
+                swap["id"] = str(swap["id"])
+        return swaps
 
     def get_swap(self, swap_id) -> Dict:
         result = self._request(f"get_swap/id={urllib.parse.quote(str(swap_id), safe='')}")
-        return self._unwrap_list_envelope(result, {})
+        result = self._unwrap_list_envelope(result, {})
+        # Normalize swap id to string at the client boundary, guard non-dict entries defensively
+        if isinstance(result, dict) and "id" in result:
+            result["id"] = str(result["id"])
+        return result
 
     def get_my_swaps(self) -> Dict:
         result = self._request("get_my_swaps", self._auth_params(), method="POST")
@@ -145,7 +154,13 @@ class LNPlusClient:
             result, {"pending": [], "opening": [], "completed": []})
         if not isinstance(result, dict):
             raise LNPlusError("get_my_swaps: unexpected payload")
-        return {k: result.get(k) or [] for k in ("pending", "opening", "completed")}
+        normalized = {k: result.get(k) or [] for k in ("pending", "opening", "completed")}
+        # Normalize swap ids to strings at the client boundary, skip entries without an id
+        for bucket in normalized.values():
+            for entry in bucket:
+                if isinstance(entry, dict) and "id" in entry:
+                    entry["id"] = str(entry["id"])
+        return normalized
 
     @staticmethod
     def _unwrap_list_envelope(result: Any, empty_fallback: Any) -> Any:
