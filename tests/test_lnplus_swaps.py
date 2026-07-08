@@ -808,4 +808,5 @@ class TestLnplusIntegration:
         assert db.lnplus_get_swap("sw1")["status"] == "ended"
         policy.remove_tag.assert_called_with(PK_A, "no_close")
         client.create_rating.assert_called_with("sw1", "positive")
+        ignore_fn.assert_not_called()
         assert lifecycle.has_inflight() is False
