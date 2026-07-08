@@ -70,8 +70,7 @@ PUBLIC_RUNTIME_KEYS = (
     'htlcmax_source_pct',
     'htlcmax_sink_pct',
     'htlcmax_balanced_pct',
-    # LN+ liquidity swap automation (9 runtime controls; fleet_pubkeys and
-    # watcher_interval are init-time only)
+    # LN+ liquidity swap automation (11 runtime controls)
     'lnplus_swaps_enabled',
     'lnplus_execute_applications',
     'lnplus_swap_preference_margin',
@@ -81,6 +80,8 @@ PUBLIC_RUNTIME_KEYS = (
     'lnplus_apply_feerate_ceiling',
     'lnplus_pending_timeout_days',
     'lnplus_inbound_credit_factor',
+    'lnplus_fleet_pubkeys',
+    'lnplus_watcher_interval',
 )
 
 # Type mapping for config fields (for validation)
@@ -389,11 +390,14 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # LN+ liquidity swap automation
     'lnplus_swap_preference_margin': (0.0, 2.0),
     'lnplus_inbound_credit_factor': (0.0, 1.0),
-    'lnplus_max_duration_months': (1, 12),
+    # C-2 (2026-07-08 audit): hard cap — contracts must never lock capital
+    # beyond a quarter. Default (3) stays inside the new [1, 3] range.
+    'lnplus_max_duration_months': (1, 3),
     'lnplus_max_participants': (2, 5),
     'lnplus_apply_feerate_ceiling': (253, 100000),
     'lnplus_pending_timeout_days': (1, 30),
     'lnplus_min_peer_positive_ratings': (0, 1000),
+    'lnplus_watcher_interval': (300, 14400),
 }
 
 # Valid values for string enum fields

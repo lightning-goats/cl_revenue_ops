@@ -2975,7 +2975,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if capacity_planner is not None:
         capacity_planner.lnplus_evaluator = SwapEvaluator(
             safe_plugin, safe_plugin.rpc, database, config, lnplus_client,
-            capacity_planner, lnplus_lifecycle)
+            capacity_planner, lnplus_lifecycle,
+            # C-1(c): same callable CapexBudgetEngine is wired with above —
+            # a hive fleet-mate participant dedups out of gate 6 even before
+            # the operator adds its pubkey to lnplus_fleet_pubkeys.
+            hive_member_check=rebalancer._is_hive_member if rebalancer is not None else None)
     plugin.log("LN+ swap automation initialized")
 
     # Hive Router (shared askrene fleet route discovery)
@@ -6408,7 +6412,13 @@ def _refresh_dynamic_config():
             ("revenue-ops-lnplus-watcher-interval", "lnplus_watcher_interval", "int"),
         ):
             _val = configs.get(_opt, {}).get("value_str", "")
-            if not _val:
+            # C-1(b) (2026-07-08 audit): the blanket "skip if empty" guard
+            # made a str-cast field (lnplus_fleet_pubkeys) unclearable via
+            # setconfig — an operator emptying the CSV would never see the
+            # empty value take effect. bool/int/float casts still skip on
+            # empty (an unset numeric/bool option has no meaningful "empty"
+            # value to apply).
+            if not _val and _cast != "str":
                 continue
             try:
                 if _cast == "bool":

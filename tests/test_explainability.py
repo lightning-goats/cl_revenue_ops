@@ -176,6 +176,8 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "lnplus_apply_feerate_ceiling",
         "lnplus_pending_timeout_days",
         "lnplus_inbound_credit_factor",
+        "lnplus_fleet_pubkeys",
+        "lnplus_watcher_interval",
     ]
     assert result["operator_controls"]["values"] == {
         "paused": False,
@@ -221,6 +223,8 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "lnplus_apply_feerate_ceiling": 5000,
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
+        "lnplus_fleet_pubkeys": "",
+        "lnplus_watcher_interval": 3600,
     }
     assert "config" not in result
 

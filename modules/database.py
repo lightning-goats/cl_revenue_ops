@@ -1348,10 +1348,21 @@ class Database:
                 deadline_at INTEGER,
                 planner_action_id INTEGER,
                 outcome TEXT,
-                metadata_json TEXT
+                metadata_json TEXT,
+                tag_added INTEGER
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_lnplus_swaps_status ON lnplus_swaps(status)")
+
+        # C-3 (2026-07-08 audit): per-contract tag_added bookkeeping — an
+        # additive CREATE TABLE change alone does not reach existing
+        # databases, so also ALTER TABLE guarded by try/except (matches the
+        # peer_policies/closed_channels migration idiom above).
+        try:
+            conn.execute("ALTER TABLE lnplus_swaps ADD COLUMN tag_added INTEGER")
+            self.plugin.log("Added tag_added column to lnplus_swaps")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         # LN+ counterparty history
         conn.execute("""
@@ -7191,7 +7202,7 @@ class Database:
     _LNPLUS_UPDATABLE_FIELDS = frozenset((
         "status", "ends_at", "outbound_peer", "incoming_peer",
         "our_identifier", "opened_at", "completed_at",
-        "channel_funding_txid", "deadline_at", "outcome",
+        "channel_funding_txid", "deadline_at", "outcome", "tag_added",
     ))
 
     def lnplus_record_swap(self, swap_id: str, status: str, capacity_sats: int,
@@ -7276,6 +7287,25 @@ class Database:
         cur = conn.execute("SELECT * FROM lnplus_peers WHERE pubkey = ?", (pubkey,))
         row = cur.fetchone()
         return self._lnplus_row_to_dict(row, cur) if row else None
+
+    _LNPLUS_TERMINAL_STATUSES = ("ended", "failed", "withdrawn", "cancelled_remote")
+
+    def lnplus_prune_terminal(self, older_than_days: int = 180) -> int:
+        """C-6 (2026-07-08 audit): delete terminal-status lnplus_swaps rows
+        old enough to be pure history. A row qualifies only when BOTH:
+          - applied_at is older than the cutoff, AND
+          - ends_at is NULL (never reached a contract) or also older than
+            the cutoff (a still-recent contract end must not be pruned
+            just because the application itself was long ago).
+        Returns the number of rows deleted."""
+        cutoff = int(time.time()) - max(0, int(older_than_days)) * 86400
+        marks = ",".join("?" for _ in self._LNPLUS_TERMINAL_STATUSES)
+        conn = self._get_connection()
+        cur = conn.execute(
+            f"DELETE FROM lnplus_swaps WHERE status IN ({marks}) "
+            f"AND applied_at < ? AND (ends_at IS NULL OR ends_at < ?)",
+            (*self._LNPLUS_TERMINAL_STATUSES, cutoff, cutoff))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     # =========================================================================
     # Mempool Fee History Methods (Vegas Reflex)

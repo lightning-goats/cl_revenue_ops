@@ -55,6 +55,8 @@ def test_public_runtime_keys_are_safety_only():
         "lnplus_apply_feerate_ceiling",
         "lnplus_pending_timeout_days",
         "lnplus_inbound_credit_factor",
+        "lnplus_fleet_pubkeys",
+        "lnplus_watcher_interval",
     ]
 
 
@@ -114,6 +116,8 @@ def test_public_runtime_dict_returns_only_public_keys():
         "lnplus_apply_feerate_ceiling": 5000,
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
+        "lnplus_fleet_pubkeys": "",
+        "lnplus_watcher_interval": 3600,
     }
 
 
@@ -728,6 +732,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "htlcmax_source_pct",
         "lnplus_apply_feerate_ceiling",
         "lnplus_execute_applications",
+        "lnplus_fleet_pubkeys",
         "lnplus_inbound_credit_factor",
         "lnplus_max_duration_months",
         "lnplus_max_participants",
@@ -735,6 +740,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "lnplus_pending_timeout_days",
         "lnplus_swap_preference_margin",
         "lnplus_swaps_enabled",
+        "lnplus_watcher_interval",
         "max_fee_ppm",
         "min_fee_ppm",
         "node_drain_bias_enabled",
@@ -749,7 +755,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_floor",
         "receivable_ratio_target",
     ]
-    assert result["count"] == 43
+    assert result["count"] == 45
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -801,6 +807,8 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "lnplus_apply_feerate_ceiling": 5000,
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
+        "lnplus_fleet_pubkeys": "",
+        "lnplus_watcher_interval": 3600,
     }
 
 
@@ -1277,6 +1285,8 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "lnplus_apply_feerate_ceiling": 5000,
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
+        "lnplus_fleet_pubkeys": "",
+        "lnplus_watcher_interval": 3600,
     }
     assert "config" not in result
     assert "hive_hints" not in result

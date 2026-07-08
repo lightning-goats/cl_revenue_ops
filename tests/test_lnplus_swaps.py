@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -93,6 +94,86 @@ class TestLnplusSwapTables:
         assert peer["ratings_given_negative"] == 1
         assert peer["ratings_given_positive"] == 0
 
+    def test_prune_terminal_deletes_old_row_keeps_recent_and_active(self):
+        """C-6: an old terminal row is pruned; an active row of any age
+        never is; a recent terminal row is kept."""
+        db = _make_db()
+        now = int(time.time())
+        old_cutoff = now - 200 * 86400   # older than the 180-day default
+
+        db.lnplus_record_swap("old_ended", "ended", 1_000_000, 3)
+        db.lnplus_record_swap("recent_ended", "ended", 1_000_000, 3)
+        db.lnplus_record_swap("old_active", "active", 1_000_000, 3)
+        conn = db._get_connection()
+        conn.execute("UPDATE lnplus_swaps SET applied_at = ? WHERE swap_id = ?",
+                     (old_cutoff, "old_ended"))
+        conn.execute("UPDATE lnplus_swaps SET applied_at = ? WHERE swap_id = ?",
+                     (old_cutoff, "old_active"))
+        # recent_ended keeps its just-now applied_at (not old enough to prune).
+
+        deleted = db.lnplus_prune_terminal(older_than_days=180)
+        assert deleted == 1
+        assert db.lnplus_get_swap("old_ended") is None
+        assert db.lnplus_get_swap("recent_ended") is not None
+        assert db.lnplus_get_swap("old_active") is not None   # never pruned
+
+    def test_prune_terminal_respects_recent_ends_at(self):
+        """C-6: a terminal row whose applied_at is old but whose ends_at is
+        still recent must be kept — the contract itself only recently
+        concluded even though the original application was long ago."""
+        db = _make_db()
+        now = int(time.time())
+        old_cutoff = now - 200 * 86400
+
+        db.lnplus_record_swap("s1", "ended", 1_000_000, 3)
+        conn = db._get_connection()
+        conn.execute("UPDATE lnplus_swaps SET applied_at = ?, ends_at = ? WHERE swap_id = ?",
+                     (old_cutoff, now - 10, "s1"))
+        deleted = db.lnplus_prune_terminal(older_than_days=180)
+        assert deleted == 0
+        assert db.lnplus_get_swap("s1") is not None
+
+    def test_prune_terminal_covers_all_terminal_statuses(self):
+        db = _make_db()
+        now = int(time.time())
+        old_cutoff = now - 200 * 86400
+        conn = db._get_connection()
+        for sid, status in (("s_ended", "ended"), ("s_failed", "failed"),
+                            ("s_withdrawn", "withdrawn"),
+                            ("s_cancelled", "cancelled_remote")):
+            db.lnplus_record_swap(sid, status, 1_000_000, 3)
+            conn.execute("UPDATE lnplus_swaps SET applied_at = ? WHERE swap_id = ?",
+                         (old_cutoff, sid))
+        deleted = db.lnplus_prune_terminal(older_than_days=180)
+        assert deleted == 4
+        for sid, _ in (("s_ended", None), ("s_failed", None),
+                       ("s_withdrawn", None), ("s_cancelled", None)):
+            assert db.lnplus_get_swap(sid) is None
+
+
+def test_lnplus_defaults_on():
+    """C-9 (2026-07-08 audit): explicit operator-requirement assertion —
+    LN+ swap automation defaults to fully ON (enabled + live applications)
+    with the 3-month duration cap, both via direct attribute access and via
+    Config.snapshot(). Also verify the plugin option defaults driving these
+    fields at init are 'true'/'true'/'3' (no drift between the dataclass
+    default and the startup option default)."""
+    cfg = Config()
+    assert cfg.lnplus_swaps_enabled is True
+    assert cfg.lnplus_execute_applications is True
+    assert cfg.lnplus_max_duration_months == 3
+
+    snap = cfg.snapshot()
+    assert snap.lnplus_swaps_enabled is True
+    assert snap.lnplus_execute_applications is True
+    assert snap.lnplus_max_duration_months == 3
+
+    from tests.plugin_test_utils import load_plugin_module
+    mod = load_plugin_module()
+    assert mod.plugin.options["revenue-ops-lnplus-swaps-enabled"]["default"] == "true"
+    assert mod.plugin.options["revenue-ops-lnplus-execute-applications"]["default"] == "true"
+    assert mod.plugin.options["revenue-ops-lnplus-max-duration-months"]["default"] == "3"
+
 
 class TestLnplusConfig:
     def test_defaults(self):
@@ -114,7 +195,8 @@ class TestLnplusConfig:
         for key in ("lnplus_swaps_enabled", "lnplus_execute_applications",
                     "lnplus_swap_preference_margin", "lnplus_inbound_credit_factor",
                     "lnplus_apply_feerate_ceiling", "lnplus_max_duration_months",
-                    "lnplus_min_peer_positive_ratings"):
+                    "lnplus_min_peer_positive_ratings", "lnplus_fleet_pubkeys",
+                    "lnplus_watcher_interval"):
             assert Config.is_public_runtime_key(key), key
 
     def test_runtime_update_roundtrip(self):
@@ -129,6 +211,36 @@ class TestLnplusConfig:
         cfg = Config()
         result = cfg.update_runtime(db, "lnplus_swap_preference_margin", "-5")
         assert "error" in result or result.get("status") != "success"
+
+    def test_max_duration_months_hard_capped_at_three(self):
+        """C-2 (2026-07-08 audit): operator decision — contracts must never
+        exceed a quarter. 6 is rejected, 2 (inside the new [1, 3] range) is
+        accepted."""
+        db = _make_db()
+        cfg = Config()
+        result = cfg.update_runtime(db, "lnplus_max_duration_months", "6")
+        assert "error" in result or result.get("status") != "success"
+        assert cfg.lnplus_max_duration_months == 3   # unchanged
+        result = cfg.update_runtime(db, "lnplus_max_duration_months", "2")
+        assert result.get("status") == "success"
+        assert cfg.lnplus_max_duration_months == 2
+
+    def test_fleet_pubkeys_and_watcher_interval_settable_via_revenue_config(self):
+        """C-1(a): both new keys work via revenue-config set (update_runtime)
+        alongside the existing setconfig path — public, typed, ranged."""
+        db = _make_db()
+        cfg = Config()
+        assert Config.is_public_runtime_key("lnplus_fleet_pubkeys")
+        assert Config.is_public_runtime_key("lnplus_watcher_interval")
+        pk = "02" + "ab" * 32
+        result = cfg.update_runtime(db, "lnplus_fleet_pubkeys", pk)
+        assert result.get("status") == "success"
+        assert cfg.lnplus_fleet_pubkeys == pk
+        result = cfg.update_runtime(db, "lnplus_watcher_interval", "200")
+        assert "error" in result or result.get("status") != "success"
+        result = cfg.update_runtime(db, "lnplus_watcher_interval", "7200")
+        assert result.get("status") == "success"
+        assert cfg.lnplus_watcher_interval == 7200
 
 
 import json as _json
@@ -241,6 +353,23 @@ class TestLnplusClient:
                 assert False
             except LNPlusError as e:
                 assert e.http_status == 422
+                # C-4: structured 422 error body parsed onto .errors.
+                assert e.errors["id"] == ["already applied"]
+
+    def test_http_error_without_errors_key_leaves_errors_none(self):
+        """C-4 counterpart: a body that is not a dict, or has no 'errors'
+        key, must leave .errors as None — no caller behavior change."""
+        client = LNPlusClient(MagicMock(), MagicMock())
+        import urllib.error
+        err = urllib.error.HTTPError("u", 500, "Server Error", {}, None)
+        err.read = lambda n=-1: b'not even json'
+        with patch("modules.lnplus_swaps.urllib.request.urlopen", side_effect=err):
+            try:
+                client.get_swap("s1")
+                assert False
+            except LNPlusError as e:
+                assert e.http_status == 500
+                assert e.errors is None
 
     def test_get_swap_id_cannot_escape_path(self):
         client = LNPlusClient(MagicMock(), MagicMock())
@@ -298,7 +427,8 @@ def _swap_fixture(**overrides):
     return swap
 
 
-def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None):
+def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None,
+                     hive_member_check=None):
     cfg = Config()
     for k, v in (cfg_overrides or {}).items():
         setattr(cfg, k, v)
@@ -322,7 +452,8 @@ def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None
     lifecycle.breaker_tripped.return_value = breaker
     lifecycle.has_inflight.return_value = inflight
     lifecycle.reconcile_ok.return_value = True
-    ev = SwapEvaluator(plugin, rpc, db, cfg, client, planner, lifecycle)
+    ev = SwapEvaluator(plugin, rpc, db, cfg, client, planner, lifecycle,
+                        hive_member_check=hive_member_check)
     return ev, cfg, client, db
 
 
@@ -385,6 +516,28 @@ class TestSwapEvaluatorGates:
             {"lnplus_fleet_pubkeys": FLEET_PK}, swaps=[swap])
         result = ev.run_cycle(cfg, 0.0)
         assert any(r["gate"] == "fleet_dedup" for r in result["rejections"])
+
+    def test_rejects_participant_flagged_only_by_hive_member_check(self):
+        """C-1(c): a participant not in the static lnplus_fleet_pubkeys CSV
+        but flagged as a hive fleet-mate by the injected callable must still
+        dedup out of gate 6."""
+        swap = _swap_fixture()
+        hive_pk = swap["participants"][1]["pubkey"]
+        hive_check = MagicMock(side_effect=lambda pk: pk == hive_pk)
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap], hive_member_check=hive_check)
+        result = ev.run_cycle(cfg, 0.0)
+        assert any(r["gate"] == "fleet_dedup" for r in result["rejections"])
+        hive_check.assert_any_call(hive_pk)
+
+    def test_hive_member_check_raising_does_not_veto(self):
+        """C-1(c): a raising hive_member_check must never veto by exception
+        — guard it and treat it as 'not a fleet member' (False), not a
+        crash or a false-positive dedup rejection."""
+        swap = _swap_fixture()
+        hive_check = MagicMock(side_effect=RuntimeError("hive router down"))
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap], hive_member_check=hive_check)
+        result = ev.run_cycle(cfg, 0.0)
+        assert not any(r["gate"] == "fleet_dedup" for r in result["rejections"])
 
     def test_rejects_bad_negative_ratio(self):
         swap = _swap_fixture()
@@ -620,6 +773,12 @@ def _make_lifecycle(my_swaps=None, local_rows=None):
     client = MagicMock()
     client.get_my_swaps.return_value = my_swaps or {"pending": [], "opening": [], "completed": []}
     policy = MagicMock()
+    # C-3: default to "no pre-existing no_close tag" so _activate's
+    # get_policy(...).has_tag("no_close") preflight behaves like the
+    # pre-fix unconditional add_tag for every test that doesn't care about
+    # tag_added bookkeeping — a bare MagicMock()'s .has_tag(...) would
+    # otherwise be truthy and silently skip add_tag everywhere.
+    policy.get_policy.return_value.has_tag.return_value = False
     ignore_fn = MagicMock()
     from modules.config import Config
     cfg = Config()
@@ -892,13 +1051,126 @@ class TestSwapLifecycle:
         assert row["status"] == "active"
         assert row["ends_at"] is not None
         policy.add_tag.assert_called_once_with(peer, "no_close")
+        assert row["tag_added"] == 1
+
+    def test_activate_does_not_re_add_pre_existing_tag(self):
+        """C-3: an already-present no_close tag (operator-set, or from
+        another running contract on the same peer) must not be re-added —
+        and tag_added must record 0 so _finalize knows this row is not the
+        owner and must not later remove it."""
+        peer = PK_A
+        ends = "2026-10-05T00:00:00Z"
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "s1", "incoming_peer_pubkey": PK_B, "ends": ends}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", status="opened")
+        policy.get_policy.return_value.has_tag.return_value = True
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "active"
+        policy.add_tag.assert_not_called()
+        assert row["tag_added"] == 0
+
+    def test_pre_existing_operator_tag_survives_contract_end(self):
+        """C-3: since this row never added the tag (tag_added=0), _finalize
+        must not remove it — an operator-set (or otherwise foreign) tag on
+        the peer must survive our own contract ending."""
+        peer, incoming = PK_A, PK_B
+        lc, db, rpc, client, policy, ignore_fn = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=peer, incoming_peer=incoming)
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60, tag_added=0)
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": incoming, "state": "CHANNELD_NORMAL"}]}
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "ended"
+        policy.remove_tag.assert_not_called()
+
+    def test_two_concurrent_contracts_first_end_does_not_strip_last_does(self):
+        """C-3: two running contracts sharing an outbound_peer. s2 (which
+        found the tag already present, tag_added=0) ends first and must not
+        touch it. s1 (which actually added the tag, tag_added=1) ends last,
+        by which point s2 is no longer 'active', so it is the one that
+        releases it."""
+        peer = PK_A
+        lc, db, rpc, client, policy, ignore_fn = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=peer, incoming_peer=PK_B)
+        db.lnplus_update_swap("s1", tag_added=1)
+        other_incoming = "02" + "cc" * 32
+        db.lnplus_record_swap("s2", "active", 3_000_000, 3,
+                              outbound_peer=peer, incoming_peer=other_incoming)
+        db.lnplus_update_swap("s2", tag_added=0)
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": PK_B, "state": "CHANNELD_NORMAL"},
+            {"peer_id": other_incoming, "state": "CHANNELD_NORMAL"}]}
+
+        # s2 ends first (s1 is still 'active').
+        lc._finalize(db.lnplus_get_swap("s2"))
+        assert db.lnplus_get_swap("s2")["status"] == "ended"
+        policy.remove_tag.assert_not_called()
+
+        # s1 ends last (s2 is no longer 'active') — now it releases.
+        lc._finalize(db.lnplus_get_swap("s1"))
+        assert db.lnplus_get_swap("s1")["status"] == "ended"
+        policy.remove_tag.assert_called_once_with(peer, "no_close")
+
+    def test_activation_records_swap_complete_planner_action(self):
+        """C-5: activation records a best-effort swap_complete planner
+        action, immediately marked completed."""
+        peer = PK_A
+        ends = "2026-10-05T00:00:00Z"
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "s1", "incoming_peer_pubkey": PK_B, "ends": ends}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", status="opened")
+        lc.run_watcher_once()
+        # Query the planner_actions table directly for a stable assertion
+        # independent of whichever convenience accessor exists.
+        conn = db._get_connection()
+        rows = conn.execute(
+            "SELECT action_type, status, peer_id, amount_sats FROM planner_actions "
+            "WHERE action_type = 'swap_complete'").fetchall()
+        assert len(rows) == 1
+        action_type, status, peer_id, amount_sats = rows[0]
+        assert action_type == "swap_complete"
+        assert status == "completed"
+        assert peer_id == peer
+        assert amount_sats == 2_000_000
+
+    def test_null_incoming_finalize_guard(self):
+        """C-8: an active row with NULL incoming_peer past ends_at must
+        transition to ended with outcome='ended_unjudged' — no rating, no
+        ignore, no defection bump (the incoming-side pipeline is entirely
+        skipped since there is no counterparty to judge)."""
+        peer = PK_A
+        lc, db, rpc, client, policy, ignore_fn = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3, outbound_peer=peer)
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60, tag_added=1)
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "ended"
+        assert row["outcome"] == "ended_unjudged"
+        client.create_rating.assert_not_called()
+        ignore_fn.assert_not_called()
+        # The outbound tag we own is still released (no other active row
+        # shares the peer) — the guard only skips incoming-side judging.
+        policy.remove_tag.assert_called_once_with(peer, "no_close")
 
     def test_contract_end_rates_and_releases(self):
         peer, incoming = PK_A, PK_B
         lc, db, rpc, client, policy, ignore_fn = _make_lifecycle()
         db.lnplus_record_swap("s1", "active", 2_000_000, 3,
                               outbound_peer=peer, incoming_peer=incoming)
-        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60)
+        # C-3: tag_added=1 marks that WE added the no_close tag (mirrors
+        # what _activate stamps) — only then is _finalize allowed to
+        # remove it.
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60, tag_added=1)
         rpc.listpeerchannels.return_value = {"channels": [
             {"peer_id": incoming, "state": "CHANNELD_NORMAL"}]}
         lc.run_watcher_once()
@@ -986,6 +1258,28 @@ class TestSwapLifecycle:
         result = lc.run_watcher_once()
         assert lc.breaker_tripped() is None
         assert result.get("skipped") == "lnplus unreachable"
+
+    def test_watcher_pass_prunes_terminal_rows(self):
+        """C-6: run_watcher_once calls the terminal-row pruner once per
+        pass (both the normal and the outage-early-return path)."""
+        lc, db, rpc, client, *_ = _make_lifecycle()
+        db.lnplus_record_swap("old_ended", "ended", 1_000_000, 3)
+        conn = db._get_connection()
+        conn.execute("UPDATE lnplus_swaps SET applied_at = ? WHERE swap_id = ?",
+                     (int(time.time()) - 200 * 86400, "old_ended"))
+        lc.run_watcher_once()
+        assert db.lnplus_get_swap("old_ended") is None
+
+    def test_watcher_pass_prunes_terminal_rows_on_outage(self):
+        from modules.lnplus_swaps import LNPlusError
+        lc, db, rpc, client, *_ = _make_lifecycle()
+        db.lnplus_record_swap("old_ended", "ended", 1_000_000, 3)
+        conn = db._get_connection()
+        conn.execute("UPDATE lnplus_swaps SET applied_at = ? WHERE swap_id = ?",
+                     (int(time.time()) - 200 * 86400, "old_ended"))
+        client.get_my_swaps.side_effect = LNPlusError("down")
+        lc.run_watcher_once()
+        assert db.lnplus_get_swap("old_ended") is None
 
     # -- atomic spend reservation around swap-open (fix round 1) -------------
     def test_open_reserves_before_fundchannel(self):
@@ -1189,6 +1483,7 @@ class TestLnplusIntegration:
         planner._estimate_open_cost.return_value = 2000
         planner._capex_engine.get_fleet_exploration_budget.return_value = 50_000
         policy = MagicMock()
+        policy.get_policy.return_value.has_tag.return_value = False
         ignore_fn = MagicMock()
 
         from modules.lnplus_swaps import SwapEvaluator, SwapLifecycle
@@ -1459,6 +1754,77 @@ class TestLnplusBackfill:
         assert db.get_config_override(SwapLifecycle._BACKFILL_FLAG) is None
         assert lc.breaker_tripped() is None
 
+    def test_concurrent_reconcile_runs_backfill_exactly_once(self):
+        """C-7 (2026-07-08 audit): the evaluator preflight and the watcher
+        can both call _reconcile concurrently on separate threads. Without
+        a dedicated lock around the backfill-run-once block, both threads
+        can pass the unlocked "if not flag" pre-check before either sets
+        the flag, and backfill_from_lnplus (and therefore
+        lnplus_record_swap) runs twice on an otherwise-empty ledger."""
+        my = {"pending": [{"id": "p1", "capacity_sats": 1_000_000, "duration_months": 3}],
+              "opening": [], "completed": []}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+
+        real_record = db.lnplus_record_swap
+        spy = MagicMock(wraps=real_record)
+        db.lnplus_record_swap = spy
+
+        real_get_override = db.get_config_override
+        barrier = threading.Barrier(2)
+        thread_state = threading.local()
+
+        def _synchronized_get_override(key):
+            # Only the FIRST get_config_override(_BACKFILL_FLAG) call made
+            # by each thread is the unlocked pre-check in _reconcile — sync
+            # both threads there so they genuinely race into the lock
+            # together. Every later call (the inner double-check, plus
+            # anything backfill_from_lnplus itself does) passes straight
+            # through.
+            if key == SwapLifecycle._BACKFILL_FLAG and not getattr(thread_state, "synced", False):
+                thread_state.synced = True
+                try:
+                    barrier.wait(timeout=5)
+                except threading.BrokenBarrierError:
+                    pass
+            return real_get_override(key)
+
+        db.get_config_override = _synchronized_get_override
+
+        # Widen the race window: whichever thread reaches backfill first
+        # (with no lock, both would, right after the synchronized outer
+        # check above) does a bit of "work" before the flag gets set, so a
+        # second unguarded caller has time to start its own backfill run
+        # too. With the fix's lock in place this sleep just happens while
+        # the other thread blocks on lock acquisition — harmless either way.
+        real_backfill = lc.backfill_from_lnplus
+
+        def _slow_backfill(my_arg=None):
+            time.sleep(0.05)
+            return real_backfill(my_arg)
+
+        lc.backfill_from_lnplus = _slow_backfill
+
+        results = []
+        errors = []
+
+        def _run():
+            try:
+                results.append(lc._reconcile(my))
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=_run)
+        t2 = threading.Thread(target=_run)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert not errors, errors
+        assert not t1.is_alive() and not t2.is_alive()
+        assert spy.call_count == 1
+        assert db.lnplus_get_swap("p1") is not None
+
     def test_invalid_pubkeys_result_in_null_fields(self):
         ends = int(time.time()) - 86400
         my = {"pending": [],
@@ -1578,3 +1944,38 @@ class TestLnplusPluginWiring:
         mod._refresh_dynamic_config()
         assert mod.config.lnplus_fleet_pubkeys == PK_A + "," + PK_B
         assert mod.config.lnplus_watcher_interval == 900
+
+    def test_dynamic_refresh_clears_str_field_on_empty_setconfig(self):
+        """C-1(b) (2026-07-08 audit): the old "if not _val: continue" guard
+        made lnplus_fleet_pubkeys (a str-cast field) unclearable via
+        setconfig — an operator emptying the CSV back out would never see
+        it take effect. bool/int/float casts still must skip on empty."""
+        mod = load_plugin_module()
+        mod.config = Config()
+        mod.config.lnplus_fleet_pubkeys = PK_A   # non-default starting value
+        mod.boltz_manager = None
+        fake_rpc = MagicMock()
+        fake_rpc.listconfigs.return_value = {"configs": {
+            "revenue-ops-lnplus-fleet-pubkeys": {"value_str": ""},
+        }}
+        mod.safe_plugin = SimpleNamespace(rpc=fake_rpc)
+        mod._refresh_dynamic_config()
+        assert mod.config.lnplus_fleet_pubkeys == ""
+
+    def test_dynamic_refresh_still_skips_empty_bool_int_float_casts(self):
+        """Companion to the str-clear fix: bool/int/float fields must still
+        skip on an empty (never-configured) value_str, not be coerced to a
+        falsy/zero default."""
+        mod = load_plugin_module()
+        mod.config = Config()
+        mod.config.lnplus_swaps_enabled = False
+        mod.config.lnplus_max_duration_months = 2
+        mod.config.lnplus_inbound_credit_factor = 0.3
+        mod.boltz_manager = None
+        fake_rpc = MagicMock()
+        fake_rpc.listconfigs.return_value = {"configs": {}}
+        mod.safe_plugin = SimpleNamespace(rpc=fake_rpc)
+        mod._refresh_dynamic_config()
+        assert mod.config.lnplus_swaps_enabled is False
+        assert mod.config.lnplus_max_duration_months == 2
+        assert mod.config.lnplus_inbound_credit_factor == 0.3

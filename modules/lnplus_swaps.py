@@ -59,9 +59,14 @@ def _parse_ts(value) -> Optional[int]:
 
 
 class LNPlusError(Exception):
-    def __init__(self, message: str, http_status: Optional[int] = None):
+    def __init__(self, message: str, http_status: Optional[int] = None,
+                 errors: Optional[Dict] = None):
         super().__init__(message)
         self.http_status = http_status
+        # C-4 (2026-07-08 audit): structured validation errors parsed from a
+        # 422 body's "errors" key (e.g. {"id": ["already applied"]}), when
+        # present. None otherwise — no caller behavior change required.
+        self.errors = errors
 
 
 class LNPlusClient:
@@ -93,8 +98,21 @@ class LNPlusClient:
                 body = e.read(_MAX_RESPONSE_BYTES)
             except Exception:
                 pass
+            # C-4 (2026-07-08 audit): best-effort structured error parse —
+            # a 422 (or other) body that decodes to a dict with an "errors"
+            # key is attached to the raised LNPlusError so callers CAN act
+            # on field-level detail (e.g. "already applied"); any parse
+            # failure or non-dict/non-"errors" body just leaves errors=None,
+            # matching the existing message format exactly either way.
+            parsed_errors = None
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and isinstance(parsed.get("errors"), dict):
+                    parsed_errors = parsed["errors"]
+            except Exception:
+                pass
             raise LNPlusError(f"LN+ HTTP {e.code} on {path}: {body[:500]!r}",
-                              http_status=e.code)
+                              http_status=e.code, errors=parsed_errors)
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             raise LNPlusError(f"LN+ unreachable on {path}: {e}")
         if len(raw) > _MAX_RESPONSE_BYTES:
@@ -212,7 +230,8 @@ _IDENTIFIERS = ("A", "B", "C", "D", "E")
 class SwapEvaluator:
     """Pre-application gate chain (spec gates 0-9). At most one apply per cycle."""
 
-    def __init__(self, plugin, rpc, database, config, client, planner, lifecycle):
+    def __init__(self, plugin, rpc, database, config, client, planner, lifecycle,
+                 hive_member_check=None):
         self._plugin = plugin
         self.rpc = rpc
         self._db = database
@@ -220,6 +239,13 @@ class SwapEvaluator:
         self._client = client
         self._planner = planner
         self._lifecycle = lifecycle
+        # C-1(c) (2026-07-08 audit): same callable CapexBudgetEngine uses
+        # (rebalancer._is_hive_member, wired by the caller) — a hive
+        # fleet-mate participant must dedup out of gate 6 exactly like a
+        # participant in the operator's static lnplus_fleet_pubkeys CSV,
+        # even before the operator has manually added its pubkey to that
+        # list.
+        self._hive_member_check = hive_member_check
 
     def run_cycle(self, cfg, best_regular_ev: float) -> Dict:
         summary = {"applied": False, "recommended": False, "swap_id": None,
@@ -323,7 +349,7 @@ class SwapEvaluator:
             pk = p.get("pubkey")
             if not _valid_pubkey(pk):
                 return "peer_quality:invalid participant pubkey"
-            if pk in fleet or (our_id and pk == our_id):
+            if pk in fleet or (our_id and pk == our_id) or self._is_hive_fleet_member(pk):
                 return "fleet_dedup:fleet node already in swap"
             pos = int(p.get("positive_ratings_count") or 0)
             neg = int(p.get("negative_ratings_count") or 0)
@@ -347,6 +373,19 @@ class SwapEvaluator:
             if enriched < SCORE_FLOOR:
                 return f"peer_quality:{pk[:16]} planner score {enriched:.2f} below floor"
         return None
+
+    def _is_hive_fleet_member(self, pubkey: str) -> bool:
+        """C-1(c): the hive membership callable is an external dependency
+        (askrene/hive-router lookup) — a raising or misbehaving callable
+        must never veto (or fail to veto) gate 6 by exception. Absence of
+        the callable (hive_hints disabled / rebalancer not constructed)
+        means "unknown" -> False, not a dedup hit."""
+        if self._hive_member_check is None:
+            return False
+        try:
+            return bool(self._hive_member_check(pubkey))
+        except Exception:
+            return False
 
     def _check_assignment_available(self, swap) -> Optional[str]:
         """B11: a full identifier set (malformed data, or an operator
@@ -607,6 +646,12 @@ class SwapLifecycle:
         self._estimate_open_cost_fn = estimate_open_cost_fn
         self._budget_params_fn = budget_params_fn
         self._watcher_lock = threading.Lock()
+        # C-7 (2026-07-08 audit): dedicated lock around the backfill-run-once
+        # block in _reconcile — the evaluator's reconcile_ok preflight and
+        # the watcher can call _reconcile concurrently on separate threads,
+        # and without this the unlocked "if not flag" check races and can
+        # run backfill_from_lnplus more than once.
+        self._backfill_lock = threading.Lock()
         # B13: in-memory only (no DB) — observability of the most recent
         # watcher pass, surfaced via get_status().
         self._last_watcher_pass: Optional[Dict] = None
@@ -657,15 +702,24 @@ class SwapLifecycle:
         # evaluator's reconcile_ok preflight. Never trip the breaker
         # against state we have not adopted yet — if backfill itself
         # raises, retry next pass instead of running divergence checks.
+        # C-7 (2026-07-08 audit): the evaluator preflight (reconcile_ok) and
+        # the watcher can both reach this choke point on separate threads.
+        # A cheap unlocked pre-check avoids taking the lock on every pass
+        # once backfill has already run; the flag is re-checked INSIDE the
+        # lock (double-checked locking) so only one thread ever actually
+        # runs backfill_from_lnplus. Blocking acquire is fine — backfill is
+        # fast and runs exactly once.
         if not self._db.get_config_override(_BACKFILL_FLAG):
-            try:
-                self.backfill_from_lnplus(my)
-            except Exception as e:
-                self._plugin.log(
-                    f"LNPLUS: backfill_from_lnplus failed: {e} — retrying "
-                    "next pass", level="error")
-                return False
-            self._db.set_config_override(_BACKFILL_FLAG, str(int(time.time())))
+            with self._backfill_lock:
+                if not self._db.get_config_override(_BACKFILL_FLAG):
+                    try:
+                        self.backfill_from_lnplus(my)
+                    except Exception as e:
+                        self._plugin.log(
+                            f"LNPLUS: backfill_from_lnplus failed: {e} — retrying "
+                            "next pass", level="error")
+                        return False
+                    self._db.set_config_override(_BACKFILL_FLAG, str(int(time.time())))
 
         my = my or {}
         pending_ids = {s.get("id") for s in (my.get("pending") or [])}
@@ -1060,6 +1114,7 @@ class SwapLifecycle:
             # ledger unconditionally (live_ids=None disables the filter) —
             # a funded deadline must not wait on LN+ being back up.
             self._phase_3b(summary, set(), live_ids=None)
+            self._prune_terminal_rows()
             return summary
 
         # Phase 2: reconcile (breaker does not block the phases below).
@@ -1195,7 +1250,22 @@ class SwapLifecycle:
         except Exception as e:
             self._plugin.log(f"LNPLUS: pending timeout phase error: {e}", level="error")
 
+        # Phase 7: cheap terminal-row pruning (C-6, 2026-07-08 audit).
+        self._prune_terminal_rows()
+
         return summary
+
+    def _prune_terminal_rows(self) -> None:
+        """C-6: keep the ledger from growing unbounded — terminal rows
+        (ended/failed/withdrawn/cancelled_remote) old enough to be pure
+        history are deleted once per watcher pass. Best-effort: a DB
+        hiccup here must never fail the pass."""
+        try:
+            pruned = self._db.lnplus_prune_terminal()
+            if pruned:
+                self._plugin.log(f"LNPLUS: pruned {pruned} terminal swap row(s)", level="debug")
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: terminal-row pruning failed: {e}", level="warn")
 
     def _phase_3b(self, summary: Dict, processed_opening_ids, live_ids=None) -> None:
         """B1: live_ids is the set of swap ids LN+ still recognizes (opening
@@ -1458,14 +1528,48 @@ class SwapLifecycle:
 
         outbound_peer = row.get("outbound_peer")
         if outbound_peer:
+            # C-3 (2026-07-08 audit): only add (and later remove) the tag if
+            # WE added it. Unconditionally removing no_close in _finalize
+            # used to clobber an operator-set tag or another running
+            # contract's protection on the same peer — record whether the
+            # tag pre-existed so _finalize knows whether it is safe to
+            # touch it.
+            already_tagged = False
             try:
-                self._policy.add_tag(outbound_peer, "no_close")
+                policy = self._policy.get_policy(outbound_peer)
+                already_tagged = bool(policy and policy.has_tag("no_close"))
             except Exception as e:
-                self._plugin.log(f"LNPLUS: add_tag(no_close) failed for {outbound_peer}: {e}",
-                                  level="warn")
+                self._plugin.log(
+                    f"LNPLUS: get_policy failed for {outbound_peer} while "
+                    f"activating swap {sid} — assuming no_close absent: {e}",
+                    level="warn")
+            if already_tagged:
+                self._db.lnplus_update_swap(sid, tag_added=0)
+            else:
+                try:
+                    self._policy.add_tag(outbound_peer, "no_close")
+                    self._db.lnplus_update_swap(sid, tag_added=1)
+                except Exception as e:
+                    self._plugin.log(f"LNPLUS: add_tag(no_close) failed for {outbound_peer}: {e}",
+                                      level="warn")
 
         # Outcome: contract is now protected.
         self._db.lnplus_update_swap(sid, status="active")
+
+        # C-5 (2026-07-08 audit): best-effort planner-action breadcrumb —
+        # observability parity with swap_apply/swap_open for the moment a
+        # contract goes live.
+        try:
+            current = self._db.lnplus_get_swap(sid) or row
+            action_id = self._db.record_planner_action(
+                action_type="swap_complete",
+                peer_id=outbound_peer or "unknown",
+                amount_sats=current.get("capacity_sats"),
+                reason=f"LN+ swap {sid} contract active until {current.get('ends_at')}")
+            self._db.update_planner_action(action_id, status="completed")
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: failed to record swap_complete planner action: {e}",
+                              level="warn")
 
     def _check_mid_contract_vanish(self, row: Dict) -> None:
         peer = row.get("outbound_peer")
@@ -1488,6 +1592,21 @@ class SwapLifecycle:
         outbound_peer = row.get("outbound_peer")
         incoming_peer = row.get("incoming_peer")
 
+        if not incoming_peer:
+            # C-8 (2026-07-08 audit): NULL/empty incoming_peer means we have
+            # no counterparty channel to check — the still-open heuristic is
+            # meaningless without one. Never default a peer we cannot even
+            # identify to a negative rating; release protection (subject to
+            # the same shared-peer guard as the normal path) and close the
+            # row out unjudged.
+            self._plugin.log(
+                f"LNPLUS: finalize for swap {sid} — cannot judge counterparty "
+                "(incoming_peer is NULL/empty); ending unjudged, no rating "
+                "filed", level="warn")
+            self._release_no_close_if_ours(sid, row, outbound_peer)
+            self._db.lnplus_update_swap(sid, status="ended", outcome="ended_unjudged")
+            return
+
         positive = self._incoming_channel_open(incoming_peer)
         if positive is None:
             # B2: listpeerchannels FAILED (unknown state) — this is not the
@@ -1508,12 +1627,7 @@ class SwapLifecycle:
         except Exception as e:
             self._plugin.log(f"LNPLUS: create_rating failed for swap {sid}: {e}", level="warn")
 
-        if outbound_peer:
-            try:
-                self._policy.remove_tag(outbound_peer, "no_close")
-            except Exception as e:
-                self._plugin.log(f"LNPLUS: remove_tag(no_close) failed for {outbound_peer}: {e}",
-                                  level="warn")
+        self._release_no_close_if_ours(sid, row, outbound_peer)
 
         if incoming_peer:
             try:
@@ -1537,6 +1651,30 @@ class SwapLifecycle:
 
         # Outcome, after best-effort ratings/tags/ignore.
         self._db.lnplus_update_swap(sid, status="ended", outcome=rating)
+
+    def _release_no_close_if_ours(self, sid: str, row: Dict, outbound_peer: Optional[str]) -> None:
+        """C-3 (2026-07-08 audit): unconditionally removing no_close here used
+        to clobber an operator-set tag or another running contract's
+        protection on the same outbound peer. Only remove it when THIS row
+        is the one that added it (tag_added == 1, stamped by _activate) AND
+        no OTHER 'active' row still shares the same outbound_peer."""
+        if not outbound_peer:
+            return
+        if row.get("tag_added") != 1:
+            return
+        other_active = [r for r in self._db.lnplus_get_swaps_by_status(["active"])
+                        if r.get("swap_id") != sid and r.get("outbound_peer") == outbound_peer]
+        if other_active:
+            self._plugin.log(
+                f"LNPLUS: swap {sid} ended but no_close on {outbound_peer} is "
+                f"still held by {len(other_active)} other active contract(s) "
+                "— not removing", level="info")
+            return
+        try:
+            self._policy.remove_tag(outbound_peer, "no_close")
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: remove_tag(no_close) failed for {outbound_peer}: {e}",
+                              level="warn")
 
     def _incoming_channel_open(self, incoming_peer) -> Optional[bool]:
         """True/False is a genuine RPC answer ("channel open"/"no channel").
