@@ -199,10 +199,15 @@ class HiveHintAdapter:
     # MAX_PEERS_IN_SNAPSHOT=200. The ["hive","hints"] datastore value is
     # locally writable and producer-controlled, so we re-enforce both bounds
     # on read: an oversized value is rejected *before* json.loads (so a
-    # multi-MB payload cannot make the fee path hang parsing), and a hint map
-    # over the entry cap is rejected via an O(1) len() check *before*
-    # _normalize_hint_map walks it. Either case is treated as absent/stale
-    # (fail-open neutral) and logged once.
+    # multi-MB payload cannot make the fee path hang parsing). A hint map
+    # over the entry cap, however, is NOT rejected outright: the producer is
+    # known to legitimately emit one entry per gossip-known peer (hundreds on
+    # a well-connected node), so rejecting the whole snapshot would silently
+    # kill the entire hint pipeline. Instead the per-peer map is truncated to
+    # MAX_PEERS_IN_SNAPSHOT entries, prioritizing fleet members and peers
+    # with actionable content (see _truncate_hint_map) and logged once per
+    # snapshot generation. Top-level list sections (rebalance_recommendations,
+    # lnplus_swap_hints, etc.) are untouched by this cap.
     DATASTORE_MAX_BYTES = 900_000
     MAX_PEERS_IN_SNAPSHOT = 200
     # Total bitcoin supply in sats — an upper sanity bound for any fleet value.
@@ -461,18 +466,80 @@ class HiveHintAdapter:
         except Exception:
             pass
 
+    def _is_member_hint(self, hint) -> bool:
+        """True if hint carries the fleet-membership signal is_hive_member reads."""
+        return isinstance(hint, dict) and bool(hint.get("member", False))
+
+    def _is_actionable_hint(self, hint) -> bool:
+        """True if hint carries content the fee/topology paths actually act on:
+        a non-neutral channel-open preference, a closure recommendation, or a
+        known (non-"none") corridor role.
+        """
+        if not isinstance(hint, dict):
+            return False
+        coh = hint.get("channel_open_hint")
+        if isinstance(coh, dict) and coh.get("open_preference") not in (None, "neutral"):
+            return True
+        if hint.get("closure_recommended"):
+            return True
+        role = hint.get("corridor_role")
+        if role in self.VALID_CORRIDOR_ROLES and role != "none":
+            return True
+        return False
+
+    def _truncate_hint_map(self, hints: dict) -> dict:
+        """Truncate an over-cap per-peer hints map to MAX_PEERS_IN_SNAPSHOT
+        entries instead of rejecting the whole snapshot.
+
+        Priority order (highest kept first):
+          1. fleet members (the signal is_hive_member/_get_hive_membership read)
+          2. peers with actionable content (open/avoid preference, closure
+             recommendation, or a known corridor role)
+          3. everything else
+
+        Within each tier, entries are kept in sorted-by-peer_id order so the
+        same input snapshot always yields the same survivors.
+        """
+        if len(hints) <= self.MAX_PEERS_IN_SNAPSHOT:
+            return hints
+        members, actionable, rest = [], [], []
+        for peer_id in sorted(hints.keys()):
+            hint = hints[peer_id]
+            if self._is_member_hint(hint):
+                members.append(peer_id)
+            elif self._is_actionable_hint(hint):
+                actionable.append(peer_id)
+            else:
+                rest.append(peer_id)
+        keep = (members + actionable + rest)[: self.MAX_PEERS_IN_SNAPSHOT]
+        keep_set = set(keep)
+        truncated = {peer_id: hint for peer_id, hint in hints.items() if peer_id in keep_set}
+        self._log_truncated_snapshot(len(hints))
+        return truncated
+
+    def _log_truncated_snapshot(self, original_count: int) -> None:
+        """Log one warn for a truncated over-cap hint map (once per snapshot
+        generation — unlike _log_oversized_payload this is not deduped across
+        the adapter's lifetime, since it is an ongoing operational signal).
+        """
+        try:
+            self._plugin.log(
+                f"hive hints: truncated {original_count}->{self.MAX_PEERS_IN_SNAPSHOT} "
+                "peers (members/actionable prioritized)",
+                level='warn',
+            )
+        except Exception:
+            pass
+
     def _validate_and_normalize_snapshot(self, raw) -> dict | None:
         if not self._validate_snapshot(raw):
             return None
-        # Entry-count cap: reject an over-cap hint map via an O(1) len() check
-        # before _normalize_hint_map walks every entry. _validate_snapshot has
-        # already confirmed raw["hints"] is a dict.
-        hints = raw.get("hints")
-        if isinstance(hints, dict) and len(hints) > self.MAX_PEERS_IN_SNAPSHOT:
-            self._log_oversized_payload("hint_entries", len(hints))
-            return None
+        # _validate_snapshot has already confirmed raw["hints"] is a dict.
+        normalized_hints = self._normalize_hint_map(raw.get("hints"))
+        if len(normalized_hints) > self.MAX_PEERS_IN_SNAPSHOT:
+            normalized_hints = self._truncate_hint_map(normalized_hints)
         snapshot = dict(raw)
-        snapshot["hints"] = self._normalize_hint_map(raw.get("hints"))
+        snapshot["hints"] = normalized_hints
         return snapshot
 
     # ------------------------------------------------------------------
