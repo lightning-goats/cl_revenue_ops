@@ -7562,7 +7562,10 @@ def revenue_boltz_loop_in(plugin: Plugin, amount_sats: int, channel_id: str = No
 
 
 @plugin.method("revenue-boltz-status")
-def revenue_boltz_status(plugin: Plugin, swap_id: str) -> Dict[str, Any]:
+def revenue_boltz_status(plugin: Plugin, swap_id: str = None) -> Dict[str, Any]:
+    if not swap_id:
+        return {"error": "usage: revenue-boltz-status swap_id (per-swap status; "
+                         "see revenue-boltz-wallet/-budget/-history for global state)"}
     try:
         return _require_boltz_manager().swap_status(swap_id)
     except Exception as e:
@@ -8459,6 +8462,11 @@ def _build_boltz_expansion_treasury_plan(
             "total_candidates": 0,
             "skipped_count": 0,
             "skipped_examples": [],
+            "budget": None,
+            "pending_swap_count": None,
+            "thresholds": None,
+            "planner_coordination": None,
+            "structural_credit": None,
         }
     deficit = max(0, target - onchain_confirmed_sats)
 
@@ -8493,6 +8501,9 @@ def _build_boltz_expansion_treasury_plan(
             "pending_swap_count": (
                 int(pending_swap_count) if pending_swap_count is not None else None
             ),
+            "thresholds": None,
+            "planner_coordination": None,
+            "structural_credit": None,
         }
 
     max_amt = max(int(min_amount_sats), min(int(max_amount_sats), int(max(deficit, min_amount_sats))))
@@ -8525,6 +8536,7 @@ def _build_boltz_expansion_treasury_plan(
     )
     filtered["treasury"] = treasury
     filtered["status"] = "ok"
+    filtered.setdefault("reason", None)
     return filtered
 
 
@@ -9349,6 +9361,32 @@ def revenue_boltz_balance_recommendations(
 
 
 @plugin.method("revenue-boltz-auto-cycle-status")
+def _compact_boltz_recommendation(rec: Any) -> Dict[str, Any]:
+    """Compact summary of a balance/treasury recommendation for status
+    payloads. Skip/plan entries in revenue-boltz-auto-cycle-status embed
+    these instead of the full recommendation (which nests route plans and
+    tuning breakdowns and pushed the status RPC past 100KB)."""
+    if not isinstance(rec, dict):
+        return {}
+    compact = {
+        key: rec.get(key)
+        for key in ("channel_id", "peer_id", "direction", "amount_sats",
+                    "local_balance_pct")
+        if key in rec
+    }
+    econ = rec.get("economics")
+    if isinstance(econ, dict):
+        compact["economics"] = {
+            key: econ.get(key)
+            for key in ("passes_profit_guard", "estimated_swap_fee_sats",
+                        "expected_uplift_sats", "structural", "marginal_roi")
+            if key in econ
+        }
+    else:
+        compact["economics"] = {}
+    return compact
+
+
 def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
     """Return scheduler status for the in-plugin Boltz auto-cycle."""
     with _boltz_auto_cycle_state_lock:
@@ -9493,7 +9531,7 @@ def _execute_boltz_balance_cycle(
         est_fee = int(econ.get("estimated_swap_fee_sats", 0) or 0)
 
         if not econ.get("passes_profit_guard", False):
-            skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id, "reason": "profit_guard_failed", "recommendation": rec})
+            skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id, "reason": "profit_guard_failed", "recommendation": _compact_boltz_recommendation(rec)})
             continue
         if est_fee > remaining_budget:
             skipped_exec.append({
@@ -9502,7 +9540,7 @@ def _execute_boltz_balance_cycle(
                 "reason": "insufficient_remaining_budget",
                 "estimated_fee_sats": est_fee,
                 "remaining_budget_sats": remaining_budget,
-                "recommendation": rec,
+                "recommendation": _compact_boltz_recommendation(rec),
             })
             continue
 
@@ -9531,7 +9569,7 @@ def _execute_boltz_balance_cycle(
                     "envelope_sats": envelope,
                     "spent_24h_sats": spent_24h,
                     "estimated_fee_sats": est_fee,
-                    "recommendation": rec,
+                    "recommendation": _compact_boltz_recommendation(rec),
                 })
                 continue
 
@@ -9553,7 +9591,7 @@ def _execute_boltz_balance_cycle(
                     "peer_id": peer_id,
                     "reason": "cooldown_active",
                     "cooldown_remaining_sec": rec_cooldown_seconds - (now - last_ts),
-                    "recommendation": rec,
+                    "recommendation": _compact_boltz_recommendation(rec),
                 })
                 continue
             # C1 FIX: Pre-claim cooldown slot to prevent TOCTOU double-execution
@@ -9567,7 +9605,7 @@ def _execute_boltz_balance_cycle(
                 "peer_id": peer_id,
                 "amount_sats": amount_sats,
                 "estimated_fee_sats": est_fee,
-                "recommendation": rec,
+                "recommendation": _compact_boltz_recommendation(rec),
             })
             remaining_budget = max(0, remaining_budget - est_fee)
             continue
@@ -9629,7 +9667,7 @@ def _execute_boltz_balance_cycle(
                     "amount_sats": amount_sats,
                     "estimated_fee_sats": est_fee,
                     "result": res,
-                    "recommendation": rec,
+                    "recommendation": _compact_boltz_recommendation(rec),
                 })
                 if status == "accepted":
                     # C1: Pre-claim already set; just update budget
@@ -9649,7 +9687,7 @@ def _execute_boltz_balance_cycle(
                     "amount_sats": amount_sats,
                     "estimated_fee_sats": est_fee,
                     "result": res,
-                    "recommendation": rec,
+                    "recommendation": _compact_boltz_recommendation(rec),
                 })
         except Exception as e:
             # C1: Exception - restore original cooldown timestamp
@@ -9660,7 +9698,7 @@ def _execute_boltz_balance_cycle(
                 "channel_id": ch_id,
                 "peer_id": peer_id,
                 "reason": f"execution_failed: {e}",
-                "recommendation": rec,
+                "recommendation": _compact_boltz_recommendation(rec),
             })
 
     return {
