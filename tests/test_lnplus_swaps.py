@@ -787,7 +787,7 @@ class TestSwapEvAndApply:
     def test_tie_break_prefers_fewer_participants_on_equal_ev(self):
         swap3 = _swap_fixture(id="sw3", participant_max_count=3)
         swap4 = _swap_fixture(id="sw4", participant_max_count=4)
-        ev, cfg, client, db = _make_evaluator(swaps=[swap3, swap4])
+        ev, cfg, client, db = _make_evaluator(swaps=[swap4, swap3])
         client.create_application.return_value = {"id": "sw3", "status": "pending"}
         db.record_planner_action = MagicMock(return_value=1)
         db.update_planner_action = MagicMock()
