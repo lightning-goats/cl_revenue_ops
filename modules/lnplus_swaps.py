@@ -150,3 +150,166 @@ class LNPlusClient:
         params["id"] = str(swap_id)
         params["rating"] = rating
         return self._request("create_rating", params, method="POST")
+
+
+NEG_RATIO_MAX = 0.10
+TOR_RELIABILITY = 0.8
+RELIABILITY_FLOOR = 0.6
+P_UNDERPERFORM = 0.3
+BOLTZ_REPLACEMENT_RATE = 0.005
+SCORE_FLOOR = 0.5
+_IDENTIFIERS = ("A", "B", "C", "D", "E")
+
+
+class SwapEvaluator:
+    """Pre-application gate chain (spec gates 0-9). At most one apply per cycle."""
+
+    def __init__(self, plugin, rpc, database, config, client, planner, lifecycle):
+        self._plugin = plugin
+        self.rpc = rpc
+        self._db = database
+        self._config = config
+        self._client = client
+        self._planner = planner
+        self._lifecycle = lifecycle
+
+    def run_cycle(self, cfg, best_regular_ev: float) -> Dict:
+        summary = {"applied": False, "recommended": False, "swap_id": None,
+                   "swap_ev": 0.0, "best_regular_ev": best_regular_ev,
+                   "rejections": []}
+
+        if not getattr(cfg, "lnplus_swaps_enabled", False):
+            return summary
+        breaker = self._lifecycle.breaker_tripped()
+        if breaker:
+            self._plugin.log(f"LNPLUS: breaker tripped ({breaker}) — no applications", level="warn")
+            return summary
+        if self._lifecycle.has_inflight():
+            self._plugin.log("LNPLUS: swap in flight — serialization gate holds", level="debug")
+            return summary
+        if not self._feerate_ok(cfg, summary):
+            return summary
+        if not self._lifecycle.reconcile_ok():
+            self._plugin.log("LNPLUS: reconciliation preflight failed — no applications", level="warn")
+            return summary
+
+        try:
+            swaps = self._client.get_applicable_swaps()
+        except LNPlusError as e:
+            self._plugin.log(f"LNPLUS: get_applicable_swaps failed: {e}", level="warn")
+            return summary
+
+        qualifying = []
+        for swap in swaps:
+            reason = self._filter_swap(swap, cfg)
+            if reason is None:
+                reason = self._check_participants(swap, cfg)
+                if reason is not None:
+                    self._reject(summary, swap, reason)
+                else:
+                    qualifying.append(swap)
+            else:
+                self._reject(summary, swap, reason)
+
+        # EV + apply/recommend implemented in the ranking task.
+        return self._select_and_apply(qualifying, cfg, best_regular_ev, summary)
+
+    # -- gates ---------------------------------------------------------
+    def _feerate_ok(self, cfg, summary) -> bool:
+        try:
+            opening = int(self.rpc.feerates("perkw")["perkw"]["opening"])
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: feerates unavailable ({e}) — skipping cycle", level="warn")
+            return False
+        if opening > int(cfg.lnplus_apply_feerate_ceiling):
+            self._plugin.log(
+                f"LNPLUS: opening feerate {opening} perkw above ceiling "
+                f"{cfg.lnplus_apply_feerate_ceiling} — no applications", level="info")
+            return False
+        return True
+
+    def _filter_swap(self, swap, cfg) -> Optional[str]:
+        """Gate 3 (fill state) + gate 4 (terms). Returns rejection 'gate:reason' or None."""
+        if swap.get("status") != "pending":
+            return "fill_state:not pending"
+        if int(swap.get("participant_waiting_for_count") or 0) != 1:
+            return "fill_state:not the last open slot"
+        capacity = int(swap.get("capacity_sats") or 0)
+        min_chan = getattr(cfg, "planner_min_channel_sats", 0) or 0
+        if capacity < min_chan:
+            return f"terms:capacity {capacity} below planner min {min_chan}"
+        if int(swap.get("duration_months") or 99) > int(cfg.lnplus_max_duration_months):
+            return "terms:duration exceeds cap"
+        if int(swap.get("participant_max_count") or 99) > int(cfg.lnplus_max_participants):
+            return "terms:too many participants"
+        if str(swap.get("platform") or "any").lower() == "lnd":
+            return "terms:LND/BOS swap — we are CLN"
+        return None
+
+    def _check_participants(self, swap, cfg) -> Optional[str]:
+        """Gate 5 (peer quality, one bad peer vetoes) + gate 6 (fleet dedup)."""
+        fleet = {pk.strip() for pk in (cfg.lnplus_fleet_pubkeys or "").split(",") if pk.strip()}
+        our_id = None
+        try:
+            our_id = self.rpc.getinfo().get("id")
+        except Exception:
+            pass
+        participants = swap.get("participants") or []
+        if not participants:
+            return "peer_quality:no visible participants"
+        for p in participants:
+            pk = p.get("pubkey")
+            if not _valid_pubkey(pk):
+                return "peer_quality:invalid participant pubkey"
+            if pk in fleet or (our_id and pk == our_id):
+                return "fleet_dedup:fleet node already in swap"
+            pos = int(p.get("positive_ratings_count") or 0)
+            neg = int(p.get("negative_ratings_count") or 0)
+            if pos < int(cfg.lnplus_min_peer_positive_ratings):
+                return f"peer_quality:{pk[:16]} has {pos} positive ratings (< floor)"
+            if pos + neg > 0 and neg / (pos + neg) > NEG_RATIO_MAX:
+                return f"peer_quality:{pk[:16]} negative ratio too high"
+            if not (p.get("address_1") or p.get("address_2")):
+                return f"peer_quality:{pk[:16]} publishes no address"
+            local = self._db.lnplus_get_peer(pk)
+            if local and local.get("defections", 0) > 0:
+                return f"peer_quality:{pk[:16]} defected on us before"
+            # Spec gate 5: planner reputation scoring must not veto the peer.
+            # _score_candidate multiplicatively enriches a base score, so with
+            # base 1.0 a result below SCORE_FLOOR means reputation/uptime/profit
+            # history cut the peer roughly in half.
+            try:
+                enriched = float(self._planner._score_candidate(pk, 1.0))
+            except Exception:
+                enriched = 1.0   # no history is not a veto
+            if enriched < SCORE_FLOOR:
+                return f"peer_quality:{pk[:16]} planner score {enriched:.2f} below floor"
+        return None
+
+    def _infer_assignment(self, swap) -> Dict:
+        """LN+ convention: each participant opens to the next letter; last wraps to A.
+        We join as the next free identifier. Authoritative assignment is re-read
+        from get_my_swaps at open time; this is for pre-apply EV only."""
+        participants = {p.get("participant_identifier"): p
+                        for p in (swap.get("participants") or [])}
+        ours = next(i for i in _IDENTIFIERS if i not in participants)
+        count = int(swap.get("participant_max_count") or (len(participants) + 1))
+        letters = list(_IDENTIFIERS[:count])
+        idx = letters.index(ours)
+        outbound_id = letters[(idx + 1) % len(letters)]
+        incoming_id = letters[(idx - 1) % len(letters)]
+        return {
+            "our_identifier": ours,
+            "outbound_peer": (participants.get(outbound_id) or {}).get("pubkey"),
+            "incoming_peer": (participants.get(incoming_id) or {}).get("pubkey"),
+        }
+
+    @staticmethod
+    def _reject(summary, swap, gate_reason: str) -> None:
+        gate, _, reason = gate_reason.partition(":")
+        summary["rejections"].append(
+            {"swap_id": swap.get("id"), "gate": gate, "reason": reason})
+
+    # -- placeholder until the ranking task ------------------------------
+    def _select_and_apply(self, qualifying, cfg, best_regular_ev, summary) -> Dict:
+        return summary

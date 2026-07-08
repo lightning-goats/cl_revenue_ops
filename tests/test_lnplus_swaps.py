@@ -204,3 +204,140 @@ class TestLnplusClient:
         with patch("modules.lnplus_swaps.urllib.request.urlopen", side_effect=fake_urlopen):
             client.get_swap("../../evil")
         assert "/api/2/get_swap/id=..%2F..%2Fevil" in captured["url"]
+
+
+from modules.lnplus_swaps import SwapEvaluator, NEG_RATIO_MAX, TOR_RELIABILITY
+
+PK_A = "02" + "aa" * 32
+PK_B = "03" + "bb" * 32
+FLEET_PK = "02" + "ff" * 32
+
+
+def _swap_fixture(**overrides):
+    swap = {
+        "id": "sw1", "status": "pending",
+        "capacity_sats": 5_000_000, "duration_months": 3,
+        "participant_max_count": 3,
+        "participant_applied_count": 2,
+        "participant_waiting_for_count": 1,
+        "clearnet_connection_allowed": True,
+        "tor_connection_allowed": True,
+        "platform": "any",
+        "participants": [
+            {"participant_identifier": "A", "pubkey": PK_A,
+             "positive_ratings_count": 20, "negative_ratings_count": 0,
+             "address_1": "1.2.3.4:9735", "capacity_sats": 100_000_000,
+             "channels_count": 40},
+            {"participant_identifier": "B", "pubkey": PK_B,
+             "positive_ratings_count": 12, "negative_ratings_count": 1,
+             "address_1": "5.6.7.8:9735", "capacity_sats": 80_000_000,
+             "channels_count": 25},
+        ],
+    }
+    swap.update(overrides)
+    return swap
+
+
+def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None):
+    cfg = Config()
+    for k, v in (cfg_overrides or {}).items():
+        setattr(cfg, k, v)
+    plugin, rpc = MagicMock(), MagicMock()
+    rpc.feerates.return_value = {"perkw": {"opening": 2500}}
+    rpc.listfunds.return_value = {"outputs": [
+        {"amount_msat": 100_000_000_000, "status": "confirmed", "reserved": False}]}
+    db = _make_db()
+    client = MagicMock()
+    client.get_applicable_swaps.return_value = swaps if swaps is not None else [_swap_fixture()]
+    planner = MagicMock()
+    planner._calculate_open_ev.return_value = 1000.0
+    planner._estimate_open_cost.return_value = 2000
+    lifecycle = MagicMock()
+    lifecycle.breaker_tripped.return_value = breaker
+    lifecycle.has_inflight.return_value = inflight
+    lifecycle.reconcile_ok.return_value = True
+    ev = SwapEvaluator(plugin, rpc, db, cfg, client, planner, lifecycle)
+    return ev, cfg, client, db
+
+
+class TestSwapEvaluatorGates:
+    def test_disabled_short_circuits(self):
+        ev, cfg, client, _ = _make_evaluator({"lnplus_swaps_enabled": False})
+        result = ev.run_cycle(cfg, 500.0)
+        assert result["applied"] is False and result["recommended"] is False
+        client.get_applicable_swaps.assert_not_called()
+
+    def test_breaker_blocks(self):
+        ev, cfg, client, _ = _make_evaluator(breaker="missed deadline sw9")
+        result = ev.run_cycle(cfg, 500.0)
+        assert result["applied"] is False
+        client.get_applicable_swaps.assert_not_called()
+
+    def test_serialization_blocks(self):
+        ev, cfg, client, _ = _make_evaluator(inflight=True)
+        result = ev.run_cycle(cfg, 500.0)
+        assert result["applied"] is False
+        client.get_applicable_swaps.assert_not_called()
+
+    def test_feerate_ceiling_blocks(self):
+        ev, cfg, client, _ = _make_evaluator()
+        ev.rpc.feerates.return_value = {"perkw": {"opening": 99999}}
+        result = ev.run_cycle(cfg, 500.0)
+        assert result["applied"] is False
+        client.get_applicable_swaps.assert_not_called()
+
+    def test_rejects_not_last_slot(self):
+        swap = _swap_fixture(participant_waiting_for_count=2)
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "fill_state" for r in result["rejections"])
+
+    def test_rejects_long_duration(self):
+        swap = _swap_fixture(duration_months=6)
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert any(r["gate"] == "terms" for r in result["rejections"])
+
+    def test_rejects_lnd_platform(self):
+        swap = _swap_fixture(platform="lnd")
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert any(r["gate"] == "terms" for r in result["rejections"])
+
+    def test_rejects_low_rated_participant(self):
+        swap = _swap_fixture()
+        swap["participants"][1]["positive_ratings_count"] = 1
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert any(r["gate"] == "peer_quality" for r in result["rejections"])
+
+    def test_rejects_fleet_member_participant(self):
+        swap = _swap_fixture()
+        swap["participants"][1]["pubkey"] = FLEET_PK
+        ev, cfg, _, _ = _make_evaluator(
+            {"lnplus_fleet_pubkeys": FLEET_PK}, swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert any(r["gate"] == "fleet_dedup" for r in result["rejections"])
+
+    def test_rejects_bad_negative_ratio(self):
+        swap = _swap_fixture()
+        swap["participants"][0].update(positive_ratings_count=10,
+                                       negative_ratings_count=5)
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert any(r["gate"] == "peer_quality" for r in result["rejections"])
+
+    def test_rejects_peer_vetoed_by_planner_scoring(self):
+        ev, cfg, _, _ = _make_evaluator()
+        ev._planner._score_candidate.return_value = 0.2   # below SCORE_FLOOR
+        result = ev.run_cycle(cfg, 0.0)
+        assert any(r["gate"] == "peer_quality" and "score" in r["reason"]
+                   for r in result["rejections"])
+
+    def test_infer_assignment_triangle(self):
+        ev, cfg, _, _ = _make_evaluator()
+        a = ev._infer_assignment(_swap_fixture())
+        assert a["our_identifier"] == "C"
+        assert a["outbound_peer"] == PK_A     # C opens to A (wraps)
+        assert a["incoming_peer"] == PK_B     # B opens to C
