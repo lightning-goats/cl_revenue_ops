@@ -41,11 +41,11 @@ class TestBudgetTOCTOU:
         call_order = []
         original_enforce = mgr._enforce_budget_for_quote
 
-        def slow_enforce(quote):
+        def slow_enforce(quote, extra_fee_sats=0):
             call_order.append(('enforce_start', threading.current_thread().name))
             # Simulate slow budget check
             time.sleep(0.05)
-            result = original_enforce(quote)
+            result = original_enforce(quote, extra_fee_sats=extra_fee_sats)
             call_order.append(('enforce_end', threading.current_thread().name))
             return result
 

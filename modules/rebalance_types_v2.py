@@ -45,6 +45,12 @@ class PairCandidate:
     source_historical_sourced_fee_ppm: float = 0.0
     dest_historical_direct_fee_ppm: float = 0.0
     dest_historical_sourced_fee_ppm: float = 0.0
+    # E-4.3 (2026-07 econ audit): True when the destination has a VALIDATED
+    # forward history (> 5 lifetime forwards per profitability accounting,
+    # i.e. ChannelState.is_active). Gates whether the sats-EV value anchor
+    # trusts the realized direct rate or discounts the advertised ask.
+    # Default False = conservative (advertised fee discounted).
+    dest_fee_history_validated: bool = False
     # Per-channel MEASURED utilization (audit RE-H1/H2): the fraction of
     # refilled/drained liquidity actually routed, observed from recent flow
     # history. Falls back to the flat EXPECTED_UTILIZATION prior in the

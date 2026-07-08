@@ -28,7 +28,7 @@ def _make_manager(**overrides):
     plugin.log = MagicMock()
     mgr = BoltzCliManager(plugin, MagicMock(), cfg)
     mgr._resolve_wallet_name = lambda cur, explicit_name=None: "CLN" if cur == "BTC" else "LOOP-LBTC"
-    mgr._enforce_budget_for_quote = lambda q: {"allowed": True, "estimated_fee_sats": 80, "budget": {}}
+    mgr._enforce_budget_for_quote = lambda q, extra_fee_sats=0: {"allowed": True, "estimated_fee_sats": 80, "budget": {}}
     mgr._record_swap_result = lambda *a, **k: None
     return mgr
 

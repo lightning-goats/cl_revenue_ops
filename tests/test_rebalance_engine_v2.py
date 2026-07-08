@@ -3799,7 +3799,9 @@ def test_realized_utilization_used_for_hot_channel(mock_plugin, mock_database):
     engine = _make_engine(mock_plugin, mock_database)
 
     amount_sats = 1_000_000
-    dest_out_fee_ppm = 2_500
+    # Kept below the default max_fee_ppm=2000 historical-fee cap; E-4.3:
+    # validated realized history so the value anchor is the rate itself.
+    dest_out_fee_ppm = 1_500
     pair = PairCandidate(
         source_channel_id="100x1x0",
         dest_channel_id="200x2x0",
@@ -3813,6 +3815,8 @@ def test_realized_utilization_used_for_hot_channel(mock_plugin, mock_database):
         source_local_ratio=0.85,
         dest_local_ratio=0.10,
         dest_out_fee_ppm=dest_out_fee_ppm,
+        dest_fee_history_validated=True,
+        dest_historical_direct_fee_ppm=dest_out_fee_ppm,
         dest_realized_utilization=0.8,
         dest_utilization_is_realized=True,
     )
@@ -3842,7 +3846,9 @@ def test_thin_history_uses_prior(mock_plugin, mock_database):
     engine = _make_engine(mock_plugin, mock_database)
 
     amount_sats = 1_000_000
-    dest_out_fee_ppm = 2_500
+    # Kept below the default max_fee_ppm=2000 historical-fee cap; E-4.3:
+    # validated realized history so the value anchor is the rate itself.
+    dest_out_fee_ppm = 1_500
     pair = PairCandidate(
         source_channel_id="100x1x0",
         dest_channel_id="200x2x0",
@@ -3856,6 +3862,8 @@ def test_thin_history_uses_prior(mock_plugin, mock_database):
         source_local_ratio=0.85,
         dest_local_ratio=0.10,
         dest_out_fee_ppm=dest_out_fee_ppm,
+        dest_fee_history_validated=True,
+        dest_historical_direct_fee_ppm=dest_out_fee_ppm,
         dest_realized_utilization=0.8,
         dest_utilization_is_realized=False,
     )
@@ -4237,6 +4245,9 @@ def test_all_three_features_compose_on_one_pair(mock_plugin, mock_database):
         source_out_fee_ppm=source_out_fee_ppm,
         dest_out_fee_ppm=dest_out_fee_ppm,
         source_historical_sourced_fee_ppm=source_historical_sourced_fee_ppm,
+        # E-4.3: validated dest history so the value anchor is the rate itself.
+        dest_fee_history_validated=True,
+        dest_historical_direct_fee_ppm=dest_out_fee_ppm,
         # Feature #2 on BOTH legs, so both sides' value/opportunity terms
         # use the measured 0.8 instead of the flat 0.5 prior.
         source_realized_utilization=0.8,

@@ -1331,17 +1331,18 @@ class EVRebalancer:
 
     def find_rebalance_candidates(self) -> List[RebalanceCandidate]:
         """
-        Find channels that would benefit from rebalancing.
-        
+        Run one automatic rebalance cycle through the v2 engine.
+
+        E-4.5 (2026-07 econ audit): despite the legacy name, this ALWAYS
+        returns [] — the v2 engine selects and executes internally
+        (engine.run_cycle). The empty return is kept for API stability with
+        the daemon loop; callers must not iterate it expecting candidates
+        (the caller-side execute loop was dead code and has been removed).
+
         This method:
-        1. First monitors existing jobs to clean up finished ones
-        2. Filters out channels with active jobs
-        3. Respects max concurrent job limit
-        4. Returns prioritized list of candidates
-        
-        Performance optimizations:
-        - Hoists listpeers RPC call to avoid N+1 queries
-        - Uses ephemeral fee cache for listchannels calls
+        1. Cleans up stale budget reservations
+        2. Checks slots + capital controls (suppression paths)
+        3. Delegates selection AND execution to RebalanceEngineV2
         """
         candidates = []
         # Early-suppression paths (no slots / capital controls) deliberately

@@ -67,6 +67,10 @@ class ChannelState:
     local_out_fee_ppm: int = 0
     historical_direct_fee_ppm: float = 0.0
     historical_sourced_fee_ppm: float = 0.0
+    # E-4.3: validated forward history (> 5 lifetime forwards). Mirrors
+    # ChannelInput.is_active so the planner can gate the sats-EV dest value
+    # anchor on realized evidence rather than the advertised ask.
+    is_active: bool = False
     # Upstream-pattern fields (#1 activity, #2 realized util, #3 per-channel band).
     realized_utilization: float = 0.5
     utilization_is_realized: bool = False
@@ -408,6 +412,7 @@ def build_state_snapshot(
                 historical_sourced_fee_ppm=_as_nonnegative_float(
                     channel.historical_sourced_fee_ppm
                 ),
+                is_active=bool(channel.is_active),
                 value_class=value_class,
                 is_valuable=is_valuable,
                 remaining_budget_sats=remaining_budget_sats,

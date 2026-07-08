@@ -59,6 +59,14 @@ SOURCE_UTILIZATION_DISCOUNT = 0.5
 # Each recent in-window failure of this pair charges this fraction of the
 # route cost as an expected-retry penalty.
 FAILURE_COST_RATE = 0.25
+# E-4.3 (2026-07 econ audit): the destination's ADVERTISED outbound fee is
+# an unvalidated ask — max(current_fee, realized_ppm) let a hopeful 2000 ppm
+# policy that never cleared a single forward justify rebalance spend. When
+# the destination has a validated forward history (ChannelState.is_active:
+# > 5 lifetime forwards from profitability accounting) the realized rate is
+# trusted; otherwise the advertised fee is discounted by this factor before
+# competing with whatever realized evidence exists.
+UNVALIDATED_ADVERTISED_FEE_DISCOUNT = 0.5
 
 
 def _nonnegative_float(value: Any, default: float = 0.0) -> float:
@@ -498,7 +506,20 @@ class RebalanceEngine:
             getattr(pair, "dest_historical_sourced_fee_ppm", 0.0),
             historical_fee_cap_ppm,
         )
-        dest_value_fee_ppm = max(dest_out_fee_ppm, dest_historical_direct_fee_ppm)
+        # E-4.3: gate the dest value anchor on VALIDATED history. With >5
+        # observed forwards the realized direct rate is the truth; without
+        # them the advertised fee is optimism and is discounted (x0.5)
+        # before competing with the (thin) realized evidence.
+        dest_fee_validated = bool(getattr(pair, "dest_fee_history_validated", False))
+        if dest_fee_validated and dest_historical_direct_fee_ppm > 0:
+            dest_value_fee_ppm = dest_historical_direct_fee_ppm
+        else:
+            dest_value_fee_ppm = max(
+                dest_out_fee_ppm * UNVALIDATED_ADVERTISED_FEE_DISCOUNT,
+                dest_historical_direct_fee_ppm,
+            )
+        # Source side deliberately unchanged: discounting the opportunity
+        # cost would INFLATE final_score_sats (less conservative).
         source_opportunity_fee_ppm = max(source_out_fee_ppm, source_historical_direct_fee_ppm)
         # Audit RE-H1/H2: use each channel's MEASURED utilization when
         # available; otherwise fall back to the flat EXPECTED_UTILIZATION
@@ -623,6 +644,9 @@ class RebalanceEngine:
                 "dest_out_fee_ppm": dest_out_fee_ppm,
                 "source_out_fee_ppm": source_out_fee_ppm,
                 "dest_value_fee_ppm": round(dest_value_fee_ppm, 6),
+                # E-4.3: whether the dest value anchor used validated
+                # realized history or the discounted advertised ask.
+                "dest_fee_history_validated": dest_fee_validated,
                 "source_opportunity_fee_ppm": round(source_opportunity_fee_ppm, 6),
                 "dest_historical_direct_fee_ppm": round(dest_historical_direct_fee_ppm, 6),
                 "dest_historical_sourced_fee_ppm": round(dest_historical_sourced_fee_ppm, 6),

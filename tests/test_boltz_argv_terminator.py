@@ -98,7 +98,7 @@ class TestLoopOutAddressTerminator:
 
         mgr._run_json = fake_run_json
         mgr.quote = lambda **kw: {"quote": {"boltzFee": "80"}, "estimated_total_fee_sats": 80}
-        mgr._enforce_budget_for_quote = lambda q: {"allowed": True, "estimated_fee_sats": 80, "budget": {}}
+        mgr._enforce_budget_for_quote = lambda q, extra_fee_sats=0: {"allowed": True, "estimated_fee_sats": 80, "budget": {}}
         mgr._detect_reverse_chanids_support = lambda: True
         mgr._record_swap_result = lambda *a, **k: None
         # P4-005 rejects a dash-leading address as a bad address before the

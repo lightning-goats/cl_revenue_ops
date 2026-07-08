@@ -27,12 +27,19 @@ IMMUTABLE_CONFIG_KEYS: FrozenSet[str] = frozenset({
 PUBLIC_RUNTIME_KEYS = (
     'paused',
     'daily_budget_sats',
+    # E-3 (2026-07 econ audit): weekly cap must be raisable live — daily was
+    # raised to 5000 but the weekly ceiling silently capped it.
+    'weekly_budget_sats',
     'growth_budget_enabled',
     'growth_budget_earned_fraction',
     'growth_budget_experiment_fraction',
     'growth_budget_max_extra_sats',
     'growth_budget_hard_ceiling_sats',
     'min_fee_ppm',
+    # E-2 (2026-07 econ audit): class-aware floor — saturated/source channels
+    # may advertise below min_fee_ppm (fee-band decompression). 0 = allow
+    # true cheap egress on saturated edges (the default).
+    'min_fee_ppm_saturated',
     'max_fee_ppm',
     'fee_profile',
     'fee_market_boundary_enabled',
@@ -99,6 +106,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_interval': int,
     'paused': bool,
     'min_fee_ppm': int,
+    'min_fee_ppm_saturated': int,
     'max_fee_ppm': int,
     'fee_profile': str,
     'fee_market_boundary_enabled': bool,
@@ -268,11 +276,19 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
 
 # Explicit migration shims only. Non-public keys remain internal until they are
 # intentionally exposed as deprecated compatibility controls.
-DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset()
+# E-4.5 (2026-07 econ audit): rebalance_min_profit was parsed and echoed but
+# enforced nowhere; the sats-EV gate's rebalance_hold_margin covers the
+# semantics. Kept as a deprecated compatibility shim so config files load.
+DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset({'rebalance_min_profit'})
 
 # Range constraints for numeric fields
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'min_fee_ppm': (5, 100000),  # CRITICAL-02 FIX: Minimum 5 PPM to ensure economic viability
+    # E-2: class floor for saturated/source channels. 0 (default) allows true
+    # cheap egress; it only ever LOWERS the floor (values >= min_fee_ppm are
+    # ignored at use), so the CRITICAL-02 global minimum is not weakened for
+    # any other class.
+    'min_fee_ppm_saturated': (0, 1000),
     'max_fee_ppm': (1, 100000),
     'fee_market_boundary_min_competitors': (1, 100),
     'fee_market_boundary_margin_ppm': (0, 10000),
@@ -506,6 +522,14 @@ class Config:
     
     # Fee parameters
     min_fee_ppm: int = 10          # Floor fee in PPM (matches plugin option default)
+    # E-2 (2026-07 econ audit): class-aware min-fee floor. Channels the
+    # controller classifies as saturated (outbound_ratio >= 0.85) or source
+    # (flow_state == 'source') use min(min_fee_ppm, min_fee_ppm_saturated)
+    # as their config floor so pinned-at-floor channels can advertise
+    # genuinely cheap egress. Default 0 = true cheap egress allowed. The
+    # rebalance-cost floor / chain-cost floor / vegas floor still compose
+    # via max() on top — this only replaces the min_fee_ppm term.
+    min_fee_ppm_saturated: int = 0
     max_fee_ppm: int = 2000        # Ceiling fee in PPM (matches revenue-ops-max-fee-ppm option default; P6-010/DEF-042)
     base_fee_msat: int = 0         # Base fee fallback when base_fee_policy = "off"
 
@@ -565,7 +589,13 @@ class Config:
     fee_market_boundary_cache_seconds: int = 60
     
     # Rebalancing parameters
-    rebalance_min_profit: int = 10     # Min profit in sats to trigger (legacy, used when ppm=0)
+    # E-4.5 (2026-07 econ audit): rebalance_min_profit is a DEPRECATED
+    # no-op compatibility field — it was parsed and echoed but enforced
+    # nowhere. Its semantics (absolute sats profit floor) are covered by
+    # rebalance_hold_margin, which the v2 engine's sats-EV do-nothing gate
+    # actually enforces. Kept only so existing config files load cleanly
+    # (mirrors the fee-market-boundary deprecation pattern).
+    rebalance_min_profit: int = 10     # DEPRECATED no-op (use rebalance_hold_margin)
     rebalance_min_profit_ppm: int = 0  # Min profit in PPM (0 = use sats threshold, >0 = use ppm)
                                         # Recommended: 20 ppm (~10 sats per 500k chunk)
     rebalance_max_amount: int = 5000000  # Max rebalance amount in sats
@@ -1295,6 +1325,10 @@ class ConfigSnapshot:
     htlcmax_source_pct: float = 0.50
     htlcmax_sink_pct: float = 0.25
     htlcmax_balanced_pct: float = 0.45
+    # E-2: class-aware min-fee floor for saturated/source channels (0 =
+    # allow true cheap egress). Missing-from-snapshot kills the feature in
+    # production (getattr fallback), so it MUST be mirrored here.
+    min_fee_ppm_saturated: int = 0
     # LN+ (lightningnetwork.plus) liquidity swap automation (C1 audit fix:
     # these were missing from ConfigSnapshot entirely, so
     # getattr(cfg, "lnplus_swaps_enabled", False) inside execute_cycle's

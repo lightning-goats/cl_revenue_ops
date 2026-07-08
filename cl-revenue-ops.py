@@ -376,6 +376,7 @@ _INIT_NUMERIC_RANGES = {
     'growth_budget_max_extra_sats': (0, 1_000_000),
     'growth_budget_hard_ceiling_sats': (0, 10_000_000),
     'weekly_budget_sats': (0, 70_000_000),
+    'min_fee_ppm_saturated': (0, 1000),
     'reputation_decay': (0.0, 1.0),
     'htlc_congestion_threshold': (0.0, 1.0),
 }
@@ -1011,6 +1012,18 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-min-fee-ppm-saturated',
+    default='0',
+    description=(
+        'Class-aware min-fee floor (PPM) for channels classified saturated '
+        '(outbound >= 85% of capacity) or source. Applied only when set '
+        'BELOW revenue-ops-min-fee-ppm; 0 (default) allows true cheap '
+        'egress on saturated edges. Cost-recovery floors still apply.'
+    ),
+    dynamic=True
+)
+
+plugin.add_option(
     name='revenue-ops-max-fee-ppm',
     default='2000',
     description='Maximum fee ceiling in PPM (default: 2000)'
@@ -1132,7 +1145,11 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-rebalance-min-profit',
     default='10',
-    description='Minimum profit in sats to trigger rebalance (default: 10)'
+    description=(
+        'Deprecated no-op compatibility setting; minimum-profit gating is '
+        'enforced by the sats-EV gate and revenue-ops-rebalance-hold-margin '
+        '(default: 10)'
+    )
 )
 
 plugin.add_option(
@@ -2436,6 +2453,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         expansion_treasury_exclude_protected=options.get('revenue-ops-expansion-treasury-exclude-protected', 'true').lower() == 'true',
         target_flow=_safe_int('revenue-ops-target-flow'),
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
+        min_fee_ppm_saturated=_safe_int('revenue-ops-min-fee-ppm-saturated'),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
         market_fee_mode=options.get('revenue-ops-market-fee-mode', 'undercut').lower(),
         base_fee_policy=options.get('revenue-ops-base-fee-policy', 'off').lower(),
@@ -3627,12 +3645,21 @@ def run_rebalance_check():
         return
     
     try:
-        candidates = rebalancer.find_rebalance_candidates()
-        plugin.log(f"Rebalance check complete: {len(candidates)} candidates found")
-        
-        for candidate in candidates:
-            rebalancer.execute_rebalance(candidate)
-            
+        # The v2 engine selects AND executes inside find_rebalance_candidates
+        # (engine.run_cycle); its return is always [] by design. E-4.5: the
+        # old `for candidate: execute_rebalance(candidate)` loop here was
+        # dead code, and the "N candidates found" log always reported 0.
+        rebalancer.find_rebalance_candidates()
+        decision = (
+            rebalancer.get_last_decision_summary()
+            if hasattr(rebalancer, "get_last_decision_summary") else {}
+        )
+        plugin.log(
+            "Rebalance check complete: "
+            f"action={decision.get('action', 'unknown')} "
+            f"reason={decision.get('reason', 'unknown')}"
+        )
+
     except Exception as e:
         plugin.log(f"Rebalance check failed: {e}", level='error')
         raise
@@ -3935,7 +3962,10 @@ def revenue_rebalance_debug(
     result["thresholds"] = {
         "low_liquidity_threshold": cfg.low_liquidity_threshold,
         "high_liquidity_threshold": cfg.high_liquidity_threshold,
-        "rebalance_min_profit_sats": cfg.rebalance_min_profit
+        # E-4.5: report the profit gate that is actually ENFORCED (the
+        # sats-EV hold margin). rebalance_min_profit was echoed here while
+        # being enforced nowhere — a misleading operator surface.
+        "rebalance_hold_margin_sats": cfg.rebalance_hold_margin,
     }
 
     # Check capital controls
@@ -6500,6 +6530,9 @@ def _refresh_dynamic_config():
             # Z-2 (2026-07-08): zero-fee hive corridor grace period, tunable
             # at runtime without a daemon restart.
             ("revenue-ops-hive-zero-fee-stale-grace", "hive_zero_fee_stale_grace_seconds", "int"),
+            # E-2 (2026-07 econ audit): class-aware saturated/source min-fee
+            # floor, dynamic so fee-band decompression is tunable live.
+            ("revenue-ops-min-fee-ppm-saturated", "min_fee_ppm_saturated", "int"),
         ):
             _val = configs.get(_opt, {}).get("value_str", "")
             # C-1(b) (2026-07-08 audit): the blanket "skip if empty" guard
@@ -8672,8 +8705,12 @@ def _build_boltz_balance_plan(
     # unknown strings through uppercased, so an unresolved 'auto' would reach
     # the boltzcli quote subprocess as a literal "AUTO" currency argument.
     # Resolution (a BTC-vs-LBTC quote comparison) runs lazily, at most once
-    # per direction per plan build, sized by the first triggered candidate's
-    # amount; resolution failure falls back to BTC.
+    # per direction per plan build, sized by the LARGEST-deficit candidate's
+    # amount in that direction (E-4.7 — sizing by whichever candidate
+    # happened to trigger first let a small probe pick the currency for the
+    # whole plan). E-4.7: resolution failure falls back to LBTC, matching
+    # _select_boltz_currency's own fallback (BTC here contradicted the
+    # cheaper-default policy the selector implements).
     _resolved_auto_currency: Dict[str, Optional[str]] = {}
 
     def _plan_currency(direction: str, configured: str, amount_sats: int) -> str:
@@ -8683,8 +8720,8 @@ def _build_boltz_balance_plan(
             try:
                 _resolved_auto_currency[direction] = _select_boltz_currency(direction, int(amount_sats))
             except Exception:
-                _resolved_auto_currency[direction] = "BTC"
-        return _resolved_auto_currency[direction] or "BTC"
+                _resolved_auto_currency[direction] = "LBTC"
+        return _resolved_auto_currency[direction] or "LBTC"
 
     def _annotated_currency(direction: str, configured: str) -> Optional[str]:
         """Concrete currency this plan's quotes used for `direction`.
@@ -8934,6 +8971,16 @@ def _build_boltz_balance_plan(
             "quote_budget": quote_budget,
         })
 
+    # E-4.7: size the lazy per-direction auto-currency resolution by the
+    # LARGEST amount among quote-eligible candidates in that direction (the
+    # largest deficit), not by whichever candidate the loop reaches first.
+    _auto_sizing_amounts: Dict[str, int] = {}
+    for p in pending_quotes[:quote_budget]:
+        d = str(p["direction"])
+        _auto_sizing_amounts[d] = max(
+            _auto_sizing_amounts.get(d, 0), int(p["amount_sats"])
+        )
+
     for p in pending_quotes[:quote_budget]:
         channel_id = p["channel_id"]
         peer_id = p["peer_id"]
@@ -8966,7 +9013,10 @@ def _build_boltz_balance_plan(
         policy_reason = p["policy_reason"]
         predicted_depletion_hours = p["predicted_depletion_hours"]
 
-        target_currency = _plan_currency(direction, target_currency, amount_sats)
+        target_currency = _plan_currency(
+            direction, target_currency,
+            _auto_sizing_amounts.get(str(direction), amount_sats),
+        )
         try:
             quote_resp = bm.quote(
                 amount_sats=amount_sats,

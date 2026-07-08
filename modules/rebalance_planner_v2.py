@@ -371,6 +371,8 @@ class RebalancePlanner:
                     dest_historical_sourced_fee_ppm=max(
                         0.0, float(getattr(dest, "historical_sourced_fee_ppm", 0.0) or 0.0)
                     ),
+                    # E-4.3: validated forward history gates the EV value anchor.
+                    dest_fee_history_validated=bool(getattr(dest, "is_active", False)),
                     dest_realized_utilization=float(
                         getattr(dest, "realized_utilization", 0.5) or 0.5
                     ),

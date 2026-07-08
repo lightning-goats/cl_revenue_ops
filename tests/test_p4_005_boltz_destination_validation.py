@@ -54,7 +54,7 @@ def _capture_run_json(mgr):
 class TestLoopOut:
     def _prep(self, mgr, calls):
         mgr.quote = lambda **kw: {"quote": {"boltzFee": "80"}}
-        mgr._enforce_budget_for_quote = lambda q: {"allowed": True, "estimated_fee_sats": 80, "budget": {}}
+        mgr._enforce_budget_for_quote = lambda q, extra_fee_sats=0: {"allowed": True, "estimated_fee_sats": 80, "budget": {}}
         mgr.check_tactical_budget = lambda **kw: {"allowed": True}
         mgr.check_channel_capex_budget = lambda **kw: {"allowed": True}
         mgr._detect_reverse_chanids_support = lambda: True
@@ -82,7 +82,7 @@ class TestLoopOut:
 # ---------------------------------------------------------------------------
 class TestChainswap:
     def _prep(self, mgr):
-        mgr._enforce_budget_for_quote = lambda q: {"allowed": True, "estimated_fee_sats": 80, "budget": {}}
+        mgr._enforce_budget_for_quote = lambda q, extra_fee_sats=0: {"allowed": True, "estimated_fee_sats": 80, "budget": {}}
         mgr._record_swap_result = lambda *a, **k: None
 
     def test_valid_to_address_passes(self):

@@ -2906,12 +2906,146 @@ class FeeController:
     # clamping DTS's sampled target down to the undercut anchor locks in
     # a low-confidence guess. Let DTS explore until the posterior tightens.
     UNDERCUT_EXPLORATION_STD_THRESHOLD = 100.0
+
+    def _exploration_std_threshold(self, current_fee_ppm: int) -> float:
+        """Explore gate composed with the SL-4 relative std floor (E-4.8).
+
+        The absolute std>=100 gate clashed with REL_MIN_STD_FRAC (4%): any
+        channel above 2500 ppm has its posterior std FLOORED at >=100, so it
+        classified as "exploring" forever and the undercut/median clamps
+        never engaged. Compose the gate with the same 4% of the current fee:
+        explore iff std exceeds max(100, 0.04 x fee). Callers must compare
+        with a STRICT '>' — a converged posterior sits exactly AT the
+        relative floor, and '>=' would re-create the absorbing state at the
+        boundary.
+        """
+        return max(
+            float(self.UNDERCUT_EXPLORATION_STD_THRESHOLD),
+            GaussianThompsonState.REL_MIN_STD_FRAC * max(0, int(current_fee_ppm or 0)),
+        )
+
     # M5 (2026-07-03 audit): below this outbound ratio the channel's
     # remaining liquidity is scarce inventory — the PID prices it at a
     # premium to slow the drain, and the market undercut clamp must not
     # override that with a below-median price (which accelerated the drain
     # and then paid rebalance costs to refill).
     UNDERCUT_MIN_OUTBOUND_RATIO = 0.35
+
+    # E-2 (2026-07 econ audit): "saturated" balance-class boundary. Single
+    # source of truth shared by the DTS context bucket
+    # (_get_context_with_values) and the class-aware min-fee floor
+    # (_effective_min_fee_ppm) — the floor reuses the exact classification
+    # the controller already computes.
+    SATURATED_OUTBOUND_RATIO = 0.85
+
+    def _effective_min_fee_ppm(
+        self,
+        cfg: Any,
+        *,
+        flow_state: Optional[str] = None,
+        outbound_ratio: Optional[float] = None,
+    ) -> int:
+        """Class-aware config min-fee floor (E-2, operator-approved).
+
+        min_fee_ppm is a single global floor; saturated/source channels
+        pinned AT it could never advertise cheaper egress (fee-band
+        compression). For channels classified saturated (outbound_ratio >=
+        SATURATED_OUTBOUND_RATIO — same boundary as the DTS context bucket)
+        or source (same flow_state the sink-floor bias uses), the effective
+        config floor is min(min_fee_ppm, min_fee_ppm_saturated).
+
+        This replaces ONLY the min_fee_ppm term of the floor stack. The
+        chain-cost floor, REBALANCE_FLOOR (refill-cost recovery), and vegas
+        multiplier still compose via max() on top, so cost recovery is
+        never undercut. Values >= min_fee_ppm (or negative) are ignored.
+        """
+        base = int(cfg.min_fee_ppm)
+        try:
+            sat_floor = int(getattr(cfg, 'min_fee_ppm_saturated', 0) or 0)
+        except (TypeError, ValueError):
+            return base
+        if sat_floor < 0 or sat_floor >= base:
+            return base
+        is_source = (flow_state == "source")
+        try:
+            is_saturated = (
+                outbound_ratio is not None
+                and float(outbound_ratio) >= self.SATURATED_OUTBOUND_RATIO
+            )
+        except (TypeError, ValueError):
+            is_saturated = False
+        if is_source or is_saturated:
+            return sat_floor
+        return base
+
+    # =========================================================================
+    # E-1 (2026-07 econ audit): dynamic htlc_max valve — live-depletion keying
+    # =========================================================================
+    # The BitMEX-validated control is LIVE OUTBOUND DEPLETION: a channel with
+    # near-zero local balance must advertise a small htlc_max regardless of
+    # its flow class (observed live: 0 sats local advertising ~4.95M htlc_max
+    # — inviting doomed HTLCs). htlc_max = min(flow-class cap, depletion cap)
+    # where depletion cap = clamp(spendable x 0.85, 10k sats, capacity).
+    HTLCMAX_DEPLETION_SPENDABLE_FRACTION = 0.85
+    HTLCMAX_FLOOR_MSAT = 10_000_000  # 10k sats — existing valve floor
+    # Gossip-churn guard: the class-keyed valve only rebroadcast on flow-state
+    # transitions; the depletion term varies with every forward. An htlcmax
+    # delta alone forces a setchannel broadcast ONLY when it moves more than
+    # this fraction of the currently advertised value (it still piggybacks
+    # exactly on any broadcast that happens anyway).
+    HTLCMAX_UPDATE_DEADBAND_FRAC = 0.10
+
+    def _compute_dynamic_htlcmax_msat(
+        self,
+        cfg: Any,
+        channel_info: Dict[str, Any],
+        flow_state: str,
+    ) -> Optional[int]:
+        """Return the valve's target htlc_max (msat), or None when disabled.
+
+        Keeps the operator's flow-class pct knobs as the UPPER shape and
+        applies the live-depletion cap whenever the valve is enabled.
+        """
+        enabled = getattr(cfg, 'enable_dynamic_htlcmax', False)
+        if isinstance(enabled, str):
+            enabled = enabled.lower() in ("true", "1", "yes")
+        else:
+            enabled = enabled is True
+        if not enabled:
+            return None
+        capacity_msat = sats_to_base(channel_info.get("capacity", 0))
+        if capacity_msat <= 0:
+            return None
+        if flow_state == "source":
+            target_msat = int(capacity_msat * cfg.htlcmax_source_pct)
+        elif flow_state == "sink":
+            target_msat = int(capacity_msat * cfg.htlcmax_sink_pct)
+        else:
+            target_msat = int(capacity_msat * cfg.htlcmax_balanced_pct)
+
+        # E-1: live-depletion cap — spendable outbound is what can actually
+        # forward; advertising more invites doomed HTLCs.
+        spendable_msat = parse_msat(channel_info.get("spendable_msat", 0))
+        depletion_cap_msat = int(
+            spendable_msat * self.HTLCMAX_DEPLETION_SPENDABLE_FRACTION
+        )
+        target_msat = min(target_msat, depletion_cap_msat)
+
+        # Safety bounds: never below 10,000 sats or above capacity.
+        return max(self.HTLCMAX_FLOOR_MSAT, min(target_msat, capacity_msat))
+
+    def _htlcmax_delta_exceeds_deadband(
+        self, new_msat: int, current_msat: int
+    ) -> bool:
+        """True when the htlcmax move is big enough to justify a broadcast
+        on its own (E-1 churn guard; see HTLCMAX_UPDATE_DEADBAND_FRAC)."""
+        new_msat = int(new_msat)
+        current_msat = int(current_msat)
+        if new_msat == current_msat:
+            return False
+        if current_msat <= 0:
+            return True  # unset/zero on chain: always advertise the valve
+        return abs(new_msat - current_msat) > current_msat * self.HTLCMAX_UPDATE_DEADBAND_FRAC
 
     # =============================================================================
     # GOSSIP REFRESH FOR FROZEN CHANNEL DETECTION
@@ -3442,8 +3576,12 @@ class FeeController:
         try:
             return int(time.gmtime().tm_hour)
         except (AttributeError, TypeError, ValueError):
-            # Fallback for exotic time providers without gmtime.
-            return int(time.strftime("%H"))
+            # Fallback for exotic time providers without gmtime. Must stay
+            # UTC: the old time.strftime("%H") fallback silently reverted to
+            # the host's LOCAL hour, re-introducing the exact 6-7h bucket
+            # skew SL-6 fixed (E-4.9, 2026-07 econ audit).
+            from datetime import datetime, timezone
+            return int(datetime.now(timezone.utc).hour)
 
     def _get_hive_exploration_multiplier(self, peer_id: str) -> float:
         """Return bounded DTS variance multiplier from hive intelligence."""
@@ -3950,7 +4088,8 @@ class FeeController:
 
     def _get_competitive_undercut_pct(self, peer_id: str, channel_id: str,
                                       neighbor_median: int | None = None,
-                                      cfg: Optional[Any] = None) -> float:
+                                      cfg: Optional[Any] = None,
+                                      *, invert_rank: bool = False) -> float:
         """Calculate intelligent undercut percentage based on competitive position.
 
         Considers our channel capacity vs competitors:
@@ -3959,6 +4098,12 @@ class FeeController:
         - We're the smallest → aggressive undercut (15%), fee is our only edge
         - High-fee corridor (median > 300 PPM) → undercut more (extra 5%)
         - Low-fee corridor (median < 100 PPM) → undercut less (halved)
+
+        invert_rank (E-4.1, 2026-07 econ audit): premium mode reuses this
+        per-corridor weight as a MARKUP, where the rank logic must invert —
+        capacity strength is what supports pricing ABOVE the median. Without
+        the inversion the WEAKEST-ranked channel charged the LARGEST premium
+        (an undercut weight applied upside down).
 
         Returns undercut as a fraction (e.g., 0.10 for 10% undercut).
         Returns 0.0 if insufficient data.
@@ -3992,7 +4137,9 @@ class FeeController:
 
             # Base undercut scales with our weakness
             # Largest (rank 0.0) → 5%, mid-pack (0.5) → 10%, smallest (1.0) → 15%
-            base_undercut = 0.05 + (our_rank_pct * 0.10)
+            # Premium (invert_rank): largest (rank 0.0) → 15%, smallest → 5%.
+            rank_weight = (1.0 - our_rank_pct) if invert_rank else our_rank_pct
+            base_undercut = 0.05 + (rank_weight * 0.10)
 
             # Corridor value adjustment
             if neighbor_median is None:
@@ -4096,7 +4243,7 @@ class FeeController:
             balance = "low"
         elif outbound_ratio < 0.65:
             balance = "balanced"
-        elif outbound_ratio < 0.85:
+        elif outbound_ratio < self.SATURATED_OUTBOUND_RATIO:
             balance = "high"
         else:
             balance = "saturated"
@@ -5792,6 +5939,7 @@ class FeeController:
         floor_ppm: int,
         cfg: "ConfigSnapshot",
         sparse_data_conservative: bool,
+        effective_min_fee_ppm: Optional[int] = None,
     ) -> int:
         """
         Return a bounded low-fee exploration target.
@@ -5800,8 +5948,18 @@ class FeeController:
         are already near the floor may stay at the floor; channels with real
         headroom are kept low-fee but above the floor to preserve pricing signal.
         Sparse channels stay even closer to the current fee.
+
+        effective_min_fee_ppm (E-2): the class-aware config floor for THIS
+        channel; defaults to cfg.min_fee_ppm when the caller has no class
+        context. floor_ppm already includes it for the DTS path, so this is
+        a belt against a caller passing a raw floor.
         """
-        exploration_floor = max(floor_ppm, cfg.min_fee_ppm)
+        config_floor = (
+            int(effective_min_fee_ppm)
+            if effective_min_fee_ppm is not None
+            else cfg.min_fee_ppm
+        )
+        exploration_floor = max(floor_ppm, config_floor)
         if current_fee_ppm <= exploration_floor:
             return exploration_floor
 
@@ -6381,12 +6539,20 @@ class FeeController:
                 marginal_roi_info = f"marginal_roi={prof_data.marginal_roi_percent:.1f}%"
         
         # Calculate Floor and Ceiling
+        # E-2: the config min-fee term is class-aware — saturated/source
+        # channels may use min_fee_ppm_saturated (default 0). The chain-cost
+        # floor, flow bias, vegas multiplier and REBALANCE_FLOOR below still
+        # compose exactly as before (max), so cost recovery never drops.
+        effective_min_fee_ppm = self._effective_min_fee_ppm(
+            cfg, flow_state=flow_state, outbound_ratio=outbound_ratio
+        )
         opener = channel_info.get("opener", "local")
         base_floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs, peer_id=peer_id, opener=opener)
-        base_floor_ppm = max(base_floor_ppm, cfg.min_fee_ppm)
-        # Apply flow state to floor (sinks can go lower, but never below min_fee_ppm)
+        base_floor_ppm = max(base_floor_ppm, effective_min_fee_ppm)
+        # Apply flow state to floor (sinks can go lower, but never below the
+        # class-effective min fee)
         base_floor_ppm = int(base_floor_ppm * flow_state_multiplier)
-        base_floor_ppm = max(base_floor_ppm, cfg.min_fee_ppm)
+        base_floor_ppm = max(base_floor_ppm, effective_min_fee_ppm)
 
         # Apply Vegas Reflex floor multiplier (mempool spike defense)
         vegas_multiplier = self._vegas_state.get_floor_multiplier()
@@ -6472,7 +6638,7 @@ class FeeController:
         # floor < ceiling always, and the discovery ceiling wins over cost
         # floors unless min_fee_ppm itself forces the floor higher.
         if floor_ppm >= ceiling_ppm:
-            overridden_floor_ppm = max(cfg.min_fee_ppm, ceiling_ppm - 10)
+            overridden_floor_ppm = max(effective_min_fee_ppm, ceiling_ppm - 10)
             self.plugin.log(
                 f"FLOOR_INVERSION: {channel_id[:12]}... rebalance/vegas floor "
                 f"{floor_ppm}ppm overridden by discovery ceiling {ceiling_ppm}ppm; "
@@ -6674,6 +6840,7 @@ class FeeController:
                     floor_ppm=floor_ppm,
                     cfg=cfg,
                     sparse_data_conservative=sparse_data_conservative,
+                    effective_min_fee_ppm=effective_min_fee_ppm,
                 )
                 exploration_mode = "bounded_low_fee_success"
                 decision_reason = "LOW_FEE_EXPLORATION_SUCCESS"
@@ -6705,6 +6872,7 @@ class FeeController:
                     floor_ppm=floor_ppm,
                     cfg=cfg,
                     sparse_data_conservative=sparse_data_conservative,
+                    effective_min_fee_ppm=effective_min_fee_ppm,
                 )
                 exploration_mode = "bounded_low_fee"
                 decision_reason = "LOW_FEE_EXPLORATION"
@@ -6762,6 +6930,69 @@ class FeeController:
 
 
             # =====================================================================
+            # DEMAND-ADJUSTED REWARD SIGNAL (Kalman)
+            # =====================================================================
+            # E-4.2 (2026-07 econ audit): computed BEFORE the sleep-entry
+            # check below so the closing window's observation can be recorded
+            # on sleep entry instead of being discarded (the old order threw
+            # away the final (fee, revenue) pair every time a channel went
+            # to sleep — systematically censoring the calmest windows).
+            expected_demand = 0.5  # healthy baseline
+            try:
+                # PERF: the caller already holds this channel's row from
+                # get_all_channel_states() (same table, same columns incl.
+                # kalman_flow_ratio / kalman_velocity) — no need to re-query.
+                ch_state = state if isinstance(state, dict) else None
+                if ch_state is not None:
+                    kr = ch_state.get("kalman_flow_ratio", ch_state.get("flow_ratio", 0.0))
+                    kv = ch_state.get("kalman_velocity", 0.0)
+                    if math.isfinite(kr) and math.isfinite(kv):
+                        # Approximate daily momentum
+                        expected_demand = abs(kr) + abs(kv * 24.0)
+            except Exception as e:
+                self.plugin.log(f"Kalman demand fallback: {e}", level='debug')
+
+            # Scale expected demand into a bounded factor.
+            # F3: continuous monotone map (see _kalman_demand_factor) — the
+            # old ed<0.05 branch + 0.5 clamp created a 2x reward cliff at
+            # ed=0.05. P5: still clamped, subordinate to the PID multiplier.
+            demand_factor = self._kalman_demand_factor(expected_demand)
+
+            adjusted_revenue_rate = current_revenue_rate / demand_factor
+
+            def record_window_posterior_observation() -> bool:
+                """Record the window that just closed into the DTS posterior.
+
+                Single recording site shared by the normal path and sleep
+                entry (E-4.2). Guards preserved verbatim:
+                P7: attribute to the TRUE on-chain fee; a 0-fee window has
+                no revenue-curve meaning and is skipped entirely.
+                SL-1: unroutable zero windows are censored data — skipped.
+                M3: the window ran under the PREVIOUS cycle's regime; its
+                congestion flag reflects that regime (prev_congestion_active).
+                """
+                if raw_chain_fee > 0 and not self._is_unroutable_zero_window(
+                    adjusted_revenue_rate, spendable
+                ):
+                    ts_state.thompson.update_posterior(
+                        fee=raw_chain_fee,
+                        revenue_rate=adjusted_revenue_rate,
+                        hours=hours_elapsed,
+                        time_bucket=time_bucket,
+                        congested=prev_congestion_active,
+                    )
+
+                    # Update contextual posterior (time-aware weighting)
+                    ts_state.thompson.update_contextual(
+                        context_key=context_key,
+                        fee=raw_chain_fee,
+                        revenue_rate=adjusted_revenue_rate,
+                        time_bucket=time_bucket
+                    )
+                    return True
+                return False
+
+            # =====================================================================
             # VOLATILITY & HYSTERESIS (preserved)
             # =====================================================================
             volatility_reset = False
@@ -6794,6 +7025,12 @@ class FeeController:
                 # Don't sleep if zero revenue and fee above floor — channel needs to keep exploring
                 zero_rev_exploring = (current_revenue_rate <= 0 and current_fee_ppm > floor_ppm)
                 if ts_state.stable_cycles >= self.STABLE_CYCLES_REQUIRED and not zero_rev_exploring:
+                    # E-4.2: the window that triggered sleep is a real market
+                    # observation — record it BEFORE discarding the cycle.
+                    # The old code returned without update_posterior, so the
+                    # posterior never saw the (fee, revenue) evidence of
+                    # exactly the stable windows sleep mode exists to detect.
+                    record_window_posterior_observation()
                     sleep_duration_seconds = cfg.fee_interval * self.SLEEP_CYCLES
                     ts_state.is_sleeping = True
                     ts_state.sleep_until = now + sleep_duration_seconds
@@ -6826,67 +7063,12 @@ class FeeController:
                     ts_state.stable_cycles = 0
 
             # =====================================================================
-            # DEMAND-ADJUSTED REWARD SIGNAL (Kalman)
-            # =====================================================================
-            expected_demand = 0.5  # healthy baseline
-            try:
-                # PERF: the caller already holds this channel's row from
-                # get_all_channel_states() (same table, same columns incl.
-                # kalman_flow_ratio / kalman_velocity) — no need to re-query.
-                ch_state = state if isinstance(state, dict) else None
-                if ch_state is not None:
-                    kr = ch_state.get("kalman_flow_ratio", ch_state.get("flow_ratio", 0.0))
-                    kv = ch_state.get("kalman_velocity", 0.0)
-                    if math.isfinite(kr) and math.isfinite(kv):
-                        # Approximate daily momentum
-                        expected_demand = abs(kr) + abs(kv * 24.0)
-            except Exception as e:
-                self.plugin.log(f"Kalman demand fallback: {e}", level='debug')
-
-            # Scale expected demand into a bounded factor.
-            # F3: continuous monotone map (see _kalman_demand_factor) — the
-            # old ed<0.05 branch + 0.5 clamp created a 2x reward cliff at
-            # ed=0.05. P5: still clamped, subordinate to the PID multiplier.
-            demand_factor = self._kalman_demand_factor(expected_demand)
-
-            adjusted_revenue_rate = current_revenue_rate / demand_factor
-
-
-            # =====================================================================
             # THOMPSON SAMPLING: Update Posterior and Sample Fee
             # =====================================================================
-            # Update DTS posterior with demand-adjusted observation.
-            # P7 fix (2026-06-10): attribute the observation to the TRUE
-            # on-chain fee. current_fee_ppm is seeded to min_fee_ppm when the
-            # chain reports 0, so using it recorded (min_fee, revenue-of-0-fee)
-            # pairs that bent the revenue curve at min_fee. A 0-fee window has
-            # no revenue-curve meaning under this model (revenue is identically
-            # 0 regardless of demand), so it is skipped entirely.
-            # Invariant: every posterior observation pairs a fee that was
-            # actually advertised with the revenue it actually produced.
-            # SL-1: unroutable zero windows are censored data — skipped.
-            # M3: the window being recorded ran under the PREVIOUS cycle's
-            # regime; if that was a congestion episode, its revenue was
-            # earned at ratcheted fees and must carry the congestion flag
-            # (excluded from the supported-ceiling earning evidence).
-            if raw_chain_fee > 0 and not self._is_unroutable_zero_window(
-                adjusted_revenue_rate, spendable
-            ):
-                ts_state.thompson.update_posterior(
-                    fee=raw_chain_fee,
-                    revenue_rate=adjusted_revenue_rate,
-                    hours=hours_elapsed,
-                    time_bucket=time_bucket,
-                    congested=prev_congestion_active,
-                )
-
-                # Update contextual posterior (time-aware weighting)
-                ts_state.thompson.update_contextual(
-                    context_key=context_key,
-                    fee=raw_chain_fee,
-                    revenue_rate=adjusted_revenue_rate,
-                    time_bucket=time_bucket
-                )
+            # Update DTS posterior with the demand-adjusted observation
+            # (adjusted_revenue_rate computed above, before the sleep gate).
+            # Guards (P7/SL-1/M3) live in record_window_posterior_observation.
+            record_window_posterior_observation()
 
             # =====================================================================
             # DTS: Apply discount factor before sampling (posterior forgetting)
@@ -7029,9 +7211,12 @@ class FeeController:
             # partially re-imposed the median clamp on exploring channels
             # that Phase B.3 deliberately released.
             median_pull_mode = getattr(cfg, 'market_fee_mode', 'undercut') if cfg else 'undercut'
+            # E-4.8: strict '>' against the fee-composed threshold (see
+            # _exploration_std_threshold) so high-fee channels whose std sits
+            # at the SL-4 relative floor are NOT permanently "exploring".
             median_pull_exploring = (
                 ts_state and ts_state.thompson and
-                ts_state.thompson.posterior_std >= self.UNDERCUT_EXPLORATION_STD_THRESHOLD
+                ts_state.thompson.posterior_std > self._exploration_std_threshold(current_fee_ppm)
             )
             if (
                 neighbor_market_usable
@@ -7054,7 +7239,8 @@ class FeeController:
             if neighbor_market_usable:
                 if sparse_data_conservative and ts_state and ts_state.thompson:
                     ts = ts_state.thompson
-                    if ts.posterior_std >= 100:  # Still very uncertain
+                    # E-4.8: same composed gate as "exploring" above.
+                    if ts.posterior_std > self._exploration_std_threshold(current_fee_ppm):  # Still very uncertain
                         # Durable nudge (15% weight — weaker than a settled
                         # forward); survives the next posterior recompute.
                         ts.record_posterior_nudge(float(neighbor_median), 0.15)
@@ -7065,8 +7251,13 @@ class FeeController:
             # used in inelastic markets where hive coordination means we retain
             # volume at higher margins (added 2026-04-21 to close vs-clboss gap).
             if neighbor_market_usable:
-                undercut_pct = self._get_competitive_undercut_pct(peer_id, channel_id, neighbor_median, cfg=cfg)
                 mode = getattr(cfg, 'market_fee_mode', 'undercut') if cfg else 'undercut'
+                # E-4.1: premium mode inverts the capacity-rank mapping —
+                # the STRONGEST-ranked channel earns the largest markup.
+                undercut_pct = self._get_competitive_undercut_pct(
+                    peer_id, channel_id, neighbor_median, cfg=cfg,
+                    invert_rank=(mode == 'premium'),
+                )
 
                 if mode == 'premium':
                     target = int(neighbor_median * (1.0 + undercut_pct))
@@ -7116,9 +7307,10 @@ class FeeController:
                     # real competitive margin).
                     preserve_threshold = self._get_neighbor_fee_percentile(peer_id, 0.25, cfg=cfg)
                     undercut_target = int(neighbor_median * (1.0 - undercut_pct))
+                    # E-4.8: composed gate, strict '>' (see helper docstring).
                     exploring = (
                         ts_state and ts_state.thompson and
-                        ts_state.thompson.posterior_std >= self.UNDERCUT_EXPLORATION_STD_THRESHOLD
+                        ts_state.thompson.posterior_std > self._exploration_std_threshold(current_fee_ppm)
                     )
                     if outbound_ratio < self.UNDERCUT_MIN_OUTBOUND_RATIO:
                         # M5: scarce inventory keeps its PID premium — never
@@ -7165,9 +7357,10 @@ class FeeController:
                         )
                 else:  # undercut (default / back-compat)
                     undercut_target = int(neighbor_median * (1.0 - undercut_pct))
+                    # E-4.8: composed gate, strict '>' (see helper docstring).
                     exploring = (
                         ts_state and ts_state.thompson and
-                        ts_state.thompson.posterior_std >= self.UNDERCUT_EXPLORATION_STD_THRESHOLD
+                        ts_state.thompson.posterior_std > self._exploration_std_threshold(current_fee_ppm)
                     )
                     if outbound_ratio < self.UNDERCUT_MIN_OUTBOUND_RATIO:
                         # M5: scarce inventory keeps its PID premium — never
@@ -7438,30 +7631,16 @@ class FeeController:
         # =====================================================================
         # DYNAMIC HTLC POLICY TARGETS
         # =====================================================================
-        htlcmax_msat = None
-        dynamic_htlcmax_enabled = getattr(cfg, 'enable_dynamic_htlcmax', False)
-        if isinstance(dynamic_htlcmax_enabled, str):
-            dynamic_htlcmax_enabled = dynamic_htlcmax_enabled.lower() in ("true", "1", "yes")
-        else:
-            dynamic_htlcmax_enabled = dynamic_htlcmax_enabled is True
-        if dynamic_htlcmax_enabled:
-            capacity_msat = sats_to_base(channel_info.get("capacity", 0))
-            if capacity_msat > 0:
-                if flow_state == "source":
-                    target_msat = int(capacity_msat * cfg.htlcmax_source_pct)
-                elif flow_state == "sink":
-                    target_msat = int(capacity_msat * cfg.htlcmax_sink_pct)
-                else:
-                    target_msat = int(capacity_msat * cfg.htlcmax_balanced_pct)
-
-                # Safety Bounds: Never go below 10,000 sats or above capacity
-                htlcmax_msat = max(10_000_000, min(target_msat, capacity_msat))
-
-                self.plugin.log(
-                    f"DYNAMIC_HTLCMAX: {channel_id[:12]}... is {flow_state}. "
-                    f"Set limit to {base_to_sats_floor(htlcmax_msat):,} sats",
-                    level='debug'
-                )
+        # E-1: valve rekeyed to live outbound depletion — see
+        # _compute_dynamic_htlcmax_msat (flow-class pct caps preserved as the
+        # upper shape; depletion term applies whenever the valve is enabled).
+        htlcmax_msat = self._compute_dynamic_htlcmax_msat(cfg, channel_info, flow_state)
+        if htlcmax_msat is not None:
+            self.plugin.log(
+                f"DYNAMIC_HTLCMAX: {channel_id[:12]}... is {flow_state}. "
+                f"Set limit to {base_to_sats_floor(htlcmax_msat):,} sats",
+                level='debug'
+            )
 
         # Dynamic HTLC min removed (was _calculate_dynamic_htlcmin_msat)
         htlcmin_msat = None
@@ -7477,8 +7656,15 @@ class FeeController:
         htlcmin_policy_change = (
             htlcmin_msat is not None and int(htlcmin_msat) != int(current_htlcmin_msat)
         )
+        # E-1 churn guard: an htlcmax delta FORCES a broadcast only beyond the
+        # deadband (the depletion term moves with every forward; the previous
+        # class-keyed valve only changed on flow-state transitions, which are
+        # always far outside the deadband — behavior preserved there). When a
+        # broadcast happens anyway (fee/base change), the fresh htlcmax still
+        # rides along via htlcmax_msat below at zero extra gossip cost.
         htlcmax_policy_change = (
-            htlcmax_msat is not None and int(htlcmax_msat) != int(current_htlcmax_msat)
+            htlcmax_msat is not None
+            and self._htlcmax_delta_exceeds_deadband(htlcmax_msat, current_htlcmax_msat)
         )
         channel_policy_change = (
             base_fee_policy_change
@@ -7752,6 +7938,10 @@ class FeeController:
             htlcmin_msat=htlcmin_msat,
             htlcmax_msat=htlcmax_msat,
             base_fee_msat_override=target_base_fee_msat,
+            # E-2: the execution-layer clamp must honor the same class-aware
+            # floor the target was computed with, or it silently re-inflates
+            # saturated/source targets back to the global min.
+            effective_min_fee_ppm=effective_min_fee_ppm,
         )
         
         if result.get("success"):
@@ -7850,6 +8040,10 @@ class FeeController:
                     # distinct mechanisms (at most one active per cycle).
                     "rebalance_cost_floor_ppm": rebalance_floor_ppm or 0,
                     "rebalance_cost_nudge_ppm": rebalance_cost_ppm,
+                    # E-2: composed floor actually used this cycle, plus the
+                    # class-aware config min-fee term it was built from.
+                    "floor_ppm": floor_ppm,
+                    "effective_min_fee_ppm": effective_min_fee_ppm,
                     "fee_profile": fee_profile_name,
                     "fee_profile_settings": fee_profile.to_dict(),
                     "context_key": context_key,
@@ -8062,7 +8256,8 @@ class FeeController:
                        htlcmin_msat: Optional[int] = None,
                        htlcmax_msat: Optional[int] = None,
                        base_fee_msat_override: Optional[int] = None,
-                       force: bool = False) -> Dict[str, Any]:
+                       force: bool = False,
+                       effective_min_fee_ppm: Optional[int] = None) -> Dict[str, Any]:
         """
         Set the fee for a channel.
 
@@ -8089,11 +8284,24 @@ class FeeController:
         # Absolute safety clamp always applies.
         fee_ppm = max(self.ABS_MIN_FEE_PPM, min(self.ABS_MAX_FEE_PPM, int(fee_ppm)))
         # Economic policy clamp applies unless explicitly bypassed (force/manual overrides, etc).
+        # E-2: a class-aware floor computed by the fee cycle (saturated/source
+        # decompression) may LOWER the min-fee term of this clamp — never
+        # raise it, and never exceed the global min_fee_ppm. Callers without
+        # class context (manual/RPC paths) keep the global floor.
+        econ_min_fee_ppm = cfg.min_fee_ppm
+        if effective_min_fee_ppm is not None:
+            try:
+                econ_min_fee_ppm = max(
+                    self.ABS_MIN_FEE_PPM,
+                    min(int(effective_min_fee_ppm), cfg.min_fee_ppm),
+                )
+            except (TypeError, ValueError):
+                econ_min_fee_ppm = cfg.min_fee_ppm
         if enforce_limits:
-            fee_ppm = max(cfg.min_fee_ppm, min(cfg.max_fee_ppm, fee_ppm))
+            fee_ppm = max(econ_min_fee_ppm, min(cfg.max_fee_ppm, fee_ppm))
         if fee_ppm != original_fee_ppm:
             clamp_note = (
-                f"(limits: {cfg.min_fee_ppm}-{cfg.max_fee_ppm} PPM)"
+                f"(limits: {econ_min_fee_ppm}-{cfg.max_fee_ppm} PPM)"
                 if enforce_limits else
                 f"(absolute: {self.ABS_MIN_FEE_PPM}-{self.ABS_MAX_FEE_PPM} PPM; economic limits bypassed)"
             )
@@ -9082,6 +9290,29 @@ class FeeController:
         # same Thompson state under _state_lock.
         with self._state_lock:
             fee_state = self._channel_fee_states.get(channel_id)
+            if not fee_state and self.database:
+                # E-4.9 (2026-07 econ audit): after a plugin restart the
+                # in-memory cache is empty until the fee loop next touches
+                # the channel, so every failure nudge was a silent no-op.
+                # Seed lazily from the persisted DTS row. Only channels with
+                # a KNOWN persisted state are seeded — never fabricate fresh
+                # state from a failure signal (a failed forward must not be
+                # a channel's first posterior evidence).
+                try:
+                    db_state, v2_data = self._load_persisted_fee_strategy_row(channel_id)
+                    # _extract_fee_state_payload defaults algorithm_version,
+                    # so check the RAW row for actual persisted DTS evidence.
+                    has_persisted_dts = isinstance(v2_data, dict) and (
+                        isinstance(v2_data.get("fee_state"), dict)
+                        or "thompson_state" in v2_data
+                        or v2_data.get("algorithm_version") in ("thompson_aimd_v1", "dts_pid_v1")
+                    )
+                    if has_persisted_dts:
+                        fee_v2_data = self._extract_fee_state_payload(db_state, v2_data)
+                        fee_state = ChannelFeeState.from_v2_dict(fee_v2_data, db_state)
+                        self._channel_fee_states[channel_id] = fee_state
+                except Exception:
+                    fee_state = None
             if not fee_state:
                 return
             state = fee_state.thompson

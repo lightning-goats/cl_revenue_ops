@@ -153,7 +153,7 @@ def _make_manager(db, budget=1000):
     }
     # Bypass the (advisory) legacy gate + subprocess so the test isolates the
     # new atomic unified-budget reservation.
-    mgr._enforce_budget_for_quote = lambda q: {
+    mgr._enforce_budget_for_quote = lambda q, extra_fee_sats=0: {
         "allowed": True, "estimated_fee_sats": 400, "budget": {}, "reason": None
     }
     mgr.check_tactical_budget = lambda **k: {"allowed": True, "reason": None}

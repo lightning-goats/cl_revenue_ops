@@ -12,12 +12,16 @@ def test_public_runtime_keys_are_safety_only():
     assert cfg.public_runtime_keys() == [
         "paused",
         "daily_budget_sats",
+        # E-3 (2026-07 econ audit): weekly cap runtime control
+        "weekly_budget_sats",
         "growth_budget_enabled",
         "growth_budget_earned_fraction",
         "growth_budget_experiment_fraction",
         "growth_budget_max_extra_sats",
         "growth_budget_hard_ceiling_sats",
         "min_fee_ppm",
+        # E-2 (2026-07 econ audit): class-aware saturated/source floor
+        "min_fee_ppm_saturated",
         "max_fee_ppm",
         "fee_profile",
         "fee_market_boundary_enabled",
@@ -78,12 +82,14 @@ def test_public_runtime_dict_returns_only_public_keys():
     assert cfg.public_runtime_dict() == {
         "paused": True,
         "daily_budget_sats": 1200,
+        "weekly_budget_sats": 35000,
         "growth_budget_enabled": False,
         "growth_budget_earned_fraction": 0.25,
         "growth_budget_experiment_fraction": 0.10,
         "growth_budget_max_extra_sats": 2000,
         "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 15,
+        "min_fee_ppm_saturated": 0,
         "max_fee_ppm": 2500,
         "fee_profile": "active",
         "fee_market_boundary_enabled": False,
@@ -752,6 +758,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "lnplus_watcher_interval",
         "max_fee_ppm",
         "min_fee_ppm",
+        "min_fee_ppm_saturated",
         "node_drain_bias_enabled",
         "node_drain_bias_max",
         "paused",
@@ -763,8 +770,9 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "planner_min_annual_roi_pct",
         "receivable_ratio_floor",
         "receivable_ratio_target",
+        "weekly_budget_sats",
     ]
-    assert result["count"] == 48
+    assert result["count"] == 50
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -775,12 +783,14 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
     assert result["config"] == {
         "paused": True,
         "daily_budget_sats": 1200,
+        "weekly_budget_sats": 35000,
         "growth_budget_enabled": False,
         "growth_budget_earned_fraction": 0.25,
         "growth_budget_experiment_fraction": 0.10,
         "growth_budget_max_extra_sats": 2000,
         "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 15,
+        "min_fee_ppm_saturated": 0,
         "max_fee_ppm": 2500,
         "fee_profile": "active",
         "fee_market_boundary_enabled": False,
@@ -1256,12 +1266,14 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
     assert result["operator_controls"]["values"] == {
         "paused": True,
         "daily_budget_sats": 1200,
+        "weekly_budget_sats": 35000,
         "growth_budget_enabled": False,
         "growth_budget_earned_fraction": 0.25,
         "growth_budget_experiment_fraction": 0.10,
         "growth_budget_max_extra_sats": 2000,
         "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 15,
+        "min_fee_ppm_saturated": 0,
         "max_fee_ppm": 2500,
         "fee_profile": "active",
         "fee_market_boundary_enabled": False,

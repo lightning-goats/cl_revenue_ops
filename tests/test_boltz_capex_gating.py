@@ -448,9 +448,9 @@ class TestRetryBudgetUsesNestedQuote:
         budget_args = []
         real_enforce = mgr._enforce_budget_for_quote
 
-        def spy(quote):
+        def spy(quote, extra_fee_sats=0):
             budget_args.append(quote)
-            return real_enforce(quote)
+            return real_enforce(quote, extra_fee_sats=extra_fee_sats)
 
         mgr._enforce_budget_for_quote = spy
 

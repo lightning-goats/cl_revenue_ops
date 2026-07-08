@@ -192,7 +192,34 @@ class TestFloorCeilingInversion:
 
     def test_min_fee_still_dominates_tiny_ceiling(self, mock_plugin, mock_database):
         """If min_fee_ppm sits above the ceiling, floor < ceiling is preserved
-        by raising the ceiling (floor never drops below min_fee_ppm)."""
+        by raising the ceiling (floor never drops below min_fee_ppm).
+
+        E-2 wave note: flow_state is 'balanced' here — a SOURCE channel now
+        uses the class-aware min_fee_ppm_saturated floor (default 0),
+        covered by test_source_class_floor_wins_inversion below."""
+        fc, cfg = _make_fc(mock_plugin, mock_database, min_fee_ppm=100)
+        mock_database.get_volume_since.return_value = 0
+
+        fc._get_rebalance_cost_floor = lambda *a, **k: 4000
+        fc._get_flow_adjusted_ceiling = lambda *a, **k: 50  # below min_fee
+
+        chain = {"fee": 600}
+        _stub_broadcasts(fc, chain)
+        _prepare_dts_stubs(fc, chain_fee=600, sampled_fee=30)
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "balanced", "forward_count": 0},
+            _channel_info(600), cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.algorithm_values["bounded_target_ppm"] >= 100
+
+    def test_source_class_floor_wins_inversion(self, mock_plugin, mock_database):
+        """E-2: a SOURCE channel's inversion-guard floor is the class-aware
+        min (default 0 = true cheap egress), so the discovery ceiling wins
+        instead of min_fee_ppm re-pinning the channel above it."""
         fc, cfg = _make_fc(mock_plugin, mock_database, min_fee_ppm=100)
         mock_database.get_volume_since.return_value = 0
 
@@ -210,7 +237,10 @@ class TestFloorCeilingInversion:
         )
 
         assert result is not None
-        assert result.algorithm_values["bounded_target_ppm"] >= 100
+        # Discovery ceiling (50) wins; the class floor (default 0) does not
+        # re-pin the target at min_fee_ppm.
+        assert result.algorithm_values["bounded_target_ppm"] <= 50
+        assert result.algorithm_values["effective_min_fee_ppm"] == 0
 
 # =============================================================================
 # P5: Kalman demand divisor clamp

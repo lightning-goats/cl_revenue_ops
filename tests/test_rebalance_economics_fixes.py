@@ -122,12 +122,16 @@ def test_f2b_positive_ev_move_is_approved(mock_plugin, mock_database):
     Old gate rejected this because the ppm-capped budget made the
     normalized penalties huge. Sats EV: 0.9 * 1,250 - 700 - 25 = 400 > 0.
     """
-    engine = _make_engine(mock_plugin, mock_database)
+    engine = _make_engine(mock_plugin, mock_database, max_fee_ppm=5000)
     pair = _make_pair(
         amount_sats=1_000_000,
         pair_budget_sats=5_000,
         dest_out_fee_ppm=2_500,
         source_out_fee_ppm=100,
+        # E-4.3: "earning 2,500 ppm" means VALIDATED realized history —
+        # an unvalidated advertised ask is now discounted by the EV gate.
+        dest_fee_history_validated=True,
+        dest_historical_direct_fee_ppm=2_500,
     )
 
     selected = _run_single_pair(
@@ -183,6 +187,9 @@ def test_f2d_hold_margin_is_respected_in_sats(mock_plugin, mock_database):
             amount_sats=200_000,
             pair_budget_sats=1_000,
             dest_out_fee_ppm=20,  # value = 200k * 20ppm * 0.5 = 2 sats
+            # E-4.3: validated history keeps the 2-sat value exact.
+            dest_fee_history_validated=True,
+            dest_historical_direct_fee_ppm=20,
         )
         selected = _run_single_pair(
             engine, pair, route_cost_sats=1, probability_ppm=990_000
@@ -210,6 +217,9 @@ def test_f2e_break_even_paid_route_is_approved(mock_plugin, mock_database):
         pair_budget_sats=1_000,
         dest_out_fee_ppm=200,  # expected value = 100 sats; 0.99 * 100 = 99
         source_out_fee_ppm=0,
+        # E-4.3: validated history keeps the break-even value exact.
+        dest_fee_history_validated=True,
+        dest_historical_direct_fee_ppm=200,
     )
 
     selected = _run_single_pair(
@@ -298,11 +308,17 @@ def test_f1_execution_honors_ppm_ceiling_not_budget(mock_plugin, mock_database):
 def test_f1_zero_ppm_cap_keeps_budget_envelope(mock_plugin, mock_database):
     """pair_fee_cap_ppm == 0 disables the ceiling (legacy behavior: the
     budget is the per-attempt envelope)."""
-    engine = _make_engine(mock_plugin, mock_database, pair_fee_cap_ppm=0)
+    engine = _make_engine(
+        mock_plugin, mock_database, pair_fee_cap_ppm=0, max_fee_ppm=5000
+    )
     pair = _make_pair(
         amount_sats=100_000,
         pair_budget_sats=2_500,
         dest_out_fee_ppm=4_000,
+        # E-4.3: keep this pair EV-positive via validated history so the
+        # test still exercises the budget-envelope path it documents.
+        dest_fee_history_validated=True,
+        dest_historical_direct_fee_ppm=4_000,
     )
 
     selected = _run_single_pair(engine, pair, route_cost_sats=150)
@@ -889,3 +905,122 @@ def test_coordination_overlay_threads_outbound_fees_to_pair():
     assert len(pairs) == 1
     assert pairs[0].source_out_fee_ppm == 300
     assert pairs[0].dest_out_fee_ppm == 1_500
+
+
+# ---------------------------------------------------------------------------
+# E-4.3 (2026-07 econ audit) — optimistic EV: the advertised (unvalidated)
+# destination fee must not justify spend on its own
+# ---------------------------------------------------------------------------
+
+
+def test_e43_unvalidated_advertised_fee_is_discounted(mock_plugin, mock_database):
+    """No validated forward history: the 2,000 ppm ask is optimism and the
+    value anchor uses only half of it. Under the old max(current, realized)
+    a never-cleared ask fully justified the route cost."""
+    engine = _make_engine(mock_plugin, mock_database)
+    pair = _make_pair(
+        amount_sats=1_000_000,
+        pair_budget_sats=5_000,
+        dest_out_fee_ppm=2_000,
+        source_out_fee_ppm=0,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=700,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    assert decomp["inputs"]["dest_fee_history_validated"] is False
+    assert decomp["inputs"]["dest_value_fee_ppm"] == pytest.approx(1_000.0)
+    # 0.9 * (1M * 1000ppm * 0.5) - 700 = -250: the hopeful ask no longer
+    # buys a 700-sat route.
+    assert decomp["final_score_sats"] < 0.0
+
+
+def test_e43_validated_realized_rate_overrides_advertised_ask(mock_plugin, mock_database):
+    """>5 observed forwards: the realized 100 ppm is the truth even when the
+    advertised policy asks 2,000 ppm."""
+    engine = _make_engine(mock_plugin, mock_database)
+    pair = _make_pair(
+        amount_sats=1_000_000,
+        pair_budget_sats=5_000,
+        dest_out_fee_ppm=2_000,
+        source_out_fee_ppm=0,
+        dest_fee_history_validated=True,
+        dest_historical_direct_fee_ppm=100.0,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    assert decomp["inputs"]["dest_fee_history_validated"] is True
+    assert decomp["inputs"]["dest_value_fee_ppm"] == pytest.approx(100.0)
+
+
+def test_e43_thin_realized_evidence_still_counts(mock_plugin, mock_database):
+    """Unvalidated + a thin realized rate above the discounted ask: the
+    realized evidence wins the max()."""
+    engine = _make_engine(mock_plugin, mock_database)
+    pair = _make_pair(
+        amount_sats=1_000_000,
+        pair_budget_sats=5_000,
+        dest_out_fee_ppm=1_000,
+        source_out_fee_ppm=0,
+        dest_fee_history_validated=False,
+        dest_historical_direct_fee_ppm=800.0,
+    )
+
+    decomp = engine._build_score_decomposition(
+        pair,
+        probability_ppm=900_000,
+        route_cost_sats=10,
+        effective_budget_sats=5_000,
+        route_status="priced",
+    )
+
+    # max(1000 * 0.5, 800) = 800
+    assert decomp["inputs"]["dest_value_fee_ppm"] == pytest.approx(800.0)
+
+
+def test_e43_is_active_threads_from_snapshot_to_pair():
+    """ChannelState.is_active (>5 lifetime forwards) must reach the
+    PairCandidate as dest_fee_history_validated."""
+    import dataclasses
+    from modules.rebalance_planner_v2 import RebalancePlanner
+    from modules.rebalance_state_v2 import build_state_snapshot
+
+    snap = build_state_snapshot(
+        channels=[
+            {
+                "channel_id": "src", "peer_id": "02" + "aa" * 32,
+                "capacity_sats": 2_000_000, "local_sats": 1_700_000,
+                "local_out_fee_ppm": 500, "is_active": True,
+            },
+            {
+                "channel_id": "dst", "peer_id": "02" + "bb" * 32,
+                "capacity_sats": 2_000_000, "local_sats": 100_000,
+                "local_out_fee_ppm": 800, "is_active": True,
+            },
+        ],
+        capex_allocations={"channel_budgets": {"src": 1_000, "dst": 1_000}},
+    )
+    by_id = {ch.channel_id: ch for ch in snap.channels}
+    assert by_id["src"].is_active is True
+    assert by_id["dst"].is_active is True
+
+    planner = RebalancePlanner(
+        target_band_low=0.35, target_band_high=0.65, max_chunk_sats=10_000_000,
+    )
+    result = planner.plan(snap)
+    assert len(result.selected) == 1
+    pair = result.selected[0]
+    assert pair.dest_channel_id == "dst"
+    assert pair.dest_fee_history_validated is True

@@ -3270,20 +3270,46 @@ class CapacityPlanner:
     def _estimate_close_cost(self) -> int:
         """Estimate the on-chain cost of closing a channel.
 
-        Uses the same feerate signal the planner's open-cost and recycle-EV
-        paths already use — falls back to the legacy static default only
-        when the feerate RPC fails. 200 vbytes matches the inline closure
-        size used at capacity_planner lines 1638 and 2193.
+        E-4.6 (2026-07 econ audit): uses the CLOSE-appropriate feerate, not
+        the OPENING rate (a close was previously priced like an open).
+        Falls back to the legacy static default only when the feerate RPC
+        fails. 200 vbytes matches the inline closure size used at
+        capacity_planner lines 1638 and 2193.
         """
         try:
             feerates = self.data_service.get_feerates(style="perkb") if self.data_service else self.plugin.rpc.feerates(style="perkb")
-            opening_perkb = self._extract_opening_feerate_perkb(feerates)
-            if opening_perkb is None:
+            close_perkb = self._extract_close_feerate_perkb(feerates)
+            if close_perkb is None:
                 return ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
-            sat_per_vb = opening_perkb / 1000.0
+            sat_per_vb = close_perkb / 1000.0
             return int(sat_per_vb * 200)  # ~200 vbytes for close tx
         except Exception:
             return ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
+
+    @staticmethod
+    def _extract_close_feerate_perkb(feerates) -> float | None:
+        """Return the close-appropriate CLN feerate (perkb) or None.
+
+        The planner executes MUTUAL (cooperative) closes, so mutual_close
+        is the correct target rate. When only unilateral_close is present
+        we use it: it is the HIGHER commitment-tx rate, i.e. the
+        conservative choice — overstating close cost biases the EV against
+        churn rather than approving closes on an understated fee. As a
+        last resort, 'opening' keeps the pre-E-4.6 behavior rather than
+        silently flooring to the static default.
+        """
+        if not isinstance(feerates, dict):
+            return None
+        perkb = feerates.get("perkb", {})
+        if not isinstance(perkb, dict):
+            return None
+        for key in ("mutual_close", "unilateral_close", "opening"):
+            value = perkb.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if value > 0:
+                return float(value)
+        return None
 
     @staticmethod
     def _extract_opening_feerate_perkb(feerates) -> float | None:

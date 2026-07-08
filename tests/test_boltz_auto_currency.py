@@ -160,7 +160,10 @@ class TestAutoNeverReachesSubprocess:
         assert plan["thresholds"]["resolved_loop_in_currency"] == "LBTC"
         assert bm.quote.call_args.kwargs["currency"] == "BTC"
 
-    def test_resolution_failure_falls_back_to_btc(self):
+    def test_resolution_failure_falls_back_to_lbtc(self):
+        """E-4.7 (2026-07 econ audit): the auto-resolution failure fallback
+        must be LBTC, matching _select_boltz_currency's own quote-failure
+        fallback (BTC here contradicted the cheaper-default policy)."""
         channels = {"100x1x0": _channel(PEER, 10_000_000, 90.0)}
         mod = _make_module(channels)
         bm = mod._require_boltz_manager.return_value
@@ -173,5 +176,43 @@ class TestAutoNeverReachesSubprocess:
 
         assert "error" not in plan
         assert plan["total_candidates"] == 1
-        assert bm.quote.call_args.kwargs["currency"] == "BTC"
-        assert plan["thresholds"]["resolved_loop_out_currency"] == "BTC"
+        assert bm.quote.call_args.kwargs["currency"] == "LBTC"
+        assert plan["thresholds"]["resolved_loop_out_currency"] == "LBTC"
+
+    def test_auto_resolution_sized_by_largest_deficit_candidate(self):
+        """E-4.7: the BTC-vs-LBTC comparison must be sized by the LARGEST
+        quote-eligible candidate's amount in that direction, not by
+        whichever candidate the loop reaches first."""
+        channels = {
+            # Higher severity (92%) but SMALLER capacity => smaller amount;
+            # it is quoted first under (severity, contrib) ordering.
+            "100x1x0": _channel(PEER, 2_000_000, 92.0),
+            # Lower severity, bigger channel => the larger deficit.
+            "100x2x0": _channel(PEER, 10_000_000, 90.0),
+        }
+        mod = _make_module(channels)
+        seen_amounts = []
+
+        def fake_select(direction, amount_sats):
+            seen_amounts.append((direction, int(amount_sats)))
+            return "LBTC"
+
+        mod._select_boltz_currency = fake_select
+
+        plan = mod._build_boltz_balance_plan(
+            require_profitable=False,
+            loop_out_currency="auto",
+        )
+
+        assert "error" not in plan
+        assert plan["total_candidates"] == 2
+        assert len(seen_amounts) == 1  # still resolved at most once
+        direction, sizing_amount = seen_amounts[0]
+        assert direction == "loop_out"
+        amounts = [
+            int(r.get("amount_sats", 0)) for r in plan["recommendations"]
+        ]
+        assert sizing_amount == max(amounts), (
+            f"auto-resolution sized by {sizing_amount}, expected the "
+            f"largest-deficit candidate {max(amounts)} (all: {amounts})"
+        )

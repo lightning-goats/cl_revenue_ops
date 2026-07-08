@@ -959,23 +959,53 @@ class BoltzCliManager:
         if seen_named:
             return total
 
-        # Fallback: recursively sum fee-like integer fields (excluding percentages/rates).
-        def rec(obj: Any, path: str = "") -> int:
-            subtotal = 0
+        # Fallback: recursively sum fee-like integer fields (excluding
+        # percentages/rates). E-4.4 (2026-07 econ audit): guarded against
+        # double-counting — when a dict level carries NUMERIC fee-like
+        # fields, that level is authoritative and its subtree is NOT also
+        # descended (payloads with a parent total plus a nested per-component
+        # breakdown used to sum BOTH, inflating spend accounting and
+        # over-throttling the budget gate).
+        def rec(obj: Any) -> int:
             if isinstance(obj, dict):
+                level_total = 0
                 for k, v in obj.items():
                     lk = str(k).lower()
-                    if "fee" in lk and not any(x in lk for x in ("percent", "percentage", "ppm", "rate")):
-                        if isinstance(v, (int, float, str)):
-                            subtotal += max(0, self._parse_int(v, 0))
-                            continue
-                    subtotal += rec(v, path + "." + str(k))
-            elif isinstance(obj, list):
-                for v in obj:
-                    subtotal += rec(v, path)
-            return subtotal
+                    if (
+                        "fee" in lk
+                        and not any(x in lk for x in ("percent", "percentage", "ppm", "rate"))
+                        and isinstance(v, (int, float, str))
+                    ):
+                        level_total += max(0, self._parse_int(v, 0))
+                if level_total > 0:
+                    return level_total
+                return sum(
+                    rec(v) for v in obj.values() if isinstance(v, (dict, list))
+                )
+            if isinstance(obj, list):
+                return sum(rec(v) for v in obj)
+            return 0
 
         return rec(swap)
+
+    def _estimate_reverse_routing_fee_sats(
+        self, amount_sats: int, routing_fee_limit_ppm: Optional[int] = None
+    ) -> int:
+        """Plan-time LN routing-fee estimate for a reverse swap (E-4.4).
+
+        A reverse swap PAYS a lightning invoice to Boltz; the quote covers
+        Boltz service + on-chain fees but NOT our routing cost, which is
+        bounded by routing_fee_limit_ppm. Omitting it understated every
+        loop-out's planned cost. 0/unset limit -> 0 (boltzcli then imposes
+        no explicit routing cap; there is no honest bound to plan with).
+        """
+        limit_ppm = routing_fee_limit_ppm
+        if limit_ppm is None:
+            limit_ppm = getattr(self.cfg, "routing_fee_limit_ppm", 0)
+        limit_ppm = max(0, self._parse_int(limit_ppm, 0))
+        if limit_ppm <= 0 or amount_sats <= 0:
+            return 0
+        return (int(amount_sats) * limit_ppm + 999_999) // 1_000_000
 
     def _swap_created_ts(self, swap: Dict[str, Any]) -> Optional[int]:
         for key in ("createdAt", "updatedAt", "created_at", "updated_at"):
@@ -1544,10 +1574,13 @@ class BoltzCliManager:
             "counted_details": counted[:20],
         }
 
-    def _enforce_budget_for_quote(self, quote: Dict[str, Any]) -> Dict[str, Any]:
+    def _enforce_budget_for_quote(self, quote: Dict[str, Any],
+                                  extra_fee_sats: int = 0) -> Dict[str, Any]:
         # Use the same fee estimation as spend accounting to prevent asymmetry
         # where the gate underestimates and allows budget overruns.
-        fee_sats = self._estimate_swap_fee_sats(quote)
+        # extra_fee_sats (E-4.4): plan-time components NOT in the raw boltzcli
+        # quote payload — currently the reverse-swap LN routing estimate.
+        fee_sats = self._estimate_swap_fee_sats(quote) + max(0, self._parse_int(extra_fee_sats, 0))
         budget = self.get_budget_status()
         allowed = True
         reason = None
@@ -1672,7 +1705,8 @@ class BoltzCliManager:
                 selected[c] = {"name": w.get("name"), "id": w.get("id"), "currency": w.get("currency")}
         return {"wallets": data.get("wallets", []), "selected_wallets": selected, "datadir": self.cfg.datadir}
 
-    def quote(self, amount_sats: int, swap_type: str = "reverse", currency: Optional[str] = None) -> Dict[str, Any]:
+    def quote(self, amount_sats: int, swap_type: str = "reverse", currency: Optional[str] = None,
+              routing_fee_limit_ppm: Optional[int] = None) -> Dict[str, Any]:
         st = (swap_type or "reverse").strip().lower()
         amount_sats = int(amount_sats)
         if amount_sats <= 0:
@@ -1692,12 +1726,22 @@ class BoltzCliManager:
             raise BoltzCliError("swap_type must be reverse, submarine, or chain")
 
         data = self._run_json(args)
+        # E-4.4: a reverse swap also pays LN routing to Boltz — include the
+        # routing_fee_limit_ppm-based estimate in the plan-time total ONCE
+        # (the boltzcli quote covers only service + on-chain fees).
+        routing_fee_sats = (
+            self._estimate_reverse_routing_fee_sats(
+                amount_sats, routing_fee_limit_ppm=routing_fee_limit_ppm
+            )
+            if st == "reverse" else 0
+        )
         return {
             "swap_type": st,
             "amount_sats": amount_sats,
             "currency": self._norm_currency(currency, "BTC" if st == "reverse" else "LBTC"),
             "quote": data,
-            "estimated_total_fee_sats": self._estimate_swap_fee_sats(data),
+            "estimated_routing_fee_sats": routing_fee_sats,
+            "estimated_total_fee_sats": self._estimate_swap_fee_sats(data) + routing_fee_sats,
         }
 
     def loop_in(self, amount_sats: int, channel_id: Optional[str] = None, peer_id: Optional[str] = None,
@@ -1858,8 +1902,19 @@ class BoltzCliManager:
     def _loop_out_locked(self, amount_sats: int, address: Optional[str], channel_id: Optional[str],
                          peer_id: Optional[str], currency: Optional[str], target_cur: str,
                          routing_fee_limit_ppm: Optional[int] = None, structural: bool = False) -> Dict[str, Any]:
-        quote = self.quote(amount_sats=amount_sats, swap_type="reverse", currency=target_cur)
-        budget_check = self._enforce_budget_for_quote(quote.get("quote", {}))
+        # E-4.4: quote with the SAME routing-fee limit the swap will be
+        # created with, so the plan-time total includes the LN routing leg.
+        quote = self.quote(
+            amount_sats=amount_sats, swap_type="reverse", currency=target_cur,
+            routing_fee_limit_ppm=(
+                int(routing_fee_limit_ppm) if routing_fee_limit_ppm
+                else (self.cfg.routing_fee_limit_ppm or 0)
+            ),
+        )
+        budget_check = self._enforce_budget_for_quote(
+            quote.get("quote", {}),
+            extra_fee_sats=quote.get("estimated_routing_fee_sats", 0),
+        )
         if not budget_check["allowed"]:
             return {
                 "status": "rejected",
@@ -2094,7 +2149,10 @@ class BoltzCliManager:
                 warnings.append("CLN boltz backend rejected chanIds in JSON result; retried reverse swap without channel pinning")
                 # Re-check budget before creating second swap (first swap may have consumed fees).
                 # Pass the nested quote (not the wrapper) so the fee estimate is not double-counted.
-                retry_budget = self._enforce_budget_for_quote(quote.get("quote", {}))
+                retry_budget = self._enforce_budget_for_quote(
+                    quote.get("quote", {}),
+                    extra_fee_sats=quote.get("estimated_routing_fee_sats", 0),
+                )
                 if not retry_budget["allowed"]:
                     warnings.append(f"Budget exhausted after chanId rejection: {retry_budget.get('reason')}")
                 else:
@@ -2119,7 +2177,10 @@ class BoltzCliManager:
                                 self._reverse_chanids_supported = False
                                 warnings.append("CLN boltz backend rejected chanIds asynchronously; retried reverse swap without channel pinning")
                                 # Re-check budget before creating second swap (nested quote, not wrapper)
-                                retry_budget = self._enforce_budget_for_quote(quote.get("quote", {}))
+                                retry_budget = self._enforce_budget_for_quote(
+                    quote.get("quote", {}),
+                    extra_fee_sats=quote.get("estimated_routing_fee_sats", 0),
+                )
                                 if not retry_budget["allowed"]:
                                     warnings.append(f"Budget exhausted after async chanId rejection: {retry_budget.get('reason')}")
                                 else:
@@ -2137,7 +2198,10 @@ class BoltzCliManager:
                 self._reverse_chanids_supported = False
                 warnings.append("CLN boltz backend rejected chanIds; retried reverse swap without channel pinning")
                 # Re-check budget before creating second swap (nested quote, not wrapper)
-                retry_budget = self._enforce_budget_for_quote(quote.get("quote", {}))
+                retry_budget = self._enforce_budget_for_quote(
+                    quote.get("quote", {}),
+                    extra_fee_sats=quote.get("estimated_routing_fee_sats", 0),
+                )
                 if not retry_budget["allowed"]:
                     warnings.append(f"Budget exhausted after chanId exception: {retry_budget.get('reason')}")
                 else:
