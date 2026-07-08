@@ -2225,3 +2225,11 @@ class TestDynamicRefreshOverridePrecedence:
         assert cfg.lnplus_fleet_pubkeys == PK_A
         # Simulate the refresh loop's guard: an active override means skip.
         assert db.get_config_override("lnplus_fleet_pubkeys") is not None
+
+    def test_planner_execute_closes_override_key_exists(self):
+        """Guard contract for the legacy refresh block: the override key it
+        checks must remain a valid public runtime key (nexus-01 2026-07-08:
+        refresh stomped the operator's execute_closes=false override)."""
+        from modules.config import Config
+        assert Config.is_public_runtime_key("planner_execute_closes")
+        assert Config.is_public_runtime_key("daily_budget_sats")

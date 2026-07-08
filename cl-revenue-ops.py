@@ -6394,9 +6394,19 @@ def _refresh_dynamic_config():
                 boltz_manager.cfg.enforce_budget = new_val
                 plugin.log(f"Dynamic config refresh: enforce_budget = {new_val}")
 
+        # Override precedence (see planner_execute_closes guard below): a
+        # revenue-config DB override on daily_budget_sats must not be stomped
+        # by the listconfigs view. enforce_budget has no runtime key, so its
+        # block above stays unguarded.
+        _bb_overridden = False
+        try:
+            _bb_overridden = (database is not None and
+                              database.get_config_override("daily_budget_sats") is not None)
+        except Exception:
+            pass
         db_cfg = configs.get("revenue-ops-boltz-daily-budget-sats", {})
         val = db_cfg.get("value_str", "")
-        if val:
+        if val and not _bb_overridden:
             try:
                 new_val = int(val)
                 if new_val != boltz_manager.cfg.daily_budget_sats:
@@ -6406,13 +6416,26 @@ def _refresh_dynamic_config():
                 pass
 
     if config:
-        ec = configs.get("revenue-ops-planner-execute-closes", {})
-        val = ec.get("value_str", "")
-        if val:
-            new_val = val.lower() in ("true", "1", "yes")
-            if new_val != config.planner_execute_closes:
-                config.planner_execute_closes = new_val
-                plugin.log(f"Dynamic config refresh: planner_execute_closes = {new_val}")
+        # Same override-precedence rule as the lnplus loop below: an active
+        # revenue-config DB override wins over the listconfigs view. Without
+        # this guard the refresh stomped a DB-overridden false back to true
+        # every cycle on nexus-01 (lightningd's parsed config predated the
+        # operator's file edit) — re-enabling planner closes the operator had
+        # explicitly disabled (observed live 2026-07-08, v41 override).
+        _ec_overridden = False
+        try:
+            _ec_overridden = (database is not None and
+                              database.get_config_override("planner_execute_closes") is not None)
+        except Exception:
+            pass
+        if not _ec_overridden:
+            ec = configs.get("revenue-ops-planner-execute-closes", {})
+            val = ec.get("value_str", "")
+            if val:
+                new_val = val.lower() in ("true", "1", "yes")
+                if new_val != config.planner_execute_closes:
+                    config.planner_execute_closes = new_val
+                    plugin.log(f"Dynamic config refresh: planner_execute_closes = {new_val}")
 
     if config:
         for _opt, _field, _cast in (
