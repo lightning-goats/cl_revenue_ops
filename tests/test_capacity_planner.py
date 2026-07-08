@@ -5372,3 +5372,47 @@ class TestRedeploymentEVSign:
         ev, _, _ = planner._calculate_redeployment_ev(profitable, winners, None)
         # 10000 - (400*6) - 1000 = 6600 — forgoing a profitable channel costs EV.
         assert ev == 6_600
+
+
+class TestFleetCloseProtectionDurability:
+    """Planner-audit item 5: fleet close-protection must survive a stale
+    hive-hints snapshot via the durable membership confirmations."""
+
+    def _planner(self):
+        from modules.config import Config
+        plugin = MagicMock()
+        prof = MagicMock()
+        flow = MagicMock()
+        planner = CapacityPlanner(plugin, prof, flow, config=Config())
+        planner.hive_hints = MagicMock()
+        return planner, prof
+
+    def test_live_member_protected(self):
+        planner, _ = self._planner()
+        planner.hive_hints.is_hive_member.return_value = True
+        assert planner._is_protected_hive_member("02" + "aa" * 32) is True
+
+    def test_stale_hints_with_recent_confirmation_protected(self):
+        planner, prof = self._planner()
+        planner.hive_hints.is_hive_member.return_value = False  # stale snapshot
+        import time as _t
+        prof.database.hive_member_last_confirmed.return_value = int(_t.time()) - 3600
+        assert planner._is_protected_hive_member("02" + "aa" * 32) is True
+
+    def test_stale_hints_with_expired_confirmation_unprotected(self):
+        planner, prof = self._planner()
+        planner.hive_hints.is_hive_member.return_value = False
+        import time as _t
+        prof.database.hive_member_last_confirmed.return_value = int(_t.time()) - 10 * 86400
+        assert planner._is_protected_hive_member("02" + "aa" * 32) is False
+
+    def test_never_confirmed_unprotected(self):
+        planner, prof = self._planner()
+        planner.hive_hints.is_hive_member.return_value = False
+        prof.database.hive_member_last_confirmed.return_value = None
+        assert planner._is_protected_hive_member("02" + "aa" * 32) is False
+
+    def test_adapter_exception_fail_closed(self):
+        planner, _ = self._planner()
+        planner.hive_hints.is_hive_member.side_effect = RuntimeError("boom")
+        assert planner._is_protected_hive_member("02" + "aa" * 32) is True

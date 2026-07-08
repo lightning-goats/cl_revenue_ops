@@ -1087,7 +1087,34 @@ class CapacityPlanner:
         if self.hive_hints is None:
             return False
         try:
-            return bool(self.hive_hints.is_hive_member(peer_id))
+            if bool(self.hive_hints.is_hive_member(peer_id)):
+                return True
+            # Stale-snapshot gap (planner-audit item 5, closed 2026-07-08):
+            # a missing/stale hints snapshot makes is_hive_member return
+            # False SILENTLY, which used to lapse fleet close-protection
+            # during any cl-hive outage. Fall back to the durable membership
+            # confirmations the fee controller records (same trust window as
+            # the zero-fee grace): a peer positively confirmed a member
+            # within the grace window keeps close protection. Conservative
+            # side effect: a peer that truly left the fleet retains
+            # protection for up to the grace window — acceptable for an
+            # irreversible action like a close.
+            try:
+                db = self.profitability.database
+                last = db.hive_member_last_confirmed(peer_id) if db else None
+            except Exception:
+                last = None
+            if last:
+                import time as _time
+                grace = int(getattr(self.config, "hive_zero_fee_stale_grace_seconds", 604800) or 0)
+                age = int(_time.time()) - int(last)
+                if 0 <= age < grace:
+                    self.plugin.log(
+                        f"PLANNER: fleet close-protection for {str(peer_id or '')[:16]}... "
+                        f"held by {age // 3600}h-old membership confirmation "
+                        "(hints say non-member/stale)", level="info")
+                    return True
+            return False
         except Exception as e:
             try:
                 peer_disp = str(peer_id or "")[:16]
