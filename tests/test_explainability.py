@@ -180,6 +180,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "lnplus_inbound_credit_factor",
         "lnplus_fleet_pubkeys",
         "lnplus_watcher_interval",
+        "hive_zero_fee_stale_grace_seconds",
     ]
     assert result["operator_controls"]["values"] == {
         "paused": False,
@@ -229,6 +230,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "lnplus_inbound_credit_factor": 0.5,
         "lnplus_fleet_pubkeys": "",
         "lnplus_watcher_interval": 3600,
+        "hive_zero_fee_stale_grace_seconds": 604800,
     }
     assert "config" not in result
 

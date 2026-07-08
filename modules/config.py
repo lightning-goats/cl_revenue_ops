@@ -88,6 +88,8 @@ PUBLIC_RUNTIME_KEYS = (
     'lnplus_inbound_credit_factor',
     'lnplus_fleet_pubkeys',
     'lnplus_watcher_interval',
+    # Z-2 (2026-07-08): durable zero-fee hive corridor grace period.
+    'hive_zero_fee_stale_grace_seconds',
 )
 
 # Type mapping for config fields (for validation)
@@ -236,6 +238,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hive_hints_enabled': bool,
     'hive_hints_ttl_seconds': int,
     'hive_hints_allow_all_hints_m2_scope': bool,
+    'hive_zero_fee_stale_grace_seconds': int,
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': float,
     'capex_bootstrap_bps': int,
@@ -386,6 +389,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
     'planner_min_annual_roi_pct': (0.0, 100.0),
     'hive_hints_ttl_seconds': (60, 7200),
+    # Z-2 (2026-07-08): 0 disables the grace fallback entirely (immediate
+    # release on hint staleness); ceiling is 30 days.
+    'hive_zero_fee_stale_grace_seconds': (0, 2592000),
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': (0.0, 1.0),
     'capex_bootstrap_bps': (0, 100),
@@ -515,14 +521,19 @@ class Config:
     base_fee_msat_intra_fleet: int = 0
     base_fee_msat_non_hive: int = 1000      # conservative default per advisor calibration
 
-    # Intra-fleet proportional fee (Path B Step 3, 2026-04-22). The prior
-    # 0-PPM fleet policy was a revenue leak: 2 of 3 hive channels earned
-    # nothing, and external traffic transiting the hive mesh got free
-    # hops it could not distinguish from member-to-member flow. A small
-    # nonzero value (default 1 ppm) preserves "cheapest path for members"
-    # (1 ppm is ~50-500× below typical competitor rates) while extracting
-    # revenue on external transit. Set to 0 to restore legacy 0-PPM policy.
-    fee_ppm_intra_fleet: int = 1
+    # Intra-fleet proportional fee (operator strategy, 2026-07-08: true
+    # zero-fee hive corridor). ALL hive-internal channels are zero fee (0
+    # base msat / 0 ppm), public and announced. Third parties chaining our
+    # free internal hops into cheap end-to-end routes is DESIRED: the
+    # fleet is the cheap corridor, revenue is captured at edge (non-hive)
+    # channels, and external flow through the mesh performs free
+    # intrafleet rebalancing. This supersedes the prior "revenue leak"
+    # framing (a 2026-04-22 attempt to price 1 ppm on intra-fleet hops to
+    # recapture external transit revenue) — that revenue is now understood
+    # to be captured at the edge instead, so the corridor itself stays
+    # free. Set to a nonzero value only to deliberately opt out of the
+    # corridor strategy for this fleet.
+    fee_ppm_intra_fleet: int = 0
 
     # Minimum competitor count for _get_neighbor_fee_median to return a
     # value. The original threshold of 3 was too strict for small labs /
@@ -750,6 +761,14 @@ class Config:
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0  # 0 = use snapshot's ttl_seconds
     hive_hints_allow_all_hints_m2_scope: bool = False
+    # Z-2 (2026-07-08, zero-fee hive corridor): how long a peer's
+    # last-confirmed hive membership keeps the zero-fee gate held after
+    # live hive-hint data goes stale/unavailable. 7 days is generous on
+    # purpose -- the corridor strategy wants zero-fee held through
+    # extended cl-hive/cl-mycelium outages rather than repricing away from
+    # 0 ppm and back on every hint hiccup. Past this grace, the peer is
+    # released and the dynamic branch reprices as before.
+    hive_zero_fee_stale_grace_seconds: int = 604800
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50       # Fraction of channel contribution for all capex
     capex_bootstrap_bps: int = 10               # Bootstrap: basis points of capacity per 30d
@@ -1249,6 +1268,7 @@ class ConfigSnapshot:
     # Hive Hints
     hive_hints_enabled: bool = True
     hive_hints_ttl_seconds: int = 0
+    hive_zero_fee_stale_grace_seconds: int = 604800
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50
     capex_bootstrap_bps: int = 10

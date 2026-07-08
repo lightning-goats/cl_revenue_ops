@@ -27,6 +27,8 @@ The consumer enforces hard rails on two hive-influence channels that are separat
 - `fee_elasticity` maps to the DTS exploration multiplier, clamped to `[0.75, 2.0]` (`EXPLORATION_BOOST_MIN`/`EXPLORATION_BOOST_MAX`, `modules/fee_controller.py`).
 - The `fleet_fee_median` wire field (inside a peer's `fleet_fee_prior` hint object) and `optimal_fee_estimate_ppm` seed a fleet fee prior, clamped to `[1, 10000]` ppm (`MAX_FLEET_FEE_PRIOR_PPM`, `modules/hive_hints.py`); an out-of-range value neutralizes to no hint rather than being pinned to the bound. Note: `fleet_fee_prior` is the consumer-side getter/scope label (`get_fleet_fee_prior`), not a wire field — the producer writes and the consumer reads the `fleet_fee_median` field.
 
+Neither of these hint-driven channels controls whether a hive member is charged zero fee. Hive-member zero-fee (0 ppm / 0 base msat) is a separate, unconditional gate (`FeeController._check_hive_member_fee` / `_hive_member_zero_fee_active`, `modules/fee_controller.py`) driven only by `member`/`known`/`fresh`/`usable` in the membership status this contract's `hints` payload carries, plus a DB-backed grace fallback (`revenue-ops-hive-zero-fee-stale-grace`, default 7 days) that holds zero-fee through membership-data staleness/unavailability. See README "Zero-Fee Hive Corridor" for the operator strategy this implements.
+
 ## Required Fields
 
 - `generated_at`: Unix epoch seconds.

@@ -50,6 +50,26 @@
 # RECOMMENDATION: 1500-2500 ppm for most routing nodes; raise only for special positioning
 #revenue-ops-max-fee-ppm=2000
 
+# --- Zero-fee hive corridor ---
+# Operator strategy: ALL hive-internal channels are zero fee (0 base msat /
+# 0 ppm), public and announced. Third parties chaining our free internal
+# hops into cheap end-to-end routes is DESIRED: the fleet is the cheap
+# corridor, revenue is captured at edge (non-hive) channels, and external
+# flow through the mesh performs free intrafleet rebalancing.
+
+# Proportional fee in ppm for channels to hive fleet members.
+# Set nonzero only to deliberately opt out of the corridor strategy.
+#revenue-ops-fee-ppm-intra-fleet=0
+
+# Base fee in msat for channels to hive fleet members.
+#revenue-ops-base-fee-intra-fleet=0
+
+# How long (seconds) a peer's last-confirmed hive membership keeps the
+# zero-fee gate held after live hive-hint data goes stale/unavailable.
+# Default 7 days -- generous on purpose so a cl-hive/cl-mycelium outage
+# doesn't reprice hive channels away from 0 ppm and back.
+#revenue-ops-hive-zero-fee-stale-grace=604800
+
 # DEPRECATED no-op compatibility flags. The fee market boundary guard was
 # removed; these options are retained only so existing configs keep loading.
 # Setting them has NO effect (the boundary logic is ignored). Default: disabled.

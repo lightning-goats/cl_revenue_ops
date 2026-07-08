@@ -3005,6 +3005,13 @@ class FeeController:
         # RPC+DB for a long time — keeps each composite op atomic without
         # coupling a fast T0 caller to the long cycle lock.
         self._hive_member_lock = threading.Lock()
+        # Z-2 (2026-07-08, zero-fee hive corridor): in-memory throttles for
+        # the DB-backed durable confirmation. Confirmation writes are
+        # throttled to once per 10 min per peer to avoid write churn; the
+        # "grace held" info log is throttled separately to avoid spam
+        # while a peer sits in the grace window across many cycles.
+        self._hive_member_confirm_last_write: Dict[str, int] = {}
+        self._hive_grace_log_last: Dict[str, int] = {}
 
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
@@ -3172,7 +3179,7 @@ class FeeController:
             try:
                 status = getter(peer_id)
                 if isinstance(status, dict):
-                    return {
+                    result = {
                         "peer_id": str(status.get("peer_id") or peer_id or ""),
                         "known": bool(status.get("known", False)),
                         "member": bool(status.get("member", False)),
@@ -3184,6 +3191,11 @@ class FeeController:
                         "age_seconds": status.get("age_seconds"),
                         "effective_ttl_seconds": status.get("effective_ttl_seconds"),
                     }
+                    # Z-2: every positive membership result is a durability
+                    # signal for the zero-fee grace fallback below.
+                    if result["member"]:
+                        self._confirm_hive_membership_db(peer_id)
+                    return result
             except Exception:
                 pass
 
@@ -3205,6 +3217,8 @@ class FeeController:
                 member = bool(self.hive_hints.is_hive_member(peer_id))
             except Exception:
                 member = False
+        if member:
+            self._confirm_hive_membership_db(peer_id)
         return {
             "peer_id": str(peer_id or ""),
             "known": bool(usable),
@@ -3230,6 +3244,11 @@ class FeeController:
                 and self._cached_hive_membership_active(peer_id)
             ):
                 return True
+            # Z-2: hive-hint data is entirely unavailable -- before
+            # releasing the peer and forcing a dynamic reprice, check
+            # whether a recent DB-confirmed membership still covers it.
+            if self._hive_zero_fee_grace_active(peer_id):
+                return True
             self._clear_hive_member_cache(peer_id, release=True)
             return False
 
@@ -3239,10 +3258,114 @@ class FeeController:
         # collection reader the P2-006 sweep missed.
         if self._cached_hive_membership_active(peer_id):
             return True
-        # Not fresh: evict any stale entry so we don't keep re-checking it.
+
+        # Z-2: hints are usable but genuinely stale (not just "positively
+        # not a member") -- the grace fallback covers this case too. Fresh
+        # hints that positively assert "not a member" (fresh=True, the
+        # default when the field is absent) must NEVER use a stale
+        # confirmation to override that current signal.
+        if not status.get("fresh", True) and self._hive_zero_fee_grace_active(peer_id):
+            return True
+
+        # Not fresh (or positively not a member): evict any stale entry so
+        # we don't keep re-checking it.
         self._clear_hive_member_cache(peer_id, release=False)
 
         return False
+
+    def _hive_zero_fee_stale_grace_seconds(self) -> int:
+        """Z-2: configured grace window (seconds) for the DB-confirmed
+        zero-fee fallback. Defensive against mocked/partial config objects
+        in tests: any non-numeric value falls back to the 7-day default."""
+        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+        value = getattr(cfg, 'hive_zero_fee_stale_grace_seconds', 604800)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 604800
+
+    def _hive_zero_fee_grace_active(self, peer_id: str) -> bool:
+        """Z-2: True when a recent DB-confirmed hive membership still
+        covers peer_id, even though live hive-hint data is currently
+        stale/unavailable. Never asserted when hints are fresh and
+        positively say "not a member" -- callers gate on that."""
+        database = getattr(self, "database", None)
+        if not peer_id or database is None:
+            return False
+        getter = getattr(database, "hive_member_last_confirmed", None)
+        if not callable(getter):
+            return False
+        try:
+            last_confirmed_at = getter(peer_id)
+        except Exception:
+            return False
+        if last_confirmed_at is None:
+            return False
+        try:
+            last_confirmed_at = int(last_confirmed_at)
+        except (TypeError, ValueError):
+            return False
+        grace = self._hive_zero_fee_stale_grace_seconds()
+        now = int(time.time())
+        age = now - last_confirmed_at
+        if age < 0 or age >= grace:
+            return False
+        self._log_hive_grace_hold(peer_id, age, grace)
+        return True
+
+    def _confirm_hive_membership_db(self, peer_id: str) -> None:
+        """Z-2: persist a positive hive-membership confirmation, throttled
+        to once per 10 minutes per peer to avoid write churn."""
+        database = getattr(self, "database", None)
+        if not peer_id or database is None:
+            return
+        confirmer = getattr(database, "hive_member_confirm", None)
+        if not callable(confirmer):
+            return
+        throttle = getattr(self, "_hive_member_confirm_last_write", None)
+        if throttle is None:
+            throttle = {}
+            self._hive_member_confirm_last_write = throttle
+        now = int(time.time())
+        lock = getattr(self, "_hive_member_lock", None)
+        if lock is not None:
+            with lock:
+                last = throttle.get(peer_id)
+                if last is not None and now - last < 600:
+                    return
+                throttle[peer_id] = now
+        else:
+            last = throttle.get(peer_id)
+            if last is not None and now - last < 600:
+                return
+            throttle[peer_id] = now
+        try:
+            confirmer(peer_id)
+        except Exception:
+            pass
+
+    def _log_hive_grace_hold(self, peer_id: str, age_seconds: int, grace_seconds: int) -> None:
+        """Z-2: throttled (hourly per peer) info log while zero-fee is held
+        by a stale-hint-window grace confirmation rather than a live hint."""
+        throttle = getattr(self, "_hive_grace_log_last", None)
+        if throttle is None:
+            throttle = {}
+            self._hive_grace_log_last = throttle
+        now = int(time.time())
+        last = throttle.get(peer_id)
+        if last is not None and now - last < 3600:
+            return
+        throttle[peer_id] = now
+        try:
+            age_hours = max(0, age_seconds) // 3600
+            grace_days = max(1, grace_seconds // 86400)
+            self.plugin.log(
+                f"HIVE_MEMBER_FEE: hints stale, zero-fee held by {age_hours}h-old "
+                f"confirmation (grace {grace_days}d) for peer {peer_id[:16]}...",
+                level='info'
+            )
+        except Exception:
+            pass
 
     def _classify_channel_role(self, peer_id: str) -> str:
         """Return channel role for base_fee selection.

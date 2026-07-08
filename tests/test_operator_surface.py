@@ -59,6 +59,7 @@ def test_public_runtime_keys_are_safety_only():
         "lnplus_inbound_credit_factor",
         "lnplus_fleet_pubkeys",
         "lnplus_watcher_interval",
+        "hive_zero_fee_stale_grace_seconds",
     ]
 
 
@@ -122,6 +123,7 @@ def test_public_runtime_dict_returns_only_public_keys():
         "lnplus_inbound_credit_factor": 0.5,
         "lnplus_fleet_pubkeys": "",
         "lnplus_watcher_interval": 3600,
+        "hive_zero_fee_stale_grace_seconds": 604800,
     }
 
 
@@ -731,6 +733,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "growth_budget_experiment_fraction",
         "growth_budget_hard_ceiling_sats",
         "growth_budget_max_extra_sats",
+        "hive_zero_fee_stale_grace_seconds",
         "htlcmax_balanced_pct",
         "htlcmax_sink_pct",
         "htlcmax_source_pct",
@@ -761,7 +764,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_floor",
         "receivable_ratio_target",
     ]
-    assert result["count"] == 47
+    assert result["count"] == 48
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -817,6 +820,7 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "lnplus_inbound_credit_factor": 0.5,
         "lnplus_fleet_pubkeys": "",
         "lnplus_watcher_interval": 3600,
+        "hive_zero_fee_stale_grace_seconds": 604800,
     }
 
 
@@ -1297,6 +1301,7 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "lnplus_inbound_credit_factor": 0.5,
         "lnplus_fleet_pubkeys": "",
         "lnplus_watcher_interval": 3600,
+        "hive_zero_fee_stale_grace_seconds": 604800,
     }
     assert "config" not in result
     assert "hive_hints" not in result

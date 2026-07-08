@@ -258,6 +258,15 @@ lightning-cli revenue-config set daily_budget_sats 10000
 | `revenue-hive-hints-status` | Diagnostic: cl-mycelium hint coverage and freshness |
 | `revenue-planner-candidate-sources` | Diagnostic: candidate pipeline strategy breakdown |
 
+## Zero-Fee Hive Corridor
+
+**Operator strategy**: all hive-internal channels are zero fee (0 base msat / 0 ppm), public and announced. Third parties chaining our free internal hops into cheap end-to-end routes is *desired*, not a leak: the fleet is the cheap corridor, revenue is captured at the edge (non-hive) channels, and external flow transiting the mesh performs free intrafleet rebalancing as a side effect.
+
+- The hive-member zero-fee gate (`FeeController._check_hive_member_fee` / `_hive_member_zero_fee_active`, `modules/fee_controller.py`) dominates the fee cycle for any peer with active hive membership: it forces 0 ppm and `base_fee_msat_override=0` with `enforce_limits=False`, ahead of DTS/PID pricing. An explicit operator STATIC policy still wins over the automatic gate (checked earlier in the cycle), and a `set-fee`/initial-fee call with `force=true` can pin a non-zero fee on a hive peer if an operator deliberately chooses to.
+- `revenue-ops-fee-ppm-intra-fleet` (default `0`) and `revenue-ops-base-fee-intra-fleet` (default `0`) are the config-level expression of the same policy for any code path that falls back to configured base/ppm values rather than the hard gate.
+- **Durability through hint staleness**: the zero-fee gate is normally contingent on live hive-hint freshness (`hive-fleet` datastore snapshot / `hive-export-hints`). To avoid repricing away from 0 ppm on every transient hint hiccup or cl-hive/cl-mycelium restart, the plugin persists each peer's last-confirmed hive membership (`hive_member_confirmations` table) and holds zero-fee for `revenue-ops-hive-zero-fee-stale-grace` seconds (default 604800 = 7 days) past the last confirmation before releasing the peer to normal dynamic repricing. Fresh hints that positively say a peer is *not* a member always win immediately -- the grace period only covers genuinely stale/unavailable membership data, never overrides a current "not a member" signal.
+- **Corridor utilization instrumentation**: each settled forward is classified by hive membership of its in/out peers into `internal_transit` (hive→hive), `edge_in` (external→hive), `edge_out` (hive→external), or `external` (external→external), and aggregated daily (`corridor_flow_daily` table). `revenue-dashboard` surfaces a 7-day rollup under `mycelial_corridor` (counts, volume, fee split edge-vs-internal). This is a utilization/success metric only -- it carries no thresholds, warnings, or revocation logic.
+
 ## cl-mycelium Hints
 
 `cl_revenue_ops` consumes `cl-mycelium` fleet hints only through `modules/hive_hints.py` (`HiveHintAdapter`). The adapter name, `hive-*` RPC names, and `["hive", "hints"]` datastore key remain the stable compatibility contract documented in [docs/contracts/HIVE_HINTS_CONTRACT.md](docs/contracts/HIVE_HINTS_CONTRACT.md).

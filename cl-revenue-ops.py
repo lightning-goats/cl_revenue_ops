@@ -1107,13 +1107,13 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-fee-ppm-intra-fleet',
-    default='1',
+    default='0',
     description=(
         'Proportional fee in ppm for channels to hive fleet members '
-        '(default: 1). The legacy 0-PPM policy leaked revenue on external '
-        'traffic transiting the hive mesh. 1 ppm keeps members "cheapest '
-        'path" (50-500x below typical competitors) while recapturing '
-        'that leak. Set to 0 to restore legacy 0-PPM.'
+        '(default: 0). Zero-fee internal hops make the fleet the cheap '
+        'corridor; revenue is captured at edge channels; external '
+        'through-flow rebalances the fleet for free. Set nonzero only to '
+        'deliberately opt out of the corridor strategy for this fleet.'
     )
 )
 
@@ -1823,6 +1823,17 @@ plugin.add_option(
     dynamic=True
 )
 plugin.add_option(
+    name='revenue-ops-hive-zero-fee-stale-grace',
+    default='604800',
+    description=(
+        'Seconds a hive member stays held at zero-fee after live hive-hint '
+        'data goes stale/unavailable, via a durable DB-confirmed membership '
+        '(default: 604800 = 7 days). Past this grace the peer is released '
+        'and dynamic fee control resumes as before.'
+    ),
+    dynamic=True
+)
+plugin.add_option(
     name='revenue-ops-hive-hints-enabled',
     default='true',
     description='Enable bounded fee/rebalance bias from cl_hive fleet hints (default: true)'
@@ -2430,7 +2441,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         base_fee_policy=options.get('revenue-ops-base-fee-policy', 'off').lower(),
         base_fee_msat_intra_fleet=_safe_int_opt('revenue-ops-base-fee-intra-fleet', '0'),
         base_fee_msat_non_hive=_safe_int_opt('revenue-ops-base-fee-non-hive', '1000'),
-        fee_ppm_intra_fleet=_safe_int_opt('revenue-ops-fee-ppm-intra-fleet', '1'),
+        fee_ppm_intra_fleet=_safe_int_opt('revenue-ops-fee-ppm-intra-fleet', '0'),
         neighbor_median_min_competitors=_safe_int_opt('revenue-ops-neighbor-median-min-competitors', '2'),
         fee_profile=str(options.get('revenue-ops-fee-profile', 'active') or 'active').lower(),
         fee_market_boundary_enabled=options.get(
@@ -2566,6 +2577,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         lnplus_inbound_credit_factor=_safe_float_opt('revenue-ops-lnplus-inbound-credit-factor', '0.5'),
         lnplus_fleet_pubkeys=options.get('revenue-ops-lnplus-fleet-pubkeys', ''),
         lnplus_watcher_interval=_safe_int_opt('revenue-ops-lnplus-watcher-interval', '3600'),
+        hive_zero_fee_stale_grace_seconds=_safe_int_opt('revenue-ops-hive-zero-fee-stale-grace', '604800'),
         hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'true').lower() in ('true', '1', 'yes'),
         hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
         hive_hints_allow_all_hints_m2_scope=options.get(
@@ -5802,7 +5814,7 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
                     f"Spent {spent} sats rebalancing, earned {earned} sats."
                 )
 
-        return {
+        result = {
             "financial_health": {
                 "tlv_sats": tlv_sats,
                 "net_profit_sats": pnl.get("net_profit_sats", 0),
@@ -5821,6 +5833,36 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
             "warnings": warnings,
             "bleeder_count": len(bleeders)
         }
+
+        # Z-3: mycelial corridor utilization -- a success metric for the
+        # zero-fee hive corridor strategy (free internal hops, revenue
+        # captured at the edge). Never a warning/threshold surface; see
+        # corridor_flow_daily / database.corridor_flow_summary.
+        summarizer = getattr(database, "corridor_flow_summary", None)
+        if callable(summarizer):
+            try:
+                corridor = summarizer(days=7)
+                by_klass = corridor.get("by_klass", {})
+                totals = corridor.get("totals", {"forwards": 0, "sats_forwarded": 0, "fees_msat": 0})
+                edge_fees_msat = (
+                    by_klass.get("edge_in", {}).get("fees_msat", 0)
+                    + by_klass.get("edge_out", {}).get("fees_msat", 0)
+                    + by_klass.get("external", {}).get("fees_msat", 0)
+                )
+                internal_fees_msat = by_klass.get("internal_transit", {}).get("fees_msat", 0)
+                result["mycelial_corridor"] = {
+                    "window_days": corridor.get("days", 7),
+                    "by_klass": by_klass,
+                    "totals": totals,
+                    "fee_split_msat": {
+                        "edge": edge_fees_msat,
+                        "internal": internal_fees_msat,
+                    },
+                }
+            except Exception as e:
+                plugin.log(f"Error generating mycelial corridor summary: {e}", level='debug')
+
+        return result
     except Exception as e:
         plugin.log(f"Error generating revenue dashboard: {e}", level='error')
         return {"error": str(e)}
@@ -6455,6 +6497,9 @@ def _refresh_dynamic_config():
             # depends on lnplus_fleet_pubkeys staying live.
             ("revenue-ops-lnplus-fleet-pubkeys", "lnplus_fleet_pubkeys", "str"),
             ("revenue-ops-lnplus-watcher-interval", "lnplus_watcher_interval", "int"),
+            # Z-2 (2026-07-08): zero-fee hive corridor grace period, tunable
+            # at runtime without a daemon restart.
+            ("revenue-ops-hive-zero-fee-stale-grace", "hive_zero_fee_stale_grace_seconds", "int"),
         ):
             _val = configs.get(_opt, {}).get("value_str", "")
             # C-1(b) (2026-07-08 audit): the blanket "skip if empty" guard
@@ -6515,6 +6560,37 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
         _on_forward_event_impl(forward_event, plugin, **kwargs)
     except Exception as e:
         plugin.log(f"Error in forward_event handler: {e}", level='error')
+
+
+def _corridor_is_hive_member(peer_id: Optional[str]) -> bool:
+    """Z-3: same membership source as the hive-member fee gate
+    (FeeController._get_hive_membership_status). Unknown/unavailable
+    (no fee_controller, no peer_id, or a lookup exception) classifies as
+    "not a member" -- i.e. external -- consistent with the fee gate's own
+    fail-safe default."""
+    if not peer_id or fee_controller is None:
+        return False
+    try:
+        status = fee_controller._get_hive_membership_status(peer_id)
+        return bool(status.get("member"))
+    except Exception:
+        return False
+
+
+def _corridor_classify_forward(in_peer_id: Optional[str], out_peer_id: Optional[str]) -> str:
+    """Z-3 (mycelial corridor instrumentation): classify a settled forward
+    by hive membership of its in/out peers into one of four utilization
+    buckets. Pure success metric -- never a gate, alarm, or revocation
+    signal; see corridor_flow_daily / corridor_flow_summary."""
+    in_member = _corridor_is_hive_member(in_peer_id)
+    out_member = _corridor_is_hive_member(out_peer_id)
+    if in_member and out_member:
+        return "internal_transit"
+    if in_member and not out_member:
+        return "edge_out"
+    if not in_member and out_member:
+        return "edge_in"
+    return "external"
 
 
 def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
@@ -6609,6 +6685,20 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
         received_time = int(forward_event.get("received_time", 0) or 0)
         resolved_time = int(forward_event.get("resolved_time", 0) or 0)
         resolution_duration = max(0, resolved_time - received_time) if resolved_time > 0 else 0
+
+        # Mycelial corridor flow instrumentation (Z-3): classify this
+        # settled forward by hive membership of its in/out peers and
+        # accumulate the daily utilization aggregate. Pure instrumentation
+        # -- guarded by getattr so databases/mocks without the accessor
+        # (older partial deployments, restrictive test doubles) no-op.
+        corridor_recorder = getattr(database, "corridor_flow_record", None)
+        if callable(corridor_recorder):
+            try:
+                out_peer_id = _resolve_scid_to_peer(out_channel) if out_channel else None
+                corridor_klass = _corridor_classify_forward(peer_id, out_peer_id)
+                corridor_recorder(corridor_klass, in_msat // 1000, fee_msat)
+            except Exception:
+                pass
 
         if callable(record_combined) and peer_id:
             record_combined(
