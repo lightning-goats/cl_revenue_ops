@@ -451,3 +451,167 @@ class TestSwapEvAndApply:
         client.create_application.assert_not_called()
         assert any(r["gate"] == "economics" and "capex" in r["reason"]
                    for r in result["rejections"])
+
+
+from modules.lnplus_swaps import SwapLifecycle
+
+
+def _make_lifecycle(my_swaps=None, local_rows=None):
+    plugin, rpc = MagicMock(), MagicMock()
+    db = _make_db()
+    client = MagicMock()
+    client.get_my_swaps.return_value = my_swaps or {"pending": [], "opening": [], "completed": []}
+    policy = MagicMock()
+    ignore_fn = MagicMock()
+    from modules.config import Config
+    cfg = Config()
+    lc = SwapLifecycle(plugin, rpc, db, cfg, client, policy, ignore_peer_fn=ignore_fn)
+    for row in (local_rows or []):
+        db.lnplus_record_swap(**row)
+    return lc, db, rpc, client, policy, ignore_fn
+
+
+class TestSwapLifecycle:
+    def test_breaker_roundtrip(self):
+        lc, db, *_ = _make_lifecycle()
+        assert lc.breaker_tripped() is None
+        lc.trip_breaker("missed deadline sw1")
+        assert "sw1" in lc.breaker_tripped()
+        lc.clear_breaker()
+        assert lc.breaker_tripped() is None
+
+    def test_has_inflight(self):
+        lc, db, *_ = _make_lifecycle(local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=1_000_000, duration_months=3)])
+        assert lc.has_inflight() is True
+
+    def test_reconcile_divergence_trips_breaker(self):
+        # Local row 'applied' but LN+ has nothing -> divergence
+        lc, *_ = _make_lifecycle(local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=1_000_000, duration_months=3)])
+        assert lc.reconcile_ok() is False
+        assert lc.breaker_tripped() is not None
+
+    def test_opening_executes_fundchannel_and_completes(self):
+        peer = PK_A
+        deadline = int(time.time()) + 40 * 3600
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "outgoing_peer_clearnet_address": "1.2.3.4:9735",
+             "deadline": deadline, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.fundchannel.return_value = {"txid": "ff" * 32}
+        lc.run_watcher_once()
+        rpc.fundchannel.assert_called_once()
+        assert rpc.fundchannel.call_args.kwargs.get("feerate") == "slow"  # >24h left
+        client.complete_application.assert_called_once_with("s1")
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "opened"
+        assert row["channel_funding_txid"] == "ff" * 32
+
+    def test_open_is_idempotent_when_channel_exists(self):
+        peer = PK_A
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "deadline": int(time.time()) + 10 * 3600, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": peer, "state": "CHANNELD_AWAITING_LOCKIN",
+             "funding_txid": "aa" * 32}]}
+        lc.run_watcher_once()
+        rpc.fundchannel.assert_not_called()
+        client.complete_application.assert_called_once()
+
+    def test_feerate_escalates_near_deadline(self):
+        peer = PK_A
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "outgoing_peer_clearnet_address": "1.2.3.4:9735",
+             "deadline": int(time.time()) + 2 * 3600, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.fundchannel.return_value = {"txid": "ff" * 32}
+        lc.run_watcher_once()
+        assert rpc.fundchannel.call_args.kwargs.get("feerate") == "urgent"
+
+    def test_missed_deadline_trips_breaker(self):
+        peer = PK_A
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "deadline": int(time.time()) - 3600, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.connect.side_effect = Exception("unreachable")
+        lc.run_watcher_once()
+        assert lc.breaker_tripped() is not None
+
+    def test_completion_activates_protection(self):
+        peer = PK_A
+        ends = "2026-10-05T00:00:00Z"
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "s1", "incoming_peer_pubkey": PK_B, "ends": ends}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", status="opened")
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "active"
+        assert row["ends_at"] is not None
+        policy.add_tag.assert_called_once_with(peer, "no_close")
+
+    def test_contract_end_rates_and_releases(self):
+        peer, incoming = PK_A, PK_B
+        lc, db, rpc, client, policy, ignore_fn = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=peer, incoming_peer=incoming)
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60)
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": incoming, "state": "CHANNELD_NORMAL"}]}
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "ended"
+        policy.remove_tag.assert_called_once_with(peer, "no_close")
+        client.create_rating.assert_called_once_with("s1", "positive")
+        ignore_fn.assert_not_called()
+
+    def test_defection_rated_negative_and_ignored(self):
+        peer, incoming = PK_A, PK_B
+        lc, db, rpc, client, policy, ignore_fn = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=peer, incoming_peer=incoming)
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60)
+        rpc.listpeerchannels.return_value = {"channels": []}   # incoming never opened / closed early
+        lc.run_watcher_once()
+        client.create_rating.assert_called_once_with("s1", "negative")
+        ignore_fn.assert_called_once()
+        assert db.lnplus_get_peer(incoming)["defections"] == 1
+
+    def test_pending_timeout_withdraws(self):
+        lc, db, rpc, client, *_ = _make_lifecycle(
+            my_swaps={"pending": [{"id": "s1"}], "opening": [], "completed": []})
+        db.lnplus_record_swap("s1", "applied", 2_000_000, 3)
+        # age the row past the timeout
+        conn = db._get_connection()
+        conn.execute("UPDATE lnplus_swaps SET applied_at = ? WHERE swap_id = 's1'",
+                     (int(time.time()) - 9 * 86400,))
+        lc.run_watcher_once()
+        client.delete_application.assert_called_once_with("s1")
+        assert db.lnplus_get_swap("s1")["status"] == "withdrawn"
+
+    def test_lnplus_outage_does_not_trip_breaker(self):
+        from modules.lnplus_swaps import LNPlusError
+        lc, db, rpc, client, *_ = _make_lifecycle()
+        client.get_my_swaps.side_effect = LNPlusError("down")
+        result = lc.run_watcher_once()
+        assert lc.breaker_tripped() is None
+        assert result.get("skipped") == "lnplus unreachable"

@@ -13,6 +13,8 @@ executes obligations safely.
 
 import json
 import re
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -429,3 +431,427 @@ class SwapEvaluator:
         self._plugin.log(f"LNPLUS: applied to swap {swap.get('id')} — {reason}")
         summary["applied"] = True
         return summary
+
+
+_BREAKER_KEY = "_lnplus_breaker"
+_OPEN_STATES = ("OPENINGD", "CHANNELD_AWAITING_LOCKIN", "CHANNELD_NORMAL",
+                "DUALOPEND_OPEN_INIT", "DUALOPEND_AWAITING_LOCKIN")
+
+
+class SwapLifecycle:
+    """Obligations watcher / state machine (spec gates 10-14).
+
+    Once an application is filled, the 48h open deadline and the eventual
+    protection contract are IRREVERSIBLE COMMITMENTS. Every DB state
+    transition here follows crash-safe ordering: write intent before acting
+    on it externally, write outcome after the external call returns.
+    Ratings and ignore_peer_fn calls are best-effort (try/except + log);
+    the DB state machine transitions are not.
+    """
+
+    def __init__(self, plugin, rpc, database, config, client, policy_manager,
+                 ignore_peer_fn=None):
+        self._plugin = plugin
+        self.rpc = rpc
+        self._db = database
+        self._config = config
+        self._client = client
+        self._policy = policy_manager
+        self._ignore_peer_fn = ignore_peer_fn
+        self._watcher_lock = threading.Lock()
+
+    # -- breaker -------------------------------------------------------
+    def breaker_tripped(self) -> Optional[str]:
+        return self._db.get_config_override(_BREAKER_KEY)
+
+    def trip_breaker(self, reason: str) -> None:
+        self._db.set_config_override(_BREAKER_KEY, f"{int(time.time())}: {reason}")
+        self._plugin.log(f"LNPLUS: CIRCUIT BREAKER TRIPPED — {reason}", level="error")
+
+    def clear_breaker(self) -> None:
+        self._db.delete_config_override(_BREAKER_KEY)
+        self._plugin.log("LNPLUS: circuit breaker cleared by operator")
+
+    def has_inflight(self) -> bool:
+        return bool(self._db.lnplus_inflight_swaps())
+
+    # -- reconciliation --------------------------------------------------
+    def reconcile_ok(self) -> bool:
+        """Live get_my_swaps vs local in-flight rows. Divergence trips the
+        breaker and returns False. Also returns False (without tripping)
+        if LN+ itself is unreachable — new applications should not proceed
+        blind, though obligation phases in run_watcher_once never call
+        this and are never blocked by it."""
+        try:
+            my = self._client.get_my_swaps()
+        except LNPlusError as e:
+            self._plugin.log(f"LNPLUS: reconcile fetch failed: {e}", level="warn")
+            return False
+        return self._reconcile(my)
+
+    def _reconcile(self, my: Dict) -> bool:
+        my = my or {}
+        pending_ids = {s.get("id") for s in (my.get("pending") or [])}
+        opening_ids = {s.get("id") for s in (my.get("opening") or [])}
+        completed_ids = {s.get("id") for s in (my.get("completed") or [])}
+        local_inflight = self._db.lnplus_inflight_swaps()
+        local_ids = {row["swap_id"] for row in local_inflight}
+
+        ok = True
+        for row in local_inflight:
+            sid = row["swap_id"]
+            status = row["status"]
+            if status == "applied":
+                compatible = sid in pending_ids or sid in opening_ids
+            elif status in ("opening", "opened"):
+                compatible = sid in opening_ids or sid in completed_ids
+            else:
+                compatible = True
+            if not compatible:
+                self.trip_breaker(
+                    f"local swap {sid} (status {status}) missing/divergent on LN+")
+                ok = False
+
+        for sid in opening_ids:
+            if sid and sid not in local_ids:
+                self.trip_breaker(f"LN+ shows opening swap {sid} with no local record")
+                ok = False
+        return ok
+
+    # -- watcher -----------------------------------------------------------
+    def run_watcher_once(self) -> Dict:
+        if not self._watcher_lock.acquire(blocking=False):
+            return {"skipped": "watcher already running"}
+        try:
+            return self._run_watcher_once_locked()
+        finally:
+            self._watcher_lock.release()
+
+    def _run_watcher_once_locked(self) -> Dict:
+        summary = {"opened": [], "activated": [], "finalized": [],
+                   "withdrawn": [], "errors": []}
+
+        # Phase 1: fetch live state. LN+ outage must not stall a funded
+        # deadline and must NOT trip the breaker — fall through only to
+        # phase 3b, which drives obligations off the local ledger.
+        try:
+            my = self._client.get_my_swaps()
+        except LNPlusError as e:
+            self._plugin.log(f"LNPLUS: get_my_swaps unreachable: {e}", level="warn")
+            summary["skipped"] = "lnplus unreachable"
+            self._phase_3b(summary, set())
+            return summary
+
+        # Phase 2: reconcile (breaker does not block the phases below).
+        try:
+            self._reconcile(my)
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: reconcile error: {e}", level="error")
+
+        # Phase 3: entries LN+ shows as filled/opening.
+        processed_opening_ids = set()
+        for entry in (my.get("opening") or []):
+            sid = entry.get("id")
+            if not sid:
+                continue
+            row = self._db.lnplus_get_swap(sid)
+            if not row:
+                continue
+            try:
+                fields = {"status": "opening"}
+                peer = entry.get("outgoing_peer_pubkey")
+                if peer:
+                    fields["outbound_peer"] = peer
+                deadline_ts = _parse_ts(entry.get("deadline"))
+                if deadline_ts:
+                    fields["deadline_at"] = deadline_ts
+                self._db.lnplus_update_swap(sid, **fields)
+                row = self._db.lnplus_get_swap(sid)
+                self._execute_swap_open(row, entry)
+                processed_opening_ids.add(sid)
+                summary["opened"].append(sid)
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: error opening swap {sid}: {e}", level="error")
+                summary["errors"].append(sid)
+
+        # Phase 3b: local opening rows not touched above this pass — the
+        # funding attempt must not wait on LN+ round-trips.
+        self._phase_3b(summary, processed_opening_ids)
+
+        # Phase 4: swaps LN+ reports completed -> activate protection.
+        completed_by_id = {e.get("id"): e for e in (my.get("completed") or []) if e.get("id")}
+        for row in self._db.lnplus_get_swaps_by_status(["opened"]):
+            sid = row["swap_id"]
+            entry = completed_by_id.get(sid)
+            if not entry:
+                continue
+            try:
+                self._activate(row, entry)
+                summary["activated"].append(sid)
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: error activating swap {sid}: {e}", level="error")
+                summary["errors"].append(sid)
+
+        # Phase 5: active contracts — watch for mid-contract defection and
+        # finalize once past ends_at.
+        now = int(time.time())
+        for row in self._db.lnplus_get_swaps_by_status(["active"]):
+            sid = row["swap_id"]
+            try:
+                ends_at = row.get("ends_at")
+                if ends_at and now >= ends_at:
+                    self._finalize(row)
+                    summary["finalized"].append(sid)
+                else:
+                    self._check_mid_contract_vanish(row)
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: error processing active swap {sid}: {e}", level="error")
+                summary["errors"].append(sid)
+
+        # Phase 6: applications that timed out still pending.
+        try:
+            summary["withdrawn"].extend(self._handle_pending_timeouts(my))
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: pending timeout phase error: {e}", level="error")
+
+        return summary
+
+    def _phase_3b(self, summary: Dict, processed_opening_ids) -> None:
+        for row in self._db.lnplus_get_swaps_by_status(["opening"]):
+            sid = row["swap_id"]
+            if sid in processed_opening_ids:
+                continue
+            if not row.get("outbound_peer") or not row.get("deadline_at"):
+                continue
+            try:
+                self._execute_swap_open(row)
+                summary["opened"].append(sid)
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: error retrying open for swap {sid}: {e}", level="error")
+                summary["errors"].append(sid)
+
+    # -- gate 10-11: channel-open execution -------------------------------
+    def _execute_swap_open(self, row: Dict, entry: Optional[Dict] = None) -> None:
+        sid = row["swap_id"]
+        peer = row.get("outbound_peer")
+        deadline = row.get("deadline_at")
+        now = int(time.time())
+
+        if row.get("channel_funding_txid"):
+            # Already funded on a prior pass — only complete_application is left.
+            self._complete_and_mark_opened(sid)
+            return
+
+        try:
+            channels = self.rpc.listpeerchannels().get("channels", []) or []
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: listpeerchannels failed for swap {sid}: {e}", level="error")
+            channels = []
+        existing = next(
+            (ch for ch in channels
+             if ch.get("peer_id") == peer and ch.get("state") in _OPEN_STATES),
+            None)
+
+        first_fund = False
+        if existing is not None:
+            # Idempotent-skip fundchannel; record txid if visible.
+            txid = existing.get("funding_txid")
+            if txid:
+                self._db.lnplus_update_swap(sid, channel_funding_txid=txid, opened_at=now)
+        else:
+            hours_left = ((deadline - now) / 3600.0) if deadline else -1.0
+            feerate = "slow" if hours_left > 24 else ("normal" if hours_left > 12 else "urgent")
+
+            addr = None
+            if entry:
+                addr = entry.get("outgoing_peer_clearnet_address") or entry.get("outgoing_peer_tor_address")
+            target = f"{peer}@{addr}" if addr else peer
+            try:
+                self.rpc.connect(target)
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: connect to {peer} failed for swap {sid}: {e}", level="warn")
+                self._maybe_trip_deadline_miss(row, sid, deadline, now)
+                return
+
+            # Write intent before the irreversible external call.
+            self._db.lnplus_update_swap(sid, status="opening", outcome="fundchannel attempt")
+            try:
+                result = self.rpc.fundchannel(peer, int(row["capacity_sats"]), feerate=feerate)
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: fundchannel to {peer} failed for swap {sid}: {e}", level="error")
+                self._maybe_trip_deadline_miss(row, sid, deadline, now)
+                return
+            txid = result.get("txid") if isinstance(result, dict) else None
+            if not txid:
+                self._plugin.log(f"LNPLUS: fundchannel for swap {sid} returned no txid", level="error")
+                self._maybe_trip_deadline_miss(row, sid, deadline, now)
+                return
+            # Outcome, after the call.
+            self._db.lnplus_update_swap(sid, channel_funding_txid=txid, opened_at=now)
+            first_fund = True
+
+        self._complete_and_mark_opened(sid)
+        if first_fund:
+            self._record_swap_open_planner_action(
+                row, status="completed",
+                reason=f"LN+ swap {sid}: channel opened to {peer}")
+
+    def _complete_and_mark_opened(self, sid: str) -> None:
+        try:
+            self._client.complete_application(sid)
+        except LNPlusError as e:
+            self._plugin.log(f"LNPLUS: complete_application failed for {sid} (will retry): {e}",
+                              level="warn")
+            return
+        self._db.lnplus_update_swap(sid, status="opened")
+
+    def _maybe_trip_deadline_miss(self, row: Dict, sid: str, deadline, now: int) -> None:
+        if not deadline or now <= deadline:
+            return
+        current = self._db.lnplus_get_swap(sid) or row
+        if current.get("channel_funding_txid"):
+            return
+        self.trip_breaker(f"missed 48h deadline for swap {sid}")
+        self._record_swap_open_planner_action(
+            current, status="failed", reason=f"LN+ swap {sid}: missed open deadline")
+
+    def _record_swap_open_planner_action(self, row: Dict, status: str, reason: str) -> None:
+        try:
+            action_id = self._db.record_planner_action(
+                action_type="swap_open",
+                peer_id=row.get("outbound_peer") or "unknown",
+                amount_sats=row.get("capacity_sats"),
+                estimated_cost_sats=0,
+                reason=reason)
+            self._db.update_planner_action(action_id, status=status)
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: failed to record swap_open planner action: {e}", level="warn")
+
+    # -- gate 12-13: activation --------------------------------------------
+    def _activate(self, row: Dict, entry: Dict) -> None:
+        sid = row["swap_id"]
+        ends_ts = _parse_ts(entry.get("ends"))
+        incoming = entry.get("incoming_peer_pubkey") or row.get("incoming_peer")
+
+        # Intent: persist the authoritative contract terms first.
+        pre_fields = {}
+        if ends_ts:
+            pre_fields["ends_at"] = ends_ts
+        if incoming:
+            pre_fields["incoming_peer"] = incoming
+        if pre_fields:
+            self._db.lnplus_update_swap(sid, **pre_fields)
+
+        outbound_peer = row.get("outbound_peer")
+        if outbound_peer:
+            try:
+                self._policy.add_tag(outbound_peer, "no_close")
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: add_tag(no_close) failed for {outbound_peer}: {e}",
+                                  level="warn")
+
+        # Outcome: contract is now protected.
+        self._db.lnplus_update_swap(sid, status="active")
+
+    def _check_mid_contract_vanish(self, row: Dict) -> None:
+        peer = row.get("outbound_peer")
+        if not peer:
+            return
+        try:
+            channels = self.rpc.listpeerchannels().get("channels", [])
+        except Exception:
+            return
+        if not isinstance(channels, list):
+            return
+        if not any(ch.get("peer_id") == peer for ch in channels):
+            self._plugin.log(
+                f"LNPLUS: swap channel to {peer} closed mid-contract — operator review needed",
+                level="error")
+
+    # -- gate 14: finalize / rate / release ---------------------------------
+    def _finalize(self, row: Dict) -> None:
+        sid = row["swap_id"]
+        outbound_peer = row.get("outbound_peer")
+        incoming_peer = row.get("incoming_peer")
+
+        positive = self._incoming_channel_open(incoming_peer)
+        rating = "positive" if positive else "negative"
+
+        try:
+            self._client.create_rating(sid, rating)
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: create_rating failed for swap {sid}: {e}", level="warn")
+
+        if outbound_peer:
+            try:
+                self._policy.remove_tag(outbound_peer, "no_close")
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: remove_tag(no_close) failed for {outbound_peer}: {e}",
+                                  level="warn")
+
+        if incoming_peer:
+            try:
+                self._db.lnplus_bump_peer(incoming_peer, defection=(not positive), rating=rating)
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: lnplus_bump_peer failed for {incoming_peer}: {e}",
+                                  level="warn")
+        if outbound_peer:
+            try:
+                self._db.lnplus_bump_peer(outbound_peer)
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: lnplus_bump_peer failed for {outbound_peer}: {e}",
+                                  level="warn")
+
+        if not positive and incoming_peer and self._ignore_peer_fn:
+            try:
+                self._ignore_peer_fn(incoming_peer, "LN+ swap defection")
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: ignore_peer_fn failed for {incoming_peer}: {e}",
+                                  level="warn")
+
+        # Outcome, after best-effort ratings/tags/ignore.
+        self._db.lnplus_update_swap(sid, status="ended", outcome=rating)
+
+    def _incoming_channel_open(self, incoming_peer) -> bool:
+        if not incoming_peer:
+            return False
+        try:
+            channels = self.rpc.listpeerchannels().get("channels", [])
+        except Exception:
+            return False
+        if not isinstance(channels, list):
+            return False
+        return any(ch.get("peer_id") == incoming_peer and ch.get("state") in _OPEN_STATES
+                   for ch in channels)
+
+    # -- gate: pending-application timeout ----------------------------------
+    def _handle_pending_timeouts(self, my: Dict) -> List[str]:
+        withdrawn = []
+        timeout_days = int(getattr(self._config, "lnplus_pending_timeout_days", 7) or 7)
+        cutoff = int(time.time()) - timeout_days * 86400
+        pending_ids = {s.get("id") for s in ((my or {}).get("pending") or [])}
+        for row in self._db.lnplus_get_swaps_by_status(["applied"]):
+            sid = row["swap_id"]
+            applied_at = row.get("applied_at") or 0
+            if applied_at > cutoff:
+                continue
+            if sid not in pending_ids:
+                continue
+            try:
+                self._client.delete_application(sid)
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: delete_application failed for {sid}: {e}", level="warn")
+                continue
+            self._db.lnplus_update_swap(sid, status="withdrawn")
+            withdrawn.append(sid)
+        return withdrawn
+
+    # -- status --------------------------------------------------------------
+    def get_status(self) -> Dict:
+        recent_ended = self._db.lnplus_get_swaps_by_status(["ended"])
+        return {
+            "breaker": self.breaker_tripped(),
+            "inflight": self._db.lnplus_inflight_swaps(),
+            "active": self._db.lnplus_get_swaps_by_status(["active"]),
+            "recent_ended": recent_ended[-10:],
+        }

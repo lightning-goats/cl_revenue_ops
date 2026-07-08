@@ -442,6 +442,34 @@ ALLOWLIST = {
         "decision and its atomic reservation are owned by the calling site that "
         "names the concrete method; this proxy only forwards it off-thread.",
     ),
+    # --- Daemon spender: LN+ liquidity-swap channel OPEN (Task 6) -----------
+    ("lnplus_swaps.py", "_execute_swap_open", "rpc_attr_fundchannel"): (
+        RAIL_COUNTED_COST, 1,
+        "SwapLifecycle._execute_swap_open's self.rpc.fundchannel(...) -- the "
+        "on-chain channel open that fulfils an LN+ liquidity-swap application. "
+        "Capacity is reserved intent-first, NOT at this call: SwapEvaluator."
+        "_select_and_apply writes the lnplus_swaps ledger row (status='applied', "
+        "capacity_sats) BEFORE create_application is even sent, and "
+        "capacity_planner.py subtracts db.lnplus_reserved_sats() (sum of "
+        "capacity across applied/opening/opened rows) from its own available "
+        "on-chain funds before its reserve_spend-gated opens (capacity_planner.py "
+        "~line 515) -- cross-category protection against the planner double "
+        "spending the same coins. SwapEvaluator additionally serializes to AT "
+        "MOST ONE swap in flight (has_inflight() gate) and re-checks confirmed "
+        "on-chain funds >= capacity+fees at apply time (gate 7), so this rail "
+        "never carries more than one reserved capacity at once. The fundchannel "
+        "call itself is idempotency-guarded: a channel_funding_txid already on "
+        "the row short-circuits to a complete_application retry, and a "
+        "listpeerchannels existing-channel check (OPENINGD/CHANNELD_AWAITING_"
+        "LOCKIN/CHANNELD_NORMAL/DUALOPEND_*) skips a duplicate fundchannel on "
+        "retry. run_watcher_once holds a non-blocking single-flight lock so two "
+        "watcher passes can never race this call. Settlement is loud: the row is "
+        "written status='opening'/outcome='fundchannel attempt' BEFORE the call "
+        "(intent) and channel_funding_txid/opened_at AFTER it returns (outcome); "
+        "a miss of the 48h deadline trips the circuit breaker and records a "
+        "failed swap_open planner action, blocking further LN+ applications "
+        "until an operator clears it.",
+    ),
 }
 
 
