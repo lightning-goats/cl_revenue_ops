@@ -2343,3 +2343,71 @@ class TestIncomingContractProtection:
         db.lnplus_record_swap("m1", "active", 1, 3)
         db.lnplus_update_swap("m1", incoming_tag_added=1)
         assert db.lnplus_get_swap("m1")["incoming_tag_added"] == 1
+
+
+class TestRatingRetryAndNotifications:
+    def _ended_contract(self, client_rating_side_effect=None):
+        lc, db, rpc, client, policy, ignore_fn = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=PK_A, incoming_peer=PK_B)
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60,
+                              tag_added=1, incoming_tag_added=1)
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": PK_B, "state": "CHANNELD_NORMAL"}]}
+        if client_rating_side_effect is not None:
+            client.create_rating.side_effect = client_rating_side_effect
+        client.get_notifications.return_value = {"notifications": []}
+        return lc, db, rpc, client
+
+    def test_rating_failure_parks_row_for_retry(self):
+        lc, db, rpc, client = self._ended_contract(LNPlusError("boom"))
+        lc.run_watcher_once()
+        assert db.lnplus_get_swap("s1")["status"] == "ended_rating_pending"
+        assert db.lnplus_get_swap("s1")["outcome"] == "positive"
+        # row is neither in-flight nor prunable-terminal
+        assert not db.lnplus_inflight_swaps()
+
+    def test_retry_files_rating_and_ends(self):
+        lc, db, rpc, client = self._ended_contract(LNPlusError("boom"))
+        lc.run_watcher_once()
+        client.create_rating.side_effect = None
+        client.create_rating.return_value = {}
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "ended"
+        assert row["outcome"] == "positive"
+
+    def test_already_rated_counts_as_filed(self):
+        err = LNPlusError("HTTP 422", http_status=422)
+        err.errors = {"id": ["You can only rate within a swap once"]}
+        lc, db, rpc, client = self._ended_contract(err)
+        lc.run_watcher_once()
+        assert db.lnplus_get_swap("s1")["status"] == "ended"
+
+    def test_retry_gives_up_after_window(self):
+        lc, db, rpc, client = self._ended_contract(LNPlusError("boom"))
+        lc.run_watcher_once()
+        # age the contract end past the retry window
+        conn = db._get_connection()
+        conn.execute("UPDATE lnplus_swaps SET ends_at = ? WHERE swap_id = 's1'",
+                     (int(time.time()) - 8 * 86400,))
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "ended"
+        assert row["outcome"] == "positive_rating_unfiled"
+
+    def test_notifications_polled_logged_and_surfaced(self):
+        lc, db, rpc, client, policy, _ = _make_lifecycle()
+        client.get_notifications.return_value = {"notifications": [
+            {"type": "Rating", "body": "You received a positive rating!",
+             "created_at": "2026-07-08T20:00:00Z", "url": "https://x"}]}
+        lc.run_watcher_once()
+        client.mark_read_notifications.assert_called_once()
+        status = lc.get_status()
+        assert status["recent_notifications"][0]["type"] == "Rating"
+
+    def test_notification_poll_failure_harmless(self):
+        lc, db, rpc, client, policy, _ = _make_lifecycle()
+        client.get_notifications.side_effect = LNPlusError("down")
+        result = lc.run_watcher_once()
+        assert "errors" in result and not result["errors"]

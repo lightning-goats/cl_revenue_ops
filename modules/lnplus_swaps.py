@@ -209,6 +209,17 @@ class LNPlusClient:
         params["id"] = str(swap_id)
         return self._request("complete_application", params, method="POST")
 
+    def get_notifications(self) -> Dict:
+        result = self._request("get_notifications", self._auth_params(), method="POST")
+        result = _unwrap_list_envelope(result)
+        if not isinstance(result, dict):
+            raise LNPlusError("get_notifications: unexpected payload")
+        return result
+
+    def mark_read_notifications(self) -> Dict:
+        result = self._request("mark_read_notifications", self._auth_params(), method="POST")
+        return _unwrap_list_envelope(result) if isinstance(result, (list, dict)) else {}
+
     def create_rating(self, swap_id, rating: str) -> Dict:
         if rating not in ("positive", "negative"):
             raise LNPlusError(f"invalid rating {rating!r}")
@@ -1228,6 +1239,7 @@ class SwapLifecycle:
         or outage-skip alike) for get_status() observability."""
         counts = {k: (len(v) if isinstance(v, list) else v)
                   for k, v in (summary or {}).items()}
+        self._poll_notifications()
         self._last_watcher_pass = {"ts": int(time.time()), "summary": counts}
 
     def _run_watcher_once_locked(self) -> Dict:
@@ -1248,6 +1260,7 @@ class SwapLifecycle:
             # a funded deadline must not wait on LN+ being back up.
             self._phase_3b(summary, set(), live_ids=None)
             self._prune_terminal_rows()
+            self._retry_pending_ratings()
             return summary
 
         # Phase 2: reconcile (breaker does not block the phases below).
@@ -1392,6 +1405,7 @@ class SwapLifecycle:
 
         # Phase 7: cheap terminal-row pruning (C-6, 2026-07-08 audit).
         self._prune_terminal_rows()
+        self._retry_pending_ratings()
 
         return summary
 
@@ -1749,10 +1763,7 @@ class SwapLifecycle:
             return
         rating = "positive" if positive else "negative"
 
-        try:
-            self._client.create_rating(sid, rating)
-        except Exception as e:
-            self._plugin.log(f"LNPLUS: create_rating failed for swap {sid}: {e}", level="warn")
+        rating_filed = self._try_create_rating(sid, rating)
 
         self._release_no_close_if_ours(sid, row, outbound_peer)
         self._release_no_close_if_ours(sid, row, incoming_peer,
@@ -1778,8 +1789,59 @@ class SwapLifecycle:
                 self._plugin.log(f"LNPLUS: ignore_peer_fn failed for {incoming_peer}: {e}",
                                   level="warn")
 
-        # Outcome, after best-effort ratings/tags/ignore.
-        self._db.lnplus_update_swap(sid, status="ended", outcome=rating)
+        # Outcome, after best-effort ratings/tags/ignore. A transiently
+        # failed create_rating parks the row in ended_rating_pending so the
+        # watcher retries it (bounded: 7 days past ends_at) instead of the
+        # swap silently ending unrated on LN+.
+        final_status = "ended" if rating_filed else "ended_rating_pending"
+        self._db.lnplus_update_swap(sid, status=final_status, outcome=rating)
+
+    _RATING_RETRY_WINDOW_SECONDS = 7 * 86400
+
+    def _try_create_rating(self, sid: str, rating: str) -> bool:
+        """Attempt create_rating once. True = filed (or LN+ says it already
+        was); False = transient failure worth retrying next pass."""
+        try:
+            self._client.create_rating(sid, rating)
+            return True
+        except LNPlusError as e:
+            errors = getattr(e, "errors", None)
+            blob = str(errors or e).lower()
+            if "already" in blob or "once" in blob:
+                # One rating per swap: an already-rated answer is success.
+                self._plugin.log(
+                    f"LNPLUS: create_rating for swap {sid}: LN+ reports "
+                    "already rated — treating as filed", level="info")
+                return True
+            self._plugin.log(f"LNPLUS: create_rating failed for swap {sid}: {e}",
+                              level="warn")
+            return False
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: create_rating failed for swap {sid}: {e}",
+                              level="warn")
+            return False
+
+    def _retry_pending_ratings(self) -> None:
+        """Watcher phase: retry ratings for rows parked in
+        ended_rating_pending. Bounded: give up (-> ended) once we are more
+        than _RATING_RETRY_WINDOW_SECONDS past the contract end."""
+        now = int(time.time())
+        for row in self._db.lnplus_get_swaps_by_status(["ended_rating_pending"]):
+            sid = row["swap_id"]
+            rating = row.get("outcome") or "positive"
+            try:
+                deadline = (row.get("ends_at") or now) + self._RATING_RETRY_WINDOW_SECONDS
+                if self._try_create_rating(sid, rating):
+                    self._db.lnplus_update_swap(sid, status="ended")
+                elif now > deadline:
+                    self._plugin.log(
+                        f"LNPLUS: giving up on rating swap {sid} after 7 days "
+                        "of retries — ending unrated", level="warn")
+                    self._db.lnplus_update_swap(sid, status="ended",
+                                                outcome=f"{rating}_rating_unfiled")
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: rating retry error for swap {sid}: {e}",
+                                  level="warn")
 
     def _protect_peer_no_close(self, sid: str, peer: str, flag_column: str) -> None:
         """Apply no_close protection to a contract peer, recording in
@@ -1871,6 +1933,31 @@ class SwapLifecycle:
         return withdrawn
 
     # -- status --------------------------------------------------------------
+    def _poll_notifications(self) -> None:
+        """Observability only: fetch LN+ notifications once per successful
+        watcher pass, log them, keep the last 10 for get_status, mark read.
+        No autonomous actions are taken from notifications — the polling
+        phases remain the source of truth for obligations. Best-effort."""
+        try:
+            result = self._client.get_notifications()
+            notes = result.get("notifications") or []
+            if not notes:
+                return
+            for n in notes[:20]:
+                self._plugin.log(
+                    f"LNPLUS: notification [{n.get('type', '?')}] "
+                    f"{str(n.get('body', ''))[:200]}", level="info")
+            keep = [{"type": n.get("type"), "body": str(n.get("body", ""))[:200],
+                     "created_at": n.get("created_at"), "url": n.get("url")}
+                    for n in notes[:10]]
+            self._recent_notifications = (keep + getattr(self, "_recent_notifications", []))[:10]
+            try:
+                self._client.mark_read_notifications()
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: mark_read_notifications failed: {e}", level="debug")
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: notification poll failed: {e}", level="debug")
+
     def get_status(self) -> Dict:
         recent_ended = self._db.lnplus_get_swaps_by_status(["ended"])
         # B13: recent_failed/backfill_done/last_watcher_pass — operator
@@ -1887,4 +1974,5 @@ class SwapLifecycle:
             "recent_failed": recent_failed[-5:],
             "backfill_done": bool(self._db.get_config_override(_BACKFILL_FLAG)),
             "last_watcher_pass": self._last_watcher_pass,
+            "recent_notifications": getattr(self, "_recent_notifications", []),
         }
