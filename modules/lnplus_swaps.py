@@ -436,6 +436,11 @@ class SwapEvaluator:
 _BREAKER_KEY = "_lnplus_breaker"
 _OPEN_STATES = ("OPENINGD", "CHANNELD_AWAITING_LOCKIN", "CHANNELD_NORMAL",
                 "DUALOPEND_OPEN_INIT", "DUALOPEND_AWAITING_LOCKIN")
+# Best-effort fallback used only when the caller does not wire the capacity
+# planner's real cost/budget estimators in (estimate_open_cost_fn /
+# budget_params_fn on SwapLifecycle.__init__). Still counted on the atomic
+# spend rail at settle time either way.
+_DEFAULT_OPEN_COST_SATS = 2500
 
 
 class SwapLifecycle:
@@ -450,7 +455,7 @@ class SwapLifecycle:
     """
 
     def __init__(self, plugin, rpc, database, config, client, policy_manager,
-                 ignore_peer_fn=None):
+                 ignore_peer_fn=None, estimate_open_cost_fn=None, budget_params_fn=None):
         self._plugin = plugin
         self.rpc = rpc
         self._db = database
@@ -458,6 +463,12 @@ class SwapLifecycle:
         self._client = client
         self._policy = policy_manager
         self._ignore_peer_fn = ignore_peer_fn
+        # Injected from the capacity planner (_estimate_open_cost /
+        # _unified_reserve_budget_params) by the caller wiring this class up;
+        # when absent, _execute_swap_open falls back to _DEFAULT_OPEN_COST_SATS
+        # and a best-effort (unenforced) reservation.
+        self._estimate_open_cost_fn = estimate_open_cost_fn
+        self._budget_params_fn = budget_params_fn
         self._watcher_lock = threading.Lock()
 
     # -- breaker -------------------------------------------------------
@@ -557,6 +568,13 @@ class SwapLifecycle:
             row = self._db.lnplus_get_swap(sid)
             if not row:
                 continue
+            if row.get("status") == "opened":
+                # Already funded and locally marked opened on a prior pass —
+                # LN+ may still list it under "opening" for a cycle or two.
+                # Do not downgrade status back to "opening" or re-run
+                # complete_application; phase 4 handles activation once LN+
+                # reports it completed.
+                continue
             try:
                 fields = {"status": "opening"}
                 peer = entry.get("outgoing_peer_pubkey")
@@ -565,6 +583,18 @@ class SwapLifecycle:
                 deadline_ts = _parse_ts(entry.get("deadline"))
                 if deadline_ts:
                     fields["deadline_at"] = deadline_ts
+                elif not row.get("deadline_at"):
+                    # Gate 10 backstop: LN+ gave us no parseable deadline and we
+                    # have no local one yet. The missed-deadline breaker must
+                    # never be silently disabled, so stamp a conservative local
+                    # 48h estimate (the LN+ contractual open window) rather than
+                    # leaving deadline_at null forever.
+                    fallback_deadline = int(time.time()) + 48 * 3600
+                    fields["deadline_at"] = fallback_deadline
+                    self._plugin.log(
+                        f"LNPLUS: swap {sid} — LN+ supplied no parseable "
+                        f"deadline; local 48h estimate ({fallback_deadline}) "
+                        "in force", level="warn")
                 self._db.lnplus_update_swap(sid, **fields)
                 row = self._db.lnplus_get_swap(sid)
                 self._execute_swap_open(row, entry)
@@ -675,20 +705,63 @@ class SwapLifecycle:
 
             # Write intent before the irreversible external call.
             self._db.lnplus_update_swap(sid, status="opening", outcome="fundchannel attempt")
+
+            # Atomic spend reservation immediately before fundchannel — pairs
+            # this money-committing call with the repo's atomic rail exactly
+            # like capacity_planner._execute_open/_execute_close do (BEGIN
+            # IMMEDIATE, cross-category budget). reserve_spend refuses to
+            # resurrect a terminal (spent/released) reservation_id, so the id
+            # is unique per attempt: a released reservation from a prior
+            # failed attempt can never block a retry.
+            estimated_cost = (self._estimate_open_cost_fn() if self._estimate_open_cost_fn
+                               else _DEFAULT_OPEN_COST_SATS)
+            eff_budget, budget_since = (self._budget_params_fn() if self._budget_params_fn
+                                         else (None, None))
+            reservation_id = f"lnplus-open-{sid}-{int(time.time())}"
+            try:
+                reservation_active = bool(self._db.reserve_spend(
+                    reservation_id=reservation_id,
+                    amount_sats=estimated_cost,
+                    category="channel_open",
+                    subcategory="lnplus_swap",
+                    metadata={"swap_id": sid, "peer_id": peer},
+                    effective_budget_sats=eff_budget,
+                    since_timestamp=budget_since,
+                ))
+            except Exception as e:
+                self._plugin.log(
+                    f"LNPLUS: budget reservation failed for swap {sid} — "
+                    f"retrying next pass ({e})", level="warn")
+                self._maybe_trip_deadline_miss(row, sid, deadline, now)
+                return
+            if not reservation_active:
+                self._plugin.log(
+                    f"LNPLUS: budget reservation failed for swap {sid} — "
+                    "retrying next pass", level="warn")
+                self._maybe_trip_deadline_miss(row, sid, deadline, now)
+                return
+
             try:
                 result = self.rpc.fundchannel(peer, int(row["capacity_sats"]), feerate=feerate)
             except Exception as e:
                 self._plugin.log(f"LNPLUS: fundchannel to {peer} failed for swap {sid}: {e}", level="error")
+                self._release_swap_open_reservation(reservation_id, sid)
                 self._maybe_trip_deadline_miss(row, sid, deadline, now)
                 return
             txid = result.get("txid") if isinstance(result, dict) else None
             if not txid:
                 self._plugin.log(f"LNPLUS: fundchannel for swap {sid} returned no txid", level="error")
+                self._release_swap_open_reservation(reservation_id, sid)
                 self._maybe_trip_deadline_miss(row, sid, deadline, now)
                 return
             # Outcome, after the call.
             self._db.lnplus_update_swap(sid, channel_funding_txid=txid, opened_at=now)
             first_fund = True
+            # Settle loud/bounded-retry — mirrors capacity_planner's
+            # _settle_capex_reservation: the on-chain tx already committed the
+            # fee, so a settle write failure must never silently release the
+            # reservation and drop the spend off the rail.
+            self._settle_swap_open_reservation(reservation_id, estimated_cost, sid)
 
         self._complete_and_mark_opened(sid)
         if first_fund:
@@ -704,6 +777,55 @@ class SwapLifecycle:
                               level="warn")
             return
         self._db.lnplus_update_swap(sid, status="opened")
+
+    def _release_swap_open_reservation(self, reservation_id: str, sid: str) -> None:
+        """Best-effort release on a failed/aborted fundchannel attempt. Never a
+        committed spend, so a release failure is logged and swallowed — the
+        hourly retry makes a fresh (unique) reservation_id next pass."""
+        try:
+            self._db.release_spend_reservation(reservation_id)
+        except Exception as e:
+            self._plugin.log(
+                f"LNPLUS: release_spend_reservation failed for swap {sid} "
+                f"({reservation_id}): {e}", level="warn")
+
+    def _settle_swap_open_reservation(self, reservation_id: str, estimated_cost: int, sid: str) -> None:
+        """Settle a committed swap-open reservation as a spend event.
+
+        Mirrors capacity_planner._settle_capex_reservation's loud/bounded-retry
+        semantics: the on-chain tx already committed the fee, so the settle
+        must NOT silently drop the spend-event write. mark_spend_reservation_spent
+        is loud/idempotent — on a spend_events write failure it rolls the UPDATE
+        back (or returns False) and the reservation stays 'active', keeping the
+        committed fee counted on the unified rail. We retry a bounded number of
+        times and, on persistent failure, log LOUDLY and leave the reservation
+        active — never release a committed spend.
+        """
+        for attempt in range(3):
+            try:
+                if self._db.mark_spend_reservation_spent(
+                    reservation_id=reservation_id,
+                    actual_spent_sats=estimated_cost,
+                    source="lnplus_swaps",
+                    record_event=True,
+                ):
+                    return
+            except Exception as e:
+                self._plugin.log(
+                    f"LNPLUS: swap-open settle write failed for swap {sid} "
+                    f"(attempt {attempt + 1}/3): {e}", level="warn")
+                continue
+            self._plugin.log(
+                f"LNPLUS: swap-open settle write returned failure for swap {sid} "
+                f"(attempt {attempt + 1}/3); retrying", level="warn")
+        # Persistent failure: the committed fee stays counted via the still-active
+        # reservation. Surface it loudly so the operator can reconcile rather
+        # than silently losing the write.
+        self._plugin.log(
+            f"LNPLUS: swap-open settle write PERSISTENTLY FAILED for swap {sid}: "
+            f"committed fee kept as an active reservation ({estimated_cost} sats) "
+            "so it stays counted against the unified budget; investigate spend_events.",
+            level="error")
 
     def _maybe_trip_deadline_miss(self, row: Dict, sid: str, deadline, now: int) -> None:
         if not deadline or now <= deadline:

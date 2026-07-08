@@ -615,3 +615,126 @@ class TestSwapLifecycle:
         result = lc.run_watcher_once()
         assert lc.breaker_tripped() is None
         assert result.get("skipped") == "lnplus unreachable"
+
+    # -- atomic spend reservation around swap-open (fix round 1) -------------
+    def test_open_reserves_before_fundchannel(self):
+        peer = PK_A
+        deadline = int(time.time()) + 40 * 3600
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "outgoing_peer_clearnet_address": "1.2.3.4:9735",
+             "deadline": deadline, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.fundchannel.return_value = {"txid": "ff" * 32}
+
+        call_order = []
+        real_reserve_spend = db.reserve_spend
+
+        def _spy_reserve_spend(*args, **kwargs):
+            call_order.append("reserve_spend")
+            return real_reserve_spend(*args, **kwargs)
+
+        def _spy_fundchannel(*args, **kwargs):
+            call_order.append("fundchannel")
+            return {"txid": "ff" * 32}
+
+        rpc.fundchannel.side_effect = _spy_fundchannel
+        with patch.object(db, "reserve_spend", side_effect=_spy_reserve_spend) as spy:
+            lc.run_watcher_once()
+            spy.assert_called_once()
+            kwargs = spy.call_args.kwargs
+            assert kwargs["category"] == "channel_open"
+            assert kwargs["subcategory"] == "lnplus_swap"
+            assert kwargs["metadata"]["swap_id"] == "s1"
+
+        assert call_order == ["reserve_spend", "fundchannel"]
+
+        # The reservation should have been settled ('spent'), not left active.
+        conn = db._get_connection()
+        rows = conn.execute(
+            "SELECT status, category, reserved_sats FROM spend_reservations "
+            "WHERE reservation_id LIKE 'lnplus-open-s1-%'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["status"] == "spent"
+        assert rows[0]["category"] == "channel_open"
+
+    def test_reservation_failure_blocks_fundchannel(self):
+        peer = PK_A
+        deadline = int(time.time()) + 40 * 3600
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "outgoing_peer_clearnet_address": "1.2.3.4:9735",
+             "deadline": deadline, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        rpc.listpeerchannels.return_value = {"channels": []}
+        with patch.object(db, "reserve_spend", return_value=False):
+            lc.run_watcher_once()
+        rpc.fundchannel.assert_not_called()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "opening"
+        assert lc.breaker_tripped() is None
+
+    def test_fundchannel_failure_releases_reservation(self):
+        peer = PK_A
+        deadline = int(time.time()) + 40 * 3600
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "outgoing_peer_clearnet_address": "1.2.3.4:9735",
+             "deadline": deadline, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.fundchannel.side_effect = Exception("fundchannel boom")
+        with patch.object(db, "release_spend_reservation",
+                           wraps=db.release_spend_reservation) as spy:
+            result = lc.run_watcher_once()
+        spy.assert_called_once()
+        assert "s1" not in result.get("errors", [])  # handled internally, no crash
+        conn = db._get_connection()
+        rows = conn.execute(
+            "SELECT status FROM spend_reservations WHERE reservation_id LIKE 'lnplus-open-s1-%'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["status"] == "released"
+
+    def test_deadline_null_gets_local_fallback(self):
+        peer = PK_A
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "outgoing_peer_clearnet_address": "1.2.3.4:9735",
+             "capacity_sats": 2_000_000}]}  # no 'deadline' key at all
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.fundchannel.return_value = {"txid": "ff" * 32}
+        before = int(time.time())
+        lc.run_watcher_once()
+        after = int(time.time())
+        row = db.lnplus_get_swap("s1")
+        assert row["deadline_at"] is not None
+        expected_low = before + 48 * 3600
+        expected_high = after + 48 * 3600
+        assert expected_low <= row["deadline_at"] <= expected_high
+
+    def test_opened_rows_skipped_in_opening_phase(self):
+        peer = PK_A
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "deadline": int(time.time()) + 40 * 3600, "capacity_sats": 2_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="opened", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", channel_funding_txid="ff" * 32, opened_at=int(time.time()))
+        lc.run_watcher_once()
+        rpc.fundchannel.assert_not_called()
+        client.complete_application.assert_not_called()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "opened"
