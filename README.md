@@ -22,7 +22,7 @@ Core Lightning owns node runtime.
 - Hints may bias local decisions only within bounded caps; they never override local budget, safety, or executor policy.
 - Live rebalances execute through `RebalanceEngineV2` using native explicit-route execution; route discovery is pinned to the `v3`/askrene router path.
 - There is no Sling dependency.
-- The normal runtime controls are `paused`, `daily_budget_sats`, fee rails, fee market-boundary knobs, and planner execution caps.
+- The normal runtime controls are `paused`, `daily_budget_sats`, fee rails, and planner execution caps. (`fee_market_boundary_*` and `rebalance_min_profit` are deprecated no-ops kept only for config-file compatibility — see Day-1 Operator Workflow.)
 - The primary operator surfaces are `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug`.
 - The normal workflow is decision explainability first, knob tuning second.
 - Auto fee bands are enabled by default. Manual policy bands are fallback only when an auto band is not yet available.
@@ -95,6 +95,17 @@ The capacity planner uses a multi-strategy candidate pipeline with portfolio-awa
 - It maintains a standing on-chain reserve for reserve maintenance, and that reserve maintenance is independent of pending planner opens.
 - When the reserve is healthy, it falls back to the existing balance cycle.
 
+## Additional Runtime Subsystems
+
+These subsystems are off by default and each has more knobs than fit in a table here — see [config/cl-revenue-ops.conf.full](config/cl-revenue-ops.conf.full) for every option, default, and comment.
+
+- **Hot-channel protection** (`revenue-ops-hot-channel-protection-*`, 8 options) — gives fast-draining, high-profit channels a wider rebalance budget and shorter cooldown than normal channels get, so they don't starve mid-burst. Gated on minimum velocity and marginal ROI, capped by a fraction of the channel's own daily contribution, with an operator override-peer list to force protection regardless of the velocity/ROI gate.
+- **Growth budget** (`revenue-ops-growth-budget-*`, 5 options) — an optional dynamic uplift on top of `daily_budget_sats`: a fraction of trailing net profit (`growth-budget-earned-fraction`) plus a smaller fleet-learning experiment fraction (`growth-budget-experiment-fraction`), bounded per-window by `growth-budget-max-extra-sats` and by a local hard ceiling (`growth-budget-hard-ceiling-sats`) that fleet hints cannot exceed. Disabled by default.
+- **Dynamic htlcmax** (`revenue-ops-enable-dynamic-htlcmax` + 3 flow-class pct options) — scales each channel's advertised `htlc_max` by its flow classification (source/sink/balanced), tightest on sinks. As of the 2026-07 econ audit it is also **live-depletion-keyed**: regardless of flow class, `htlc_max` is additionally capped to a fraction of the channel's current spendable balance (clamped to a 10k-sat floor), so a channel that has drained to near-zero local balance stops advertising an `htlc_max` large enough to invite doomed HTLCs. A gossip-churn deadband limits how often the resulting change actually triggers a `setchannel` broadcast.
+- **Expansion treasury** (`revenue-ops-expansion-treasury-*`, 7 options) — reverse-swaps excess Lightning balance from over-local channels to on-chain funds via Boltz, to build the on-chain reserve the capacity planner needs for new opens. Runs only when the confirmed on-chain reserve is below `expansion-treasury-onchain-target-sats` by at least `expansion-treasury-min-deficit-sats`; protected/hot channels are excluded from harvesting by default.
+- **Drain-bias / receivable-ratio** (`revenue-ops-node-drain-bias-*`, `revenue-ops-receivable-ratio-*`, `revenue-ops-drain-fee-discount-max`, `revenue-ops-boltz-structural-budget-sats`) — the node-level inbound-liquidity objective described above under "What Operators Need To Know": biases fees down on stagnant over-local channels and can earn a capped Boltz structural credit for demand the circular rebalancer can't place internally. All off by default (0 / false).
+- **Boltz** (`revenue-ops-boltz-*`, 17 options / 22 RPCs) — Lightning⇄on-chain swap integration behind the balance cycle and expansion treasury. On-chain capacity already committed to an in-flight LN+ swap open (`lnplus_reserved_sats`) is subtracted before Boltz's confirmed-on-chain-sats calculation, so LN+ is effectively a third consumer of the same on-chain reserve pool. Too large to table here; see [docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md) for the full RPC inventory and `config/cl-revenue-ops.conf.full` for every option.
+
 ## LN+ Liquidity Swaps
 
 `cl_revenue_ops` can autonomously join [lightningnetwork.plus](https://lightningnetwork.plus) (LN+) liquidity swaps — a ring of nodes where each participant opens one channel to the next and receives one in return, so an outbound open buys an equal-capacity inbound channel. This is join-only: the plugin applies to swaps other operators posted, it never creates them.
@@ -136,6 +147,7 @@ The capacity planner uses a multi-strategy candidate pipeline with portfolio-awa
 | `revenue-lnplus-status` | Circuit-breaker state, in-flight swap, and active/recently-ended contracts. |
 | `revenue-lnplus-breaker-clear` | Operator acknowledgment that clears a tripped breaker so new applications can resume. |
 | `revenue-lnplus-abandon <swap_id>` | Emergency abandon of an in-flight obligation — marks the local row failed and trips the breaker, since abandoning a commitment is a defection on our side and must never happen silently. |
+| `revenue-lnplus-backfill` | Operator remedy that adopts pre-existing LN+ swaps (applied/opened/settled manually on the LN+ website, before or after this automation existed) into the local ledger. Idempotent — existing rows are never touched, so it is safe to run repeatedly. |
 
 ### Circuit breaker
 
@@ -231,7 +243,7 @@ Saved artifacts:
 ## Day-1 Operator Workflow
 
 1. Start the plugin and check `revenue-status`.
-2. Set only the safety rails you actually want to constrain: `paused`, `daily_budget_sats`, `min_fee_ppm`, `max_fee_ppm`, and `fee_profile`. (The `fee_market_boundary_*` controls are deprecated no-ops kept only for config compatibility; they have no effect.)
+2. Set only the safety rails you actually want to constrain: `paused`, `daily_budget_sats`, `min_fee_ppm`, `max_fee_ppm`, and `fee_profile`. (The `fee_market_boundary_*` controls and `rebalance_min_profit` are deprecated no-ops kept only for config compatibility; they have no effect — minimum-profit gating is now enforced by the sats-EV gate and `rebalance_hold_margin`.)
 3. Let the executor run.
 4. Use `revenue-fee-debug` and `revenue-rebalance-debug` to understand holds, clamps, and actions before touching anything else.
 Example runtime adjustments:
@@ -257,6 +269,16 @@ lightning-cli revenue-config set daily_budget_sats 10000
 | `revenue-wake-all` | Wake the background loops immediately |
 | `revenue-hive-hints-status` | Diagnostic: cl-mycelium hint coverage and freshness |
 | `revenue-planner-candidate-sources` | Diagnostic: candidate pipeline strategy breakdown |
+
+See [docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md) for the full action/mutation RPC inventory across all subsystems (fees, rebalancing, planner, Boltz, LN+).
+
+### revenue-config: actions and override precedence
+
+`revenue-config` supports four actions: `get [key]` (public controls, or one key with its classification), `set <key> <value>`, `reset <key>`, and `list-mutable` (lists every public runtime key that `set`/`reset` will accept).
+
+- `revenue-config set <key> <value>` writes a DB override for that key. Once set, the override **wins over `setconfig`/config-file changes to the same option on every dynamic-config refresh cycle** — the refresh loop explicitly skips any field with an active DB override rather than stomping it back to the file/`setconfig` value.
+- `revenue-config reset <key>` removes the DB override, the escape hatch that lets `setconfig`/config-file values govern the field again (some fields apply immediately; others require a plugin restart to re-adopt the file default — the RPC response says which).
+- `revenue-config list-mutable` returns the current set of public runtime keys; only keys in this list can be `set` or `reset` (all others return `"not a public runtime control"`).
 
 ## Zero-Fee Hive Corridor
 

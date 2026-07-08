@@ -59,6 +59,33 @@ Production M2 section hints should carry explicit peer identifiers so the consum
 
 Adapter diagnostics expose `m2_scope`, `m2_scope_enforced_by_consumer`, `m2_scope_lab_only_all_hints`, `m2_out_of_scope_peer_count`, and `m2_scope_neutralized_field_count`.
 
+## LN+ Swap Hints (D-4, Revision 2)
+
+`lnplus_swap_hints` is an optional top-level section, consumed via `HiveHintAdapter.get_lnplus_swap_hints()` (`modules/hive_hints.py`), that biases which LN+ (lightningnetwork.plus) swap peer the plugin prefers. It follows the same envelope-freshness convention as `get_open_candidates`: there is no separate per-section TTL, the outer snapshot's freshness gates the whole section, and a stale/missing/malformed snapshot returns `{}` (fully neutral) rather than raising.
+
+Validation, applied per entry (malformed entries are skipped individually, never raising):
+
+- The section must be present with `schema_version` starting with `"lnplus-swap-hints/"`, and carry an `entries` list.
+- Each entry needs a `peer_pubkey` matching a valid 66-hex compressed pubkey (`^0[23][0-9a-fA-F]{64}$`).
+- `action` must be one of `{prefer, avoid, allow_duplicate}`; any other value (including missing) drops the entry.
+- `ev_multiplier` is coerced to float and clamped to `[0.8, 1.5]`; absent/non-numeric defaults to `1.0`.
+- `topology_gain` is coerced to float and clamped to `[0.0, 1.0]`; absent/non-numeric defaults to `0.0`.
+- `reason` is carried through as a string (defaults to `""`).
+
+Consumer usage (`modules/lnplus_swaps.py`): hints only ever bias the EV of the assigned outbound peer multiplicatively via `ev_multiplier`, and `allow_duplicate` skips the normal duplicate-peer veto for that peer. They never bypass any other safety gate (fleet dedup, peer-rating floor, rank floor, capex budget, capacity/reserve bounds).
+
+## Per-Peer Hint Map Truncation (200-Peer Cap)
+
+`HiveHintAdapter.MAX_PEERS_IN_SNAPSHOT = 200` mirrors the producer's own `MAX_PEERS_IN_SNAPSHOT` cap. If the per-peer `hints` map exceeds this count the adapter does **not** reject the whole snapshot (the producer legitimately emits one entry per gossip-known peer, which can be hundreds on a well-connected node); instead `_truncate_hint_map` keeps the highest-priority 200 entries:
+
+1. Fleet members (peers the membership signal `is_hive_member`/`_get_hive_membership` reads as a member) — highest priority.
+2. Peers with actionable content (an open/avoid preference, a closure recommendation, or a known corridor role).
+3. Everything else.
+
+Within each tier, entries are kept in sorted-`peer_id` order so the same input snapshot always yields the same survivors (deterministic truncation), and truncation is logged once per snapshot generation.
+
+Top-level list sections — `route_segment_leases`, `rebalance_recommendations`, `rebalance_campaigns`, `segment_scores`, `segment_observations`, `lnplus_swap_hints`, and other non-per-peer sections — are **untouched** by this cap; only the per-peer `hints` map is truncated.
+
 ## Metabolic Influence v1
 
 `metabolic_influence` is an optional top-level Level 2c section produced by cl-mycelium and consumed by `cl_revenue_ops` only through `HiveHintAdapter`. It uses `schema_version=metabolic-influence/v1` and carries `generated_at`, `ttl_seconds`, `m2_scope`, `confidence`, `coverage`, `global_effects`, `peer_effects`, and safety flags.

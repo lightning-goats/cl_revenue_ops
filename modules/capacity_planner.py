@@ -1,8 +1,27 @@
 """
 Capacity Planner Module for cl-revenue-ops
 
-This module identifies "Winner" channels for capital injection
-and "Loser" channels for capital redeployment (Close).
+The plugin's capital-allocation engine. On a timer it identifies "Winner" channels for
+capital injection and "Loser" channels for capital redeployment (close, fee-reduce, or
+defibrillation — a diagnostic rebalance that distinguishes "stagnant because unbalanced"
+from "stagnant because dead" before paying a close fee). Beyond winner/loser classification
+this module also:
+
+- runs a multi-strategy open-candidate discovery pipeline (proven winners, neighbor/patron
+  graph, graph centrality, hive open-hints and hive-member topology, route-pair analysis,
+  demand-flow sink adjacency) with normalized cross-strategy scoring and pool-slot quotas;
+- gates a portfolio-balance governor (hard block on outbound opens above a local-liquidity
+  ceiling, constrained allow-list below it) ahead of every discovery/execution pass;
+- coordinates with the Boltz auto-cycle (loser SCIDs to avoid loop-out through, on-chain
+  funding-deficit signal, preferred loop-out target) via `get_boltz_coordination`;
+- integrates the LN+ (lightningnetwork.plus) liquidity-swap evaluator as a second
+  capital-allocation channel that competes for the same per-cycle open slot and on-chain
+  funds as a regular channel open (see `docs/audit/contracts/lnplus_swaps.md`);
+- prices and reserves channel-close fees through a shared close-fee-gating subsystem
+  (fixed cap or reserve-multiplier, optional CLN close feerange) rather than each close
+  path deriving its own cap.
+
+See `docs/audit/contracts/capacity_planner.md` for the full invariant-level contract.
 """
 
 from __future__ import annotations

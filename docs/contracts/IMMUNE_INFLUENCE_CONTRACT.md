@@ -4,7 +4,7 @@ This contract defines the optional top-level `immune_influence` section inside t
 
 ## Producer
 
-cl-mycelium produces `immune_influence/v1` from `goal_state.diagnostics.immune_advisory` only when `hive-organism-immune-m2-influence=true` is explicitly configured. Producers pre-scope peer effects, but consumers must still enforce scope locally.
+cl-mycelium produces `immune_influence/v1` from `goal_state.diagnostics.immune_advisory` when `hive-organism-immune-m2-influence=true`, which is the production default (shipped default ON). Producers pre-scope peer effects, but consumers must still enforce scope locally.
 
 ## Consumer
 

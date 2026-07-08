@@ -39,7 +39,15 @@ historical claim the plugin makes ultimately rests on rows this module wrote.
   `daily_forwarding_stats`(+`_inbound`), `budget_reservations`, `spend_reservations`,
   `spend_events`, `financial_snapshots`, `channel_closure_costs`, `closed_channels`,
   `planner_candidates`, `planner_actions`, `dead_capital_stage`, `planner_recycle_ops`,
-  `kalman_state` (:1495), `plugin_flags` (:1955).
+  `kalman_state` (:1495), `plugin_flags` (:1955), plus four newer tables: `lnplus_swaps`
+  and `lnplus_peers` (LN+ swap automation state; accessors `lnplus_record_swap`,
+  `lnplus_update_swap`, `lnplus_get_swap`, `lnplus_get_swaps_by_status`,
+  `lnplus_inflight_swaps`, `lnplus_reserved_sats`, `lnplus_bump_peer`, `lnplus_get_peer`,
+  `lnplus_prune_terminal`, modules/database.py:7243–7343), `hive_member_confirmations`
+  (durable zero-fee-corridor membership grace; accessors `hive_member_confirm` /
+  `hive_member_last_confirmed`, :7349–7376), and `corridor_flow_daily` (mycelial corridor
+  flow instrumentation; accessors `corridor_flow_record` / `corridor_flow_summary`,
+  :7384+).
 
 ## Invariants
 
@@ -72,11 +80,16 @@ historical claim the plugin makes ultimately rests on rows this module wrote.
   zeroes non-numeric/NaN but **permits negative amounts** (clamping magnitude to
   `MAX_AMOUNT_SATS`, :550–557) — negative spend events are storable by design;
   `_validate_channel_id`/`_validate_peer_id` (:458/:473) gate identifiers.
-- **DB-7** `get_spend_ledger_summary(window_hours)` (modules/database.py:3912) windows all
+- **DB-7** `get_spend_ledger_summary(window_hours)` (modules/database.py:4329) windows all
   sums by `now - window_hours*3600`, but names the fields `spent_24h_sats` /
-  `reserved_24h_sats` regardless of the requested window (:3964–3965), and emits **no**
-  `covered_hours`/`coverage_hours` field — downstream consumers (cl-hive metabolism
-  ledger) cannot tell how much history backs the number.
+  `reserved_24h_sats` regardless of the requested window — that misnomer is still live.
+  However the payload now also carries `window_hours` (the requested window, echoed
+  verbatim) and, separately, `coverage_hours`/`covered_hours` (identical values; measured
+  from `_coverage_from_earliest` against the earliest ledger evidence timestamp — how much
+  of the requested window is actually backed by evidence, not an echo of the request) and
+  `coverage_status` (:4389–4399). Downstream consumers (cl-hive metabolism ledger) that
+  read `coverage_hours`/`covered_hours` can now tell how much history backs the number;
+  only the `_24h`-suffixed field *names* remain a legacy misnomer when `window_hours != 24`.
 
 ## Revenue role
 
@@ -99,7 +112,18 @@ sources name `revenue_spend_ledger` and `revenue_total_cost_budget`. The DB file
   reservation) has not been traced end-to-end.
 - The `spent_24h_sats` field-name misnomer (DB-7) is consumed by external code; renaming
   it is a cross-repo compatibility question.
-- `schema_version` table exists but migrations are ad-hoc `ALTER TABLE ... except
-  OperationalError`; actual version row appears never bumped past 1.
+- ~~`schema_version` table exists but migrations are ad-hoc `ALTER TABLE ... except
+  OperationalError`; actual version row appears never bumped past 1.~~ RESOLVED (DD9/MIG-3,
+  operator ruling 2026-07-02, modules/database.py:606–618): `schema_version` is
+  **write-only by design** — the row is recorded but never gated on. Every migration in
+  this file is additive and idempotent (`CREATE TABLE IF NOT EXISTS` / `ADD COLUMN`
+  guards), so a database written by newer code opens fine under older code (the older
+  code just ignores the extra columns/tables) and re-running init against an
+  already-migrated DB is a no-op. Real version gating (refuse to open when on-disk
+  `schema_version` exceeds what the code knows) is deliberately deferred until a
+  migration becomes destructive or renaming — i.e. only when opening a newer DB with
+  older code could actually misread or corrupt data; until then gating would only add
+  false-positive refusals with no safety benefit. The version staying at 1 is therefore
+  expected, not a bug.
 - Retention interplay: `_revenue_by_size_bucket_sql` (:58) documents ~8-day accuracy, but
   callers requesting `window_days=30` on forwards-backed queries silently undercount.

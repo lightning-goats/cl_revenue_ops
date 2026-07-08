@@ -34,6 +34,7 @@ Read:
 - `docs/plans/cl_mycelium_revenue_integrated_plan_v3.md`
 - `docs/prompts/cl_mycelium_revenue_codex_prompt_pack_v3.md`
 - `modules/hive_hints.py`
+- `modules/lnplus_swaps.py`
 - rebalance engine / planner / capex / profitability modules
 - existing revenue RPC tests
 
@@ -58,6 +59,9 @@ The following are action/mutation RPCs and must not be called in read-only tests
 - `revenue-clear-reservations`
 - `revenue-policy set`
 - `revenue-config set`
+- `revenue-lnplus-abandon`
+- `revenue-lnplus-breaker-clear`
+- `revenue-lnplus-backfill`
 - any Boltz action RPC
 - any CLN open/close/pay/withdraw RPC
 

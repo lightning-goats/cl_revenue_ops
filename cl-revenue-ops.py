@@ -63,6 +63,24 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.13.0: Econ audit wave (2026-07-08)
+#   - Class-aware saturated/source min-fee floor (min_fee_ppm_saturated) so saturated
+#     and pure-source channels can price below the global fee floor
+#   - Dynamic-htlcmax valve gains live-outbound-depletion keying so a near-drained
+#     channel never advertises an htlc_max sized off total capacity
+#   - Node-liquidity-aware drain-bias, weekly-budget live-raise fix, and
+#     rebalance_min_profit deprecated to a no-op (superseded by the sats-EV gate)
+# v2.12.0: True zero-fee hive corridor (2026-07-08)
+#   - All hive-internal channels default to 0 ppm / 0 base msat, public and announced
+#   - Durable through hint staleness via a DB-confirmed membership grace window
+#     (hive_zero_fee_stale_grace_seconds, default 7 days)
+#   - Adds mycelial corridor-flow utilization instrumentation (internal/edge/external)
+# v2.11.0: LN+ (lightningnetwork.plus) swap automation (2026-07-08)
+#   - Autonomous join-only liquidity-swap ring participation, scored against the
+#     capacity planner's own open-EV machinery with an inbound-liquidity credit
+#   - One swap in flight per node; one-strike circuit breaker; both-side no_close
+#     contract protection; intent-first ledger writes on every irreversible step
+#   - New revenue-lnplus-status/-breaker-clear/-abandon/-backfill operator RPCs
 # v2.10.0: Hive member zero-fee policy restoration
 #   - Restores confirmed hive-member channels to 0 ppm and 0 msat base fee
 #   - Keeps stale/malformed/missing hive hints neutral unless recent membership grace applies
@@ -92,7 +110,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.10.0"
+PLUGIN_VERSION = "2.13.0"
 HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
 # Supply-chain / runtime version floors (Phase 3C).

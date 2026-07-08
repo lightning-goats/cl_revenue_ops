@@ -55,6 +55,16 @@ Required channel fields:
 
 Producers may add channel diagnostics such as age windows, margin fields, confidence, or classification reasons. Consumers must ignore unknown fields.
 
+`_push_profitability_summary()` (`modules/profitability_analyzer.py`) currently emits a trailing-30-day window alongside the lifetime fields above, on every channel:
+
+- `contribution_30d_msat`: `max(exit fees, sourced fees)` over the trailing 30 days.
+- `fees_earned_30d_msat`: direct exit-fee revenue over the trailing 30 days.
+- `sourced_fee_30d_msat`: sourced-fee contribution over the trailing 30 days.
+- `forward_count_30d`: forwards as the exit channel over the trailing 30 days.
+- `sourced_forward_count_30d`: forwards as the entry (sourcing) channel over the trailing 30 days.
+- `role_30d`: windowed flow-role classification (`inbound_gateway` / `outbound_gateway` / `balanced` / `dormant`), same >=10-forwards / >70%-directional thresholds as lifetime `role` but computed from the 30d counts only, so a channel that sourced volume long ago and nothing since decays to `dormant` instead of staying a protected gateway forever. Consumers making close/keep decisions should prefer `role_30d` + `sourced_fee_30d_msat` over the lifetime `role` + `sourced_fee_contribution_msat`. Falls back to the lifetime `role` value when no 30d window was available at analysis time.
+- `marginal_roi_reliable`: boolean; `false` when trailing-30d rebalance spend is under 100 sats, signaling that any marginal-ROI ratio derived from that spend is statistically unreliable (a few sats of cost swings the ratio wildly) and should be treated as neutral — no boost, no penalty — by consumers.
+
 ## Stale Behavior
 
 Consumers should mark samples stale when `now - timestamp` exceeds the configured freshness window. Stale samples may inform reports, but must not command cl_revenue_ops, bypass executor budgets, or broaden M2 scope.

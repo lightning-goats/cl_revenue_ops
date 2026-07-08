@@ -36,9 +36,6 @@ scripts/clean-local.sh --heavy --apply
 
 ## Tracked Artifact Debt
 
-Some historical artifacts are already tracked. Removing them from future commits should be done deliberately with `git rm --cached` or `git rm` after confirming the data is no longer needed in repository history.
+Some historical artifacts have been tracked in the past. Removing them from future commits should be done deliberately with `git rm --cached` or `git rm` after confirming the data is no longer needed in repository history.
 
-Current candidates:
-
-- `MagicMock/mock/*`
-- timestamped raw run output under `results/`
+As of 2026-07-08 there are no known tracked artifact-debt candidates — the previously flagged `MagicMock/mock/*` files and timestamped raw run output under `results/` are no longer present in the tracked tree (`git ls-files`). If new generated output gets committed by accident, add it here before cleaning it up.

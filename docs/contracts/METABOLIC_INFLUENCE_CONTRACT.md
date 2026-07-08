@@ -4,7 +4,7 @@ This contract defines the optional top-level `metabolic_influence` section insid
 
 ## Producer
 
-cl-mycelium produces `metabolic_influence/v1` from its metabolic arbitration layer when the producer-side feature is explicitly enabled. Producers should pre-scope peer effects, but consumers must still enforce scope locally.
+cl-mycelium produces `metabolic_influence/v1` from its metabolic arbitration layer when `hive-organism-metabolism-m2-influence=true`, which is the production default (shipped default ON; default scope `channel_and_fleet_peers`). Producers should pre-scope peer effects, but consumers must still enforce scope locally.
 
 ## Consumer
 
@@ -71,6 +71,8 @@ The consumer clamps each additive peer delta and converts it to a bounded multip
 - Closure-watch bias: `closure_watch_priority_delta` clamped to `±0.15` → multiplier `[0.85, 1.15]` (`METABOLIC_CLOSURE_WATCH_CAP`); diagnostic/advisory only and cannot call close.
 
 The metabolic fee-bias channel is reserved / currently-neutral by producer choice: cl-hive emits `fee_bias_delta: 0.0` unconditionally, so `get_metabolic_fee_bias` always returns `1.0` in practice. The consumer machinery is wired up only for forward compatibility and will activate if the producer gains fee-advisory capability.
+
+The producer additionally bounds every peer effect by a configurable `max_peer_effect` (cl-hive `modules/organism/metabolic_influence.py`, `DEFAULT_MAX_PEER_EFFECT = 0.15`, plugin option `hive-organism-metabolism-max-peer-effect`). This is defense-in-depth: because the producer value is configurable, the per-field consumer caps above are what actually keep values in-contract on the `cl_revenue_ops` side.
 
 Metabolic influence never overrides min/max fee rails, budget gates, route-cost gates, ROI floors, dry-run mode, planner enablement, close/open authorization, or local executor policy.
 

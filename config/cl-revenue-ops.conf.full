@@ -46,9 +46,34 @@
 # RECOMMENDATION: 100 ppm for competitive markets, 50 ppm for volume focus
 #revenue-ops-min-fee-ppm=10
 
+# Class-aware min-fee floor (PPM) for channels classified saturated (outbound
+# >= 85% of capacity) or source. Applied only when set BELOW min-fee-ppm; 0
+# (default) allows true cheap egress on saturated edges. Cost-recovery floors
+# still apply.
+#revenue-ops-min-fee-ppm-saturated=0
+
 # Fee ceiling - maximum fee rate
 # RECOMMENDATION: 1500-2500 ppm for most routing nodes; raise only for special positioning
 #revenue-ops-max-fee-ppm=2000
+
+# How to price relative to neighbor-median fee: undercut (default, price
+# below median to win volume), match (target median), premium (price above
+# median in inelastic-demand markets), competition_aware (undercut only when
+# a competitor is at/below DTS's target).
+#revenue-ops-market-fee-mode=undercut
+
+# Minimum competitor count required before neighbor_median (used by
+# market-fee-mode) is computed; below this the market-fee-mode branch is
+# skipped.
+#revenue-ops-neighbor-median-min-competitors=2
+
+# Base-fee policy (Upgrade A). "off": use a single base fee for all channels.
+# "adaptive": apply base-fee-intra-fleet to hive members and
+# base-fee-non-hive to everyone else.
+#revenue-ops-base-fee-policy=off
+
+# Base fee in msat for channels to non-hive peers when base-fee-policy=adaptive.
+#revenue-ops-base-fee-non-hive=1000
 
 # --- Zero-fee hive corridor ---
 # Operator strategy: ALL hive-internal channels are zero fee (0 base msat /
@@ -87,6 +112,9 @@
 # Enable Vegas Reflex mempool-aware floor adjustment
 #revenue-ops-vegas-reflex=true
 
+# Vegas Reflex decay rate per cycle, 0.0-1.0 (~30min half-life at default)
+#revenue-ops-vegas-decay=0.85
+
 # ============================================================================
 # REBALANCING
 # ============================================================================
@@ -94,14 +122,83 @@
 # Rebalance candidate evaluation interval in seconds
 #revenue-ops-rebalance-interval=900
 
-# Minimum expected profit in sats to trigger rebalance
-# RECOMMENDATION: 50-100 sats for active rebalancing, 200+ for conservative
+# DEPRECATED no-op. Minimum-profit gating is now enforced by the sats-EV
+# gate and revenue-ops-rebalance-hold-margin; this value is parsed and
+# echoed for config-file compatibility only.
 #revenue-ops-rebalance-min-profit=10
 
 # Rebalance route discovery is pinned to v3/askrene.
 #revenue-ops-rebalance-router=v3
 
+# CSV of askrene layer names passed to v3 router getroutes calls. Missing
+# layers are silently dropped by askrene. Blank uses the default
+# 'hive-fleet' cl-hive bias; set to 'none' or 'standalone' for no layers.
+#revenue-ops-askrene-layers=hive-fleet
+
 # Rebalance execution uses the exact route priced by askrene.
+
+# Hours before retrying a channel after 10+ consecutive rebalance failures.
+#revenue-ops-futility-cooldown-hours=48
+
+# Local ratio below which a destination bypasses the channel-level rebalance
+# cooldown (0 disables).
+#revenue-ops-rebalance-emergency-local-ratio=0.10
+
+# Drift since last successful rebalance that bypasses the cooldown (0 disables).
+#revenue-ops-rebalance-drift-override-ratio=0.30
+
+# Minimum final_score in SATS of expected net value a priced pair must clear,
+# or it is rejected as below_hold_margin.
+#revenue-ops-rebalance-hold-margin=0.0
+
+# Per-pair fee budget = max(dest capex, ceil(amount * ppm / 1M)). Decouples
+# per-rebalance fee from capex bootstrap (0 disables).
+#revenue-ops-pair-fee-cap-ppm=1000
+
+# Conservative per-pair fee budget for active hive-member channels before
+# capex/profitability history appears (0 disables).
+#revenue-ops-hive-rebalance-bootstrap-budget-sats=300
+
+# Reserved slots for coordination pairs (from cl-hive's rebalance_
+# recommendations / rebalance_campaigns hints) on top of the planner's
+# max_pairs cap. 0 restores strict-cap behavior.
+#revenue-ops-rebalance-coordination-reserved-slots=2
+
+# --- Activity-recency penalty ---
+# Window in seconds over which recent forwarding activity is measured.
+#revenue-ops-rebalance-activity-window-seconds=3600
+# Coefficient applied to the activity-recency penalty (0 disables).
+#revenue-ops-rebalance-activity-penalty-coeff=0.5
+# Maximum fraction of score the activity-recency penalty may remove.
+#revenue-ops-rebalance-activity-penalty-cap-frac=0.5
+
+# --- Utilization-based sizing ---
+# Trailing window in days over which forwarding utilization is measured.
+#revenue-ops-rebalance-utilization-window-days=7
+# Minimum utilization ratio floor used when normalizing observed flow.
+#revenue-ops-rebalance-utilization-floor=0.05
+# Maximum utilization ratio ceiling used when normalizing observed flow.
+#revenue-ops-rebalance-utilization-ceiling=1.0
+# Minimum forwards in the utilization window required before utilization-based
+# sizing is trusted.
+#revenue-ops-rebalance-utilization-min-forwards=5
+
+# --- Size-tiered targets ---
+# Bucket target amounts by channel capacity percentile instead of a flat target.
+#revenue-ops-rebalance-size-tiered-targets=true
+# Percentile (0.0-1.0) of the channel-capacity distribution used as the
+# reference point for size-tiered target amounts.
+#revenue-ops-rebalance-size-reference-percentile=0.5
+# Half-width (fraction) of the "small channel" band around the reference percentile.
+#revenue-ops-rebalance-small-channel-band-half-width=0.15
+
+# Fee cap in sats for the diagnostic (defibrillator) shock rebalance; the
+# shock ppm ceiling is derived from this cap. Clamped to
+# [1, min(daily budget, 10000)].
+#revenue-ops-diagnostic-rebalance-max-fee-sats=400
+
+# Allow automatic zero-fee rebalances when daily_budget_sats is zero.
+#revenue-ops-allow-zero-cost-auto-rebalance-when-budget-zero=false
 
 # ============================================================================
 # CAPACITY PLANNER
@@ -119,6 +216,117 @@
 #revenue-ops-planner-max-channel-sats=10000000
 #revenue-ops-planner-max-fee-rate=50.0
 #revenue-ops-planner-min-annual-roi-pct=1.0
+
+# --- Planner close-fee reservation ---
+# Multiplier applied to estimated close fee for the planner close budget
+# reservation.
+#revenue-ops-planner-close-fee-reserve-multiplier=2.0
+# Fixed planner close fee cap/reservation in sats; 0 uses the reserve multiplier.
+#revenue-ops-planner-close-fee-cap-sats=0
+# Pass a CLN close feerange cap derived from the planner close fee reservation.
+#revenue-ops-planner-close-feerange-enabled=false
+
+# ============================================================================
+# HOT-CHANNEL PROTECTION
+# ============================================================================
+# Gives fast-draining, high-profit channels a wider rebalance budget and
+# shorter cooldown so they don't starve mid-burst.
+
+# Enable aggressive rebalance protection for fast-draining high-profit channels.
+#revenue-ops-hot-channel-protection-enabled=true
+
+# CSV peer pubkeys to force hot-channel protection regardless of the
+# velocity/ROI gate below.
+#revenue-ops-hot-channel-protection-override-peers=
+
+# Minimum daily turnover ratio to qualify for hot-channel protection.
+#revenue-ops-hot-channel-protection-min-velocity=0.20
+
+# Minimum marginal ROI (decimal) for hot-channel protection.
+#revenue-ops-hot-channel-protection-min-marginal-roi=0.20
+
+# Max fraction of daily channel contribution spendable on protective rebalancing.
+#revenue-ops-hot-channel-protection-profit-budget-pct=0.75
+
+# Max multiplier on rebalance chunk size for hot-channel protection.
+#revenue-ops-hot-channel-protection-max-chunk-multiplier=4.0
+
+# Minimum cooldown hours for protected hot channels.
+#revenue-ops-hot-channel-protection-min-cooldown-hours=1.0
+
+# Hard max routing fee ppm for protected hot-channel rebalances.
+#revenue-ops-hot-channel-protection-max-rebalance-fee-ppm=2000
+
+# ============================================================================
+# GROWTH BUDGET
+# ============================================================================
+# Optional dynamic uplift on top of daily_budget_sats, funded from trailing
+# net profit. Disabled by default.
+
+# Enable dynamic growth budget: base daily budget plus bounded earned/growth credit.
+#revenue-ops-growth-budget-enabled=false
+
+# Fraction of trailing net profit that can raise the effective daily budget.
+#revenue-ops-growth-budget-earned-fraction=0.25
+
+# Fraction of trailing net profit available for fleet-learned growth experiments.
+#revenue-ops-growth-budget-experiment-fraction=0.10
+
+# Maximum extra sats unlocked by growth experiment credit per budget window.
+#revenue-ops-growth-budget-max-extra-sats=2000
+
+# Local hard ceiling for dynamic effective daily budget; fleet hints cannot
+# exceed this.
+#revenue-ops-growth-budget-hard-ceiling-sats=10000
+
+# ============================================================================
+# DYNAMIC HTLCMAX (Flow Valve)
+# ============================================================================
+# Scales each channel's advertised htlc_max by its flow classification
+# (source/sink/balanced), tightest on sinks. Live-depletion-keyed: htlc_max
+# is additionally capped to a fraction of the channel's current spendable
+# balance (floored at 10k sats) so a near-drained channel never advertises
+# an htlc_max large enough to invite doomed HTLCs.
+
+# Enable the dynamic htlc_max flow valve.
+#revenue-ops-enable-dynamic-htlcmax=false
+
+# Max HTLC as a fraction of capacity for SOURCE channels (0.01-1.0).
+#revenue-ops-htlcmax-source-pct=0.50
+
+# Max HTLC as a fraction of capacity for SINK channels (0.01-1.0).
+#revenue-ops-htlcmax-sink-pct=0.25
+
+# Max HTLC as a fraction of capacity for balanced channels (0.01-1.0).
+#revenue-ops-htlcmax-balanced-pct=0.45
+
+# ============================================================================
+# EXPANSION TREASURY
+# ============================================================================
+# Reverse-swaps excess Lightning balance from over-local channels to
+# on-chain funds via Boltz, to build the on-chain reserve the capacity
+# planner needs for new opens.
+
+# Enable expansion treasury mode.
+#revenue-ops-expansion-treasury-enabled=false
+
+# Target confirmed on-chain reserve in sats for expansion treasury mode.
+#revenue-ops-expansion-treasury-onchain-target-sats=5000000
+
+# Minimum on-chain reserve deficit before treasury swaps are attempted.
+#revenue-ops-expansion-treasury-min-deficit-sats=250000
+
+# Preferred Boltz reverse-swap output currency (BTC or LBTC).
+#revenue-ops-expansion-treasury-preferred-currency=BTC
+
+# Max treasury reverse swaps per treasury cycle.
+#revenue-ops-expansion-treasury-max-actions=1
+
+# Minimum local balance percent to consider a channel as treasury harvest source.
+#revenue-ops-expansion-treasury-min-source-local-pct=80.0
+
+# Exclude hot/protected channels from treasury harvesting.
+#revenue-ops-expansion-treasury-exclude-protected=true
 
 # ============================================================================
 # LN+ LIQUIDITY SWAPS (lightningnetwork.plus)
@@ -141,6 +349,100 @@
 #revenue-ops-lnplus-watcher-interval=3600
 
 # ============================================================================
+# HIVE / CL-MYCELIUM HINTS
+# ============================================================================
+
+# Enable bounded fee/rebalance bias from cl_hive fleet hints.
+#revenue-ops-hive-hints-enabled=true
+
+# Override hint snapshot TTL in seconds; 0 = use snapshot value.
+#revenue-ops-hive-hints-ttl=0
+
+# Allow lab-only all_hints M2 scope from hive hints. Not a production default.
+#revenue-ops-hive-hints-allow-all-hints-m2-scope=false
+
+# ============================================================================
+# DRAIN BIAS / RECEIVABLE RATIO
+# ============================================================================
+# Node-level inbound-liquidity objective: bias fees down on stagnant
+# over-local channels and, for demand the circular rebalancer can't place
+# internally, allow a capped Boltz structural credit. All off/neutral by default.
+
+# Node receivable/capacity ratio at which structural drain pressure reaches zero.
+#revenue-ops-receivable-ratio-target=0.30
+
+# Receivable/capacity ratio below which the node is considered inbound-starved.
+#revenue-ops-receivable-ratio-floor=0.20
+
+# Max bounded fee discount on stagnant over-local channels (0.0 = disabled).
+#revenue-ops-drain-fee-discount-max=0.0
+
+# Enable node-liquidity-aware auto-drain-bias on over-local channel fees when
+# the node is source-heavy.
+#revenue-ops-node-drain-bias-enabled=false
+
+# Max node-scaled fee discount applied to over-local channels (0.0-0.5).
+#revenue-ops-node-drain-bias-max=0.3
+
+# Daily swap-fee budget (sats) for scarcity-credited Boltz loop-outs the
+# circular rebalancer cannot place internally (0 = disabled).
+#revenue-ops-boltz-structural-budget-sats=0
+
+# ============================================================================
+# BOLTZ (Lightning <-> On-Chain Swaps)
+# ============================================================================
+# Backs the balance cycle and expansion treasury above. Disabled by default;
+# see docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md for the RPC surface.
+
+# Enable Boltz CLI integration for revenue-boltz-* RPCs.
+#revenue-ops-boltz-enabled=false
+
+# Path to boltzcli binary.
+#revenue-ops-boltz-cli-path=/usr/local/bin/boltzcli
+
+# Boltz data dir for boltzd client auth.
+#revenue-ops-boltz-datadir=/var/lib/boltz
+
+# Run boltzcli via sudo -n -u <user>.
+#revenue-ops-boltz-use-sudo=false
+
+# User for sudo boltzcli execution when enabled.
+#revenue-ops-boltz-sudo-user=boltz
+
+# boltzcli command timeout in seconds.
+#revenue-ops-boltz-timeout-seconds=60
+
+# Daily Boltz swap fee budget used by revenue-boltz loop methods.
+#revenue-ops-boltz-daily-budget-sats=3000
+
+# If true, reject Boltz swaps when estimated fee exceeds remaining daily budget.
+#revenue-ops-boltz-enforce-budget=true
+
+# Preferred boltzd BTC / LBTC wallet names.
+#revenue-ops-boltz-btc-wallet=CLN
+#revenue-ops-boltz-lbtc-wallet=LOOP-LBTC
+
+# Max routing fee in PPM for reverse swaps (0 = no limit, boltzcli default).
+#revenue-ops-boltz-routing-fee-limit-ppm=0
+
+# Hard cap on a single Boltz on-chain withdraw in sats (0 disables). A sweep
+# withdraw bypasses this cap and requires confirm_sweep=true.
+#revenue-ops-boltz-max-withdraw-sats=10000000
+
+# Enable in-plugin periodic profit-gated Boltz balance cycles. Automated
+# spending must be opted into explicitly.
+#revenue-ops-boltz-auto-cycle-enabled=false
+
+# Minutes between scheduled Boltz auto-balance cycles.
+#revenue-ops-boltz-auto-cycle-interval-minutes=15
+
+# Maximum Boltz actions per scheduled auto-cycle.
+#revenue-ops-boltz-auto-cycle-max-actions=1
+
+# Startup delay before first Boltz auto-cycle run, in seconds.
+#revenue-ops-boltz-auto-cycle-startup-delay-seconds=120
+
+# ============================================================================
 # CAPITAL SAFETY (Global Capital Controls)
 # ============================================================================
 
@@ -155,6 +457,15 @@
 
 # On-chain + Off-chain reserve threshold (abort rebalancing if below)
 #revenue-ops-min-wallet-reserve=1000000
+
+# Hard timeout for all RPC calls to lightningd, in seconds.
+#revenue-ops-rpc-timeout-seconds=15
+
+# Cooldown period after an RPC timeout for that method group, in seconds.
+#revenue-ops-rpc-circuit-breaker-seconds=60
+
+# Hours before stale budget reservations are auto-released.
+#revenue-ops-reservation-timeout-hours=4
 
 # ============================================================================
 # RISK MANAGEMENT (Kelly Criterion)
