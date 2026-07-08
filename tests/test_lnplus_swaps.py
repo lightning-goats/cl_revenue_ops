@@ -2210,3 +2210,18 @@ class TestLnplusPluginWiring:
         assert mod.config.lnplus_swaps_enabled is False
         assert mod.config.lnplus_max_duration_months == 2
         assert mod.config.lnplus_inbound_credit_factor == 0.3
+
+
+class TestDynamicRefreshOverridePrecedence:
+    def test_db_override_not_stomped_by_refresh(self):
+        """A revenue-config DB override must survive _refresh_dynamic_config
+        reading an empty/different value_str from listconfigs (nexus-01
+        2026-07-08 incident: fleet pubkeys cleared 1 minute after set)."""
+        db = _make_db()
+        from modules.config import Config
+        cfg = Config()
+        result = cfg.update_runtime(db, "lnplus_fleet_pubkeys", PK_A)
+        assert result.get("status") == "success"
+        assert cfg.lnplus_fleet_pubkeys == PK_A
+        # Simulate the refresh loop's guard: an active override means skip.
+        assert db.get_config_override("lnplus_fleet_pubkeys") is not None

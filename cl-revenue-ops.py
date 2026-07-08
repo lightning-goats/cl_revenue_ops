@@ -6442,6 +6442,18 @@ def _refresh_dynamic_config():
             # value to apply).
             if not _val and _cast != "str":
                 continue
+            # Runtime precedence: an active revenue-config DB override wins
+            # over the listconfigs view. Without this guard the refresh loop
+            # stomps a `revenue-config set` value with the (possibly empty)
+            # setconfig/file value every cycle — observed live on nexus-01
+            # 2026-07-08: lnplus_fleet_pubkeys cleared 1 minute after being
+            # set. Operators drop the override with `revenue-config reset`
+            # if they want the setconfig/file value to govern again.
+            try:
+                if database is not None and database.get_config_override(_field) is not None:
+                    continue
+            except Exception:
+                pass
             try:
                 if _cast == "bool":
                     _new = _val.lower() in ("true", "1", "yes")
