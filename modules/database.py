@@ -1364,6 +1364,13 @@ class Database:
             self.plugin.log("Added tag_added column to lnplus_swaps")
         except sqlite3.OperationalError:
             pass  # Column already exists
+        # Incoming-side contract protection (2026-07-08): the counterparty's
+        # channel to us is bound by the same LN+ agreement.
+        try:
+            conn.execute("ALTER TABLE lnplus_swaps ADD COLUMN incoming_tag_added INTEGER")
+            self.plugin.log("Added incoming_tag_added column to lnplus_swaps")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         # LN+ counterparty history
         conn.execute("""

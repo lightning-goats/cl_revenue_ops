@@ -2316,3 +2316,30 @@ class TestIncomingContractProtection:
         removed = {c.args for c in policy.remove_tag.call_args_list}
         assert (PK_A, "no_close") in removed
         assert (PK_B, "no_close") not in removed
+
+    def test_migration_adds_incoming_tag_added_to_existing_db(self):
+        """Fresh DBs get the column from CREATE TABLE; EXISTING deployments
+        only get it via the guarded ALTER. Simulate a pre-migration DB and
+        assert initialize() migrates it (live incident: nexus-01 self-heal
+        failed with 'no such column: incoming_tag_added')."""
+        import sqlite3 as _sq
+        path = os.path.join(tempfile.mkdtemp(prefix="lnplus_mig_"), "old.db")
+        conn = _sq.connect(path)
+        conn.execute("""CREATE TABLE lnplus_swaps (
+            swap_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+            capacity_sats INTEGER NOT NULL, duration_months INTEGER NOT NULL,
+            ends_at INTEGER, outbound_peer TEXT, incoming_peer TEXT,
+            our_identifier TEXT, applied_at INTEGER NOT NULL,
+            opened_at INTEGER, completed_at INTEGER,
+            channel_funding_txid TEXT, deadline_at INTEGER,
+            planner_action_id INTEGER, outcome TEXT, metadata_json TEXT,
+            tag_added INTEGER)""")
+        conn.commit(); conn.close()
+        db = Database(path, MagicMock())
+        db.initialize()
+        cols = {r[1] for r in db._get_connection().execute(
+            "PRAGMA table_info(lnplus_swaps)").fetchall()}
+        assert "incoming_tag_added" in cols
+        db.lnplus_record_swap("m1", "active", 1, 3)
+        db.lnplus_update_swap("m1", incoming_tag_added=1)
+        assert db.lnplus_get_swap("m1")["incoming_tag_added"] == 1
