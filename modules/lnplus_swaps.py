@@ -231,7 +231,7 @@ class SwapEvaluator:
     """Pre-application gate chain (spec gates 0-9). At most one apply per cycle."""
 
     def __init__(self, plugin, rpc, database, config, client, planner, lifecycle,
-                 hive_member_check=None):
+                 hive_member_check=None, hive_hints=None):
         self._plugin = plugin
         self.rpc = rpc
         self._db = database
@@ -240,12 +240,20 @@ class SwapEvaluator:
         self._planner = planner
         self._lifecycle = lifecycle
         # C-1(c) (2026-07-08 audit): same callable CapexBudgetEngine uses
-        # (rebalancer._is_hive_member, wired by the caller) — a hive
-        # fleet-mate participant must dedup out of gate 6 exactly like a
-        # participant in the operator's static lnplus_fleet_pubkeys CSV,
-        # even before the operator has manually added its pubkey to that
-        # list.
+        # (rebalancer._is_hive_member, wired by the caller) — D-1 (Revision
+        # 2): a hive fleet-mate participant is now TRUSTED (skips LN+
+        # reputation checks) exactly like a participant in the operator's
+        # static lnplus_fleet_pubkeys CSV, even before the operator has
+        # manually added its pubkey to that list.
         self._hive_member_check = hive_member_check
+        # D-4 (2026-07-08 Revision 2): optional HiveHintAdapter — mycelium
+        # LN+ swap hints BIAS the EV comparison and the duplicate-peer gate,
+        # never bypass a safety gate. Absent adapter is fully neutral.
+        self._hive_hints = hive_hints
+        # Fetched once per run_cycle (see _fetch_lnplus_hints); default {}
+        # (neutral) so _swap_ev/_check_existing_channel behave correctly
+        # even when called directly outside a run_cycle (e.g. in tests).
+        self._cur_hints: Dict[str, dict] = {}
 
     def run_cycle(self, cfg, best_regular_ev: float) -> Dict:
         summary = {"applied": False, "recommended": False, "swap_id": None,
@@ -272,6 +280,11 @@ class SwapEvaluator:
         except LNPlusError as e:
             self._plugin.log(f"LNPLUS: get_applicable_swaps failed: {e}", level="warn")
             return summary
+
+        # D-4(b): fetch mycelium LN+ swap hints once per cycle — used by
+        # both the gate chain (existing-channel allow_duplicate) and EV
+        # scoring below.
+        self._cur_hints = self._fetch_lnplus_hints()
 
         qualifying = []
         for swap in swaps:
@@ -325,13 +338,31 @@ class SwapEvaluator:
             return "terms:duration exceeds cap"
         if int(swap.get("participant_max_count") or 99) > int(cfg.lnplus_max_participants):
             return "terms:too many participants"
+        # D-3 (2026-07-08 Revision 2, operator-directed): dual (2-party)
+        # swaps are rejected; 3+ participants required. A missing count
+        # already fails the max check above (default 99), so this only
+        # bites a genuinely-declared undersized ring.
+        min_participants = int(cfg.lnplus_min_participants)
+        if int(swap.get("participant_max_count") or 0) < min_participants:
+            return f"terms:fewer than {min_participants} participants"
         if str(swap.get("platform") or "any").lower() == "lnd":
             return "terms:LND/BOS swap — we are CLN"
         return None
 
     def _check_participants(self, swap, cfg) -> Optional[str]:
-        """Gate 5 (peer quality, one bad peer vetoes) + gate 6 (fleet dedup)."""
-        fleet = {pk.strip() for pk in (cfg.lnplus_fleet_pubkeys or "").split(",") if pk.strip()}
+        """Gate 5 (peer quality, one bad peer vetoes) + own-node check.
+
+        D-1 (2026-07-08 Revision 2, operator-directed): the fleet-member
+        veto (formerly 'fleet_dedup') is REMOVED — fleet/hive members are
+        ALLOWED and TRUSTED (LN+ swaps with hive members support
+        intrafleet rebalancing). Only the own-node check remains. Fleet
+        participants (lnplus_fleet_pubkeys CSV union live
+        hive_member_check) skip every LN+ reputation check (ratings floor,
+        negative ratio, rank floor, planner _score_candidate veto, local
+        defection check) but still need a valid pubkey and a reachable
+        address.
+        """
+        fleet = self._fleet_pubkeys(cfg)
         our_id = None
         try:
             our_id = self.rpc.getinfo().get("id")
@@ -349,16 +380,26 @@ class SwapEvaluator:
             pk = p.get("pubkey")
             if not _valid_pubkey(pk):
                 return "peer_quality:invalid participant pubkey"
-            if pk in fleet or (our_id and pk == our_id) or self._is_hive_fleet_member(pk):
-                return "fleet_dedup:fleet node already in swap"
+            if our_id and pk == our_id:
+                return "own_node:we are already in this swap"
+            if not (p.get("address_1") or p.get("address_2")):
+                return f"peer_quality:{pk[:16]} publishes no address"
+            if self._is_fleet_participant(pk, fleet):
+                # D-1: trusted — skip ratings floor, negative ratio, rank
+                # floor, local-defection check, and planner score veto.
+                continue
             pos = int(p.get("positive_ratings_count") or 0)
             neg = int(p.get("negative_ratings_count") or 0)
             if pos < int(cfg.lnplus_min_peer_positive_ratings):
                 return f"peer_quality:{pk[:16]} has {pos} positive ratings (< floor)"
             if pos + neg > 0 and neg / (pos + neg) > NEG_RATIO_MAX:
                 return f"peer_quality:{pk[:16]} negative ratio too high"
-            if not (p.get("address_1") or p.get("address_2")):
-                return f"peer_quality:{pk[:16]} publishes no address"
+            # D-2 (Revision 2): gold-or-better rank floor. Missing/zero
+            # rank is fail-closed (below floor), not a pass.
+            rank = int(p.get("lnplus_rank_number") or 0)
+            floor = int(cfg.lnplus_min_peer_rank)
+            if rank < floor:
+                return f"peer_quality:{pk[:16]} rank {rank} below floor {floor}"
             local = self._db.lnplus_get_peer(pk)
             if local and local.get("defections", 0) > 0:
                 return f"peer_quality:{pk[:16]} defected on us before"
@@ -373,6 +414,15 @@ class SwapEvaluator:
             if enriched < SCORE_FLOOR:
                 return f"peer_quality:{pk[:16]} planner score {enriched:.2f} below floor"
         return None
+
+    @staticmethod
+    def _fleet_pubkeys(cfg) -> set:
+        return {pk.strip() for pk in (cfg.lnplus_fleet_pubkeys or "").split(",") if pk.strip()}
+
+    def _is_fleet_participant(self, pk, fleet: set) -> bool:
+        """D-1: trusted fleet identity = lnplus_fleet_pubkeys CSV union live
+        hive_member_check."""
+        return bool(pk) and (pk in fleet or self._is_hive_fleet_member(pk))
 
     def _is_hive_fleet_member(self, pubkey: str) -> bool:
         """C-1(c): the hive membership callable is an external dependency
@@ -405,7 +455,13 @@ class SwapEvaluator:
         serialization slot on a swap that cannot add new capacity anyway.
         Fail-open on an RPC hiccup (matches _check_mid_contract_vanish /
         _execute_swap_open's existing-channel lookups elsewhere in this
-        module) — real state is re-checked at open time regardless."""
+        module) — real state is re-checked at open time regardless.
+
+        D-4(c) (Revision 2, operator-directed): the duplicate-peer veto is
+        SKIPPED when a mycelium hint marks the inferred outbound peer
+        'allow_duplicate' — the only gate hints are allowed to bypass (per
+        spec Revision 2 point 4); every other gate is unaffected by hints.
+        """
         outbound_peer = self._infer_assignment(swap).get("outbound_peer")
         if not outbound_peer:
             return None
@@ -413,9 +469,15 @@ class SwapEvaluator:
             channels = self.rpc.listpeerchannels(outbound_peer).get("channels", []) or []
         except Exception:
             return None
-        if channels:
-            return "terms:existing channel to assigned outbound peer"
-        return None
+        if not channels:
+            return None
+        hint = self._lnplus_hint_entry(outbound_peer)
+        if hint is not None and hint.get("action") == "allow_duplicate":
+            self._plugin.log(
+                f"LNPLUS: duplicate allowed by mycelium hint (topology_gain="
+                f"{hint.get('topology_gain', 0.0)})", level="info")
+            return None
+        return "terms:existing channel to assigned outbound peer"
 
     def _infer_assignment(self, swap) -> Dict:
         """LN+ convention: each participant opens to the next letter; last wraps to A.
@@ -473,12 +535,25 @@ class SwapEvaluator:
         replacement = capacity * BOLTZ_REPLACEMENT_RATE
         inbound_credit = min(inbound_corridor, replacement)
 
+        # D-1 (2026-07-08 Revision 2, operator-directed): fleet/hive
+        # counterparties are fully trusted — the ratings-based reliability
+        # is computed over NON-fleet counterparties only. If ALL visible
+        # counterparties are fleet, reliability is 1.0 outright (trust
+        # overrides transport, so no Tor discount either). Mixed rings use
+        # the min-non-fleet-based value as before, and the Tor discount
+        # only considers non-fleet participants' addresses.
         counterparties = [p for p in (swap.get("participants") or [])]
-        min_pos = min((int(p.get("positive_ratings_count") or 0) for p in counterparties),
-                      default=0)
-        reliability = min(1.0, RELIABILITY_FLOOR + 0.4 * min(1.0, min_pos / 50.0))
-        if counterparties and all(self._tor_only(p) for p in counterparties):
-            reliability *= TOR_RELIABILITY
+        fleet = self._fleet_pubkeys(cfg)
+        non_fleet = [p for p in counterparties
+                     if not self._is_fleet_participant(p.get("pubkey"), fleet)]
+        if counterparties and not non_fleet:
+            reliability = 1.0
+        else:
+            min_pos = min((int(p.get("positive_ratings_count") or 0) for p in non_fleet),
+                          default=0)
+            reliability = min(1.0, RELIABILITY_FLOOR + 0.4 * min(1.0, min_pos / 50.0))
+            if non_fleet and all(self._tor_only(p) for p in non_fleet):
+                reliability *= TOR_RELIABILITY
 
         lockup_haircut = P_UNDERPERFORM * max(0.0, best_regular_ev) * (duration / 12.0)
         # I4: _calculate_open_ev (outbound_ev, above) already nets out
@@ -494,12 +569,66 @@ class SwapEvaluator:
         value = (outbound_ev
                  + inbound_credit * reliability * float(cfg.lnplus_inbound_credit_factor)
                  - lockup_haircut)
+
+        # D-4(c) (Revision 2): hints BIAS the EV, never bypass a gate —
+        # multiply by the assigned outbound peer's clamped ev_multiplier
+        # (neutral 1.0 when no hint/adapter). 'avoid' always dampens to at
+        # most 0.8 regardless of the published value.
+        multiplier, hint_note = self._lnplus_hint_multiplier(assignment.get("outbound_peer"))
+        if multiplier != 1.0:
+            self._plugin.log(
+                f"LNPLUS: swap {swap.get('id')} EV multiplier {multiplier:.2f}"
+                f"{hint_note}", level="debug")
+        value *= multiplier
         return value, assignment
 
     @staticmethod
     def _tor_only(participant) -> bool:
         addrs = [a for a in (participant.get("address_1"), participant.get("address_2")) if a]
         return bool(addrs) and all(".onion" in str(a) for a in addrs)
+
+    # -- D-4: mycelium LN+ swap hints ------------------------------------
+    def _fetch_lnplus_hints(self) -> Dict[str, dict]:
+        """Fetch cl-mycelium's LN+ swap hints once per run_cycle via the
+        optional hive_hints adapter. Guarded: an absent adapter, missing
+        method, or any exception must never break the cycle — absent
+        hints are fully neutral (no behavior change)."""
+        if self._hive_hints is None:
+            return {}
+        getter = getattr(self._hive_hints, "get_lnplus_swap_hints", None)
+        if getter is None:
+            return {}
+        try:
+            hints = getter()
+        except Exception as e:
+            self._plugin.log(f"LNPLUS: get_lnplus_swap_hints failed: {e}", level="debug")
+            return {}
+        return hints if isinstance(hints, dict) else {}
+
+    def _lnplus_hint_entry(self, peer_pubkey) -> Optional[Dict]:
+        if not peer_pubkey:
+            return None
+        entry = self._cur_hints.get(peer_pubkey) if isinstance(self._cur_hints, dict) else None
+        return entry if isinstance(entry, dict) else None
+
+    def _lnplus_hint_multiplier(self, peer_pubkey):
+        """D-4(c): return (multiplier, note) for the EV bias on peer_pubkey.
+        Absent adapter/hint/peer -> (1.0, '') = fully neutral. 'avoid'
+        forces the multiplier to at most 0.8 (the published value is
+        already clamped to [0.8, 1.5] upstream by the adapter, so this
+        floors an 'avoid' entry at exactly 0.8 regardless of what was
+        published)."""
+        entry = self._lnplus_hint_entry(peer_pubkey)
+        if entry is None:
+            return 1.0, ""
+        try:
+            multiplier = float(entry.get("ev_multiplier", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            multiplier = 1.0
+        action = entry.get("action")
+        if action == "avoid":
+            multiplier = min(multiplier, 0.8)
+        return multiplier, f"; mycelium hint {action or 'neutral'} x{multiplier:.2f}"
 
     def _select_and_apply(self, qualifying, cfg, best_regular_ev, summary) -> Dict:
         scored = []
@@ -511,7 +640,10 @@ class SwapEvaluator:
             scored.append((value, swap, assignment))
         if not scored:
             return summary
-        scored.sort(key=lambda t: t[0], reverse=True)
+        # D-3 (2026-07-08 Revision 2, operator-directed): among equal-EV
+        # qualifiers, prefer fewer participants (triangle beats square
+        # beats pentagon) — pure tie-break, EV still decides primarily.
+        scored.sort(key=lambda t: (-t[0], int(t[1].get("participant_max_count") or 0)))
         value, swap, assignment = scored[0]
         summary["swap_ev"] = value
         summary["swap_id"] = swap.get("id")
@@ -560,8 +692,9 @@ class SwapEvaluator:
                 summary["swap_id"] = None
                 return summary
 
+        _, hint_note = self._lnplus_hint_multiplier(assignment.get("outbound_peer"))
         reason = (f"LN+ swap {swap.get('id')}: EV {value:.0f} vs regular {best_regular_ev:.0f}, "
-                  f"{capacity} sats for {swap.get('duration_months')}mo")
+                  f"{capacity} sats for {swap.get('duration_months')}mo{hint_note}")
         action_id = self._db.record_planner_action(
             action_type="swap_apply",
             peer_id=assignment.get("outbound_peer") or "unknown",

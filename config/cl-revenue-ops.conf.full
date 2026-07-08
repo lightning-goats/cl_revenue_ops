@@ -111,7 +111,9 @@
 #revenue-ops-lnplus-swap-preference-margin=0.2
 #revenue-ops-lnplus-max-duration-months=3
 #revenue-ops-lnplus-min-peer-positive-ratings=5
+#revenue-ops-lnplus-min-peer-rank=8
 #revenue-ops-lnplus-max-participants=4
+#revenue-ops-lnplus-min-participants=3
 #revenue-ops-lnplus-apply-feerate-ceiling=5000
 #revenue-ops-lnplus-pending-timeout-days=7
 #revenue-ops-lnplus-inbound-credit-factor=0.5

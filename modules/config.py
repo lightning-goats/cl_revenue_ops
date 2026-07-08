@@ -70,13 +70,19 @@ PUBLIC_RUNTIME_KEYS = (
     'htlcmax_source_pct',
     'htlcmax_sink_pct',
     'htlcmax_balanced_pct',
-    # LN+ liquidity swap automation (11 runtime controls)
+    # LN+ liquidity swap automation (13 runtime controls)
     'lnplus_swaps_enabled',
     'lnplus_execute_applications',
     'lnplus_swap_preference_margin',
     'lnplus_max_duration_months',
     'lnplus_min_peer_positive_ratings',
+    # D-2 (Revision 2, 2026-07-08 operator-directed): rank floor for
+    # non-fleet participants.
+    'lnplus_min_peer_rank',
     'lnplus_max_participants',
+    # D-3 (Revision 2): minimum 3 participants, fewer preferred among
+    # equal-EV qualifiers.
+    'lnplus_min_participants',
     'lnplus_apply_feerate_ceiling',
     'lnplus_pending_timeout_days',
     'lnplus_inbound_credit_factor',
@@ -247,7 +253,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'lnplus_swap_preference_margin': float,
     'lnplus_max_duration_months': int,
     'lnplus_min_peer_positive_ratings': int,
+    'lnplus_min_peer_rank': int,
     'lnplus_max_participants': int,
+    'lnplus_min_participants': int,
     'lnplus_apply_feerate_ceiling': int,
     'lnplus_pending_timeout_days': int,
     'lnplus_inbound_credit_factor': float,
@@ -394,9 +402,14 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # beyond a quarter. Default (3) stays inside the new [1, 3] range.
     'lnplus_max_duration_months': (1, 3),
     'lnplus_max_participants': (2, 5),
+    # D-3 (Revision 2, 2026-07-08 operator-directed): dual (2-party) swaps
+    # are rejected; must stay <= lnplus_max_participants in practice.
+    'lnplus_min_participants': (2, 5),
     'lnplus_apply_feerate_ceiling': (253, 100000),
     'lnplus_pending_timeout_days': (1, 30),
     'lnplus_min_peer_positive_ratings': (0, 1000),
+    # D-2 (Revision 2): LN+ rank scale is 1-10 (higher is better); 8 = Gold.
+    'lnplus_min_peer_rank': (1, 10),
     'lnplus_watcher_interval': (300, 14400),
 }
 
@@ -761,7 +774,13 @@ class Config:
     lnplus_swap_preference_margin: float = 0.2
     lnplus_max_duration_months: int = 3
     lnplus_min_peer_positive_ratings: int = 5
+    # D-2 (Revision 2, 2026-07-08 operator-directed): rank floor for
+    # non-fleet participants; LN+ scale 1-10, higher better, 8 = "Gold".
+    lnplus_min_peer_rank: int = 8
     lnplus_max_participants: int = 4
+    # D-3 (Revision 2): minimum 3 participants (dual swaps rejected);
+    # among equal-EV qualifiers, fewer participants win the tie-break.
+    lnplus_min_participants: int = 3
     lnplus_apply_feerate_ceiling: int = 5000
     lnplus_pending_timeout_days: int = 7
     lnplus_inbound_credit_factor: float = 0.5
@@ -1266,7 +1285,9 @@ class ConfigSnapshot:
     lnplus_swap_preference_margin: float = 0.2
     lnplus_max_duration_months: int = 3
     lnplus_min_peer_positive_ratings: int = 5
+    lnplus_min_peer_rank: int = 8
     lnplus_max_participants: int = 4
+    lnplus_min_participants: int = 3
     lnplus_apply_feerate_ceiling: int = 5000
     lnplus_pending_timeout_days: int = 7
     lnplus_inbound_credit_factor: float = 0.5

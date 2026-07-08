@@ -51,7 +51,9 @@ def test_public_runtime_keys_are_safety_only():
         "lnplus_swap_preference_margin",
         "lnplus_max_duration_months",
         "lnplus_min_peer_positive_ratings",
+        "lnplus_min_peer_rank",
         "lnplus_max_participants",
+        "lnplus_min_participants",
         "lnplus_apply_feerate_ceiling",
         "lnplus_pending_timeout_days",
         "lnplus_inbound_credit_factor",
@@ -112,7 +114,9 @@ def test_public_runtime_dict_returns_only_public_keys():
         "lnplus_swap_preference_margin": 0.2,
         "lnplus_max_duration_months": 3,
         "lnplus_min_peer_positive_ratings": 5,
+        "lnplus_min_peer_rank": 8,
         "lnplus_max_participants": 4,
+        "lnplus_min_participants": 3,
         "lnplus_apply_feerate_ceiling": 5000,
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
@@ -736,7 +740,9 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "lnplus_inbound_credit_factor",
         "lnplus_max_duration_months",
         "lnplus_max_participants",
+        "lnplus_min_participants",
         "lnplus_min_peer_positive_ratings",
+        "lnplus_min_peer_rank",
         "lnplus_pending_timeout_days",
         "lnplus_swap_preference_margin",
         "lnplus_swaps_enabled",
@@ -755,7 +761,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_floor",
         "receivable_ratio_target",
     ]
-    assert result["count"] == 45
+    assert result["count"] == 47
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -803,7 +809,9 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "lnplus_swap_preference_margin": 0.2,
         "lnplus_max_duration_months": 3,
         "lnplus_min_peer_positive_ratings": 5,
+        "lnplus_min_peer_rank": 8,
         "lnplus_max_participants": 4,
+        "lnplus_min_participants": 3,
         "lnplus_apply_feerate_ceiling": 5000,
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
@@ -1281,7 +1289,9 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "lnplus_swap_preference_margin": 0.2,
         "lnplus_max_duration_months": 3,
         "lnplus_min_peer_positive_ratings": 5,
+        "lnplus_min_peer_rank": 8,
         "lnplus_max_participants": 4,
+        "lnplus_min_participants": 3,
         "lnplus_apply_feerate_ceiling": 5000,
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,

@@ -103,6 +103,14 @@ The capacity planner uses a multi-strategy candidate pipeline with portfolio-awa
 - **One swap in flight per node at a time.** No new application is submitted while a prior one is applied, opening, or awaiting completion (checked before every LN+ API call, so an outage or a tripped breaker can never queue up a second commitment).
 - Applying to a filled swap slot is an irreversible commitment: once the last slot fills, a 48-hour clock starts to open the assigned channel. The obligations watcher (`revenue-ops-lnplus-watcher-interval`, default hourly) drives every step after application — connect, `fundchannel` (feerate escalates as the deadline approaches), `complete_application`, activation (tags the channel `no_close` so nothing else can close it mid-contract), and finally release + rating once the contract's `ends_at` passes.
 
+**Fleet participation (2026-07-08 Revision 2 — operator-directed).** Swaps that include another fleet or hive node are allowed and welcome — they support intrafleet rebalancing, and only the own-node check remains (we still cannot join a swap we're already in). A fleet/hive participant (identity = `revenue-ops-lnplus-fleet-pubkeys` CSV union the live hive-membership check) is fully TRUSTED: it skips every LN+ reputation check — positive-ratings floor, negative-ratio ceiling, and the rank floor below — and counts as reliability 1.0 in the EV inbound credit. If every visible counterparty in a swap is a fleet/hive node, the swap's reliability is 1.0 outright with no Tor discount (trust overrides transport); a mixed ring still computes reliability from its non-fleet counterparties only.
+
+**Rank floor (gold or better).** Every non-fleet participant must clear `revenue-ops-lnplus-min-peer-rank` (default `8`, LN+'s own 1-10 scale where higher is better and 8 = "Gold" in their docs). A missing or zero rank is treated as below the floor (fail-closed), not a pass. This is in addition to the existing positive-ratings and negative-ratio floors.
+
+**Minimum participants.** Dual (2-party) swaps are rejected by default (`revenue-ops-lnplus-min-participants`, default `3`) — LN+'s smallest useful ring for this automation is a triangle. Among multiple qualifying swaps with equal EV, the smaller ring wins the tie-break (triangle beats square beats pentagon); EV still decides primarily.
+
+**cl-mycelium hints (advisory, bounded).** When cl-hive/cl-mycelium is present, `cl_revenue_ops` consumes an optional `lnplus_swap_hints` section from the same hive-hints envelope the rest of the fleet-awareness machinery already reads. Each entry names a peer pubkey, an `action` (`prefer` / `avoid` / `allow_duplicate`), an `ev_multiplier` (clamped to `[0.8, 1.5]`, default `1.0`), and a `topology_gain` (clamped to `[0.0, 1.0]`). Hints only ever **bias** the EV of the assigned outbound peer (multiplicatively) and, for `allow_duplicate`, skip the duplicate-peer veto (a swap whose assigned outbound peer we already have a channel to is normally rejected) — they never bypass any other safety gate, and an `avoid` hint always dampens the EV to at most `×0.8`. The feature is fully functional without cl-mycelium: an absent adapter, missing section, or malformed entry is treated as fully neutral.
+
 ### Options
 
 | Option | Default | Meaning |
@@ -111,12 +119,14 @@ The capacity planner uses a multi-strategy candidate pipeline with portfolio-awa
 | `revenue-ops-lnplus-execute-applications` | `true` | `false` = recommendation-only; gates are still evaluated and logged, but no live `create_application` call is made. |
 | `revenue-ops-lnplus-swap-preference-margin` | `0.2` | Fraction by which a regular open's EV must beat the best swap's EV to win the slot instead. |
 | `revenue-ops-lnplus-max-duration-months` | `3` | Longest contract duration we'll apply to. |
-| `revenue-ops-lnplus-min-peer-positive-ratings` | `5` | Minimum LN+ positive-rating floor for every participant in the swap (one under-rated peer vetoes the whole swap). |
+| `revenue-ops-lnplus-min-peer-positive-ratings` | `5` | Minimum LN+ positive-rating floor for every non-fleet participant in the swap (one under-rated peer vetoes the whole swap). |
+| `revenue-ops-lnplus-min-peer-rank` | `8` | Minimum LN+ rank (1-10, higher better; 8 = "Gold") for every non-fleet participant. Missing/zero rank fails closed. |
 | `revenue-ops-lnplus-max-participants` | `4` | Maximum ring size we'll join. |
+| `revenue-ops-lnplus-min-participants` | `3` | Minimum ring size we'll join (dual swaps rejected); among equal-EV qualifiers, fewer participants win the tie-break. |
 | `revenue-ops-lnplus-apply-feerate-ceiling` | `5000` | No applications while the current opening feerate (perkw) exceeds this. |
 | `revenue-ops-lnplus-pending-timeout-days` | `7` | Withdraw an application still stuck `pending` (unfilled) after this many days. |
 | `revenue-ops-lnplus-inbound-credit-factor` | `0.5` | Damping applied to the inbound-liquidity EV credit (the value of the channel we receive) — conservative by default since inbound value is harder to realize than outbound. |
-| `revenue-ops-lnplus-fleet-pubkeys` | `` (empty) | Comma-separated pubkeys of our own fleet nodes; any swap with one of these as a participant is rejected (fleet dedup — we don't want to swap with ourselves). |
+| `revenue-ops-lnplus-fleet-pubkeys` | `` (empty) | Comma-separated pubkeys treated as trusted fleet members — exempt from LN+ reputation checks (hive members are detected automatically without needing to be listed here). |
 | `revenue-ops-lnplus-watcher-interval` | `3600` | Obligations watcher poll interval, in seconds. |
 
 ### RPCs

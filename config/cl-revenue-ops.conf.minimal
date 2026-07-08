@@ -47,4 +47,6 @@ revenue-ops-hot-channel-protection-enabled=true
 #revenue-ops-lnplus-execute-applications=true
 #revenue-ops-lnplus-swap-preference-margin=0.2
 #revenue-ops-lnplus-max-duration-months=3
+#revenue-ops-lnplus-min-peer-rank=8
+#revenue-ops-lnplus-min-participants=3
 #revenue-ops-lnplus-fleet-pubkeys=<pubkey1>,<pubkey2>

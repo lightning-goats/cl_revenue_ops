@@ -1770,13 +1770,25 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-lnplus-min-peer-positive-ratings',
     default='5',
-    description='Minimum LN+ positive ratings for every swap participant (default: 5)',
+    description='Minimum LN+ positive ratings for every non-fleet swap participant (default: 5)',
+    dynamic=True
+)
+plugin.add_option(
+    name='revenue-ops-lnplus-min-peer-rank',
+    default='8',
+    description='Minimum LN+ rank (1-10, higher better; 8="Gold") for every non-fleet swap participant (default: 8)',
     dynamic=True
 )
 plugin.add_option(
     name='revenue-ops-lnplus-max-participants',
     default='4',
     description='Maximum LN+ swap participant count (default: 4)',
+    dynamic=True
+)
+plugin.add_option(
+    name='revenue-ops-lnplus-min-participants',
+    default='3',
+    description='Minimum LN+ swap participant count; among equal-EV qualifiers fewer participants win (default: 3)',
     dynamic=True
 )
 plugin.add_option(
@@ -1800,7 +1812,8 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-lnplus-fleet-pubkeys',
     default='',
-    description='Comma-separated fleet node pubkeys never to join LN+ swaps with',
+    description=('Comma-separated pubkeys treated as trusted fleet members '
+                 '(exempt from LN+ reputation checks; hive members detected automatically)'),
     dynamic=True
 )
 plugin.add_option(
@@ -2545,7 +2558,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         lnplus_swap_preference_margin=_safe_float_opt('revenue-ops-lnplus-swap-preference-margin', '0.2'),
         lnplus_max_duration_months=_safe_int_opt('revenue-ops-lnplus-max-duration-months', '3'),
         lnplus_min_peer_positive_ratings=_safe_int_opt('revenue-ops-lnplus-min-peer-positive-ratings', '5'),
+        lnplus_min_peer_rank=_safe_int_opt('revenue-ops-lnplus-min-peer-rank', '8'),
         lnplus_max_participants=_safe_int_opt('revenue-ops-lnplus-max-participants', '4'),
+        lnplus_min_participants=_safe_int_opt('revenue-ops-lnplus-min-participants', '3'),
         lnplus_apply_feerate_ceiling=_safe_int_opt('revenue-ops-lnplus-apply-feerate-ceiling', '5000'),
         lnplus_pending_timeout_days=_safe_int_opt('revenue-ops-lnplus-pending-timeout-days', '7'),
         lnplus_inbound_credit_factor=_safe_float_opt('revenue-ops-lnplus-inbound-credit-factor', '0.5'),
@@ -2977,9 +2992,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             safe_plugin, safe_plugin.rpc, database, config, lnplus_client,
             capacity_planner, lnplus_lifecycle,
             # C-1(c): same callable CapexBudgetEngine is wired with above —
-            # a hive fleet-mate participant dedups out of gate 6 even before
-            # the operator adds its pubkey to lnplus_fleet_pubkeys.
-            hive_member_check=rebalancer._is_hive_member if rebalancer is not None else None)
+            # D-1 (Revision 2): a hive fleet-mate participant is trusted
+            # (skips LN+ reputation checks) even before the operator adds
+            # its pubkey to lnplus_fleet_pubkeys.
+            hive_member_check=rebalancer._is_hive_member if rebalancer is not None else None,
+            # D-4: mycelium LN+ swap hints (advisory bias only); may be
+            # None (hive_hints disabled) — the evaluator treats that as
+            # fully neutral.
+            hive_hints=hive_hints)
     plugin.log("LN+ swap automation initialized")
 
     # Hive Router (shared askrene fleet route discovery)
@@ -6401,7 +6421,9 @@ def _refresh_dynamic_config():
             ("revenue-ops-lnplus-swap-preference-margin", "lnplus_swap_preference_margin", "float"),
             ("revenue-ops-lnplus-max-duration-months", "lnplus_max_duration_months", "int"),
             ("revenue-ops-lnplus-min-peer-positive-ratings", "lnplus_min_peer_positive_ratings", "int"),
+            ("revenue-ops-lnplus-min-peer-rank", "lnplus_min_peer_rank", "int"),
             ("revenue-ops-lnplus-max-participants", "lnplus_max_participants", "int"),
+            ("revenue-ops-lnplus-min-participants", "lnplus_min_participants", "int"),
             ("revenue-ops-lnplus-apply-feerate-ceiling", "lnplus_apply_feerate_ceiling", "int"),
             ("revenue-ops-lnplus-pending-timeout-days", "lnplus_pending_timeout_days", "int"),
             ("revenue-ops-lnplus-inbound-credit-factor", "lnplus_inbound_credit_factor", "float"),

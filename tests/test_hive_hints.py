@@ -1692,6 +1692,105 @@ class TestFleetTopologyHints:
         }
 
 
+# ---------------------------------------------------------------------------
+# D-4 (2026-07-08 Revision 2): cl-mycelium LN+ swap hints
+# ---------------------------------------------------------------------------
+
+_LNPLUS_PK_PREFER = "02" + "aa" * 32
+_LNPLUS_PK_AVOID = "03" + "bb" * 32
+_LNPLUS_PK_DEFAULTS = "02" + "dd" * 32
+_LNPLUS_PK_BAD_ACTION = "02" + "cc" * 32
+
+SNAPSHOT_WITH_LNPLUS_HINTS = {
+    "generated_at": int(time.time()),
+    "ttl_seconds": 900,
+    "hints": {},
+    "lnplus_swap_hints": {
+        "schema_version": "lnplus-swap-hints/v1",
+        "generated_at": int(time.time()),
+        "ttl_seconds": 900,
+        "advisory_only": True,
+        "entries": [
+            {"peer_pubkey": _LNPLUS_PK_PREFER, "action": "prefer",
+             "ev_multiplier": 1.15, "topology_gain": 0.7,
+             "reason": "underserved_corridor"},
+            {"peer_pubkey": _LNPLUS_PK_AVOID, "action": "avoid",
+             "ev_multiplier": 2.0, "topology_gain": -5,
+             "reason": "oversaturated"},
+            {"peer_pubkey": "not-a-pubkey", "action": "prefer"},
+            {"peer_pubkey": _LNPLUS_PK_BAD_ACTION, "action": "bogus_action"},
+            {"peer_pubkey": _LNPLUS_PK_DEFAULTS, "action": "allow_duplicate"},
+            "not-a-dict-entry",
+        ],
+    },
+}
+
+
+class TestLnplusSwapHints:
+    def _make_adapter(self, mock_plugin, snapshot):
+        mock_plugin.rpc.call.return_value = snapshot
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        adapter.poll()
+        return adapter
+
+    def test_valid_entries_parsed_and_clamped(self, mock_plugin):
+        adapter = self._make_adapter(mock_plugin, SNAPSHOT_WITH_LNPLUS_HINTS)
+        hints = adapter.get_lnplus_swap_hints()
+        assert hints[_LNPLUS_PK_PREFER]["action"] == "prefer"
+        assert hints[_LNPLUS_PK_PREFER]["ev_multiplier"] == 1.15
+        assert hints[_LNPLUS_PK_PREFER]["topology_gain"] == 0.7
+        assert hints[_LNPLUS_PK_PREFER]["reason"] == "underserved_corridor"
+        # out-of-range ev_multiplier (2.0) clamped to the [0.8, 1.5] ceiling
+        assert hints[_LNPLUS_PK_AVOID]["ev_multiplier"] == 1.5
+        # negative topology_gain clamped to the [0.0, 1.0] floor
+        assert hints[_LNPLUS_PK_AVOID]["topology_gain"] == 0.0
+        # absent ev_multiplier/topology_gain default to 1.0 / 0.0
+        assert hints[_LNPLUS_PK_DEFAULTS]["ev_multiplier"] == 1.0
+        assert hints[_LNPLUS_PK_DEFAULTS]["topology_gain"] == 0.0
+
+    def test_invalid_pubkey_entry_skipped(self, mock_plugin):
+        adapter = self._make_adapter(mock_plugin, SNAPSHOT_WITH_LNPLUS_HINTS)
+        hints = adapter.get_lnplus_swap_hints()
+        assert "not-a-pubkey" not in hints
+
+    def test_invalid_action_entry_skipped(self, mock_plugin):
+        adapter = self._make_adapter(mock_plugin, SNAPSHOT_WITH_LNPLUS_HINTS)
+        hints = adapter.get_lnplus_swap_hints()
+        assert _LNPLUS_PK_BAD_ACTION not in hints
+
+    def test_non_dict_entry_skipped_without_raising(self, mock_plugin):
+        adapter = self._make_adapter(mock_plugin, SNAPSHOT_WITH_LNPLUS_HINTS)
+        hints = adapter.get_lnplus_swap_hints()
+        assert len(hints) == 3   # prefer, avoid, allow_duplicate-with-defaults only
+
+    def test_missing_section_returns_empty(self, mock_plugin):
+        snap = {"generated_at": int(time.time()), "ttl_seconds": 900, "hints": {}}
+        adapter = self._make_adapter(mock_plugin, snap)
+        assert adapter.get_lnplus_swap_hints() == {}
+
+    def test_wrong_schema_prefix_returns_empty(self, mock_plugin):
+        snap = json.loads(json.dumps(SNAPSHOT_WITH_LNPLUS_HINTS))
+        snap["lnplus_swap_hints"]["schema_version"] = "something-else/v1"
+        adapter = self._make_adapter(mock_plugin, snap)
+        assert adapter.get_lnplus_swap_hints() == {}
+
+    def test_non_list_entries_returns_empty(self, mock_plugin):
+        snap = json.loads(json.dumps(SNAPSHOT_WITH_LNPLUS_HINTS))
+        snap["lnplus_swap_hints"]["entries"] = "not-a-list"
+        adapter = self._make_adapter(mock_plugin, snap)
+        assert adapter.get_lnplus_swap_hints() == {}
+
+    def test_stale_envelope_returns_empty(self, mock_plugin):
+        snap = json.loads(json.dumps(SNAPSHOT_WITH_LNPLUS_HINTS))
+        snap["generated_at"] = int(time.time()) - 2000
+        adapter = self._make_adapter(mock_plugin, snap)
+        assert adapter.get_lnplus_swap_hints() == {}
+
+    def test_no_snapshot_returns_empty(self, mock_plugin):
+        adapter = HiveHintAdapter(mock_plugin, ttl_override=0)
+        assert adapter.get_lnplus_swap_hints() == {}
+
+
 class TestCoordinationSections:
     def _make_adapter(self, mock_plugin, snapshot):
         mock_plugin.rpc.call.return_value = snapshot

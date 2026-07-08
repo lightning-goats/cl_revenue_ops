@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import threading
 import time
 
@@ -23,6 +24,14 @@ MAX_REBALANCE_BIAS = 0.15    # +/-15% max rebalance score effect
 MAX_CORRIDOR_UTILIZATION_BIAS = 0.10  # +/-10% max utilization effect
 METABOLIC_SCHEMA_VERSION = "metabolic-influence/v1"
 IMMUNE_SCHEMA_VERSION = "immune-influence/v1"
+# D-4 (2026-07-08 Revision 2, operator-directed): cl-mycelium LN+ swap hints,
+# a top-level section in the same ["hive","hints"] envelope this adapter
+# already fetches. Governed by envelope freshness (see get_lnplus_swap_hints).
+LNPLUS_SWAP_HINTS_SCHEMA_PREFIX = "lnplus-swap-hints/"
+LNPLUS_SWAP_HINT_ACTIONS = {"prefer", "avoid", "allow_duplicate"}
+LNPLUS_SWAP_HINT_EV_MULTIPLIER_RANGE = (0.8, 1.5)
+LNPLUS_SWAP_HINT_TOPOLOGY_GAIN_RANGE = (0.0, 1.0)
+_LNPLUS_PUBKEY_RE = re.compile(r"^0[23][0-9a-fA-F]{64}$")
 METABOLIC_MIN_CONFIDENCE_SCORE = 0.50
 METABOLIC_FEE_BIAS_CAP = 0.05       # +/-5% max metabolic fee effect
 METABOLIC_REBALANCE_BIAS_CAP = 0.15 # +/-15% max metabolic rebalance score effect
@@ -1594,6 +1603,62 @@ class HiveHintAdapter:
             if validated.get("open_preference") == "open":
                 results.append((peer_id, validated))
         return results
+
+    # ------------------------------------------------------------------
+    # LN+ swap hints (D-4, 2026-07-08 Revision 2)
+    # ------------------------------------------------------------------
+
+    def get_lnplus_swap_hints(self) -> dict:
+        """Return {peer_pubkey: entry} for the top-level lnplus_swap_hints
+        section cl-mycelium publishes in the same ["hive","hints"] envelope
+        this adapter already fetches (see get_open_candidates for the same
+        snapshot/TTL convention this follows: envelope freshness governs,
+        no separate per-section TTL check).
+
+        Validation: the section must be present with schema_version
+        starting with "lnplus-swap-hints/"; each entry needs a valid
+        66-hex pubkey and an action in {prefer, avoid, allow_duplicate}.
+        ev_multiplier is coerced to float and clamped to [0.8, 1.5]
+        (absent -> 1.0); topology_gain is clamped to [0.0, 1.0] (absent ->
+        0.0). Malformed entries are skipped individually — this method
+        never raises, and an absent/stale/invalid section returns {}
+        (fully neutral)."""
+        with self._lock:
+            snapshot = self._snapshot
+            if not self._snapshot_is_fresh(snapshot):
+                return {}
+            section = snapshot.get("lnplus_swap_hints") if isinstance(snapshot, dict) else None
+        if not isinstance(section, dict):
+            return {}
+        schema = str(section.get("schema_version") or "")
+        if not schema.startswith(LNPLUS_SWAP_HINTS_SCHEMA_PREFIX):
+            return {}
+        entries = section.get("entries")
+        if not isinstance(entries, list):
+            return {}
+        ev_lo, ev_hi = LNPLUS_SWAP_HINT_EV_MULTIPLIER_RANGE
+        tg_lo, tg_hi = LNPLUS_SWAP_HINT_TOPOLOGY_GAIN_RANGE
+        result: dict = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            pk = entry.get("peer_pubkey")
+            if not isinstance(pk, str) or not _LNPLUS_PUBKEY_RE.match(pk):
+                continue
+            action = entry.get("action")
+            if action not in LNPLUS_SWAP_HINT_ACTIONS:
+                continue
+            ev_multiplier = self._finite_number(entry.get("ev_multiplier"))
+            ev_multiplier = 1.0 if ev_multiplier is None else max(ev_lo, min(ev_hi, ev_multiplier))
+            topology_gain = self._finite_number(entry.get("topology_gain"))
+            topology_gain = 0.0 if topology_gain is None else max(tg_lo, min(tg_hi, topology_gain))
+            result[pk] = {
+                "action": action,
+                "ev_multiplier": ev_multiplier,
+                "topology_gain": topology_gain,
+                "reason": str(entry.get("reason") or ""),
+            }
+        return result
 
     # ------------------------------------------------------------------
     # Closure recommendations

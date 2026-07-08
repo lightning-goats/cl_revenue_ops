@@ -183,7 +183,9 @@ class TestLnplusConfig:
         assert cfg.lnplus_swap_preference_margin == 0.2
         assert cfg.lnplus_max_duration_months == 3
         assert cfg.lnplus_min_peer_positive_ratings == 5
+        assert cfg.lnplus_min_peer_rank == 8
         assert cfg.lnplus_max_participants == 4
+        assert cfg.lnplus_min_participants == 3
         assert cfg.lnplus_apply_feerate_ceiling == 5000
         assert cfg.lnplus_pending_timeout_days == 7
         assert cfg.lnplus_inbound_credit_factor == 0.5
@@ -195,9 +197,32 @@ class TestLnplusConfig:
         for key in ("lnplus_swaps_enabled", "lnplus_execute_applications",
                     "lnplus_swap_preference_margin", "lnplus_inbound_credit_factor",
                     "lnplus_apply_feerate_ceiling", "lnplus_max_duration_months",
-                    "lnplus_min_peer_positive_ratings", "lnplus_fleet_pubkeys",
-                    "lnplus_watcher_interval"):
+                    "lnplus_min_peer_positive_ratings", "lnplus_min_peer_rank",
+                    "lnplus_max_participants", "lnplus_min_participants",
+                    "lnplus_fleet_pubkeys", "lnplus_watcher_interval"):
             assert Config.is_public_runtime_key(key), key
+
+    def test_min_peer_rank_range_rejected(self):
+        """D-2: LN+ rank scale is 1-10; out-of-range updates are rejected."""
+        db = _make_db()
+        cfg = Config()
+        result = cfg.update_runtime(db, "lnplus_min_peer_rank", "11")
+        assert "error" in result or result.get("status") != "success"
+        assert cfg.lnplus_min_peer_rank == 8   # unchanged
+        result = cfg.update_runtime(db, "lnplus_min_peer_rank", "6")
+        assert result.get("status") == "success"
+        assert cfg.lnplus_min_peer_rank == 6
+
+    def test_min_participants_range_rejected(self):
+        """D-3: minimum 3 participants by default; range is (2, 5)."""
+        db = _make_db()
+        cfg = Config()
+        result = cfg.update_runtime(db, "lnplus_min_participants", "1")
+        assert "error" in result or result.get("status") != "success"
+        assert cfg.lnplus_min_participants == 3   # unchanged
+        result = cfg.update_runtime(db, "lnplus_min_participants", "4")
+        assert result.get("status") == "success"
+        assert cfg.lnplus_min_participants == 4
 
     def test_runtime_update_roundtrip(self):
         db = _make_db()
@@ -415,10 +440,12 @@ def _swap_fixture(**overrides):
         "participants": [
             {"participant_identifier": "A", "pubkey": PK_A,
              "positive_ratings_count": 20, "negative_ratings_count": 0,
+             "lnplus_rank_number": 9,
              "address_1": "1.2.3.4:9735", "capacity_sats": 100_000_000,
              "channels_count": 40},
             {"participant_identifier": "B", "pubkey": PK_B,
              "positive_ratings_count": 12, "negative_ratings_count": 1,
+             "lnplus_rank_number": 8,
              "address_1": "5.6.7.8:9735", "capacity_sats": 80_000_000,
              "channels_count": 25},
         ],
@@ -428,7 +455,7 @@ def _swap_fixture(**overrides):
 
 
 def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None,
-                     hive_member_check=None):
+                     hive_member_check=None, hive_hints=None):
     cfg = Config()
     for k, v in (cfg_overrides or {}).items():
         setattr(cfg, k, v)
@@ -453,7 +480,7 @@ def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None
     lifecycle.has_inflight.return_value = inflight
     lifecycle.reconcile_ok.return_value = True
     ev = SwapEvaluator(plugin, rpc, db, cfg, client, planner, lifecycle,
-                        hive_member_check=hive_member_check)
+                        hive_member_check=hive_member_check, hive_hints=hive_hints)
     return ev, cfg, client, db
 
 
@@ -509,35 +536,52 @@ class TestSwapEvaluatorGates:
         result = ev.run_cycle(cfg, 0.0)
         assert any(r["gate"] == "peer_quality" for r in result["rejections"])
 
-    def test_rejects_fleet_member_participant(self):
+    def test_fleet_member_participant_is_allowed_and_trusted(self):
+        """D-1 (2026-07-08 Revision 2, operator-directed): the fleet veto is
+        REMOVED — a fleet participant is allowed and TRUSTED, exempt from
+        every LN+ reputation check (ratings floor, negative ratio, rank
+        floor). A low-rated/unranked fleet member must still pass."""
         swap = _swap_fixture()
         swap["participants"][1]["pubkey"] = FLEET_PK
+        swap["participants"][1]["positive_ratings_count"] = 0
+        swap["participants"][1]["negative_ratings_count"] = 50
+        swap["participants"][1]["lnplus_rank_number"] = 0
         ev, cfg, _, _ = _make_evaluator(
             {"lnplus_fleet_pubkeys": FLEET_PK}, swaps=[swap])
         result = ev.run_cycle(cfg, 0.0)
-        assert any(r["gate"] == "fleet_dedup" for r in result["rejections"])
+        assert not any(r["gate"] in ("fleet_dedup", "peer_quality")
+                       for r in result["rejections"])
 
-    def test_rejects_participant_flagged_only_by_hive_member_check(self):
-        """C-1(c): a participant not in the static lnplus_fleet_pubkeys CSV
-        but flagged as a hive fleet-mate by the injected callable must still
-        dedup out of gate 6."""
+    def test_hive_member_flagged_low_rated_unranked_participant_passes_peer_checks(self):
+        """D-1: a participant not in the static lnplus_fleet_pubkeys CSV but
+        flagged as a hive fleet-mate by the injected callable is equally
+        trusted — same reputation-check exemption as a static fleet pubkey."""
         swap = _swap_fixture()
         hive_pk = swap["participants"][1]["pubkey"]
+        swap["participants"][1]["positive_ratings_count"] = 0
+        swap["participants"][1]["negative_ratings_count"] = 50
+        swap["participants"][1]["lnplus_rank_number"] = 0
         hive_check = MagicMock(side_effect=lambda pk: pk == hive_pk)
         ev, cfg, _, _ = _make_evaluator(swaps=[swap], hive_member_check=hive_check)
         result = ev.run_cycle(cfg, 0.0)
-        assert any(r["gate"] == "fleet_dedup" for r in result["rejections"])
+        assert not any(r["gate"] in ("fleet_dedup", "peer_quality")
+                       for r in result["rejections"])
         hive_check.assert_any_call(hive_pk)
 
     def test_hive_member_check_raising_does_not_veto(self):
-        """C-1(c): a raising hive_member_check must never veto by exception
-        — guard it and treat it as 'not a fleet member' (False), not a
-        crash or a false-positive dedup rejection."""
+        """C-1(c): a raising hive_member_check must never veto (or crash)
+        — guard it and treat it as 'not a fleet member' (False). Under D-1
+        there is no fleet_dedup gate any more, but a raising callable must
+        still fall back to normal (non-fleet) reputation checks rather than
+        crashing or spuriously passing/failing the gate chain."""
         swap = _swap_fixture()
         hive_check = MagicMock(side_effect=RuntimeError("hive router down"))
         ev, cfg, _, _ = _make_evaluator(swaps=[swap], hive_member_check=hive_check)
         result = ev.run_cycle(cfg, 0.0)
         assert not any(r["gate"] == "fleet_dedup" for r in result["rejections"])
+        # Fixture participants pass ratings/rank/address checks on their own
+        # merits, so falling back to non-fleet treatment must not reject them.
+        assert not any(r["gate"] == "peer_quality" for r in result["rejections"])
 
     def test_rejects_bad_negative_ratio(self):
         swap = _swap_fixture()
@@ -589,6 +633,7 @@ class TestSwapEvaluatorGates:
             {"participant_identifier": letter,
              "pubkey": "02" + f"{i:02x}" * 32,
              "positive_ratings_count": 20, "negative_ratings_count": 0,
+             "lnplus_rank_number": 9,
              "address_1": "1.2.3.4:9735"}
             for i, letter in enumerate(letters, start=1)
         ]
@@ -630,6 +675,68 @@ class TestSwapEvaluatorGates:
         assert a["outbound_peer"] == PK_A     # C opens to A (wraps)
         assert a["incoming_peer"] == PK_B     # B opens to C
 
+    def test_own_node_still_rejected(self):
+        """D-1: the fleet veto is gone but the own-node check remains,
+        renamed to 'own_node'."""
+        swap = _swap_fixture()
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        ev.rpc.getinfo.return_value = {"id": PK_A}
+        result = ev.run_cycle(cfg, 0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "own_node" for r in result["rejections"])
+
+    # -- D-2: rank floor (gold or better) for non-fleet participants -----
+
+    def test_rejects_rank_below_floor(self):
+        swap = _swap_fixture()
+        swap["participants"][1]["lnplus_rank_number"] = 7   # below default floor 8
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert any(r["gate"] == "peer_quality" and "rank" in r["reason"]
+                   for r in result["rejections"])
+
+    def test_rank_at_floor_passes(self):
+        swap = _swap_fixture()   # B already at rank 8 == default floor
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert not any(r["gate"] == "peer_quality" and "rank" in r["reason"]
+                       for r in result["rejections"])
+
+    def test_missing_rank_rejected(self):
+        """Fail-closed: a missing rank is treated as below floor, not a pass."""
+        swap = _swap_fixture()
+        del swap["participants"][1]["lnplus_rank_number"]
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert any(r["gate"] == "peer_quality" and "rank" in r["reason"]
+                   for r in result["rejections"])
+
+    def test_fleet_member_rank_zero_passes(self):
+        """D-1 x D-2: fleet participants are exempt from the rank floor."""
+        swap = _swap_fixture()
+        swap["participants"][1]["lnplus_rank_number"] = 0
+        ev, cfg, _, _ = _make_evaluator(
+            {"lnplus_fleet_pubkeys": PK_B}, swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert not any(r["gate"] == "peer_quality" for r in result["rejections"])
+
+    # -- D-3: minimum 3 participants ---------------------------------------
+
+    def test_rejects_below_min_participants(self):
+        swap = _swap_fixture(participant_max_count=2)
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "terms" and "participants" in r["reason"]
+                   for r in result["rejections"])
+
+    def test_min_participants_at_default_passes(self):
+        swap = _swap_fixture()   # default participant_max_count == 3
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert not any(r["gate"] == "terms" and "participants" in r["reason"]
+                       for r in result["rejections"])
+
 
 class TestSwapEvAndApply:
     def test_swap_ev_computation(self):
@@ -656,6 +763,111 @@ class TestSwapEvAndApply:
         tor_value, _ = ev._swap_ev(swap, cfg, best_regular_ev=0.0)
         clear_value, _ = ev._swap_ev(_swap_fixture(), cfg, best_regular_ev=0.0)
         assert tor_value < clear_value
+
+    # -- D-1: fleet-aware reliability --------------------------------------
+
+    def test_swap_ev_all_fleet_counterparties_reliability_one(self):
+        """D-1: when ALL visible counterparties are fleet, reliability is
+        1.0 outright — trust overrides transport, so no Tor discount even
+        if the fixture participants publish only Tor addresses."""
+        swap = _swap_fixture()
+        for p in swap["participants"]:
+            p["address_1"] = "abcdef.onion:9735"
+            p["address_2"] = None
+        fleet_csv = f"{PK_A},{PK_B}"
+        ev, cfg, _, _ = _make_evaluator({"lnplus_fleet_pubkeys": fleet_csv}, swaps=[swap])
+        value, assignment = ev._swap_ev(swap, cfg, best_regular_ev=800.0)
+        # inbound_credit = min(1000, 5M*0.005=25000) = 1000; reliability = 1.0
+        # haircut = 0.3 * 800 * (3/12) = 60
+        expected = 1000.0 + 1000.0 * 1.0 * 0.5 - 60.0
+        assert abs(value - expected) < 1.0
+
+    # -- D-3: tie-break on equal EV ------------------------------------------
+
+    def test_tie_break_prefers_fewer_participants_on_equal_ev(self):
+        swap3 = _swap_fixture(id="sw3", participant_max_count=3)
+        swap4 = _swap_fixture(id="sw4", participant_max_count=4)
+        ev, cfg, client, db = _make_evaluator(swaps=[swap3, swap4])
+        client.create_application.return_value = {"id": "sw3", "status": "pending"}
+        db.record_planner_action = MagicMock(return_value=1)
+        db.update_planner_action = MagicMock()
+        # Force identical EV for both swaps so only the tie-break decides.
+        ev._swap_ev = MagicMock(side_effect=lambda swap, cfg, best_regular_ev: (
+            500.0, ev._infer_assignment(swap)))
+        result = ev.run_cycle(cfg, best_regular_ev=0.0)
+        assert result["applied"] is True
+        assert result["swap_id"] == "sw3"
+
+    # -- D-4: mycelium LN+ swap hints -----------------------------------
+
+    def test_hint_multiplier_applied_to_ev(self):
+        swap = _swap_fixture()
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        ev._cur_hints = {PK_A: {"action": "prefer", "ev_multiplier": 1.2,
+                                 "topology_gain": 0.5, "reason": "underserved_corridor"}}
+        value, assignment = ev._swap_ev(swap, cfg, best_regular_ev=800.0)
+        base = 1000.0 + 1000.0 * 0.696 * 0.5 - 60.0
+        assert abs(value - base * 1.2) < 1.0
+
+    def test_hint_avoid_forces_multiplier_to_at_most_point_eight(self):
+        swap = _swap_fixture()
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        # Already-clamped-range value (>= 0.8) must still be forced down.
+        ev._cur_hints = {PK_A: {"action": "avoid", "ev_multiplier": 1.5,
+                                 "topology_gain": 0.0, "reason": "oversaturated"}}
+        value, assignment = ev._swap_ev(swap, cfg, best_regular_ev=800.0)
+        base = 1000.0 + 1000.0 * 0.696 * 0.5 - 60.0
+        assert abs(value - base * 0.8) < 1.0
+
+    def test_absent_hint_for_peer_is_neutral(self):
+        swap = _swap_fixture()
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        ev._cur_hints = {PK_B: {"action": "prefer", "ev_multiplier": 1.3,
+                                 "topology_gain": 0.5, "reason": "x"}}   # not PK_A (outbound)
+        value, assignment = ev._swap_ev(swap, cfg, best_regular_ev=800.0)
+        base = 1000.0 + 1000.0 * 0.696 * 0.5 - 60.0
+        assert abs(value - base) < 1.0
+
+    def test_allow_duplicate_hint_skips_existing_channel_gate(self):
+        hive_hints = MagicMock()
+        hive_hints.get_lnplus_swap_hints.return_value = {
+            PK_A: {"action": "allow_duplicate", "ev_multiplier": 1.0,
+                   "topology_gain": 0.7, "reason": "redundancy"}}
+        ev, cfg, _, _ = _make_evaluator(hive_hints=hive_hints)
+        ev.rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": PK_A, "state": "CHANNELD_NORMAL"}]}
+        result = ev.run_cycle(cfg, 0.0)
+        assert not any(r["gate"] == "terms" and "existing channel" in r["reason"]
+                       for r in result["rejections"])
+
+    def test_hive_hints_fetch_failure_is_neutral(self):
+        """D-4(b): a raising adapter must never break the cycle."""
+        hive_hints = MagicMock()
+        hive_hints.get_lnplus_swap_hints.side_effect = RuntimeError("boom")
+        ev, cfg, _, _ = _make_evaluator(hive_hints=hive_hints)
+        result = ev.run_cycle(cfg, best_regular_ev=800.0)
+        assert ev._cur_hints == {}
+
+    def test_absent_hive_hints_adapter_is_neutral(self):
+        """D-4: no adapter wired (hive_hints disabled) => fully neutral."""
+        ev, cfg, _, _ = _make_evaluator()
+        result = ev.run_cycle(cfg, best_regular_ev=800.0)
+        assert ev._cur_hints == {}
+
+    def test_hints_do_not_rescue_a_failed_safety_gate(self):
+        """D-4(c): hints bias EV/duplicate-peer, never bypass another gate
+        — a rank-floor rejection stands even with a strong 'prefer' hint."""
+        swap = _swap_fixture()
+        swap["participants"][1]["lnplus_rank_number"] = 1   # below floor, non-fleet
+        hive_hints = MagicMock()
+        hive_hints.get_lnplus_swap_hints.return_value = {
+            PK_B: {"action": "prefer", "ev_multiplier": 1.5,
+                   "topology_gain": 1.0, "reason": "x"}}
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap], hive_hints=hive_hints)
+        result = ev.run_cycle(cfg, 0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "peer_quality" and "rank" in r["reason"]
+                   for r in result["rejections"])
 
     def test_swap_wins_within_margin_and_applies(self):
         ev, cfg, client, db = _make_evaluator()
@@ -1944,6 +2156,25 @@ class TestLnplusPluginWiring:
         mod._refresh_dynamic_config()
         assert mod.config.lnplus_fleet_pubkeys == PK_A + "," + PK_B
         assert mod.config.lnplus_watcher_interval == 900
+
+    def test_min_peer_rank_and_min_participants_options_are_dynamic_and_refresh(self):
+        """D-2/D-3 config-plumbing checklist: both new options are dynamic
+        and covered by _refresh_dynamic_config's cast-tuple loop."""
+        mod = load_plugin_module()
+        for option in ("revenue-ops-lnplus-min-peer-rank",
+                       "revenue-ops-lnplus-min-participants"):
+            assert mod.plugin.options[option]["dynamic"] is True
+        mod.config = Config()
+        mod.boltz_manager = None
+        fake_rpc = MagicMock()
+        fake_rpc.listconfigs.return_value = {"configs": {
+            "revenue-ops-lnplus-min-peer-rank": {"value_str": "6"},
+            "revenue-ops-lnplus-min-participants": {"value_str": "4"},
+        }}
+        mod.safe_plugin = SimpleNamespace(rpc=fake_rpc)
+        mod._refresh_dynamic_config()
+        assert mod.config.lnplus_min_peer_rank == 6
+        assert mod.config.lnplus_min_participants == 4
 
     def test_dynamic_refresh_clears_str_field_on_empty_setconfig(self):
         """C-1(b) (2026-07-08 audit): the old "if not _val: continue" guard
