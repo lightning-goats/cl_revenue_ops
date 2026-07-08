@@ -133,6 +133,11 @@ def test_revenue_status_reports_operator_controls_not_full_config():
     assert result["operator_controls"]["public_keys"] == [
         "paused",
         "daily_budget_sats",
+        "growth_budget_enabled",
+        "growth_budget_earned_fraction",
+        "growth_budget_experiment_fraction",
+        "growth_budget_max_extra_sats",
+        "growth_budget_hard_ceiling_sats",
         "min_fee_ppm",
         "max_fee_ppm",
         "fee_profile",
@@ -175,6 +180,11 @@ def test_revenue_status_reports_operator_controls_not_full_config():
     assert result["operator_controls"]["values"] == {
         "paused": False,
         "daily_budget_sats": 2400,
+        "growth_budget_enabled": False,
+        "growth_budget_earned_fraction": 0.25,
+        "growth_budget_experiment_fraction": 0.10,
+        "growth_budget_max_extra_sats": 2000,
+        "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 25,
         "max_fee_ppm": 1800,
         "fee_profile": "active",

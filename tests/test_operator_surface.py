@@ -12,6 +12,11 @@ def test_public_runtime_keys_are_safety_only():
     assert cfg.public_runtime_keys() == [
         "paused",
         "daily_budget_sats",
+        "growth_budget_enabled",
+        "growth_budget_earned_fraction",
+        "growth_budget_experiment_fraction",
+        "growth_budget_max_extra_sats",
+        "growth_budget_hard_ceiling_sats",
         "min_fee_ppm",
         "max_fee_ppm",
         "fee_profile",
@@ -68,6 +73,11 @@ def test_public_runtime_dict_returns_only_public_keys():
     assert cfg.public_runtime_dict() == {
         "paused": True,
         "daily_budget_sats": 1200,
+        "growth_budget_enabled": False,
+        "growth_budget_earned_fraction": 0.25,
+        "growth_budget_experiment_fraction": 0.10,
+        "growth_budget_max_extra_sats": 2000,
+        "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 15,
         "max_fee_ppm": 2500,
         "fee_profile": "active",
@@ -708,6 +718,11 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "fee_market_boundary_max_downshift_ratio",
         "fee_market_boundary_min_competitors",
         "fee_profile",
+        "growth_budget_earned_fraction",
+        "growth_budget_enabled",
+        "growth_budget_experiment_fraction",
+        "growth_budget_hard_ceiling_sats",
+        "growth_budget_max_extra_sats",
         "htlcmax_balanced_pct",
         "htlcmax_sink_pct",
         "htlcmax_source_pct",
@@ -734,7 +749,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_floor",
         "receivable_ratio_target",
     ]
-    assert result["count"] == 38
+    assert result["count"] == 43
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -745,6 +760,11 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
     assert result["config"] == {
         "paused": True,
         "daily_budget_sats": 1200,
+        "growth_budget_enabled": False,
+        "growth_budget_earned_fraction": 0.25,
+        "growth_budget_experiment_fraction": 0.10,
+        "growth_budget_max_extra_sats": 2000,
+        "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 15,
         "max_fee_ppm": 2500,
         "fee_profile": "active",
@@ -1216,6 +1236,11 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
     assert result["operator_controls"]["values"] == {
         "paused": True,
         "daily_budget_sats": 1200,
+        "growth_budget_enabled": False,
+        "growth_budget_earned_fraction": 0.25,
+        "growth_budget_experiment_fraction": 0.10,
+        "growth_budget_max_extra_sats": 2000,
+        "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 15,
         "max_fee_ppm": 2500,
         "fee_profile": "active",
