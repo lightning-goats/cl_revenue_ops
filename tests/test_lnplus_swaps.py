@@ -738,3 +738,74 @@ class TestSwapLifecycle:
         client.complete_application.assert_not_called()
         row = db.lnplus_get_swap("s1")
         assert row["status"] == "opened"
+
+
+class TestLnplusIntegration:
+    def test_full_swap_lifecycle(self):
+        """apply (evaluator) -> fill -> open (watcher) -> activate -> end -> rate."""
+        from modules.config import Config
+        cfg = Config()
+        plugin, rpc = MagicMock(), MagicMock()
+        rpc.feerates.return_value = {"perkw": {"opening": 2000}}
+        rpc.getinfo.return_value = {"id": FLEET_PK}
+        # Gate 7 (confirmed on-chain funds) is exercised elsewhere by
+        # TestSwapEvAndApply; here we only need it to not block the apply,
+        # so give the mock rpc a generous confirmed balance (mirrors the
+        # _make_evaluator fixture's listfunds shape).
+        rpc.listfunds.return_value = {"outputs": [
+            {"amount_msat": 100_000_000_000, "status": "confirmed", "reserved": False}]}
+        db = _make_db()
+        client = MagicMock()
+        planner = MagicMock()
+        planner._calculate_open_ev.return_value = 8000.0
+        planner._estimate_open_cost.return_value = 2000
+        planner._capex_engine.get_fleet_exploration_budget.return_value = 50_000
+        policy = MagicMock()
+        ignore_fn = MagicMock()
+
+        from modules.lnplus_swaps import SwapEvaluator, SwapLifecycle
+        lifecycle = SwapLifecycle(plugin, rpc, db, cfg, client, policy,
+                                  ignore_peer_fn=ignore_fn,
+                                  estimate_open_cost_fn=lambda: 2000)
+        evaluator = SwapEvaluator(plugin, rpc, db, cfg, client, planner, lifecycle)
+
+        # Phase 1: apply
+        client.get_my_swaps.return_value = {"pending": [], "opening": [], "completed": []}
+        client.get_applicable_swaps.return_value = [_swap_fixture()]
+        client.create_application.return_value = {"id": "sw1"}
+        summary = evaluator.run_cycle(cfg, best_regular_ev=1000.0)
+        assert summary["applied"] is True
+        assert lifecycle.has_inflight() is True
+        # Serialization: a second cycle must not even fetch swaps
+        client.get_applicable_swaps.reset_mock()
+        summary2 = evaluator.run_cycle(cfg, best_regular_ev=1000.0)
+        assert summary2["applied"] is False
+        client.get_applicable_swaps.assert_not_called()
+
+        # Phase 2: swap fills -> watcher opens our channel
+        client.get_my_swaps.return_value = {"pending": [], "completed": [], "opening": [
+            {"id": "sw1", "outgoing_peer_pubkey": PK_A,
+             "outgoing_peer_clearnet_address": "1.2.3.4:9735",
+             "deadline": int(time.time()) + 40 * 3600, "capacity_sats": 5_000_000}]}
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.fundchannel.return_value = {"txid": "ab" * 32}
+        lifecycle.run_watcher_once()
+        assert db.lnplus_get_swap("sw1")["status"] == "opened"
+
+        # Phase 3: all sides open -> active + protected
+        client.get_my_swaps.return_value = {"pending": [], "opening": [], "completed": [
+            {"id": "sw1", "incoming_peer_pubkey": PK_B,
+             "ends": "2026-10-05T00:00:00Z"}]}
+        lifecycle.run_watcher_once()
+        assert db.lnplus_get_swap("sw1")["status"] == "active"
+        policy.add_tag.assert_called_with(PK_A, "no_close")
+
+        # Phase 4: contract ends -> release + positive rating
+        db.lnplus_update_swap("sw1", ends_at=int(time.time()) - 1)
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": PK_B, "state": "CHANNELD_NORMAL"}]}
+        lifecycle.run_watcher_once()
+        assert db.lnplus_get_swap("sw1")["status"] == "ended"
+        policy.remove_tag.assert_called_with(PK_A, "no_close")
+        client.create_rating.assert_called_with("sw1", "positive")
+        assert lifecycle.has_inflight() is False

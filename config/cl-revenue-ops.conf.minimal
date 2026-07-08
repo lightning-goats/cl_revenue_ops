@@ -39,3 +39,12 @@ revenue-ops-hot-channel-protection-enabled=true
 #revenue-ops-planner-max-opens-per-cycle=1
 #revenue-ops-planner-max-closes-per-cycle=0
 #revenue-ops-planner-min-annual-roi-pct=1.0
+
+# LN+ liquidity swap automation (lightningnetwork.plus)
+# Autonomous by default. One swap in flight at a time; circuit breaker trips on any
+# missed obligation and blocks new applications until revenue-lnplus-breaker-clear.
+#revenue-ops-lnplus-swaps-enabled=true
+#revenue-ops-lnplus-execute-applications=true
+#revenue-ops-lnplus-swap-preference-margin=0.2
+#revenue-ops-lnplus-max-duration-months=3
+#revenue-ops-lnplus-fleet-pubkeys=<pubkey1>,<pubkey2>
