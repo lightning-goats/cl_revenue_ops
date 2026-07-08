@@ -70,6 +70,17 @@ PUBLIC_RUNTIME_KEYS = (
     'htlcmax_source_pct',
     'htlcmax_sink_pct',
     'htlcmax_balanced_pct',
+    # LN+ liquidity swap automation (9 runtime controls; fleet_pubkeys and
+    # watcher_interval are init-time only)
+    'lnplus_swaps_enabled',
+    'lnplus_execute_applications',
+    'lnplus_swap_preference_margin',
+    'lnplus_max_duration_months',
+    'lnplus_min_peer_positive_ratings',
+    'lnplus_max_participants',
+    'lnplus_apply_feerate_ceiling',
+    'lnplus_pending_timeout_days',
+    'lnplus_inbound_credit_factor',
 )
 
 # Type mapping for config fields (for validation)
@@ -229,6 +240,18 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'capex_global_envelope_sats': int,
     'capex_cost_efficiency_weight': float,
     'capex_drain_benefit_weight': float,
+    # LN+ liquidity swap automation
+    'lnplus_swaps_enabled': bool,
+    'lnplus_execute_applications': bool,
+    'lnplus_swap_preference_margin': float,
+    'lnplus_max_duration_months': int,
+    'lnplus_min_peer_positive_ratings': int,
+    'lnplus_max_participants': int,
+    'lnplus_apply_feerate_ceiling': int,
+    'lnplus_pending_timeout_days': int,
+    'lnplus_inbound_credit_factor': float,
+    'lnplus_fleet_pubkeys': str,
+    'lnplus_watcher_interval': int,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -363,6 +386,14 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'capex_tactical_rate': (0.0, 1.0),
     'capex_probability_budget_bonus': (0.0, 1.0),
     'capex_global_envelope_sats': (0, 100_000_000),
+    # LN+ liquidity swap automation
+    'lnplus_swap_preference_margin': (0.0, 2.0),
+    'lnplus_inbound_credit_factor': (0.0, 1.0),
+    'lnplus_max_duration_months': (1, 12),
+    'lnplus_max_participants': (2, 5),
+    'lnplus_apply_feerate_ceiling': (253, 100000),
+    'lnplus_pending_timeout_days': (1, 30),
+    'lnplus_min_peer_positive_ratings': (0, 1000),
 }
 
 # Valid values for string enum fields
@@ -717,6 +748,21 @@ class Config:
     # the route to exceed the raw pair budget by up to (probability * bonus)
     # fraction. Default 0.0 = disabled, preserving v2 behavior exactly.
     capex_probability_budget_bonus: float = 0.0
+
+    # ==========================================================================
+    # LN+ Liquidity Swap Automation
+    # ==========================================================================
+    lnplus_swaps_enabled: bool = True
+    lnplus_execute_applications: bool = True
+    lnplus_swap_preference_margin: float = 0.2
+    lnplus_max_duration_months: int = 3
+    lnplus_min_peer_positive_ratings: int = 5
+    lnplus_max_participants: int = 4
+    lnplus_apply_feerate_ceiling: int = 5000
+    lnplus_pending_timeout_days: int = 7
+    lnplus_inbound_credit_factor: float = 0.5
+    lnplus_fleet_pubkeys: str = ''
+    lnplus_watcher_interval: int = 3600
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -1206,6 +1252,22 @@ class ConfigSnapshot:
     htlcmax_source_pct: float = 0.50
     htlcmax_sink_pct: float = 0.25
     htlcmax_balanced_pct: float = 0.45
+    # LN+ (lightningnetwork.plus) liquidity swap automation (C1 audit fix:
+    # these were missing from ConfigSnapshot entirely, so
+    # getattr(cfg, "lnplus_swaps_enabled", False) inside execute_cycle's
+    # snapshot always fell back to False in production — the evaluator was
+    # silently dead despite Config defaulting it on).
+    lnplus_swaps_enabled: bool = True
+    lnplus_execute_applications: bool = True
+    lnplus_swap_preference_margin: float = 0.2
+    lnplus_max_duration_months: int = 3
+    lnplus_min_peer_positive_ratings: int = 5
+    lnplus_max_participants: int = 4
+    lnplus_apply_feerate_ceiling: int = 5000
+    lnplus_pending_timeout_days: int = 7
+    lnplus_inbound_credit_factor: float = 0.5
+    lnplus_fleet_pubkeys: str = ''
+    lnplus_watcher_interval: int = 3600
     # Version tracking
     version: int = 0
     

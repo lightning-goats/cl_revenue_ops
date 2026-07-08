@@ -95,6 +95,48 @@ The capacity planner uses a multi-strategy candidate pipeline with portfolio-awa
 - It maintains a standing on-chain reserve for reserve maintenance, and that reserve maintenance is independent of pending planner opens.
 - When the reserve is healthy, it falls back to the existing balance cycle.
 
+## LN+ Liquidity Swaps
+
+`cl_revenue_ops` can autonomously join [lightningnetwork.plus](https://lightningnetwork.plus) (LN+) liquidity swaps — a ring of nodes where each participant opens one channel to the next and receives one in return, so an outbound open buys an equal-capacity inbound channel. This is join-only: the plugin applies to swaps other operators posted, it never creates them.
+
+- Each applicable swap is scored with the same EV machinery the capacity planner uses for regular opens (`_calculate_open_ev`, capex budget, ROI hurdle) plus an inbound-liquidity credit and a lockup haircut for the capital committed over the contract term. The swap only proceeds if its EV beats the best regular-open EV by `revenue-ops-lnplus-swap-preference-margin` — ties and near-ties favor the regular open, since a swap locks capital for the contract term and a regular open does not.
+- **One swap in flight per node at a time.** No new application is submitted while a prior one is applied, opening, or awaiting completion (checked before every LN+ API call, so an outage or a tripped breaker can never queue up a second commitment).
+- Applying to a filled swap slot is an irreversible commitment: once the last slot fills, a 48-hour clock starts to open the assigned channel. The obligations watcher (`revenue-ops-lnplus-watcher-interval`, default hourly) drives every step after application — connect, `fundchannel` (feerate escalates as the deadline approaches), `complete_application`, activation (tags the channel `no_close` so nothing else can close it mid-contract), and finally release + rating once the contract's `ends_at` passes.
+
+### Options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `revenue-ops-lnplus-swaps-enabled` | `true` | Master switch for LN+ automation. |
+| `revenue-ops-lnplus-execute-applications` | `true` | `false` = recommendation-only; gates are still evaluated and logged, but no live `create_application` call is made. |
+| `revenue-ops-lnplus-swap-preference-margin` | `0.2` | Fraction by which a regular open's EV must beat the best swap's EV to win the slot instead. |
+| `revenue-ops-lnplus-max-duration-months` | `3` | Longest contract duration we'll apply to. |
+| `revenue-ops-lnplus-min-peer-positive-ratings` | `5` | Minimum LN+ positive-rating floor for every participant in the swap (one under-rated peer vetoes the whole swap). |
+| `revenue-ops-lnplus-max-participants` | `4` | Maximum ring size we'll join. |
+| `revenue-ops-lnplus-apply-feerate-ceiling` | `5000` | No applications while the current opening feerate (perkw) exceeds this. |
+| `revenue-ops-lnplus-pending-timeout-days` | `7` | Withdraw an application still stuck `pending` (unfilled) after this many days. |
+| `revenue-ops-lnplus-inbound-credit-factor` | `0.5` | Damping applied to the inbound-liquidity EV credit (the value of the channel we receive) — conservative by default since inbound value is harder to realize than outbound. |
+| `revenue-ops-lnplus-fleet-pubkeys` | `` (empty) | Comma-separated pubkeys of our own fleet nodes; any swap with one of these as a participant is rejected (fleet dedup — we don't want to swap with ourselves). |
+| `revenue-ops-lnplus-watcher-interval` | `3600` | Obligations watcher poll interval, in seconds. |
+
+### RPCs
+
+| Command | Use |
+|---|---|
+| `revenue-lnplus-status` | Circuit-breaker state, in-flight swap, and active/recently-ended contracts. |
+| `revenue-lnplus-breaker-clear` | Operator acknowledgment that clears a tripped breaker so new applications can resume. |
+| `revenue-lnplus-abandon <swap_id>` | Emergency abandon of an in-flight obligation — marks the local row failed and trips the breaker, since abandoning a commitment is a defection on our side and must never happen silently. |
+
+### Circuit breaker
+
+The breaker is a one-strike mechanism: a missed 48-hour open deadline, or the local ledger diverging from what LN+ reports for an in-flight swap, trips it immediately and blocks all new applications. Obligations already in flight (an open in progress, an active contract) are still driven to completion — the breaker only stops new commitments, it does not abandon existing ones. Clearing it is always an explicit operator action via `revenue-lnplus-breaker-clear`; it never clears itself.
+
+Note the distinction between disabling and abandoning: setting `revenue-ops-lnplus-swaps-enabled=false` stops new applications, but any swap already applied, opening, or active is still honored to completion (fundchannel executed, contract protected with `no_close`, rated and released at term end) — disabling is not the same as walking away from a commitment. Use `revenue-lnplus-abandon` only as a last resort, since it deliberately defects on an LN+ commitment and will draw a negative rating.
+
+### Contract lifecycle and the 3-month cap
+
+Swap contracts are capped at `revenue-ops-lnplus-max-duration-months` (default 3, configurable 1-12). While a contract is active the outbound channel is tagged `no_close` so the planner's capital-recycling logic cannot touch it. Once the contract's `ends_at` passes, the watcher rates the counterparty (positive if their channel to us is still open, negative — plus an ignore — if they defected), removes the `no_close` tag, and marks the swap `ended`. From that point the channel reverts to normal planner management like any other channel: it is eligible for fee optimization, rebalancing, and capital recycling on the same footing as a channel opened the regular way. A well-performing swap channel is expected to naturally stay open past the contract; the cap only bounds the *protected, locked* period.
+
 ## Architecture
 
 ```text

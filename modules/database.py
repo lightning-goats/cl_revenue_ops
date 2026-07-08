@@ -1330,6 +1330,41 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_peer_time ON planner_actions(peer_id, created_at)")
         conn.execute("DROP INDEX IF EXISTS idx_planner_actions_peer")
 
+        # LN+ liquidity swap terms ledger (one row per swap we've touched)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lnplus_swaps (
+                swap_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                capacity_sats INTEGER NOT NULL,
+                duration_months INTEGER NOT NULL,
+                ends_at INTEGER,
+                outbound_peer TEXT,
+                incoming_peer TEXT,
+                our_identifier TEXT,
+                applied_at INTEGER NOT NULL,
+                opened_at INTEGER,
+                completed_at INTEGER,
+                channel_funding_txid TEXT,
+                deadline_at INTEGER,
+                planner_action_id INTEGER,
+                outcome TEXT,
+                metadata_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_lnplus_swaps_status ON lnplus_swaps(status)")
+
+        # LN+ counterparty history
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lnplus_peers (
+                pubkey TEXT PRIMARY KEY,
+                swaps_count INTEGER NOT NULL DEFAULT 0,
+                ratings_given_positive INTEGER NOT NULL DEFAULT 0,
+                ratings_given_negative INTEGER NOT NULL DEFAULT 0,
+                defections INTEGER NOT NULL DEFAULT 0,
+                last_swap_at INTEGER
+            )
+        """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS dead_capital_stage (
                 channel_id TEXT PRIMARY KEY,
@@ -7147,6 +7182,96 @@ class Database:
         """Delete dead-capital stage state for a channel."""
         conn = self._get_connection()
         conn.execute("DELETE FROM dead_capital_stage WHERE channel_id = ?", (channel_id,))
+
+    # =========================================================================
+    # LN+ Liquidity Swap Ledger
+    # =========================================================================
+
+    _LNPLUS_INFLIGHT_STATUSES = ("applied", "opening", "opened")
+    _LNPLUS_UPDATABLE_FIELDS = frozenset((
+        "status", "ends_at", "outbound_peer", "incoming_peer",
+        "our_identifier", "opened_at", "completed_at",
+        "channel_funding_txid", "deadline_at", "outcome",
+    ))
+
+    def lnplus_record_swap(self, swap_id: str, status: str, capacity_sats: int,
+                           duration_months: int, outbound_peer: str = None,
+                           incoming_peer: str = None, our_identifier: str = None,
+                           planner_action_id: int = None, metadata: dict = None) -> None:
+        """Record an LN+ swap we are participating in (intent-first ledger row)."""
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT OR REPLACE INTO lnplus_swaps
+            (swap_id, status, capacity_sats, duration_months, outbound_peer,
+             incoming_peer, our_identifier, applied_at, planner_action_id, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (swap_id, status, capacity_sats, duration_months, outbound_peer,
+              incoming_peer, our_identifier, int(time.time()), planner_action_id,
+              json.dumps(metadata) if metadata else None))
+
+    def lnplus_update_swap(self, swap_id: str, **fields) -> None:
+        bad = set(fields) - self._LNPLUS_UPDATABLE_FIELDS
+        if bad:
+            raise ValueError(f"lnplus_update_swap: unknown fields {sorted(bad)}")
+        if not fields:
+            return
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        conn = self._get_connection()
+        conn.execute(f"UPDATE lnplus_swaps SET {sets} WHERE swap_id = ?",
+                     (*fields.values(), swap_id))
+
+    def _lnplus_row_to_dict(self, row, cursor) -> dict:
+        return {desc[0]: row[i] for i, desc in enumerate(cursor.description)}
+
+    def lnplus_get_swap(self, swap_id: str):
+        conn = self._get_connection()
+        cur = conn.execute("SELECT * FROM lnplus_swaps WHERE swap_id = ?", (swap_id,))
+        row = cur.fetchone()
+        return self._lnplus_row_to_dict(row, cur) if row else None
+
+    def lnplus_get_swaps_by_status(self, statuses) -> list:
+        if not statuses:
+            return []
+        marks = ",".join("?" for _ in statuses)
+        conn = self._get_connection()
+        cur = conn.execute(
+            f"SELECT * FROM lnplus_swaps WHERE status IN ({marks}) ORDER BY applied_at",
+            tuple(statuses))
+        return [self._lnplus_row_to_dict(r, cur) for r in cur.fetchall()]
+
+    def lnplus_inflight_swaps(self) -> list:
+        return self.lnplus_get_swaps_by_status(list(self._LNPLUS_INFLIGHT_STATUSES))
+
+    def lnplus_reserved_sats(self) -> int:
+        marks = ",".join("?" for _ in self._LNPLUS_INFLIGHT_STATUSES)
+        conn = self._get_connection()
+        cur = conn.execute(
+            f"SELECT COALESCE(SUM(capacity_sats), 0) FROM lnplus_swaps WHERE status IN ({marks})",
+            self._LNPLUS_INFLIGHT_STATUSES)
+        return int(cur.fetchone()[0])
+
+    def lnplus_bump_peer(self, pubkey: str, defection: bool = False, rating: str = None) -> None:
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT INTO lnplus_peers (pubkey, swaps_count, defections,
+                ratings_given_positive, ratings_given_negative, last_swap_at)
+            VALUES (?, 1, ?, ?, ?, ?)
+            ON CONFLICT(pubkey) DO UPDATE SET
+                swaps_count = swaps_count + 1,
+                defections = defections + excluded.defections,
+                ratings_given_positive = ratings_given_positive + excluded.ratings_given_positive,
+                ratings_given_negative = ratings_given_negative + excluded.ratings_given_negative,
+                last_swap_at = excluded.last_swap_at
+        """, (pubkey, 1 if defection else 0,
+              1 if rating == "positive" else 0,
+              1 if rating == "negative" else 0,
+              int(time.time())))
+
+    def lnplus_get_peer(self, pubkey: str):
+        conn = self._get_connection()
+        cur = conn.execute("SELECT * FROM lnplus_peers WHERE pubkey = ?", (pubkey,))
+        row = cur.fetchone()
+        return self._lnplus_row_to_dict(row, cur) if row else None
 
     # =========================================================================
     # Mempool Fee History Methods (Vegas Reflex)

@@ -101,6 +101,24 @@
 #revenue-ops-planner-min-annual-roi-pct=1.0
 
 # ============================================================================
+# LN+ LIQUIDITY SWAPS (lightningnetwork.plus)
+# ============================================================================
+
+# Autonomous by default. One swap in flight at a time; circuit breaker trips on any
+# missed obligation and blocks new applications until revenue-lnplus-breaker-clear.
+#revenue-ops-lnplus-swaps-enabled=true
+#revenue-ops-lnplus-execute-applications=true
+#revenue-ops-lnplus-swap-preference-margin=0.2
+#revenue-ops-lnplus-max-duration-months=3
+#revenue-ops-lnplus-min-peer-positive-ratings=5
+#revenue-ops-lnplus-max-participants=4
+#revenue-ops-lnplus-apply-feerate-ceiling=5000
+#revenue-ops-lnplus-pending-timeout-days=7
+#revenue-ops-lnplus-inbound-credit-factor=0.5
+#revenue-ops-lnplus-fleet-pubkeys=<pubkey1>,<pubkey2>
+#revenue-ops-lnplus-watcher-interval=3600
+
+# ============================================================================
 # CAPITAL SAFETY (Global Capital Controls)
 # ============================================================================
 

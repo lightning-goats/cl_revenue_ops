@@ -442,6 +442,66 @@ ALLOWLIST = {
         "decision and its atomic reservation are owned by the calling site that "
         "names the concrete method; this proxy only forwards it off-thread.",
     ),
+    # --- Daemon spender: LN+ liquidity-swap channel OPEN (Task 6, hardened) --
+    ("lnplus_swaps.py", "_execute_swap_open", "reserve_spend"): (
+        ATOMIC_RESERVE, 1,
+        "SwapLifecycle._execute_swap_open reserves atomically (category="
+        "'channel_open', subcategory='lnplus_swap') via db.reserve_spend "
+        "BEGIN IMMEDIATE, IMMEDIATELY before self.rpc.fundchannel, mirroring "
+        "capacity_planner._execute_open/_execute_close (P4-018/DD1 parity). "
+        "The reservation_id is unique per attempt (swap_id + int(time.time())) "
+        "so reserve_spend's terminal-state guard (refusing to resurrect a "
+        "spent/released id) can never block a retry after a failed attempt. "
+        "When the caller wires estimate_open_cost_fn/budget_params_fn (the "
+        "capacity planner's _estimate_open_cost / _unified_reserve_budget_"
+        "params) this is a real cross-category-enforced reserve identical to "
+        "the planner's own opens; absent that wiring it falls back to a fixed "
+        "_DEFAULT_OPEN_COST_SATS best-effort reservation (effective_budget_"
+        "sats=None -> reserve_spend skips enforcement but the amount is still "
+        "counted on the rail at settle). A reservation failure (False or "
+        "raise) aborts BEFORE fundchannel is called and logs a warning for "
+        "the hourly watcher to retry.",
+    ),
+    ("lnplus_swaps.py", "_execute_swap_open", "rpc_attr_fundchannel"): (
+        RAIL_COUNTED_COST, 1,
+        "SwapLifecycle._execute_swap_open's self.rpc.fundchannel(...) -- the "
+        "on-chain channel open that fulfils an LN+ liquidity-swap application. "
+        "Reserved atomically by the reserve_spend call in the same method "
+        "IMMEDIATELY before this call (see the paired allowlist entry above), "
+        "mirroring capacity_planner._execute_open's reserve-then-fundchannel "
+        "pairing (P4-018 parity). On success the reservation is settled loud/ "
+        "bounded-retry via _settle_swap_open_reservation (mirrors "
+        "capacity_planner._settle_capex_reservation: 3 attempts calling "
+        "mark_spend_reservation_spent, and on persistent failure the "
+        "reservation is left active and logged at error rather than released, "
+        "so a committed fee always stays counted on the unified rail). On a "
+        "fundchannel exception or a missing txid the reservation is released "
+        "best-effort via _release_swap_open_reservation and the attempt is "
+        "retried next watcher pass. Independently, capacity is also reserved "
+        "intent-first at the ledger level: SwapEvaluator._select_and_apply "
+        "writes the lnplus_swaps row (status='applied', capacity_sats) BEFORE "
+        "create_application is even sent, and capacity_planner.py subtracts "
+        "db.lnplus_reserved_sats() (sum of capacity across applied/opening/"
+        "opened rows) from its own available on-chain funds before its "
+        "reserve_spend-gated opens (capacity_planner.py ~line 515) -- "
+        "cross-category protection against the planner double spending the "
+        "same coins. SwapEvaluator additionally serializes to AT MOST ONE "
+        "swap in flight (has_inflight() gate) and re-checks confirmed "
+        "on-chain funds >= capacity+fees at apply time (gate 7), so this rail "
+        "never carries more than one reserved capacity at once. The "
+        "fundchannel call itself is ALSO idempotency-guarded: a "
+        "channel_funding_txid already on the row short-circuits to a "
+        "complete_application retry, and a listpeerchannels existing-channel "
+        "check (OPENINGD/CHANNELD_AWAITING_LOCKIN/CHANNELD_NORMAL/DUALOPEND_*) "
+        "skips a duplicate fundchannel on retry. run_watcher_once holds a "
+        "non-blocking single-flight lock so two watcher passes can never race "
+        "this call. Row-level settlement is loud too: the row is written "
+        "status='opening'/outcome='fundchannel attempt' BEFORE the call "
+        "(intent) and channel_funding_txid/opened_at AFTER it returns "
+        "(outcome); a miss of the 48h deadline trips the circuit breaker and "
+        "records a failed swap_open planner action, blocking further LN+ "
+        "applications until an operator clears it.",
+    ),
 }
 
 

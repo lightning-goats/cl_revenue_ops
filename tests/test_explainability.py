@@ -161,6 +161,16 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "htlcmax_source_pct",
         "htlcmax_sink_pct",
         "htlcmax_balanced_pct",
+        # LN+ liquidity swap automation
+        "lnplus_swaps_enabled",
+        "lnplus_execute_applications",
+        "lnplus_swap_preference_margin",
+        "lnplus_max_duration_months",
+        "lnplus_min_peer_positive_ratings",
+        "lnplus_max_participants",
+        "lnplus_apply_feerate_ceiling",
+        "lnplus_pending_timeout_days",
+        "lnplus_inbound_credit_factor",
     ]
     assert result["operator_controls"]["values"] == {
         "paused": False,
@@ -192,6 +202,15 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "htlcmax_source_pct": 0.50,
         "htlcmax_sink_pct": 0.25,
         "htlcmax_balanced_pct": 0.45,
+        "lnplus_swaps_enabled": True,
+        "lnplus_execute_applications": True,
+        "lnplus_swap_preference_margin": 0.2,
+        "lnplus_max_duration_months": 3,
+        "lnplus_min_peer_positive_ratings": 5,
+        "lnplus_max_participants": 4,
+        "lnplus_apply_feerate_ceiling": 5000,
+        "lnplus_pending_timeout_days": 7,
+        "lnplus_inbound_credit_factor": 0.5,
     }
     assert "config" not in result
 

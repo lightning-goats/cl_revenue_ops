@@ -40,6 +40,16 @@ def test_public_runtime_keys_are_safety_only():
         "htlcmax_source_pct",
         "htlcmax_sink_pct",
         "htlcmax_balanced_pct",
+        # LN+ liquidity swap automation
+        "lnplus_swaps_enabled",
+        "lnplus_execute_applications",
+        "lnplus_swap_preference_margin",
+        "lnplus_max_duration_months",
+        "lnplus_min_peer_positive_ratings",
+        "lnplus_max_participants",
+        "lnplus_apply_feerate_ceiling",
+        "lnplus_pending_timeout_days",
+        "lnplus_inbound_credit_factor",
     ]
 
 
@@ -85,6 +95,15 @@ def test_public_runtime_dict_returns_only_public_keys():
         "htlcmax_source_pct": 0.50,
         "htlcmax_sink_pct": 0.25,
         "htlcmax_balanced_pct": 0.45,
+        "lnplus_swaps_enabled": True,
+        "lnplus_execute_applications": True,
+        "lnplus_swap_preference_margin": 0.2,
+        "lnplus_max_duration_months": 3,
+        "lnplus_min_peer_positive_ratings": 5,
+        "lnplus_max_participants": 4,
+        "lnplus_apply_feerate_ceiling": 5000,
+        "lnplus_pending_timeout_days": 7,
+        "lnplus_inbound_credit_factor": 0.5,
     }
 
 
@@ -692,6 +711,15 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "htlcmax_balanced_pct",
         "htlcmax_sink_pct",
         "htlcmax_source_pct",
+        "lnplus_apply_feerate_ceiling",
+        "lnplus_execute_applications",
+        "lnplus_inbound_credit_factor",
+        "lnplus_max_duration_months",
+        "lnplus_max_participants",
+        "lnplus_min_peer_positive_ratings",
+        "lnplus_pending_timeout_days",
+        "lnplus_swap_preference_margin",
+        "lnplus_swaps_enabled",
         "max_fee_ppm",
         "min_fee_ppm",
         "node_drain_bias_enabled",
@@ -706,7 +734,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_floor",
         "receivable_ratio_target",
     ]
-    assert result["count"] == 29
+    assert result["count"] == 38
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -744,6 +772,15 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "htlcmax_source_pct": 0.50,
         "htlcmax_sink_pct": 0.25,
         "htlcmax_balanced_pct": 0.45,
+        "lnplus_swaps_enabled": True,
+        "lnplus_execute_applications": True,
+        "lnplus_swap_preference_margin": 0.2,
+        "lnplus_max_duration_months": 3,
+        "lnplus_min_peer_positive_ratings": 5,
+        "lnplus_max_participants": 4,
+        "lnplus_apply_feerate_ceiling": 5000,
+        "lnplus_pending_timeout_days": 7,
+        "lnplus_inbound_credit_factor": 0.5,
     }
 
 
@@ -1206,6 +1243,15 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "htlcmax_source_pct": 0.50,
         "htlcmax_sink_pct": 0.25,
         "htlcmax_balanced_pct": 0.45,
+        "lnplus_swaps_enabled": True,
+        "lnplus_execute_applications": True,
+        "lnplus_swap_preference_margin": 0.2,
+        "lnplus_max_duration_months": 3,
+        "lnplus_min_peer_positive_ratings": 5,
+        "lnplus_max_participants": 4,
+        "lnplus_apply_feerate_ceiling": 5000,
+        "lnplus_pending_timeout_days": 7,
+        "lnplus_inbound_credit_factor": 0.5,
     }
     assert "config" not in result
     assert "hive_hints" not in result
