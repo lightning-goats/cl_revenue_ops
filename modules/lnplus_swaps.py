@@ -131,13 +131,30 @@ class LNPlusClient:
         return swaps if isinstance(swaps, list) else []
 
     def get_swap(self, swap_id) -> Dict:
-        return self._request(f"get_swap/id={urllib.parse.quote(str(swap_id), safe='')}")
+        result = self._request(f"get_swap/id={urllib.parse.quote(str(swap_id), safe='')}")
+        return self._unwrap_list_envelope(result, {})
 
     def get_my_swaps(self) -> Dict:
         result = self._request("get_my_swaps", self._auth_params(), method="POST")
+        result = self._unwrap_list_envelope(
+            result, {"pending": [], "opening": [], "completed": []})
         if not isinstance(result, dict):
             raise LNPlusError("get_my_swaps: unexpected payload")
         return {k: result.get(k) or [] for k in ("pending", "opening", "completed")}
+
+    @staticmethod
+    def _unwrap_list_envelope(result: Any, empty_fallback: Any) -> Any:
+        """The LN+ docs show get_my_swaps (and get_account_info/get_my_todos)
+        wrapping a single response object in a one-element array:
+        [ {...} ]. Normalize defensively so the client is the only place
+        that has to know this: a list -> its first element if that element
+        is a dict (an empty list -> empty_fallback); a dict -> used as-is;
+        anything else is returned unchanged for the caller to reject."""
+        if isinstance(result, list):
+            if not result:
+                return empty_fallback
+            return result[0] if isinstance(result[0], dict) else result
+        return result
 
     def create_application(self, swap_id) -> Dict:
         params = self._auth_params()
@@ -493,6 +510,7 @@ class SwapEvaluator:
 
 
 _BREAKER_KEY = "_lnplus_breaker"
+_BACKFILL_FLAG = "_lnplus_backfill_done"   # config_overrides key, value = epoch str
 _OPEN_STATES = ("OPENINGD", "CHANNELD_AWAITING_LOCKIN", "CHANNELD_NORMAL",
                 "DUALOPEND_OPEN_INIT", "DUALOPEND_AWAITING_LOCKIN")
 # Best-effort fallback used only when the caller does not wire the capacity
@@ -512,6 +530,8 @@ class SwapLifecycle:
     Ratings and ignore_peer_fn calls are best-effort (try/except + log);
     the DB state machine transitions are not.
     """
+
+    _BACKFILL_FLAG = _BACKFILL_FLAG
 
     def __init__(self, plugin, rpc, database, config, client, policy_manager,
                  ignore_peer_fn=None, estimate_open_cost_fn=None, budget_params_fn=None):
@@ -560,6 +580,22 @@ class SwapLifecycle:
         return self._reconcile(my)
 
     def _reconcile(self, my: Dict) -> bool:
+        # Choke point: adopt pre-existing LN+ state (manual applications/
+        # opens/contracts predating this automation) BEFORE the first
+        # divergence check ever runs, on both the watcher pass and the
+        # evaluator's reconcile_ok preflight. Never trip the breaker
+        # against state we have not adopted yet — if backfill itself
+        # raises, retry next pass instead of running divergence checks.
+        if not self._db.get_config_override(_BACKFILL_FLAG):
+            try:
+                self.backfill_from_lnplus(my)
+            except Exception as e:
+                self._plugin.log(
+                    f"LNPLUS: backfill_from_lnplus failed: {e} — retrying "
+                    "next pass", level="error")
+                return False
+            self._db.set_config_override(_BACKFILL_FLAG, str(int(time.time())))
+
         my = my or {}
         pending_ids = {s.get("id") for s in (my.get("pending") or [])}
         opening_ids = {s.get("id") for s in (my.get("opening") or [])}
@@ -584,7 +620,10 @@ class SwapLifecycle:
 
         for sid in opening_ids:
             if sid and sid not in local_ids:
-                self.trip_breaker(f"LN+ shows opening swap {sid} with no local record")
+                self.trip_breaker(
+                    f"LN+ shows opening swap {sid} with no local record — "
+                    "if this swap was entered manually, run "
+                    "revenue-lnplus-backfill to adopt it")
                 ok = False
 
         # I1 fix: gate 0 was one-eyed — it only checked the opening list for
@@ -596,9 +635,281 @@ class SwapLifecycle:
         # forever.
         for sid in pending_ids:
             if sid and sid not in local_ids:
-                self.trip_breaker(f"LN+ shows pending swap {sid} with no local record")
+                self.trip_breaker(
+                    f"LN+ shows pending swap {sid} with no local record — "
+                    "if this swap was entered manually, run "
+                    "revenue-lnplus-backfill to adopt it")
                 ok = False
         return ok
+
+    # -- backfill of pre-existing (manual) LN+ swaps -----------------------
+    def backfill_from_lnplus(self, my: Optional[Dict] = None) -> Dict:
+        """Adopt LN+ account state accumulated before this automation
+        existed (manual applications/opens/running-or-ended contracts made
+        on the LN+ website) into the local ledger.
+
+        Common rule across every category: skip unconditionally if a local
+        row for that swap_id already exists — lnplus_record_swap is INSERT
+        OR REPLACE and would otherwise clobber automation-owned state or
+        resurrect a terminal row. This makes the whole method idempotent
+        and safe to call any number of times (the flag in _reconcile only
+        prevents redundant AUTO-runs; the revenue-lnplus-backfill RPC path
+        relies purely on this per-swap skip).
+        """
+        if my is None:
+            my = self._client.get_my_swaps()
+        my = my or {}
+        now = int(time.time())
+        imported = {"pending": 0, "opening": 0, "active": 0, "ended": 0}
+        skipped: List[str] = []
+        warnings: List[str] = []
+
+        for entry in (my.get("pending") or []):
+            self._backfill_pending(entry, now, imported, skipped, warnings)
+        for entry in (my.get("opening") or []):
+            self._backfill_opening(entry, now, imported, skipped, warnings)
+        for entry in (my.get("completed") or []):
+            self._backfill_completed(entry, now, imported, skipped, warnings)
+
+        return {"imported": imported, "skipped": skipped, "warnings": warnings}
+
+    def _backfill_pending(self, entry: Dict, now: int, imported: Dict,
+                          skipped: List[str], warnings: List[str]) -> None:
+        """Rule 1: applied row, no peer/identifier assignment yet (phase 3
+        receives the authoritative assignment when it fills — running
+        _infer_assignment on stale data here would be wrong)."""
+        sid = entry.get("id")
+        if not sid:
+            return
+        sid = str(sid)
+        if self._db.lnplus_get_swap(sid):
+            skipped.append(sid)
+            return
+        capacity, duration = self._resolve_capacity_duration(entry, sid, warnings)
+        self._db.lnplus_record_swap(
+            sid, "applied", capacity, duration,
+            metadata={"imported": True, "imported_at": now})
+        self._plugin.log(
+            f"LNPLUS: backfill — imported pending swap {sid} "
+            f"({capacity} sats, {duration}mo); pending-timeout clock "
+            "starts now", level="info")
+        imported["pending"] += 1
+
+    def _backfill_opening(self, entry: Dict, now: int, imported: Dict,
+                          skipped: List[str], warnings: List[str]) -> None:
+        """Rule 2: opening row. outbound_peer only if the LN+-supplied
+        pubkey validates (else NULL + warning, phase 3 retries); deadline
+        from the entry or a conservative now+48h fallback. Phase 3/3b
+        executes the open in the same watcher pass, and its existing
+        capacity-match idempotency already handles an operator having
+        funded the channel manually — nothing to duplicate here."""
+        sid = entry.get("id")
+        if not sid:
+            return
+        sid = str(sid)
+        if self._db.lnplus_get_swap(sid):
+            skipped.append(sid)
+            return
+        capacity, duration = self._resolve_capacity_duration(entry, sid, warnings)
+        peer = entry.get("outgoing_peer_pubkey")
+        outbound_peer = peer if _valid_pubkey(peer) else None
+        if peer and not outbound_peer:
+            warnings.append(
+                f"swap {sid}: invalid outgoing_peer_pubkey on import — "
+                "outbound_peer left NULL")
+        deadline_ts = _parse_ts(entry.get("deadline"))
+        if not deadline_ts:
+            deadline_ts = now + 48 * 3600
+            warnings.append(
+                f"swap {sid}: no parseable deadline on import — using 48h "
+                "fallback")
+        self._db.lnplus_record_swap(
+            sid, "opening", capacity, duration,
+            outbound_peer=outbound_peer,
+            metadata={"imported": True, "imported_at": now})
+        self._db.lnplus_update_swap(sid, deadline_at=deadline_ts)
+        self._plugin.log(
+            f"LNPLUS: backfill — imported opening swap {sid} "
+            f"({capacity} sats)", level="info")
+        imported["opening"] += 1
+
+    def _backfill_completed(self, entry: Dict, now: int, imported: Dict,
+                            skipped: List[str], warnings: List[str]) -> None:
+        sid = entry.get("id")
+        if not sid:
+            return
+        sid = str(sid)
+        if self._db.lnplus_get_swap(sid):
+            skipped.append(sid)
+            return
+        ends_ts = _parse_ts(entry.get("ends"))
+        incoming = entry.get("incoming_peer_pubkey")
+        incoming_peer = incoming if _valid_pubkey(incoming) else None
+        if incoming and not incoming_peer:
+            warnings.append(
+                f"swap {sid}: invalid incoming_peer_pubkey on import — "
+                "incoming_peer left NULL")
+
+        if ends_ts and ends_ts > now:
+            self._backfill_running_contract(
+                sid, entry, ends_ts, incoming_peer, now, imported, warnings)
+        else:
+            if not ends_ts:
+                warnings.append(
+                    f"swap {sid}: completed entry has no parseable 'ends' "
+                    "— importing as ended anyway")
+            self._backfill_ended_contract(
+                sid, entry, ends_ts, incoming_peer, now, imported, warnings)
+
+    def _backfill_running_contract(self, sid: str, entry: Dict, ends_ts: int,
+                                   incoming_peer: Optional[str], now: int,
+                                   imported: Dict, warnings: List[str]) -> None:
+        """Rule 3: a still-running manual contract is NOT protected by
+        no_close until this import runs — the planner could otherwise
+        force-close a live contract (defection). outbound_peer is derived
+        from the authoritative, complete participant list on get_swap(sid)
+        (exact, unlike the pre-apply letter inference)."""
+        outbound_peer, detail = self._derive_outbound_for_import(sid, warnings)
+        capacity = entry.get("capacity_sats")
+        if capacity is None and isinstance(detail, dict):
+            capacity = detail.get("capacity_sats")
+        if capacity is None:
+            warnings.append(
+                f"swap {sid}: capacity_sats unknown on import (defaulted "
+                "to 0)")
+            capacity = 0
+        duration = int(entry.get("duration_months") or 0)
+        self._db.lnplus_record_swap(
+            sid, "opened", int(capacity), duration,
+            outbound_peer=outbound_peer, incoming_peer=incoming_peer,
+            metadata={"imported": True, "imported_at": now})
+        self._db.lnplus_update_swap(sid, ends_at=ends_ts)
+        self._plugin.log(
+            f"LNPLUS: backfill — imported running contract {sid} "
+            f"(outbound_peer={'set' if outbound_peer else 'NULL'}); phase "
+            "4 this pass will activate no_close protection", level="info")
+        imported["active"] += 1
+
+    def _derive_outbound_for_import(self, sid: str, warnings: List[str]):
+        """Fetch get_swap(sid), locate our own participant by pubkey
+        (self.rpc.getinfo()["id"]), and derive outbound as the next
+        participant_identifier cyclically — the participant list on a
+        completed entry is final, so this is exact (not an inference).
+        Never raises: any failure is logged at ERROR naming the swap and
+        telling the operator to protect the channel manually. Returns
+        (outbound_peer_or_None, detail_or_None)."""
+        try:
+            detail = self._client.get_swap(sid)
+        except Exception as e:
+            self._plugin.log(
+                f"LNPLUS: backfill — get_swap({sid}) failed while "
+                f"importing a running contract: {e}; importing with "
+                "outbound_peer NULL — operator must protect this channel "
+                "manually", level="error")
+            return None, None
+        participants = detail.get("participants") if isinstance(detail, dict) else None
+        if not participants:
+            self._plugin.log(
+                f"LNPLUS: backfill — get_swap({sid}) returned no usable "
+                "participants while importing a running contract; "
+                "importing with outbound_peer NULL — operator must "
+                "protect this channel manually", level="error")
+            return None, (detail if isinstance(detail, dict) else None)
+        try:
+            our_id = self.rpc.getinfo().get("id")
+        except Exception:
+            our_id = None
+        by_ident = {}
+        our_ident = None
+        for p in participants:
+            ident = p.get("participant_identifier")
+            pk = p.get("pubkey")
+            if ident is None:
+                continue
+            by_ident[ident] = pk
+            if our_id and pk == our_id:
+                our_ident = ident
+        if our_ident is None or not by_ident:
+            self._plugin.log(
+                f"LNPLUS: backfill — could not locate our own pubkey "
+                f"among swap {sid}'s participants; importing with "
+                "outbound_peer NULL — operator must protect this channel "
+                "manually", level="error")
+            return None, detail
+        letters = sorted(by_ident.keys())
+        idx = letters.index(our_ident)
+        outbound_pk = by_ident.get(letters[(idx + 1) % len(letters)])
+        if not _valid_pubkey(outbound_pk):
+            self._plugin.log(
+                f"LNPLUS: backfill — derived outbound pubkey for swap "
+                f"{sid} is invalid; importing with outbound_peer NULL — "
+                "operator must protect this channel manually", level="error")
+            return None, detail
+        return outbound_pk, detail
+
+    def _backfill_ended_contract(self, sid: str, entry: Dict, ends_ts: Optional[int],
+                                 incoming_peer: Optional[str], now: int,
+                                 imported: Dict, warnings: List[str]) -> None:
+        """Rule 4: a contract that already ended before this automation
+        existed. Never rate it — the still-open heuristic used by
+        _finalize is only valid to check AT contract end, and a peer who
+        legitimately closed after expiry must not be defamed. Bumping peer
+        history (no rating, no defection) is a best-effort seed only."""
+        capacity = entry.get("capacity_sats")
+        if capacity is None:
+            warnings.append(
+                f"swap {sid}: capacity_sats unknown on import (defaulted "
+                "to 0)")
+            capacity = 0
+        duration = int(entry.get("duration_months") or 0)
+        self._db.lnplus_record_swap(
+            sid, "ended", int(capacity), duration,
+            incoming_peer=incoming_peer,
+            metadata={"imported": True, "imported_at": now})
+        fields = {"outcome": "imported_pre_automation"}
+        if ends_ts:
+            fields["ends_at"] = ends_ts
+        self._db.lnplus_update_swap(sid, **fields)
+        self._plugin.log(
+            f"LNPLUS: backfill — imported ended contract {sid} (no rating "
+            "filed — still-open heuristic is only valid at contract end)",
+            level="info")
+        if incoming_peer:
+            try:
+                self._db.lnplus_bump_peer(incoming_peer)
+            except Exception as e:
+                self._plugin.log(
+                    f"LNPLUS: backfill — lnplus_bump_peer failed for "
+                    f"{incoming_peer}: {e}", level="warn")
+        imported["ended"] += 1
+
+    def _resolve_capacity_duration(self, entry: Dict, sid: str, warnings: List[str]):
+        """Rule 1/2: capacity_sats/duration_months from the entry, falling
+        back to get_swap(sid) detail if either is absent; if still
+        unknown, default to 0 and warn."""
+        capacity = entry.get("capacity_sats")
+        duration = entry.get("duration_months")
+        if capacity is None or duration is None:
+            try:
+                detail = self._client.get_swap(sid)
+            except Exception:
+                detail = None
+            if isinstance(detail, dict):
+                if capacity is None:
+                    capacity = detail.get("capacity_sats")
+                if duration is None:
+                    duration = detail.get("duration_months")
+        if capacity is None:
+            warnings.append(
+                f"swap {sid}: capacity_sats unknown on import (defaulted "
+                "to 0)")
+            capacity = 0
+        if duration is None:
+            warnings.append(
+                f"swap {sid}: duration_months unknown on import (defaulted "
+                "to 0)")
+            duration = 0
+        return int(capacity), int(duration)
 
     # -- watcher -----------------------------------------------------------
     def run_watcher_once(self) -> Dict:

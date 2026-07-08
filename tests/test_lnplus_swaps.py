@@ -164,12 +164,43 @@ class TestLnplusClient:
         assert _parse_ts("garbage") is None
 
     def test_auth_flow_signs_challenge(self):
+        # LN+ docs show get_my_swaps wrapping its response in a one-element
+        # array — this is the documented reality, so the primary happy-path
+        # test now serves the ARRAY-wrapped payload.
         challenge = {"message": "lnplus-auth-abc123", "expires_at": "2099-01-01T00:00:00Z"}
-        client, rpc, patcher = _make_client([challenge, {"pending": [], "opening": [], "completed": []}])
+        client, rpc, patcher = _make_client(
+            [challenge, [{"pending": [], "opening": [], "completed": []}]])
         with patcher:
             result = client.get_my_swaps()
         rpc.signmessage.assert_called_once_with("lnplus-auth-abc123")
         assert result["pending"] == []
+
+    def test_get_my_swaps_bare_dict_still_accepted(self):
+        """Docs are ambiguous about whether the envelope is always present
+        — a bare dict (no array wrapper) must still be accepted."""
+        challenge = {"message": "lnplus-auth-abc123", "expires_at": "2099-01-01T00:00:00Z"}
+        client, rpc, patcher = _make_client(
+            [challenge, {"pending": [{"id": "p1"}], "opening": [], "completed": []}])
+        with patcher:
+            result = client.get_my_swaps()
+        assert result["pending"] == [{"id": "p1"}]
+
+    def test_get_my_swaps_empty_list_returns_empty_buckets(self):
+        challenge = {"message": "lnplus-auth-abc123", "expires_at": "2099-01-01T00:00:00Z"}
+        client, rpc, patcher = _make_client([challenge, []])
+        with patcher:
+            result = client.get_my_swaps()
+        assert result == {"pending": [], "opening": [], "completed": []}
+
+    def test_get_my_swaps_garbage_payload_raises(self):
+        challenge = {"message": "lnplus-auth-abc123", "expires_at": "2099-01-01T00:00:00Z"}
+        client, rpc, patcher = _make_client([challenge, "not a payload"])
+        with patcher:
+            try:
+                client.get_my_swaps()
+                assert False, "should have raised"
+            except LNPlusError:
+                pass
 
     def test_auth_rejects_suspicious_challenge(self):
         # Never sign something that looks like an invoice.
@@ -549,9 +580,16 @@ class TestSwapLifecycle:
         """I1 regression: gate 0 only checked the 'opening' list for
         LN+-side entries with no local record. A pending application LN+
         knows about, with no local row at all, is an untracked live
-        commitment ('ghost') and must trip the breaker too."""
+        commitment ('ghost') and must trip the breaker too.
+
+        Audit wave A / Part 2: an unknown pending entry on the very FIRST
+        pass is now adopted by backfill_from_lnplus rather than treated as
+        a ghost (see TestLnplusBackfill for that case) — the backfill flag
+        is primed here to exercise genuine post-backfill ghost detection,
+        which must still trip the breaker."""
         lc, db, rpc, client, *_ = _make_lifecycle(
             my_swaps={"pending": [{"id": "ghost1"}], "opening": [], "completed": []})
+        db.set_config_override(SwapLifecycle._BACKFILL_FLAG, str(int(time.time())))
         assert lc.reconcile_ok() is False
         assert "ghost1" in lc.breaker_tripped()
 
@@ -961,3 +999,262 @@ class TestLnplusIntegration:
         client.create_rating.assert_called_with("sw1", "positive")
         ignore_fn.assert_not_called()
         assert lifecycle.has_inflight() is False
+
+
+class TestLnplusBackfill:
+    """Audit wave A / Part 2: adopt pre-existing (manual) LN+ swaps into
+    the local ledger. See docs/plans/2026-07-05-lnplus-swap-automation-design.md
+    and .superpowers/sdd/audit-wave-a-brief.md for the mechanism."""
+
+    def test_pending_entry_imports_applied_row(self):
+        my = {"pending": [{"id": "p1", "capacity_sats": 3_000_000, "duration_months": 3}],
+              "opening": [], "completed": []}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+        result = lc.backfill_from_lnplus()
+        row = db.lnplus_get_swap("p1")
+        assert row["status"] == "applied"
+        assert row["capacity_sats"] == 3_000_000
+        assert row["duration_months"] == 3
+        assert row["outbound_peer"] is None
+        assert row["incoming_peer"] is None
+        assert row["our_identifier"] is None
+        assert row["applied_at"] > 0
+        assert result["imported"]["pending"] == 1
+
+    def test_opening_entry_imports_opening_row(self):
+        deadline = int(time.time()) + 40 * 3600
+        my = {"pending": [], "opening": [
+            {"id": "o1", "outgoing_peer_pubkey": PK_A, "deadline": deadline,
+             "capacity_sats": 2_000_000, "duration_months": 3}], "completed": []}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+        result = lc.backfill_from_lnplus()
+        row = db.lnplus_get_swap("o1")
+        assert row["status"] == "opening"
+        assert row["outbound_peer"] == PK_A
+        assert row["deadline_at"] == deadline
+        assert row["capacity_sats"] == 2_000_000
+        assert result["imported"]["opening"] == 1
+
+    def test_running_contract_imports_opened_row_with_derived_outbound(self):
+        ends = int(time.time()) + 30 * 86400
+        detail = {"participants": [
+            {"participant_identifier": "A", "pubkey": FLEET_PK},
+            {"participant_identifier": "B", "pubkey": PK_A},
+            {"participant_identifier": "C", "pubkey": PK_B}]}
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "c1", "incoming_peer_pubkey": PK_B, "ends": ends,
+             "capacity_sats": 4_000_000, "duration_months": 3}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+        rpc.getinfo.return_value = {"id": FLEET_PK}
+        client.get_swap.return_value = detail
+        result = lc.backfill_from_lnplus()
+        row = db.lnplus_get_swap("c1")
+        assert row["status"] == "opened"
+        assert row["outbound_peer"] == PK_A   # A (us) -> next letter B -> PK_A
+        assert row["incoming_peer"] == PK_B
+        assert row["ends_at"] == ends
+        assert row["opened_at"] is None
+        assert result["imported"]["active"] == 1
+
+    def test_ended_contract_imports_ended_row(self):
+        ends = int(time.time()) - 86400
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "e1", "incoming_peer_pubkey": PK_B, "ends": ends,
+             "capacity_sats": 1_500_000, "duration_months": 3}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+        result = lc.backfill_from_lnplus()
+        row = db.lnplus_get_swap("e1")
+        assert row["status"] == "ended"
+        assert row["outcome"] == "imported_pre_automation"
+        assert row["ends_at"] == ends
+        assert row["incoming_peer"] == PK_B
+        client.create_rating.assert_not_called()
+        assert result["imported"]["ended"] == 1
+
+    def test_rerun_is_noop(self):
+        ends_running = int(time.time()) + 30 * 86400
+        ends_ended = int(time.time()) - 86400
+        my = {"pending": [{"id": "p1", "capacity_sats": 1_000_000, "duration_months": 3}],
+              "opening": [{"id": "o1", "outgoing_peer_pubkey": PK_A,
+                          "deadline": int(time.time()) + 40 * 3600,
+                          "capacity_sats": 2_000_000, "duration_months": 3}],
+              "completed": [
+                  {"id": "c1", "incoming_peer_pubkey": PK_B, "ends": ends_running,
+                   "capacity_sats": 3_000_000, "duration_months": 3},
+                  {"id": "e1", "incoming_peer_pubkey": PK_B, "ends": ends_ended,
+                   "capacity_sats": 1_500_000, "duration_months": 3}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+        rpc.getinfo.return_value = {"id": FLEET_PK}
+        client.get_swap.return_value = {"participants": [
+            {"participant_identifier": "A", "pubkey": FLEET_PK},
+            {"participant_identifier": "B", "pubkey": PK_A}]}
+        lc.backfill_from_lnplus()
+        before = {sid: db.lnplus_get_swap(sid) for sid in ("p1", "o1", "c1", "e1")}
+        result2 = lc.backfill_from_lnplus()
+        after = {sid: db.lnplus_get_swap(sid) for sid in ("p1", "o1", "c1", "e1")}
+        assert before == after
+        assert result2["imported"] == {"pending": 0, "opening": 0, "active": 0, "ended": 0}
+        assert set(result2["skipped"]) == {"p1", "o1", "c1", "e1"}
+
+    def test_automation_owned_row_untouched(self):
+        my = {"pending": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": PK_A,
+             "deadline": int(time.time()) + 40 * 3600,
+             "capacity_sats": 2_000_000, "duration_months": 3}], "completed": []}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="opening", capacity_sats=9_999_999,
+                 duration_months=6, outbound_peer=PK_B)])
+        db.lnplus_update_swap("s1", channel_funding_txid="aa" * 32)
+        result = lc.backfill_from_lnplus()
+        row = db.lnplus_get_swap("s1")
+        assert row["capacity_sats"] == 9_999_999
+        assert row["outbound_peer"] == PK_B
+        assert row["channel_funding_txid"] == "aa" * 32
+        assert "s1" in result["skipped"]
+        assert result["imported"] == {"pending": 0, "opening": 0, "active": 0, "ended": 0}
+
+    def test_first_watcher_pass_imports_and_sets_flag_no_breaker(self):
+        my = {"pending": [{"id": "p1", "capacity_sats": 1_000_000, "duration_months": 3}],
+              "opening": [{"id": "o1", "outgoing_peer_pubkey": PK_A,
+                          "deadline": int(time.time()) + 40 * 3600,
+                          "capacity_sats": 2_000_000, "duration_months": 3}],
+              "completed": []}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.fundchannel.return_value = {"txid": "ff" * 32}
+        lc.run_watcher_once()
+        assert lc.breaker_tripped() is None
+        assert db.get_config_override(SwapLifecycle._BACKFILL_FLAG) is not None
+
+    def test_new_ghost_after_flag_set_trips_breaker(self):
+        lc, db, rpc, client, *_ = _make_lifecycle(
+            my_swaps={"pending": [], "opening": [], "completed": []})
+        lc.run_watcher_once()  # sets flag, nothing to import
+        assert db.get_config_override(SwapLifecycle._BACKFILL_FLAG) is not None
+        client.get_my_swaps.return_value = {
+            "pending": [{"id": "ghost1"}], "opening": [], "completed": []}
+        lc.run_watcher_once()
+        assert lc.breaker_tripped() is not None
+        assert "ghost1" in lc.breaker_tripped()
+
+    def test_imported_opening_entry_opens_same_pass(self):
+        deadline = int(time.time()) + 40 * 3600
+        my = {"pending": [], "opening": [
+            {"id": "o1", "outgoing_peer_pubkey": PK_A,
+             "outgoing_peer_clearnet_address": "1.2.3.4:9735",
+             "deadline": deadline, "capacity_sats": 2_000_000,
+             "duration_months": 3}], "completed": []}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.fundchannel.return_value = {"txid": "ff" * 32}
+        lc.run_watcher_once()
+        rpc.fundchannel.assert_called_once()
+        assert rpc.fundchannel.call_args.args[1] == 2_000_000
+        row = db.lnplus_get_swap("o1")
+        assert row["status"] == "opened"
+
+    def test_imported_running_contract_activates_same_pass(self):
+        ends = int(time.time()) + 30 * 86400
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "c1", "incoming_peer_pubkey": PK_B, "ends": ends,
+             "capacity_sats": 3_000_000, "duration_months": 3}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my)
+        rpc.getinfo.return_value = {"id": FLEET_PK}
+        client.get_swap.return_value = {"participants": [
+            {"participant_identifier": "A", "pubkey": FLEET_PK},
+            {"participant_identifier": "B", "pubkey": PK_A}]}
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("c1")
+        assert row["status"] == "active"
+        assert row["ends_at"] == ends
+        policy.add_tag.assert_called_once_with(PK_A, "no_close")
+
+    def test_imported_running_contract_get_swap_failure_leaves_outbound_null(self):
+        ends = int(time.time()) + 30 * 86400
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "c1", "incoming_peer_pubkey": PK_B, "ends": ends,
+             "capacity_sats": 3_000_000, "duration_months": 3}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my)
+        client.get_swap.side_effect = Exception("lnplus down")
+        result = lc.run_watcher_once()   # must not raise
+        row = db.lnplus_get_swap("c1")
+        assert row is not None
+        assert row["outbound_peer"] is None
+        assert row["status"] == "active"   # phase 4 still activates this pass
+        policy.add_tag.assert_not_called()  # nothing to tag with a NULL peer
+        error_logged = any(
+            call.kwargs.get("level") == "error" and "c1" in call.args[0]
+            for call in lc._plugin.log.call_args_list)
+        assert error_logged
+        assert "c1" not in result.get("errors", [])   # handled, no crash
+
+    def test_imported_ended_contract_no_rating(self):
+        ends = int(time.time()) - 86400
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "e1", "incoming_peer_pubkey": PK_B, "ends": ends,
+             "capacity_sats": 1_000_000, "duration_months": 3}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("e1")
+        assert row["status"] == "ended"
+        client.create_rating.assert_not_called()
+
+    def test_backfill_failure_blocks_flag_and_divergence_check(self):
+        my = {"pending": [
+            {"id": "p1", "capacity_sats": 1_000_000, "duration_months": 3},
+            {"id": "p2", "capacity_sats": 1_000_000, "duration_months": 3}],
+            "opening": [], "completed": []}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+        real_record = db.lnplus_record_swap
+        call_count = {"n": 0}
+
+        def _flaky_record(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise RuntimeError("db boom")
+            return real_record(*args, **kwargs)
+
+        with patch.object(db, "lnplus_record_swap", side_effect=_flaky_record):
+            ok = lc._reconcile(my)
+        assert ok is False
+        assert db.get_config_override(SwapLifecycle._BACKFILL_FLAG) is None
+        assert lc.breaker_tripped() is None
+
+    def test_invalid_pubkeys_result_in_null_fields(self):
+        ends = int(time.time()) - 86400
+        my = {"pending": [],
+              "opening": [{"id": "o1", "outgoing_peer_pubkey": "not-a-pubkey",
+                          "deadline": int(time.time()) + 40 * 3600,
+                          "capacity_sats": 2_000_000, "duration_months": 3}],
+              "completed": [{"id": "e1", "incoming_peer_pubkey": "also-bad",
+                            "ends": ends, "capacity_sats": 1_000_000,
+                            "duration_months": 3}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+        result = lc.backfill_from_lnplus()
+        row_o = db.lnplus_get_swap("o1")
+        row_e = db.lnplus_get_swap("e1")
+        assert row_o["outbound_peer"] is None
+        assert row_e["incoming_peer"] is None
+        assert any("o1" in w for w in result["warnings"])
+        assert any("e1" in w for w in result["warnings"])
+
+    def test_backfill_returns_per_category_counts(self):
+        my = {"pending": [{"id": "p1", "capacity_sats": 1_000_000, "duration_months": 3}],
+              "opening": [{"id": "o1", "outgoing_peer_pubkey": PK_A,
+                          "deadline": int(time.time()) + 40 * 3600,
+                          "capacity_sats": 2_000_000, "duration_months": 3}],
+              "completed": [
+                  {"id": "c1", "incoming_peer_pubkey": PK_B,
+                   "ends": int(time.time()) + 30 * 86400,
+                   "capacity_sats": 3_000_000, "duration_months": 3},
+                  {"id": "e1", "incoming_peer_pubkey": PK_B,
+                   "ends": int(time.time()) - 86400,
+                   "capacity_sats": 1_500_000, "duration_months": 3}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
+        rpc.getinfo.return_value = {"id": FLEET_PK}
+        client.get_swap.return_value = {"participants": [
+            {"participant_identifier": "A", "pubkey": FLEET_PK},
+            {"participant_identifier": "B", "pubkey": PK_A}]}
+        result = lc.backfill_from_lnplus()
+        assert result["imported"] == {"pending": 1, "opening": 1, "active": 1, "ended": 1}
+        assert result["skipped"] == []

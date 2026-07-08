@@ -4560,6 +4560,20 @@ def revenue_lnplus_abandon(plugin: Plugin, swap_id: str = None, **_unused: Any) 
             "warning": "This defects on an LN+ commitment; expect a negative rating."}
 
 
+@plugin.method("revenue-lnplus-backfill")
+def revenue_lnplus_backfill(plugin: Plugin, **_unused: Any) -> Dict[str, Any]:
+    """Adopt pre-existing LN+ swaps into the local ledger.
+
+    Operator remedy for swaps applied/opened/settled manually on the LN+
+    website (before this automation existed, or afterward if the operator
+    deliberately did something manual). Safe to run repeatedly — existing
+    rows are never touched.
+    """
+    if lnplus_lifecycle is None:
+        return {"error": "LN+ automation not initialized"}
+    return lnplus_lifecycle.backfill_from_lnplus()
+
+
 @plugin.method("revenue-planner-candidate-sources")
 def planner_candidate_sources(plugin: Plugin):
     """Show strategy distribution of the current candidate pool."""
