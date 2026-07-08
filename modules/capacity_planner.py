@@ -127,6 +127,7 @@ class CapacityPlanner:
         self.external_liquidity_cost_provider = None
         self._capex_engine = None
         self._capital_efficiency = None
+        self.lnplus_evaluator = None  # Injected by main plugin (Task 5)
         # Coordination signals: cached from last execute_cycle for Boltz integration
         self._last_loser_scids: set = set()        # SCIDs with action=CLOSE
         self._last_funding_deficit_sats: int = 0    # On-chain shortfall for next open
@@ -508,6 +509,15 @@ class CapacityPlanner:
             except Exception as e:
                 self.plugin.log(f"Cannot determine available funds: {e}", level='debug')
 
+            # LN+ swaps in flight reserve on-chain capacity for their opens —
+            # keep the regular-open sizer from double-spending it.
+            try:
+                _lnplus_reserved = self.profitability.database.lnplus_reserved_sats()
+            except Exception:
+                _lnplus_reserved = 0
+            if isinstance(_lnplus_reserved, (int, float)) and not isinstance(_lnplus_reserved, bool) and _lnplus_reserved:
+                available_sats = max(0, available_sats - _lnplus_reserved)
+
             # Detect funding deficit: best candidate needs more than available
             if candidates:
                 top = max(candidates, key=lambda c: c.get("score", 0))
@@ -591,6 +601,19 @@ class CapacityPlanner:
                 key=lambda c: (c.get("_planned_ev", 0), c.get("score", 0)),
                 reverse=True,
             )
+
+            # 7a. LN+ swap evaluation — swaps are preferred within the margin
+            if self.lnplus_evaluator is not None and opens_this_cycle < max_opens:
+                try:
+                    _best_regular_ev = (ranked_candidates[0].get("_planned_ev", 0.0)
+                                        if ranked_candidates else 0.0)
+                    _lnplus_summary = self.lnplus_evaluator.run_cycle(cfg, _best_regular_ev)
+                    summary["lnplus"] = _lnplus_summary
+                    if _lnplus_summary.get("applied"):
+                        opens_this_cycle += 1
+                except Exception as e:
+                    self.plugin.log(f"LNPLUS: evaluator failed: {e}", level="warn")
+
             for candidate in ranked_candidates:
                 if opens_this_cycle >= max_opens:
                     break

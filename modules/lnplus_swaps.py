@@ -310,6 +310,126 @@ class SwapEvaluator:
         summary["rejections"].append(
             {"swap_id": swap.get("id"), "gate": gate, "reason": reason})
 
-    # -- placeholder until the ranking task ------------------------------
+    def _swap_ev(self, swap, cfg, best_regular_ev: float):
+        assignment = self._infer_assignment(swap)
+        capacity = int(swap.get("capacity_sats") or 0)
+        duration = int(swap.get("duration_months") or 0)
+        outbound_ev = float(self._planner._calculate_open_ev(
+            assignment["outbound_peer"], capacity, cfg) or 0.0)
+        inbound_corridor = float(self._planner._calculate_open_ev(
+            assignment["incoming_peer"], capacity, cfg) or 0.0)
+        replacement = capacity * BOLTZ_REPLACEMENT_RATE
+        inbound_credit = min(inbound_corridor, replacement)
+
+        counterparties = [p for p in (swap.get("participants") or [])]
+        min_pos = min((int(p.get("positive_ratings_count") or 0) for p in counterparties),
+                      default=0)
+        reliability = min(1.0, RELIABILITY_FLOOR + 0.4 * min(1.0, min_pos / 50.0))
+        if counterparties and all(self._tor_only(p) for p in counterparties):
+            reliability *= TOR_RELIABILITY
+
+        lockup_haircut = P_UNDERPERFORM * max(0.0, best_regular_ev) * (duration / 12.0)
+        open_cost = int(self._planner._estimate_open_cost() or 0)
+        value = (outbound_ev
+                 + inbound_credit * reliability * float(cfg.lnplus_inbound_credit_factor)
+                 - lockup_haircut - open_cost)
+        return value, assignment
+
+    @staticmethod
+    def _tor_only(participant) -> bool:
+        addrs = [a for a in (participant.get("address_1"), participant.get("address_2")) if a]
+        return bool(addrs) and all(".onion" in str(a) for a in addrs)
+
     def _select_and_apply(self, qualifying, cfg, best_regular_ev, summary) -> Dict:
+        scored = []
+        for swap in qualifying:
+            value, assignment = self._swap_ev(swap, cfg, best_regular_ev)
+            if value <= 0:
+                self._reject(summary, swap, f"economics:non-positive EV ({value:.0f})")
+                continue
+            scored.append((value, swap, assignment))
+        if not scored:
+            return summary
+        scored.sort(key=lambda t: t[0], reverse=True)
+        value, swap, assignment = scored[0]
+        summary["swap_ev"] = value
+        summary["swap_id"] = swap.get("id")
+
+        margin = float(cfg.lnplus_swap_preference_margin)
+        if best_regular_ev > value * (1.0 + margin):
+            self._reject(summary, swap,
+                         f"preference_margin:regular open EV {best_regular_ev:.0f} beats "
+                         f"swap EV {value:.0f} beyond {margin:.0%} margin")
+            summary["swap_id"] = None
+            return summary
+
+        open_cost = int(self._planner._estimate_open_cost() or 0)
+        capacity = int(swap.get("capacity_sats") or 0)
+        # Gate 7: confirmed unreserved on-chain funds must cover capacity + fee buffer.
+        # Fail-closed: unparseable listfunds counts as zero.
+        try:
+            outputs = self.rpc.listfunds().get("outputs", [])
+            confirmed_sats = sum(
+                int(o.get("amount_msat", 0)) // 1000
+                for o in outputs
+                if o.get("status") == "confirmed" and not o.get("reserved"))
+        except Exception:
+            confirmed_sats = 0
+        if confirmed_sats < capacity + open_cost:
+            self._reject(summary, swap,
+                         f"economics:confirmed funds {confirmed_sats} below "
+                         f"capacity+fees {capacity + open_cost}")
+            summary["swap_id"] = None
+            return summary
+        capex = getattr(self._planner, "_capex_engine", None)
+        if capex is not None:
+            try:
+                raw_budget = capex.get_fleet_exploration_budget()
+            except Exception:
+                raw_budget = None
+            # Only enforce the gate when the engine returns a real number —
+            # an unwired/mocked engine (no usable budget signal) doesn't block.
+            if isinstance(raw_budget, (int, float)) and not isinstance(raw_budget, bool):
+                budget = int(raw_budget)
+                if budget < open_cost:
+                    self._reject(summary, swap,
+                                 f"economics:capex budget {budget} below open cost {open_cost}")
+                    summary["swap_id"] = None
+                    return summary
+
+        reason = (f"LN+ swap {swap.get('id')}: EV {value:.0f} vs regular {best_regular_ev:.0f}, "
+                  f"{capacity} sats for {swap.get('duration_months')}mo")
+        action_id = self._db.record_planner_action(
+            action_type="swap_apply",
+            peer_id=assignment.get("outbound_peer") or "unknown",
+            amount_sats=capacity, estimated_cost_sats=open_cost,
+            reason=reason,
+            metadata={"swap_id": swap.get("id"),
+                      "incoming_peer": assignment.get("incoming_peer")})
+
+        if not getattr(cfg, "lnplus_execute_applications", False) or getattr(cfg, "planner_dry_run", False):
+            self._db.update_planner_action(action_id, status="recommended")
+            self._plugin.log(f"LNPLUS: [RECOMMEND] would apply to swap {swap.get('id')} — {reason}")
+            summary["recommended"] = True
+            return summary
+
+        # Intent-first: ledger row before the external call.
+        self._db.lnplus_record_swap(
+            str(swap.get("id")), "applied", capacity,
+            int(swap.get("duration_months") or 0),
+            outbound_peer=assignment.get("outbound_peer"),
+            incoming_peer=assignment.get("incoming_peer"),
+            our_identifier=assignment.get("our_identifier"),
+            planner_action_id=action_id)
+        try:
+            self._client.create_application(swap.get("id"))
+        except LNPlusError as e:
+            self._db.lnplus_update_swap(str(swap.get("id")), status="failed",
+                                        outcome=f"apply failed: {e}")
+            self._db.update_planner_action(action_id, status="failed")
+            self._plugin.log(f"LNPLUS: application to {swap.get('id')} failed: {e}", level="warn")
+            return summary
+        self._db.update_planner_action(action_id, status="completed")
+        self._plugin.log(f"LNPLUS: applied to swap {swap.get('id')} — {reason}")
+        summary["applied"] = True
         return summary

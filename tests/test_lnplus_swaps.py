@@ -341,3 +341,102 @@ class TestSwapEvaluatorGates:
         assert a["our_identifier"] == "C"
         assert a["outbound_peer"] == PK_A     # C opens to A (wraps)
         assert a["incoming_peer"] == PK_B     # B opens to C
+
+
+class TestSwapEvAndApply:
+    def test_swap_ev_computation(self):
+        ev, cfg, _, _ = _make_evaluator()
+        # outbound_ev = inbound_corridor = 1000.0 (mocked), open cost 2000
+        # replacement = 5M * 0.005 = 25000 -> inbound_credit = 1000
+        # min pos ratings = 12 -> reliability = 0.6 + 0.4*(12/50) = 0.696 (clearnet)
+        # haircut = 0.3 * 800 * (3/12) = 60 (best_regular_ev=800)
+        value, assignment = ev._swap_ev(_swap_fixture(), cfg, best_regular_ev=800.0)
+        expected = 1000.0 + 1000.0 * 0.696 * 0.5 - 60.0 - 2000
+        assert abs(value - expected) < 1.0
+        assert assignment["outbound_peer"] == PK_A
+
+    def test_tor_only_counterparty_discounted(self):
+        swap = _swap_fixture()
+        for p in swap["participants"]:
+            p["address_1"] = "abcdef.onion:9735"
+            p["address_2"] = None
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        tor_value, _ = ev._swap_ev(swap, cfg, best_regular_ev=0.0)
+        clear_value, _ = ev._swap_ev(_swap_fixture(), cfg, best_regular_ev=0.0)
+        assert tor_value < clear_value
+
+    def test_swap_wins_within_margin_and_applies(self):
+        ev, cfg, client, db = _make_evaluator()
+        ev._planner._calculate_open_ev.return_value = 5000.0
+        client.create_application.return_value = {"id": "sw1", "status": "pending"}
+        db.record_planner_action = MagicMock(return_value=42)
+        db.update_planner_action = MagicMock()
+        # swap_ev clearly positive; best_regular_ev inside margin
+        result = ev.run_cycle(cfg, best_regular_ev=3000.0)
+        assert result["applied"] is True
+        assert result["swap_id"] == "sw1"
+        client.create_application.assert_called_once_with("sw1")
+        # intent-first: DB row exists with status applied
+        row = ev._db.lnplus_get_swap("sw1")
+        assert row["status"] == "applied"
+        db.record_planner_action.assert_called_once()
+        assert db.record_planner_action.call_args.kwargs["action_type"] == "swap_apply"
+
+    def test_regular_open_beats_margin(self):
+        ev, cfg, client, _ = _make_evaluator()
+        # swap EV positive but small: 2500 + 2500*0.696*0.5 - 0.3*10000*(3/12) - 2000 = 620
+        # margin: 10000 > 620 * 1.2 -> regular open wins
+        ev._planner._calculate_open_ev.return_value = 2500.0
+        result = ev.run_cycle(cfg, best_regular_ev=10_000.0)
+        assert result["applied"] is False
+        client.create_application.assert_not_called()
+        assert any(r["gate"] == "preference_margin" for r in result["rejections"])
+
+    def test_insufficient_onchain_funds_blocks(self):
+        ev, cfg, client, _ = _make_evaluator()
+        ev._planner._calculate_open_ev.return_value = 5000.0
+        # confirmed on-chain funds below capacity + open cost
+        ev.rpc.listfunds.return_value = {"outputs": [
+            {"amount_msat": 1_000_000_000, "status": "confirmed", "reserved": False}]}
+        result = ev.run_cycle(cfg, best_regular_ev=0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "economics" and "funds" in r["reason"]
+                   for r in result["rejections"])
+
+    def test_negative_ev_rejected(self):
+        ev, cfg, client, _ = _make_evaluator()
+        ev._planner._calculate_open_ev.return_value = 0.0   # ev = -open_cost < 0
+        result = ev.run_cycle(cfg, best_regular_ev=0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "economics" for r in result["rejections"])
+
+    def test_recommend_only_mode(self):
+        ev, cfg, client, db = _make_evaluator({"lnplus_execute_applications": False})
+        ev._planner._calculate_open_ev.return_value = 5000.0
+        db.record_planner_action = MagicMock(return_value=43)
+        db.update_planner_action = MagicMock()
+        result = ev.run_cycle(cfg, best_regular_ev=0.0)
+        assert result["recommended"] is True and result["applied"] is False
+        client.create_application.assert_not_called()
+        db.update_planner_action.assert_called_with(43, status="recommended")
+
+    def test_capex_budget_blocks(self):
+        ev, cfg, client, _ = _make_evaluator()
+        ev._planner._calculate_open_ev.return_value = 5000.0
+        ev._planner._capex_engine.get_fleet_exploration_budget.return_value = 0
+        result = ev.run_cycle(cfg, best_regular_ev=0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "economics" for r in result["rejections"])
+
+    def test_application_failure_marks_failed(self):
+        ev, cfg, client, db = _make_evaluator()
+        ev._planner._calculate_open_ev.return_value = 5000.0
+        from modules.lnplus_swaps import LNPlusError
+        client.create_application.side_effect = LNPlusError("slot taken", http_status=422)
+        db.record_planner_action = MagicMock(return_value=44)
+        db.update_planner_action = MagicMock()
+        result = ev.run_cycle(cfg, best_regular_ev=0.0)
+        assert result["applied"] is False
+        row = ev._db.lnplus_get_swap("sw1")
+        assert row["status"] == "failed"
+        db.update_planner_action.assert_called_with(44, status="failed")
