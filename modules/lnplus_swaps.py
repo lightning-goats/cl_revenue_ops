@@ -1372,6 +1372,13 @@ class SwapLifecycle:
                     self._finalize(row)
                     summary["finalized"].append(sid)
                 else:
+                    # Self-heal: contracts activated before the incoming-side
+                    # protection existed (incoming_tag_added never evaluated)
+                    # get the counterparty channel tagged now. Idempotent —
+                    # stamps 0/1 on first evaluation.
+                    if row.get("incoming_tag_added") is None and row.get("incoming_peer"):
+                        self._protect_peer_no_close(sid, row["incoming_peer"],
+                                                    "incoming_tag_added")
                     self._check_mid_contract_vanish(row)
             except Exception as e:
                 self._plugin.log(f"LNPLUS: error processing active swap {sid}: {e}", level="error")
@@ -1661,30 +1668,15 @@ class SwapLifecycle:
 
         outbound_peer = row.get("outbound_peer")
         if outbound_peer:
-            # C-3 (2026-07-08 audit): only add (and later remove) the tag if
-            # WE added it. Unconditionally removing no_close in _finalize
-            # used to clobber an operator-set tag or another running
-            # contract's protection on the same peer — record whether the
-            # tag pre-existed so _finalize knows whether it is safe to
-            # touch it.
-            already_tagged = False
-            try:
-                policy = self._policy.get_policy(outbound_peer)
-                already_tagged = bool(policy and policy.has_tag("no_close"))
-            except Exception as e:
-                self._plugin.log(
-                    f"LNPLUS: get_policy failed for {outbound_peer} while "
-                    f"activating swap {sid} — assuming no_close absent: {e}",
-                    level="warn")
-            if already_tagged:
-                self._db.lnplus_update_swap(sid, tag_added=0)
-            else:
-                try:
-                    self._policy.add_tag(outbound_peer, "no_close")
-                    self._db.lnplus_update_swap(sid, tag_added=1)
-                except Exception as e:
-                    self._plugin.log(f"LNPLUS: add_tag(no_close) failed for {outbound_peer}: {e}",
-                                      level="warn")
+            self._protect_peer_no_close(sid, outbound_peer, "tag_added")
+        # The LN+ agreement binds BOTH sides of our participation: the
+        # channel the counterparty opened TO us is part of the same contract,
+        # and it is exactly the shape the planner's loser classifier likes to
+        # close (all-inbound balance, no outbound history). Closing it
+        # mid-contract is a defection just like closing our outbound side.
+        incoming_peer = row.get("incoming_peer") or (self._db.lnplus_get_swap(sid) or {}).get("incoming_peer")
+        if incoming_peer:
+            self._protect_peer_no_close(sid, incoming_peer, "incoming_tag_added")
 
         # Outcome: contract is now protected.
         self._db.lnplus_update_swap(sid, status="active")
@@ -1737,6 +1729,8 @@ class SwapLifecycle:
                 "(incoming_peer is NULL/empty); ending unjudged, no rating "
                 "filed", level="warn")
             self._release_no_close_if_ours(sid, row, outbound_peer)
+            self._release_no_close_if_ours(sid, row, row.get("incoming_peer"),
+                                           flag_column="incoming_tag_added")
             self._db.lnplus_update_swap(sid, status="ended", outcome="ended_unjudged")
             return
 
@@ -1761,6 +1755,8 @@ class SwapLifecycle:
             self._plugin.log(f"LNPLUS: create_rating failed for swap {sid}: {e}", level="warn")
 
         self._release_no_close_if_ours(sid, row, outbound_peer)
+        self._release_no_close_if_ours(sid, row, incoming_peer,
+                                       flag_column="incoming_tag_added")
 
         if incoming_peer:
             try:
@@ -1785,28 +1781,55 @@ class SwapLifecycle:
         # Outcome, after best-effort ratings/tags/ignore.
         self._db.lnplus_update_swap(sid, status="ended", outcome=rating)
 
-    def _release_no_close_if_ours(self, sid: str, row: Dict, outbound_peer: Optional[str]) -> None:
+    def _protect_peer_no_close(self, sid: str, peer: str, flag_column: str) -> None:
+        """Apply no_close protection to a contract peer, recording in
+        flag_column ('tag_added' for outbound, 'incoming_tag_added' for the
+        counterparty's channel to us) whether WE added the tag. C-3: a
+        pre-existing tag (operator-set or another contract's) is recorded as
+        0 so release never clobbers it."""
+        already_tagged = False
+        try:
+            policy = self._policy.get_policy(peer)
+            already_tagged = bool(policy and policy.has_tag("no_close"))
+        except Exception as e:
+            self._plugin.log(
+                f"LNPLUS: get_policy failed for {peer} while protecting "
+                f"swap {sid} — assuming no_close absent: {e}", level="warn")
+        if already_tagged:
+            self._db.lnplus_update_swap(sid, **{flag_column: 0})
+        else:
+            try:
+                self._policy.add_tag(peer, "no_close")
+                self._db.lnplus_update_swap(sid, **{flag_column: 1})
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: add_tag(no_close) failed for {peer}: {e}",
+                                  level="warn")
+
+    def _release_no_close_if_ours(self, sid: str, row: Dict, peer: Optional[str],
+                                  flag_column: str = "tag_added") -> None:
         """C-3 (2026-07-08 audit): unconditionally removing no_close here used
         to clobber an operator-set tag or another running contract's
-        protection on the same outbound peer. Only remove it when THIS row
-        is the one that added it (tag_added == 1, stamped by _activate) AND
-        no OTHER 'active' row still shares the same outbound_peer."""
-        if not outbound_peer:
+        protection on the same peer. Only remove it when THIS row is the one
+        that added it (flag_column == 1, stamped by _protect_peer_no_close)
+        AND no OTHER 'active' row still references the same peer in EITHER
+        contract role (outbound or incoming)."""
+        if not peer:
             return
-        if row.get("tag_added") != 1:
+        if row.get(flag_column) != 1:
             return
         other_active = [r for r in self._db.lnplus_get_swaps_by_status(["active"])
-                        if r.get("swap_id") != sid and r.get("outbound_peer") == outbound_peer]
+                        if r.get("swap_id") != sid
+                        and peer in (r.get("outbound_peer"), r.get("incoming_peer"))]
         if other_active:
             self._plugin.log(
-                f"LNPLUS: swap {sid} ended but no_close on {outbound_peer} is "
+                f"LNPLUS: swap {sid} ended but no_close on {peer} is "
                 f"still held by {len(other_active)} other active contract(s) "
                 "— not removing", level="info")
             return
         try:
-            self._policy.remove_tag(outbound_peer, "no_close")
+            self._policy.remove_tag(peer, "no_close")
         except Exception as e:
-            self._plugin.log(f"LNPLUS: remove_tag(no_close) failed for {outbound_peer}: {e}",
+            self._plugin.log(f"LNPLUS: remove_tag(no_close) failed for {peer}: {e}",
                               level="warn")
 
     def _incoming_channel_open(self, incoming_peer) -> Optional[bool]:

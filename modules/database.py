@@ -1349,7 +1349,8 @@ class Database:
                 planner_action_id INTEGER,
                 outcome TEXT,
                 metadata_json TEXT,
-                tag_added INTEGER
+                tag_added INTEGER,
+                incoming_tag_added INTEGER
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_lnplus_swaps_status ON lnplus_swaps(status)")
@@ -7229,6 +7230,7 @@ class Database:
         "status", "ends_at", "outbound_peer", "incoming_peer",
         "our_identifier", "opened_at", "completed_at",
         "channel_funding_txid", "deadline_at", "outcome", "tag_added",
+        "incoming_tag_added",
     ))
 
     def lnplus_record_swap(self, swap_id: str, status: str, capacity_sats: int,

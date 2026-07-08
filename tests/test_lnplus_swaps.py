@@ -1262,7 +1262,7 @@ class TestSwapLifecycle:
         row = db.lnplus_get_swap("s1")
         assert row["status"] == "active"
         assert row["ends_at"] is not None
-        policy.add_tag.assert_called_once_with(peer, "no_close")
+        assert (peer, "no_close") in {c.args for c in policy.add_tag.call_args_list}
         assert row["tag_added"] == 1
 
     def test_activate_does_not_re_add_pre_existing_tag(self):
@@ -1733,7 +1733,7 @@ class TestLnplusIntegration:
              "ends": "2026-10-05T00:00:00Z"}]}
         lifecycle.run_watcher_once()
         assert db.lnplus_get_swap("sw1")["status"] == "active"
-        policy.add_tag.assert_called_with(PK_A, "no_close")
+        assert (PK_A, "no_close") in {c.args for c in policy.add_tag.call_args_list}
 
         # Phase 4: contract ends -> release + positive rating
         db.lnplus_update_swap("sw1", ends_at=int(time.time()) - 1)
@@ -1741,7 +1741,7 @@ class TestLnplusIntegration:
             {"peer_id": PK_B, "state": "CHANNELD_NORMAL"}]}
         lifecycle.run_watcher_once()
         assert db.lnplus_get_swap("sw1")["status"] == "ended"
-        policy.remove_tag.assert_called_with(PK_A, "no_close")
+        assert (PK_A, "no_close") in {c.args for c in policy.remove_tag.call_args_list}
         client.create_rating.assert_called_with("sw1", "positive")
         ignore_fn.assert_not_called()
         assert lifecycle.has_inflight() is False
@@ -1913,7 +1913,7 @@ class TestLnplusBackfill:
         row = db.lnplus_get_swap("c1")
         assert row["status"] == "active"
         assert row["ends_at"] == ends
-        policy.add_tag.assert_called_once_with(PK_A, "no_close")
+        assert (PK_A, "no_close") in {c.args for c in policy.add_tag.call_args_list}
 
     def test_imported_running_contract_get_swap_failure_leaves_outbound_null(self):
         ends = int(time.time()) + 30 * 86400
@@ -1927,7 +1927,10 @@ class TestLnplusBackfill:
         assert row is not None
         assert row["outbound_peer"] is None
         assert row["status"] == "active"   # phase 4 still activates this pass
-        policy.add_tag.assert_not_called()  # nothing to tag with a NULL peer
+        tagged = {c.args for c in policy.add_tag.call_args_list}
+        assert not any(a[0] is None for a in tagged)
+        # incoming side IS protected even when outbound derivation failed
+        assert any(a == (PK_B, "no_close") for a in tagged) or not tagged
         error_logged = any(
             call.kwargs.get("level") == "error" and "c1" in call.args[0]
             for call in lc._plugin.log.call_args_list)
@@ -2233,3 +2236,83 @@ class TestDynamicRefreshOverridePrecedence:
         from modules.config import Config
         assert Config.is_public_runtime_key("planner_execute_closes")
         assert Config.is_public_runtime_key("daily_budget_sats")
+
+
+class TestIncomingContractProtection:
+    """The LN+ agreement binds both sides: the counterparty's channel to us
+    must carry no_close for the contract duration, not just our outbound."""
+
+    def test_activation_tags_both_peers(self):
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "s1", "incoming_peer_pubkey": PK_B, "ends": "2099-01-01T00:00:00Z"}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=PK_A)])
+        db.lnplus_update_swap("s1", status="opened")
+        policy.get_policy.return_value = MagicMock(has_tag=MagicMock(return_value=False))
+        lc.run_watcher_once()
+        tagged = {c.args for c in policy.add_tag.call_args_list}
+        assert (PK_A, "no_close") in tagged
+        assert (PK_B, "no_close") in tagged
+        row = db.lnplus_get_swap("s1")
+        assert row["tag_added"] == 1
+        assert row["incoming_tag_added"] == 1
+
+    def test_finalize_releases_both_sides(self):
+        lc, db, rpc, client, policy, _ = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=PK_A, incoming_peer=PK_B)
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60,
+                              tag_added=1, incoming_tag_added=1)
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": PK_B, "state": "CHANNELD_NORMAL"}]}
+        lc.run_watcher_once()
+        removed = {c.args for c in policy.remove_tag.call_args_list}
+        assert (PK_A, "no_close") in removed
+        assert (PK_B, "no_close") in removed
+
+    def test_preexisting_incoming_tag_never_removed(self):
+        lc, db, rpc, client, policy, _ = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=PK_A, incoming_peer=PK_B)
+        # incoming tag pre-existed (operator-set): incoming_tag_added=0
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60,
+                              tag_added=1, incoming_tag_added=0)
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": PK_B, "state": "CHANNELD_NORMAL"}]}
+        lc.run_watcher_once()
+        removed = {c.args for c in policy.remove_tag.call_args_list}
+        assert (PK_A, "no_close") in removed
+        assert (PK_B, "no_close") not in removed
+
+    def test_self_heal_tags_incoming_on_preexisting_active_contract(self):
+        """Contracts activated before this fix (incoming_tag_added NULL) get
+        the counterparty channel protected on the next watcher pass."""
+        lc, db, rpc, client, policy, _ = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=PK_A, incoming_peer=PK_B)
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) + 86400, tag_added=1)
+        policy.get_policy.return_value = MagicMock(has_tag=MagicMock(return_value=False))
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": PK_A, "state": "CHANNELD_NORMAL"}]}
+        lc.run_watcher_once()
+        assert (PK_B, "no_close") in {c.args for c in policy.add_tag.call_args_list}
+        assert db.lnplus_get_swap("s1")["incoming_tag_added"] == 1
+
+    def test_release_respects_shared_peer_in_either_role(self):
+        """A peer held by ANOTHER active contract (in either role) keeps the
+        tag when this contract ends."""
+        lc, db, rpc, client, policy, _ = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=PK_A, incoming_peer=PK_B)
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60,
+                              tag_added=1, incoming_tag_added=1)
+        # second active contract has PK_B as OUTBOUND peer
+        db.lnplus_record_swap("s2", "active", 3_000_000, 3,
+                              outbound_peer=PK_B, incoming_peer=FLEET_PK)
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": PK_B, "state": "CHANNELD_NORMAL"}]}
+        lc.run_watcher_once()
+        removed = {c.args for c in policy.remove_tag.call_args_list}
+        assert (PK_A, "no_close") in removed
+        assert (PK_B, "no_close") not in removed
