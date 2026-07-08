@@ -1800,12 +1800,14 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-lnplus-fleet-pubkeys',
     default='',
-    description='Comma-separated fleet node pubkeys never to join LN+ swaps with'
+    description='Comma-separated fleet node pubkeys never to join LN+ swaps with',
+    dynamic=True
 )
 plugin.add_option(
     name='revenue-ops-lnplus-watcher-interval',
     default='3600',
-    description='LN+ obligations watcher interval in seconds (default: 3600)'
+    description='LN+ obligations watcher interval in seconds (default: 3600)',
+    dynamic=True
 )
 plugin.add_option(
     name='revenue-ops-hive-hints-enabled',
@@ -3240,7 +3242,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return
         while not shutdown_event.is_set():
             try:
-                interval = max(300, int(getattr(config, 'lnplus_watcher_interval', 3600) or 3600))
+                configured_interval = int(getattr(config, 'lnplus_watcher_interval', 3600) or 3600)
+                interval = _clamp_lnplus_watcher_interval(configured_interval)
+                if interval != configured_interval:
+                    plugin.log(
+                        f"LNPLUS: watcher interval {configured_interval}s clamped to "
+                        f"{interval}s (bounds "
+                        f"{_LNPLUS_WATCHER_INTERVAL_MIN_SECONDS}-"
+                        f"{_LNPLUS_WATCHER_INTERVAL_MAX_SECONDS}s)", level='warn')
                 _record_loop_heartbeat("lnplus-watcher", interval_seconds=interval)
                 try:
                     _refresh_dynamic_config()
@@ -4553,9 +4562,22 @@ def revenue_lnplus_abandon(plugin: Plugin, swap_id: str = None, **_unused: Any) 
         return {"error": f"Unknown swap {swap_id}"}
     if row["status"] not in ("applied", "opening", "opened"):
         return {"error": f"Swap {swap_id} is not in flight (status {row['status']})"}
+    was_applied = row["status"] == "applied"
     database.lnplus_update_swap(swap_id, status="failed",
                                 outcome="abandoned by operator")
     lnplus_lifecycle.trip_breaker(f"operator abandoned swap {swap_id}")
+    # B5(a): an 'applied' row is still a LIVE application on LN+'s side —
+    # leaving it there would trip the breaker again next reconcile pass
+    # (pending ghost) forever. delete_application is only accepted by LN+
+    # while a swap is pending, so this is best-effort; a failure here is
+    # fine (the reconcile pending-ghost path retries it, see B5(b)).
+    if was_applied and lnplus_client is not None:
+        try:
+            lnplus_client.delete_application(swap_id)
+        except Exception as e:
+            plugin.log(
+                f"LNPLUS: delete_application failed for abandoned swap "
+                f"{swap_id} (best-effort): {e}", level="warn")
     return {"status": "abandoned", "swap_id": swap_id,
             "warning": "This defects on an LN+ commitment; expect a negative rating."}
 
@@ -6308,6 +6330,20 @@ def _parse_msat(msat_val: Any) -> int:
     return parse_msat(msat_val)
 
 
+_LNPLUS_WATCHER_INTERVAL_MIN_SECONDS = 300
+_LNPLUS_WATCHER_INTERVAL_MAX_SECONDS = 14400
+
+
+def _clamp_lnplus_watcher_interval(configured: int) -> int:
+    """B6(a): a watcher interval configured far too high (e.g. by a typo or
+    an over-eager operator) can otherwise starve a 48h open deadline of
+    retries. One pass per >=4h still gives >=12 retries inside a 48h
+    deadline, so clamp at that ceiling (and keep the existing >=300s floor
+    that already prevented hammering LN+)."""
+    return min(_LNPLUS_WATCHER_INTERVAL_MAX_SECONDS,
+               max(_LNPLUS_WATCHER_INTERVAL_MIN_SECONDS, int(configured)))
+
+
 def _refresh_dynamic_config():
     """Read dynamic option values from CLN and update in-memory objects.
 
@@ -6365,6 +6401,11 @@ def _refresh_dynamic_config():
             ("revenue-ops-lnplus-apply-feerate-ceiling", "lnplus_apply_feerate_ceiling", "int"),
             ("revenue-ops-lnplus-pending-timeout-days", "lnplus_pending_timeout_days", "int"),
             ("revenue-ops-lnplus-inbound-credit-factor", "lnplus_inbound_credit_factor", "float"),
+            # B6(b): fleet growth (new fleet pubkeys) and the watcher
+            # interval must not require a plugin restart — gate 6 dedup
+            # depends on lnplus_fleet_pubkeys staying live.
+            ("revenue-ops-lnplus-fleet-pubkeys", "lnplus_fleet_pubkeys", "str"),
+            ("revenue-ops-lnplus-watcher-interval", "lnplus_watcher_interval", "int"),
         ):
             _val = configs.get(_opt, {}).get("value_str", "")
             if not _val:
@@ -6374,6 +6415,8 @@ def _refresh_dynamic_config():
                     _new = _val.lower() in ("true", "1", "yes")
                 elif _cast == "int":
                     _new = int(_val)
+                elif _cast == "str":
+                    _new = _val
                 else:
                     _new = float(_val)
             except ValueError:

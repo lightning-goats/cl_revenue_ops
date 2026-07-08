@@ -66,6 +66,15 @@ class TestLnplusSwapTables:
         assert {r["swap_id"] for r in inflight} == {"s1", "s2"}
         assert db.lnplus_reserved_sats() == 5_000_000
 
+    def test_reserved_sats_excludes_already_funded_rows(self):
+        """B8: once channel_funding_txid is set the capacity already left
+        listfunds — it must not still be subtracted from available_sats."""
+        db = _make_db()
+        db.lnplus_record_swap("s1", "opening", 2_000_000, 3)
+        db.lnplus_update_swap("s1", channel_funding_txid="aa" * 32)
+        db.lnplus_record_swap("s2", "opening", 3_000_000, 3)
+        assert db.lnplus_reserved_sats() == 3_000_000
+
     def test_get_swaps_by_status(self):
         db = _make_db()
         db.lnplus_record_swap("s1", "active", 2_000_000, 3)
@@ -163,6 +172,13 @@ class TestLnplusClient:
         assert _parse_ts(1785542400) == 1785542400
         assert _parse_ts("garbage") is None
 
+    def test_parse_ts_naive_string_treated_as_utc(self):
+        """B3: a TZ-less ISO timestamp must not be interpreted in the node's
+        local timezone by .timestamp() — LN+ deadlines/ends are UTC. Assert
+        equality with the explicit-Z form rather than depending on the
+        test runner's local TZ (monkeypatching TZ is unreliable)."""
+        assert _parse_ts("2026-08-01T00:00:00") == _parse_ts("2026-08-01T00:00:00Z")
+
     def test_auth_flow_signs_challenge(self):
         # LN+ docs show get_my_swaps wrapping its response in a one-element
         # array — this is the documented reality, so the primary happy-path
@@ -237,7 +253,7 @@ class TestLnplusClient:
         assert "/api/2/get_swap/id=..%2F..%2Fevil" in captured["url"]
 
 
-from modules.lnplus_swaps import SwapEvaluator, NEG_RATIO_MAX, TOR_RELIABILITY
+from modules.lnplus_swaps import SwapEvaluator, NEG_RATIO_MAX, TOR_RELIABILITY, _IDENTIFIERS
 
 PK_A = "02" + "aa" * 32
 PK_B = "03" + "bb" * 32
@@ -395,6 +411,51 @@ class TestSwapEvaluatorGates:
         assert result["applied"] is False
         assert any(r["gate"] == "terms" and "existing channel" in r["reason"]
                    for r in result["rejections"])
+
+    def test_rejects_full_identifier_set_no_free_slot(self):
+        """B11: a full identifier set (participant count == cfg's own
+        max_participants ceiling, so every _IDENTIFIERS slot is occupied)
+        must be rejected cleanly via a gate ('terms:no free participant
+        slot'), not raise a bare StopIteration through the gate chain."""
+        max_participants = 4
+        letters = _IDENTIFIERS[:max_participants]
+        participants = [
+            {"participant_identifier": letter,
+             "pubkey": "02" + f"{i:02x}" * 32,
+             "positive_ratings_count": 20, "negative_ratings_count": 0,
+             "address_1": "1.2.3.4:9735"}
+            for i, letter in enumerate(letters, start=1)
+        ]
+        swap = _swap_fixture(participant_max_count=max_participants,
+                             participant_waiting_for_count=1,
+                             participants=participants)
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "terms" and "no free participant slot" in r["reason"]
+                   for r in result["rejections"])
+
+    def test_cancelled_participant_does_not_veto_peer_gate(self):
+        """B12: a cancelled participant's stats are stale and their slot is
+        effectively free — they must not veto gate 5 even with a
+        disqualifying rating."""
+        swap = _swap_fixture()
+        swap["participants"][1]["positive_ratings_count"] = 1
+        swap["participants"][1]["cancelled"] = True
+        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
+        result = ev.run_cycle(cfg, 0.0)
+        assert not any(r["gate"] == "peer_quality" for r in result["rejections"])
+
+    def test_infer_assignment_treats_cancelled_identifier_as_free(self):
+        """B12: _infer_assignment must exclude a cancelled participant from
+        the identifier map — their letter is free for us to take rather
+        than treated as occupied."""
+        swap = _swap_fixture()
+        swap["participants"][1]["cancelled"] = True   # B is cancelled
+        ev, cfg, _, _ = _make_evaluator()
+        a = ev._infer_assignment(swap)
+        assert a["our_identifier"] == "B"   # B's slot reads as free
+        assert a["incoming_peer"] == PK_A   # A -> B (us)
 
     def test_infer_assignment_triangle(self):
         ev, cfg, _, _ = _make_evaluator()
@@ -564,17 +625,82 @@ class TestSwapLifecycle:
         lc.clear_breaker()
         assert lc.breaker_tripped() is None
 
+    def test_trip_breaker_preserves_first_cause(self):
+        """B10: a second trip must not overwrite the stored reason — the
+        first cause is the diagnostic signal the operator needs."""
+        lc, db, *_ = _make_lifecycle()
+        lc.trip_breaker("first cause: missed deadline sw1")
+        lc.trip_breaker("second cause: unrelated noise sw2")
+        reason = lc.breaker_tripped()
+        assert "first cause" in reason
+        assert "second cause" not in reason
+
     def test_has_inflight(self):
         lc, db, *_ = _make_lifecycle(local_rows=[
             dict(swap_id="s1", status="applied", capacity_sats=1_000_000, duration_months=3)])
         assert lc.has_inflight() is True
 
     def test_reconcile_divergence_trips_breaker(self):
-        # Local row 'applied' but LN+ has nothing -> divergence
+        # Local row 'opening' (funds may already be committed on-chain) but
+        # LN+ has nothing -> divergence. B4 carves 'applied' rows out into a
+        # cancelled_remote transition instead (see
+        # test_reconcile_applied_row_vanished_becomes_cancelled_remote) —
+        # 'opening'/'opened' rows still trip the breaker exactly as before,
+        # since funds may already be committed and this needs an operator.
         lc, *_ = _make_lifecycle(local_rows=[
-            dict(swap_id="s1", status="applied", capacity_sats=1_000_000, duration_months=3)])
+            dict(swap_id="s1", status="opening", capacity_sats=1_000_000, duration_months=3)])
         assert lc.reconcile_ok() is False
         assert lc.breaker_tripped() is not None
+
+    def test_reconcile_applied_row_vanished_becomes_cancelled_remote(self):
+        """B4: an 'applied' row absent from pending/opening/completed on a
+        successful fetch is a REMOTE cancellation, not our defection — it
+        must transition to cancelled_remote (terminal, frees the
+        serialization slot + reservation) rather than trip the breaker
+        every pass forever."""
+        lc, db, *_ = _make_lifecycle(local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=1_000_000, duration_months=3)])
+        conn = db._get_connection()
+        conn.execute("UPDATE lnplus_swaps SET applied_at = ? WHERE swap_id = 's1'",
+                     (int(time.time()) - 3600,))
+        assert lc.reconcile_ok() is True
+        assert lc.breaker_tripped() is None
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "cancelled_remote"
+        assert lc.has_inflight() is False
+
+    def test_reconcile_fresh_application_grace_window(self):
+        """B9: a local 'applied' row with applied_at=now must not be
+        evaluated for divergence at all — the evaluator may have applied
+        milliseconds after the watcher's own get_my_swaps fetch ran."""
+        lc, db, *_ = _make_lifecycle(local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=1_000_000, duration_months=3)])
+        assert lc.reconcile_ok() is True
+        assert lc.breaker_tripped() is None
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "applied"   # untouched — not cancelled_remote either
+
+    def test_reconcile_pending_ghost_with_terminal_local_row_deletes_not_trips(self):
+        """B5(b): a pending entry LN+ still lists that matches a local row
+        we've already knowingly walked away from (failed) is cleanup, not a
+        genuine ghost — delete_application attempted, breaker NOT tripped."""
+        lc, db, rpc, client, *_ = _make_lifecycle(
+            my_swaps={"pending": [{"id": "s1"}], "opening": [], "completed": []})
+        db.set_config_override(SwapLifecycle._BACKFILL_FLAG, str(int(time.time())))
+        db.lnplus_record_swap("s1", "failed", 1_000_000, 3)
+        assert lc.reconcile_ok() is True
+        client.delete_application.assert_called_once_with("s1")
+        assert lc.breaker_tripped() is None
+
+    def test_reconcile_pending_ghost_with_no_local_row_still_trips(self):
+        """B5(b) counterpart: a true untracked ghost (no local row at all)
+        must still trip the breaker."""
+        lc, db, rpc, client, *_ = _make_lifecycle(
+            my_swaps={"pending": [{"id": "ghost1"}], "opening": [], "completed": []})
+        db.set_config_override(SwapLifecycle._BACKFILL_FLAG, str(int(time.time())))
+        assert lc.reconcile_ok() is False
+        assert "ghost1" in lc.breaker_tripped()
+        client.delete_application.assert_not_called()
 
     def test_reconcile_trips_breaker_on_pending_ghost(self):
         """I1 regression: gate 0 only checked the 'opening' list for
@@ -660,6 +786,26 @@ class TestSwapLifecycle:
         rpc.listpeerchannels.return_value = {"channels": [
             {"peer_id": peer, "state": "CHANNELD_AWAITING_LOCKIN",
              "total_msat": 2_000_000_000, "funding_txid": "aa" * 32}]}
+        lc.run_watcher_once()
+        rpc.fundchannel.assert_not_called()
+        client.complete_application.assert_called_once()
+
+    def test_dual_fund_inflated_total_msat_matched_via_to_us_msat(self):
+        """B7: under experimental-dual-fund a peer contribution inflates
+        total_msat past our committed capacity — a crash-retry must still
+        recognize the channel as ours via to_us_msat (our own promised
+        contribution) rather than funding a SECOND channel."""
+        peer = PK_A
+        my = {"pending": [], "completed": [], "opening": [
+            {"id": "s1", "outgoing_peer_pubkey": peer,
+             "deadline": int(time.time()) + 40 * 3600, "capacity_sats": 5_000_000}]}
+        lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=5_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": peer, "state": "CHANNELD_AWAITING_LOCKIN",
+             "total_msat": 7_000_000_000, "to_us_msat": 5_000_000_000,
+             "funding_txid": "aa" * 32}]}
         lc.run_watcher_once()
         rpc.fundchannel.assert_not_called()
         client.complete_application.assert_called_once()
@@ -760,6 +906,53 @@ class TestSwapLifecycle:
         client.create_rating.assert_called_once_with("s1", "negative")
         ignore_fn.assert_called_once()
         assert db.lnplus_get_peer(incoming)["defections"] == 1
+
+    def test_finalize_rpc_failure_defers_no_negative_rating(self):
+        """B2: listpeerchannels raising must not be read as "no channel" ->
+        permanent negative rating for an innocent peer. Row stays active,
+        no rating/ignore/bump — retried next hourly pass."""
+        peer, incoming = PK_A, PK_B
+        lc, db, rpc, client, policy, ignore_fn = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=peer, incoming_peer=incoming)
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60)
+        rpc.listpeerchannels.side_effect = Exception("rpc timeout")
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "active"
+        client.create_rating.assert_not_called()
+        ignore_fn.assert_not_called()
+        assert db.lnplus_get_peer(incoming) is None
+
+    def test_finalize_rpc_empty_channels_still_negative(self):
+        """B2 counterpart: an RPC that ANSWERS with no matching channel is
+        still a genuine defection — unchanged from prior behavior."""
+        peer, incoming = PK_A, PK_B
+        lc, db, rpc, client, policy, ignore_fn = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=peer, incoming_peer=incoming)
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60)
+        rpc.listpeerchannels.return_value = {"channels": []}
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "ended"
+        client.create_rating.assert_called_once_with("s1", "negative")
+        ignore_fn.assert_called_once()
+
+    def test_get_status_after_watcher_pass_carries_last_watcher_pass(self):
+        """B13: get_status must surface recent_failed, backfill_done, and
+        last_watcher_pass (in-memory, recorded at the end of every pass)."""
+        lc, db, rpc, client, *_ = _make_lifecycle()
+        db.lnplus_record_swap("s1", "failed", 1_000_000, 3)
+        db.lnplus_update_swap("s1", outcome="abandoned by operator")
+        before = int(time.time())
+        lc.run_watcher_once()
+        status = lc.get_status()
+        assert status["last_watcher_pass"] is not None
+        assert status["last_watcher_pass"]["ts"] >= before
+        assert "summary" in status["last_watcher_pass"]
+        assert status["backfill_done"] is True
+        assert any(r["swap_id"] == "s1" for r in status["recent_failed"])
 
     def test_pending_timeout_withdraws(self):
         lc, db, rpc, client, *_ = _make_lifecycle(
@@ -908,6 +1101,39 @@ class TestSwapLifecycle:
         client.complete_application.assert_not_called()
         row = db.lnplus_get_swap("s1")
         assert row["status"] == "failed"
+
+    def test_phase_3b_skips_dead_swap_on_successful_fetch(self):
+        """B1: a local 'opening' row LN+ no longer recognizes (creator
+        cancelled / we were banned / swap deleted) must NOT be funded when
+        get_my_swaps succeeds and returns it in neither opening nor
+        completed."""
+        peer = PK_A
+        lc, db, rpc, client, *_ = _make_lifecycle(
+            my_swaps={"pending": [], "opening": [], "completed": []},
+            local_rows=[dict(swap_id="s1", status="opening", capacity_sats=2_000_000,
+                             duration_months=3, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", deadline_at=int(time.time()) + 40 * 3600)
+        rpc.listpeerchannels.return_value = {"channels": []}
+        lc.run_watcher_once()
+        rpc.fundchannel.assert_not_called()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "opening"   # untouched, not funded
+
+    def test_phase_3b_still_drives_from_ledger_on_outage(self):
+        """B1 counterpart: when get_my_swaps itself fails (outage), phase 3b
+        must still drive off the local ledger unconditionally — a funded
+        deadline cannot wait on LN+ being reachable."""
+        from modules.lnplus_swaps import LNPlusError
+        peer = PK_A
+        lc, db, rpc, client, *_ = _make_lifecycle(
+            local_rows=[dict(swap_id="s1", status="opening", capacity_sats=2_000_000,
+                             duration_months=3, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", deadline_at=int(time.time()) + 40 * 3600)
+        client.get_my_swaps.side_effect = LNPlusError("down")
+        rpc.listpeerchannels.return_value = {"channels": []}
+        rpc.fundchannel.return_value = {"txid": "ff" * 32}
+        lc.run_watcher_once()
+        rpc.fundchannel.assert_called_once()
 
     def test_opened_rows_skipped_in_opening_phase(self):
         peer = PK_A
@@ -1258,3 +1484,84 @@ class TestLnplusBackfill:
         result = lc.backfill_from_lnplus()
         assert result["imported"] == {"pending": 1, "opening": 1, "active": 1, "ended": 1}
         assert result["skipped"] == []
+
+
+from types import SimpleNamespace
+from tests.plugin_test_utils import load_plugin_module
+
+
+class TestLnplusPluginWiring:
+    """Audit wave B: fixes that live in cl-revenue-ops.py rather than
+    modules/lnplus_swaps.py (B5(a) abandon RPC, B6 watcher interval clamp +
+    dynamic config refresh)."""
+
+    def test_abandon_applied_row_deletes_live_application(self):
+        """B5(a): abandoning an 'applied' row leaves a LIVE application on
+        LN+'s side unless we also ask LN+ to delete it (best-effort — the
+        reconcile pending-ghost path in B5(b) covers a delete failure)."""
+        mod = load_plugin_module()
+        mod.database = MagicMock()
+        mod.database.lnplus_get_swap.return_value = {"status": "applied"}
+        mod.lnplus_lifecycle = MagicMock()
+        mod.lnplus_client = MagicMock()
+        result = mod.revenue_lnplus_abandon(mod.plugin, swap_id="s1")
+        assert result["status"] == "abandoned"
+        mod.lnplus_client.delete_application.assert_called_once_with("s1")
+        mod.lnplus_lifecycle.trip_breaker.assert_called_once()
+
+    def test_abandon_opening_row_does_not_call_delete_application(self):
+        """B5(a): delete_application is only valid while a swap is pending
+        on LN+'s side — an 'opening'/'opened' row must not attempt it."""
+        mod = load_plugin_module()
+        mod.database = MagicMock()
+        mod.database.lnplus_get_swap.return_value = {"status": "opening"}
+        mod.lnplus_lifecycle = MagicMock()
+        mod.lnplus_client = MagicMock()
+        result = mod.revenue_lnplus_abandon(mod.plugin, swap_id="s1")
+        assert result["status"] == "abandoned"
+        mod.lnplus_client.delete_application.assert_not_called()
+
+    def test_abandon_delete_application_failure_does_not_raise(self):
+        """B5(a): delete_application is best-effort — a failure must not
+        crash the abandon RPC."""
+        mod = load_plugin_module()
+        mod.database = MagicMock()
+        mod.database.lnplus_get_swap.return_value = {"status": "applied"}
+        mod.lnplus_lifecycle = MagicMock()
+        mod.lnplus_client = MagicMock()
+        mod.lnplus_client.delete_application.side_effect = Exception("lnplus down")
+        result = mod.revenue_lnplus_abandon(mod.plugin, swap_id="s1")
+        assert result["status"] == "abandoned"
+
+    def test_watcher_interval_clamp_helper(self):
+        """B6(a): one pass per >=4h still gives >=12 retries inside a 48h
+        deadline — clamp to [300s, 14400s]."""
+        mod = load_plugin_module()
+        assert mod._clamp_lnplus_watcher_interval(100) == 300
+        assert mod._clamp_lnplus_watcher_interval(999_999) == 14400
+        assert mod._clamp_lnplus_watcher_interval(1800) == 1800
+
+    def test_fleet_pubkeys_and_watcher_interval_options_are_dynamic(self):
+        """B6(b): fleet growth (new pubkeys) and interval tuning must not
+        require a plugin restart."""
+        mod = load_plugin_module()
+        for option in ("revenue-ops-lnplus-fleet-pubkeys",
+                       "revenue-ops-lnplus-watcher-interval"):
+            assert mod.plugin.options[option]["dynamic"] is True
+
+    def test_dynamic_refresh_updates_fleet_pubkeys_and_watcher_interval(self):
+        """B6(b): _refresh_dynamic_config's cast-tuple loop must cover both
+        new options (extending the loop to support a "str" cast for
+        fleet_pubkeys)."""
+        mod = load_plugin_module()
+        mod.config = Config()
+        mod.boltz_manager = None
+        fake_rpc = MagicMock()
+        fake_rpc.listconfigs.return_value = {"configs": {
+            "revenue-ops-lnplus-fleet-pubkeys": {"value_str": PK_A + "," + PK_B},
+            "revenue-ops-lnplus-watcher-interval": {"value_str": "900"},
+        }}
+        mod.safe_plugin = SimpleNamespace(rpc=fake_rpc)
+        mod._refresh_dynamic_config()
+        assert mod.config.lnplus_fleet_pubkeys == PK_A + "," + PK_B
+        assert mod.config.lnplus_watcher_interval == 900

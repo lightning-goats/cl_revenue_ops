@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 BASE_URL = "https://lightningnetwork.plus/api/2"
@@ -47,9 +47,14 @@ def _parse_ts(value) -> Optional[int]:
         return int(value)
     if isinstance(value, str):
         try:
-            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
+        # B3: a TZ-less ISO string must not be interpreted in the node's
+        # local timezone by .timestamp() — LN+ deadlines/ends are UTC.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
     return None
 
 
@@ -233,6 +238,8 @@ class SwapEvaluator:
             if reason is None:
                 reason = self._check_participants(swap, cfg)
             if reason is None:
+                reason = self._check_assignment_available(swap)
+            if reason is None:
                 reason = self._check_existing_channel(swap)
             if reason is not None:
                 self._reject(summary, swap, reason)
@@ -293,6 +300,11 @@ class SwapEvaluator:
         if not participants:
             return "peer_quality:no visible participants"
         for p in participants:
+            # B12: a cancelled/banned participant's slot is effectively free
+            # (they are no longer party to the swap) and their historical
+            # stats are stale — they must not veto gate 5 on our behalf.
+            if p.get("cancelled") or p.get("banned"):
+                continue
             pk = p.get("pubkey")
             if not _valid_pubkey(pk):
                 return "peer_quality:invalid participant pubkey"
@@ -321,6 +333,15 @@ class SwapEvaluator:
                 return f"peer_quality:{pk[:16]} planner score {enriched:.2f} below floor"
         return None
 
+    def _check_assignment_available(self, swap) -> Optional[str]:
+        """B11: a full identifier set (malformed data, or an operator
+        raising max-participants above _IDENTIFIERS' length) leaves
+        _infer_assignment with no free slot. Reject cleanly here instead of
+        letting a bare StopIteration escape through the gate chain."""
+        if self._infer_assignment(swap).get("our_identifier") is None:
+            return "terms:no free participant slot"
+        return None
+
     def _check_existing_channel(self, swap) -> Optional[str]:
         """I5(a): reject a swap whose INFERRED outbound peer we already have
         a channel to. Without this an idempotency check can later (I5b)
@@ -345,12 +366,26 @@ class SwapEvaluator:
     def _infer_assignment(self, swap) -> Dict:
         """LN+ convention: each participant opens to the next letter; last wraps to A.
         We join as the next free identifier. Authoritative assignment is re-read
-        from get_my_swaps at open time; this is for pre-apply EV only."""
+        from get_my_swaps at open time; this is for pre-apply EV only.
+
+        B12: cancelled/banned participants are excluded from the identifier
+        map entirely — their slot is effectively free (not occupied) and
+        their pubkey must not be used as an outbound/incoming assignment.
+        B11: if no identifier is free (full/malformed participant set),
+        return a None-valued assignment instead of letting the underlying
+        next() raise a bare StopIteration — callers check our_identifier
+        and reject via _check_assignment_available."""
         participants = {p.get("participant_identifier"): p
-                        for p in (swap.get("participants") or [])}
-        ours = next(i for i in _IDENTIFIERS if i not in participants)
+                        for p in (swap.get("participants") or [])
+                        if not (p.get("cancelled") or p.get("banned"))}
+        ours = next((i for i in _IDENTIFIERS if i not in participants), None)
+        empty = {"our_identifier": None, "outbound_peer": None, "incoming_peer": None}
+        if ours is None:
+            return empty
         count = int(swap.get("participant_max_count") or (len(participants) + 1))
         letters = list(_IDENTIFIERS[:count])
+        if ours not in letters:
+            return empty
         idx = letters.index(ours)
         outbound_id = letters[(idx + 1) % len(letters)]
         incoming_id = letters[(idx - 1) % len(letters)]
@@ -518,6 +553,14 @@ _OPEN_STATES = ("OPENINGD", "CHANNELD_AWAITING_LOCKIN", "CHANNELD_NORMAL",
 # budget_params_fn on SwapLifecycle.__init__). Still counted on the atomic
 # spend rail at settle time either way.
 _DEFAULT_OPEN_COST_SATS = 2500
+# B9: local 'applied' rows younger than this are exempt from reconcile
+# divergence checks — the evaluator may have applied milliseconds after the
+# watcher's own get_my_swaps fetch ran.
+_RECONCILE_GRACE_SECONDS = 600
+# B5(b): local statuses meaning "we have already knowingly walked away from
+# this swap" — a pending ghost matching one of these is cleanup, not a
+# genuine untracked commitment.
+_TERMINAL_PENDING_GHOST_STATUSES = ("failed", "withdrawn", "cancelled_remote")
 
 
 class SwapLifecycle:
@@ -549,12 +592,25 @@ class SwapLifecycle:
         self._estimate_open_cost_fn = estimate_open_cost_fn
         self._budget_params_fn = budget_params_fn
         self._watcher_lock = threading.Lock()
+        # B13: in-memory only (no DB) — observability of the most recent
+        # watcher pass, surfaced via get_status().
+        self._last_watcher_pass: Optional[Dict] = None
 
     # -- breaker -------------------------------------------------------
     def breaker_tripped(self) -> Optional[str]:
         return self._db.get_config_override(_BREAKER_KEY)
 
     def trip_breaker(self, reason: str) -> None:
+        # B10: preserve the FIRST cause. Overwriting the stored reason on a
+        # second/later trip destroys the original diagnostic signal the
+        # operator needs — later reasons are often downstream noise from the
+        # same underlying divergence (e.g. repeated deadline misses).
+        existing = self._db.get_config_override(_BREAKER_KEY)
+        if existing:
+            self._plugin.log(
+                f"LNPLUS: CIRCUIT BREAKER TRIP — {reason} (breaker already tripped)",
+                level="error")
+            return
         self._db.set_config_override(_BREAKER_KEY, f"{int(time.time())}: {reason}")
         self._plugin.log(f"LNPLUS: CIRCUIT BREAKER TRIPPED — {reason}", level="error")
 
@@ -604,12 +660,39 @@ class SwapLifecycle:
         local_ids = {row["swap_id"] for row in local_inflight}
 
         ok = True
+        now = int(time.time())
         for row in local_inflight:
             sid = row["swap_id"]
             status = row["status"]
             if status == "applied":
-                compatible = sid in pending_ids or sid in opening_ids
+                # B9: the evaluator may have applied milliseconds after the
+                # watcher's own get_my_swaps fetch — a swap that legitimately
+                # exists on LN+ can still be invisible in `my` for one pass.
+                # Skip divergence evaluation entirely inside the grace window.
+                applied_at = row.get("applied_at") or 0
+                if now - applied_at < _RECONCILE_GRACE_SECONDS:
+                    continue
+                if sid in pending_ids or sid in opening_ids:
+                    continue
+                # B4: an 'applied' row absent from pending/opening/completed
+                # on a successful fetch is a REMOTE cancellation (creator
+                # cancelled/deleted the swap), not our defection. Tripping
+                # the breaker here every pass forever was a permanent
+                # breaker trip-loop while the row also held the
+                # serialization slot and its capacity reservation.
+                # cancelled_remote is terminal (not in
+                # _LNPLUS_INFLIGHT_STATUSES) so both free automatically.
+                self._db.lnplus_update_swap(
+                    sid, status="cancelled_remote",
+                    outcome="swap disappeared from LN+ (creator cancelled/deleted)")
+                self._plugin.log(
+                    f"LNPLUS: applied swap {sid} vanished from LN+ (not in "
+                    "pending/opening/completed) — treating as remote "
+                    "cancellation, not tripping the breaker", level="warn")
+                continue
             elif status in ("opening", "opened"):
+                # Funds may already be committed on-chain for these — this
+                # IS a divergence needing an operator, so still trip.
                 compatible = sid in opening_ids or sid in completed_ids
             else:
                 compatible = True
@@ -634,12 +717,28 @@ class SwapLifecycle:
         # about), so it must trip the breaker here instead of going unnoticed
         # forever.
         for sid in pending_ids:
-            if sid and sid not in local_ids:
-                self.trip_breaker(
-                    f"LN+ shows pending swap {sid} with no local record — "
-                    "if this swap was entered manually, run "
-                    "revenue-lnplus-backfill to adopt it")
-                ok = False
+            if not sid or sid in local_ids:
+                continue
+            # B5(b): a pending entry LN+ still lists that matches a local row
+            # we have already knowingly walked away from (terminal:
+            # failed/withdrawn/cancelled_remote) is not a "ghost" — it is a
+            # stale application we should clean up on LN+'s side. Only a
+            # pending id with NO local row at all is a true untracked ghost.
+            local_row = self._db.lnplus_get_swap(sid)
+            if local_row and local_row.get("status") in _TERMINAL_PENDING_GHOST_STATUSES:
+                try:
+                    self._client.delete_application(sid)
+                except Exception as e:
+                    self._plugin.log(
+                        f"LNPLUS: delete_application({sid}) failed for a "
+                        f"stale pending application (local status "
+                        f"{local_row.get('status')!r}): {e}", level="warn")
+                continue
+            self.trip_breaker(
+                f"LN+ shows pending swap {sid} with no local record — "
+                "if this swap was entered manually, run "
+                "revenue-lnplus-backfill to adopt it")
+            ok = False
         return ok
 
     # -- backfill of pre-existing (manual) LN+ swaps -----------------------
@@ -916,9 +1015,18 @@ class SwapLifecycle:
         if not self._watcher_lock.acquire(blocking=False):
             return {"skipped": "watcher already running"}
         try:
-            return self._run_watcher_once_locked()
+            result = self._run_watcher_once_locked()
+            self._record_watcher_pass(result)
+            return result
         finally:
             self._watcher_lock.release()
+
+    def _record_watcher_pass(self, summary: Dict) -> None:
+        """B13: in-memory only (no DB) — recorded after every pass (success
+        or outage-skip alike) for get_status() observability."""
+        counts = {k: (len(v) if isinstance(v, list) else v)
+                  for k, v in (summary or {}).items()}
+        self._last_watcher_pass = {"ts": int(time.time()), "summary": counts}
 
     def _run_watcher_once_locked(self) -> Dict:
         summary = {"opened": [], "activated": [], "finalized": [],
@@ -932,7 +1040,11 @@ class SwapLifecycle:
         except LNPlusError as e:
             self._plugin.log(f"LNPLUS: get_my_swaps unreachable: {e}", level="warn")
             summary["skipped"] = "lnplus unreachable"
-            self._phase_3b(summary, set())
+            # B1: outage path — LN+ is unreachable so we cannot know which
+            # swaps it still recognizes. Drive obligations off the local
+            # ledger unconditionally (live_ids=None disables the filter) —
+            # a funded deadline must not wait on LN+ being back up.
+            self._phase_3b(summary, set(), live_ids=None)
             return summary
 
         # Phase 2: reconcile (breaker does not block the phases below).
@@ -1024,7 +1136,13 @@ class SwapLifecycle:
 
         # Phase 3b: local opening rows not touched above this pass — the
         # funding attempt must not wait on LN+ round-trips.
-        self._phase_3b(summary, processed_opening_ids)
+        # B1: on the success path, only fund rows LN+ still recognizes
+        # (opening ∪ completed). A local 'opening' row absent from both
+        # (creator cancelled / we were banned / swap deleted) is a dead
+        # swap — funding it would commit an on-chain channel for nothing.
+        opening_ids = {e.get("id") for e in (my.get("opening") or []) if e.get("id")}
+        completed_ids = {e.get("id") for e in (my.get("completed") or []) if e.get("id")}
+        self._phase_3b(summary, processed_opening_ids, live_ids=opening_ids | completed_ids)
 
         # Phase 4: swaps LN+ reports completed -> activate protection.
         completed_by_id = {e.get("id"): e for e in (my.get("completed") or []) if e.get("id")}
@@ -1064,12 +1182,24 @@ class SwapLifecycle:
 
         return summary
 
-    def _phase_3b(self, summary: Dict, processed_opening_ids) -> None:
+    def _phase_3b(self, summary: Dict, processed_opening_ids, live_ids=None) -> None:
+        """B1: live_ids is the set of swap ids LN+ still recognizes (opening
+        ∪ completed) on a SUCCESSFUL get_my_swaps fetch. When not None, a
+        local 'opening' row absent from it is dead (creator cancelled / we
+        were banned / swap deleted) and must be skipped, not funded.
+        live_ids=None means the fetch itself failed (outage) — drive
+        obligations off the local ledger unconditionally, as before."""
         for row in self._db.lnplus_get_swaps_by_status(["opening"]):
             sid = row["swap_id"]
             if sid in processed_opening_ids:
                 continue
             if not row.get("outbound_peer") or not row.get("deadline_at"):
+                continue
+            if live_ids is not None and sid not in live_ids:
+                self._plugin.log(
+                    f"LNPLUS: swap {sid} is 'opening' locally but LN+ no "
+                    "longer recognizes it (missing from opening/completed) "
+                    "— not funding a channel for a dead swap", level="warn")
                 continue
             try:
                 self._execute_swap_open(row)
@@ -1104,10 +1234,19 @@ class SwapLifecycle:
         # capacity (this row's committed swap terms) or because we already
         # recorded our own funding txid for it (checked above, kept here for
         # defense-in-depth against any future reordering of this method).
+        # B7: under experimental-dual-fund a peer contribution inflates
+        # total_msat past our committed capacity, so a crash-retry would
+        # never match on total_msat and would fund a SECOND channel. Our
+        # own contribution (to_us_msat) on a freshly-opened channel still
+        # equals the capacity we promised, so accept that as an equally
+        # valid match — accepting a small staleness window where to_us_msat
+        # could theoretically drift post-open (e.g. from routed HTLCs) is
+        # preferable to a duplicate on-chain open.
         existing = next(
             (ch for ch in channels
              if ch.get("peer_id") == peer and ch.get("state") in _OPEN_STATES
              and (int(ch.get("total_msat", 0) or 0) // 1000 == capacity_sats
+                  or int(ch.get("to_us_msat", 0) or 0) // 1000 == capacity_sats
                   or bool(row.get("channel_funding_txid")))),
             None)
 
@@ -1335,6 +1474,18 @@ class SwapLifecycle:
         incoming_peer = row.get("incoming_peer")
 
         positive = self._incoming_channel_open(incoming_peer)
+        if positive is None:
+            # B2: listpeerchannels FAILED (unknown state) — this is not the
+            # same as the RPC answering "no channel" (genuine defection).
+            # Filing a permanent negative rating / ignore / defection bump
+            # for an innocent peer on a transient RPC hiccup is a much worse
+            # outcome than retrying next hourly pass, so make no state
+            # change at all and leave the row 'active'.
+            self._plugin.log(
+                f"LNPLUS: finalize for swap {sid} deferred — listpeerchannels "
+                "failed (unknown channel state), not defaulting to a "
+                "negative rating; will retry next pass", level="warn")
+            return
         rating = "positive" if positive else "negative"
 
         try:
@@ -1372,15 +1523,19 @@ class SwapLifecycle:
         # Outcome, after best-effort ratings/tags/ignore.
         self._db.lnplus_update_swap(sid, status="ended", outcome=rating)
 
-    def _incoming_channel_open(self, incoming_peer) -> bool:
+    def _incoming_channel_open(self, incoming_peer) -> Optional[bool]:
+        """True/False is a genuine RPC answer ("channel open"/"no channel").
+        B2: None means the RPC itself FAILED — distinct from an authoritative
+        "no channel" answer, and must not be treated as a negative-rating
+        signal by the caller."""
         if not incoming_peer:
             return False
         try:
             channels = self.rpc.listpeerchannels().get("channels", [])
         except Exception:
-            return False
+            return None
         if not isinstance(channels, list):
-            return False
+            return None
         return any(ch.get("peer_id") == incoming_peer and ch.get("state") in _OPEN_STATES
                    for ch in channels)
 
@@ -1409,9 +1564,18 @@ class SwapLifecycle:
     # -- status --------------------------------------------------------------
     def get_status(self) -> Dict:
         recent_ended = self._db.lnplus_get_swaps_by_status(["ended"])
+        # B13: recent_failed/backfill_done/last_watcher_pass — operator
+        # observability into terminal-failure rows, whether adoption of
+        # pre-existing LN+ state has completed, and the most recent
+        # watcher pass (in-memory only, no DB).
+        recent_failed = self._db.lnplus_get_swaps_by_status(
+            list(_TERMINAL_PENDING_GHOST_STATUSES))
         return {
             "breaker": self.breaker_tripped(),
             "inflight": self._db.lnplus_inflight_swaps(),
             "active": self._db.lnplus_get_swaps_by_status(["active"]),
             "recent_ended": recent_ended[-10:],
+            "recent_failed": recent_failed[-5:],
+            "backfill_done": bool(self._db.get_config_override(_BACKFILL_FLAG)),
+            "last_watcher_pass": self._last_watcher_pass,
         }

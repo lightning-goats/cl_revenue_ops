@@ -7243,10 +7243,14 @@ class Database:
         return self.lnplus_get_swaps_by_status(list(self._LNPLUS_INFLIGHT_STATUSES))
 
     def lnplus_reserved_sats(self) -> int:
+        # B8: once a row's channel is funded (channel_funding_txid set),
+        # the capacity has already left listfunds — counting it again here
+        # double-reserves it against the planner's available_sats.
         marks = ",".join("?" for _ in self._LNPLUS_INFLIGHT_STATUSES)
         conn = self._get_connection()
         cur = conn.execute(
-            f"SELECT COALESCE(SUM(capacity_sats), 0) FROM lnplus_swaps WHERE status IN ({marks})",
+            f"SELECT COALESCE(SUM(capacity_sats), 0) FROM lnplus_swaps "
+            f"WHERE status IN ({marks}) AND channel_funding_txid IS NULL",
             self._LNPLUS_INFLIGHT_STATUSES)
         return int(cur.fetchone()[0])
 
