@@ -48,7 +48,7 @@ def _make_flow(channel_id: str, peer_id: str, capacity: int, forward_count: int,
     )
 
 
-def _make_analyzer(profitability, flow, stages=None, hive_members=None, grace_days=14, flow_window_days=7):
+def _make_analyzer(profitability, flow, stages=None, grace_days=14, flow_window_days=7):
     profitability_analyzer = MagicMock()
     profitability_analyzer.analyze_all_channels.return_value = profitability
 
@@ -59,15 +59,11 @@ def _make_analyzer(profitability, flow, stages=None, hive_members=None, grace_da
     database = MagicMock()
     database.get_dead_capital_stages.return_value = stages or {}
 
-    hive_hints = MagicMock()
-    hive_hints.is_hive_member.side_effect = lambda peer_id: peer_id in (hive_members or set())
-
     config = SimpleNamespace(capex_grace_days=grace_days)
     return CapitalEfficiencyAnalyzer(
         profitability_analyzer=profitability_analyzer,
         flow_analyzer=flow_analyzer,
         database=database,
-        hive_hints=hive_hints,
         config=config,
     )
 
@@ -115,27 +111,25 @@ class TestCapitalEfficiencyAnalyzer:
         assert dead.dead_capital_stage == "fee_reduction"
         assert dead.efficiency_rank == 0.0
 
-    def test_dead_capital_excludes_young_channels_and_hive_members(self):
+    def test_dead_capital_excludes_young_channels_but_flags_mature_idle(self):
+        # cl-mycelium retired: there is no longer a hive-member exemption, so a
+        # mature zero-forward channel past the grace window IS dead capital.
         profitability = {
             "young": _make_profitability("young", "peer-young", 1_000_000, 0, 7),
-            "member": _make_profitability("member", "peer-member", 1_500_000, 0, 30),
+            "mature": _make_profitability("mature", "peer-mature", 1_500_000, 0, 30),
         }
         flow = {
             "young": _make_flow("young", "peer-young", 1_000_000, 0, 0),
-            "member": _make_flow("member", "peer-member", 1_500_000, 0, 0),
+            "mature": _make_flow("mature", "peer-mature", 1_500_000, 0, 0),
         }
-        analyzer = _make_analyzer(
-            profitability,
-            flow,
-            hive_members={"peer-member"},
-        )
+        analyzer = _make_analyzer(profitability, flow)
 
         fleet = analyzer.analyze()
 
         assert fleet.channel_efficiencies["young"].is_dead_capital is False
         assert fleet.channel_efficiencies["young"].dead_capital_stage == "none"
-        assert fleet.channel_efficiencies["member"].is_dead_capital is False
-        assert fleet.dead_capital_count == 0
+        assert fleet.channel_efficiencies["mature"].is_dead_capital is True
+        assert fleet.dead_capital_count == 1
 
     def test_missing_stage_defaults_to_none(self):
         profitability = {

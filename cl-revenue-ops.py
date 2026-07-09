@@ -3008,14 +3008,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global hive_hints
     hive_hints = None
 
+    # Phase 3 consumers still read self.hive_hints (permanently None); Phase 2
+    # de-hived consumers (profitability_analyzer, policy_manager) no longer do.
     if fee_controller is not None:
         fee_controller.hive_hints = hive_hints
     if rebalancer is not None:
         rebalancer.hive_hints = hive_hints
-    if profitability_analyzer is not None:
-        profitability_analyzer.hive_hints = hive_hints
-    if policy_manager is not None:
-        policy_manager.hive_hints = hive_hints
     if capacity_planner is not None:
         capacity_planner.hive_hints = hive_hints
         capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
@@ -3025,7 +3023,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         profitability_analyzer=profitability_analyzer,
         flow_analyzer=flow_analyzer,
         database=database,
-        hive_hints=hive_hints,
         config=config,
     )
     plugin.log("CapitalEfficiencyAnalyzer initialized")
@@ -3035,9 +3032,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         profitability_analyzer=profitability_analyzer,
         database=database,
         config=config,
-        hive_hints=hive_hints,
         capital_efficiency=capital_efficiency,
-        hive_member_check=rebalancer._is_hive_member if rebalancer is not None else None,
     )
     plugin.log("CapexBudgetEngine initialized")
 
@@ -3587,13 +3582,9 @@ def run_flow_analysis():
 
 
 def _refresh_fee_cycle_hive_inputs():
-    """cl-mycelium retired: hive inputs are gone. Kept as a no-op seam so the
-    fee-cycle callers don't need restructuring until Phase 3."""
-    if policy_manager is not None and hive_hints is not None:
-        try:
-            policy_manager.apply_corridor_policies()
-        except Exception:
-            pass  # fail-open
+    """cl-mycelium retired: hive inputs are gone. Retained as a no-op seam so
+    the fee-cycle callers don't need restructuring until Phase 3."""
+    return None
 
 
 
@@ -7335,7 +7326,6 @@ def revenue_capex_status(plugin, **kwargs):
             "tier": b.tier,
             "tier_ppm": b.tier_ppm,
             "priority_class": b.priority_class,
-            "hive_multiplier": b.hive_multiplier,
         }
 
     now = int(time.time())

@@ -164,7 +164,6 @@ def test_capex_summary_producer_payload_matches_contract():
                 tier="proven",
                 tier_ppm=750,
                 priority_class="growth",
-                hive_multiplier=1.05,
             )
         },
     )

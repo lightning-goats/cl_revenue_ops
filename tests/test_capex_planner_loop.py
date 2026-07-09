@@ -35,18 +35,3 @@ def test_disabled_loop_keeps_baseline_capex_checks():
     }
 
 
-def test_ab_loop_exercises_hive_discovery_ev_and_capex_budget():
-    loop = load_loop()
-
-    results = loop.run_loop(min_annual_roi_pct=1.0, hive_mode="ab")
-    by_name = {item.name: item for item in results}
-
-    assert all(item.passed for item in results)
-    assert by_name["hive_open_hint_adds_candidate"].opens == 1
-    assert by_name["hive_score_bias_prioritizes_stronger_peer"].action == "boost"
-    assert by_name["hive_avoid_hint_penalizes_candidate"].action == "penalize"
-    assert by_name["hive_rebalance_bias_clears_marginal_roi_hurdle"].ev_sats > 0
-    assert "disabled_ev=" in by_name["hive_rebalance_bias_clears_marginal_roi_hurdle"].reason
-    assert by_name["hive_bias_changes_cycle_decision"].opens == 1
-    assert by_name["hive_closure_hint_escalates_underwater_peer"].action == "defibrillate"
-    assert by_name["hive_member_gets_fleet_capex_budget"].action == "fleet"

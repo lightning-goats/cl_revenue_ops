@@ -7,7 +7,6 @@ Inputs:
 - Profitability analyzer cache (contribution, classification, bleeder status)
 - Database spend history (rebalance_costs + spend_events tables)
 - Config (reinvestment rates, caps, thresholds)
-- Hive hints (optional: member/corridor multipliers)
 
 Outputs:
 - Per-channel budgets with tier classification
@@ -68,7 +67,6 @@ class ChannelCapexBudget:
     tier: str = "blocked"          # proven / active / bootstrap / fleet / blocked
     tier_ppm: int = 0              # Max PPM per rebalance attempt
     priority_class: str = "growth" # defensive / preservation / operational / growth
-    hive_multiplier: float = 1.0   # 1.0 / 1.5 / 2.0
     # Diagnostics (audit F6): sr no longer discounts the budget (v2 bleeder
     # detection already divides effective cost by sr); kept for visibility.
     success_rate_30d: Optional[float] = None
@@ -133,16 +131,12 @@ class CapexBudgetEngine:
         profitability_analyzer,
         database,
         config,
-        hive_hints=None,
         capital_efficiency=None,
-        hive_member_check: Callable[[str], bool] = None,
     ):
         self._profitability = profitability_analyzer
         self._database = database
         self._config = config
-        self._hive_hints = hive_hints
         self._capital_efficiency = capital_efficiency
-        self._hive_member_check = hive_member_check
         self._last_allocations: Optional[CapexAllocations] = None
 
     def compute_allocations(self) -> CapexAllocations:
@@ -541,54 +535,18 @@ class CapexBudgetEngine:
         days_open = prof.days_open
         marginal_roi = getattr(prof, 'marginal_roi', 0.0)
 
-        peer_id = getattr(prof, 'peer_id', '')
-
-        # Hive multiplier
-        hive_mult = 1.0
-        if self._hive_hints:
-            try:
-                if self._hive_hints.is_hive_member(peer_id):
-                    hive_mult = 1.5
-                corridor = self._hive_hints.get_corridor_role(peer_id)
-                if corridor == "owner":
-                    hive_mult = 2.0
-            except Exception:
-                pass
-
-        # FLEET tier: hive member channels enable free fleet routing.
-        # These channels earn 0 direct fee revenue (0 ppm policy) so they'd
-        # normally be BOOTSTRAP or BLOCKED.  Recognise their strategic value
-        # before the BLOCKED gates can reject them.
-        if self._hive_member_check and self._hive_member_check(peer_id):
-            capacity_sats = getattr(prof, 'capacity_sats', 0) or 0
-            fleet_budget_msat = min(
-                int(capacity_sats * 1000 * 50 / 10000),  # 50 bps of capacity in msat
-                200 * MSAT_PER_SAT,  # cap at bootstrap max (200 sats default)
-            )
-            fleet_budget_msat = max(fleet_budget_msat, 10_000)  # At least 10 sats
-            return ChannelCapexBudget(
-                channel_id=ch_id,
-                tier="fleet",
-                budget_msat=fleet_budget_msat,
-                tier_ppm=50,
-                priority_class="fleet_coordination",
-                hive_multiplier=hive_mult,
-            )
-
         # Blocked channels
         if classification == "zombie":
             return ChannelCapexBudget(
                 channel_id=ch_id, tier="blocked", priority_class="defensive",
-                hive_multiplier=hive_mult,
             )
         if bleeder_status == "hard":
             return ChannelCapexBudget(
                 channel_id=ch_id, tier="blocked", priority_class="defensive",
-                hive_multiplier=hive_mult,
             )
         if days_open < cfg.capex_grace_days and contribution_msat == 0:
             return ChannelCapexBudget(
-                channel_id=ch_id, tier="blocked", hive_multiplier=hive_mult,
+                channel_id=ch_id, tier="blocked",
             )
         # NOTE: Removed the marginal_roi < 0 + zero contribution block.
         # New channels have negative ROI (open cost > 0, revenue = 0) and
@@ -658,12 +616,12 @@ class CapexBudgetEngine:
             raw_budget_msat = max(0, bootstrap_budget_msat - total_capex_30d_msat)
         else:
             return ChannelCapexBudget(
-                channel_id=ch_id, tier="blocked", hive_multiplier=hive_mult,
+                channel_id=ch_id, tier="blocked",
             )
 
         efficiency_mult = self._get_efficiency_multiplier(
             ch_id, fleet_efficiency, prof=prof)
-        budget_msat = int(raw_budget_msat * roi_mult * hive_mult * efficiency_mult)
+        budget_msat = int(raw_budget_msat * roi_mult * efficiency_mult)
 
         return ChannelCapexBudget(
             channel_id=ch_id,
@@ -671,7 +629,6 @@ class CapexBudgetEngine:
             tier=tier,
             tier_ppm=tier_ppm,
             priority_class=priority,
-            hive_multiplier=hive_mult,
             success_rate_30d=success_rate,
             roi_multiplier=roi_mult,
         )

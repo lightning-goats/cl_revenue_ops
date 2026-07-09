@@ -199,7 +199,6 @@ class PolicyManager:
         """
         self.database = database
         self.plugin = plugin
-        self.hive_hints = None  # Injected by main plugin for corridor-aware policies
         self.data_service = None  # Unified data service (injected by main plugin)
 
         # In-memory cache with write-through pattern (v2.0)
@@ -1079,99 +1078,6 @@ class PolicyManager:
     # Corridor-Aware Auto-Policies
     # =========================================================================
 
-    def apply_corridor_policies(self) -> int:
-        """Auto-set protective policies for corridor owner channels.
-
-        Corridor owners get:
-        - strategy=DYNAMIC (active fee optimization)
-        - rebalance_mode=ENABLED (allow rebalancing to maintain liquidity)
-        - tag='corridor_owner' for identification
-
-        Fleet members get:
-        - no stored fee policy
-        - dedicated hint-driven 0-fee handling in the fee controller
-
-        Only applies to peers without explicit manual policies.
-        Returns count of policies applied.
-        """
-        if not self.hive_hints:
-            return 0
-
-        applied = 0
-        try:
-            # Get all channels to find peers
-            channels = self.data_service.get_peer_channels() if self.data_service else self.plugin.rpc.listpeerchannels()
-            for ch in channels.get("channels", []):
-                if ch.get("state") != "CHANNELD_NORMAL":
-                    continue
-                peer_id = ch.get("peer_id", "")
-                if not peer_id:
-                    continue
-
-                # Check current policy — skip if manually set
-                current = self.get_policy(peer_id)
-                if current.peer_id and current.tags and "manual" in current.tags:
-                    continue
-
-                is_member = self.hive_hints.is_hive_member(peer_id)
-                corridor_role = self.hive_hints.get_corridor_role(peer_id)
-
-                if is_member:
-                    # Fleet members use the dedicated hint-driven 0-PPM path.
-                    # Remove legacy auto_fleet policies so min-fee clamps do not
-                    # override the controller's enforce_limits=False handling.
-                    if current.tags and "auto_fleet" in current.tags:
-                        if self.delete_policy(peer_id):
-                            applied += 1
-                elif corridor_role == "owner":
-                    # Corridor owners: DYNAMIC + protected
-                    current_tags = set(current.tags or [])
-                    if "corridor_owner" in current_tags:
-                        continue
-                    # get_policy returns a default (updated_at=0) when no
-                    # policy is stored; only a stored policy can be operator-owned.
-                    has_stored_policy = int(current.updated_at or 0) > 0
-                    if has_stored_policy and "auto_corridor" not in current_tags:
-                        # A stored policy this automation didn't create is
-                        # operator-owned. set_policy replaces tags and modes,
-                        # so writing here would wipe protect/no_close tags and
-                        # re-enable fees/rebalancing the operator disabled.
-                        # Corridor role comes from hive hints (external input)
-                        # and must never override local policy.
-                        continue
-                    self.set_policy(
-                        peer_id,
-                        strategy=FeeStrategy.DYNAMIC.value,
-                        rebalance_mode=RebalanceMode.ENABLED.value,
-                        tags=["corridor_owner", "auto_corridor"],
-                    )
-                    applied += 1
-                else:
-                    # Role loss reconciliation: the peer is neither a fleet
-                    # member nor a corridor owner anymore. Remove only the
-                    # policy this automation created (tagged auto_corridor);
-                    # operator-owned policies are never touched ('manual'
-                    # tagged policies were already skipped above).
-                    current_tags = set(current.tags or [])
-                    has_stored_policy = int(current.updated_at or 0) > 0
-                    if has_stored_policy and "auto_corridor" in current_tags:
-                        if self.delete_policy(peer_id):
-                            applied += 1
-                            self.plugin.log(
-                                f"PolicyManager: Removed auto_corridor policy "
-                                f"for {peer_id[:12]}... (corridor role lost)",
-                                level='info',
-                            )
-
-        except Exception as e:
-            self.plugin.log(f"PolicyManager: Corridor policy error: {e}", level='warn')
-
-        if applied > 0:
-            self.plugin.log(
-                f"PolicyManager: Applied {applied} corridor-aware policies",
-                level='info'
-            )
-        return applied
 
     # =========================================================================
     # v2.0 Batch Operations

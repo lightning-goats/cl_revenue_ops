@@ -49,13 +49,11 @@ class CapitalEfficiencyAnalyzer:
         profitability_analyzer,
         flow_analyzer,
         database,
-        hive_hints=None,
         config=None,
     ):
         self._profitability = profitability_analyzer
         self._flow = flow_analyzer
         self._database = database
-        self._hive_hints = hive_hints
         self._config = config
 
     def analyze(self) -> FleetEfficiency:
@@ -216,12 +214,5 @@ class CapitalEfficiencyAnalyzer:
 
         if int(getattr(prof, "days_open", 0) or 0) <= grace_days:
             return False
-
-        if self._hive_hints is not None:
-            try:
-                if self._hive_hints.is_hive_member(getattr(prof, "peer_id", None)):
-                    return False
-            except Exception:
-                pass
 
         return True

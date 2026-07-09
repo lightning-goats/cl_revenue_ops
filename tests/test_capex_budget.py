@@ -68,7 +68,6 @@ def _make_engine(
     spend_by_channel=None,
     rebalance_cost_by_channel=None,
     spend_summary=None,
-    hive_hints=None,
     capital_efficiency=None,
     reserve_deficit=0,
     confirmed_onchain_sats=None,
@@ -108,7 +107,6 @@ def _make_engine(
         profitability_analyzer=mock_profitability,
         database=mock_db,
         config=cfg,
-        hive_hints=hive_hints,
         capital_efficiency=capital_efficiency,
     )
     # Patch the capex lookup to return test data
@@ -129,10 +127,6 @@ class TestEngineConstruction:
         engine = _make_engine()
         assert engine is not None
 
-    def test_construction_with_hive(self):
-        mock_hive = MagicMock()
-        engine = _make_engine(hive_hints=mock_hive)
-        assert engine is not None
 
     def test_compute_allocations_returns_dataclass(self):
         engine = _make_engine()
@@ -231,7 +225,7 @@ class TestPerChannelBudget:
         )
         alloc = engine.compute_allocations()
         b = alloc.channel_budgets["100x1x0"]
-        # (1_000_000 * 0.50 - 200_000) * 1.0 discount * 1.0 hive = 300_000 msat = 300 sats
+        # (1_000_000 * 0.50 - 200_000) * 1.0 discount = 300_000 msat = 300 sats
         assert b.budget_sats == 300
         assert b.tier == "proven"
         assert b.tier_ppm == 2000
@@ -555,61 +549,6 @@ class TestPerChannelBudget:
         b = alloc.channel_budgets["100x1x0"]
         assert b.tier == "blocked"
         assert b.priority_class == "defensive"
-
-    def test_hive_member_gets_multiplier(self):
-        mock_hive = MagicMock()
-        mock_hive.is_hive_member.return_value = True
-        mock_hive.get_corridor_role.return_value = "none"
-        engine = _make_engine(
-            channel_profitabilities={
-                "100x1x0": _make_mock_profitability(
-                    contribution_msat=1_000_000,
-                    fees_earned_msat=800_000,
-                    total_forward_count=50,
-                ),
-            },
-            hive_hints=mock_hive,
-        )
-        alloc = engine.compute_allocations()
-        b = alloc.channel_budgets["100x1x0"]
-        # (1_000_000 * 0.50) * 1.0 discount * 1.5 hive = 750_000 msat = 750 sats
-        assert b.budget_sats == 750
-        assert b.hive_multiplier == 1.5
-
-    def test_corridor_owner_gets_2x(self):
-        mock_hive = MagicMock()
-        mock_hive.is_hive_member.return_value = True
-        mock_hive.get_corridor_role.return_value = "owner"
-        engine = _make_engine(
-            channel_profitabilities={
-                "100x1x0": _make_mock_profitability(
-                    contribution_msat=1_000_000,
-                    fees_earned_msat=800_000,
-                    total_forward_count=50,
-                ),
-            },
-            hive_hints=mock_hive,
-        )
-        alloc = engine.compute_allocations()
-        b = alloc.channel_budgets["100x1x0"]
-        # (1_000_000 * 0.50) * 1.0 discount * 2.0 hive = 1_000_000 msat = 1000 sats
-        assert b.budget_sats == 1000
-        assert b.hive_multiplier == 2.0
-
-    def test_no_hive_defaults_to_1x(self):
-        engine = _make_engine(
-            channel_profitabilities={
-                "100x1x0": _make_mock_profitability(
-                    contribution_msat=1_000_000,
-                    fees_earned_msat=800_000,
-                    total_forward_count=50,
-                ),
-            },
-        )
-        alloc = engine.compute_allocations()
-        b = alloc.channel_budgets["100x1x0"]
-        assert b.hive_multiplier == 1.0
-        assert b.budget_sats == 500
 
 
 class TestFleetExplorationBudget:
@@ -1001,154 +940,7 @@ class TestCapexStatusOutput:
             assert hasattr(b, 'tier')
             assert hasattr(b, 'tier_ppm')
             assert hasattr(b, 'priority_class')
-            assert hasattr(b, 'hive_multiplier')
 
-
-class TestFleetTier:
-    """FLEET tier: hive member channels get strategic budget despite 0 fee revenue."""
-
-    HIVE_PEER = "03796a" + "0" * 58
-
-    def test_hive_member_gets_fleet_tier(self):
-        """Confirmed hive member should receive fleet tier with budget > 0."""
-        engine = CapexBudgetEngine.__new__(CapexBudgetEngine)
-        engine._hive_member_check = lambda pid: pid == self.HIVE_PEER
-        engine._hive_hints = None
-        engine._capital_efficiency = None
-
-        prof = _make_mock_profitability(
-            peer_id=self.HIVE_PEER,
-            contribution_msat=0,
-            fees_earned_msat=0,
-            total_forward_count=0,
-            days_open=60,
-            capacity_sats=5_000_000,
-            classification="break_even",
-        )
-        cfg = Config().snapshot()
-
-        budget = engine._compute_channel_budget(
-            ch_id="100x1x0",
-            prof=prof,
-            total_capex_30d_msat=0,
-            bleeder_status="none",
-            cfg=cfg,
-        )
-
-        assert budget.tier == "fleet"
-        assert budget.tier_ppm == 50
-        assert budget.priority_class == "fleet_coordination"
-        assert budget.budget_msat > 0
-        assert budget.budget_msat >= 10_000  # At least 10 sats
-
-    def test_non_hive_member_not_fleet_tier(self):
-        """Non-hive-member peer should NOT get fleet tier."""
-        engine = CapexBudgetEngine.__new__(CapexBudgetEngine)
-        engine._hive_member_check = lambda pid: False
-        engine._hive_hints = None
-        engine._capital_efficiency = None
-
-        prof = _make_mock_profitability(
-            peer_id="02" + "b" * 64,
-            contribution_msat=0,
-            fees_earned_msat=0,
-            total_forward_count=0,
-            days_open=60,
-            capacity_sats=5_000_000,
-            classification="break_even",
-        )
-        cfg = Config().snapshot()
-
-        budget = engine._compute_channel_budget(
-            ch_id="100x1x0",
-            prof=prof,
-            total_capex_30d_msat=0,
-            bleeder_status="none",
-            cfg=cfg,
-        )
-
-        assert budget.tier != "fleet"
-
-    def test_fleet_budget_is_50bps_of_capacity(self):
-        """Fleet budget should be 50 bps of capacity (capped at 200 sats)."""
-        engine = CapexBudgetEngine.__new__(CapexBudgetEngine)
-        engine._hive_member_check = lambda pid: True
-        engine._hive_hints = None
-        engine._capital_efficiency = None
-
-        # 1M sat capacity -> 50 bps = 5000 sats -> capped at 200 sats = 200_000 msat
-        prof = _make_mock_profitability(
-            peer_id="02" + "c" * 64,
-            contribution_msat=0,
-            capacity_sats=1_000_000,
-        )
-        cfg = Config().snapshot()
-
-        budget = engine._compute_channel_budget(
-            ch_id="100x1x0",
-            prof=prof,
-            total_capex_30d_msat=0,
-            bleeder_status="none",
-            cfg=cfg,
-        )
-
-        assert budget.tier == "fleet"
-        # 1M * 50/10000 = 5000 sats = 5_000_000 msat, capped to 200_000 msat
-        assert budget.budget_msat == 200_000
-
-    def test_fleet_budget_small_channel_floor(self):
-        """Very small channel should still get minimum 10 sat budget."""
-        engine = CapexBudgetEngine.__new__(CapexBudgetEngine)
-        engine._hive_member_check = lambda pid: True
-        engine._hive_hints = None
-        engine._capital_efficiency = None
-
-        # 100 sat capacity -> 50 bps = 0.5 sats = 500 msat -> floor to 10_000 msat
-        prof = _make_mock_profitability(
-            peer_id="02" + "d" * 64,
-            contribution_msat=0,
-            capacity_sats=100,
-        )
-        cfg = Config().snapshot()
-
-        budget = engine._compute_channel_budget(
-            ch_id="100x1x0",
-            prof=prof,
-            total_capex_30d_msat=0,
-            bleeder_status="none",
-            cfg=cfg,
-        )
-
-        assert budget.tier == "fleet"
-        assert budget.budget_msat == 10_000  # 10 sats floor
-
-    def test_fleet_tier_bypasses_blocked_gates(self):
-        """Hive member should get fleet tier even when it would be blocked (zombie, hard bleeder, etc.)."""
-        engine = CapexBudgetEngine.__new__(CapexBudgetEngine)
-        engine._hive_member_check = lambda pid: True
-        engine._hive_hints = None
-        engine._capital_efficiency = None
-
-        # Zombie classification would normally be blocked
-        prof = _make_mock_profitability(
-            peer_id="02" + "e" * 64,
-            contribution_msat=0,
-            classification="zombie",
-            days_open=90,
-            marginal_roi=-1.0,
-        )
-        cfg = Config().snapshot()
-
-        budget = engine._compute_channel_budget(
-            ch_id="100x1x0",
-            prof=prof,
-            total_capex_30d_msat=0,
-            bleeder_status="hard",
-            cfg=cfg,
-        )
-
-        assert budget.tier == "fleet"
-        assert budget.budget_msat > 0
 
 class TestMarginalRoiBudgetMultiplier:
     """Audit F6: the success-rate discount double-penalized (v2 already
@@ -1351,33 +1143,6 @@ class TestWindowedCapexFunding:
         b = alloc.channel_budgets["100x1x0"]
         assert b.tier == "proven"
         assert b.budget_sats == 300  # legacy lifetime math
-
-
-class TestFleetTierContinued:
-    def test_no_hive_member_check_skips_fleet(self):
-        """When hive_member_check is None, fleet tier is never assigned."""
-        engine = CapexBudgetEngine.__new__(CapexBudgetEngine)
-        engine._hive_member_check = None
-        engine._hive_hints = None
-        engine._capital_efficiency = None
-
-        prof = _make_mock_profitability(
-            peer_id="02" + "f" * 64,
-            contribution_msat=0,
-            days_open=60,
-            capacity_sats=5_000_000,
-        )
-        cfg = Config().snapshot()
-
-        budget = engine._compute_channel_budget(
-            ch_id="100x1x0",
-            prof=prof,
-            total_capex_30d_msat=0,
-            bleeder_status="none",
-            cfg=cfg,
-        )
-
-        assert budget.tier != "fleet"
 
 
 class TestDbErrorFailsClosed:
