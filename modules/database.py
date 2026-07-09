@@ -1392,32 +1392,6 @@ class Database:
             )
         """)
 
-        # Z-2 (2026-07-08, zero-fee hive corridor): last-confirmed hive
-        # membership per peer, so the zero-fee gate can stay held through
-        # hive-hint staleness/unavailability instead of repricing away from
-        # 0 ppm the moment the hint snapshot goes stale. Same additive
-        # CREATE TABLE idiom as the lnplus tables above.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS hive_member_confirmations (
-                pubkey TEXT PRIMARY KEY,
-                last_confirmed_at INTEGER NOT NULL
-            )
-        """)
-
-        # Z-3 (2026-07-08): daily corridor utilization aggregates —
-        # classifies settled forwards by hive membership of the in/out
-        # peers. Pure instrumentation: a success metric, never an alarm.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS corridor_flow_daily (
-                day TEXT NOT NULL,
-                klass TEXT NOT NULL,
-                forwards INTEGER NOT NULL DEFAULT 0,
-                sats_forwarded INTEGER NOT NULL DEFAULT 0,
-                fees_msat INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (day, klass)
-            )
-        """)
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS planner_recycle_ops (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7342,104 +7316,6 @@ class Database:
             (*self._LNPLUS_TERMINAL_STATUSES, cutoff, cutoff))
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
-    # =========================================================================
-    # Zero-fee hive corridor: durable membership confirmations (Z-2)
-    # =========================================================================
-
-    def hive_member_confirm(self, pubkey: str) -> None:
-        """Record/refresh a positive hive-membership confirmation for pubkey.
-
-        Cheap upsert; callers are expected to throttle write frequency
-        themselves (e.g. once per 10 min per peer) to avoid write churn --
-        this method itself performs no throttling.
-        """
-        if not pubkey:
-            return
-        conn = self._get_connection()
-        conn.execute("""
-            INSERT INTO hive_member_confirmations (pubkey, last_confirmed_at)
-            VALUES (?, ?)
-            ON CONFLICT(pubkey) DO UPDATE SET
-                last_confirmed_at = excluded.last_confirmed_at
-        """, (pubkey, int(time.time())))
-
-    def hive_member_last_confirmed(self, pubkey: str) -> Optional[int]:
-        """Return the unix timestamp of the last positive hive-membership
-        confirmation for pubkey, or None if never confirmed."""
-        if not pubkey:
-            return None
-        conn = self._get_connection()
-        cur = conn.execute(
-            "SELECT last_confirmed_at FROM hive_member_confirmations WHERE pubkey = ?",
-            (pubkey,))
-        row = cur.fetchone()
-        return int(row[0]) if row else None
-
-    # =========================================================================
-    # Mycelial corridor flow instrumentation (Z-3)
-    # =========================================================================
-
-    _CORRIDOR_FLOW_KLASSES = ("internal_transit", "edge_in", "edge_out", "external")
-
-    def corridor_flow_record(self, klass: str, amount_sats: int, fee_msat: int) -> None:
-        """Upsert today's corridor-flow aggregate for klass.
-
-        klass is one of internal_transit / edge_in / edge_out / external
-        (hive-membership classification of a settled forward's in/out
-        peers). Pure utilization instrumentation -- never gates or alarms.
-        """
-        if klass not in self._CORRIDOR_FLOW_KLASSES:
-            return
-        day = time.strftime("%Y-%m-%d", time.gmtime())
-        conn = self._get_connection()
-        conn.execute("""
-            INSERT INTO corridor_flow_daily (day, klass, forwards, sats_forwarded, fees_msat)
-            VALUES (?, ?, 1, ?, ?)
-            ON CONFLICT(day, klass) DO UPDATE SET
-                forwards = forwards + 1,
-                sats_forwarded = sats_forwarded + excluded.sats_forwarded,
-                fees_msat = fees_msat + excluded.fees_msat
-        """, (day, klass, max(0, int(amount_sats)), max(0, int(fee_msat))))
-
-    def corridor_flow_summary(self, days: int = 7) -> Dict[str, Any]:
-        """Return the corridor-flow rollup for the last `days` days.
-
-        Shape:
-            {
-                "days": int,
-                "by_klass": {klass: {"forwards": int, "sats_forwarded": int, "fees_msat": int}, ...},
-                "totals": {"forwards": int, "sats_forwarded": int, "fees_msat": int},
-            }
-        """
-        days = max(1, int(days))
-        cutoff_day = time.strftime(
-            "%Y-%m-%d", time.gmtime(time.time() - (days - 1) * 86400))
-        conn = self._get_connection()
-        cur = conn.execute("""
-            SELECT klass, SUM(forwards), SUM(sats_forwarded), SUM(fees_msat)
-            FROM corridor_flow_daily
-            WHERE day >= ?
-            GROUP BY klass
-        """, (cutoff_day,))
-        by_klass: Dict[str, Dict[str, int]] = {
-            k: {"forwards": 0, "sats_forwarded": 0, "fees_msat": 0}
-            for k in self._CORRIDOR_FLOW_KLASSES
-        }
-        totals = {"forwards": 0, "sats_forwarded": 0, "fees_msat": 0}
-        for klass, forwards, sats_forwarded, fees_msat in cur.fetchall():
-            forwards = int(forwards or 0)
-            sats_forwarded = int(sats_forwarded or 0)
-            fees_msat = int(fees_msat or 0)
-            if klass in by_klass:
-                by_klass[klass] = {
-                    "forwards": forwards,
-                    "sats_forwarded": sats_forwarded,
-                    "fees_msat": fees_msat,
-                }
-            totals["forwards"] += forwards
-            totals["sats_forwarded"] += sats_forwarded
-            totals["fees_msat"] += fees_msat
-        return {"days": days, "by_klass": by_klass, "totals": totals}
 
     # =========================================================================
     # Mempool Fee History Methods (Vegas Reflex)
