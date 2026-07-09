@@ -162,3 +162,27 @@ def sample_channel_opened_payload(sample_peer_ids, sample_channel_id):
     }
 
 
+
+
+# Lazy-eval audit F4/F6: policy gates fail closed when policy_manager is
+# None. Production constructs it unconditionally; tests that build bare
+# planners get a permissive stand-in so unrelated tests keep passing. Tests
+# exercising the gates set planner.policy_manager themselves afterwards.
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _default_planner_policy_manager(monkeypatch):
+    from modules.capacity_planner import CapacityPlanner
+    from tests.plugin_test_utils import PermissivePolicyManager
+    import functools
+    original = CapacityPlanner.__init__
+
+    @functools.wraps(original)
+    def patched(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        if getattr(self, "policy_manager", None) is None:
+            self.policy_manager = PermissivePolicyManager()
+
+    monkeypatch.setattr(CapacityPlanner, "__init__", patched)
+    yield

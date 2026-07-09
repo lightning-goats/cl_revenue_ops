@@ -430,6 +430,12 @@ class CapacityPlanner:
                     f"Defibrillation skipped for {scid}: {attempted_reason}"
                 )
                 continue
+            defib_ok, defib_reason = self._check_defib_allowed(peer_id)
+            if not defib_ok:
+                summary["skipped_reasons"].append(
+                    f"Defibrillation policy-blocked for {scid}: {defib_reason}"
+                )
+                continue
 
             result = self._execute_defibrillation(scid, peer_id, cfg, loser.get("reason", ""))
             summary["defibrillations"].append({
@@ -2252,7 +2258,9 @@ class CapacityPlanner:
         if self._is_protected_hive_member(peer_id):
             return False, "Hive member protected"
 
-        # Policy protection
+        # Policy protection. None = policy source failed -> fail closed.
+        if protected_peers is None:
+            return False, "Policy protection unknown (source failed)"
         if peer_id in protected_peers:
             return False, "Policy-protected peer"
 
@@ -2315,16 +2323,9 @@ class CapacityPlanner:
         if not db:
             return None
 
-        # Build protection sets
-        protected_peers = set()
-        if self.policy_manager:
-            try:
-                for peer_id, policy in self.policy_manager.get_all_policies().items():
-                    tags = getattr(policy, 'tags', []) or []
-                    if "protect" in tags or "no_close" in tags:
-                        protected_peers.add(peer_id)
-            except Exception:
-                pass
+        # Build protection sets. None means "unknown" (policy source failed):
+        # every nominee is then treated as protected — fail closed.
+        protected_peers = self._recycle_protected_peers()
 
         route_pair_scids = set()
         try:
@@ -3438,6 +3439,13 @@ class CapacityPlanner:
         5. On success: update action, mark spend
         6. On failure: update action, release reservation
         """
+        # Lazy-eval audit F4: last-moment policy gate — opens commit
+        # irreversible on-chain capital toward this peer.
+        open_ok, open_reason = self._check_open_allowed(peer_id)
+        if not open_ok:
+            return {"status": "blocked_by_policy", "peer_id": peer_id,
+                    "reason": open_reason}
+
         db = self.profitability.database if self.profitability else None
 
         estimated_cost = self._estimate_open_cost()
@@ -3633,6 +3641,72 @@ class CapacityPlanner:
         )
         return False
 
+    def _recycle_protected_peers(self):
+        """Peers whose protect/no_close tags exclude them from recycle
+        nomination. Returns a set, or None when the policy source failed
+        (lazy-eval audit F1: get_all_policies returns a LIST — the old
+        .items() iteration raised AttributeError into a bare except, so the
+        set was silently always empty and tagged peers were nominatable as
+        Boltz loop-out targets)."""
+        if not self.policy_manager:
+            return set()
+        try:
+            protected = set()
+            for policy in self.policy_manager.get_all_policies():
+                tags = getattr(policy, "tags", []) or []
+                if "protect" in tags or "no_close" in tags:
+                    peer_id = getattr(policy, "peer_id", None)
+                    if peer_id:
+                        protected.add(peer_id)
+            return protected
+        except Exception as e:
+            try:
+                self.plugin.log(
+                    f"Recycle protection set unavailable ({e}); "
+                    "treating all nominees as protected", level="warn")
+            except Exception:
+                pass
+            return None
+
+    def _check_open_allowed(self, peer_id: str) -> tuple:
+        """Lazy policy gate before channel opens (lazy-eval audit F4).
+
+        Opens commit irreversible on-chain capital: a peer the operator set
+        to strategy=passive (the canonical 'ignored') must never receive
+        one. Fails closed on a missing/broken policy source.
+        """
+        if not self.policy_manager:
+            return False, "Policy manager unavailable — open blocked (fail closed)"
+        try:
+            policy = self.policy_manager.get_policy(peer_id)
+            strategy = policy.strategy
+            strategy_str = strategy.value if hasattr(strategy, "value") else str(strategy)
+            if strategy_str == "passive":
+                return False, "Peer policy is passive — open blocked"
+            return True, "open allowed"
+        except Exception as e:
+            return False, f"Open policy check failed (fail closed): {e}"
+
+    def _check_defib_allowed(self, peer_id: str) -> tuple:
+        """Lazy policy gate before defibrillation (lazy-eval audit F4).
+
+        A defibrillation FILLS the target channel; rebalance_mode disabled
+        or source_only forbids filling it. no_close/protect tags do NOT
+        block defib (operator policy 2026-07-09: LN+ contract channels stay
+        diagnosable). Fails closed on policy errors.
+        """
+        if not self.policy_manager:
+            return False, "Policy manager unavailable — defib blocked (fail closed)"
+        try:
+            policy = self.policy_manager.get_policy(peer_id)
+            mode = getattr(policy, "rebalance_mode", None)
+            mode_str = mode.value if hasattr(mode, "value") else str(mode or "enabled")
+            if mode_str in ("disabled", "source_only"):
+                return False, f"rebalance_mode={mode_str} forbids filling — defib blocked"
+            return True, "defib allowed"
+        except Exception as e:
+            return False, f"Defib policy check failed (fail closed): {e}"
+
     def _check_close_allowed(self, peer_id: str) -> tuple:
         """Check if a channel close is allowed for this peer.
 
@@ -3642,8 +3716,17 @@ class CapacityPlanner:
         Returns:
             (allowed, reason) tuple.
         """
+        # Lazy-eval audit F5: membership was read eagerly at classification,
+        # minutes before this gate runs — re-read lazily so a peer that
+        # joined the fleet mid-cycle cannot be closed. Fails CLOSED inside.
+        if self._is_protected_hive_member(peer_id):
+            return False, "Hive member protected — close blocked"
+
         if not self.policy_manager:
-            return True, "No policy manager configured"
+            # Lazy-eval audit F6: the policy manager is constructed
+            # unconditionally at init — None means broken init, and closing
+            # without tag protection is the dangerous direction. Fail closed.
+            return False, "Policy manager unavailable — close blocked (fail closed)"
 
         try:
             policy = self.policy_manager.get_policy(peer_id)

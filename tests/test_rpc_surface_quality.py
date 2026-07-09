@@ -98,3 +98,59 @@ class TestCompactRecommendationSummary:
         mod = load_plugin_module()
         assert mod._compact_boltz_recommendation(None) == {}
         assert mod._compact_boltz_recommendation({"economics": "junk"})["economics"] == {}
+
+
+class TestPolicyGatesFailClosedWithoutManager:
+    """Lazy-eval audit F6: policy_manager is constructed unconditionally at
+    init, so None means broken init — and the close/swap gates returned
+    'allowed', silently discarding ALL tag protection. Fail closed."""
+
+    def test_close_gate_blocks_without_policy_manager(self):
+        from modules.capacity_planner import CapacityPlanner
+        from modules.config import Config
+        planner = CapacityPlanner(MagicMock(), MagicMock(), MagicMock(),
+                                  config=Config())
+        planner.policy_manager = None
+        allowed, reason = planner._check_close_allowed("02" + "a" * 64)
+        assert allowed is False
+        assert "policy" in reason.lower()
+
+    def test_boltz_direction_gate_blocks_without_policy_manager(self, monkeypatch):
+        mod = load_plugin_module()
+        monkeypatch.setattr(mod, "policy_manager", None)
+        allowed, reason = mod._boltz_direction_allowed_by_policy("02" + "a" * 64, "loop_out")
+        assert allowed is False
+        assert "fail_closed" in reason
+
+
+class TestBoltzExecutionPolicyRecheck:
+    """Lazy-eval audit F2: swap policy was read at plan build, execution
+    happened minutes later with no re-read — and the hive-route override
+    could re-pin the drain to a channel whose peer was never checked."""
+
+    def test_recheck_blocks_when_policy_flipped_after_plan(self, monkeypatch):
+        mod = load_plugin_module()
+        calls = []
+        def fake_gate(peer_id, direction):
+            calls.append((peer_id, direction))
+            return False, "policy_passive"
+        monkeypatch.setattr(mod, "_boltz_direction_allowed_by_policy", fake_gate)
+        ok, reason = mod._boltz_exec_policy_recheck("02" + "a" * 64, "loop_out")
+        assert ok is False and "policy_passive" in reason
+        assert calls == [("02" + "a" * 64, "loop_out")]
+
+    def test_hive_route_first_hop_peer_extraction(self):
+        mod = load_plugin_module()
+        class HR:  # duck-typed HiveRoute
+            path = [{"short_channel_id_dir": "100x1x0/1",
+                     "next_node": "02" + "c" * 64}]
+        assert mod._hive_route_first_hop_peer(HR()) == "02" + "c" * 64
+
+    def test_hive_route_first_hop_peer_missing_returns_none(self):
+        mod = load_plugin_module()
+        class HR:
+            path = [{"short_channel_id_dir": "100x1x0/1"}]
+        assert mod._hive_route_first_hop_peer(HR()) is None
+        class Empty:
+            path = []
+        assert mod._hive_route_first_hop_peer(Empty()) is None

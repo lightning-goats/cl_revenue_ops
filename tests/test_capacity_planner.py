@@ -3460,13 +3460,17 @@ class TestDirectClose:
 
         assert allowed is True
 
-    def test_close_allowed_without_policy_manager(self):
-        """Without a policy manager, close is always allowed."""
+    def test_close_blocked_without_policy_manager(self):
+        """Lazy-eval audit F6 (2026-07-09): the policy manager is
+        constructed unconditionally at init, so None means broken init —
+        closes now FAIL CLOSED instead of silently dropping tag protection."""
         planner, db, _ = _make_close_planner(with_policy_manager=False)
+        planner.policy_manager = None  # explicit: simulate broken init
 
         allowed, reason = planner._check_close_allowed("peer_abc")
 
-        assert allowed is True
+        assert allowed is False
+        assert "fail closed" in reason.lower()
 
     def test_close_respects_passive_policy(self):
         """Channels with passive policy are never auto-closed."""
@@ -4616,7 +4620,11 @@ class TestConstructorCleanup:
         assert planner.plugin is plugin
         assert planner.profitability is prof
         assert planner.flow is flow
-        assert planner.policy_manager is None
+        # The conftest autouse fixture substitutes a permissive stand-in for
+        # None (lazy-eval audit F4/F6: gates fail closed on a missing
+        # manager; production constructs one unconditionally).
+        from tests.plugin_test_utils import PermissivePolicyManager
+        assert isinstance(planner.policy_manager, PermissivePolicyManager)
         assert planner.config is None
         assert planner.rebalancer is None
 
@@ -5502,3 +5510,114 @@ class TestLnplusChannelsDefibrillatableButNotCloseable:
             "944398x16x0", "02" + "f" * 64, planner.config)
         planner.rebalancer.diagnostic_rebalance.assert_called_once_with("944398x16x0")
         assert result.get("status") != "blocked_by_policy"
+
+
+class TestRecycleProtectedPeersSet:
+    """Lazy-eval audit F1: get_all_policies() returns a LIST, but the
+    recycle protection-set builder called .items() on it — the guaranteed
+    AttributeError was swallowed and protected_peers was ALWAYS empty, so
+    protect/no_close-tagged peers could be nominated as Boltz loop-out
+    targets for up to a full planner interval."""
+
+    def _planner(self):
+        from modules.config import Config
+        plugin = MagicMock()
+        prof = MagicMock()
+        flow = MagicMock()
+        return CapacityPlanner(plugin, prof, flow, config=Config())
+
+    def test_tagged_peers_populate_protection_set(self):
+        planner = self._planner()
+        tagged = MagicMock()
+        tagged.peer_id = "02" + "a" * 64
+        tagged.tags = ["no_close"]
+        plain = MagicMock()
+        plain.peer_id = "02" + "b" * 64
+        plain.tags = []
+        protected_mock = MagicMock()
+        protected_mock.peer_id = "02" + "c" * 64
+        protected_mock.tags = ["protect"]
+        planner.policy_manager = MagicMock()
+        planner.policy_manager.get_all_policies.return_value = [
+            tagged, plain, protected_mock]
+        peers = planner._recycle_protected_peers()
+        assert peers == {tagged.peer_id, protected_mock.peer_id}
+
+    def test_policy_error_fails_closed_with_sentinel(self):
+        planner = self._planner()
+        planner.policy_manager = MagicMock()
+        planner.policy_manager.get_all_policies.side_effect = RuntimeError("db")
+        peers = planner._recycle_protected_peers()
+        assert peers is None  # None = unknown -> caller must treat as protected
+
+
+class TestCloseGateRechecksMembershipLazily:
+    """Lazy-eval audit F5: membership was read eagerly at classification,
+    minutes before close execution — a peer joining the fleet mid-cycle was
+    closable. The close gate now re-reads membership lazily."""
+
+    def test_close_blocked_for_fresh_hive_member(self):
+        planner, db, _ = _make_close_planner()
+        planner._is_protected_hive_member = MagicMock(return_value=True)
+        allowed, reason = planner._check_close_allowed("peer_abc")
+        assert allowed is False
+        assert "member" in reason.lower()
+        planner._is_protected_hive_member.assert_called_once_with("peer_abc")
+
+
+class TestOpensAndDefibsRespectPolicy:
+    """Lazy-eval audit F4: opens could commit on-chain capital toward a
+    peer the operator set passive ('ignored'), and defibs filled/drained
+    channels whose rebalance_mode forbade it. no_close tags deliberately do
+    NOT block defib (operator policy 2026-07-09) — rebalance_mode is a
+    different axis and is now respected."""
+
+    def _planner_with_policy(self, strategy="passive", mode="disabled"):
+        from modules.config import Config
+        planner = CapacityPlanner(MagicMock(), MagicMock(), MagicMock(),
+                                  config=Config())
+        policy = MagicMock()
+        policy.strategy = MagicMock(value=strategy)
+        policy.rebalance_mode = MagicMock(value=mode)
+        policy.has_tag.return_value = False
+        planner.policy_manager = MagicMock()
+        planner.policy_manager.get_policy.return_value = policy
+        return planner
+
+    def test_open_blocked_for_passive_peer(self):
+        planner = self._planner_with_policy(strategy="passive")
+        allowed, reason = planner._check_open_allowed("02" + "a" * 64)
+        assert allowed is False
+        assert "passive" in reason.lower()
+
+    def test_open_allowed_for_dynamic_peer(self):
+        planner = self._planner_with_policy(strategy="dynamic")
+        allowed, _ = planner._check_open_allowed("02" + "a" * 64)
+        assert allowed is True
+
+    def test_open_fails_closed_without_policy_manager(self):
+        planner = self._planner_with_policy()
+        planner.policy_manager = None
+        allowed, _ = planner._check_open_allowed("02" + "a" * 64)
+        assert allowed is False
+
+    def test_defib_blocked_when_fill_forbidden(self):
+        for mode in ("disabled", "source_only"):
+            planner = self._planner_with_policy(strategy="dynamic", mode=mode)
+            allowed, reason = planner._check_defib_allowed("02" + "a" * 64)
+            assert allowed is False, mode
+            assert mode in reason
+
+    def test_defib_allowed_when_fill_permitted(self):
+        for mode in ("enabled", "sink_only"):
+            planner = self._planner_with_policy(strategy="dynamic", mode=mode)
+            allowed, _ = planner._check_defib_allowed("02" + "a" * 64)
+            assert allowed is True, mode
+
+    def test_defib_allowed_with_no_close_tag(self):
+        """Operator policy: no_close (LN+ contracts) never blocks defib."""
+        planner = self._planner_with_policy(strategy="dynamic", mode="enabled")
+        planner.policy_manager.get_policy.return_value.has_tag.side_effect = \
+            lambda t: t == "no_close"
+        allowed, _ = planner._check_defib_allowed("02" + "a" * 64)
+        assert allowed is True

@@ -74,4 +74,37 @@ def load_plugin_module():
             sys.modules["pyln.client"] = old_pyln_client
         else:
             sys.modules.pop("pyln.client", None)
+    if getattr(module, "policy_manager", None) is None:
+        module.policy_manager = PermissivePolicyManager()
+
     return module
+
+
+class _PermissivePolicy:
+    """Dynamic/enabled/untagged policy for tests that don't care about policy.
+
+    Uses the REAL enums: some gates compare identity (pol.strategy ==
+    FeeStrategy.PASSIVE), not .value strings."""
+    def __init__(self):
+        from modules.policy_manager import FeeStrategy, RebalanceMode
+        self.strategy = FeeStrategy.DYNAMIC
+        self.rebalance_mode = RebalanceMode.ENABLED
+        self.tags = []
+    def has_tag(self, _tag):
+        return False
+
+
+class PermissivePolicyManager:
+    """Stands in for the always-present production PolicyManager in tests.
+
+    Lazy-eval audit F4/F6 made the open/close/defib/swap gates FAIL CLOSED
+    when the policy manager is missing (production constructs it
+    unconditionally, so None means broken init). Tests that don't exercise
+    policy get this permissive stand-in; tests that DO exercise the gates
+    explicitly set policy_manager = None or their own mock after
+    construction.
+    """
+    def get_policy(self, _peer_id):
+        return _PermissivePolicy()
+    def get_all_policies(self):
+        return []

@@ -8143,10 +8143,38 @@ def _non_boltz_liquidity_cost_components(window_hours: Optional[int] = None) -> 
     }
 
 
+def _boltz_exec_policy_recheck(peer_id: str, direction: str) -> Tuple[bool, str]:
+    """Lazy re-check at swap EXECUTION time (lazy-eval audit F2).
+
+    Plans are built minutes before execution; policy may flip in between.
+    PolicyManager is a write-through cache, so this read is fresh-as-DB.
+    """
+    return _boltz_direction_allowed_by_policy(peer_id, direction)
+
+
+def _hive_route_first_hop_peer(hive_route) -> Optional[str]:
+    """Peer id of a hive route's first hop, or None when undeterminable.
+
+    The loop-out hive-route override re-pins the drain to a different
+    channel; its peer must pass the same policy gate. None means the caller
+    must decline the override (fail closed to the already-checked channel).
+    """
+    try:
+        path = getattr(hive_route, "path", None) or []
+        first = path[0] if path else None
+        peer = first.get("next_node") if isinstance(first, dict) else None
+        return str(peer) if peer else None
+    except Exception:
+        return None
+
+
 def _boltz_direction_allowed_by_policy(peer_id: str, direction: str) -> Tuple[bool, str]:
     """direction: loop_in (fill local) or loop_out (drain local)."""
     if policy_manager is None:
-        return True, "no_policy_manager"
+        # Lazy-eval audit F6: constructed unconditionally at init; None means
+        # broken init. Swapping without policy checks is the dangerous
+        # direction — fail closed.
+        return False, "policy_manager_unavailable_fail_closed"
     try:
         pol = policy_manager.get_policy(peer_id)
     except Exception as e:
@@ -9626,6 +9654,11 @@ def _execute_boltz_balance_cycle(
                         currency = _select_boltz_currency("loop_in", amount_sats)
                     except Exception:
                         currency = "LBTC"
+                _ok, _why = _boltz_exec_policy_recheck(peer_id, "loop_in")
+                if not _ok:
+                    skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id,
+                                         "reason": f"policy_recheck_blocked: {_why}"})
+                    continue
                 res = bm.loop_in(amount_sats=amount_sats, channel_id=ch_id, peer_id=peer_id, currency=currency)
             elif direction == "loop_out":
                 currency = loop_out_currency
@@ -9641,13 +9674,33 @@ def _execute_boltz_balance_cycle(
                     try:
                         hr = hive_router.discover_route(peer_id, amount_sats)
                         if hr and hr.source_scid and hr.fee_ppm < 200:
-                            exec_ch_id = hr.source_scid
-                            plugin.log(
-                                f"BOLTZ HIVE ROUTE: Using fleet path for loop-out "
-                                f"({hr.hops} hops, {hr.fee_ppm} ppm, via {hr.source_scid})",
-                            )
+                            # Lazy-eval audit F2: the override drains a
+                            # DIFFERENT channel — its peer must pass the same
+                            # policy gate; undeterminable peer declines the
+                            # override (the original channel was checked).
+                            _hop_peer = _hive_route_first_hop_peer(hr)
+                            _hop_ok = False
+                            if _hop_peer:
+                                _hop_ok, _hop_why = _boltz_exec_policy_recheck(_hop_peer, "loop_out")
+                            if _hop_peer and _hop_ok:
+                                exec_ch_id = hr.source_scid
+                                plugin.log(
+                                    f"BOLTZ HIVE ROUTE: Using fleet path for loop-out "
+                                    f"({hr.hops} hops, {hr.fee_ppm} ppm, via {hr.source_scid})",
+                                )
+                            else:
+                                plugin.log(
+                                    "BOLTZ HIVE ROUTE: override declined "
+                                    f"(first-hop peer policy: {_hop_why if _hop_peer else 'peer undeterminable'})",
+                                    level="info",
+                                )
                     except Exception:
                         pass  # Fall back to original channel selection
+                _ok, _why = _boltz_exec_policy_recheck(exec_peer_id, "loop_out")
+                if not _ok:
+                    skipped_exec.append({"channel_id": ch_id, "peer_id": exec_peer_id,
+                                         "reason": f"policy_recheck_blocked: {_why}"})
+                    continue
                 # structural=True routes the swap fee into the dedicated
                 # "structural" spend subcategory so the envelope gate's 24h
                 # sum advances with each structural execution.
