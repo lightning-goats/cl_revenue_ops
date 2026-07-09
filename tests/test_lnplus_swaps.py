@@ -2299,6 +2299,37 @@ class TestIncomingContractProtection:
         assert (PK_B, "no_close") in {c.args for c in policy.add_tag.call_args_list}
         assert db.lnplus_get_swap("s1")["incoming_tag_added"] == 1
 
+    def test_policy_lookup_failure_protects_but_never_claims_ownership(self):
+        """Lazy-eval audit F3b: on get_policy failure the old code 'assumed
+        absent' and could stamp ownership over a pre-existing operator tag —
+        release would later strip the operator's protection. Now: still add
+        the tag (protection first), but stamp 0 (never claim ownership under
+        uncertainty; worst case is a stale tag needing manual cleanup)."""
+        lc, db, rpc, client, policy, _ = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=PK_A, incoming_peer=PK_B)
+        policy.get_policy.side_effect = RuntimeError("policy db locked")
+        lc._protect_peer_no_close("s1", PK_A, "tag_added")
+        assert (PK_A, "no_close") in {c.args for c in policy.add_tag.call_args_list}
+        assert db.lnplus_get_swap("s1")["tag_added"] == 0
+
+    def test_self_heal_tags_outbound_when_unresolved(self):
+        """Lazy-eval audit F3a: a transient add_tag failure at activation
+        left the OUTBOUND contract channel unprotected for the whole term
+        (self-heal only covered the incoming side). The watcher now retries
+        the outbound flag too."""
+        lc, db, rpc, client, policy, _ = _make_lifecycle()
+        db.lnplus_record_swap("s1", "active", 2_000_000, 3,
+                              outbound_peer=PK_A, incoming_peer=PK_B)
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) + 86400,
+                              incoming_tag_added=1)
+        policy.get_policy.return_value = MagicMock(has_tag=MagicMock(return_value=False))
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": PK_A, "state": "CHANNELD_NORMAL"}]}
+        lc.run_watcher_once()
+        assert (PK_A, "no_close") in {c.args for c in policy.add_tag.call_args_list}
+        assert db.lnplus_get_swap("s1")["tag_added"] == 1
+
     def test_release_respects_shared_peer_in_either_role(self):
         """A peer held by ANOTHER active contract (in either role) keeps the
         tag when this contract ends."""

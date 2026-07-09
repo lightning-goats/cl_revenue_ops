@@ -173,16 +173,27 @@ import pytest as _pytest
 
 @_pytest.fixture(autouse=True)
 def _default_planner_policy_manager(monkeypatch):
-    from modules.capacity_planner import CapacityPlanner
-    from tests.plugin_test_utils import PermissivePolicyManager
     import functools
-    original = CapacityPlanner.__init__
+    from modules.capacity_planner import CapacityPlanner
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from tests.plugin_test_utils import PermissivePolicyManager
 
-    @functools.wraps(original)
-    def patched(self, *args, **kwargs):
-        original(self, *args, **kwargs)
+    planner_init = CapacityPlanner.__init__
+
+    @functools.wraps(planner_init)
+    def planner_patched(self, *args, **kwargs):
+        planner_init(self, *args, **kwargs)
         if getattr(self, "policy_manager", None) is None:
             self.policy_manager = PermissivePolicyManager()
 
-    monkeypatch.setattr(CapacityPlanner, "__init__", patched)
+    engine_init = RebalanceEngine.__init__
+
+    @functools.wraps(engine_init)
+    def engine_patched(self, *args, **kwargs):
+        engine_init(self, *args, **kwargs)
+        if getattr(self, "_policy_manager", None) is None:
+            self._policy_manager = PermissivePolicyManager()
+
+    monkeypatch.setattr(CapacityPlanner, "__init__", planner_patched)
+    monkeypatch.setattr(RebalanceEngine, "__init__", engine_patched)
     yield

@@ -63,6 +63,18 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.13.2: Policy lazy-evaluation audit fixes (2026-07-09)
+#   - Native rebalance engine now enforces peer policy (rebalance_mode /
+#     passive) — eager candidate filter + lazy re-check at execution; the
+#     highest-frequency spend path previously never read policy at all
+#   - Recycle protection set actually populates (list/.items() crash was
+#     swallowed); close/open/swap/defib gates fail CLOSED on policy errors
+#   - Boltz executes with fresh policy (plans are minutes stale) and the
+#     hive-route override's first-hop peer passes the same gate
+#   - Close gate lazily re-reads hive membership; opens blocked for passive
+#     peers; defib respects rebalance_mode (no_close never blocks defib)
+#   - LN+ outbound no_close self-heals like the incoming side; ownership is
+#     never claimed under policy-lookup uncertainty
 # v2.13.1: RPC surface-quality fixes from the read-only sweep (2026-07-08)
 #   - revenue-boltz-status returns a usage error (not a raw traceback) without
 #     swap_id and points at the global-state RPCs
@@ -115,7 +127,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.13.1"
+PLUGIN_VERSION = "2.13.2"
 HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
 # Supply-chain / runtime version floors (Phase 3C).
@@ -3086,6 +3098,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             segment_observation_store=segment_observation_store,
             global_budget_limit_provider=_total_cost_budget_limit_provider,
             external_liquidity_cost_provider=_non_rebalance_liquidity_cost_components,
+            policy_manager=policy_manager,
         )
         rebalancer.data_service = data_service
         plugin.log("RebalanceEngine initialized")

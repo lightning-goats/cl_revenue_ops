@@ -143,10 +143,12 @@ class RebalanceEngine:
         segment_observation_store: Any = None,
         global_budget_limit_provider: Any = None,
         external_liquidity_cost_provider: Any = None,
+        policy_manager: Any = None,
     ):
         self.plugin = plugin
         self.config = config
         self.database = database
+        self._policy_manager = policy_manager
         self._capex_engine = capex_engine
         self._profitability = profitability
         self._hive_hints = hive_hints
@@ -2941,6 +2943,41 @@ class RebalanceEngine:
             )
         return prior_result
 
+    def _pair_policy_allowed(self, pair) -> tuple:
+        """Peer-policy gate for a rebalance pair (lazy-eval audit F0).
+
+        The native pipeline historically never read policy at all —
+        rebalance_mode and strategy=passive (the canonical revenue-ignore)
+        were void on this path. A rebalance DRAINS the source and FILLS the
+        dest: source forbids draining under disabled/sink_only; dest forbids
+        filling under disabled/source_only; passive forbids the pair. Fails
+        CLOSED on a missing/broken policy source.
+        """
+        if self._policy_manager is None:
+            return False, "policy manager unavailable (fail closed)"
+        try:
+            checks = (
+                (getattr(pair, "source_peer_id", None), "source",
+                 ("disabled", "sink_only")),
+                (getattr(pair, "dest_peer_id", None), "dest",
+                 ("disabled", "source_only")),
+            )
+            for peer_id, side, forbidden in checks:
+                if not peer_id:
+                    continue
+                policy = self._policy_manager.get_policy(peer_id)
+                strategy = getattr(policy, "strategy", None)
+                strategy_str = strategy.value if hasattr(strategy, "value") else str(strategy)
+                if strategy_str == "passive":
+                    return False, f"{side} peer policy is passive"
+                mode = getattr(policy, "rebalance_mode", None)
+                mode_str = mode.value if hasattr(mode, "value") else str(mode or "enabled")
+                if mode_str in forbidden:
+                    return False, f"{side} rebalance_mode={mode_str} forbids this direction"
+            return True, "policy allows pair"
+        except Exception as e:
+            return False, f"policy check failed (fail closed): {e}"
+
     def _execute_pair(
         self,
         pair: PairCandidate,
@@ -2961,6 +2998,16 @@ class RebalanceEngine:
         instead of inserting a second 'pending' row. This keeps one history
         row per rebalance so success-rate/fee stats are not double-counted.
         """
+        policy_ok, policy_reason = self._pair_policy_allowed(pair)
+        if not policy_ok:
+            # Lazy re-check at the execution sink: candidate selection may be
+            # minutes old and policy is a fresh write-through read.
+            return ExecutionResult(
+                success=False,
+                amount_sats=int(getattr(pair, "amount_sats", 0) or 0),
+                error=f"policy_blocked: {policy_reason}",
+                route_type="native",
+            )
         # Stage 2D Defect 3 fix: the v2 engine used to leave ``rebalance_history``
         # empty on automatic cycles, which made ``revenue-status.rebalance_decision.
         # action == 'rebalance'`` reachable alongside ``recent_rebalances == []``.
@@ -3561,6 +3608,26 @@ class RebalanceEngine:
         # visible in the REBAL_SKIP stream.
         live_candidates: List[PairCandidate] = []
         for pair in candidates:
+            policy_ok, policy_reason = self._pair_policy_allowed(pair)
+            if not policy_ok:
+                debug_pair = considered_lookup.get(self._pair_key(pair))
+                if debug_pair is not None:
+                    self._update_pair_score_decomposition(
+                        debug_pair,
+                        route_cost_sats=debug_pair.route_cost_sats,
+                        effective_budget_sats=int(getattr(debug_pair, "pair_budget_sats", 0) or 0),
+                        rejection_reason="policy_blocked",
+                        route_status="policy_blocked",
+                    )
+                self._audit.log_skip(
+                    channel_id=pair.dest_channel_id,
+                    reason="policy_blocked",
+                    value_class="valuable",
+                    remaining_budget_sats=int(getattr(pair, "pair_budget_sats", 0) or 0),
+                    detail=f"src={pair.source_channel_id} {policy_reason}",
+                    router="v3",
+                )
+                continue
             if self._is_pair_in_futility(pair.source_channel_id, pair.dest_channel_id):
                 debug_pair = considered_lookup.get(self._pair_key(pair))
                 if debug_pair is not None:

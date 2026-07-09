@@ -1392,6 +1392,12 @@ class SwapLifecycle:
                     if row.get("incoming_tag_added") is None and row.get("incoming_peer"):
                         self._protect_peer_no_close(sid, row["incoming_peer"],
                                                     "incoming_tag_added")
+                    # Lazy-eval audit F3a: retry the OUTBOUND side too — a
+                    # transient add_tag failure at activation left the
+                    # contract channel unprotected for the whole term.
+                    if row.get("tag_added") is None and row.get("outbound_peer"):
+                        self._protect_peer_no_close(sid, row["outbound_peer"],
+                                                    "tag_added")
                     self._check_mid_contract_vanish(row)
             except Exception as e:
                 self._plugin.log(f"LNPLUS: error processing active swap {sid}: {e}", level="error")
@@ -1850,13 +1856,27 @@ class SwapLifecycle:
         pre-existing tag (operator-set or another contract's) is recorded as
         0 so release never clobbers it."""
         already_tagged = False
+        lookup_failed = False
         try:
             policy = self._policy.get_policy(peer)
             already_tagged = bool(policy and policy.has_tag("no_close"))
         except Exception as e:
+            lookup_failed = True
             self._plugin.log(
                 f"LNPLUS: get_policy failed for {peer} while protecting "
-                f"swap {sid} — assuming no_close absent: {e}", level="warn")
+                f"swap {sid}: {e}", level="warn")
+        if lookup_failed:
+            # Lazy-eval audit F3b: under uncertainty, protect but NEVER claim
+            # ownership — a pre-existing operator tag stamped as ours would be
+            # stripped at release. Worst case now: a stale tag needing manual
+            # cleanup (the safe direction).
+            try:
+                self._policy.add_tag(peer, "no_close")
+            except Exception as e:
+                self._plugin.log(f"LNPLUS: add_tag(no_close) failed for {peer}: {e}",
+                                  level="warn")
+            self._db.lnplus_update_swap(sid, **{flag_column: 0})
+            return
         if already_tagged:
             self._db.lnplus_update_swap(sid, **{flag_column: 0})
         else:
