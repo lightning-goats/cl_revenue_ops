@@ -80,12 +80,23 @@ and pruned 5 mixed ones (kept non-hive coverage). Suite green (3330 passed).
 - **`tools/audit/*` hive sweeps deferred to Phase 5** (dev-only, not runtime/suite).
 
 **Phase 2 — Surgical de-hive of the easy modules (low density first).**
-`growth_budget` (0) → `profitability_analyzer` (1) → `capital_efficiency` (4) →
-`rebalance_state_v2` (4) → `database` (5) → `policy_manager` (5) → `capex_budget` (8) →
-`rebalance_route_policy` (14) → `rebalance_coordination_overlay` (16). For each: delete the
-hint-bias code path and the now-dead branches, keeping the underlying decision on its
-non-hive inputs. TDD each; the coordination-overlay lease/campaign/segment logic goes entirely
-(it required a fleet).
+Batch 1 ✅ DONE 2026-07-09 (commit 03518c9): the four modules that are *not*
+coupled to the Phase 3 core — `profitability_analyzer` (1), `capital_efficiency` (4),
+`policy_manager` (5), `capex_budget` (8). Each had its hint-bias path and dead branches
+removed; decisions now run on non-hive inputs only. Suite green (3309).
+
+**Remaining Phase 2 is coupled to Phase 3 and merges into it.** Mapping the
+consumers showed `rebalance_state_v2` (`is_hive_member` field, `"hive"` value_class,
+`hive_bootstrap_budget`), `database` (`hive_member_confirmations` table + settled-forward
+hive classification), `rebalance_route_policy` (`HIVE_ONLY`/`HIVE_EQUALIZATION`), and
+`rebalance_coordination_overlay` (whole module) are all read/written by the Phase 3
+revenue-critical modules — `rebalance_engine_v2` sets and reads `is_hive_member`, emits the
+`"hive"` value_class, and holds a full `"hive"` routing-result path; `capacity_planner` and
+`rebalance_planner_v2` carry `"hive"` priority weights; `fee_controller` drives the zero-fee
+corridor off the database hive methods. These four modules cannot be de-hived in isolation
+without breaking their Phase 3 consumers, so **they are folded into Phase 3 and done as one
+careful unit** (coordination-overlay lease/campaign/segment logic goes entirely — it required
+a fleet). This is the revenue-critical core the plan already flagged for a deploy-and-watch.
 
 **Phase 3 — The dense, revenue-critical modules (highest care).**
 `rebalancer` (24) → `capacity_planner` (38) → `rebalance_engine_v2` (54) →
