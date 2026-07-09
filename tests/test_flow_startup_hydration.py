@@ -134,8 +134,6 @@ def test_startup_hydration_uses_helper_window_for_empty_table():
         patch.object(mod, "CapacityPlanner", return_value=_FakeCapacityPlanner()),
         patch.object(mod, "FeeController", return_value=_FakeComponent()),
         patch.object(mod, "EVRebalancer", return_value=_FakeRebalancer()),
-        patch.object(mod, "HiveHintAdapter", return_value=_FakeComponent()),
-        patch.object(mod, "HiveRouter", return_value=_FakeComponent()),
         patch.object(mod, "CapitalEfficiencyAnalyzer", return_value=_FakeComponent()),
         patch.object(mod, "CapexBudgetEngine", return_value=_FakeCapexEngine()),
         patch.object(mod, "BoltzCliManager", return_value=_FakeBoltzManager()),

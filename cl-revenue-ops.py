@@ -41,9 +41,6 @@ from modules.growth_budget import compute_growth_budget_status
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
 from modules.capacity_planner import CapacityPlanner
-from modules.hive_hints import HiveHintAdapter
-from modules.hive_router import HiveRouter
-from modules.hive_runtime import refresh_hive_runtime
 from modules.policy_manager import (
     PolicyManager,
     FeeStrategy,
@@ -63,6 +60,16 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.15.0: Standalone Phase 1 — delete the dedicated hive modules (2026-07-09)
+#   - Removed modules/hive_hints.py, hive_router.py, hive_runtime.py (~3,368
+#     lines) and every orchestrator reference to them: the imports, the
+#     HiveRouter construction, all refresh_hive_runtime call sites, and the
+#     hive_refresh debug block. hive_hints/hive_router stay as permanently-None
+#     globals (neutral seams); the guarded consumer branches no-op.
+#   - Deleted 18 dedicated hive test modules; surgically pruned 5 mixed test
+#     files (kept their non-hive coverage) and 1 daemon-survival helper list.
+#   - Deferred to later phases: rebalance_hive_router.py (module-level dep of
+#     rebalance_engine_v2 → Phase 3) and the tools/audit/* hive sweeps (Phase 5).
 # v2.14.0: Standalone Phase 0 — cut the cl-mycelium live wires (2026-07-09)
 #   - cl-mycelium retired: hive_hints is now permanently None (HiveHintAdapter
 #     is never constructed); every consumer neutralizes through its existing
@@ -140,7 +147,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.14.0"
+PLUGIN_VERSION = "2.15.0"
 HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
 # Supply-chain / runtime version floors (Phase 3C).
@@ -964,7 +971,7 @@ policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
 lnplus_client = None  # LNPlusClient: LN+ API client (LN+ swap automation)
 lnplus_lifecycle = None  # SwapLifecycle: LN+ obligations watcher / state machine
-hive_hints: Optional[HiveHintAdapter] = None  # cl_hive fleet hint adapter
+hive_hints = None  # cl-mycelium retired: permanently None (neutral seam for consumers)
 capex_engine: Optional[CapexBudgetEngine] = None  # Unified capex budget engine
 hive_router = None  # HiveRouter: shared askrene fleet route discovery
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
@@ -3074,20 +3081,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             hive_hints=hive_hints)
     plugin.log("LN+ swap automation initialized")
 
-    # Hive Router (shared askrene fleet route discovery)
+    # cl-mycelium retired: HiveRouter (shared askrene fleet route discovery) is
+    # gone. hive_router stays permanently None; the guarded consumer branches
+    # that reference it no-op.
     global hive_router
     hive_router = None
-    if hive_hints is not None:
-        hive_router = HiveRouter(safe_plugin, hive_hints)
-        plugin.log("HiveRouter initialized - fleet route discovery enabled")
-
-    if rebalancer is not None and hive_router is not None:
-        rebalancer.hive_router = hive_router
-
-    if hive_router is not None:
-        hive_router.data_service = data_service
-        if profitability_analyzer is not None:
-            hive_router.profitability_analyzer = profitability_analyzer
 
     # Rebalance engine: unified actual-fee pipeline
     from modules.rebalance_engine_v2 import RebalanceEngine
@@ -3240,10 +3238,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             try:
                 _hb_cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
                 _record_loop_heartbeat("rebalance-check", interval_seconds=max(60, _hb_cfg_snap.rebalance_interval))
-                try:
-                    refresh_hive_runtime(hive_hints=hive_hints, hive_router=hive_router, log=plugin.log)
-                except Exception:
-                    pass  # fail-open
                 try:
                     plugin.log("Running scheduled rebalance check...")
                     run_rebalance_check()
@@ -3593,12 +3587,8 @@ def run_flow_analysis():
 
 
 def _refresh_fee_cycle_hive_inputs():
-    """Refresh advisory hive inputs before any fee adjustment path."""
-    try:
-        refresh_hive_runtime(hive_hints=hive_hints, hive_router=hive_router, log=plugin.log)
-    except Exception:
-        pass  # fail-open
-
+    """cl-mycelium retired: hive inputs are gone. Kept as a no-op seam so the
+    fee-cycle callers don't need restructuring until Phase 3."""
     if policy_manager is not None and hive_hints is not None:
         try:
             policy_manager.apply_corridor_policies()
@@ -3713,10 +3703,6 @@ def revenue_rebalance_cycle(plugin: Plugin, max_candidates: int = 20) -> Dict[st
     """Run one automatic rebalance cycle immediately and return debug state."""
     if rebalancer is None:
         return {"error": "Rebalancer not initialized"}
-    try:
-        refresh_hive_runtime(hive_hints=hive_hints, hive_router=hive_router, log=plugin.log)
-    except Exception:
-        pass  # fail-open; missing hive must not block standalone rebalancing
     try:
         run_rebalance_check()
         engine = getattr(rebalancer, "rebalance_engine_v2", None)
@@ -4398,17 +4384,12 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     min_forwards = profile["min_forwards_for_signal"]
     market_boundary_configured = bool(getattr(cfg_snap, "fee_market_boundary_enabled", False))
 
+    # cl-mycelium retired: no hive runtime to refresh. Key retained for API
+    # stability; always reports not-attempted.
     hive_refresh_debug = {
         "attempted": False,
         "ok": False,
     }
-    if hive_hints is not None or hive_router is not None:
-        hive_refresh_debug["attempted"] = True
-        try:
-            refresh_hive_runtime(hive_hints=hive_hints, hive_router=hive_router, log=plugin.log)
-            hive_refresh_debug["ok"] = True
-        except Exception as e:
-            hive_refresh_debug["error"] = str(e)
 
     now = int(time.time())
     result = {

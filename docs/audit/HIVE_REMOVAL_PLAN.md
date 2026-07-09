@@ -67,10 +67,17 @@ Made it standalone at the seams without touching the consumers yet:
 - **Deploy + verify** both nodes: fees/rebalances/opens unchanged, no "hive-export-hints not
   found" log noise. This alone delivers "truly standalone" operationally.
 
-**Phase 1 — Delete the 4 dedicated modules (~4,032 lines).** Remove `hive_hints.py`,
-`hive_router.py`, `rebalance_hive_router.py`, `hive_runtime.py`, the `import` at
-`cl-revenue-ops.py:44`, and the injection block. Fix the fallout: any consumer still importing
-them. Suite green.
+**Phase 1 — Delete the dedicated modules. ✅ DONE 2026-07-09 (v2.15.0).**
+Re-scoped from "4 modules" to **3**: `hive_hints.py`, `hive_router.py`, `hive_runtime.py`
+(~3,368 lines). Removed the imports (`cl-revenue-ops.py:44-46`), the `HiveRouter`
+construction/injection, all four `refresh_hive_runtime` call sites, and the hive_refresh
+debug block. `hive_hints`/`hive_router` remain as permanently-`None` globals (neutral seams);
+their guarded consumer branches no-op until Phase 2/3. Deleted 18 dedicated hive test modules
+and pruned 5 mixed ones (kept non-hive coverage). Suite green (3330 passed).
+- **`rebalance_hive_router.py` deferred to Phase 3**: it is a *module-level* import of
+  `rebalance_engine_v2.py` (`from .rebalance_hive_router import RebalanceHiveRouter`), so it
+  cannot be cleanly removed before the engine is de-hived. It moves into Phase 3 with the engine.
+- **`tools/audit/*` hive sweeps deferred to Phase 5** (dev-only, not runtime/suite).
 
 **Phase 2 — Surgical de-hive of the easy modules (low density first).**
 `growth_budget` (0) → `profitability_analyzer` (1) → `capital_efficiency` (4) →

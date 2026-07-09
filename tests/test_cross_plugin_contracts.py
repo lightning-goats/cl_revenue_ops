@@ -16,7 +16,6 @@ from modules.profitability_analyzer import (
     ChannelRevenue,
     ProfitabilityClass,
 )
-from modules.hive_hints import HiveHintAdapter
 from modules.segment_observations import SegmentObservationStore
 from tests.plugin_test_utils import load_plugin_module
 
@@ -46,69 +45,6 @@ REQUIRED_CONTRACT_SECTIONS = (
 
 def _jsonable(payload: dict) -> None:
     json.dumps(payload, sort_keys=True)
-
-
-def _datastore(snapshot: dict) -> dict:
-    return {"datastore": [{"string": json.dumps(snapshot, sort_keys=True)}]}
-
-
-def _fresh_hive_snapshot(now: int, peer_id: str = "02" + "a" * 64) -> dict:
-    return {
-        "generated_at": now,
-        "ttl_seconds": 900,
-        "schema_version": 1,
-        "m2_scope": "channel_and_fleet_peers",
-        "peer_count": 1,
-        "hints": {
-            peer_id: {
-                "member": True,
-                "corridor_role": "owner",
-                "competition_bias": 1,
-                "traffic_confidence": 0.6,
-                "rebalance_preference": "sink",
-                "peer_quality_score": 0.8,
-                "fleet_capacity_sats": 2_000_000,
-                "fleet_available_sats": 1_250_000,
-                "channel_open_hint": {
-                    "open_preference": "avoid",
-                    "topology_confidence": 0.4,
-                    "suggested_size_bucket": "medium",
-                    "reason": "organism_high_risk_suppression",
-                },
-            }
-        },
-        "segment_scores": [
-            {
-                "short_channel_id": "123x1x0",
-                "direction": 1,
-                "amount_bucket_sats": 250_000,
-                "success_score": 0.8,
-                "failure_score": 0.1,
-                "net_utility": 0.5,
-                "confidence": 0.9,
-                "observer_count": 2,
-                "last_observed_at": now,
-            }
-        ],
-        "segment_observations": [
-            {
-                "observation_id": "obs-1",
-                "observer_member_id": "02" + "b" * 64,
-                "short_channel_id": "123x1x0",
-                "direction": 1,
-                "amount_bucket_sats": 250_000,
-                "outcome": "failure",
-                "failure_class": "liquidity",
-                "confidence": 0.7,
-                "observed_at": now,
-                "source_channel_id": "100x1x0",
-                "dest_channel_id": "123x1x0",
-                "route_policy": "network",
-                "router_kind": "v2",
-                "correlation_id": "corr-1",
-            }
-        ],
-    }
 
 
 def _profitability_analyzer() -> ChannelProfitabilityAnalyzer:
@@ -161,53 +97,6 @@ def test_contract_documents_exist_and_define_required_sections():
         assert f"`{list(key)}`" in text or f'["{key[0]}", "{key[1]}"]' in text
         for section in REQUIRED_CONTRACT_SECTIONS:
             assert section in text, f"{path_text} missing {section}"
-
-
-def test_hive_hints_consumer_accepts_valid_datastore_contract_without_rpc():
-    now = int(time.time())
-    peer_id = "02" + "a" * 64
-    plugin = MagicMock()
-    plugin.rpc.call.side_effect = AssertionError("fresh datastore must not use hive-export-hints")
-    adapter = HiveHintAdapter(plugin, ttl_override=0)
-    adapter.data_service = MagicMock()
-    adapter.data_service.list_datastore.return_value = _datastore(_fresh_hive_snapshot(now, peer_id))
-
-    adapter.poll()
-    status = adapter.get_status(live_refresh=False)
-
-    assert status["snapshot_fresh"] is True
-    assert status["snapshot_source"] == "datastore"
-    assert adapter.is_hive_member(peer_id) is True
-    assert 0.9 <= adapter.get_fee_bias(peer_id) <= 1.1
-    assert 0.85 <= adapter.get_rebalance_bias(peer_id) <= 1.15
-    assert adapter.get_fleet_balance(peer_id)["capacity_sats"] == 2_000_000
-    assert adapter.get_channel_open_hint(peer_id)["reason"] == "organism_high_risk_suppression"
-    assert adapter.get_segment_score("123:1:0", 1, 420_000)["amount_bucket_sats"] == 250_000
-    assert adapter.get_segment_observations()[0]["failure_class"] == "liquidity"
-
-
-def test_hive_hints_consumer_neutralizes_malformed_and_ancient_payloads():
-    now = int(time.time())
-    peer_id = "02" + "a" * 64
-    ancient = _fresh_hive_snapshot(now - 30_000, peer_id)
-    ancient["ttl_seconds"] = 900
-    plugin = MagicMock()
-    plugin.rpc.call.side_effect = Exception("Unknown command 'hive-export-hints'")
-    adapter = HiveHintAdapter(plugin, ttl_override=0)
-    adapter.data_service = MagicMock()
-
-    adapter.data_service.list_datastore.return_value = {"datastore": [{"string": "{bad json"}]}
-    adapter.poll()
-    assert adapter.is_usable() is False
-    assert adapter.get_fee_bias(peer_id) == 1.0
-    assert adapter.get_rebalance_bias(peer_id) == 1.0
-    assert adapter.get_segment_scores() == []
-
-    adapter.data_service.list_datastore.return_value = _datastore(ancient)
-    adapter.poll()
-    assert adapter.is_usable() is False
-    assert adapter.get_fee_bias(peer_id) == 1.0
-    assert adapter.get_rebalance_bias(peer_id) == 1.0
 
 
 def test_profitability_summary_producer_payload_matches_contract_and_rounding():

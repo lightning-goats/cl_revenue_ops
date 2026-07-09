@@ -15,8 +15,6 @@ most modules are imported directly by cl-revenue-ops.py. Module families:
   capex_budget (budget/reservation engine), capital_efficiency (dead-capital analysis)
 - On-/off-chain swaps: boltz_manager (submarine swap integration),
   lnplus_swaps (lightningnetwork.plus liquidity-swap automation)
-- Fleet/hive integration: hive_hints (bounded cl-mycelium/cl-hive hint adapter), hive_router,
-  hive_runtime
 - Analysis & reporting: profitability_analyzer, demand_flow, segment_observations
 - Infrastructure: config (configuration and constants), database (SQLite storage layer),
   data_service, policy_manager (peer-level policy management, v1.4), utils

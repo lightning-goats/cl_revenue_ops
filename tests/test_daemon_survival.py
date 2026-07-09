@@ -220,7 +220,6 @@ def _build_namespace(event, work_name, work_callable, randint_mock):
     # Helper functions closed over by the loops.
     for helper in (
         "_refresh_fee_cycle_hive_inputs",
-        "refresh_hive_runtime",
         "_refresh_dynamic_config",
         "_boltz_auto_cycle_mark_state",
         "_take_financial_snapshot",
