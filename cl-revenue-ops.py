@@ -63,6 +63,11 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.13.1: RPC surface-quality fixes from the read-only sweep (2026-07-08)
+#   - revenue-boltz-status returns a usage error (not a raw traceback) without
+#     swap_id and points at the global-state RPCs
+#   - expansion-treasury-recommendations returns one stable key set on every
+#     branch; auto-cycle-status embeds compact recommendation summaries
 # v2.13.0: Econ audit wave (2026-07-08)
 #   - Class-aware saturated/source min-fee floor (min_fee_ppm_saturated) so saturated
 #     and pure-source channels can price below the global fee floor
@@ -110,7 +115,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.13.0"
+PLUGIN_VERSION = "2.13.1"
 HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
 # Supply-chain / runtime version floors (Phase 3C).
