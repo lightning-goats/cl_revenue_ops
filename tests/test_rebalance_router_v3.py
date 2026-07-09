@@ -28,11 +28,13 @@ def test_parse_layer_names_empty_returns_empty_list():
     assert _parse_layer_names(",,") == []
 
 
-def test_configured_layer_names_blank_uses_hive_default():
+def test_configured_layer_names_blank_is_standalone():
+    # cl-mycelium retired: the default is now the standalone sentinel, so blank
+    # config resolves to no askrene layers (plain CLN routing).
     from modules.rebalance_router_v3 import _configured_layer_names
-    assert _configured_layer_names("") == ["hive-fleet"]
-    assert _configured_layer_names(" ") == ["hive-fleet"]
-    assert _configured_layer_names(None) == ["hive-fleet"]
+    assert _configured_layer_names("") == []
+    assert _configured_layer_names(" ") == []
+    assert _configured_layer_names(None) == []
 
 
 def test_configured_layer_names_supports_explicit_standalone():

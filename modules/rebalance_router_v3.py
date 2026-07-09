@@ -42,7 +42,7 @@ def _parse_layer_names(csv: str) -> List[str]:
     return [name.strip() for name in csv.split(",") if name.strip()]
 
 
-DEFAULT_ASKRENE_LAYERS = "hive-fleet"
+DEFAULT_ASKRENE_LAYERS = "standalone"
 ASKRENE_STANDALONE_LAYER_VALUES = frozenset({
     "none",
     "off",
@@ -62,10 +62,10 @@ def _configured_layer_names(raw: Any) -> List[str]:
     run without cl-hive bias.
     """
     text = "" if raw is None else str(raw).strip()
-    if text.lower() in ASKRENE_STANDALONE_LAYER_VALUES:
-        return []
     if not text:
         text = DEFAULT_ASKRENE_LAYERS
+    if text.lower() in ASKRENE_STANDALONE_LAYER_VALUES:
+        return []
     return _parse_layer_names(text)
 
 

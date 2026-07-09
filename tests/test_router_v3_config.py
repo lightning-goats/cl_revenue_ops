@@ -7,10 +7,11 @@ def test_config_has_rebalance_router_default_v3():
     assert cfg.rebalance_router == "v3"
 
 
-def test_config_has_askrene_layers_default_hive_fleet():
+def test_config_has_askrene_layers_default_standalone():
+    # cl-mycelium retired: default is the standalone sentinel (no fleet layer).
     from modules.config import Config
     cfg = Config()
-    assert cfg.askrene_layers == "hive-fleet"
+    assert cfg.askrene_layers == "standalone"
 
 
 def test_rebalance_router_in_field_type_map():

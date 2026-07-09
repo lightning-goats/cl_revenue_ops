@@ -41,11 +41,12 @@ def test_engine_builds_only_v3_router_when_askrene_available():
     assert not hasattr(engine, "router_v2")
 
 
-def test_engine_defaults_blank_askrene_layers_to_hive_fleet():
+def test_engine_defaults_blank_askrene_layers_to_standalone():
+    # cl-mycelium retired: blank askrene config resolves to no layers.
     engine, _ = _make_engine(askrene_available=True, askrene_layers=" ")
     assert engine.router_v3 is not None
-    assert engine.router_v3.layer_names == ["hive-fleet"]
-    assert engine.router_v3.found_layers == ["hive-fleet"]
+    assert engine.router_v3.layer_names == []
+    assert engine.router_v3.found_layers == []
 
 
 def test_engine_allows_explicit_standalone_askrene_layers():

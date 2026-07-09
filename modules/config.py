@@ -733,9 +733,9 @@ class Config:
     askrene_layer: str = 'xpay'               # Layer name for askrene-listlayers
     askrene_max_age_sec: int = 900            # Max constraint age (seconds) to consider fresh
 
-    # V3 rebalance router (askrene getroutes + cl-hive layers)
+    # V3 rebalance router (askrene getroutes)
     rebalance_router: str = 'v3'              # only 'v3' is supported
-    askrene_layers: str = 'hive-fleet'        # CSV of layers to pass to v3 router's getroutes calls
+    askrene_layers: str = 'standalone'        # CSV of layers to pass to v3 router's getroutes calls ('standalone' = none)
 
     # Safety flags
     paused: bool = False           # If True, suppress automated executor actions
@@ -1269,9 +1269,9 @@ class ConfigSnapshot:
     askrene_layer: str = 'xpay'
     askrene_max_age_sec: int = 900
 
-    # V3 rebalance router (askrene getroutes + cl-hive layers)
+    # V3 rebalance router (askrene getroutes)
     rebalance_router: str = 'v3'
-    askrene_layers: str = 'hive-fleet'
+    askrene_layers: str = 'standalone'
 
     # Weekly budget cap (hard ceiling over daily burst)
     weekly_budget_sats: int = 35000

@@ -63,6 +63,19 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.14.0: Standalone Phase 0 — cut the cl-mycelium live wires (2026-07-09)
+#   - cl-mycelium retired: hive_hints is now permanently None (HiveHintAdapter
+#     is never constructed); every consumer neutralizes through its existing
+#     getattr defaults. Injection into fee_controller/rebalancer/etc. is kept.
+#   - The three cl-hive coordination RPCs are gone: hive-report-rebalance-intent
+#     and both hive-report-rebalance-outcome sites are no-ops (coordinated
+#     candidates cannot arise without hive hints, so these paths are inert).
+#   - askrene default layer flipped from "hive-fleet" to the "standalone"
+#     sentinel, so blank config resolves to no askrene layers (plain CLN
+#     routing). Fixed _configured_layer_names ordering so the default itself
+#     resolves through the standalone sentinel to [].
+#   - Config options remain registered-but-unused (removing an option a node's
+#     config still references is restart-fatal); their excision is deferred.
 # v2.13.2: Policy lazy-evaluation audit fixes (2026-07-09)
 #   - Native rebalance engine now enforces peer policy (rebalance_mode /
 #     passive) — eager candidate filter + lazy re-check at execution; the
@@ -127,7 +140,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.13.2"
+PLUGIN_VERSION = "2.14.0"
 HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
 # Supply-chain / runtime version floors (Phase 3C).
@@ -2637,7 +2650,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             'revenue-ops-hive-hints-allow-all-hints-m2-scope', 'false'
         ).lower() in ('true', '1', 'yes'),
         rebalance_router='v3',
-        askrene_layers=str(options.get('revenue-ops-askrene-layers', '') or '').strip() or 'hive-fleet',
+        askrene_layers=str(options.get('revenue-ops-askrene-layers', '') or '').strip() or 'standalone',
     )
     # P1-008: range-validate numeric options before Config construction so a
     # 0/negative/out-of-band value can never fail open.
@@ -2982,17 +2995,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # them instead.
         boltz_manager.structural_envelope_provider = _structural_envelope_sats_provider
 
-    # Hive Hints adapter (sole integration boundary with cl_hive)
+    # cl-mycelium retired (2026-07-09): no fleet coordinator. hive_hints is
+    # permanently None; every consumer neutralizes through its getattr defaults.
+    # Injection is kept so those neutral no-op paths stay wired.
     global hive_hints
-    if config.hive_hints_enabled:
-        hive_hints = HiveHintAdapter(
-            safe_plugin,
-            ttl_override=config.hive_hints_ttl_seconds,
-            allow_all_hints_m2_scope=config.hive_hints_allow_all_hints_m2_scope,
-        )
-        plugin.log("HiveHintAdapter initialized - fleet hint bias enabled")
-    else:
-        hive_hints = None
+    hive_hints = None
 
     if fee_controller is not None:
         fee_controller.hive_hints = hive_hints

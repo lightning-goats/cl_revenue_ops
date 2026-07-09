@@ -953,16 +953,14 @@ class EVRebalancer:
                 ),
             })
 
-        try:
-            response = self.plugin.rpc.call("hive-report-rebalance-intent", payload)
-        except Exception as e:
-            context["intent_status"] = "report_failed"
-            self.plugin.log(
-                f"HIVE_COORDINATION: intent report failed for {candidate.to_channel}: {e}",
-                level='debug',
-            )
-            return context
+        # cl-mycelium retired (2026-07-09): no fleet coordinator to report to.
+        # Coordinated candidates cannot arise without hive hints (hive_hints is
+        # permanently None), so this path is inert. Return the neutral,
+        # unreported context without contacting cl-hive.
+        context["intent_status"] = "report_failed"
+        return context
 
+        response = None  # unreachable — retained until coordination code is excised
         if isinstance(response, dict):
             status = str(response.get("status") or "").strip().lower()
             context["intent_status"] = status or "invalid_response"
@@ -1066,13 +1064,10 @@ class EVRebalancer:
             "campaign_chunk_index": int(context.get("campaign_chunk_index", 1) or 1),
         }
 
-        try:
-            self.plugin.rpc.call("hive-report-rebalance-outcome", payload)
-        except Exception as e:
-            self.plugin.log(
-                f"HIVE_COORDINATION: outcome report failed for {candidate.to_channel}: {e}",
-                level='debug',
-            )
+        # cl-mycelium retired (2026-07-09): no fleet coordinator. Outcome
+        # reporting for coordinated candidates is a no-op (this path is inert
+        # since coordinated candidates cannot arise without hive hints).
+        del payload  # built above; nothing consumes it in standalone mode
 
 
     @staticmethod
@@ -1145,13 +1140,9 @@ class EVRebalancer:
             "campaign_goal_type": "growth_spend_learning",
             "campaign_target_peer_or_corridor": outcome_details.get("destination_peer_id") or outcome_details.get("sink_scid") or "",
         }
-        try:
-            self.plugin.rpc.call("hive-report-rebalance-outcome", payload)
-        except Exception as e:
-            self.plugin.log(
-                f"GROWTH_SPEND: outcome report failed for {candidate.to_channel}: {e}",
-                level='debug',
-            )
+        # cl-mycelium retired (2026-07-09): growth-spend outcomes were reported
+        # to the fleet coordinator, which no longer exists. No-op in standalone.
+        del payload  # built above; nothing consumes it in standalone mode
 
 
 
