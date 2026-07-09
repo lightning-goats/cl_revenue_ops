@@ -5466,3 +5466,39 @@ class TestDefibrillationQueueAdvances:
         ]
         ok, _ = planner._check_cooldown("02" + "a" * 64)
         assert ok is True
+
+
+class TestLnplusChannelsDefibrillatableButNotCloseable:
+    """Operator policy (2026-07-09): LN+ contract channels are excluded from
+    closes until their agreements expire (no_close tag, released at contract
+    end) but MUST remain eligible for defibrillation diagnostics."""
+
+    def _planner_with_tagged_peer(self):
+        from modules.config import Config
+        plugin = MagicMock()
+        prof = MagicMock()
+        flow = MagicMock()
+        planner = CapacityPlanner(plugin, prof, flow, config=Config())
+        policy = MagicMock()
+        policy.strategy = MagicMock(value="dynamic")
+        policy.has_tag.side_effect = lambda t: t == "no_close"
+        planner.policy_manager = MagicMock()
+        planner.policy_manager.get_policy.return_value = policy
+        return planner, prof
+
+    def test_no_close_tag_blocks_close(self):
+        planner, _ = self._planner_with_tagged_peer()
+        allowed, reason = planner._check_close_allowed("02" + "f" * 64)
+        assert allowed is False
+        assert "no_close" in reason
+
+    def test_no_close_tag_does_not_block_defibrillation(self):
+        planner, prof = self._planner_with_tagged_peer()
+        planner.rebalancer = MagicMock()
+        planner.rebalancer.diagnostic_rebalance.return_value = {
+            "status": "success", "amount_sats": 50_000}
+        prof.database.log_planner_action.return_value = 7
+        result = planner._execute_defibrillation(
+            "944398x16x0", "02" + "f" * 64, planner.config)
+        planner.rebalancer.diagnostic_rebalance.assert_called_once_with("944398x16x0")
+        assert result.get("status") != "blocked_by_policy"

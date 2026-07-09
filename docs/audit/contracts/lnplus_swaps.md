@@ -202,3 +202,15 @@ defaults and one-line descriptions of each.
   `_finalize()` negative-rating path — whether a fleet participant can defect without
   consequence (since fleet trust also means no local-defection-history check in
   `_check_participants()`) is worth a closer look.
+
+### Close-vs-defibrillation policy (operator, 2026-07-09)
+
+LN+ contract channels are **excluded from auto-closes for the full life of
+their agreement** — `no_close` tags are placed on both the outbound and
+incoming peers at contract activation and released only when the contract
+concludes; `_check_close_allowed` vetoes every close at execution time.
+They **remain eligible for defibrillation**: diagnostic rebalances carry no
+policy gate, and the dead-capital staging pipeline holds protected channels
+at DEFIBRILLATE rather than advancing them to CLOSE. Pinned by
+`TestLnplusChannelsDefibrillatableButNotCloseable` in
+tests/test_capacity_planner.py.
