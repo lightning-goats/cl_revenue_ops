@@ -49,83 +49,6 @@ def _candidate(
     )
 
 
-def _make_coordination_rebalancer(mock_plugin, mock_database):
-    from modules.config import Config
-    from modules.rebalancer import EVRebalancer
-
-    cfg = Config(
-        dry_run=True,
-        low_liquidity_threshold=0.2,
-        high_liquidity_threshold=0.8,
-    )
-    r = EVRebalancer(mock_plugin, cfg, mock_database)
-
-    r.data_service = MagicMock()
-    r.data_service.invalidate = MagicMock()
-    r.data_service.datastore_push.return_value = True
-
-    r._check_capital_controls = MagicMock(return_value=True)
-    r._get_peer_connection_status = MagicMock(return_value={})
-    r._calculate_turnover_rate = MagicMock(return_value=0.05)
-
-    source_scid = "111x1x0"
-    sink_a_scid = "222x2x0"
-    sink_b_scid = "333x3x0"
-    source_peer = "02" + "a" * 64
-    sink_a_peer = "02" + "b" * 64
-    sink_b_peer = "02" + "c" * 64
-
-    r._get_channels_with_balances = MagicMock(return_value={
-        source_scid: {
-            "peer_id": source_peer,
-            "capacity": 1_000_000,
-            "spendable_sats": 900_000,
-            "fee_ppm": 100,
-        },
-        sink_a_scid: {
-            "peer_id": sink_a_peer,
-            "capacity": 1_000_000,
-            "spendable_sats": 100_000,
-            "fee_ppm": 200,
-        },
-        sink_b_scid: {
-            "peer_id": sink_b_peer,
-            "capacity": 1_000_000,
-            "spendable_sats": 120_000,
-            "fee_ppm": 220,
-        },
-    })
-
-    mock_database.cleanup_stale_reservations.return_value = 0
-    mock_database.list_hot_channel_protection_override_peers.return_value = []
-    mock_database.get_failure_count.return_value = (0, 0)
-    mock_database.get_failure_metadata.return_value = {"last_error_type": "other"}
-    mock_database.get_last_rebalance_time.return_value = 0
-    mock_database.get_top_route_pairs.return_value = []
-    mock_database.get_channel_state.return_value = {"state": "balanced"}
-    mock_database.get_rebalance_success_signal.return_value = None
-    mock_database.get_peer_uptime_percent.return_value = 99.0
-
-    # CapEx engine: active tier for all channels (CapEx is the primary path)
-    from modules.capex_budget import ChannelCapexBudget
-    mock_capex = MagicMock()
-    mock_capex.compute_allocations.return_value = None
-    mock_capex.get_channel_budget.return_value = ChannelCapexBudget(
-        channel_id="test", tier="active", budget_msat=500_000_000,
-        tier_ppm=500, priority_class="preservation",
-    )
-    r.set_capex_engine(mock_capex)
-
-    return r, {
-        "source_scid": source_scid,
-        "sink_a_scid": sink_a_scid,
-        "sink_b_scid": sink_b_scid,
-        "source_peer": source_peer,
-        "sink_a_peer": sink_a_peer,
-        "sink_b_peer": sink_b_peer,
-    }
-
-
 class TestExecuteRebalanceBudgetReservationLifecycle:
     def test_execute_rebalance_dry_run_does_not_reserve_budget_and_clears_pending(self, mock_plugin, mock_database):
         from modules.config import Config
@@ -207,7 +130,6 @@ class TestExecuteRebalanceBudgetReservationLifecycle:
         assert call_kwargs["cost_msat"] == 1501
         assert call_kwargs["cost_sats"] == 2
         assert call_kwargs["amount_sats"] == cand.amount_sats
-
 
 
 class TestLastHopFeeUnits:
@@ -577,7 +499,6 @@ class TestExecuteOnceManual:
         mock_database.update_rebalance_result.assert_called_once_with(55, 'failed', error_message="no route found")
 
 
-
 # Obsolete executor-specific test classes removed.
 
 # =============================================================================
@@ -758,102 +679,6 @@ class TestLastDecisionSummary:
         assert summary["dominant_input"] == "daily_budget_sats"
         assert summary["safety_block"] is True
         assert summary["budget_blocked"] is True
-
-
-class TestHiveEqualizationConfigSurface:
-    def test_hive_equalization_defaults_are_present_in_config_and_snapshot(self):
-        from modules.config import Config
-
-        cfg = Config()
-        snapshot = cfg.snapshot()
-
-        assert cfg.hive_equalization_enabled is True
-        assert cfg.hive_equalization_low_pct == 0.35
-        assert cfg.hive_equalization_high_pct == 0.65
-        assert cfg.hive_equalization_cooldown_hours == 48
-        assert cfg.hive_equalization_max_candidates_per_cycle == 1
-
-        assert snapshot.hive_equalization_enabled is True
-        assert snapshot.hive_equalization_low_pct == 0.35
-        assert snapshot.hive_equalization_high_pct == 0.65
-        assert snapshot.hive_equalization_cooldown_hours == 48
-        assert snapshot.hive_equalization_max_candidates_per_cycle == 1
-
-    def test_hive_equalization_direct_construction_requires_valid_band(self):
-        from modules.config import Config
-
-        with pytest.raises(ValueError, match="hive_equalization_low_pct"):
-            Config(hive_equalization_low_pct=0.7, hive_equalization_high_pct=0.6)
-
-    def test_hive_equalization_runtime_updates_use_typed_validation(self):
-        from modules.config import Config
-
-        cfg = Config()
-        stored_values = {}
-        database = MagicMock()
-
-        def set_config_override(key, value):
-            stored_values[key] = value
-            return 99
-
-        def get_config_override(key):
-            return stored_values.get(key)
-
-        database.set_config_override.side_effect = set_config_override
-        database.get_config_override.side_effect = get_config_override
-        database.delete_config_override.return_value = True
-
-        result = cfg.update_runtime(database, "hive_equalization_enabled", "false")
-        assert result["status"] == "success"
-        assert cfg.hive_equalization_enabled is False
-
-        result = cfg.update_runtime(database, "hive_equalization_low_pct", "0.4")
-        assert result["status"] == "success"
-        assert cfg.hive_equalization_low_pct == 0.4
-
-        result = cfg.update_runtime(database, "hive_equalization_high_pct", "0.7")
-        assert result["status"] == "success"
-        assert cfg.hive_equalization_high_pct == 0.7
-
-        result = cfg.update_runtime(database, "hive_equalization_cooldown_hours", "72")
-        assert result["status"] == "success"
-        assert cfg.hive_equalization_cooldown_hours == 72
-
-        result = cfg.update_runtime(database, "hive_equalization_max_candidates_per_cycle", "3")
-        assert result["status"] == "success"
-        assert cfg.hive_equalization_max_candidates_per_cycle == 3
-
-        result = cfg.update_runtime(database, "hive_equalization_low_pct", "1.5")
-        assert "out of range" in result["error"]
-
-        result = cfg.update_runtime(database, "hive_equalization_low_pct", "0.8")
-        assert "must be less than" in result["error"]
-
-        result = cfg.update_runtime(database, "hive_equalization_high_pct", "0.39")
-        assert "must be greater than" in result["error"]
-
-    def test_hive_equalization_load_overrides_repairs_invalid_band(self):
-        from modules.config import Config
-
-        cfg = Config()
-        database = MagicMock()
-        database.get_all_config_overrides.return_value = {
-            "hive_equalization_low_pct": "0.8",
-            "hive_equalization_high_pct": "0.6",
-        }
-        database.get_config_version.return_value = 7
-
-        warnings = cfg.load_overrides(database)
-
-        assert warnings == []
-        assert cfg.hive_equalization_high_pct == 0.6
-        assert cfg.hive_equalization_low_pct == pytest.approx(0.55)
-        assert cfg.snapshot().hive_equalization_low_pct == pytest.approx(0.55)
-
-    def test_reason_code_includes_hive_equalization(self):
-        from modules.rebalancer import RebalanceReasonCode
-
-        assert RebalanceReasonCode.HIVE_EQUALIZATION.value == "hive_equalization"
 
 
 class TestRebalanceUtilizationFloorCeilingGuard:
