@@ -5416,3 +5416,53 @@ class TestFleetCloseProtectionDurability:
         planner, _ = self._planner()
         planner.hive_hints.is_hive_member.side_effect = RuntimeError("boom")
         assert planner._is_protected_hive_member("02" + "aa" * 32) is True
+
+
+class TestDefibrillationQueueAdvances:
+    """2026-07-09 operator-run finding: a failing defib target was retried
+    11 consecutive cycles because _check_cooldown excludes failed actions
+    (correct for opens, which have exponential backoff) and defibs had no
+    backoff of their own — one dead-and-unroutable channel starved the
+    entire diagnostic queue."""
+
+    def _planner(self):
+        from modules.config import Config
+        plugin = MagicMock()
+        prof = MagicMock()
+        flow = MagicMock()
+        return CapacityPlanner(plugin, prof, flow, config=Config()), prof
+
+    def test_failed_defib_attempt_blocks_retry_within_window(self):
+        planner, prof = self._planner()
+        prof.database.get_recent_planner_actions.return_value = [
+            {"action_type": "defibrillate", "status": "failed",
+             "channel_id": "942934x1116x3"},
+        ]
+        attempted, reason = planner._defib_recently_attempted("02" + "a" * 64)
+        assert attempted is True
+        assert "defib" in reason.lower()
+
+    def test_non_defib_actions_do_not_block_defib(self):
+        planner, prof = self._planner()
+        prof.database.get_recent_planner_actions.return_value = [
+            {"action_type": "open", "status": "failed"},
+            {"action_type": "close", "status": "completed"},
+        ]
+        attempted, _ = planner._defib_recently_attempted("02" + "a" * 64)
+        assert attempted is False
+
+    def test_no_recent_actions_allows_defib(self):
+        planner, prof = self._planner()
+        prof.database.get_recent_planner_actions.return_value = []
+        attempted, _ = planner._defib_recently_attempted("02" + "a" * 64)
+        assert attempted is False
+
+    def test_open_cooldown_still_excludes_failed_actions(self):
+        """Regression pin: failed opens must NOT establish the generic
+        cooldown — the failed-open exponential backoff owns that path."""
+        planner, prof = self._planner()
+        prof.database.get_recent_planner_actions.return_value = [
+            {"action_type": "open", "status": "failed"},
+        ]
+        ok, _ = planner._check_cooldown("02" + "a" * 64)
+        assert ok is True

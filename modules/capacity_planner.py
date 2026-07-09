@@ -424,6 +424,12 @@ class CapacityPlanner:
                     f"Defibrillation cooldown for {scid}: {cooldown_reason}"
                 )
                 continue
+            attempted, attempted_reason = self._defib_recently_attempted(peer_id)
+            if attempted:
+                summary["skipped_reasons"].append(
+                    f"Defibrillation skipped for {scid}: {attempted_reason}"
+                )
+                continue
 
             result = self._execute_defibrillation(scid, peer_id, cfg, loser.get("reason", ""))
             summary["defibrillations"].append({
@@ -432,6 +438,7 @@ class CapacityPlanner:
                 "reason": loser.get("reason", ""),
                 "action_id": result.get("action_id"),
                 "status": result.get("status", "unknown"),
+                "error": result.get("error"),
             })
             defibrillations_this_cycle += 1
 
@@ -2718,6 +2725,31 @@ class CapacityPlanner:
             return True, f"Available: {available} sats (reserve: {min_reserve})"
         except Exception as e:
             return False, f"Cannot check funds: {e}"
+
+    def _defib_recently_attempted(self, peer_id: str, hours: int = 24) -> tuple:
+        """Defib-specific gate: ANY defibrillate attempt (including failed)
+        within the window blocks a retry so the diagnostic queue advances.
+
+        The generic _check_cooldown deliberately ignores failed actions
+        because failed OPENS are owned by the exponential backoff — but
+        defibs have no backoff, and excluding failures let one unroutable
+        channel be retried every cycle forever, starving the other
+        candidates (observed live 2026-07-09: 11 consecutive cycles on one
+        scid)."""
+        db = self.profitability.database if self.profitability else None
+        if not db:
+            return False, "no database"
+        try:
+            recent = db.get_recent_planner_actions(peer_id, hours=hours)
+        except Exception as exc:
+            return True, f"defib attempt check failed: {exc}"
+        for action in recent:
+            if str(action.get("action_type", "")) == "defibrillate":
+                return True, (
+                    f"defib already attempted in last {hours}h "
+                    f"(status={action.get('status')})"
+                )
+        return False, "no recent defib attempts"
 
     def _check_cooldown(self, peer_id: str) -> tuple:
         """Check 24h cooldown per peer."""
