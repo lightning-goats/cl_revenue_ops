@@ -735,7 +735,6 @@ def _cycle_module(envelope=1000, spent=0):
     mod.config = Config(boltz_structural_budget_sats_per_day=envelope)
     mod.database = MagicMock()
     mod.database.get_category_spend_sats.return_value = spent
-    mod.hive_router = None
     bm = MagicMock()
     bm.loop_out.return_value = {"status": "accepted"}
     mod._require_boltz_manager = MagicMock(return_value=bm)

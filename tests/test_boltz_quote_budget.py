@@ -36,10 +36,6 @@ def _make_module(channels):
     mod.database = database
 
     mod.profitability_analyzer = None
-    hive_hints = MagicMock()
-    hive_hints.get_rebalance_bias.return_value = 1.0
-    mod.hive_hints = hive_hints
-    mod.hive_router = None
     mod.rebalancer = None
 
     bm = MagicMock()

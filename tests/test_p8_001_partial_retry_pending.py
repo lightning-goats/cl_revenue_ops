@@ -69,7 +69,6 @@ def _prime_partial_retry(engine):
     """Wire the engine so the partial-retry loop reaches ``executor.execute``."""
     engine._executor_mode = lambda: "native"
     engine._cycle_router = MagicMock()
-    engine._hive_router = None
     engine._route_decision_for_pair = lambda pair: SimpleNamespace(policy=None)
     # Route always prices successfully and cheaply so the budget gate passes.
     route_result = SimpleNamespace(

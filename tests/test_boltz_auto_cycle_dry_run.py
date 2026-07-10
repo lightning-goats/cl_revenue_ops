@@ -44,7 +44,6 @@ def _make_module():
     mod.boltz_manager = MagicMock(enabled=True)
     mod.capacity_planner = None
     mod.rebalancer = None
-    mod.hive_router = None
     mod.config = MagicMock()
     mod.config.snapshot.return_value = SimpleNamespace(
         boltz_auto_cycle_enabled=True,

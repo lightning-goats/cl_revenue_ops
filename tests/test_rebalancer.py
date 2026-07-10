@@ -125,7 +125,6 @@ class TestInboundFeeBlendNoDoubleCount:
         from modules.rebalancer import EVRebalancer
         cfg = Config(inbound_fee_estimate_ppm=buffer_ppm)
         r = EVRebalancer(mock_plugin, cfg, mock_database)
-        r.hive_hints = None  # bypass the hive-member fast path
         return r
 
     def test_medium_confidence_blend_excludes_buffer(self, mock_plugin, mock_database):

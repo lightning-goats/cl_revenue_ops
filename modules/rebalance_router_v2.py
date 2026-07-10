@@ -2,7 +2,7 @@
 rebalance_router_v2 — Route discovery and pricing using official CLN RPCs.
 
 Uses ONLY official Core Lightning RPCs (listpeerchannels, listchannels,
-getroute) for route discovery.  No askrene, no hive router, no fleet layers.
+getroute) for route discovery.  No askrene, no layer machinery.
 
 The router computes actual final-hop fees from live peer channel policy and
 returns priced route results that the v2 rebalance engine can evaluate for

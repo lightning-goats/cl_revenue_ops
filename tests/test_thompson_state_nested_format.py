@@ -266,7 +266,6 @@ class TestProfitabilityReaderBothFormats:
         )
         analyzer.plugin = MagicMock()
         analyzer.database = MagicMock()
-        analyzer.hive_hints = None
         analyzer.database.get_fee_strategy_state.return_value = fee_state_row
         result = analyzer._classify_channel(
             roi=0.07,  # between widened (5%) and base (10%) PROFITABLE bars

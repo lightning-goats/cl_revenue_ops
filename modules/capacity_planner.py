@@ -8,7 +8,7 @@ from "stagnant because dead" before paying a close fee). Beyond winner/loser cla
 this module also:
 
 - runs a multi-strategy open-candidate discovery pipeline (proven winners, neighbor/patron
-  graph, graph centrality, hive open-hints and hive-member topology, route-pair analysis,
+  graph, graph centrality, route-pair analysis,
   demand-flow sink adjacency) with normalized cross-strategy scoring and pool-slot quotas;
 - gates a portfolio-balance governor (hard block on outbound opens above a local-liquidity
   ceiling, constrained allow-list below it) ahead of every discovery/execution pass;

@@ -173,7 +173,6 @@ def test_partial_retry_passes_proportionally_scaled_max_fee(
 
     engine = _make_engine(mock_plugin, mock_database)
     engine._cycle_router = MagicMock()
-    engine._hive_router = None
     mock_database.record_rebalance.return_value = 123
 
     pair = PairCandidate(
@@ -234,7 +233,6 @@ def test_partial_retry_rejects_routes_over_scaled_budget(
 
     engine = _make_engine(mock_plugin, mock_database)
     engine._cycle_router = MagicMock()
-    engine._hive_router = None
     mock_database.record_rebalance.return_value = 124
 
     pair = PairCandidate(

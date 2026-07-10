@@ -69,7 +69,6 @@ def test_build_state_snapshot_normalizes_mapping_booleans_and_budget_defaults():
                 "capacity_sats": 400_000,
                 "local_sats": 40_000,
                 "peer_inbound_fee_ppm": 95,
-                "is_hive_member": "false",
                 "is_profitable": "0",
                 "is_active": "yes",
                 "cooldown_active": "off",

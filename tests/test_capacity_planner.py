@@ -1168,10 +1168,6 @@ class TestDeadCapitalLosers:
             {"in_channel": scid, "out_channel": "900x1x0", "total_fee_msat": 50_000, "forward_count": 5}
         ]
 
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.is_hive_member.return_value = False
-        planner.hive_hints.get_corridor_role.return_value = "none"
-        planner.hive_hints.get_fee_bias.return_value = 1.02
 
         losers = planner._identify_losers({scid: prof}, {scid: flow})
 
@@ -4642,8 +4638,6 @@ def test_metabolic_open_bias_cannot_bypass_planner_disabled_gate():
     profitability = MagicMock()
     flow = MagicMock()
     planner = CapacityPlanner(plugin, profitability, flow, config=MagicMock())
-    planner.hive_hints = MagicMock()
-    planner.hive_hints.get_metabolic_open_bias.return_value = 1.10
     cfg = MagicMock()
     cfg.planner_enabled = False
 

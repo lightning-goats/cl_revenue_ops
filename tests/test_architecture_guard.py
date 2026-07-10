@@ -58,6 +58,78 @@ class TestNoHiveReintroduction:
         from modules.policy_manager import PolicyManager
         assert not hasattr(PolicyManager, "is_hive_peer")
 
+    def test_no_tracked_hive_modules(self):
+        """Standalone Phases 0-5 (2026-07-09): the dedicated hive modules
+        must stay deleted."""
+        removed = [
+            "modules/hive_hints.py",
+            "modules/hive_router.py",
+            "modules/hive_runtime.py",
+            "modules/rebalance_hive_router.py",
+            "modules/rebalance_coordination_overlay.py",
+        ]
+        result = subprocess.run(
+            ["git", "ls-files", *removed],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert result.stdout.strip() == ""
+
+    def test_no_hive_references_in_runtime_source(self):
+        """The Phase 5 grep gate, pinned: modules/ and cl-revenue-ops.py
+        carry no hive/mycelium code. Historical changelog comments in the
+        plugin header and explanatory retirement comments are exempt."""
+        import re
+
+        pattern = re.compile(r"hive|mycelium", re.IGNORECASE)
+        for path in _source_files():
+            for lineno, line in enumerate(open(path).readlines(), 1):
+                if not pattern.search(line):
+                    continue
+                stripped = line.strip()
+                # 'archived'/'archive' contains 'hive' — incidental.
+                if pattern.search(re.sub(r"archiv\w*", "", stripped, flags=re.I)) is None:
+                    continue
+                assert stripped.startswith("#") or stripped.startswith("'"), (
+                    f"non-comment hive/mycelium reference in {path}:{lineno}: "
+                    f"{stripped!r}"
+                )
+
+    def test_no_hive_symbols_on_core_classes(self):
+        from modules.fee_controller import FeeController
+        from modules.capacity_planner import CapacityPlanner
+        from modules.rebalance_engine_v2 import RebalanceEngine
+        from modules.rebalance_types_v2 import PairCandidate
+        from modules.config import Config
+
+        for cls, attrs in [
+            (FeeController, ["_get_hive_fee_bias", "_get_temporal_fee_adjustment",
+                             "_is_fleet_sibling", "_maybe_reseed_skewed_prior",
+                             "_check_hive_member_fee"]),
+            (CapacityPlanner, ["_is_protected_hive_member", "_discover_from_hive"]),
+            (RebalanceEngine, ["_apply_metabolic_rebalance_bias",
+                               "_apply_immune_rebalance_bias",
+                               "_get_hive_rebalance_bias"]),
+        ]:
+            for attr in attrs:
+                assert not hasattr(cls, attr), f"{cls.__name__}.{attr} returned"
+
+        for field_name in ("hive_source_rebalance_bias", "metabolic_rebalance_bias",
+                           "immune_rebalance_bias"):
+            assert field_name not in PairCandidate.__dataclass_fields__
+
+        cfg_fields = Config.__dataclass_fields__
+        for key in ("hive_hints_enabled", "hive_zero_fee_stale_grace_seconds",
+                    "hive_equalization_enabled", "hive_push_enabled",
+                    "hive_rebalance_bootstrap_budget_sats",
+                    "base_fee_msat_intra_fleet", "base_fee_msat_non_hive",
+                    "fee_ppm_intra_fleet", "lnplus_fleet_pubkeys",
+                    "rebalance_coordination_reserved_slots"):
+            assert key not in cfg_fields, f"Config.{key} returned"
+
 
 class TestNoLegacyFeeAlgorithms:
     """Legacy standalone fee algorithms (AIMD, Hill Climbing, discrete Thompson) must not return."""

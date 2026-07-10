@@ -141,8 +141,6 @@ def _load_debug_module(rebalancer_override=None):
     """Load the plugin module with minimal stubs needed for revenue-rebalance-debug."""
     mod = load_plugin_module()
     mod.config = Config(paused=True)
-    mod.hive_hints = None
-    mod.hive_router = None
     mod.safe_plugin = SimpleNamespace(rpc=MagicMock())
     mod.data_service = MagicMock()
     mod.data_service.get_funds.return_value = {"outputs": [], "channels": []}

@@ -51,8 +51,6 @@ def _make_module(fee_rows):
         "min_forwards_for_signal": 5,
     }
     mod.fee_controller = fee_controller
-    mod.hive_hints = None
-    mod.hive_router = None
     mod.config = SimpleNamespace(snapshot=lambda: SimpleNamespace(), fee_interval=1800)
     return mod
 

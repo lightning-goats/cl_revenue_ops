@@ -84,7 +84,6 @@ def test_startup_hydration_uses_helper_window_for_empty_table():
 
     class _FakeComponent:
         def __init__(self, *args, **kwargs):
-            self.hive_hints = None
             self.data_service = None
 
         def __getattr__(self, name):

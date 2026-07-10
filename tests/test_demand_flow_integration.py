@@ -61,7 +61,6 @@ class TestDemandFlowIntegration:
             for i in range(5)
         ]
 
-        planner.hive_hints = None
 
         candidates = planner._discover_peers([], all_profitability, all_flow)
         demand_candidates = [c for c in candidates if c["source"] == "demand_flow"]

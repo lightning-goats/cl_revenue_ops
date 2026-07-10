@@ -1,10 +1,9 @@
 """Route-policy classification for the active rebalance engine.
 
-cl-mycelium retired (2026-07-09): there is no fleet routing. Every candidate
-uses ordinary market routing. This module keeps the RouteDecision type and the
+Every candidate uses ordinary market routing (the coordinated policies
+retired in 2026-07). This module keeps the RouteDecision type and the
 classifier signature so the engine and types layers don't need structural
-changes; the hive-only / hybrid / coordinated policies and their hint-parsing
-machinery are gone.
+changes.
 """
 
 from __future__ import annotations

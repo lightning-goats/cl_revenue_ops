@@ -466,7 +466,6 @@ class TestClassificationTotalForwardCount:
         analyzer = ProfitabilityAnalyzer.__new__(ProfitabilityAnalyzer)
         analyzer.plugin = mock_plugin
         analyzer.database = mock_db
-        analyzer.hive_hints = None
         analyzer._profitability_cache = {}
         analyzer._cache_timestamp = 0
         analyzer._cache_ttl = 300
@@ -550,7 +549,6 @@ class TestPolicyManagerZombieCheck:
         pm._cache_valid = True  # Prevent _load_cache from hitting DB
         pm._cache_lock = threading.Lock()
         pm._change_timestamps = {}
-        pm.hive_hints = None
 
         mock_pa = MagicMock()
         mock_pa.identify_bleeders.return_value = [{
@@ -858,7 +856,6 @@ class TestSourcedFeeDecay:
         analyzer = ProfitabilityAnalyzer.__new__(ProfitabilityAnalyzer)
         analyzer.plugin = mock_plugin
         analyzer.database = mock_db
-        analyzer.hive_hints = None
         analyzer._profitability_cache = {}
         analyzer._cache_timestamp = 0
         analyzer._cache_ttl = 300

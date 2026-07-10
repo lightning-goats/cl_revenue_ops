@@ -316,7 +316,6 @@ class TestBoltzAutoCycleScheduler:
         mod.config.boltz_structural_budget_sats_per_day = 1000
         mod.database = MagicMock()
         mod.database.get_category_spend_sats.return_value = 0
-        mod.hive_router = None
         bm = MagicMock()
         bm.loop_out.return_value = {"status": "accepted"}
         mod._require_boltz_manager = MagicMock(return_value=bm)
