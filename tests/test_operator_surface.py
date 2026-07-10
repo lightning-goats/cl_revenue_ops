@@ -1154,7 +1154,7 @@ def test_revenue_policy_list_remains_available_for_transition_diagnostics():
     assert result["count"] == 1
 
 
-def test_readme_examples_describe_current_hive_surfaces():
+def test_readme_describes_standalone_surfaces():
     readme = Path("README.md").read_text()
 
     assert "paused" in readme
@@ -1164,17 +1164,15 @@ def test_readme_examples_describe_current_hive_surfaces():
     assert "decision explainability" in readme
     assert "revenue-config set enable_vegas_reflex false" not in readme
     assert "lightning-cli revenue-policy set" not in readme
-    assert "cl-mycelium" in readme
-    assert "hive-hints" in readme
-    assert "mycelium/hive hint contract" in readme
-    assert "revenue-hive-hints-status" in readme
+    assert "fully standalone" in readme
+    assert "revenue-hive-hints-status" not in readme
 
 
-def test_agent_docs_describe_current_hive_hint_surface():
+def test_agent_docs_describe_standalone_invariants():
     agent_docs = Path("AGENTS.md").read_text()
 
-    assert "cl-mycelium" in agent_docs
-    assert "hints" in agent_docs
+    assert "standalone" in agent_docs
+    assert "fully independent" in agent_docs
 
 
 def test_readme_states_planner_closes_are_recommendation_only_by_default():

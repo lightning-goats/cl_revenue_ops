@@ -2,7 +2,7 @@
 
 ## Project identity
 
-`cl_revenue_ops` is an independent Core Lightning plugin for local revenue operations.
+`cl_revenue_ops` is an independent, standalone Core Lightning plugin for local revenue operations.
 
 It owns local execution:
 
@@ -12,18 +12,16 @@ It owns local execution:
 - profitability analysis
 - budget enforcement
 
-cl-mycelium may enhance it through bounded hints, but `cl_revenue_ops` must run safely without cl-mycelium.
+It has no external coordinator: the cl-mycelium/cl-hive hint integration was
+retired and fully removed in 2026-07 (see `docs/audit/HIVE_REMOVAL_PLAN.md`).
 
 ## Core invariants
 
-- `cl_revenue_ops` must remain fully independent.
-- It must run when cl-hive/cl-mycelium is absent.
-- Missing hints must fall back to neutral behavior.
-- Stale hints must fall back safely.
-- Malformed hints must not crash the plugin.
-- cl-mycelium hints may influence but must not command.
+- `cl_revenue_ops` is fully independent — all decisions run on local evidence
+  (own forwards, gossip, node state) only.
+- No hive/mycelium/fleet coordination code may return
+  (`tests/test_architecture_guard.py` pins this).
 - No Sling dependency.
-- Do not introduce a dependency on cl-mycelium.
 - Do not trigger live action in tests unless explicitly scoped.
 - Hermes/data collection must be read-only.
 
@@ -31,9 +29,7 @@ cl-mycelium may enhance it through bounded hints, but `cl_revenue_ops` must run 
 
 Read:
 
-- `docs/plans/cl_mycelium_revenue_integrated_plan_v3.md`
-- `docs/prompts/cl_mycelium_revenue_codex_prompt_pack_v3.md`
-- `modules/hive_hints.py`
+- `README.md`
 - `modules/lnplus_swaps.py`
 - rebalance engine / planner / capex / profitability modules
 - existing revenue RPC tests
@@ -65,40 +61,13 @@ The following are action/mutation RPCs and must not be called in read-only tests
 - any Boltz action RPC
 - any CLN open/close/pay/withdraw RPC
 
-## Hint integration requirement
-
-`modules/hive_hints.py` is the integration boundary.
-
-Required behavior:
-
-```text
-no cl-hive -> neutral hints
-missing datastore -> neutral hints
-unknown hive-export-hints -> neutral hints
-stale hints -> safe stale/neutral fallback
-malformed hints -> safe neutral fallback
-valid hints -> bounded influence
-```
-
-## Bounded influence
-
-Hive/cl-mycelium hints may bias fee/rebalance decisions, but within bounded caps.
-
-Do not allow hints to override local budget, safety, or executor policy.
-
 ## Required tests
 
-When touching hint integration, add tests for:
+When touching decision paths, add tests for:
 
-- no cl-hive
-- no `["hive","hints"]`
-- stale hints
-- malformed hints
-- valid classic hints
-- valid cl-mycelium hints
-- neutral fallback
-- no crash
-- no live action triggered
+- neutral/absent-data fallback (missing DB rows, empty gossip, RPC errors)
+- no crash on malformed inputs
+- no live action triggered from read-only surfaces
 
 ## Required report format
 
@@ -106,8 +75,6 @@ For every Codex task, report:
 
 - files changed
 - tests run
-- standalone behavior without cl-hive
-- stale/malformed hint behavior
 - no-Sling confirmation
 - no action RPCs triggered
 - production compatibility notes

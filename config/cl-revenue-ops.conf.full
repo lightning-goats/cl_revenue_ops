@@ -67,33 +67,10 @@
 # skipped.
 #revenue-ops-neighbor-median-min-competitors=2
 
-# Base-fee policy (Upgrade A). "off": use a single base fee for all channels.
-# "adaptive": apply base-fee-intra-fleet to hive members and
-# base-fee-non-hive to everyone else.
+# Base-fee policy (Upgrade A). "off" (default) and "adaptive" both apply
+# revenue-ops-base-fee-msat to every channel (the per-role split was retired
+# with the cl-mycelium integration).
 #revenue-ops-base-fee-policy=off
-
-# Base fee in msat for channels to non-hive peers when base-fee-policy=adaptive.
-#revenue-ops-base-fee-non-hive=1000
-
-# --- Zero-fee hive corridor ---
-# Operator strategy: ALL hive-internal channels are zero fee (0 base msat /
-# 0 ppm), public and announced. Third parties chaining our free internal
-# hops into cheap end-to-end routes is DESIRED: the fleet is the cheap
-# corridor, revenue is captured at edge (non-hive) channels, and external
-# flow through the mesh performs free intrafleet rebalancing.
-
-# Proportional fee in ppm for channels to hive fleet members.
-# Set nonzero only to deliberately opt out of the corridor strategy.
-#revenue-ops-fee-ppm-intra-fleet=0
-
-# Base fee in msat for channels to hive fleet members.
-#revenue-ops-base-fee-intra-fleet=0
-
-# How long (seconds) a peer's last-confirmed hive membership keeps the
-# zero-fee gate held after live hive-hint data goes stale/unavailable.
-# Default 7 days -- generous on purpose so a cl-hive/cl-mycelium outage
-# doesn't reprice hive channels away from 0 ppm and back.
-#revenue-ops-hive-zero-fee-stale-grace=604800
 
 # DEPRECATED no-op compatibility flags. The fee market boundary guard was
 # removed; these options are retained only so existing configs keep loading.
@@ -131,9 +108,9 @@
 #revenue-ops-rebalance-router=v3
 
 # CSV of askrene layer names passed to v3 router getroutes calls. Missing
-# layers are silently dropped by askrene. Blank uses the default
-# 'hive-fleet' cl-hive bias; set to 'none' or 'standalone' for no layers.
-#revenue-ops-askrene-layers=hive-fleet
+# layers are silently dropped by askrene. Blank or 'standalone'/'none'
+# configures no layers (askrene's own gossip view only).
+#revenue-ops-askrene-layers=standalone
 
 # Rebalance execution uses the exact route priced by askrene.
 
@@ -154,15 +131,6 @@
 # Per-pair fee budget = max(dest capex, ceil(amount * ppm / 1M)). Decouples
 # per-rebalance fee from capex bootstrap (0 disables).
 #revenue-ops-pair-fee-cap-ppm=1000
-
-# Conservative per-pair fee budget for active hive-member channels before
-# capex/profitability history appears (0 disables).
-#revenue-ops-hive-rebalance-bootstrap-budget-sats=300
-
-# Reserved slots for coordination pairs (from cl-hive's rebalance_
-# recommendations / rebalance_campaigns hints) on top of the planner's
-# max_pairs cap. 0 restores strict-cap behavior.
-#revenue-ops-rebalance-coordination-reserved-slots=2
 
 # --- Activity-recency penalty ---
 # Window in seconds over which recent forwarding activity is measured.
@@ -345,21 +313,7 @@
 #revenue-ops-lnplus-apply-feerate-ceiling=5000
 #revenue-ops-lnplus-pending-timeout-days=7
 #revenue-ops-lnplus-inbound-credit-factor=0.5
-#revenue-ops-lnplus-fleet-pubkeys=<pubkey1>,<pubkey2>
 #revenue-ops-lnplus-watcher-interval=3600
-
-# ============================================================================
-# HIVE / CL-MYCELIUM HINTS
-# ============================================================================
-
-# Enable bounded fee/rebalance bias from cl_hive fleet hints.
-#revenue-ops-hive-hints-enabled=true
-
-# Override hint snapshot TTL in seconds; 0 = use snapshot value.
-#revenue-ops-hive-hints-ttl=0
-
-# Allow lab-only all_hints M2 scope from hive hints. Not a production default.
-#revenue-ops-hive-hints-allow-all-hints-m2-scope=false
 
 # ============================================================================
 # DRAIN BIAS / RECEIVABLE RATIO

@@ -8,7 +8,7 @@ Datastore key: `["revenue", "capex-summary"]`
 
 ## Consumer
 
-cl-hive / cl-mycelium and other read-only consumers may consume this datastore payload as capital posture telemetry. Consumers must not use it to spend directly.
+External read-only consumers may consume this datastore payload as capital posture telemetry. Consumers must not use it to spend directly.
 
 ## Generated At
 
@@ -50,7 +50,7 @@ Malformed JSON, a non-object root, missing `timestamp`, or missing required nume
 
 ## Neutral Fallback Behavior
 
-Missing, stale, or malformed payloads produce unknown capex posture and zero confidence. They do not change cl_revenue_ops budgets or cl-mycelium M2 scope.
+Missing, stale, or malformed payloads produce unknown capex posture and zero confidence. They do not change cl_revenue_ops budgets.
 
 ## Versioning
 

@@ -8,7 +8,7 @@ Datastore key: `["revenue", "segment-observations"]`
 
 ## Consumer
 
-cl-hive / cl-mycelium may consume this datastore payload as read-only local route evidence. Consumers may aggregate it into future hint payloads, but must not directly trigger cl_revenue_ops actions.
+External read-only consumers may consume this datastore payload as read-only local route evidence. Consumers must not directly trigger cl_revenue_ops actions.
 
 ## Generated At
 

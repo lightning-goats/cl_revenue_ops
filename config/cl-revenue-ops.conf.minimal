@@ -49,4 +49,3 @@ revenue-ops-hot-channel-protection-enabled=true
 #revenue-ops-lnplus-max-duration-months=3
 #revenue-ops-lnplus-min-peer-rank=8
 #revenue-ops-lnplus-min-participants=3
-#revenue-ops-lnplus-fleet-pubkeys=<pubkey1>,<pubkey2>

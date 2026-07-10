@@ -4,8 +4,7 @@
 
 Minimum supported Core Lightning: `v24.11.1+`.
 
-`cl-revenue-ops` uses the askrene v3 route path with optional mycelium/hive
-route-layer coordination. `v24.08.1` contains `getroutes` and
+`cl-revenue-ops` uses the askrene v3 route path. `v24.08.1` contains `getroutes` and
 `askrene-listlayers`, but it does not expose the full askrene layer lifecycle
 used by the route layer integration. In Polar, `askrene-create-layer` returns
 `Unknown command` on `v24.08.1`, so `v24.08.1` is not a valid runtime floor for
@@ -63,7 +62,6 @@ For each tested CLN version:
    - `revenue-status`
    - `revenue-fee-debug`
    - `revenue-rebalance-debug summary_only=true`
-   - `revenue-hive-hints-status`
 
 The minimum supported CLN version is the oldest version that passes this full
 checklist, not merely the oldest version with `getroutes`.

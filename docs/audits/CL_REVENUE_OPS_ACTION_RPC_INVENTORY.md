@@ -1,3 +1,8 @@
+> NOTE (2026-07-09): the cl-mycelium/cl-hive hint integration was removed
+> (docs/audit/HIVE_REMOVAL_PLAN.md). `revenue-hive-hints-status` and the
+> `hive-report-rebalance-*` reporting RPCs no longer exist; hive-related
+> entries below are retained only as historical audit record.
+
 # cl_revenue_ops Action RPC Inventory
 
 - Audit date: 2026-05-20
@@ -25,7 +30,6 @@ Hermes may call these read-only/debug surfaces with bounded parameters:
 | revenue-status | read_only | Operator controls and latest fee/rebalance decision summaries. |
 | revenue-dashboard | read_only | P&L summary; may be moderately sized. |
 | revenue-health | read_only | Consolidated health. |
-| revenue-hive-hints-status | debug/read_only | Primary full hint freshness surface. Requires diagnostics_version=standalone-hints-v1. |
 | revenue-rebalance-debug | debug/read_only | Corroborates hint freshness; use filters/summary_only for collection. |
 | revenue-fee-debug | debug/read_only | Fee diagnostic; not the full hint freshness source. |
 | revenue-profitability | read_only | Economic telemetry; can be large. |
@@ -44,7 +48,6 @@ Hermes may call these read-only/debug surfaces with bounded parameters:
 | --- | --- | --- | --- |
 | revenue-rebalance-cycle | execution | no | Runs automatic rebalance check/cycle. |
 | revenue-status | read_only | yes | Status and summaries. |
-| revenue-hive-hints-status | debug/read_only | yes | Hint freshness and coverage. |
 | revenue-rebalance-debug | debug/read_only | yes | Rebalance diagnostics. |
 | revenue-fee-debug | debug/read_only | yes | Fee diagnostics. |
 | revenue-fee-cycle | execution | no | Runs fee adjustment cycle and may set fees when not dry-run. |

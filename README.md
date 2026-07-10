@@ -2,24 +2,21 @@
 
 `cl_revenue_ops` is the independent local execution layer for Core Lightning routing economics. It owns fee control, rebalance decisioning/execution, planner/capex, profitability analysis, and budget enforcement. It watches channel economics, adjusts fees, and executes rebalancing while keeping the normal operator surface intentionally small.
 
-It can consume bounded cl-mycelium hints, but those hints are optional enhancements, not dependencies. `cl_revenue_ops` must run safely when cl-mycelium or cl-hive is absent.
+It is fully standalone: every decision runs on local evidence only (own forwards, gossip, node state). The former cl-mycelium/cl-hive fleet-hint integration was retired and removed in 2026-07 (see [docs/audit/HIVE_REMOVAL_PLAN.md](docs/audit/HIVE_REMOVAL_PLAN.md)).
 
 ## Product Architecture
 
 ```text
-cl-mycelium coordinates.
-cl_revenue_ops executes.
+cl_revenue_ops decides and executes locally.
 Core Lightning owns node runtime.
 ```
 
-`cl-mycelium` may produce bounded hints and read-only context. `cl_revenue_ops` remains the local executor: it decides what is safe, applies local budgets and policy, and uses Core Lightning RPCs for execution when operator controls allow it.
+`cl_revenue_ops` is the local executor: it decides what is safe, applies local budgets and policy, and uses Core Lightning RPCs for execution when operator controls allow it.
 
 ## What Operators Need To Know
 
 - This is the executor. It owns local fee execution, rebalance execution, planner/capex decisions, profitability analysis, and budgets.
-- `cl-mycelium` is the fleet coordination organism. `cl_revenue_ops` consumes its hints, but all spending decisions remain local and bounded by this plugin's controls.
-- `cl_revenue_ops` runs safely without cl-mycelium or cl-hive. Missing, stale, malformed, or unavailable hints neutralize safely.
-- Hints may bias local decisions only within bounded caps; they never override local budget, safety, or executor policy.
+- All spending decisions are local and bounded by this plugin's controls.
 - Live rebalances execute through `RebalanceEngineV2` using native explicit-route execution; route discovery is pinned to the `v3`/askrene router path.
 - There is no Sling dependency.
 - The normal runtime controls are `paused`, `daily_budget_sats`, fee rails, and planner execution caps. (`fee_market_boundary_*` and `rebalance_min_profit` are deprecated no-ops kept only for config-file compatibility — see Day-1 Operator Workflow.)
@@ -34,7 +31,7 @@ Core Lightning owns node runtime.
 
 ## Rebalance Execution
 
-- Route selection is pinned to `rebalance_router=v3`, which uses askrene and cl-mycelium-aware path discovery through the stable hive route layers.
+- Route selection is pinned to `rebalance_router=v3`, which uses askrene path discovery.
 - Live execution uses the explicit route priced by askrene and pays it with native Core Lightning RPCs.
 - Failed route segments are recorded as local observations and exported through the `["revenue", "segment-observations"]` datastore key for read-only route evidence.
 - No Sling plugin is required or used by the current execution path.
@@ -55,7 +52,7 @@ Use `revenue-profitability` to see per-channel analysis including sourced metric
 
 ### Profitability Snapshot Contract
 
-`cl-revenue-ops` publishes the canonical profitability snapshot for `cl-mycelium` to CLN datastore key `["revenue", "profitability-summary"]`.
+`cl-revenue-ops` publishes the canonical profitability snapshot for external read-only consumers to CLN datastore key `["revenue", "profitability-summary"]`.
 
 Payload shape:
 - Top level: `timestamp`, `channels`
@@ -63,11 +60,11 @@ Payload shape:
 - Per channel msat fields: `fees_earned_msat`, `sourced_fee_contribution_msat`, `total_contribution_msat`, `volume_routed_msat`, `sourced_volume_msat`, `open_cost_msat`, `rebalance_cost_msat`, `net_pnl_msat`
 - Per channel counters: `forward_count`, `sourced_forward_count`, `total_forward_count`
 
-`revenue-profitability` remains available as an RPC surface, but the datastore snapshot is the canonical cross-plugin contract and is the path `cl-mycelium` should prefer. See [docs/contracts/REVENUE_PROFITABILITY_SUMMARY_CONTRACT.md](docs/contracts/REVENUE_PROFITABILITY_SUMMARY_CONTRACT.md).
+`revenue-profitability` remains available as an RPC surface, but the datastore snapshot is the canonical cross-plugin contract and is the path external consumers should prefer. See [docs/contracts/REVENUE_PROFITABILITY_SUMMARY_CONTRACT.md](docs/contracts/REVENUE_PROFITABILITY_SUMMARY_CONTRACT.md).
 
 ## Produced Telemetry Contracts
 
-`cl_revenue_ops` publishes read-only telemetry for cl-mycelium and other consumers:
+`cl_revenue_ops` publishes read-only telemetry for external consumers (e.g. monitoring/management tooling):
 
 | Datastore key | Contract | Notes |
 | --- | --- | --- |
@@ -82,7 +79,7 @@ Consumers must treat stale, missing, or malformed payloads as unknown confidence
 The capacity planner uses a multi-strategy candidate pipeline with portfolio-aware governance:
 
 - **Portfolio balance governor** — hard gate at >95% local blocks outbound opens, constrained at 85-95% allows only sink-adjacent or dual-fund
-- **Multi-strategy discovery** — winner (proven revenue), demand-flow (gossip heuristics), mycelium/hive hint contract (fleet intelligence), route-pair, graph, and neighbor strategies
+- **Multi-strategy discovery** — winner (proven revenue), demand-flow (gossip heuristics), route-pair, graph, and neighbor strategies
 - **Score normalization** — within-strategy 0-1 normalization with configurable weights; pool slot quotas prevent strategy monoculture
 - **Demand-flow classifier** — classifies peers as source/sink/router using FlowMetrics aggregation and gossip heuristics (exchange, LSP, sink keyword matching)
 - **Capital hurdle** — open EV subtracts a configurable annualized return hurdle (`planner_min_annual_roi_pct`, default 1%) so low-yield channel opens do not pass on tiny absolute-profit edges
@@ -100,7 +97,7 @@ The capacity planner uses a multi-strategy candidate pipeline with portfolio-awa
 These subsystems are off by default and each has more knobs than fit in a table here — see [config/cl-revenue-ops.conf.full](config/cl-revenue-ops.conf.full) for every option, default, and comment.
 
 - **Hot-channel protection** (`revenue-ops-hot-channel-protection-*`, 8 options) — gives fast-draining, high-profit channels a wider rebalance budget and shorter cooldown than normal channels get, so they don't starve mid-burst. Gated on minimum velocity and marginal ROI, capped by a fraction of the channel's own daily contribution, with an operator override-peer list to force protection regardless of the velocity/ROI gate.
-- **Growth budget** (`revenue-ops-growth-budget-*`, 5 options) — an optional dynamic uplift on top of `daily_budget_sats`: a fraction of trailing net profit (`growth-budget-earned-fraction`) plus a smaller fleet-learning experiment fraction (`growth-budget-experiment-fraction`), bounded per-window by `growth-budget-max-extra-sats` and by a local hard ceiling (`growth-budget-hard-ceiling-sats`) that fleet hints cannot exceed. Disabled by default.
+- **Growth budget** (`revenue-ops-growth-budget-*`, 5 options) — an optional dynamic uplift on top of `daily_budget_sats`: a fraction of trailing net profit (`growth-budget-earned-fraction`) plus a smaller experiment fraction (`growth-budget-experiment-fraction`), bounded per-window by `growth-budget-max-extra-sats` and by a local hard ceiling (`growth-budget-hard-ceiling-sats`). Disabled by default.
 - **Dynamic htlcmax** (`revenue-ops-enable-dynamic-htlcmax` + 3 flow-class pct options) — scales each channel's advertised `htlc_max` by its flow classification (source/sink/balanced), tightest on sinks. As of the 2026-07 econ audit it is also **live-depletion-keyed**: regardless of flow class, `htlc_max` is additionally capped to a fraction of the channel's current spendable balance (clamped to a 10k-sat floor), so a channel that has drained to near-zero local balance stops advertising an `htlc_max` large enough to invite doomed HTLCs. A gossip-churn deadband limits how often the resulting change actually triggers a `setchannel` broadcast.
 - **Expansion treasury** (`revenue-ops-expansion-treasury-*`, 7 options) — reverse-swaps excess Lightning balance from over-local channels to on-chain funds via Boltz, to build the on-chain reserve the capacity planner needs for new opens. Runs only when the confirmed on-chain reserve is below `expansion-treasury-onchain-target-sats` by at least `expansion-treasury-min-deficit-sats`; protected/hot channels are excluded from harvesting by default.
 - **Drain-bias / receivable-ratio** (`revenue-ops-node-drain-bias-*`, `revenue-ops-receivable-ratio-*`, `revenue-ops-drain-fee-discount-max`, `revenue-ops-boltz-structural-budget-sats`) — the node-level inbound-liquidity objective described above under "What Operators Need To Know": biases fees down on stagnant over-local channels and can earn a capped Boltz structural credit for demand the circular rebalancer can't place internally. All off by default (0 / false).
@@ -114,13 +111,9 @@ These subsystems are off by default and each has more knobs than fit in a table 
 - **One swap in flight per node at a time.** No new application is submitted while a prior one is applied, opening, or awaiting completion (checked before every LN+ API call, so an outage or a tripped breaker can never queue up a second commitment).
 - Applying to a filled swap slot is an irreversible commitment: once the last slot fills, a 48-hour clock starts to open the assigned channel. The obligations watcher (`revenue-ops-lnplus-watcher-interval`, default hourly) drives every step after application — connect, `fundchannel` (feerate escalates as the deadline approaches), `complete_application`, activation (tags the channel `no_close` so nothing else can close it mid-contract), and finally release + rating once the contract's `ends_at` passes.
 
-**Fleet participation (2026-07-08 Revision 2 — operator-directed).** Swaps that include another fleet or hive node are allowed and welcome — they support intrafleet rebalancing, and only the own-node check remains (we still cannot join a swap we're already in). A fleet/hive participant (identity = `revenue-ops-lnplus-fleet-pubkeys` CSV union the live hive-membership check) is fully TRUSTED: it skips every LN+ reputation check — positive-ratings floor, negative-ratio ceiling, and the rank floor below — and counts as reliability 1.0 in the EV inbound credit. If every visible counterparty in a swap is a fleet/hive node, the swap's reliability is 1.0 outright with no Tor discount (trust overrides transport); a mixed ring still computes reliability from its non-fleet counterparties only.
-
-**Rank floor (gold or better).** Every non-fleet participant must clear `revenue-ops-lnplus-min-peer-rank` (default `8`, LN+'s own 1-10 scale where higher is better and 8 = "Gold" in their docs). A missing or zero rank is treated as below the floor (fail-closed), not a pass. This is in addition to the existing positive-ratings and negative-ratio floors.
+**Rank floor (gold or better).** Every participant must clear `revenue-ops-lnplus-min-peer-rank` (default `8`, LN+'s own 1-10 scale where higher is better and 8 = "Gold" in their docs). A missing or zero rank is treated as below the floor (fail-closed), not a pass. This is in addition to the existing positive-ratings and negative-ratio floors.
 
 **Minimum participants.** Dual (2-party) swaps are rejected by default (`revenue-ops-lnplus-min-participants`, default `3`) — LN+'s smallest useful ring for this automation is a triangle. Among multiple qualifying swaps with equal EV, the smaller ring wins the tie-break (triangle beats square beats pentagon); EV still decides primarily.
-
-**cl-mycelium hints (advisory, bounded).** When cl-hive/cl-mycelium is present, `cl_revenue_ops` consumes an optional `lnplus_swap_hints` section from the same hive-hints envelope the rest of the fleet-awareness machinery already reads. Each entry names a peer pubkey, an `action` (`prefer` / `avoid` / `allow_duplicate`), an `ev_multiplier` (clamped to `[0.8, 1.5]`, default `1.0`), and a `topology_gain` (clamped to `[0.0, 1.0]`). Hints only ever **bias** the EV of the assigned outbound peer (multiplicatively) and, for `allow_duplicate`, skip the duplicate-peer veto (a swap whose assigned outbound peer we already have a channel to is normally rejected) — they never bypass any other safety gate, and an `avoid` hint always dampens the EV to at most `×0.8`. The feature is fully functional without cl-mycelium: an absent adapter, missing section, or malformed entry is treated as fully neutral.
 
 ### Options
 
@@ -130,14 +123,13 @@ These subsystems are off by default and each has more knobs than fit in a table 
 | `revenue-ops-lnplus-execute-applications` | `true` | `false` = recommendation-only; gates are still evaluated and logged, but no live `create_application` call is made. |
 | `revenue-ops-lnplus-swap-preference-margin` | `0.2` | Fraction by which a regular open's EV must beat the best swap's EV to win the slot instead. |
 | `revenue-ops-lnplus-max-duration-months` | `3` | Longest contract duration we'll apply to. |
-| `revenue-ops-lnplus-min-peer-positive-ratings` | `5` | Minimum LN+ positive-rating floor for every non-fleet participant in the swap (one under-rated peer vetoes the whole swap). |
-| `revenue-ops-lnplus-min-peer-rank` | `8` | Minimum LN+ rank (1-10, higher better; 8 = "Gold") for every non-fleet participant. Missing/zero rank fails closed. |
+| `revenue-ops-lnplus-min-peer-positive-ratings` | `5` | Minimum LN+ positive-rating floor for every participant in the swap (one under-rated peer vetoes the whole swap). |
+| `revenue-ops-lnplus-min-peer-rank` | `8` | Minimum LN+ rank (1-10, higher better; 8 = "Gold") for every participant. Missing/zero rank fails closed. |
 | `revenue-ops-lnplus-max-participants` | `4` | Maximum ring size we'll join. |
 | `revenue-ops-lnplus-min-participants` | `3` | Minimum ring size we'll join (dual swaps rejected); among equal-EV qualifiers, fewer participants win the tie-break. |
 | `revenue-ops-lnplus-apply-feerate-ceiling` | `5000` | No applications while the current opening feerate (perkw) exceeds this. |
 | `revenue-ops-lnplus-pending-timeout-days` | `7` | Withdraw an application still stuck `pending` (unfilled) after this many days. |
 | `revenue-ops-lnplus-inbound-credit-factor` | `0.5` | Damping applied to the inbound-liquidity EV credit (the value of the channel we receive) — conservative by default since inbound value is harder to realize than outbound. |
-| `revenue-ops-lnplus-fleet-pubkeys` | `` (empty) | Comma-separated pubkeys treated as trusted fleet members — exempt from LN+ reputation checks (hive members are detected automatically without needing to be listed here). |
 | `revenue-ops-lnplus-watcher-interval` | `3600` | Obligations watcher poll interval, in seconds. |
 
 ### RPCs
@@ -164,7 +156,7 @@ Swap contracts are capped at `revenue-ops-lnplus-max-duration-months` (default 3
 ```text
 pair selection / fee decisions
     ↓
-v3 router (askrene + mycelium/hive layers)
+v3 router (askrene)
     ↓
 RebalanceEngineV2
     ↓
@@ -267,7 +259,6 @@ lightning-cli revenue-config set daily_budget_sats 10000
 | `revenue-profitability [channel_id]` | Per-channel profitability with sourced metrics and flow profiles |
 | `revenue-analyze` | Trigger immediate analysis |
 | `revenue-wake-all` | Wake the background loops immediately |
-| `revenue-hive-hints-status` | Diagnostic: cl-mycelium hint coverage and freshness |
 | `revenue-planner-candidate-sources` | Diagnostic: candidate pipeline strategy breakdown |
 
 See [docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md) for the full action/mutation RPC inventory across all subsystems (fees, rebalancing, planner, Boltz, LN+).
@@ -280,52 +271,17 @@ See [docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md](docs/audits/CL_REVENUE_
 - `revenue-config reset <key>` removes the DB override, the escape hatch that lets `setconfig`/config-file values govern the field again (some fields apply immediately; others require a plugin restart to re-adopt the file default — the RPC response says which).
 - `revenue-config list-mutable` returns the current set of public runtime keys; only keys in this list can be `set` or `reset` (all others return `"not a public runtime control"`).
 
-## Zero-Fee Hive Corridor
-
-**Operator strategy**: all hive-internal channels are zero fee (0 base msat / 0 ppm), public and announced. Third parties chaining our free internal hops into cheap end-to-end routes is *desired*, not a leak: the fleet is the cheap corridor, revenue is captured at the edge (non-hive) channels, and external flow transiting the mesh performs free intrafleet rebalancing as a side effect.
-
-- The hive-member zero-fee gate (`FeeController._check_hive_member_fee` / `_hive_member_zero_fee_active`, `modules/fee_controller.py`) dominates the fee cycle for any peer with active hive membership: it forces 0 ppm and `base_fee_msat_override=0` with `enforce_limits=False`, ahead of DTS/PID pricing. An explicit operator STATIC policy still wins over the automatic gate (checked earlier in the cycle), and a `set-fee`/initial-fee call with `force=true` can pin a non-zero fee on a hive peer if an operator deliberately chooses to.
-- `revenue-ops-fee-ppm-intra-fleet` (default `0`) and `revenue-ops-base-fee-intra-fleet` (default `0`) are the config-level expression of the same policy for any code path that falls back to configured base/ppm values rather than the hard gate.
-- **Durability through hint staleness**: the zero-fee gate is normally contingent on live hive-hint freshness (`hive-fleet` datastore snapshot / `hive-export-hints`). To avoid repricing away from 0 ppm on every transient hint hiccup or cl-hive/cl-mycelium restart, the plugin persists each peer's last-confirmed hive membership (`hive_member_confirmations` table) and holds zero-fee for `revenue-ops-hive-zero-fee-stale-grace` seconds (default 604800 = 7 days) past the last confirmation before releasing the peer to normal dynamic repricing. Fresh hints that positively say a peer is *not* a member always win immediately -- the grace period only covers genuinely stale/unavailable membership data, never overrides a current "not a member" signal.
-- **Corridor utilization instrumentation**: each settled forward is classified by hive membership of its in/out peers into `internal_transit` (hive→hive), `edge_in` (external→hive), `edge_out` (hive→external), or `external` (external→external), and aggregated daily (`corridor_flow_daily` table). `revenue-dashboard` surfaces a 7-day rollup under `mycelial_corridor` (counts, volume, fee split edge-vs-internal). This is a utilization/success metric only -- it carries no thresholds, warnings, or revocation logic.
-
-## cl-mycelium Hints
-
-`cl_revenue_ops` consumes `cl-mycelium` fleet hints only through `modules/hive_hints.py` (`HiveHintAdapter`). The adapter name, `hive-*` RPC names, and `["hive", "hints"]` datastore key remain the stable compatibility contract documented in [docs/contracts/HIVE_HINTS_CONTRACT.md](docs/contracts/HIVE_HINTS_CONTRACT.md).
-
-- Transport order is datastore first: read CLN datastore key `["hive", "hints"]`, then fall back to `hive-export-hints` only if the datastore payload is missing, stale, or invalid.
-- Missing, stale, malformed, or unavailable hints degrade to neutral local behavior; they do not bypass fee, rebalance, planner, budget, or policy safety rails.
-- Once per fee cycle, `cl_revenue_ops` polls the hint snapshot and refreshes the shared `HiveRouter` compatibility layer (`hive-fleet` layer detection, fleet balance cache, route cache clear) so inbound-fee estimation and Boltz topology scoring see live fleet state instead of a startup-only snapshot.
-- Rebalance candidates are classified before pricing as `hive_only`, `hybrid`, or `market_only`. `hive_only` uses the active cl-mycelium-aware route pricer with live `hive-*` and `revenue-*` askrene layers, `hybrid` compares that fleet-aware route against the configured market router, and `market_only` stays on the configured router only.
-- Coordination hints now seed candidate generation before the active pair cap is applied. `rebalance_recommendations` / `rebalance_campaigns` can materialize coordinated pairs from peer IDs, local SCIDs, or route segments, and may steer policy via `route_policy`, `allow_market_fallback`, `prefer_hive_on_tie`, and `priority_score`.
-- `route_segment_leases` are honored during that overlay stage: overlapping foreign leases suppress the candidate with an explicit `lease_conflict` audit reason, while our own leases are allowed through.
-- Additional live hint consumers:
-  - `fee_elasticity` arms the DTS exploration multiplier, hard-clamped to `[0.75, 2.0]` (`EXPLORATION_BOOST_MIN/MAX` in `modules/fee_controller.py`)
-  - `fleet_fee_prior` / `optimal_fee_estimate_ppm` seed a fleet fee prior, clamped to `[1, 10000]` ppm (`MAX_FLEET_FEE_PRIOR_PPM` in `modules/hive_hints.py`); out-of-range values neutralize to no hint. These two are separate hive-influence channels with their own rails and are NOT the ±10% bounded fee-bias clamp
-  - `reputation_score` and `corridor_utilization_bias` modestly bias capacity-planner open scoring
-  - `drain_direction` remains askrene/diagnostic only; the fee controller intentionally does not apply it directly
-- `revenue-hive-hints-status` reports freshness and signal coverage for the currently cached cl-mycelium hint snapshot.
-- Metabolism Level 2c: optional `metabolic_influence/v1` is consumed fresh-only and scope-valid as bounded scoring input: fee bias `[0.95, 1.05]`, rebalance bias `[0.85, 1.15]`, and planner/open bias `[0.85, 1.10]`. Immune/pathology Level 2c: optional `immune_influence/v1` is also consumed fresh-only and scope-valid as bounded scoring input with the same hard caps. Neither payload grants budget, peer-suppression, or execution authority, and neither proves Level 3 value.
-
-### Hint Diagnostics
-
-`revenue-hive-hints-status` is the primary full freshness diagnostic. The current diagnostic surface includes `diagnostics_version=standalone-hints-v1` and reports cache status, `cache_after_refresh`, `live_datastore`, `live_hive_export`, fallback state, and segment score counts.
-
-`revenue-rebalance-debug.hive_hints` corroborates hint freshness. `revenue-fee-debug` is a lighter supporting surface for fee debugging, not the primary full freshness diagnostic.
-
 ## cl_revenue_ops standalone invariant
 
-`cl_revenue_ops` remains a fully independent local executor when cl-hive or cl-mycelium is absent. Hint integration is confined to `modules/hive_hints.py`; missing datastore entries, unknown `hive-export-hints`, stale snapshots, malformed payloads, and disabled hint adapters must degrade to neutral hint lookups rather than crashing or changing budgets.
+`cl_revenue_ops` is a fully independent local executor. The former cl-hive/cl-mycelium hint integration was removed entirely in 2026-07 (`docs/audit/HIVE_REMOVAL_PLAN.md`); `tests/test_architecture_guard.py` pins that no hive/fleet coordination code returns.
 
-The read-only operator surfaces `revenue-status`, `revenue-fee-debug`, `revenue-rebalance-debug`, and `revenue-hive-hints-status` must keep returning JSON in standalone mode. Bad hints must not call fee, rebalance, planner, Boltz, or CLN mutation RPCs. Valid classic cl-hive hints, valid cl-mycelium M2-scoped hints, optional metabolic influence, and optional immune influence may bias local fee/rebalance/planner behavior only through bounded caps; they never override local budget, safety, or executor policy. M2 `all_hints` is not a production default for this plugin.
+The read-only operator surfaces `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug` must keep returning JSON with no external plugins present, and read-only surfaces must never call fee, rebalance, planner, Boltz, or CLN mutation RPCs.
 
 ## Public Contract Docs
 
 - Contract index: [docs/contracts/README.md](docs/contracts/README.md)
-- Cross-repo doc reference audit: [docs/audits/CROSS_REPO_DOC_REFERENCE_AUDIT.md](docs/audits/CROSS_REPO_DOC_REFERENCE_AUDIT.md)
 - Standalone independence audit: [docs/audits/2026-05-19-standalone-independence-audit.md](docs/audits/2026-05-19-standalone-independence-audit.md)
-- Hint freshness diagnostics audit: [docs/audits/HIVE_HINT_FRESHNESS_DIAGNOSTICS_AUDIT.md](docs/audits/HIVE_HINT_FRESHNESS_DIAGNOSTICS_AUDIT.md)
-- Cross-plugin contract audit: [docs/audits/CROSS_PLUGIN_CONTRACT_AUDIT.md](docs/audits/CROSS_PLUGIN_CONTRACT_AUDIT.md)
+- Hive/mycelium removal record: [docs/audit/HIVE_REMOVAL_PLAN.md](docs/audit/HIVE_REMOVAL_PLAN.md)
 
 ## More Detail
 

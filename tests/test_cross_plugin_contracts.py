@@ -21,7 +21,6 @@ from tests.plugin_test_utils import load_plugin_module
 
 
 CONTRACT_DOCS = {
-    ("hive", "hints"): "docs/contracts/HIVE_HINTS_CONTRACT.md",
     ("revenue", "profitability-summary"): "docs/contracts/REVENUE_PROFITABILITY_SUMMARY_CONTRACT.md",
     ("revenue", "capex-summary"): "docs/contracts/REVENUE_CAPEX_SUMMARY_CONTRACT.md",
     ("revenue", "segment-observations"): "docs/contracts/REVENUE_SEGMENT_OBSERVATIONS_CONTRACT.md",
@@ -240,14 +239,3 @@ def test_segment_observations_producer_payload_matches_contract_and_stale_behavi
     assert observation["confidence"] == 1.0
 
 
-def test_metabolic_influence_contract_is_documented_as_bounded_advisory_input():
-    metabolic = Path("docs/contracts/METABOLIC_INFLUENCE_CONTRACT.md").read_text()
-    hive = Path("docs/contracts/HIVE_HINTS_CONTRACT.md").read_text()
-
-    assert "metabolic-influence/v1" in metabolic
-    assert "[0.95, 1.05]" in metabolic
-    assert "[0.85, 1.15]" in metabolic
-    assert "[0.85, 1.10]" in metabolic
-    assert "never grants budget authority" in hive
-    assert "never authorizes execution" in hive
-    assert "metabolic_influence" in hive
