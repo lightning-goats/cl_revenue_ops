@@ -189,7 +189,6 @@ class TestLnplusConfig:
         assert cfg.lnplus_apply_feerate_ceiling == 5000
         assert cfg.lnplus_pending_timeout_days == 7
         assert cfg.lnplus_inbound_credit_factor == 0.5
-        assert cfg.lnplus_fleet_pubkeys == ''
         assert cfg.lnplus_watcher_interval == 3600
 
     def test_public_runtime_keys(self):
@@ -199,7 +198,7 @@ class TestLnplusConfig:
                     "lnplus_apply_feerate_ceiling", "lnplus_max_duration_months",
                     "lnplus_min_peer_positive_ratings", "lnplus_min_peer_rank",
                     "lnplus_max_participants", "lnplus_min_participants",
-                    "lnplus_fleet_pubkeys", "lnplus_watcher_interval"):
+                    "lnplus_watcher_interval"):
             assert Config.is_public_runtime_key(key), key
 
     def test_min_peer_rank_range_rejected(self):
@@ -250,17 +249,12 @@ class TestLnplusConfig:
         assert result.get("status") == "success"
         assert cfg.lnplus_max_duration_months == 2
 
-    def test_fleet_pubkeys_and_watcher_interval_settable_via_revenue_config(self):
-        """C-1(a): both new keys work via revenue-config set (update_runtime)
+    def test_watcher_interval_settable_via_revenue_config(self):
+        """C-1(a): the key works via revenue-config set (update_runtime)
         alongside the existing setconfig path — public, typed, ranged."""
         db = _make_db()
         cfg = Config()
-        assert Config.is_public_runtime_key("lnplus_fleet_pubkeys")
         assert Config.is_public_runtime_key("lnplus_watcher_interval")
-        pk = "02" + "ab" * 32
-        result = cfg.update_runtime(db, "lnplus_fleet_pubkeys", pk)
-        assert result.get("status") == "success"
-        assert cfg.lnplus_fleet_pubkeys == pk
         result = cfg.update_runtime(db, "lnplus_watcher_interval", "200")
         assert "error" in result or result.get("status") != "success"
         result = cfg.update_runtime(db, "lnplus_watcher_interval", "7200")
@@ -424,7 +418,7 @@ from modules.lnplus_swaps import SwapEvaluator, NEG_RATIO_MAX, TOR_RELIABILITY, 
 
 PK_A = "02" + "aa" * 32
 PK_B = "03" + "bb" * 32
-FLEET_PK = "02" + "ff" * 32
+OUR_NODE_PK = "02" + "ff" * 32
 
 
 def _swap_fixture(**overrides):
@@ -454,8 +448,7 @@ def _swap_fixture(**overrides):
     return swap
 
 
-def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None,
-                     hive_member_check=None, hive_hints=None):
+def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None):
     cfg = Config()
     for k, v in (cfg_overrides or {}).items():
         setattr(cfg, k, v)
@@ -479,8 +472,7 @@ def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None
     lifecycle.breaker_tripped.return_value = breaker
     lifecycle.has_inflight.return_value = inflight
     lifecycle.reconcile_ok.return_value = True
-    ev = SwapEvaluator(plugin, rpc, db, cfg, client, planner, lifecycle,
-                        hive_member_check=hive_member_check, hive_hints=hive_hints)
+    ev = SwapEvaluator(plugin, rpc, db, cfg, client, planner, lifecycle)
     return ev, cfg, client, db
 
 
@@ -535,53 +527,6 @@ class TestSwapEvaluatorGates:
         ev, cfg, _, _ = _make_evaluator(swaps=[swap])
         result = ev.run_cycle(cfg, 0.0)
         assert any(r["gate"] == "peer_quality" for r in result["rejections"])
-
-    def test_fleet_member_participant_is_allowed_and_trusted(self):
-        """D-1 (2026-07-08 Revision 2, operator-directed): the fleet veto is
-        REMOVED — a fleet participant is allowed and TRUSTED, exempt from
-        every LN+ reputation check (ratings floor, negative ratio, rank
-        floor). A low-rated/unranked fleet member must still pass."""
-        swap = _swap_fixture()
-        swap["participants"][1]["pubkey"] = FLEET_PK
-        swap["participants"][1]["positive_ratings_count"] = 0
-        swap["participants"][1]["negative_ratings_count"] = 50
-        swap["participants"][1]["lnplus_rank_number"] = 0
-        ev, cfg, _, _ = _make_evaluator(
-            {"lnplus_fleet_pubkeys": FLEET_PK}, swaps=[swap])
-        result = ev.run_cycle(cfg, 0.0)
-        assert not any(r["gate"] in ("fleet_dedup", "peer_quality")
-                       for r in result["rejections"])
-
-    def test_hive_member_flagged_low_rated_unranked_participant_passes_peer_checks(self):
-        """D-1: a participant not in the static lnplus_fleet_pubkeys CSV but
-        flagged as a hive fleet-mate by the injected callable is equally
-        trusted — same reputation-check exemption as a static fleet pubkey."""
-        swap = _swap_fixture()
-        hive_pk = swap["participants"][1]["pubkey"]
-        swap["participants"][1]["positive_ratings_count"] = 0
-        swap["participants"][1]["negative_ratings_count"] = 50
-        swap["participants"][1]["lnplus_rank_number"] = 0
-        hive_check = MagicMock(side_effect=lambda pk: pk == hive_pk)
-        ev, cfg, _, _ = _make_evaluator(swaps=[swap], hive_member_check=hive_check)
-        result = ev.run_cycle(cfg, 0.0)
-        assert not any(r["gate"] in ("fleet_dedup", "peer_quality")
-                       for r in result["rejections"])
-        hive_check.assert_any_call(hive_pk)
-
-    def test_hive_member_check_raising_does_not_veto(self):
-        """C-1(c): a raising hive_member_check must never veto (or crash)
-        — guard it and treat it as 'not a fleet member' (False). Under D-1
-        there is no fleet_dedup gate any more, but a raising callable must
-        still fall back to normal (non-fleet) reputation checks rather than
-        crashing or spuriously passing/failing the gate chain."""
-        swap = _swap_fixture()
-        hive_check = MagicMock(side_effect=RuntimeError("hive router down"))
-        ev, cfg, _, _ = _make_evaluator(swaps=[swap], hive_member_check=hive_check)
-        result = ev.run_cycle(cfg, 0.0)
-        assert not any(r["gate"] == "fleet_dedup" for r in result["rejections"])
-        # Fixture participants pass ratings/rank/address checks on their own
-        # merits, so falling back to non-fleet treatment must not reject them.
-        assert not any(r["gate"] == "peer_quality" for r in result["rejections"])
 
     def test_rejects_bad_negative_ratio(self):
         swap = _swap_fixture()
@@ -676,8 +621,7 @@ class TestSwapEvaluatorGates:
         assert a["incoming_peer"] == PK_B     # B opens to C
 
     def test_own_node_still_rejected(self):
-        """D-1: the fleet veto is gone but the own-node check remains,
-        renamed to 'own_node'."""
+        """The own-node check: we must not join a swap we are already in."""
         swap = _swap_fixture()
         ev, cfg, _, _ = _make_evaluator(swaps=[swap])
         ev.rpc.getinfo.return_value = {"id": PK_A}
@@ -685,7 +629,7 @@ class TestSwapEvaluatorGates:
         assert result["applied"] is False
         assert any(r["gate"] == "own_node" for r in result["rejections"])
 
-    # -- D-2: rank floor (gold or better) for non-fleet participants -----
+    # -- D-2: rank floor (gold or better) ---------------------------------
 
     def test_rejects_rank_below_floor(self):
         swap = _swap_fixture()
@@ -710,15 +654,6 @@ class TestSwapEvaluatorGates:
         result = ev.run_cycle(cfg, 0.0)
         assert any(r["gate"] == "peer_quality" and "rank" in r["reason"]
                    for r in result["rejections"])
-
-    def test_fleet_member_rank_zero_passes(self):
-        """D-1 x D-2: fleet participants are exempt from the rank floor."""
-        swap = _swap_fixture()
-        swap["participants"][1]["lnplus_rank_number"] = 0
-        ev, cfg, _, _ = _make_evaluator(
-            {"lnplus_fleet_pubkeys": PK_B}, swaps=[swap])
-        result = ev.run_cycle(cfg, 0.0)
-        assert not any(r["gate"] == "peer_quality" for r in result["rejections"])
 
     # -- D-3: minimum 3 participants ---------------------------------------
 
@@ -764,24 +699,6 @@ class TestSwapEvAndApply:
         clear_value, _ = ev._swap_ev(_swap_fixture(), cfg, best_regular_ev=0.0)
         assert tor_value < clear_value
 
-    # -- D-1: fleet-aware reliability --------------------------------------
-
-    def test_swap_ev_all_fleet_counterparties_reliability_one(self):
-        """D-1: when ALL visible counterparties are fleet, reliability is
-        1.0 outright — trust overrides transport, so no Tor discount even
-        if the fixture participants publish only Tor addresses."""
-        swap = _swap_fixture()
-        for p in swap["participants"]:
-            p["address_1"] = "abcdef.onion:9735"
-            p["address_2"] = None
-        fleet_csv = f"{PK_A},{PK_B}"
-        ev, cfg, _, _ = _make_evaluator({"lnplus_fleet_pubkeys": fleet_csv}, swaps=[swap])
-        value, assignment = ev._swap_ev(swap, cfg, best_regular_ev=800.0)
-        # inbound_credit = min(1000, 5M*0.005=25000) = 1000; reliability = 1.0
-        # haircut = 0.3 * 800 * (3/12) = 60
-        expected = 1000.0 + 1000.0 * 1.0 * 0.5 - 60.0
-        assert abs(value - expected) < 1.0
-
     # -- D-3: tie-break on equal EV ------------------------------------------
 
     def test_tie_break_prefers_fewer_participants_on_equal_ev(self):
@@ -797,77 +714,6 @@ class TestSwapEvAndApply:
         result = ev.run_cycle(cfg, best_regular_ev=0.0)
         assert result["applied"] is True
         assert result["swap_id"] == "sw3"
-
-    # -- D-4: mycelium LN+ swap hints -----------------------------------
-
-    def test_hint_multiplier_applied_to_ev(self):
-        swap = _swap_fixture()
-        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
-        ev._cur_hints = {PK_A: {"action": "prefer", "ev_multiplier": 1.2,
-                                 "topology_gain": 0.5, "reason": "underserved_corridor"}}
-        value, assignment = ev._swap_ev(swap, cfg, best_regular_ev=800.0)
-        base = 1000.0 + 1000.0 * 0.696 * 0.5 - 60.0
-        assert abs(value - base * 1.2) < 1.0
-
-    def test_hint_avoid_forces_multiplier_to_at_most_point_eight(self):
-        swap = _swap_fixture()
-        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
-        # Already-clamped-range value (>= 0.8) must still be forced down.
-        ev._cur_hints = {PK_A: {"action": "avoid", "ev_multiplier": 1.5,
-                                 "topology_gain": 0.0, "reason": "oversaturated"}}
-        value, assignment = ev._swap_ev(swap, cfg, best_regular_ev=800.0)
-        base = 1000.0 + 1000.0 * 0.696 * 0.5 - 60.0
-        assert abs(value - base * 0.8) < 1.0
-
-    def test_absent_hint_for_peer_is_neutral(self):
-        swap = _swap_fixture()
-        ev, cfg, _, _ = _make_evaluator(swaps=[swap])
-        ev._cur_hints = {PK_B: {"action": "prefer", "ev_multiplier": 1.3,
-                                 "topology_gain": 0.5, "reason": "x"}}   # not PK_A (outbound)
-        value, assignment = ev._swap_ev(swap, cfg, best_regular_ev=800.0)
-        base = 1000.0 + 1000.0 * 0.696 * 0.5 - 60.0
-        assert abs(value - base) < 1.0
-
-    def test_allow_duplicate_hint_skips_existing_channel_gate(self):
-        hive_hints = MagicMock()
-        hive_hints.get_lnplus_swap_hints.return_value = {
-            PK_A: {"action": "allow_duplicate", "ev_multiplier": 1.0,
-                   "topology_gain": 0.7, "reason": "redundancy"}}
-        ev, cfg, _, _ = _make_evaluator(hive_hints=hive_hints)
-        ev.rpc.listpeerchannels.return_value = {"channels": [
-            {"peer_id": PK_A, "state": "CHANNELD_NORMAL"}]}
-        result = ev.run_cycle(cfg, 0.0)
-        assert not any(r["gate"] == "terms" and "existing channel" in r["reason"]
-                       for r in result["rejections"])
-
-    def test_hive_hints_fetch_failure_is_neutral(self):
-        """D-4(b): a raising adapter must never break the cycle."""
-        hive_hints = MagicMock()
-        hive_hints.get_lnplus_swap_hints.side_effect = RuntimeError("boom")
-        ev, cfg, _, _ = _make_evaluator(hive_hints=hive_hints)
-        result = ev.run_cycle(cfg, best_regular_ev=800.0)
-        assert ev._cur_hints == {}
-
-    def test_absent_hive_hints_adapter_is_neutral(self):
-        """D-4: no adapter wired (hive_hints disabled) => fully neutral."""
-        ev, cfg, _, _ = _make_evaluator()
-        result = ev.run_cycle(cfg, best_regular_ev=800.0)
-        assert ev._cur_hints == {}
-
-    def test_hints_do_not_rescue_a_failed_safety_gate(self):
-        """D-4(c): hints bias EV/duplicate-peer, never bypass another gate
-        — a rank-floor rejection stands even with a strong 'prefer' hint."""
-        swap = _swap_fixture()
-        swap["participants"][1]["lnplus_rank_number"] = 1   # below floor, non-fleet
-        hive_hints = MagicMock()
-        hive_hints.get_lnplus_swap_hints.return_value = {
-            PK_B: {"action": "prefer", "ev_multiplier": 1.5,
-                   "topology_gain": 1.0, "reason": "x"}}
-        ev, cfg, _, _ = _make_evaluator(swaps=[swap], hive_hints=hive_hints)
-        result = ev.run_cycle(cfg, 0.0)
-        assert result["applied"] is False
-        assert any(r["gate"] == "peer_quality" and "rank" in r["reason"]
-                   for r in result["rejections"])
 
     def test_swap_wins_within_margin_and_applies(self):
         ev, cfg, client, db = _make_evaluator()
@@ -1677,7 +1523,7 @@ class TestLnplusIntegration:
         cfg = Config()
         plugin, rpc = MagicMock(), MagicMock()
         rpc.feerates.return_value = {"perkw": {"opening": 2000}}
-        rpc.getinfo.return_value = {"id": FLEET_PK}
+        rpc.getinfo.return_value = {"id": OUR_NODE_PK}
         # Gate 7 (confirmed on-chain funds) is exercised elsewhere by
         # TestSwapEvAndApply; here we only need it to not block the apply,
         # so give the mock rpc a generous confirmed balance (mirrors the
@@ -1784,14 +1630,14 @@ class TestLnplusBackfill:
     def test_running_contract_imports_opened_row_with_derived_outbound(self):
         ends = int(time.time()) + 30 * 86400
         detail = {"participants": [
-            {"participant_identifier": "A", "pubkey": FLEET_PK},
+            {"participant_identifier": "A", "pubkey": OUR_NODE_PK},
             {"participant_identifier": "B", "pubkey": PK_A},
             {"participant_identifier": "C", "pubkey": PK_B}]}
         my = {"pending": [], "opening": [], "completed": [
             {"id": "c1", "incoming_peer_pubkey": PK_B, "ends": ends,
              "capacity_sats": 4_000_000, "duration_months": 3}]}
         lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
-        rpc.getinfo.return_value = {"id": FLEET_PK}
+        rpc.getinfo.return_value = {"id": OUR_NODE_PK}
         client.get_swap.return_value = detail
         result = lc.backfill_from_lnplus()
         row = db.lnplus_get_swap("c1")
@@ -1830,9 +1676,9 @@ class TestLnplusBackfill:
                   {"id": "e1", "incoming_peer_pubkey": PK_B, "ends": ends_ended,
                    "capacity_sats": 1_500_000, "duration_months": 3}]}
         lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
-        rpc.getinfo.return_value = {"id": FLEET_PK}
+        rpc.getinfo.return_value = {"id": OUR_NODE_PK}
         client.get_swap.return_value = {"participants": [
-            {"participant_identifier": "A", "pubkey": FLEET_PK},
+            {"participant_identifier": "A", "pubkey": OUR_NODE_PK},
             {"participant_identifier": "B", "pubkey": PK_A}]}
         lc.backfill_from_lnplus()
         before = {sid: db.lnplus_get_swap(sid) for sid in ("p1", "o1", "c1", "e1")}
@@ -1905,9 +1751,9 @@ class TestLnplusBackfill:
             {"id": "c1", "incoming_peer_pubkey": PK_B, "ends": ends,
              "capacity_sats": 3_000_000, "duration_months": 3}]}
         lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my)
-        rpc.getinfo.return_value = {"id": FLEET_PK}
+        rpc.getinfo.return_value = {"id": OUR_NODE_PK}
         client.get_swap.return_value = {"participants": [
-            {"participant_identifier": "A", "pubkey": FLEET_PK},
+            {"participant_identifier": "A", "pubkey": OUR_NODE_PK},
             {"participant_identifier": "B", "pubkey": PK_A}]}
         lc.run_watcher_once()
         row = db.lnplus_get_swap("c1")
@@ -2071,9 +1917,9 @@ class TestLnplusBackfill:
                    "ends": int(time.time()) - 86400,
                    "capacity_sats": 1_500_000, "duration_months": 3}]}
         lc, db, rpc, client, *_ = _make_lifecycle(my_swaps=my)
-        rpc.getinfo.return_value = {"id": FLEET_PK}
+        rpc.getinfo.return_value = {"id": OUR_NODE_PK}
         client.get_swap.return_value = {"participants": [
-            {"participant_identifier": "A", "pubkey": FLEET_PK},
+            {"participant_identifier": "A", "pubkey": OUR_NODE_PK},
             {"participant_identifier": "B", "pubkey": PK_A}]}
         result = lc.backfill_from_lnplus()
         assert result["imported"] == {"pending": 1, "opening": 1, "active": 1, "ended": 1}
@@ -2135,29 +1981,19 @@ class TestLnplusPluginWiring:
         assert mod._clamp_lnplus_watcher_interval(999_999) == 14400
         assert mod._clamp_lnplus_watcher_interval(1800) == 1800
 
-    def test_fleet_pubkeys_and_watcher_interval_options_are_dynamic(self):
-        """B6(b): fleet growth (new pubkeys) and interval tuning must not
-        require a plugin restart."""
+    def test_watcher_interval_option_is_dynamic_and_refreshes(self):
+        """B6(b): interval tuning must not require a plugin restart, and
+        _refresh_dynamic_config's cast-tuple loop must cover the option."""
         mod = load_plugin_module()
-        for option in ("revenue-ops-lnplus-fleet-pubkeys",
-                       "revenue-ops-lnplus-watcher-interval"):
-            assert mod.plugin.options[option]["dynamic"] is True
-
-    def test_dynamic_refresh_updates_fleet_pubkeys_and_watcher_interval(self):
-        """B6(b): _refresh_dynamic_config's cast-tuple loop must cover both
-        new options (extending the loop to support a "str" cast for
-        fleet_pubkeys)."""
-        mod = load_plugin_module()
+        assert mod.plugin.options["revenue-ops-lnplus-watcher-interval"]["dynamic"] is True
         mod.config = Config()
         mod.boltz_manager = None
         fake_rpc = MagicMock()
         fake_rpc.listconfigs.return_value = {"configs": {
-            "revenue-ops-lnplus-fleet-pubkeys": {"value_str": PK_A + "," + PK_B},
             "revenue-ops-lnplus-watcher-interval": {"value_str": "900"},
         }}
         mod.safe_plugin = SimpleNamespace(rpc=fake_rpc)
         mod._refresh_dynamic_config()
-        assert mod.config.lnplus_fleet_pubkeys == PK_A + "," + PK_B
         assert mod.config.lnplus_watcher_interval == 900
 
     def test_min_peer_rank_and_min_participants_options_are_dynamic_and_refresh(self):
@@ -2178,23 +2014,6 @@ class TestLnplusPluginWiring:
         mod._refresh_dynamic_config()
         assert mod.config.lnplus_min_peer_rank == 6
         assert mod.config.lnplus_min_participants == 4
-
-    def test_dynamic_refresh_clears_str_field_on_empty_setconfig(self):
-        """C-1(b) (2026-07-08 audit): the old "if not _val: continue" guard
-        made lnplus_fleet_pubkeys (a str-cast field) unclearable via
-        setconfig — an operator emptying the CSV back out would never see
-        it take effect. bool/int/float casts still must skip on empty."""
-        mod = load_plugin_module()
-        mod.config = Config()
-        mod.config.lnplus_fleet_pubkeys = PK_A   # non-default starting value
-        mod.boltz_manager = None
-        fake_rpc = MagicMock()
-        fake_rpc.listconfigs.return_value = {"configs": {
-            "revenue-ops-lnplus-fleet-pubkeys": {"value_str": ""},
-        }}
-        mod.safe_plugin = SimpleNamespace(rpc=fake_rpc)
-        mod._refresh_dynamic_config()
-        assert mod.config.lnplus_fleet_pubkeys == ""
 
     def test_dynamic_refresh_still_skips_empty_bool_int_float_casts(self):
         """Companion to the str-clear fix: bool/int/float fields must still
@@ -2219,15 +2038,15 @@ class TestDynamicRefreshOverridePrecedence:
     def test_db_override_not_stomped_by_refresh(self):
         """A revenue-config DB override must survive _refresh_dynamic_config
         reading an empty/different value_str from listconfigs (nexus-01
-        2026-07-08 incident: fleet pubkeys cleared 1 minute after set)."""
+        2026-07-08 incident: a str option cleared 1 minute after set)."""
         db = _make_db()
         from modules.config import Config
         cfg = Config()
-        result = cfg.update_runtime(db, "lnplus_fleet_pubkeys", PK_A)
+        result = cfg.update_runtime(db, "lnplus_watcher_interval", "7200")
         assert result.get("status") == "success"
-        assert cfg.lnplus_fleet_pubkeys == PK_A
+        assert cfg.lnplus_watcher_interval == 7200
         # Simulate the refresh loop's guard: an active override means skip.
-        assert db.get_config_override("lnplus_fleet_pubkeys") is not None
+        assert db.get_config_override("lnplus_watcher_interval") is not None
 
     def test_planner_execute_closes_override_key_exists(self):
         """Guard contract for the legacy refresh block: the override key it
@@ -2340,7 +2159,7 @@ class TestIncomingContractProtection:
                               tag_added=1, incoming_tag_added=1)
         # second active contract has PK_B as OUTBOUND peer
         db.lnplus_record_swap("s2", "active", 3_000_000, 3,
-                              outbound_peer=PK_B, incoming_peer=FLEET_PK)
+                              outbound_peer=PK_B, incoming_peer=OUR_NODE_PK)
         rpc.listpeerchannels.return_value = {"channels": [
             {"peer_id": PK_B, "state": "CHANNELD_NORMAL"}]}
         lc.run_watcher_once()

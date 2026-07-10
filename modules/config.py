@@ -93,7 +93,6 @@ PUBLIC_RUNTIME_KEYS = (
     'lnplus_apply_feerate_ceiling',
     'lnplus_pending_timeout_days',
     'lnplus_inbound_credit_factor',
-    'lnplus_fleet_pubkeys',
     'lnplus_watcher_interval',
     # Z-2 (2026-07-08): durable zero-fee hive corridor grace period.
     'hive_zero_fee_stale_grace_seconds',
@@ -270,7 +269,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'lnplus_apply_feerate_ceiling': int,
     'lnplus_pending_timeout_days': int,
     'lnplus_inbound_credit_factor': float,
-    'lnplus_fleet_pubkeys': str,
     'lnplus_watcher_interval': int,
 }
 
@@ -833,7 +831,6 @@ class Config:
     lnplus_apply_feerate_ceiling: int = 5000
     lnplus_pending_timeout_days: int = 7
     lnplus_inbound_credit_factor: float = 0.5
-    lnplus_fleet_pubkeys: str = ''
     lnplus_watcher_interval: int = 3600
 
     # Internal version tracking (not a user-configurable option)
@@ -1345,7 +1342,6 @@ class ConfigSnapshot:
     lnplus_apply_feerate_ceiling: int = 5000
     lnplus_pending_timeout_days: int = 7
     lnplus_inbound_credit_factor: float = 0.5
-    lnplus_fleet_pubkeys: str = ''
     lnplus_watcher_interval: int = 3600
     # Version tracking
     version: int = 0

@@ -1897,13 +1897,6 @@ plugin.add_option(
     dynamic=True
 )
 plugin.add_option(
-    name='revenue-ops-lnplus-fleet-pubkeys',
-    default='',
-    description=('Comma-separated pubkeys treated as trusted fleet members '
-                 '(exempt from LN+ reputation checks; hive members detected automatically)'),
-    dynamic=True
-)
-plugin.add_option(
     name='revenue-ops-lnplus-watcher-interval',
     default='3600',
     description='LN+ obligations watcher interval in seconds (default: 3600)',
@@ -2663,7 +2656,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         lnplus_apply_feerate_ceiling=_safe_int_opt('revenue-ops-lnplus-apply-feerate-ceiling', '5000'),
         lnplus_pending_timeout_days=_safe_int_opt('revenue-ops-lnplus-pending-timeout-days', '7'),
         lnplus_inbound_credit_factor=_safe_float_opt('revenue-ops-lnplus-inbound-credit-factor', '0.5'),
-        lnplus_fleet_pubkeys=options.get('revenue-ops-lnplus-fleet-pubkeys', ''),
         lnplus_watcher_interval=_safe_int_opt('revenue-ops-lnplus-watcher-interval', '3600'),
         hive_zero_fee_stale_grace_seconds=_safe_int_opt('revenue-ops-hive-zero-fee-stale-grace', '604800'),
         hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'true').lower() in ('true', '1', 'yes'),
@@ -3072,11 +3064,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if capacity_planner is not None:
         capacity_planner.lnplus_evaluator = SwapEvaluator(
             safe_plugin, safe_plugin.rpc, database, config, lnplus_client,
-            capacity_planner, lnplus_lifecycle,
-            # cl-mycelium retired: no fleet-mate trust shortcut and no swap
-            # hints. LN+ participants are evaluated purely on local reputation.
-            hive_member_check=None,
-            hive_hints=None)
+            capacity_planner, lnplus_lifecycle)
     plugin.log("LN+ swap automation initialized")
 
     # cl-mycelium retired: HiveRouter (shared askrene fleet route discovery) is
@@ -6502,10 +6490,6 @@ def _refresh_dynamic_config():
             ("revenue-ops-lnplus-apply-feerate-ceiling", "lnplus_apply_feerate_ceiling", "int"),
             ("revenue-ops-lnplus-pending-timeout-days", "lnplus_pending_timeout_days", "int"),
             ("revenue-ops-lnplus-inbound-credit-factor", "lnplus_inbound_credit_factor", "float"),
-            # B6(b): fleet growth (new fleet pubkeys) and the watcher
-            # interval must not require a plugin restart — gate 6 dedup
-            # depends on lnplus_fleet_pubkeys staying live.
-            ("revenue-ops-lnplus-fleet-pubkeys", "lnplus_fleet_pubkeys", "str"),
             ("revenue-ops-lnplus-watcher-interval", "lnplus_watcher_interval", "int"),
             # Z-2 (2026-07-08): zero-fee hive corridor grace period, tunable
             # at runtime without a daemon restart.
@@ -6516,20 +6500,19 @@ def _refresh_dynamic_config():
         ):
             _val = configs.get(_opt, {}).get("value_str", "")
             # C-1(b) (2026-07-08 audit): the blanket "skip if empty" guard
-            # made a str-cast field (lnplus_fleet_pubkeys) unclearable via
-            # setconfig — an operator emptying the CSV would never see the
-            # empty value take effect. bool/int/float casts still skip on
-            # empty (an unset numeric/bool option has no meaningful "empty"
-            # value to apply).
+            # made str-cast fields unclearable via setconfig — an operator
+            # emptying the value would never see it take effect. bool/int/
+            # float casts still skip on empty (an unset numeric/bool option
+            # has no meaningful "empty" value to apply).
             if not _val and _cast != "str":
                 continue
             # Runtime precedence: an active revenue-config DB override wins
             # over the listconfigs view. Without this guard the refresh loop
             # stomps a `revenue-config set` value with the (possibly empty)
             # setconfig/file value every cycle — observed live on nexus-01
-            # 2026-07-08: lnplus_fleet_pubkeys cleared 1 minute after being
-            # set. Operators drop the override with `revenue-config reset`
-            # if they want the setconfig/file value to govern again.
+            # 2026-07-08: a str option cleared 1 minute after being set.
+            # Operators drop the override with `revenue-config reset` if
+            # they want the setconfig/file value to govern again.
             try:
                 if database is not None and database.get_config_override(_field) is not None:
                     continue

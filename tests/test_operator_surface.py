@@ -61,7 +61,6 @@ def test_public_runtime_keys_are_safety_only():
         "lnplus_apply_feerate_ceiling",
         "lnplus_pending_timeout_days",
         "lnplus_inbound_credit_factor",
-        "lnplus_fleet_pubkeys",
         "lnplus_watcher_interval",
         "hive_zero_fee_stale_grace_seconds",
     ]
@@ -127,7 +126,6 @@ def test_public_runtime_dict_returns_only_public_keys():
         "lnplus_apply_feerate_ceiling": 5000,
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
-        "lnplus_fleet_pubkeys": "",
         "lnplus_watcher_interval": 3600,
         "hive_zero_fee_stale_grace_seconds": 604800,
     }
@@ -745,7 +743,6 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "htlcmax_source_pct",
         "lnplus_apply_feerate_ceiling",
         "lnplus_execute_applications",
-        "lnplus_fleet_pubkeys",
         "lnplus_inbound_credit_factor",
         "lnplus_max_duration_months",
         "lnplus_max_participants",
@@ -772,7 +769,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_target",
         "weekly_budget_sats",
     ]
-    assert result["count"] == 50
+    assert result["count"] == 49
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -828,7 +825,6 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "lnplus_apply_feerate_ceiling": 5000,
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
-        "lnplus_fleet_pubkeys": "",
         "lnplus_watcher_interval": 3600,
         "hive_zero_fee_stale_grace_seconds": 604800,
     }
@@ -1311,7 +1307,6 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "lnplus_apply_feerate_ceiling": 5000,
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
-        "lnplus_fleet_pubkeys": "",
         "lnplus_watcher_interval": 3600,
         "hive_zero_fee_stale_grace_seconds": 604800,
     }
