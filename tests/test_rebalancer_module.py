@@ -600,15 +600,13 @@ class TestVolumeBasedSizingFix:
     """Fix: Low-volume channels should not be penalized worse than zero-volume."""
 
     def test_low_volume_not_killed_by_sizing_guard(self, mock_plugin, mock_database):
-        """A channel with 10k sats/day volume (below rebalance_min_amount) should
+        """A channel with 10k sats/day volume (below the 50k floor) should
         use capacity-based target, not vol_target which would fail the sizing guard."""
         from modules.config import Config
         from modules.rebalancer import EVRebalancer
 
         cfg = Config(
-            rebalance_min_amount=50000,
             flow_window_days=7,
-            enable_velocity_gate=False,
         )
         r = EVRebalancer(mock_plugin, cfg, mock_database)
 
@@ -632,21 +630,20 @@ class TestVolumeBasedSizingFix:
         vol_target = int(daily_volume * 3)  # 30000
         cap_target = int(1_000_000 * 0.50)  # 500000
 
-        # After fix: vol_target (30000) < rebalance_min_amount (50000), so use cap_target
-        assert vol_target < cfg.rebalance_min_amount
-        if vol_target >= cfg.rebalance_min_amount:
+        # After fix: vol_target (30000) < the 50k floor, so use cap_target
+        assert vol_target < 50000
+        if vol_target >= 50000:
             raw_target = min(cap_target, vol_target)
         else:
             raw_target = cap_target
         assert raw_target == cap_target
-        assert raw_target >= cfg.rebalance_min_amount
+        assert raw_target >= 50000
 
     def test_high_volume_still_constrains_target(self, mock_plugin, mock_database):
         """A channel with high volume should still use vol_target to prevent overfill."""
         from modules.config import Config
 
         cfg = Config(
-            rebalance_min_amount=50000,
             flow_window_days=7,
         )
 
@@ -654,7 +651,7 @@ class TestVolumeBasedSizingFix:
         vol_target = int(daily_volume * 3)  # 300000
         cap_target = int(2_000_000 * 0.50)  # 1000000
 
-        assert vol_target >= cfg.rebalance_min_amount
+        assert vol_target >= 50000
         raw_target = min(cap_target, vol_target)
         assert raw_target == vol_target  # volume constraint applied
 

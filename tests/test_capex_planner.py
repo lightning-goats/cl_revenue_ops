@@ -65,7 +65,6 @@ class TestExplorationBudgetGate:
         mock_config.planner_max_channel_sats = 10_000_000
         mock_config.planner_reserve_pct = 0.20
         mock_config.rebalance_max_amount = 5_000_000
-        mock_config.rebalance_min_amount = 50_000
         mock_config.min_wallet_reserve = 500_000
         mock_config.snapshot.return_value = mock_config
 

@@ -19,8 +19,6 @@
 # FLOW ANALYSIS
 # ============================================================================
 
-# Target daily flow per channel in sats (used for liquidity scoring)
-#revenue-ops-target-flow=100000
 
 # Flow analysis interval in seconds (1 hour default)
 #revenue-ops-flow-interval=3600
@@ -114,8 +112,6 @@
 
 # Rebalance execution uses the exact route priced by askrene.
 
-# Hours before retrying a channel after 10+ consecutive rebalance failures.
-#revenue-ops-futility-cooldown-hours=48
 
 # Local ratio below which a destination bypasses the channel-level rebalance
 # cooldown (0 disables).
@@ -222,8 +218,6 @@
 # Minimum cooldown hours for protected hot channels.
 #revenue-ops-hot-channel-protection-min-cooldown-hours=1.0
 
-# Hard max routing fee ppm for protected hot-channel rebalances.
-#revenue-ops-hot-channel-protection-max-rebalance-fee-ppm=2000
 
 # ============================================================================
 # GROWTH BUDGET
@@ -415,8 +409,6 @@
 # Hard timeout for all RPC calls to lightningd, in seconds.
 #revenue-ops-rpc-timeout-seconds=15
 
-# Cooldown period after an RPC timeout for that method group, in seconds.
-#revenue-ops-rpc-circuit-breaker-seconds=60
 
 # Hours before stale budget reservations are auto-released.
 #revenue-ops-reservation-timeout-hours=4

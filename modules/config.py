@@ -128,7 +128,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hot_channel_protection_profit_budget_pct': float,
     'hot_channel_protection_max_chunk_multiplier': float,
     'hot_channel_protection_min_cooldown_hours': float,
-    'hot_channel_protection_max_rebalance_fee_ppm': int,
     'boltz_auto_cycle_enabled': bool,
     'boltz_auto_cycle_interval_minutes': int,
     'boltz_auto_cycle_max_actions': int,
@@ -160,12 +159,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'max_concurrent_jobs': int,
     'askrene_layer': str,
     'askrene_layers': str,
-    'askrene_max_age_sec': int,
     'rebalance_router': str,
     'rebalance_min_profit': int,
-    'rebalance_min_profit_ppm': int,
     'rebalance_max_amount': int,
-    'rebalance_min_amount': int,
     'rebalance_cooldown_hours': int,
     'rebalance_emergency_local_ratio': float,
     'rebalance_drift_override_ratio': float,
@@ -182,34 +178,23 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_size_tiered_targets': bool,
     'rebalance_size_reference_percentile': float,
     'rebalance_small_channel_band_half_width': float,
-    'futility_cooldown_hours': int,
     'inbound_fee_estimate_ppm': int,
     # Vegas Reflex
     'enable_vegas_reflex': bool,
     'vegas_decay_rate': float,
     # Operational Hardening
     'rpc_timeout_seconds': int,
-    'rpc_circuit_breaker_seconds': int,
-    'rpc_pool_size': int,
     'reservation_timeout_hours': int,
     # Issue #28: Revenue rate smoothing
-    'ema_smoothing_alpha': float,
     # Issue #30: Velocity gate for rebalancing
-    'enable_velocity_gate': bool,
-    'min_velocity_threshold': float,
-    'new_channel_grace_days': int,
     # DTS (Discounted Thompson Sampling) parameters
     'thompson_prior_std_fee': int,
-    'thompson_observation_decay_hours': int,
-    'thompson_max_observations': int,
-    'thompson_min_observations': int,
     # Routing Intelligence Integration
     # Fields present in CONFIG_FIELD_RANGES that need type registration
     'base_fee_msat': int,
     'neighbor_median_min_competitors': int,
     'flow_window_days': int,
     'estimated_open_cost_sats': int,
-    'target_flow': int,
     'source_threshold': float,
     'sink_threshold': float,
     # Capacity Planner
@@ -224,8 +209,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'planner_close_feerange_enabled': bool,
     'planner_min_channel_sats': int,
     'planner_max_channel_sats': int,
-    'planner_min_channel_age_days': int,
-    'planner_min_peer_uptime_pct': float,
     'planner_max_fee_rate_sat_vb': float,
     'planner_min_annual_roi_pct': float,
     # Unified Capex Budget Engine
@@ -237,8 +220,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'capex_exploration_rate': float,
     'capex_tactical_rate': float,
     'capex_global_envelope_sats': int,
-    'capex_cost_efficiency_weight': float,
-    'capex_drain_benefit_weight': float,
     # LN+ liquidity swap automation
     'lnplus_swaps_enabled': bool,
     'lnplus_execute_applications': bool,
@@ -302,32 +283,21 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'htlc_congestion_threshold': (0.0, 1.0),
     'reputation_decay': (0.0, 1.0),
     'vegas_decay_rate': (0.0, 1.0),
-    'rebalance_min_profit_ppm': (0, 100000),
     'rpc_timeout_seconds': (1, 300),
-    'rpc_circuit_breaker_seconds': (0, 3600),
-    'rpc_pool_size': (1, 8),
     'reservation_timeout_hours': (1, 24),
     # Issue #28: Revenue rate smoothing
-    'ema_smoothing_alpha': (0.1, 0.9),
     # Issue #30: Velocity gate for rebalancing
-    'min_velocity_threshold': (0.0, 1.0),
-    'new_channel_grace_days': (0, 30),
     # DTS (Discounted Thompson Sampling) parameters
     'thompson_prior_std_fee': (10, 500),
-    'thompson_observation_decay_hours': (24, 720),  # 1 day to 30 days
-    'thompson_max_observations': (50, 500),
-    'thompson_min_observations': (1, 20),
     # Routing Intelligence Integration
     # Additional range validations
     'flow_interval': (60, 86400),
     'fee_interval': (60, 86400),
     'rebalance_interval': (60, 86400),
     'max_concurrent_jobs': (1, 20),
-    'askrene_max_age_sec': (10, 86400),
     'base_fee_msat': (0, 10000),
     'neighbor_median_min_competitors': (2, 50),
     'rebalance_min_profit': (0, 1000000),
-    'rebalance_min_amount': (1000, 50000000),
     'rebalance_max_amount': (10000, 100000000),
     'flow_window_days': (1, 365),
     # AUDIT FIX C-2/I-4: Missing range validation for float/int fields
@@ -360,21 +330,16 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_utilization_min_forwards': (0, 1000),
     'rebalance_size_reference_percentile': (0.0, 1.0),
     'rebalance_small_channel_band_half_width': (0.0, 0.5),
-    'futility_cooldown_hours': (1, 168),
-    'target_flow': (1000, 100000000),
     'estimated_open_cost_sats': (0, 1000000),
     'expansion_treasury_max_actions': (1, 10),
     'expansion_treasury_min_deficit_sats': (0, 100000000),
     'expansion_treasury_onchain_target_sats': (0, 1000000000),
-    'hot_channel_protection_max_rebalance_fee_ppm': (0, 100000),
     # Capacity Planner
     'planner_interval': (600, 604800),
     'planner_max_opens_per_cycle': (0, 10),
     'planner_max_closes_per_cycle': (0, 10),
     'planner_min_channel_sats': (100000, 100000000),
     'planner_max_channel_sats': (500000, 1677721500),
-    'planner_min_channel_age_days': (1, 365),
-    'planner_min_peer_uptime_pct': (0.0, 100.0),
     'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
     'planner_min_annual_roi_pct': (0.0, 100.0),
     # Z-2 (2026-07-08): 0 disables the grace fallback entirely (immediate
@@ -438,7 +403,6 @@ class Config:
     hot_channel_protection_profit_budget_pct: float = 0.75
     hot_channel_protection_max_chunk_multiplier: float = 4.0
     hot_channel_protection_min_cooldown_hours: float = 1.0
-    hot_channel_protection_max_rebalance_fee_ppm: int = 2000
     boltz_auto_cycle_enabled: bool = False  # Run profit-gated Boltz auto-balance cycle in background (opt-in)
     boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
     boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
@@ -479,7 +443,6 @@ class Config:
     expansion_treasury_exclude_protected: bool = True
     
     # Flow analysis parameters
-    target_flow: int = 100000      # Target sats routed per day per channel
     flow_window_days: int = 7      # Days to analyze for flow calculation
     
     # Flow ratio thresholds for classification (net daily flow / capacity).
@@ -546,10 +509,8 @@ class Config:
     # actually enforces. Kept only so existing config files load cleanly
     # (mirrors the fee-market-boundary deprecation pattern).
     rebalance_min_profit: int = 10     # DEPRECATED no-op (use rebalance_hold_margin)
-    rebalance_min_profit_ppm: int = 0  # Min profit in PPM (0 = use sats threshold, >0 = use ppm)
                                         # Recommended: 20 ppm (~10 sats per 500k chunk)
     rebalance_max_amount: int = 5000000  # Max rebalance amount in sats
-    rebalance_min_amount: int = 50000    # Min rebalance amount in sats
     low_liquidity_threshold: float = 0.3  # Below 30% = low outbound
     high_liquidity_threshold: float = 0.7 # Above 70% = high outbound
     rebalance_cooldown_hours: int = 24   # Don't re-rebalance same channel for 24h
@@ -608,7 +569,6 @@ class Config:
     # sized for target-sizing purposes.
     rebalance_small_channel_band_half_width: float = 0.15
 
-    futility_cooldown_hours: int = 48   # Hours before retrying after 10+ consecutive failures
     inbound_fee_estimate_ppm: int = 50  # Route cost buffer added on top of last-hop fee (PPM)
     
     # Profitability tracking
@@ -634,8 +594,6 @@ class Config:
 
     # RPC Hardening
     rpc_timeout_seconds: int = 15
-    rpc_circuit_breaker_seconds: int = 60
-    rpc_pool_size: int = 5             # Number of RPC worker processes
     reservation_timeout_hours: int = 4  # Hours before stale budget reservations auto-release
     
     # HTLC Congestion threshold
@@ -656,7 +614,6 @@ class Config:
 
     # AskRene (xpay) constraint integration
     askrene_layer: str = 'xpay'               # Layer name for askrene-listlayers
-    askrene_max_age_sec: int = 900            # Max constraint age (seconds) to consider fresh
 
     # V3 rebalance router (askrene getroutes)
     rebalance_router: str = 'v3'              # only 'v3' is supported
@@ -675,21 +632,14 @@ class Config:
     # Issue #28: Revenue rate EMA smoothing
     # EMA formula: new_ema = alpha * current + (1 - alpha) * old_ema
     # Lower alpha = slower response (more smoothing), higher = faster response
-    ema_smoothing_alpha: float = 0.3       # Default 0.3 balances responsiveness and stability
 
     # Issue #30: Velocity gate for rebalancing
     # Prevents overfilling channels with no routing history
-    enable_velocity_gate: bool = True      # Require minimum velocity before full rebalancing
-    min_velocity_threshold: float = 0.01   # Min daily_volume/capacity ratio (1% daily turnover)
-    new_channel_grace_days: int = 7        # Days before velocity gate applies to new channels
 
     # ==========================================================================
     # DTS (Discounted Thompson Sampling) Parameters
     # ==========================================================================
     thompson_prior_std_fee: int = 100         # Default prior uncertainty in ppm
-    thompson_observation_decay_hours: int = 168  # 7-day half-life for observations
-    thompson_max_observations: int = 200      # Bounded memory per channel
-    thompson_min_observations: int = 3        # Minimum before trusting posterior
 
 
     # ==========================================================================
@@ -708,8 +658,6 @@ class Config:
     planner_close_feerange_enabled: bool = False
     planner_min_channel_sats: int = 500000      # 500k sats
     planner_max_channel_sats: int = 10000000    # 10M sats
-    planner_min_channel_age_days: int = 30
-    planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
     planner_min_annual_roi_pct: float = 1.0
     # Unified Capex Budget Engine
@@ -720,8 +668,6 @@ class Config:
     capex_exploration_rate: float = 0.10        # Fleet contribution fraction for opens/growth
     capex_tactical_rate: float = 0.15           # Fleet contribution fraction for Boltz treasury
     capex_global_envelope_sats: int = 0         # Global cap (0 = auto-computed)
-    capex_cost_efficiency_weight: float = 0.5   # Weight for cost-efficiency in dual-benefit score
-    capex_drain_benefit_weight: float = 0.5     # Weight for drain-benefit in dual-benefit score
     # Probability-aware budget relaxation. When a router reports a route
     # probability (v3/askrene does; v2/getroute returns 0), the engine allows
     # the route to exceed the raw pair budget by up to (probability * bonus)
@@ -833,8 +779,6 @@ class Config:
         # (e.g., min_fee_ppm > max_fee_ppm from TOCTOU race or manual DB edits).
         if self.min_fee_ppm > self.max_fee_ppm:
             self.min_fee_ppm = self.max_fee_ppm
-        if self.rebalance_min_amount > self.rebalance_max_amount:
-            self.rebalance_min_amount = self.rebalance_max_amount
         if hasattr(self, 'low_liquidity_threshold') and hasattr(self, 'high_liquidity_threshold'):
             if self.low_liquidity_threshold >= self.high_liquidity_threshold:
                 # M-R6-1 FIX: Clamp to 0.0 to prevent negative values when
@@ -959,10 +903,6 @@ class Config:
                 return {"error": f"min_fee_ppm ({typed_value}) cannot exceed current max_fee_ppm ({self.max_fee_ppm})"}
             if key == 'max_fee_ppm' and typed_value < self.min_fee_ppm:
                 return {"error": f"max_fee_ppm ({typed_value}) cannot be less than current min_fee_ppm ({self.min_fee_ppm})"}
-            if key == 'rebalance_min_amount' and typed_value > self.rebalance_max_amount:
-                return {"error": f"rebalance_min_amount ({typed_value}) cannot exceed rebalance_max_amount ({self.rebalance_max_amount})"}
-            if key == 'rebalance_max_amount' and typed_value < self.rebalance_min_amount:
-                return {"error": f"rebalance_max_amount ({typed_value}) cannot be less than rebalance_min_amount ({self.rebalance_min_amount})"}
             # M-R5-4 FIX: Also validate liquidity threshold cross-field consistency
             if key == 'low_liquidity_threshold' and typed_value >= self.high_liquidity_threshold:
                 return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
@@ -1051,7 +991,6 @@ class ConfigSnapshot:
     hot_channel_protection_profit_budget_pct: float
     hot_channel_protection_max_chunk_multiplier: float
     hot_channel_protection_min_cooldown_hours: float
-    hot_channel_protection_max_rebalance_fee_ppm: int
     boltz_auto_cycle_enabled: bool
     boltz_auto_cycle_interval_minutes: int
     boltz_auto_cycle_max_actions: int
@@ -1065,7 +1004,6 @@ class ConfigSnapshot:
     expansion_treasury_exclude_protected: bool
     
     # Flow analysis parameters
-    target_flow: int
     flow_window_days: int
     
     # Flow ratio thresholds for classification
@@ -1088,9 +1026,7 @@ class ConfigSnapshot:
     fee_market_boundary_cache_seconds: int
     # Rebalancing parameters
     rebalance_min_profit: int
-    rebalance_min_profit_ppm: int
     rebalance_max_amount: int
-    rebalance_min_amount: int
     low_liquidity_threshold: float
     high_liquidity_threshold: float
     rebalance_cooldown_hours: int
@@ -1098,7 +1034,6 @@ class ConfigSnapshot:
     rebalance_drift_override_ratio: float
     rebalance_hold_margin: float
     pair_fee_cap_ppm: int
-    futility_cooldown_hours: int
     inbound_fee_estimate_ppm: int
     # Upstream rebalancer patterns
     rebalance_activity_window_seconds: int
@@ -1149,28 +1084,18 @@ class ConfigSnapshot:
 
     # RPC Hardening
     rpc_timeout_seconds: int
-    rpc_circuit_breaker_seconds: int
-    rpc_pool_size: int
     reservation_timeout_hours: int
 
     # Issue #28: Revenue rate EMA smoothing
-    ema_smoothing_alpha: float
 
     # Issue #30: Velocity gate for rebalancing
-    enable_velocity_gate: bool
-    min_velocity_threshold: float
-    new_channel_grace_days: int
 
     # DTS (Discounted Thompson Sampling) parameters
     thompson_prior_std_fee: int
-    thompson_observation_decay_hours: int
-    thompson_max_observations: int
-    thompson_min_observations: int
     # Routing Intelligence Integration
 
     # M-27: xpay/askrene parameters (were missing from snapshot)
     askrene_layer: str = 'xpay'
-    askrene_max_age_sec: int = 900
 
     # V3 rebalance router (askrene getroutes)
     rebalance_router: str = 'v3'
@@ -1194,8 +1119,6 @@ class ConfigSnapshot:
     planner_close_feerange_enabled: bool = False
     planner_min_channel_sats: int = 500000
     planner_max_channel_sats: int = 10000000
-    planner_min_channel_age_days: int = 30
-    planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
     planner_min_annual_roi_pct: float = 1.0
     # Unified Capex Budget Engine
@@ -1206,8 +1129,6 @@ class ConfigSnapshot:
     capex_exploration_rate: float = 0.10
     capex_tactical_rate: float = 0.15
     capex_global_envelope_sats: int = 0
-    capex_cost_efficiency_weight: float = 0.5
-    capex_drain_benefit_weight: float = 0.5
     capex_probability_budget_bonus: float = 0.0
     # Structural loop-out / drain-demand fields
     receivable_ratio_target: float = 0.30

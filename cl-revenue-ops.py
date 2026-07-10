@@ -1096,12 +1096,6 @@ plugin.add_option(
 
 
 plugin.add_option(
-    name='revenue-ops-target-flow',
-    default='100000',
-    description='Target daily flow in sats per channel (default: 100,000)'
-)
-
-plugin.add_option(
     name='revenue-ops-min-fee-ppm',
     default='10',
     description='Minimum fee floor in PPM (default: 10)'
@@ -1216,12 +1210,6 @@ plugin.add_option(
         'enforced by the sats-EV gate and revenue-ops-rebalance-hold-margin '
         '(default: 10)'
     )
-)
-
-plugin.add_option(
-    name='revenue-ops-futility-cooldown-hours',
-    default='48',
-    description='Hours before retrying a channel after 10+ consecutive rebalance failures (default: 48)'
 )
 
 plugin.add_option(
@@ -1471,12 +1459,6 @@ plugin.add_option(
 )
 
 plugin.add_option(
-    name='revenue-ops-rpc-circuit-breaker-seconds',
-    default='60',
-    description='Cooldown period after an RPC timeout for that method group (default: 60)'
-)
-
-plugin.add_option(
     name='revenue-ops-reservation-timeout-hours',
     default='4',
     description='Hours before stale budget reservations are auto-released (default: 4)',
@@ -1524,13 +1506,6 @@ plugin.add_option(
     name='revenue-ops-hot-channel-protection-min-cooldown-hours',
     default='1.0',
     description='Minimum cooldown hours for protected hot channels (default: 1.0)'
-)
-
-plugin.add_option(
-    name='revenue-ops-hot-channel-protection-max-rebalance-fee-ppm',
-    default='2000',
-    description='Hard max routing fee ppm for protected hot-channel rebalances (default: 2000)',
-    opt_type='int'
 )
 
 plugin.add_option(
@@ -2435,7 +2410,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hot_channel_protection_profit_budget_pct=_safe_float_opt('revenue-ops-hot-channel-protection-profit-budget-pct', '0.75'),
         hot_channel_protection_max_chunk_multiplier=_safe_float_opt('revenue-ops-hot-channel-protection-max-chunk-multiplier', '4.0'),
         hot_channel_protection_min_cooldown_hours=_safe_float_opt('revenue-ops-hot-channel-protection-min-cooldown-hours', '1.0'),
-        hot_channel_protection_max_rebalance_fee_ppm=_safe_int_opt('revenue-ops-hot-channel-protection-max-rebalance-fee-ppm', '2000'),
         boltz_auto_cycle_enabled=options.get('revenue-ops-boltz-auto-cycle-enabled', 'false').lower() == 'true',
         boltz_auto_cycle_interval_minutes=_safe_int_opt('revenue-ops-boltz-auto-cycle-interval-minutes', '15'),
         boltz_auto_cycle_max_actions=_safe_int_opt('revenue-ops-boltz-auto-cycle-max-actions', '1'),
@@ -2457,7 +2431,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         expansion_treasury_max_actions=_safe_int_opt('revenue-ops-expansion-treasury-max-actions', '1'),
         expansion_treasury_min_source_local_pct=_safe_float_opt('revenue-ops-expansion-treasury-min-source-local-pct', '80.0'),
         expansion_treasury_exclude_protected=options.get('revenue-ops-expansion-treasury-exclude-protected', 'true').lower() == 'true',
-        target_flow=_safe_int('revenue-ops-target-flow'),
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         min_fee_ppm_saturated=_safe_int('revenue-ops-min-fee-ppm-saturated'),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
@@ -2526,7 +2499,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalance_small_channel_band_half_width=_safe_float_opt(
             'revenue-ops-rebalance-small-channel-band-half-width', '0.15'
         ),
-        futility_cooldown_hours=_safe_int('revenue-ops-futility-cooldown-hours'),
         flow_window_days=_safe_int('revenue-ops-flow-window-days'),
         daily_budget_sats=_safe_int('revenue-ops-daily-budget-sats'),
         growth_budget_enabled=options.get(
@@ -2561,7 +2533,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         enable_vegas_reflex=options['revenue-ops-vegas-reflex'].lower() == 'true',
         vegas_decay_rate=_safe_float('revenue-ops-vegas-decay'),
         rpc_timeout_seconds=_safe_int('revenue-ops-rpc-timeout-seconds'),
-        rpc_circuit_breaker_seconds=_safe_int('revenue-ops-rpc-circuit-breaker-seconds'),
         reservation_timeout_hours=_safe_int('revenue-ops-reservation-timeout-hours'),
         planner_enabled=options.get('revenue-ops-planner-enabled', 'false').lower() in ('true', '1', 'yes'),
         planner_interval=_safe_int('revenue-ops-planner-interval'),
@@ -2621,7 +2592,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         )
     config = Config(**{k: v for k, v in config_kwargs.items() if k in config_fields})
     
-    plugin.log(f"Configuration loaded: target_flow={config.target_flow}, "
+    plugin.log(f"Configuration loaded: "
                f"fee_range=[{config.min_fee_ppm}, {config.max_fee_ppm}], "
                f"fee_profile={config.fee_profile}, "
                f"rebalance_executor=native, "

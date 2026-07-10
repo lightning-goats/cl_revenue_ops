@@ -80,7 +80,7 @@ def _reb_mod():
     mod = load_plugin_module()
     mod.rebalancer = MagicMock()
     mod.rebalancer.manual_rebalance.return_value = {"success": True, "message": "completed"}
-    mod.config = Config(rebalance_min_amount=50000, rebalance_max_amount=5_000_000)
+    mod.config = Config(rebalance_max_amount=5_000_000)
     mod.force_rate_limiter = MagicMock()
     mod.force_rate_limiter.check_rate_limit.return_value = (True, "")
     return mod
