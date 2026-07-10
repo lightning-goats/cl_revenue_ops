@@ -2061,19 +2061,20 @@ class ChannelProfitabilityAnalyzer:
         # extrapolation rewrote opened_at every pass), so a stored value
         # that deviates from the tip-anchored SCID estimate by more than
         # the estimate's own error band is poisoned — repair it with the
-        # estimate instead of freezing the corruption forever.
-        _OPENED_AT_PLAUSIBLE_SLACK = 30 * 86400
+        # estimate instead of freezing the corruption forever. The band
+        # scales with estimated age (the 600s/block assumption drifts
+        # ~3.5% vs real block times) with a 7-day floor so young channels'
+        # uniform now-30d poison is still caught.
         stored_opened_at = (
             db_cost_row.get("opened_at")
             if (db_cost_row_known and db_cost_row is not None)
             else None
         )
-        if (
-            stored_opened_at
-            and open_timestamp
-            and abs(int(stored_opened_at) - int(open_timestamp)) > _OPENED_AT_PLAUSIBLE_SLACK
-        ):
-            stored_opened_at = None
+        if stored_opened_at and open_timestamp:
+            _est_age = max(0, int(time.time()) - int(open_timestamp))
+            _slack = max(7 * 86400, int(0.15 * _est_age))
+            if abs(int(stored_opened_at) - int(open_timestamp)) > _slack:
+                stored_opened_at = None
         effective_opened_at = stored_opened_at or open_timestamp
 
         if opener == 'remote':
