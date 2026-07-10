@@ -60,6 +60,21 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.16.0: Standalone Phases 2-3 — de-hive the revenue core (2026-07-09)
+#   - Removed all remaining cl-hive/fleet/coordination code from the revenue
+#     engine: profitability_analyzer, capital_efficiency, policy_manager,
+#     capex_budget, database (hive tables + corridor instrumentation),
+#     rebalancer (coordination cluster), capacity_planner (hive discovery +
+#     close-protection + value weights), the atomic routing cluster (deleted
+#     rebalance_coordination_overlay + rebalance_hive_router; collapsed
+#     rebalance_route_policy to market-only; de-hived rebalance_engine_v2 /
+#     _state_v2 / _planner_v2), and fee_controller (zero-fee corridor).
+#   - Behavior-neutral except two intended standalone changes: fleet peers are
+#     no longer close-protected, and "fleet member" channels are no longer
+#     force-priced to 0 ppm (they price normally via DTS/PID). Neither has any
+#     effect today — there are no fleet members without cl-hive.
+#   - Preserved all general pricing/routing math (DTS/PID, drain bias, the
+#     composite temporal-bias clamp, market routing, capex/budget, LN+, Boltz).
 # v2.15.0: Standalone Phase 1 — delete the dedicated hive modules (2026-07-09)
 #   - Removed modules/hive_hints.py, hive_router.py, hive_runtime.py (~3,368
 #     lines) and every orchestrator reference to them: the imports, the
@@ -147,7 +162,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.15.0"
+PLUGIN_VERSION = "2.16.0"
 HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
 # Supply-chain / runtime version floors (Phase 3C).

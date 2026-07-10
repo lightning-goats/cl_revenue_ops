@@ -98,7 +98,21 @@ without breaking their Phase 3 consumers, so **they are folded into Phase 3 and 
 careful unit** (coordination-overlay lease/campaign/segment logic goes entirely — it required
 a fleet). This is the revenue-critical core the plan already flagged for a deploy-and-watch.
 
-**Phase 3 — The dense, revenue-critical modules (highest care).**
+**Phase 3 — ✅ DONE 2026-07-09 (v2.16.0).** De-hived the whole revenue core in
+independently-green commits: `database` (1531699), `rebalancer` (54cb6d3),
+`capacity_planner` (3841827), the atomic engine cluster (3ec5a87 — deleted
+`rebalance_coordination_overlay` + `rebalance_hive_router`, collapsed
+`rebalance_route_policy` to market-only, de-hived `rebalance_engine_v2`/`_state_v2`/
+`_planner_v2`), and `fee_controller` (f5c2528 — zero-fee corridor removed). Suite
+green throughout (3139). Two intended standalone behavior changes: fleet peers no
+longer close-protected; "fleet member" channels price normally (no forced 0 ppm) —
+neither active today. **Remaining cleanup (Phase 5 / low-risk):** dead config.py keys
+(`hive_equalization_*`, `hive_push_*`, `base_fee_msat_intra_fleet/_non_hive`, etc.),
+the `revenue_hive_hints_status` RPC + `hive_hints`/`hive_router` orchestrator globals,
+the inert hint-reading branches left in fee_controller (temporal/prior/quality), and
+the `tools/audit/*` hive sweeps. Original Phase-3 note:
+
+**Original plan — The dense, revenue-critical modules (highest care).**
 `rebalancer` (24) → `capacity_planner` (38) → `rebalance_engine_v2` (54) →
 `fee_controller` (125, last). fee_controller is the revenue engine and holds the member→zero-fee
 corridor logic, competition/traffic/quality biases, and the fleet-fee-median prior — all of
