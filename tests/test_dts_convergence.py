@@ -452,7 +452,7 @@ class TestNudgesReachSampling:
 
 
 # =============================================================================
-# Fix #5: the hive exploration multiplier must reach the actual samplers
+# The exploration multiplier must reach the actual samplers
 # =============================================================================
 
 class TestExplorationMultiplierReachesSampling:
@@ -477,15 +477,13 @@ class TestExplorationMultiplierReachesSampling:
         random.seed(77)
         for _ in range(n):
             s = copy.deepcopy(state)
-            s.scale_variance(boost)
-            samples.append(s.sample_fee_contextual(ctx, FLOOR, CEIL))
+            samples.append(s.sample_fee_contextual(
+                ctx, FLOOR, CEIL, exploration_multiplier=boost))
         return stats.stdev(samples)
 
     def test_multiplier_widens_contextual_samples(self, fake_time):
-        """Audit defect 5: scale_variance mutated posterior_std, which neither
-        sample path reads — the hive exploration multiplier was dead. The
-        live path (scale_variance -> sample_fee_contextual) must now widen
-        the sampled distribution."""
+        """The explicit exploration_multiplier kwarg must widen the sampled
+        distribution (it scales the polynomial/Gaussian draw noise)."""
         st, ctx = self._established()
         spread_normal = self._sample_spread(st, ctx, 1.0)
         spread_boosted = self._sample_spread(st, ctx, 2.0)
@@ -494,47 +492,12 @@ class TestExplorationMultiplierReachesSampling:
             f"-> {spread_boosted:.1f} with boost 2.0"
         )
 
-    def test_boost_is_consumed_by_one_sample(self, fake_time):
-        st, ctx = self._established()
-        st.scale_variance(2.0)
-        assert st.exploration_boost == pytest.approx(2.0)
-        st.sample_fee_contextual(ctx, FLOOR, CEIL)
-        assert st.exploration_boost == pytest.approx(1.0), (
-            "exploration boost must be one-shot (pipeline re-arms it each cycle)"
-        )
-
-    def test_explicit_multiplier_param_overrides_stored(self, fake_time):
-        st, _ = self._established()
-        st.scale_variance(2.0)
-        # Explicit kwarg wins over the stored boost
-        st.sample_fee(FLOOR, CEIL, exploration_multiplier=1.0)
-        # Stored boost must survive an explicitly-overridden sample
-        assert st.exploration_boost == pytest.approx(2.0)
-
-    def test_multiplier_clamped_to_bounds(self, fake_time):
-        st = GaussianThompsonState()
-        st.scale_variance(10.0)
-        assert st.exploration_boost == pytest.approx(
-            GaussianThompsonState.EXPLORATION_BOOST_MAX
-        )
-        st.scale_variance(0.1)
-        assert st.exploration_boost == pytest.approx(
-            GaussianThompsonState.EXPLORATION_BOOST_MIN
-        )
-
-    def test_scale_variance_no_longer_capped_at_prior_std(self, fake_time):
-        """The old cap at prior_std_fee meant scale_variance(>1) NARROWED the
-        posterior whenever std already exceeded the prior — it no-op'd (or
-        backfired) exactly when exploration was wanted."""
-        st = GaussianThompsonState()
-        st.posterior_std = 150.0  # above prior_std_fee (100)
-        st.scale_variance(1.5)
-        assert st.posterior_std > 150.0
-
-    def test_boost_round_trips_and_defaults(self, fake_time):
+    def test_boost_field_round_trips_and_defaults(self, fake_time):
+        # exploration_boost is retained only for state-blob compatibility;
+        # it must still serialize/deserialize and default sanely.
         import json
         st = GaussianThompsonState()
-        st.scale_variance(1.7)
+        st.exploration_boost = 1.7
         restored = GaussianThompsonState.from_dict(json.loads(json.dumps(st.to_dict())))
         assert restored.exploration_boost == pytest.approx(1.7)
         legacy = GaussianThompsonState.from_dict({"posterior_mean": 250.0})

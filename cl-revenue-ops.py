@@ -4461,7 +4461,7 @@ def revenue_set_fee(plugin: Plugin, channel_id: str = None, fee_ppm: int = None,
         )
 
     try:
-        result = fee_controller.set_channel_fee(channel_id, fee_ppm, manual=True, enforce_limits=(not force), force=force)
+        result = fee_controller.set_channel_fee(channel_id, fee_ppm, manual=True, enforce_limits=(not force))
         if not result.get("success"):
             return {
                 "status": "error",

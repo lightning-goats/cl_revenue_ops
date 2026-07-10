@@ -374,10 +374,9 @@ class GaussianThompsonState:
     CTX_CONFIDENCE_COUNT = 10.0     # Half-saturation obs count for ctx confidence
     CTX_PRECISION_DECAY = 0.98      # Per-update ctx precision decay (re-learnable)
 
-    # Exploration multiplier bounds. scale_variance() used to mutate only
-    # posterior_std, which neither sample path reads, so the multiplier never
-    # reached the fees actually sampled; it is now stored and consumed by the
-    # samplers themselves (scaling the polynomial/Gaussian draw noise).
+    # Exploration multiplier bounds applied to the explicit
+    # exploration_multiplier argument of sample_fee/sample_fee_contextual
+    # (scaling the polynomial/Gaussian draw noise).
     EXPLORATION_BOOST_MIN = 0.75
     EXPLORATION_BOOST_MAX = 2.0
 
@@ -447,9 +446,10 @@ class GaussianThompsonState:
     # Last granted upward exploration probe (see UPWARD_PROBE_STRETCH)
     last_upward_probe_ts: int = 0
 
-    # One-shot exploration multiplier armed by scale_variance() and consumed
-    # by the next sample_fee/sample_fee_contextual call (the pipeline re-arms
-    # it every cycle when exploration is requested)
+    # Retired one-shot exploration multiplier (the arming machinery is gone;
+    # samplers take an explicit exploration_multiplier argument instead).
+    # Retained only for state-blob compatibility: it is still
+    # serialized/deserialized so existing state blobs round-trip.
     exploration_boost: float = 1.0
 
     # Tracking
@@ -526,24 +526,6 @@ class GaussianThompsonState:
                     L[i][j] = (m[i][j] - s) / L[j][j]
         return L
 
-    def predict_optimal_fee(self, floor_ppm: int, ceiling_ppm: int) -> Optional[int]:
-        """
-        Return the current posterior optimum, clamped to caller bounds.
-
-        Auto-band calibration needs a deterministic best-fee estimate rather than
-        a Thompson sample. The Gaussian state already maintains that estimate in
-        posterior_mean, so expose it through the same accessor shape used by the
-        controller.
-        """
-        if self.real_observation_count() < self.MIN_OBSERVATIONS:
-            return None
-
-        optimal_fee = self.posterior_mean
-        if optimal_fee is None or not math.isfinite(optimal_fee):
-            return None
-
-        return int(max(floor_ppm, min(ceiling_ppm, round(optimal_fee))))
-
     def real_observation_count(self) -> int:
         """Count of genuine market windows (SL-3, 2026-07-03 audit).
 
@@ -555,56 +537,6 @@ class GaussianThompsonState:
             1 for obs in self.observations
             if not (len(obs) >= 6 and obs[5] == self.ZERO_PROBE_FLAG)
         )
-
-    def scale_variance(self, factor: float) -> None:
-        """Arm an exploration multiplier for the next sample.
-
-        Stores the (bounded) factor in exploration_boost, which the sample
-        paths consume by scaling their draw noise — the previous behaviour
-        of only mutating posterior_std was dead code for sampling, because
-        neither the polynomial nor the contextual path reads posterior_std.
-
-        posterior_std is still widened for backward compatibility (it feeds
-        the downstream blend ratio), but capped at the MIN_PRECISION max
-        std rather than prior_std_fee: the old cap NARROWED the posterior
-        whenever std already exceeded the prior, i.e. it no-op'd or
-        backfired exactly when exploration was wanted.
-        """
-        try:
-            factor = float(factor)
-        except (TypeError, ValueError):
-            return
-        if not math.isfinite(factor) or factor <= 0:
-            return
-        factor = max(self.EXPLORATION_BOOST_MIN,
-                     min(self.EXPLORATION_BOOST_MAX, factor))
-        self.exploration_boost = factor
-        max_std = math.sqrt(1.0 / self.MIN_PRECISION)
-        self.posterior_std = min(
-            max_std,
-            max(float(self.MIN_STD), self.posterior_std * factor)
-        )
-
-    def _resolve_exploration_boost(self, exploration_multiplier: Optional[float]) -> float:
-        """
-        Resolve the effective exploration multiplier for a sample.
-
-        An explicit argument wins (without consuming the stored boost);
-        otherwise the one-shot boost armed by scale_variance is consumed.
-        Always bounded to [EXPLORATION_BOOST_MIN, EXPLORATION_BOOST_MAX].
-        """
-        if exploration_multiplier is None:
-            boost = self.exploration_boost
-            self.exploration_boost = 1.0  # One-shot: re-armed each cycle
-        else:
-            try:
-                boost = float(exploration_multiplier)
-            except (TypeError, ValueError):
-                boost = 1.0
-            if not math.isfinite(boost) or boost <= 0:
-                boost = 1.0
-        return max(self.EXPLORATION_BOOST_MIN,
-                   min(self.EXPLORATION_BOOST_MAX, boost))
 
     def sample_fee(self, floor: int, ceiling: int,
                    exploration_multiplier: Optional[float] = None) -> int:
@@ -619,13 +551,19 @@ class GaussianThompsonState:
             floor: Minimum allowed fee (ppm)
             ceiling: Maximum allowed fee (ppm)
             exploration_multiplier: Optional explicit draw-noise multiplier;
-                when omitted, the one-shot boost armed by scale_variance()
-                is consumed instead
+                non-positive/non-finite values fall back to 1.0
 
         Returns:
             Sampled fee in ppm, clamped to [floor, ceiling]
         """
-        boost = self._resolve_exploration_boost(exploration_multiplier)
+        try:
+            boost = float(exploration_multiplier)
+        except (TypeError, ValueError):
+            boost = 1.0
+        if not math.isfinite(boost) or boost <= 0:
+            boost = 1.0
+        boost = max(self.EXPLORATION_BOOST_MIN,
+                    min(self.EXPLORATION_BOOST_MAX, boost))
 
         # If not enough observations, explore more widely
         if self.real_observation_count() < self.MIN_OBSERVATIONS:
@@ -681,7 +619,6 @@ class GaussianThompsonState:
             floor: Minimum allowed fee
             ceiling: Maximum allowed fee
             exploration_multiplier: Optional explicit draw-noise multiplier
-                (otherwise the one-shot scale_variance boost is consumed)
 
         Returns:
             Sampled fee in ppm
@@ -1694,92 +1631,6 @@ class GaussianThompsonState:
     def get_exploitation_fee(self) -> int:
         """Get the current best estimate (posterior mean) without exploration."""
         return int(self.posterior_mean)
-
-    def check_for_discovery(
-        self,
-        fee: int,
-        revenue_rate: float,
-        min_revenue_rate: float = 50.0,
-        min_observations: int = 5
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Check if the current observation represents a significant discovery.
-
-        A discovery is when we find a fee that performs significantly better
-        than expected, which should be shared with the fleet.
-
-        Criteria for discovery:
-        - Revenue rate above threshold
-        - Fee is within observed successful range
-        - We have enough observations to be confident
-        - Revenue rate is significantly above our posterior mean expectation
-
-        Args:
-            fee: Current fee in ppm
-            revenue_rate: Current revenue rate (sats/hour)
-            min_revenue_rate: Minimum revenue to consider (default 50 sats/hr)
-            min_observations: Minimum observations needed (default 5)
-
-        Returns:
-            Discovery dict if significant, None otherwise:
-            {
-                "fee_ppm": 200,
-                "revenue_rate": 75.0,
-                "confidence": 0.8,
-                "discovery_type": "high_revenue" | "optimal_fee"
-            }
-        """
-        # Need enough observations to claim discovery (real market windows
-        # only — probe pseudo-observations are fabricated, SL-3)
-        if self.real_observation_count() < min_observations:
-            return None
-
-        # Need reasonable revenue to be a discovery
-        if revenue_rate < min_revenue_rate:
-            return None
-
-        # Calculate mean revenue from recent observations at similar fees.
-        # Probe pseudo-observations are excluded: their fabricated zeros
-        # dragged avg_similar_revenue down, manufacturing fake 1.3x
-        # "discoveries" to share with the fleet (SL-3).
-        similar_obs = [
-            obs for obs in self.observations[-20:]
-            if len(obs) >= 2 and abs(obs[0] - fee) < 50
-            and not (len(obs) >= 6 and obs[5] == self.ZERO_PROBE_FLAG)
-        ]
-
-        if len(similar_obs) < 3:
-            return None
-
-        avg_similar_revenue = sum(obs[1] for obs in similar_obs) / len(similar_obs)
-
-        # Discovery: current revenue significantly beats similar fee observations
-        if revenue_rate > avg_similar_revenue * 1.3:
-            confidence = min(0.9, len(similar_obs) / 10.0)
-            return {
-                "fee_ppm": fee,
-                "revenue_rate": revenue_rate,
-                "avg_revenue_at_fee": avg_similar_revenue,
-                "confidence": confidence,
-                "discovery_type": "high_revenue",
-                "observation_count": len(similar_obs)
-            }
-
-        # Discovery: fee near posterior mean with good consistent revenue
-        if abs(fee - self.posterior_mean) < self.posterior_std and revenue_rate > min_revenue_rate * 1.5:
-            # This confirms our posterior estimate is good
-            confidence = min(0.85, 0.5 + len(self.observations) / 40.0)
-            return {
-                "fee_ppm": fee,
-                "revenue_rate": revenue_rate,
-                "posterior_mean": self.posterior_mean,
-                "posterior_std": self.posterior_std,
-                "confidence": confidence,
-                "discovery_type": "optimal_fee",
-                "observation_count": len(self.observations)
-            }
-
-        return None
 
     def apply_vegas_adjustment(self, vegas_multiplier, new_floor):
         """
@@ -4125,21 +3976,6 @@ class FeeController:
         row_kwargs = self._build_fee_strategy_row_kwargs(channel_id, fee_state=state)
         self._persist_fee_strategy_row(row_kwargs)
         state.clear_explicit_shared_fields()
-
-    def _get_or_create_channel_fee_state(self, channel_id: str) -> ChannelFeeState:
-        """Return cached channel fee state or a minimal persisted state shell."""
-        cached_state = self._channel_fee_states.get(channel_id)
-        if cached_state is not None:
-            return cached_state
-
-        db_state, v2_data = self._load_persisted_fee_strategy_row(channel_id)
-
-        state = ChannelFeeState.from_v2_dict(
-            self._extract_fee_state_payload(db_state, v2_data),
-            db_state or {},
-        )
-        self._channel_fee_states[channel_id] = state
-        return state
 
     def _get_rebalance_cost_floor(
         self,
@@ -6896,8 +6732,14 @@ class FeeController:
                 cycle_hours=cycle_hours,
             )
             try:
+                # L8: the guard's silence test must agree with the streak's.
+                # zero_revenue_streak and positive_rate_ref are maintained by
+                # update_posterior on the DEMAND-ADJUSTED rate, so classify
+                # the same quantity here — testing the raw rate let a
+                # high-demand trickle extend the streak while bypassing the
+                # raise-freeze/downshift.
                 rate_is_meaningful = ts_state.thompson.is_meaningful_rate(
-                    current_revenue_rate
+                    adjusted_revenue_rate
                 )
             except Exception:
                 rate_is_meaningful = None
@@ -6907,7 +6749,7 @@ class FeeController:
                 min_fee=floor_ppm,
                 zero_revenue_streak=zero_revenue_streak,
                 forwards_since_update=forward_count,
-                revenue_rate=current_revenue_rate,
+                revenue_rate=adjusted_revenue_rate,
                 supported_fee_ceiling=supported_cap_ppm,
                 earning_anchor_ppm=earning_anchor_ppm,
                 guard_streak=guard_streak,
@@ -7585,7 +7427,6 @@ class FeeController:
                        htlcmin_msat: Optional[int] = None,
                        htlcmax_msat: Optional[int] = None,
                        base_fee_msat_override: Optional[int] = None,
-                       force: bool = False,
                        effective_min_fee_ppm: Optional[int] = None) -> Dict[str, Any]:
         """
         Set the fee for a channel.

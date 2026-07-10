@@ -732,7 +732,6 @@ def test_revenue_set_fee_accepts_full_channel_id_hash():
         125,
         manual=True,
         enforce_limits=True,
-        force=False,
     )
 
 

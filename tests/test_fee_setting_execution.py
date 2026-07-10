@@ -244,9 +244,9 @@ class TestSetChannelFeeLimits:
         fc.data_service = _make_data_service(mock_plugin)
 
         # Mirror the revenue-set-fee force=true call path: manual operator set,
-        # economic clamp bypassed, force flag set.
+        # economic clamp bypassed (enforce_limits=False).
         result = fc.set_channel_fee(
-            channel_id, 250, manual=True, enforce_limits=False, force=True
+            channel_id, 250, manual=True, enforce_limits=False
         )
 
         assert result["success"] is True

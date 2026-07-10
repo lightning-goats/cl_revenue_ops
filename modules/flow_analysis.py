@@ -120,6 +120,11 @@ KALMAN_CONFIDENCE_SCALING = 0.8  # How much confidence reduces measurement noise
 # sqrt(KALMAN_INITIAL_VARIANCE) ≈ 0.316; converged filters typically reach 0.05-0.15
 KALMAN_CONVERGENCE_UNCERTAINTY = 0.25  # Below this, Kalman overrides EMA state
 KALMAN_MIN_OBSERVATIONS = 5  # Minimum observation count before Kalman can override EMA
+# One observation consume per window: repeated analyze calls inside this
+# interval (e.g. polling the revenue-flow-analyze RPC) run predict-only so
+# the same forwards are not re-applied (observation_count inflation +
+# premature variance collapse past the convergence gate).
+KALMAN_MIN_UPDATE_INTERVAL_SECS = 300
 
 # BALANCED_ACTIVE classification: distinguish busy two-way channels from dormant ones
 BALANCED_ACTIVE_TURNOVER_THRESHOLD = 0.01  # 1% of capacity per day
@@ -982,7 +987,17 @@ class FlowAnalyzer:
             # Without this guard, channels with no forwards get observation=0.0
             # which actively pulls the filter toward BALANCED regardless of prior state.
             innovation = 0.0
-            if has_observation:
+            recently_updated = (
+                kf.state.last_update > 0
+                and (now - kf.state.last_update) < KALMAN_MIN_UPDATE_INTERVAL_SECS
+            )
+            if has_observation and recently_updated:
+                # Same observation window as the last consume — predict-only.
+                # last_update is deliberately NOT advanced here, so continuous
+                # polling cannot starve the next genuine hourly update.
+                if kf._has_nan():
+                    kf._reset_state()
+            elif has_observation:
                 innovation = kf.update(observed_ratio, confidence)
             else:
                 # Predict-only: still record that we ran so dt_hours stays accurate

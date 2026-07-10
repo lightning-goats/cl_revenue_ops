@@ -35,7 +35,7 @@ from .rebalance_state_v2 import (
 )
 from .segment_observations import SegmentObservationStore
 from .rebalance_types_v2 import DrainDemand, PairCandidate, PlanResult, SkipRecord
-from .utils import base_to_sats_ceil, parse_msat
+from .utils import base_to_sats_ceil, base_to_sats_floor, parse_msat
 
 # ---------------------------------------------------------------------------
 # Sats-EV gate constants (audit F2).
@@ -728,7 +728,7 @@ class RebalanceEngine:
         buckets = {
             "dest_blocked_by_cooldown": 0,
             "dest_not_funded": 0,
-            "source_rejected_neutral": 0,
+            "dest_not_valuable": 0,
             "source_protected": 0,
             "source_inside_band": 0,
         }
@@ -737,22 +737,33 @@ class RebalanceEngine:
             return buckets
 
         cfg = self.config if not hasattr(self.config, "snapshot") else self.config.snapshot()
-        low = float(getattr(cfg, "low_liquidity_threshold", 0.35) or 0.35)
-        high = float(getattr(cfg, "high_liquidity_threshold", 0.65) or 0.65)
+        default_low = float(getattr(cfg, "low_liquidity_threshold", 0.35) or 0.35)
+        default_high = float(getattr(cfg, "high_liquidity_threshold", 0.65) or 0.65)
 
         for ch in channels:
             local_ratio = float(getattr(ch, "local_ratio", 0.0) or 0.0)
             source_reason = str(getattr(ch, "source_reason", "") or "")
             dest_reason = str(getattr(ch, "dest_reason", "") or "")
+            # Classify against the channel's own (possibly size-tiered) band —
+            # the planner does; comparing flat cfg thresholds miscounted every
+            # widened-band channel.
+            low = float(getattr(ch, "target_band_low", default_low) or default_low)
+            high = float(getattr(ch, "target_band_high", default_high) or default_high)
             if local_ratio < low:
+                # Destination-side blockers (see _destination_eligibility):
+                # cooldown, no_budget, not_valuable.
                 if dest_reason == "cooldown":
                     buckets["dest_blocked_by_cooldown"] += 1
                 elif dest_reason == "no_budget":
                     buckets["dest_not_funded"] += 1
+                elif dest_reason == "not_valuable":
+                    buckets["dest_not_valuable"] += 1
             elif local_ratio > high:
-                if source_reason == "not_valuable":
-                    buckets["source_rejected_neutral"] += 1
-                elif source_reason == "cooldown":
+                # The only source-side blocker _source_eligibility can emit
+                # is "cooldown" (value class deliberately does not gate
+                # sources); the old "not_valuable" source bucket was
+                # unreachable.
+                if source_reason == "cooldown":
                     buckets["source_protected"] += 1
             else:
                 buckets["source_inside_band"] += 1
@@ -2715,11 +2726,24 @@ class RebalanceEngine:
             fee_msat = max(0, sent_msat - amount_msat)
             fee_sats = base_to_sats_ceil(fee_msat)
             dest_channel = str(row.get("to_channel") or "")
+            # A partial-amount retry may have settled for less than the
+            # amount the history row was inserted with. amount_msat on a
+            # sendpay entry is the amount delivered to the destination
+            # (amount_sent_msat includes routing fees), so it is the true
+            # filled amount. Correct the history row and cost attribution
+            # with it; if it is missing/unparseable (0), keep the original
+            # planned amount rather than zeroing the anchor.
+            settled_amount_sats = base_to_sats_floor(amount_msat)
+            if settled_amount_sats <= 0:
+                settled_amount_sats = int(row.get("amount_sats") or 0)
             self.database.update_rebalance_result(
                 rebalance_id,
                 "success",
                 actual_fee_sats=fee_sats,
                 actual_fee_msat=fee_msat,
+                amount_sats=(
+                    settled_amount_sats if settled_amount_sats > 0 else None
+                ),
             )
             if fee_msat > 0:
                 self.database.record_rebalance_cost(
@@ -2729,7 +2753,7 @@ class RebalanceEngine:
                     ),
                     cost_sats=fee_sats,
                     cost_msat=fee_msat,
-                    amount_sats=int(row.get("amount_sats") or 0),
+                    amount_sats=settled_amount_sats,
                     timestamp=int(time.time()),
                 )
             self.database.mark_budget_spent(reservation_id, fee_sats)

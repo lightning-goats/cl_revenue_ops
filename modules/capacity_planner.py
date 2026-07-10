@@ -2231,10 +2231,13 @@ class CapacityPlanner:
         # to them captures more of the payment size distribution.
         try:
             peer_channels = self._get_cached_channels(peer_id, "destination")
+            # 'satoshis' was removed from listchannels output in modern CLN;
+            # amount_msat is the live field (matches every other consumer).
             capacities = [
-                ch.get("satoshis", 0)
+                base_to_sats_floor(parse_msat(ch.get("amount_msat", 0) or 0))
                 for ch in peer_channels
-                if ch.get("active", False) and ch.get("satoshis", 0) > 0
+                if ch.get("active", False)
+                and parse_msat(ch.get("amount_msat", 0) or 0) > 0
             ]
             if capacities:
                 median_cap = sorted(capacities)[len(capacities) // 2]
@@ -2842,10 +2845,13 @@ class CapacityPlanner:
         if peer_id:
             try:
                 peer_channels = self._get_cached_channels(peer_id, "destination")
+                # 'satoshis' was removed from listchannels output in modern
+                # CLN; amount_msat is the live field.
                 capacities = [
-                    ch.get("satoshis", 0)
+                    base_to_sats_floor(parse_msat(ch.get("amount_msat", 0) or 0))
                     for ch in peer_channels
-                    if ch.get("active", False) and ch.get("satoshis", 0) > 0
+                    if ch.get("active", False)
+                    and parse_msat(ch.get("amount_msat", 0) or 0) > 0
                 ]
                 if capacities:
                     median_cap = sorted(capacities)[len(capacities) // 2]

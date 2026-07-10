@@ -564,21 +564,6 @@ class TestZeroProbeExclusionFromFit:
         self._append_probes(st, fee=90, n=4)
         assert st.real_observation_count() == 3
 
-    def test_probes_do_not_enable_false_discoveries(self, fake_time):
-        """Probes at the current fee drag avg_similar_revenue toward zero,
-        making ordinary revenue (120 < 1.3x the real 100/hr average) look
-        like a 'high_revenue' discovery to share with the fleet."""
-        st = GaussianThompsonState()
-        feed_windows(st, fee=100, rate=100.0, n=5)
-        baseline = st.check_for_discovery(fee=100, revenue_rate=120.0)
-        assert baseline is None or baseline["discovery_type"] != "high_revenue"
-
-        self._append_probes(st, fee=100, n=5)
-        poisoned = st.check_for_discovery(fee=100, revenue_rate=120.0)
-        assert poisoned is None or poisoned["discovery_type"] != "high_revenue", (
-            "probe zeros manufactured a fake high_revenue fleet discovery"
-        )
-
 
 # =============================================================================
 # 2026-07-03 audit SL-4: converged channels must keep relative uncertainty

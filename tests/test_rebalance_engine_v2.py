@@ -460,7 +460,7 @@ def test_polar_s2_pairless_failure_names_source_rejected_neutral(
 
     assert debug["summary"]["considered_pairs"] >= 1
     diagnostics = debug["hold_diagnostics"]
-    assert diagnostics["source_rejected_neutral"] == 0
+    assert diagnostics["dest_not_valuable"] == 0
     considered_sources = {
         c["source_channel_id"] for c in debug["considered_candidates"]
     }
@@ -537,7 +537,7 @@ def test_polar_s9_pairless_failure_names_dest_cooldown_and_neutral_sources(
     assert debug["summary"]["considered_pairs"] >= 1
     diagnostics = debug["hold_diagnostics"]
     assert diagnostics["dest_blocked_by_cooldown"] == 0  # override fired
-    assert diagnostics["source_rejected_neutral"] == 0
+    assert diagnostics["dest_not_valuable"] == 0
     considered_dests = {
         c["dest_channel_id"] for c in debug["considered_candidates"]
     }
@@ -586,9 +586,9 @@ def test_get_last_cycle_debug_emits_pairless_hold_diagnostics(
             _ch("101x1x0", local_ratio=0.10, source_eligible=False,
                 dest_eligible=False, dest_reason="no_budget",
                 source_reason="no_budget", value_class="active"),
-            # over-local neutral channel rejected as not_valuable -> source_rejected_neutral
-            _ch("200x2x0", local_ratio=0.95, source_eligible=False,
-                dest_eligible=False, source_reason="not_valuable",
+            # depleted neutral channel rejected as not_valuable -> dest_not_valuable
+            _ch("200x2x0", local_ratio=0.05, source_eligible=True,
+                dest_eligible=False, source_reason="",
                 dest_reason="not_valuable", value_class="neutral"),
             # over-local but parked in cooldown -> source_protected
             _ch("201x2x0", local_ratio=0.92, source_eligible=False,
@@ -611,7 +611,7 @@ def test_get_last_cycle_debug_emits_pairless_hold_diagnostics(
     diagnostics = debug["hold_diagnostics"]
     assert diagnostics["dest_blocked_by_cooldown"] == 1
     assert diagnostics["dest_not_funded"] == 1
-    assert diagnostics["source_rejected_neutral"] == 1
+    assert diagnostics["dest_not_valuable"] == 1
     assert diagnostics["source_protected"] == 1
     assert diagnostics["source_inside_band"] == 1
 
@@ -773,7 +773,7 @@ def test_top_level_hold_reason_maps_specific_blocker_from_engine(
 ):
     """Phase 1 (deferred completion): when the engine returns no candidates,
     the rebalancer's last_decision.reason must surface the most specific
-    blocker (e.g. dest_blocked_by_cooldown, source_rejected_neutral,
+    blocker (e.g. dest_blocked_by_cooldown, dest_not_valuable,
     below_hold_margin) instead of the coarse no_rebalance_candidates."""
     from modules.config import Config
     from modules.rebalance_engine_v2 import CycleResult
@@ -814,7 +814,7 @@ def test_top_level_hold_reason_maps_specific_blocker_from_engine(
         "hold_diagnostics": {
             "dest_blocked_by_cooldown": 1,
             "dest_not_funded": 0,
-            "source_rejected_neutral": 0,
+            "dest_not_valuable": 0,
             "source_protected": 0,
             "source_inside_band": 0,
         },

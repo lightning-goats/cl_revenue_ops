@@ -401,7 +401,7 @@ class EVRebalancer:
         priority = (
             "dest_blocked_by_cooldown",
             "dest_not_funded",
-            "source_rejected_neutral",
+            "dest_not_valuable",
             "source_protected",
             "source_inside_band",
         )

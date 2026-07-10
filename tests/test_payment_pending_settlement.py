@@ -434,6 +434,69 @@ def test_reconcile_settled_payment_records_cost_and_marks_spent(
     mock_database.mark_budget_spent.assert_called_once_with("42", 5)
 
 
+def test_reconcile_partial_fill_settles_with_actual_amount(
+    mock_plugin, mock_database
+):
+    # A partial-amount retry parked with the ORIGINAL planned amount
+    # (1,000,000 sats) settles for only 250,000 sats. The reconcile sweep
+    # must correct both the history row and the cost record to the settled
+    # amount, or cost-ppm stats and the fill-fraction destination cooldown
+    # anchor are computed against an inflated amount.
+    engine = _make_engine(mock_plugin, mock_database)
+    mock_database.get_pending_settlement_rebalances.return_value = [
+        _reconcile_row(amount_sats=1_000_000)
+    ]
+    mock_plugin.rpc.call.return_value = {
+        "payments": [
+            {
+                "status": "complete",
+                "amount_msat": 250_000_000,
+                "amount_sent_msat": 250_005_000,
+            }
+        ]
+    }
+
+    resolved = engine.reconcile_pending_settlements()
+
+    assert resolved == 1
+    args, kwargs = mock_database.update_rebalance_result.call_args
+    assert args[0] == 42
+    assert args[1] == "success"
+    assert kwargs.get("amount_sats") == 250_000
+    cost_kwargs = mock_database.record_rebalance_cost.call_args.kwargs
+    assert cost_kwargs["amount_sats"] == 250_000
+    mock_database.mark_budget_spent.assert_called_once_with("42", 5)
+
+
+def test_reconcile_settled_amount_missing_falls_back_to_planned(
+    mock_plugin, mock_database
+):
+    # If listsendpays lacks a parseable amount_msat, keep the original
+    # planned amount rather than zeroing the anchor (and never crash).
+    engine = _make_engine(mock_plugin, mock_database)
+    mock_database.get_pending_settlement_rebalances.return_value = [
+        _reconcile_row(amount_sats=1_000_000)
+    ]
+    mock_plugin.rpc.call.return_value = {
+        "payments": [
+            {
+                "status": "complete",
+                "amount_msat": "garbage",
+                "amount_sent_msat": 1_000_005_000,
+            }
+        ]
+    }
+
+    resolved = engine.reconcile_pending_settlements()
+
+    assert resolved == 1
+    args, kwargs = mock_database.update_rebalance_result.call_args
+    assert args[1] == "success"
+    assert kwargs.get("amount_sats") == 1_000_000
+    cost_kwargs = mock_database.record_rebalance_cost.call_args.kwargs
+    assert cost_kwargs["amount_sats"] == 1_000_000
+
+
 def test_reconcile_failed_payment_releases_reservation(mock_plugin, mock_database):
     engine = _make_engine(mock_plugin, mock_database)
     mock_database.get_pending_settlement_rebalances.return_value = [_reconcile_row()]
@@ -522,3 +585,37 @@ def test_database_stores_and_lists_pending_settlement(real_database):
     # Terminal update clears it from the pending queue.
     real_database.update_rebalance_result(rebalance_id, "success", actual_fee_msat=5000)
     assert real_database.get_pending_settlement_rebalances() == []
+
+
+def test_database_late_settlement_corrects_amount_in_history_row(real_database):
+    # Parked with the planned 1,000,000 sats; the sweep later reports the
+    # payment settled for only 250,000. The history row must reflect the
+    # settled amount, not the planned one.
+    rebalance_id = real_database.record_rebalance(
+        from_channel="100x1x0",
+        to_channel="200x1x0",
+        amount_sats=1_000_000,
+        max_fee_sats=100,
+        expected_profit_sats=0,
+        status="pending",
+    )
+    real_database.update_rebalance_result(
+        rebalance_id,
+        "pending_settlement",
+        error_message="payment_pending_timeout",
+        payment_hash="hash-partial",
+    )
+
+    real_database.update_rebalance_result(
+        rebalance_id,
+        "success",
+        actual_fee_msat=5000,
+        amount_sats=250_000,
+    )
+
+    row = real_database._get_connection().execute(
+        "SELECT status, amount_sats FROM rebalance_history WHERE id = ?",
+        (rebalance_id,),
+    ).fetchone()
+    assert row["status"] == "success"
+    assert row["amount_sats"] == 250_000
