@@ -99,9 +99,6 @@ STRATEGY_WEIGHTS = {
 #   neighbor:    patron-derived advisory score, designed full scale 1.0
 #   demand_flow: 0.4 x confidence x rank-bonus, designed max 0.8
 #   route_pair:  0.3 base x small multipliers, designed max ~0.4
-#   hive:        0.3 x topology confidence — the designed 0.3 advisory cap,
-#                preserved by construction (raw can never exceed it honestly;
-#                poisoned input is clamped at 2x = 0.6)
 #   graph:       channel_count x sqrt(capacity_btc) "channel-units";
 #                50 units ≡ a full-scale hub (divided down onto [0, 2])
 # Anchors <= 1.0 are already on the common advisory scale and act as clamp

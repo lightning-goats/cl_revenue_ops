@@ -60,6 +60,19 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.17.0: Standalone Phases 4-5 — complete the de-hive (2026-07-09/10)
+#   - Phase 4: de-hived lnplus_swaps — LN+ automation stays; the fleet-trust
+#     exemption, mycelium swap hints, and lnplus_fleet_pubkeys option are gone.
+#   - Phase 5: removed every remaining inert hive branch — fee_controller
+#     (temporal adjustment, fleet fee prior, skewed-prior reseed, fleet-sibling
+#     exclusion), the orchestrator's hive globals/RPC (revenue-hive-hints-status
+#     removed) and 9 dead option registrations, config.py dead keys, module
+#     bias plumbing (PairCandidate hive/metabolic/immune fields), the
+#     hive-observed-liquidity layer, and the tools/audit hive sweeps.
+#   - Tests scrubbed; architecture guard now pins the de-hive (deleted modules
+#     stay deleted, no non-comment hive/mycelium references in runtime source).
+#   - Docs: hive contracts/audits deleted, README/AGENTS rewritten standalone.
+#   - Grep gate: modules/ + cl-revenue-ops.py contain only historical comments.
 # v2.16.0: Standalone Phases 2-3 — de-hive the revenue core (2026-07-09)
 #   - Removed all remaining cl-hive/fleet/coordination code from the revenue
 #     engine: profitability_analyzer, capital_efficiency, policy_manager,
@@ -162,7 +175,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.16.0"
+PLUGIN_VERSION = "2.17.0"
 
 # Supply-chain / runtime version floors (Phase 3C).
 # These drive NON-FATAL startup probes: a version below floor logs a warning but

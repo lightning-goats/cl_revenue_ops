@@ -1,6 +1,10 @@
 # Plan: make cl_revenue_ops truly standalone (remove all hive / cl-mycelium code)
 
-Status: proposed 2026-07-09 · Context: cl-mycelium retired and disabled on both
+Status: ✅ COMPLETE 2026-07-10 (v2.17.0) — all phases done; grep gate green
+(only historical comments remain, pinned by test_architecture_guard.py).
+Remaining operational step: deploy v2.17.0 to both nodes and watch fee/
+rebalance cycles (the plan's post-Phase-3 deploy-and-watch has not run yet).
+· Context: cl-mycelium retired and disabled on both
 fleet nodes. cl_revenue_ops is the keeper; this plan removes every hive / mycelium
 dependency so it stands on its own with no dead coordination code.
 
@@ -120,14 +124,37 @@ which collapse to their local-only behavior once hive inputs are gone. Do this m
 dedicated test pass and a **deploy + multi-day fee/rebalance watch**, since it's the only place
 removal could shift live pricing (even though it's inert without a fleet today).
 
-**Phase 4 — LN+ swaps de-hive.** `lnplus_swaps` (12): LN+ swap *automation stays* (it's a real
-standalone feature); only the fleet-topology *swap hints* consumption goes.
+**Phase 4 — LN+ swaps de-hive. ✅ DONE 2026-07-09 (0e03e58).** LN+ automation stays;
+removed the fleet-participant trust exemption (D-1), mycelium swap hints (D-4), the
+fleet-aware reliability partition, and `lnplus_fleet_pubkeys` + its option (both node
+configs verified clean first). Suite green (3125).
 
-**Phase 5 — Tests + docs.** Delete/trim the ~80 hive-referencing test files (many are whole
-hive test modules — delete; others need the hive assertions pruned). Update the ~133 docs:
-delete the hive/mycelium contracts and audit docs, scrub hive references from README/AGENTS and
-the operator/config docs, and update the RPC/option inventories. Rename any remaining
-"fleet/hive" operator language to plain node-local terms.
+**Phase 5 — Everything else. ✅ DONE 2026-07-09/10 (v2.17.0), in five commits:**
+- **5a (39f3d40)** fee_controller inert branches: temporal adjustment + composite
+  clamp, fleet fee prior, `_maybe_reseed_skewed_prior` (could never resolve without
+  a fleet source), `_is_fleet_sibling`, hive quality/context reads. All provably
+  behavior-preserving (gated on permanently-None hive_hints).
+- **5b (aa845a7)** orchestrator + config + modules: hive globals, the
+  `revenue-hive-hints-status` RPC, debug-payload hive keys, fleet growth prior,
+  Boltz hive-route override, stagnant-scoring hive factors, 9 dead option
+  registrations (node configs verified clean; askrene-layers default flipped to
+  'standalone'), config.py dead keys, PairCandidate hive/metabolic/immune bias
+  plumbing, the hive-observed-liquidity layer, capacity_planner
+  hive_closure_flagged. RPC surface now 57 handlers.
+- **5c (079915e)** tools: deleted sweep_planner_boltz_hints + sweep_routing_stack,
+  descoped scorecard + capex_planner_loop. `tools/hive_mcp_compat.py` KEPT — it
+  backs the live hive-mcp fleet-management interface (out of scope).
+- **5d (66d1804)** tests: dead hive plumbing scrubbed from ~17 files;
+  test_architecture_guard.py now pins the de-hive (deleted modules stay deleted;
+  no non-comment hive/mycelium references in modules/ + cl-revenue-ops.py; removed
+  symbols/config keys stay gone).
+- **5e (4a79cc6)** docs: hive contracts + hive audit docs + prompt pack deleted,
+  README/AGENTS rewritten standalone, contracts index reduced to produced
+  telemetry, config examples + compatibility doc + RPC inventory updated.
+  Historical dated audits/plans/reports kept as record.
+
+Original Phase 4/5 scope, for reference: `lnplus_swaps` fleet hints only (automation
+stays); delete/trim the ~80 hive-referencing test files; update the ~133 docs.
 
 ## Verification gates
 - Full `pytest` green after every phase.
