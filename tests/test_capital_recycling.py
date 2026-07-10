@@ -74,15 +74,6 @@ class TestRecycleEligibility:
         eligible, reason = planner._is_recycle_eligible(loser, protected_peers=set(), route_pair_scids=set())
         assert eligible is False
 
-    def test_ineligible_hive_member(self):
-        planner = _make_planner()
-        planner.plugin.rpc.getinfo.return_value = {"blockheight": 943000}
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.is_hive_member.return_value = True
-        loser = _make_loser(scid="800000x1x0")
-        eligible, reason = planner._is_recycle_eligible(loser, protected_peers=set(), route_pair_scids=set())
-        assert eligible is False
-
     def test_ineligible_protected_peer(self):
         planner = _make_planner()
         planner.plugin.rpc.getinfo.return_value = {"blockheight": 943000}

@@ -3008,13 +3008,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global hive_hints
     hive_hints = None
 
-    # Phase 3 consumers still read self.hive_hints (permanently None); the
-    # de-hived consumers (profitability_analyzer, policy_manager, rebalancer)
-    # no longer do.
+    # Only fee_controller still reads self.hive_hints (permanently None) until
+    # its Phase 3 de-hive lands; the other consumers no longer do.
     if fee_controller is not None:
         fee_controller.hive_hints = hive_hints
     if capacity_planner is not None:
-        capacity_planner.hive_hints = hive_hints
         capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
         capacity_planner.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
 
@@ -4689,17 +4687,9 @@ def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any
     except _ParamError as e:
         return {"error": str(e)}
     candidates = database.get_planner_candidates(limit=limit)
-    metabolic_planner_influence = {}
-    try:
-        getter = getattr(capacity_planner, "get_metabolic_planner_influence_debug", None)
-        if callable(getter):
-            metabolic_planner_influence = getter()
-    except Exception:
-        metabolic_planner_influence = {"seen": False, "usable": False, "reason": "debug_error"}
     return {
         "candidates": candidates,
         "count": len(candidates),
-        "metabolic_planner_influence": metabolic_planner_influence,
     }
 
 

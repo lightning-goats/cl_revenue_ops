@@ -60,14 +60,6 @@ class TestDiscoveryIntegration:
             for i in range(5)
         ]
 
-        # Mock hive hints (strategy 4)
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.get_open_candidates.return_value = [
-            (f"hive_{i}", {"topology_confidence": 0.7, "reason": "corridor"})
-            for i in range(5)
-        ]
-        planner.hive_hints.get_channel_open_hint.return_value = {}
-
         # Mock graph data (strategy 3) — put nodes with channel data in cache
         for i in range(5):
             nid = f"graph_{i}"
@@ -84,8 +76,7 @@ class TestDiscoveryIntegration:
 
         # Must have candidates from at least 3 different strategies
         assert len(sources) >= 3, f"Only got sources: {sources}"
-        # Must have at least one from hive and graph (reserved slots)
-        assert "hive" in sources, f"No hive candidates in {sources}"
+        # Must include the graph strategy (reserved slot)
         assert "graph" in sources, f"No graph candidates in {sources}"
 
     def test_blocked_portfolio_skips_opens(self):

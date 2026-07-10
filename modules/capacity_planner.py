@@ -36,7 +36,6 @@ from .config import ChainCostDefaults
 from .demand_flow import DemandFlowClassifier
 from .utils import parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
-
 # Loser severity ranking for sorting (higher = worse)
 _LOSER_SEVERITY = {
     "ZOMBIE": 3,
@@ -82,7 +81,6 @@ ASSUMED_AVG_FEE_PPM = 150.0
 STRATEGY_WEIGHTS = {
     "winner": 1.0,
     "demand_flow": 1.0,
-    "hive": 0.9,
     "route_pair": 0.85,
     "graph": 0.8,
     "neighbor": 0.9,
@@ -113,19 +111,15 @@ SCALE_ANCHORS = {
     "neighbor": 1.0,
     "demand_flow": 0.8,
     "route_pair": 0.4,
-    "hive": 0.3,
     "graph": 50.0,
 }
 
 # F2: minimum raw evidence to participate in the candidate pool at all.
 # Below these, the signal is noise and must not be normalized upward:
-#   hive:   topology confidence >= 0.3  =>  raw = 0.3 x 0.3 = 0.09
 #   winner: marginal ROI >= 20%         =>  raw = 0.20
 RAW_SCORE_FLOORS = {
-    "hive": 0.09,
     "winner": 0.20,
 }
-
 
 class CapacityPlanner:
     """
@@ -139,7 +133,6 @@ class CapacityPlanner:
         self.policy_manager = policy_manager
         self.config = config
         self.rebalancer = None
-        self.hive_hints = None  # Injected by main plugin
         self.data_service = None  # Injected by main plugin
         # Unified budget provider: injected by main plugin for cross-module budget gating
         self.global_budget_limit_provider = None
@@ -198,12 +191,6 @@ class CapacityPlanner:
         """Return planner status for RPC query."""
         db = self.profitability.database if self.profitability else None
         cfg = self.config
-        hive_open_count = 0
-        if self.hive_hints is not None:
-            try:
-                hive_open_count = len(self.hive_hints.get_open_candidates())
-            except Exception:
-                pass
         max_closes = getattr(cfg, 'planner_max_closes_per_cycle', 0) if cfg else 0
         if not isinstance(max_closes, (int, float)) or isinstance(max_closes, bool):
             max_closes = 0
@@ -221,8 +208,6 @@ class CapacityPlanner:
             ),
             "candidate_pool_size": len(db.get_planner_candidates()) if db else 0,
             "recent_actions": db.get_planner_actions(limit=5) if db else [],
-            "hive_open_candidates": hive_open_count,
-            "metabolic_planner_influence": self.get_metabolic_planner_influence_debug(),
         }
 
     def generate_report(self) -> Dict[str, Any]:
@@ -938,13 +923,6 @@ class CapacityPlanner:
                 except Exception:
                     pass
 
-            # Hive member protection -- never emit fleet channels as losers.
-            # D1 (operator decision): this skip runs BEFORE the dead-capital
-            # pipeline so members are never staged FEE_REDUCE/DEFIBRILLATE/
-            # CLOSE either, and the membership check fails CLOSED.
-            if self._is_protected_hive_member(prof.peer_id):
-                continue
-
             dead_capital_loser = self._build_dead_capital_loser(
                 scid_display,
                 prof,
@@ -982,16 +960,7 @@ class CapacityPlanner:
                 elif isinstance(bleeder_info, dict):
                     is_hard_bleeder = bool(bleeder_info.get('is_hard_bleeder', False))
 
-            # Hive reputation closure signal — peer flagged by fleet intelligence
             hive_closure_flagged = False
-            if self.hive_hints is not None:
-                try:
-                    checker = getattr(self.hive_hints, "is_closure_recommended_fresh", None)
-                    if not callable(checker):
-                        checker = getattr(self.hive_hints, "is_closure_recommended", None)
-                    hive_closure_flagged = bool(checker(prof.peer_id)) if callable(checker) else False
-                except Exception:
-                    pass
 
             # Logic 1: FIRE SALE mode (Zombie or Deeply Underwater)
             # Guard: require flow data before recommending closure (matches _identify_winners).
@@ -1108,57 +1077,6 @@ class CapacityPlanner:
 
         return losers
 
-    def _is_protected_hive_member(self, peer_id) -> bool:
-        """Return True when the peer must be protected as a hive member.
-
-        Fail-CLOSED (audit D1 / CP-I15): if the hive adapter raises, treat
-        the peer as protected and log, rather than silently dropping fleet
-        protection. No hive adapter (hive_hints is None) means no fleet,
-        so no protection applies.
-        """
-        if self.hive_hints is None:
-            return False
-        try:
-            if bool(self.hive_hints.is_hive_member(peer_id)):
-                return True
-            # Stale-snapshot gap (planner-audit item 5, closed 2026-07-08):
-            # a missing/stale hints snapshot makes is_hive_member return
-            # False SILENTLY, which used to lapse fleet close-protection
-            # during any cl-hive outage. Fall back to the durable membership
-            # confirmations the fee controller records (same trust window as
-            # the zero-fee grace): a peer positively confirmed a member
-            # within the grace window keeps close protection. Conservative
-            # side effect: a peer that truly left the fleet retains
-            # protection for up to the grace window — acceptable for an
-            # irreversible action like a close.
-            try:
-                db = self.profitability.database
-                last = db.hive_member_last_confirmed(peer_id) if db else None
-            except Exception:
-                last = None
-            if last:
-                import time as _time
-                grace = int(getattr(self.config, "hive_zero_fee_stale_grace_seconds", 604800) or 0)
-                age = int(_time.time()) - int(last)
-                if 0 <= age < grace:
-                    self.plugin.log(
-                        f"PLANNER: fleet close-protection for {str(peer_id or '')[:16]}... "
-                        f"held by {age // 3600}h-old membership confirmation "
-                        "(hints say non-member/stale)", level="info")
-                    return True
-            return False
-        except Exception as e:
-            try:
-                peer_disp = str(peer_id or "")[:16]
-                self.plugin.log(
-                    f"PLANNER: hive membership check failed for {peer_disp}...: "
-                    f"{e} — treating peer as protected (fail-closed)",
-                    level="warn",
-                )
-            except Exception:
-                pass
-            return True
-
     def _close_protection_reason(
         self,
         scid_display: str,
@@ -1176,11 +1094,6 @@ class CapacityPlanner:
         - Route-pair (revenue route) protection
         """
         from .profitability_analyzer import ChannelRole
-
-        # Hive member protection -- never recommend closing fleet channels.
-        # Fails CLOSED (D1): an adapter error protects the peer.
-        if self._is_protected_hive_member(prof.peer_id):
-            return "HIVE_MEMBER"
 
         # Kalman confidence gate -- block closure only when the Kalman
         # estimate is load-bearing (recent/mixed activity with low
@@ -1233,20 +1146,10 @@ class CapacityPlanner:
 
         # Route-pair protection: channels on proven revenue routes have network value
         # beyond their individual ROI.  Closing one kills the paired channel's revenue.
-        # Hive corridor channels on revenue routes get extra protection.
         is_on_revenue_route = scid_display in (route_pair_channels or set())
-        is_hive_corridor = False
-        if self.hive_hints is not None:
-            try:
-                corridor_role = self.hive_hints.get_corridor_role(prof.peer_id)
-                is_hive_corridor = corridor_role in {"owner", "secondary", "contested"}
-            except Exception:
-                pass
         if is_on_revenue_route:
-            # Hive corridor channels on revenue routes: protect until -50% ROI
-            # Regular revenue route channels: protect until -30% ROI
-            route_close_threshold = -50.0 if is_hive_corridor else -30.0
-            if prof.marginal_roi_percent > route_close_threshold:
+            # Revenue route channels: protect until -30% ROI
+            if prof.marginal_roi_percent > -30.0:
                 return "REVENUE_ROUTE"  # Protect revenue route channels
 
         return None
@@ -2010,83 +1913,6 @@ class CapacityPlanner:
         ranked = sorted(seen.values(), key=lambda c: c["score"], reverse=True)
         return ranked[:10]
 
-    def _discover_from_hive(self) -> List[Dict]:
-        """Strategy 4: Propose peers where cl_hive recommends channel opening."""
-        if self.hive_hints is None:
-            self.plugin.log("Hive discovery: hive_hints not injected, skipping", level='debug')
-            return []
-        try:
-            open_candidates = self.hive_hints.get_open_candidates()
-        except Exception as e:
-            self.plugin.log(f"Hive discovery: get_open_candidates() failed: {e}", level='info')
-            open_candidates = []
-        if not open_candidates:
-            self.plugin.log("Hive discovery: get_open_candidates() returned empty", level='debug')
-        candidates = []
-        for peer_id, hint in open_candidates:
-            if self._has_direct_peer_channel(peer_id):
-                self.plugin.log(
-                    f"Hive discovery: ignoring open hint for existing direct peer {str(peer_id)[:12]}...",
-                    level='debug',
-                )
-                continue
-            confidence = hint.get("topology_confidence", 0.0)
-            reason_str = hint.get("reason", "hive_topology")
-            candidates.append({
-                "peer_id": peer_id,
-                "source": "hive",
-                "score": 0.3 * max(confidence, 0.1),
-                "reason": f"Hive: {reason_str}",
-                "hive_open_hint": hint,
-            })
-        candidates.extend(self._discover_from_hive_member_topology())
-        candidates = self._dedupe_hive_candidates(candidates)
-        self.plugin.log(f"Hive discovery: produced {len(candidates)} candidates", level='debug')
-        return candidates
-
-    def _dedupe_hive_candidates(self, candidates: List[Dict]) -> List[Dict]:
-        """Deduplicate hive-discovered open candidates by peer id.
-
-        Explicit channel-open hints are authoritative when the same peer is also
-        found through fleet topology fallback. Topology metadata is retained as
-        supplemental context, but it must not replace the explicit hint payload.
-        """
-        deduped: Dict[str, Dict] = {}
-        for candidate in candidates:
-            peer_id = str(candidate.get("peer_id") or "")
-            if not peer_id or self._has_direct_peer_channel(peer_id):
-                continue
-
-            candidate = dict(candidate)
-            candidate["peer_id"] = peer_id
-            existing = deduped.get(peer_id)
-            if existing is None:
-                deduped[peer_id] = candidate
-                continue
-
-            existing_has_hint = existing.get("hive_open_hint") is not None
-            candidate_has_hint = candidate.get("hive_open_hint") is not None
-            if candidate_has_hint and not existing_has_hint:
-                replacement = candidate
-                if existing.get("hive_topology_witnesses") and not replacement.get("hive_topology_witnesses"):
-                    replacement["hive_topology_witnesses"] = existing["hive_topology_witnesses"]
-                replacement["score"] = max(
-                    float(replacement.get("score", 0.0)),
-                    float(existing.get("score", 0.0)),
-                )
-                deduped[peer_id] = replacement
-                continue
-
-            keeper = existing
-            if candidate.get("hive_topology_witnesses") and not keeper.get("hive_topology_witnesses"):
-                keeper["hive_topology_witnesses"] = candidate["hive_topology_witnesses"]
-            keeper["score"] = max(
-                float(keeper.get("score", 0.0)),
-                float(candidate.get("score", 0.0)),
-            )
-
-        return list(deduped.values())
-
     def _get_our_node_id(self) -> str:
         try:
             if self.data_service is not None:
@@ -2134,69 +1960,6 @@ class CapacityPlanner:
             if str(peer.get("id") or "") == peer_id and bool(peer.get("connected", False)):
                 return True
         return False
-
-    def _is_hive_topology_witness(self, peer_id: str) -> bool:
-        """A hive witness only needs an active peer connection, not a channel."""
-        return self._is_peer_connected(peer_id) or self._has_direct_peer_channel(peer_id)
-
-    def _discover_from_hive_member_topology(self) -> List[Dict]:
-        """Discover non-direct hive members advertised by direct hive peers.
-
-        cl-hive member hints can carry each member's known topology. When a
-        connected hive peer reports other hive members in that topology, those are
-        useful mesh-expansion candidates for faster hive gossip and coordination.
-        """
-        if self.hive_hints is None:
-            return []
-
-        try:
-            member_ids = self.hive_hints.get_member_peer_ids()
-        except Exception:
-            return []
-        if not isinstance(member_ids, list):
-            return []
-
-        our_node_id = self._get_our_node_id()
-        member_set = {str(peer_id) for peer_id in member_ids if peer_id}
-        direct_members = [
-            peer_id
-            for peer_id in sorted(member_set)
-            if peer_id != our_node_id and self._is_hive_topology_witness(peer_id)
-        ]
-        if not direct_members:
-            return []
-
-        witnesses_by_target: Dict[str, set] = {}
-        for witness in direct_members:
-            try:
-                topology = self.hive_hints.get_fleet_topology(witness)
-            except Exception:
-                topology = []
-            if not isinstance(topology, list):
-                continue
-            for target in topology:
-                target_id = str(target or "")
-                if (
-                    not target_id
-                    or target_id == our_node_id
-                    or target_id == witness
-                    or target_id not in member_set
-                    or self._has_direct_peer_channel(target_id)
-                ):
-                    continue
-                witnesses_by_target.setdefault(target_id, set()).add(witness)
-
-        candidates = []
-        for target_id, witnesses in witnesses_by_target.items():
-            witness_count = len(witnesses)
-            candidates.append({
-                "peer_id": target_id,
-                "source": "hive",
-                "score": min(0.30, 0.14 + (0.04 * witness_count)),
-                "reason": f"Hive topology: advertised by {witness_count} connected hive member(s)",
-                "hive_topology_witnesses": sorted(witnesses),
-            })
-        return sorted(candidates, key=lambda c: c["score"], reverse=True)
 
     def _discover_from_demand_flow(self, all_flow, existing_peers: set) -> List[Dict]:
         """Strategy 6: Find candidates adjacent to our sink peers."""
@@ -2253,10 +2016,6 @@ class CapacityPlanner:
         # Marginal ROI must be negative
         if loser.get("marginal_roi", 0) >= 0:
             return False, f"Marginal ROI {loser.get('marginal_roi', 0):.1f}% >= 0"
-
-        # Hive member protection (fails CLOSED on adapter errors — D1)
-        if self._is_protected_hive_member(peer_id):
-            return False, "Hive member protected"
 
         # Policy protection. None = policy source failed -> fail closed.
         if protected_peers is None:
@@ -2440,27 +2199,6 @@ class CapacityPlanner:
         except Exception:
             pass
 
-        # Hive channel-open hint bias (bounded ±30%)
-        if self.hive_hints is not None:
-            try:
-                hint = self.hive_hints.get_channel_open_hint(peer_id)
-                pref = hint.get("open_preference")
-                conf = hint.get("topology_confidence", 0.0)
-                reason = hint.get("reason")
-                if pref == "open" and reason == "member_connectivity" and self._has_direct_peer_channel(peer_id):
-                    pref = None
-                if pref == "open":
-                    score *= 1.0 + (0.20 * conf)
-                elif pref == "avoid":
-                    score *= 1.0 - (0.30 * conf)
-            except Exception:
-                pass
-
-            try:
-                score *= self._get_hive_open_score_multiplier(peer_id)
-            except Exception:
-                pass
-
         # Inbound fee penalty: expensive-to-rebalance peers are less valuable
         try:
             inbound_data = self.profitability.database.get_historical_inbound_fee_ppm(peer_id)
@@ -2505,71 +2243,6 @@ class CapacityPlanner:
                 score *= 0.9
 
         return score
-
-    def _get_hive_open_score_multiplier(self, peer_id: str) -> float:
-        """Return bounded open-candidate multiplier from hive routing intelligence."""
-        if self.hive_hints is None:
-            return 1.0
-
-        multiplier = 1.0
-
-        try:
-            multiplier *= max(
-                0.9,
-                min(1.1, float(self.hive_hints.get_corridor_utilization_bias(peer_id))),
-            )
-        except Exception:
-            pass
-
-        try:
-            reputation = self.hive_hints.get_reputation_score(peer_id)
-            if isinstance(reputation, (int, float)):
-                reputation = max(0.0, min(100.0, float(reputation)))
-                multiplier *= 1.0 + (((reputation - 50.0) / 50.0) * 0.1)
-        except Exception:
-            pass
-
-        try:
-            getter = getattr(self.hive_hints, "get_metabolic_open_bias", None)
-            if callable(getter):
-                multiplier *= max(0.85, min(1.10, float(getter(peer_id))))
-        except Exception:
-            pass
-
-        try:
-            getter = getattr(self.hive_hints, "get_immune_open_bias", None)
-            if callable(getter):
-                multiplier *= max(0.85, min(1.10, float(getter(peer_id))))
-        except Exception:
-            pass
-
-        return max(0.75, min(1.25, multiplier))
-
-    def get_metabolic_planner_influence_debug(self) -> Dict[str, Any]:
-        """Return read-only metabolic influence diagnostics for planner surfaces."""
-        if self.hive_hints is None:
-            return {
-                "seen": False,
-                "usable": False,
-                "reason": "no_hive_hint_adapter",
-            }
-        try:
-            status_getter = getattr(self.hive_hints, "get_metabolic_status", None)
-            status = status_getter() if callable(status_getter) else {}
-            if not isinstance(status, dict):
-                status = {}
-            if not status.get("present", False):
-                return {"seen": False, "usable": False, "reason": "missing"}
-            return {
-                "seen": True,
-                "usable": bool(status.get("usable", False)),
-                "m2_scope": status.get("m2_scope"),
-                "confidence": status.get("confidence", "unknown"),
-                "coverage": dict(status.get("coverage", {}) or {}),
-                "reason": status.get("reason") or (None if status.get("usable") else "unusable"),
-            }
-        except Exception as e:
-            return {"seen": False, "usable": False, "reason": f"error: {e}"}
 
     def _update_candidate_pool(self, candidates: List[Dict]):
         """Persist scored candidates to database."""
@@ -2637,7 +2310,7 @@ class CapacityPlanner:
 
     def _apply_pool_quotas(self, candidates: List[Dict], max_pool: int = 32) -> List[Dict]:
         """Apply reserved slot quotas per strategy, then fill remaining slots by score."""
-        RESERVED = {"hive": 4, "graph": 4, "route_pair": 4}
+        RESERVED = {"graph": 4, "route_pair": 4}
         reserved_total = sum(RESERVED.values())
         open_slots = max_pool - reserved_total
 
@@ -3087,9 +2760,6 @@ class CapacityPlanner:
                 existing_peers.add(pid)
         candidates.extend(self._discover_from_graph(existing_peers))
 
-        # Strategy 4: hive topology hints
-        candidates.extend(self._discover_from_hive())
-
         # Strategy 5: route-pair analysis (neighbors of peers on profitable routes)
         candidates.extend(self._discover_from_route_pairs(all_profitability))
 
@@ -3251,13 +2921,6 @@ class CapacityPlanner:
                 # Bootstrap: no routing history at all — use the legacy rate.
                 forecast_daily_ppm = LEGACY_FORECAST_DAILY_PPM_CEILING
             daily_revenue = channel_size_sats * forecast_daily_ppm / 1_000_000.0
-
-        # Hive demand signal: apply bounded, confidence-weighted fleet bias
-        if self.hive_hints:
-            try:
-                daily_revenue *= self.hive_hints.get_rebalance_bias(peer_id)
-            except Exception:
-                pass
 
         # Estimate on-chain costs (dynamic via feerates RPC, legacy fallback)
         open_cost = self._estimate_open_cost()
@@ -3716,12 +3379,6 @@ class CapacityPlanner:
         Returns:
             (allowed, reason) tuple.
         """
-        # Lazy-eval audit F5: membership was read eagerly at classification,
-        # minutes before this gate runs — re-read lazily so a peer that
-        # joined the fleet mid-cycle cannot be closed. Fails CLOSED inside.
-        if self._is_protected_hive_member(peer_id):
-            return False, "Hive member protected — close blocked"
-
         if not self.policy_manager:
             # Lazy-eval audit F6: the policy manager is constructed
             # unconditionally at init — None means broken init, and closing

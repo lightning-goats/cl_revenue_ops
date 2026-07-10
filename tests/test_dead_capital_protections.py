@@ -3,7 +3,7 @@
 A historically valuable channel that merely goes quiet for the flow window
 must not be staged FEE_REDUCE -> DEFIBRILLATE -> CLOSE on pure stage
 timeouts. The protective gates (Kalman confidence, inbound-gateway,
-sourced-fee contribution, route-pair, hive membership) must block the
+sourced-fee contribution, route-pair) must block the
 CLOSE stage; the earlier FEE_REDUCE/DEFIBRILLATE stages remain allowed.
 """
 
@@ -181,24 +181,6 @@ class TestDeadCapitalCloseProtections:
         assert losers[0]["action"] == "DEFIBRILLATE"
         assert losers[0]["close_protection"] == "KALMAN_LOW_CONFIDENCE"
 
-    def test_hive_member_short_circuits_dead_capital_staging(self):
-        """D1 (operator decision): a hive member with a dead-capital
-        signature must not be emitted as a DEAD_CAPITAL loser at all —
-        no FEE_REDUCE, no DEFIBRILLATE, no CLOSE, no staged action."""
-        planner, prof_analyzer = _make_planner()
-        _set_dead_capital(planner, stage="defibrillation")
-        _expired_stage(prof_analyzer, stage="defibrillation")
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.is_hive_member.return_value = True
-        planner.hive_hints.get_corridor_role.return_value = None
-        prof = _make_prof(marginal_roi_percent=-80.0)
-
-        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow()})
-
-        assert losers == []
-        prof_analyzer.database.upsert_dead_capital_stage.assert_not_called()
-        prof_analyzer.database.record_planner_action.assert_not_called()
-
     def test_persisted_close_stage_demoted_while_protected(self):
         """A previously persisted close stage is demoted back to
         defibrillation when the channel is protected."""
@@ -244,135 +226,15 @@ class TestDeadCapitalCloseProtections:
         )
 
 
-class TestD1MemberDeadCapitalShortCircuit:
-    """D1 (operator decision): hive-member protection short-circuits
-    dead-capital staging entirely, and the membership check fails CLOSED —
-    an adapter exception treats the peer as protected instead of silently
-    dropping fleet protection."""
-
-    def test_member_with_fee_reduce_signature_produces_no_action(self):
-        """Fresh dead-capital member (stage none): no FEE_REDUCE delegation
-        is recorded and no stage timer starts."""
-        planner, prof_analyzer = _make_planner()
-        _set_dead_capital(planner, stage="none")
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.is_hive_member.return_value = True
-        planner.hive_hints.get_corridor_role.return_value = None
-        prof = _make_prof(marginal_roi_percent=-10.0)
-
-        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow()})
-
-        assert losers == []
-        prof_analyzer.database.record_planner_action.assert_not_called()
-        prof_analyzer.database.upsert_dead_capital_stage.assert_not_called()
-
-    def test_adapter_exception_treats_peer_as_protected(self):
-        """Fail-closed: is_hive_member raising must protect the peer, not
-        expose it to dead-capital staging."""
-        planner, prof_analyzer = _make_planner()
-        _set_dead_capital(planner, stage="defibrillation")
-        _expired_stage(prof_analyzer, stage="defibrillation")
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.is_hive_member.side_effect = Exception("hive down")
-        planner.hive_hints.get_corridor_role.return_value = None
-        prof = _make_prof(marginal_roi_percent=-80.0)
-
-        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow()})
-
-        assert losers == []
-        prof_analyzer.database.upsert_dead_capital_stage.assert_not_called()
-
-    def test_adapter_exception_blocks_fire_sale_close_too(self):
-        """Fail-closed applies to the regular loser pipeline as well: a
-        raising adapter must never let a fire-sale CLOSE through."""
-        planner, prof_analyzer = _make_planner()
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.is_hive_member.side_effect = Exception("hive down")
-        planner.hive_hints.get_corridor_role.return_value = None
-        prof = _make_prof(
-            marginal_roi_percent=-80.0,
-            classification=ProfitabilityClass.UNDERWATER,
-        )
-        prof.days_open = 200
-        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {
-            "attempt_count": 5
-        }
-
-        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow(
-            confidence=1.0, forward_count=10)})
-
-        assert losers == []
-
-    def test_close_protection_reason_fails_closed(self):
-        """_close_protection_reason returns HIVE_MEMBER when the adapter
-        raises (shared gate: dead-capital staging + recycle nomination)."""
-        planner, _ = _make_planner()
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.is_hive_member.side_effect = Exception("hive down")
-        prof = _make_prof(marginal_roi_percent=-80.0)
-
-        reason = planner._close_protection_reason(
-            SCID, prof, _make_flow(), set()
-        )
-
-        assert reason == "HIVE_MEMBER"
-
-    def test_non_member_dead_capital_unaffected(self):
-        """Control: a healthy adapter answering False leaves the
-        dead-capital pipeline fully operational."""
-        planner, prof_analyzer = _make_planner()
-        _set_dead_capital(planner, stage="defibrillation")
-        _expired_stage(prof_analyzer, stage="defibrillation")
-        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {
-            "attempt_count": 1
-        }
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.is_hive_member.return_value = False
-        planner.hive_hints.get_corridor_role.return_value = None
-        prof = _make_prof(marginal_roi_percent=-80.0)
-
-        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow()})
-
-        assert len(losers) == 1
-        assert losers[0]["action"] == "CLOSE"
-
-
-class TestMemberCloseProtectionWithoutClassMask:
+class TestUnderwaterCloseWithoutClassMask:
     """D2 (audit): with the UNDERWATER -> BREAK_EVEN fleet-loss mask removed
-    from the profitability analyzer, close protection for hive members must
-    still hold — via the explicit member skip / HIVE_MEMBER protection
-    reason, never via class falsification."""
-
-    def test_underwater_hive_member_never_emitted_as_close_loser(self):
-        """A deeply underwater hive member with a fire-sale signature (the
-        exact shape the mask used to hide) produces no CLOSE loser."""
-        planner, prof_analyzer = _make_planner()
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.is_hive_member.return_value = True
-        planner.hive_hints.get_corridor_role.return_value = None
-        # Fire-sale signature: mature, UNDERWATER, marginal ROI < -50
-        prof = _make_prof(
-            marginal_roi_percent=-80.0,
-            classification=ProfitabilityClass.UNDERWATER,
-        )
-        prof.days_open = 200
-        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {
-            "attempt_count": 5
-        }
-
-        losers = planner._identify_losers({SCID: prof}, {SCID: _make_flow(
-            confidence=1.0, forward_count=10)})
-
-        assert not any(l.get("action") == "CLOSE" for l in losers)
+    from the profitability analyzer, a deeply underwater channel with a
+    fire-sale signature is recommended for CLOSE via the real classification,
+    never hidden by class falsification."""
 
     def test_underwater_non_member_still_closeable(self):
-        """Control: the same fire-sale signature without membership is
-        recommended for CLOSE — protection is member-specific."""
+        """The fire-sale signature is recommended for CLOSE."""
         planner, prof_analyzer = _make_planner()
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.is_hive_member.return_value = False
-        planner.hive_hints.get_corridor_role.return_value = None
-        planner.hive_hints.is_closure_recommended_fresh.return_value = False
         prof = _make_prof(
             marginal_roi_percent=-80.0,
             classification=ProfitabilityClass.UNDERWATER,

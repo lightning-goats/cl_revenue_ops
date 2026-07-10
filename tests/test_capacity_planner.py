@@ -1987,26 +1987,6 @@ class TestGraphDiscoveryAndScoring:
         expected = base_score * (51 / 62) * 1.5
         assert abs(result - expected) < 0.01
 
-    def test_score_candidate_uses_hive_reputation_and_corridor_bias(self):
-        plugin = MagicMock()
-        prof_analyzer = MagicMock()
-
-        prof_analyzer.database.get_peer_reputation.return_value = None
-        prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
-            'count': 0, 'marginal_roi_proxy': 0,
-        }
-        prof_analyzer.database.get_peer_uptime_percent.return_value = 99.0
-
-        planner = CapacityPlanner(plugin, prof_analyzer, MagicMock())
-        planner.hive_hints = MagicMock()
-        planner.hive_hints.get_channel_open_hint.return_value = {}
-        planner.hive_hints.get_corridor_utilization_bias.return_value = 1.1
-        planner.hive_hints.get_reputation_score.return_value = 80
-
-        result = planner._score_candidate("peer_abc", 1.0)
-
-        assert result > 1.15
-
     # --- _update_candidate_pool tests ---
 
     def test_update_candidate_pool_persists(self):
@@ -2747,22 +2727,6 @@ class TestOpenEV:
         ev = planner._calculate_open_ev("peer1", 5000000, cfg)
         # Should not crash; uses ChainCostDefaults fallback
         assert isinstance(ev, float)
-
-    def test_ev_uses_public_rebalance_bias_from_hive_hints(self):
-        planner = self._make_planner(
-            feerates_return={"perkb": {"opening": 1000}},
-            closed_summary=None,
-        )
-        planner.hive_hints = MagicMock(spec=["get_rebalance_bias"])
-        planner.hive_hints.get_rebalance_bias.return_value = 1.10
-        cfg = self._make_cfg()
-
-        ev = planner._calculate_open_ev("peer1", 5000000, cfg)
-
-        daily_revenue = (5000000 * 0.3 * 150 / 1_000_000) * 1.10
-        expected_hurdle = 5_000_000 * 0.01 * (180 / 365)
-        expected_ev = (daily_revenue * 180) - ((daily_revenue * 0.1) * 180) - (140 + 200) - expected_hurdle
-        assert abs(ev - expected_ev) < 1.0
 
     def test_ev_rejects_low_yield_channel_below_capital_hurdle(self):
         """Positive absolute profit is rejected when return on locked capital is too low."""
@@ -4673,40 +4637,6 @@ class TestConstructorCleanup:
         assert planner.rebalancer is mock_rebalancer
 
 
-def test_metabolic_open_bias_is_bounded_planner_scoring_input():
-    plugin = MagicMock()
-    profitability = MagicMock()
-    flow = MagicMock()
-    planner = CapacityPlanner(plugin, profitability, flow, config=MagicMock())
-    hive_hints = MagicMock()
-    hive_hints.get_corridor_utilization_bias.return_value = 1.0
-    hive_hints.get_reputation_score.return_value = 50
-    hive_hints.get_metabolic_open_bias.return_value = 0.50
-    planner.hive_hints = hive_hints
-
-    multiplier = planner._get_hive_open_score_multiplier("02candidate")
-
-    assert multiplier == pytest.approx(0.85)
-
-
-
-def test_immune_open_bias_is_bounded_planner_scoring_input():
-    plugin = MagicMock()
-    profitability = MagicMock()
-    flow = MagicMock()
-    planner = CapacityPlanner(plugin, profitability, flow, config=MagicMock())
-    hive_hints = MagicMock()
-    hive_hints.get_corridor_utilization_bias.return_value = 1.0
-    hive_hints.get_reputation_score.return_value = 50
-    hive_hints.get_metabolic_open_bias.return_value = 1.0
-    hive_hints.get_immune_open_bias.return_value = 0.50
-    planner.hive_hints = hive_hints
-
-    multiplier = planner._get_hive_open_score_multiplier("02candidate")
-
-    assert multiplier == pytest.approx(0.85)
-
-
 def test_metabolic_open_bias_cannot_bypass_planner_disabled_gate():
     plugin = MagicMock()
     profitability = MagicMock()
@@ -5382,50 +5312,6 @@ class TestRedeploymentEVSign:
         assert ev == 6_600
 
 
-class TestFleetCloseProtectionDurability:
-    """Planner-audit item 5: fleet close-protection must survive a stale
-    hive-hints snapshot via the durable membership confirmations."""
-
-    def _planner(self):
-        from modules.config import Config
-        plugin = MagicMock()
-        prof = MagicMock()
-        flow = MagicMock()
-        planner = CapacityPlanner(plugin, prof, flow, config=Config())
-        planner.hive_hints = MagicMock()
-        return planner, prof
-
-    def test_live_member_protected(self):
-        planner, _ = self._planner()
-        planner.hive_hints.is_hive_member.return_value = True
-        assert planner._is_protected_hive_member("02" + "aa" * 32) is True
-
-    def test_stale_hints_with_recent_confirmation_protected(self):
-        planner, prof = self._planner()
-        planner.hive_hints.is_hive_member.return_value = False  # stale snapshot
-        import time as _t
-        prof.database.hive_member_last_confirmed.return_value = int(_t.time()) - 3600
-        assert planner._is_protected_hive_member("02" + "aa" * 32) is True
-
-    def test_stale_hints_with_expired_confirmation_unprotected(self):
-        planner, prof = self._planner()
-        planner.hive_hints.is_hive_member.return_value = False
-        import time as _t
-        prof.database.hive_member_last_confirmed.return_value = int(_t.time()) - 10 * 86400
-        assert planner._is_protected_hive_member("02" + "aa" * 32) is False
-
-    def test_never_confirmed_unprotected(self):
-        planner, prof = self._planner()
-        planner.hive_hints.is_hive_member.return_value = False
-        prof.database.hive_member_last_confirmed.return_value = None
-        assert planner._is_protected_hive_member("02" + "aa" * 32) is False
-
-    def test_adapter_exception_fail_closed(self):
-        planner, _ = self._planner()
-        planner.hive_hints.is_hive_member.side_effect = RuntimeError("boom")
-        assert planner._is_protected_hive_member("02" + "aa" * 32) is True
-
-
 class TestDefibrillationQueueAdvances:
     """2026-07-09 operator-run finding: a failing defib target was retried
     11 consecutive cycles because _check_cooldown excludes failed actions
@@ -5549,20 +5435,6 @@ class TestRecycleProtectedPeersSet:
         planner.policy_manager.get_all_policies.side_effect = RuntimeError("db")
         peers = planner._recycle_protected_peers()
         assert peers is None  # None = unknown -> caller must treat as protected
-
-
-class TestCloseGateRechecksMembershipLazily:
-    """Lazy-eval audit F5: membership was read eagerly at classification,
-    minutes before close execution — a peer joining the fleet mid-cycle was
-    closable. The close gate now re-reads membership lazily."""
-
-    def test_close_blocked_for_fresh_hive_member(self):
-        planner, db, _ = _make_close_planner()
-        planner._is_protected_hive_member = MagicMock(return_value=True)
-        allowed, reason = planner._check_close_allowed("peer_abc")
-        assert allowed is False
-        assert "member" in reason.lower()
-        planner._is_protected_hive_member.assert_called_once_with("peer_abc")
 
 
 class TestOpensAndDefibsRespectPolicy:

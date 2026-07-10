@@ -32,7 +32,7 @@ def _make_planner():
 class TestStrategyWeights:
 
     def test_weights_exist_for_all_strategies(self):
-        expected = {"winner", "neighbor", "graph", "hive", "route_pair"}
+        expected = {"winner", "neighbor", "graph", "demand_flow", "route_pair"}
         assert expected.issubset(set(STRATEGY_WEIGHTS.keys()))
 
     def test_neighbor_weight_less_than_winner(self):
@@ -50,31 +50,23 @@ class TestFixedReferenceAnchors:
     Scores now normalize against fixed, documented SCALE_ANCHORS."""
 
     def test_anchors_exist_for_all_strategies(self):
-        expected = {"winner", "neighbor", "graph", "hive", "route_pair", "demand_flow"}
+        expected = {"winner", "neighbor", "graph", "route_pair", "demand_flow"}
         assert expected.issubset(set(SCALE_ANCHORS.keys()))
 
-    def test_hive_anchor_preserves_designed_ceiling(self):
-        """git history: e352409 designed the 0.3 hive advisory cap; the
-        normalization commit (4f1feae) destroyed it. The anchor restores it
-        by construction."""
-        assert SCALE_ANCHORS["hive"] == pytest.approx(0.3)
-
     def test_floors_gate_weak_evidence(self):
-        assert RAW_SCORE_FLOORS["hive"] == pytest.approx(0.09)  # confidence >= 0.3
         assert RAW_SCORE_FLOORS["winner"] == pytest.approx(0.20)  # marginal ROI >= 20%
 
 
 class TestNormalizeCandidates:
 
     def test_audit_reproduction_evidence_ordering(self):
-        """Audit repro: W1 0.8, W2 0.45, H1 0.03, G1 1.12 must order
-        W1 > W2 > G1, with H1 excluded (or last). Under the old group-max
-        rescale H1 landed at 0.9 — above the proven 45%-ROI winner."""
+        """Audit repro: W1 0.8, W2 0.45, G1 1.12 must order W1 > W2 > G1.
+        Under the old group-max rescale a lone graph node jumped above the
+        proven 45%-ROI winner."""
         planner = _make_planner()
         candidates = [
             {"peer_id": "W1", "source": "winner", "score": 0.8, "reason": ""},
             {"peer_id": "W2", "source": "winner", "score": 0.45, "reason": ""},
-            {"peer_id": "H1", "source": "hive", "score": 0.03, "reason": ""},
             {"peer_id": "G1", "source": "graph", "score": 1.12, "reason": ""},
         ]
         normalized = planner._normalize_candidate_scores(candidates)
@@ -83,25 +75,6 @@ class TestNormalizeCandidates:
         assert by_id["W1"]["score"] == pytest.approx(0.8, rel=1e-3)
         assert by_id["W2"]["score"] == pytest.approx(0.45, rel=1e-3)
         assert by_id["W1"]["score"] > by_id["W2"]["score"] > by_id["G1"]["score"]
-        if "H1" in by_id:
-            assert by_id["H1"]["score"] <= by_id["G1"]["score"]
-        else:
-            # Excluded by the hive raw floor (0.03 < 0.09)
-            assert "H1" not in by_id
-
-    def test_confident_hive_hint_lands_below_proven_winner_above_noise(self):
-        """A max-confidence hive hint (0.3 raw) lands at 0.3 x 0.9 = 0.27:
-        below a proven winner, above discovery noise."""
-        planner = _make_planner()
-        candidates = [
-            {"peer_id": "w", "source": "winner", "score": 0.45, "reason": ""},
-            {"peer_id": "h", "source": "hive", "score": 0.3, "reason": ""},
-            {"peer_id": "g", "source": "graph", "score": 1.12, "reason": ""},
-        ]
-        normalized = planner._normalize_candidate_scores(candidates)
-        by_id = {c["peer_id"]: c for c in normalized}
-        assert by_id["h"]["score"] == pytest.approx(0.27, rel=1e-3)
-        assert by_id["w"]["score"] > by_id["h"]["score"] > by_id["g"]["score"]
 
     def test_no_group_max_rescale(self):
         """Scores must not depend on the other members of the group."""
@@ -138,13 +111,6 @@ class TestNormalizeCandidates:
         expected = (1.12 / SCALE_ANCHORS["graph"]) * STRATEGY_WEIGHTS["graph"]
         assert normalized[0]["score"] == pytest.approx(expected, rel=1e-3)
         assert normalized[0]["score"] < 0.05
-
-    def test_weak_hive_hint_excluded_by_floor(self):
-        planner = _make_planner()
-        normalized = planner._normalize_candidate_scores(
-            [{"peer_id": "h", "source": "hive", "score": 0.03, "reason": ""}]
-        )
-        assert normalized == []
 
     def test_sub_20pct_roi_winner_excluded_by_floor(self):
         planner = _make_planner()
