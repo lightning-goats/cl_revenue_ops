@@ -60,6 +60,22 @@ from modules.utils import normalize_scid, parse_msat
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v2.17.1: Deep-audit fix release (2026-07-10)
+#   - Six-agent top-to-bottom audit (module clusters + live RPC/DB
+#     cross-validation) followed by two fix iterations and an adversarial
+#     verification pass. 1 critical (days_open frozen at 30 for every
+#     channel opened in the last ~9 months — SCID timestamp estimate now
+#     tip-anchored, poisoned opened_at rows repaired), 13 major (dead
+#     revenue-boltz-auto-cycle-status RPC, LN+ notifications NameError,
+#     boltz loop_in/chainswap embedded-error detection, balance-cycle
+#     cooldown burn on dry-run/policy-block, RPC-handler tracebacks,
+#     crossed LN+ participants band, reconcile completed-while-applied
+#     misclassification, LN+ same-cycle funds race, loser-pipeline defib
+#     deadlock, dead boltz-coordination exhaustion signal, budget blocks
+#     poisoning futility/success-rates, execute_candidate inflight-guard
+#     bypass, PnL 30d-revenue-vs-8d-volume window mismatch), and ~20 minor
+#     fixes. Orphan hive tables dropped by migration. fee_controller dead
+#     code removed (-207 lines). Full suite 3091 green.
 # v2.17.0: Standalone Phases 4-5 — complete the de-hive (2026-07-09/10)
 #   - Phase 4: de-hived lnplus_swaps — LN+ automation stays; the fleet-trust
 #     exemption, mycelium swap hints, and lnplus_fleet_pubkeys option are gone.
@@ -175,7 +191,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.17.0"
+PLUGIN_VERSION = "2.17.1"
 
 # Supply-chain / runtime version floors (Phase 3C).
 # These drive NON-FATAL startup probes: a version below floor logs a warning but

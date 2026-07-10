@@ -763,8 +763,8 @@ class SwapLifecycle:
                     # tag). Trip the breaker for operator review instead.
                     self.trip_breaker(
                         f"local swap {sid} still 'applied' but LN+ lists it "
-                        "completed — run revenue-lnplus-backfill or resolve "
-                        "manually")
+                        "completed — resolve manually (backfill skips swaps "
+                        "that already have a local row)")
                     ok = False
                     continue
                 # B4: an 'applied' row absent from pending/opening/completed

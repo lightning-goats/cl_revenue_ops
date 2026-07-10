@@ -2055,6 +2055,27 @@ class ChannelProfitabilityAnalyzer:
             # Fallback (e.g. database layer without get_channel_cost)
             db_open_cost = self.database.get_channel_open_cost(channel_id)
 
+        # The stored opened_at is normally ground truth (written at actual
+        # open time). But rows written by the pre-fix analyzer carry a
+        # rolling now-30d estimate (the old future-landing SCID
+        # extrapolation rewrote opened_at every pass), so a stored value
+        # that deviates from the tip-anchored SCID estimate by more than
+        # the estimate's own error band is poisoned — repair it with the
+        # estimate instead of freezing the corruption forever.
+        _OPENED_AT_PLAUSIBLE_SLACK = 30 * 86400
+        stored_opened_at = (
+            db_cost_row.get("opened_at")
+            if (db_cost_row_known and db_cost_row is not None)
+            else None
+        )
+        if (
+            stored_opened_at
+            and open_timestamp
+            and abs(int(stored_opened_at) - int(open_timestamp)) > _OPENED_AT_PLAUSIBLE_SLACK
+        ):
+            stored_opened_at = None
+        effective_opened_at = stored_opened_at or open_timestamp
+
         if opener == 'remote':
             # Remote opener pays the fees -> Cost to us is 0
             open_cost = 0
@@ -2068,7 +2089,7 @@ class ChannelProfitabilityAnalyzer:
                 )
                 self.database.record_channel_open_cost(
                     channel_id, peer_id, 0, capacity_sats,
-                    timestamp=open_timestamp
+                    timestamp=effective_opened_at
                 )
         else:
             # Local opener -> We paid fees. Proceed with lookup logic.
@@ -2094,7 +2115,7 @@ class ChannelProfitabilityAnalyzer:
                         )
                         self.database.record_channel_open_cost(
                             channel_id, peer_id, requeried_cost, capacity_sats,
-                            timestamp=open_timestamp
+                            timestamp=effective_opened_at
                         )
                         open_cost = requeried_cost
             
@@ -2102,7 +2123,7 @@ class ChannelProfitabilityAnalyzer:
             if open_cost is not None and capacity_sats > 0:
                 open_cost = self._sanity_check_open_cost(
                     channel_id, peer_id, funding_txid, open_cost, capacity_sats,
-                    open_timestamp=open_timestamp,
+                    open_timestamp=effective_opened_at,
                     bkpr_cache=bkpr_cache
                 )
             
@@ -2112,7 +2133,7 @@ class ChannelProfitabilityAnalyzer:
                 if open_cost is not None:
                     self.database.record_channel_open_cost(
                         channel_id, peer_id, open_cost, capacity_sats,
-                        timestamp=open_timestamp
+                        timestamp=effective_opened_at
                     )
             
             # Final fallback
@@ -2132,16 +2153,6 @@ class ChannelProfitabilityAnalyzer:
         # 100 channels). Falls back to the unconditional write when the full
         # row could not be read (db_cost_row_known is False).
         if open_timestamp is not None and open_cost is not None:
-            # The stored opened_at was written at actual open time (see
-            # record_channel_open_cost callers on the open path) and is
-            # ground truth; open_timestamp here is only an SCID-based
-            # estimate. Never overwrite the former with the latter.
-            stored_opened_at = (
-                db_cost_row.get("opened_at")
-                if (db_cost_row_known and db_cost_row is not None)
-                else None
-            )
-            effective_opened_at = stored_opened_at or open_timestamp
             row_matches = (
                 db_cost_row_known
                 and db_cost_row is not None

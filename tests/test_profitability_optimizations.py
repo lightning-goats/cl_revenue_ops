@@ -278,6 +278,24 @@ class TestOpenCostWriteSkip:
         assert db.calls['record_channel_open_cost'] == 0
         assert db.cost_rows["800000x1x0"]["opened_at"] == stored
 
+    def test_implausible_stored_opened_at_is_repaired(self):
+        """Rows poisoned by the pre-fix rolling now-30d estimate (stored
+        opened_at wildly off the tip-anchored SCID estimate) are repaired
+        with the estimate instead of being frozen forever."""
+        channels = {"800000x1x0": make_channel_seed("800000x1x0")}
+        db = BatchFakeDatabase(channels)
+        analyzer = make_analyzer(db, channels)
+        seed = channels["800000x1x0"]
+        opened_at = analyzer._get_channel_open_timestamp(
+            "800000x1x0", seed['funding_txid'])
+        poisoned = opened_at + 120 * 86400  # 4 months off — implausible
+        db.seed_cost_row("800000x1x0", seed['peer_id'], 2000,
+                         seed['capacity'], poisoned)
+
+        analyzer.analyze_all_channels(force=True)
+        assert db.calls['record_channel_open_cost'] >= 1
+        assert db.cost_rows["800000x1x0"]["opened_at"] == opened_at
+
     def test_write_happens_when_capacity_differs(self):
         """A capacity change (e.g. splice) triggers the corrective write."""
         channels = {"800000x1x0": make_channel_seed("800000x1x0")}

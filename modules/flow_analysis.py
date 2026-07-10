@@ -980,47 +980,59 @@ class FlowAnalyzer:
             # Cap dt to prevent explosion after long gaps (7 days = 168 hours)
             dt_hours = min(dt_hours, 168.0)
 
-            # Predict step (always runs — grows uncertainty over time)
-            kf.predict(dt_hours, volatility)
-
-            # Update step — only when we have real observation data.
-            # Without this guard, channels with no forwards get observation=0.0
-            # which actively pulls the filter toward BALANCED regardless of prior state.
-            innovation = 0.0
+            # One filter step per observation window: a call arriving within
+            # KALMAN_MIN_UPDATE_INTERVAL_SECS of the last consume (e.g.
+            # polling the revenue-analyze RPC) must leave the filter
+            # UNTOUCHED — running predict from the same un-advanced anchor
+            # compounds velocity drift and process noise per poll, and
+            # re-running update would re-consume the same forwards. Read the
+            # current state and return without mutating or persisting.
             recently_updated = (
                 kf.state.last_update > 0
                 and (now - kf.state.last_update) < KALMAN_MIN_UPDATE_INTERVAL_SECS
             )
-            if has_observation and recently_updated:
-                # Same observation window as the last consume — predict-only.
-                # last_update is deliberately NOT advanced here, so continuous
-                # polling cannot starve the next genuine hourly update.
-                if kf._has_nan():
-                    kf._reset_state()
-            elif has_observation:
-                innovation = kf.update(observed_ratio, confidence)
+            innovation = 0.0
+            if recently_updated:
+                nan_recovery_count = 0
+                regime_change = kf.is_regime_change(threshold=2.5)
+                uncertainty = kf.get_uncertainty()
+                result_flow_ratio = kf.state.flow_ratio
+                result_flow_velocity = kf.state.flow_velocity
+                result_observation_count = kf.state.observation_count
+                state_snapshot = None  # unchanged — nothing to persist
             else:
-                # Predict-only: still record that we ran so dt_hours stays accurate
-                kf.state.last_update = int(time.time())
-                # AUDIT FIX I-3: Check for NaN after predict-only path
-                if kf._has_nan():
-                    kf._reset_state()
+                # Predict step — grows uncertainty over time
+                kf.predict(dt_hours, volatility)
 
-            # Snapshot the NaN-recovery counter and reset it while we still hold
-            # the lock, then log outside the critical section.
-            nan_recovery_count = kf._nan_recovery_count
-            kf._nan_recovery_count = 0
+                # Update step — only when we have real observation data.
+                # Without this guard, channels with no forwards get
+                # observation=0.0 which actively pulls the filter toward
+                # BALANCED regardless of prior state.
+                if has_observation:
+                    innovation = kf.update(observed_ratio, confidence)
+                else:
+                    # Predict-only: still record that we ran so dt_hours
+                    # stays accurate
+                    kf.state.last_update = int(time.time())
+                    # AUDIT FIX I-3: Check for NaN after predict-only path
+                    if kf._has_nan():
+                        kf._reset_state()
 
-            # Detect regime change
-            regime_change = kf.is_regime_change(threshold=2.5)
+                # Snapshot the NaN-recovery counter and reset it while we
+                # still hold the lock, then log outside the critical section.
+                nan_recovery_count = kf._nan_recovery_count
+                kf._nan_recovery_count = 0
 
-            # Read every value we return / persist while holding the lock so the
-            # caller sees a mutually-consistent snapshot of this filter.
-            uncertainty = kf.get_uncertainty()
-            result_flow_ratio = kf.state.flow_ratio
-            result_flow_velocity = kf.state.flow_velocity
-            result_observation_count = kf.state.observation_count
-            state_snapshot = kf.state.to_dict()
+                # Detect regime change
+                regime_change = kf.is_regime_change(threshold=2.5)
+
+                # Read every value we return / persist while holding the lock
+                # so the caller sees a mutually-consistent snapshot.
+                uncertainty = kf.get_uncertainty()
+                result_flow_ratio = kf.state.flow_ratio
+                result_flow_velocity = kf.state.flow_velocity
+                result_observation_count = kf.state.observation_count
+                state_snapshot = kf.state.to_dict()
 
         # L-25: Log warning on NaN recovery (outside the lock)
         if nan_recovery_count > 0:
@@ -1040,8 +1052,12 @@ class FlowAnalyzer:
         # Save state. Predict-only runs are saved too: the predict step still
         # changes covariance (uncertainty growth) and last_update, both of
         # which must survive restarts for dt accounting to stay correct. The
-        # DB write happens outside _kalman_lock using the snapshot taken above.
-        if pending_kalman_saves is not None:
+        # DB write happens outside _kalman_lock using the snapshot taken
+        # above. Gated (recently_updated) calls left the filter untouched,
+        # so there is nothing to persist.
+        if state_snapshot is None:
+            pass
+        elif pending_kalman_saves is not None:
             pending_kalman_saves.append(
                 {"channel_id": channel_id, "state": state_snapshot}
             )
