@@ -1055,6 +1055,13 @@ class Database:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_closure_costs_peer ON channel_closure_costs(peer_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_closure_costs_time ON channel_closure_costs(closed_at)")
+        # Closure-resolution sweep: bookkeeper account (hex channel_id, not
+        # SCID) so post-close HTLC sweeps can be re-queried after the fact.
+        try:
+            conn.execute("ALTER TABLE channel_closure_costs ADD COLUMN bkpr_account TEXT")
+            self.plugin.log("Added bkpr_account column to channel_closure_costs")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         # Closed Channels History table (Accounting v2.0)
         # Preserves complete P&L history for channels after they close
@@ -5844,7 +5851,8 @@ class Database:
         htlc_sweep_fee_sats: int = 0,
         penalty_fee_sats: int = 0,
         funding_txid: Optional[str] = None,
-        closing_txid: Optional[str] = None
+        closing_txid: Optional[str] = None,
+        bkpr_account: Optional[str] = None
     ) -> bool:
         """
         Record channel closure costs for accurate P&L accounting.
@@ -5861,6 +5869,8 @@ class Database:
             penalty_fee_sats: Penalty fees (if we were penalized - rare)
             funding_txid: The original funding transaction ID
             closing_txid: The closing transaction ID
+            bkpr_account: Bookkeeper account identifier (hex channel_id) so
+                the closure-resolution sweep can re-query later sweeps
 
         Returns:
             True if recorded successfully, False otherwise
@@ -5910,10 +5920,11 @@ class Database:
                 INSERT OR REPLACE INTO channel_closure_costs
                 (channel_id, peer_id, close_type, closure_fee_sats, htlc_sweep_fee_sats,
                  penalty_fee_sats, total_closure_cost_sats, funding_txid, closing_txid,
-                 closed_at, resolution_complete)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                 closed_at, resolution_complete, bkpr_account)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
             """, (channel_id, peer_id, close_type, closure_fee_sats, htlc_sweep_fee_sats,
-                  penalty_fee_sats, total_closure_cost, funding_txid, closing_txid, now))
+                  penalty_fee_sats, total_closure_cost, funding_txid, closing_txid, now,
+                  bkpr_account))
 
             self.plugin.log(
                 f"Recorded closure cost for {channel_id}: {total_closure_cost} sats "
@@ -5982,6 +5993,43 @@ class Database:
 
         except Exception as e:
             self.plugin.log(f"Error marking closure complete for {channel_id}: {e}", level='error')
+            return False
+
+    def get_unresolved_closures(self) -> List[Dict[str, Any]]:
+        """Closure rows whose on-chain resolution is not yet complete.
+
+        Consumed by the closure-resolution sweep, which re-queries the
+        bookkeeper for post-close HTLC sweeps and marks rows complete once
+        the account balance reaches zero.
+        """
+        try:
+            conn = self._get_connection()
+            rows = conn.execute("""
+                SELECT channel_id, peer_id, close_type, closure_fee_sats,
+                       htlc_sweep_fee_sats, penalty_fee_sats,
+                       total_closure_cost_sats, funding_txid, closing_txid,
+                       closed_at, bkpr_account
+                FROM channel_closure_costs
+                WHERE resolution_complete = 0
+                ORDER BY closed_at ASC
+            """).fetchall()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            self.plugin.log(f"Error listing unresolved closures: {e}", level='error')
+            return []
+
+    def set_closure_bkpr_account(self, channel_id: str, bkpr_account: str) -> bool:
+        """Backfill the bookkeeper account on a pre-existing closure row."""
+        try:
+            conn = self._get_connection()
+            conn.execute("""
+                UPDATE channel_closure_costs
+                SET bkpr_account = ?
+                WHERE channel_id = ? AND (bkpr_account IS NULL OR bkpr_account = '')
+            """, (bkpr_account, channel_id))
+            return True
+        except Exception as e:
+            self.plugin.log(f"Error setting closure bkpr_account for {channel_id}: {e}", level='error')
             return False
 
     def get_channel_closure_cost(self, channel_id: str) -> Optional[Dict[str, Any]]:

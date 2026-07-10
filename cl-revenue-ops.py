@@ -3365,6 +3365,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             _take_financial_snapshot()
         except Exception as e:
             plugin.log(f"Error taking initial financial snapshot: {e}", level='warn')
+        try:
+            _reconcile_closure_resolutions()
+        except Exception as e:
+            plugin.log(f"Error reconciling closure resolutions: {e}", level='warn')
 
         while not shutdown_event.is_set():
             # DD5 / P1-010: canonical guard over the ENTIRE iteration. This loop
@@ -3387,6 +3391,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     plugin.log(f"RPC degraded in financial snapshot: {e}. Skipping this cycle.", level='warn')
                 except Exception as e:
                     plugin.log(f"Error in financial snapshot: {e}", level='error')
+
+                # Daily closure-resolution sweep: accumulate post-close HTLC
+                # sweep fees for closures whose outputs were still unresolved
+                # at close-detection time.
+                try:
+                    _reconcile_closure_resolutions()
+                except Exception as e:
+                    plugin.log(f"Error reconciling closure resolutions: {e}", level='warn')
             except Exception as e:
                 plugin.log(f"Unhandled error in financial-snapshot loop iteration: {e}", level='error')
                 try:
@@ -6606,7 +6618,8 @@ def _on_channel_state_changed_impl(plugin: Plugin, **kwargs):
         closure_fee_sats=closure_fee_sats,
         htlc_sweep_fee_sats=htlc_sweep_fee_sats,
         funding_txid=funding_txid,
-        closing_txid=closing_txid
+        closing_txid=closing_txid,
+        bkpr_account=bkpr_account
     )
 
     # If the channel is fully closed, archive its P&L history
@@ -6787,6 +6800,124 @@ def _get_closure_costs_from_bookkeeper(bkpr_account: str) -> Optional[Dict[str, 
     except Exception as e:
         plugin.log(f"Bookkeeper query failed for {bkpr_account}: {e}", level='debug')
         return None
+
+
+# Give up polling a closure this long after close: whatever the bookkeeper
+# reports by then is final for our accounting (timelocks and sweeps resolve
+# in days, not months).
+CLOSURE_RESOLUTION_TIMEOUT_DAYS = 90
+
+
+def _reconcile_closure_resolutions() -> Dict[str, Any]:
+    """Accumulate post-close resolution fees (HTLC sweeps) for closures
+    recorded before their outputs were fully swept.
+
+    record_channel_closure fires once at close detection; unilateral closes
+    keep paying sweep fees for hours or days afterwards. This sweep
+    re-queries the bookkeeper for every unresolved closure row, adds any new
+    fees via update_closure_resolution, and marks the row complete once the
+    bookkeeper account balance reaches zero (or after
+    CLOSURE_RESOLUTION_TIMEOUT_DAYS).
+    """
+    summary = {"checked": 0, "updated": 0, "completed": 0, "added_fee_sats": 0}
+    if database is None or safe_plugin is None:
+        return summary
+
+    rows = database.get_unresolved_closures()
+    if not rows:
+        return summary
+
+    # One balances call for every account: zero balance == fully swept.
+    balances_by_account: Dict[str, int] = {}
+    balances_available = False
+    try:
+        balances = safe_plugin.rpc.call("bkpr-listbalances", {})
+        for acct in balances.get("accounts", []) or []:
+            name = str(acct.get("account") or "")
+            total = 0
+            for bal in acct.get("balances", []) or []:
+                total += parse_msat(bal.get("balance_msat", 0) or 0)
+            balances_by_account[name] = total
+        balances_available = True
+    except Exception as e:
+        plugin.log(f"CLOSURE_SWEEP: bkpr-listbalances unavailable: {e}", level='debug')
+
+    # Legacy rows (recorded before bkpr_account was stored) resolve their
+    # account via listclosedchannels' SCID -> hex channel_id mapping.
+    scid_to_account: Dict[str, str] = {}
+
+    def _account_for(row: Dict[str, Any]) -> Optional[str]:
+        account = str(row.get("bkpr_account") or "")
+        if account:
+            return account
+        nonlocal scid_to_account
+        if not scid_to_account:
+            try:
+                closed = (data_service.get_closed_channels() if data_service
+                          else safe_plugin.rpc.call("listclosedchannels"))
+                for ch in closed.get("closedchannels", []) or []:
+                    scid = normalize_scid(ch.get("short_channel_id", "") or "")
+                    acct = str(ch.get("channel_id") or "")
+                    if scid and acct:
+                        scid_to_account[scid] = acct
+            except Exception as e:
+                plugin.log(f"CLOSURE_SWEEP: listclosedchannels unavailable: {e}", level='debug')
+                scid_to_account = {"": ""}  # sentinel: don't retry this pass
+        account = scid_to_account.get(normalize_scid(row.get("channel_id") or ""), "")
+        if account:
+            database.set_closure_bkpr_account(row["channel_id"], account)
+        return account or None
+
+    now = int(time.time())
+    for row in rows:
+        summary["checked"] += 1
+        channel_id = row.get("channel_id")
+        closed_at = int(row.get("closed_at") or 0)
+        aged_out = closed_at > 0 and (now - closed_at) > CLOSURE_RESOLUTION_TIMEOUT_DAYS * 86400
+
+        account = _account_for(row)
+        if not account:
+            # Without an account we cannot re-query; once aged out, stop
+            # revisiting the row every pass.
+            if aged_out:
+                database.mark_closure_complete(channel_id)
+                summary["completed"] += 1
+            continue
+
+        fresh = None
+        try:
+            fresh = _get_closure_costs_from_bookkeeper(account)
+        except Exception as e:
+            plugin.log(f"CLOSURE_SWEEP: bkpr query failed for {channel_id}: {e}", level='debug')
+        if fresh:
+            stored_total = (int(row.get("closure_fee_sats") or 0)
+                            + int(row.get("htlc_sweep_fee_sats") or 0))
+            fresh_total = (int(fresh.get("closure_fee_sats") or 0)
+                           + int(fresh.get("htlc_sweep_fee_sats") or 0))
+            delta = fresh_total - stored_total
+            if delta > 0:
+                database.update_closure_resolution(channel_id, delta)
+                summary["updated"] += 1
+                summary["added_fee_sats"] += delta
+                plugin.log(
+                    f"CLOSURE_SWEEP: {channel_id} +{delta} sats post-close "
+                    f"resolution fees (total now {fresh_total})",
+                    level='info'
+                )
+
+        resolved = balances_available and balances_by_account.get(account, 0) == 0
+        if resolved or aged_out:
+            database.mark_closure_complete(channel_id)
+            summary["completed"] += 1
+
+    if summary["updated"] or summary["completed"]:
+        plugin.log(
+            f"CLOSURE_SWEEP: checked={summary['checked']} "
+            f"updated={summary['updated']} (+{summary['added_fee_sats']} sats) "
+            f"completed={summary['completed']}",
+            level='info'
+        )
+    return summary
 
 
 def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type: str,
