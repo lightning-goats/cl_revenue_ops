@@ -211,14 +211,14 @@ class LNPlusClient:
 
     def get_notifications(self) -> Dict:
         result = self._request("get_notifications", self._auth_params(), method="POST")
-        result = _unwrap_list_envelope(result)
+        result = self._unwrap_list_envelope(result, {})
         if not isinstance(result, dict):
             raise LNPlusError("get_notifications: unexpected payload")
         return result
 
     def mark_read_notifications(self) -> Dict:
         result = self._request("mark_read_notifications", self._auth_params(), method="POST")
-        return _unwrap_list_envelope(result) if isinstance(result, (list, dict)) else {}
+        return self._unwrap_list_envelope(result, {}) if isinstance(result, (list, dict)) else {}
 
     def create_rating(self, swap_id, rating: str) -> Dict:
         if rating not in ("positive", "negative"):
@@ -476,7 +476,11 @@ class SwapEvaluator:
         replacement = capacity * BOLTZ_REPLACEMENT_RATE
         inbound_credit = min(inbound_corridor, replacement)
 
-        counterparties = [p for p in (swap.get("participants") or [])]
+        # B12: cancelled/banned participants are no longer party to the
+        # swap — exclude them from reliability and the Tor discount, same
+        # as gate 5 and _infer_assignment already do.
+        counterparties = [p for p in (swap.get("participants") or [])
+                          if not (p.get("cancelled") or p.get("banned"))]
         min_pos = min((int(p.get("positive_ratings_count") or 0) for p in counterparties),
                       default=0)
         reliability = min(1.0, RELIABILITY_FLOOR + 0.4 * min(1.0, min_pos / 50.0))
@@ -748,6 +752,20 @@ class SwapLifecycle:
                 if now - applied_at < _RECONCILE_GRACE_SECONDS:
                     continue
                 if sid in pending_ids or sid in opening_ids:
+                    continue
+                if sid in completed_ids:
+                    # The swap filled and completed while our row was still
+                    # 'applied' (e.g. operator drove it manually on the LN+
+                    # site while the watcher was down). This is a LIVE
+                    # contract, not a remote cancellation — terminally
+                    # marking it cancelled_remote would skip activation and
+                    # leave the contract channel unprotected (no no_close
+                    # tag). Trip the breaker for operator review instead.
+                    self.trip_breaker(
+                        f"local swap {sid} still 'applied' but LN+ lists it "
+                        "completed — run revenue-lnplus-backfill or resolve "
+                        "manually")
+                    ok = False
                     continue
                 # B4: an 'applied' row absent from pending/opening/completed
                 # on a successful fetch is a REMOTE cancellation (creator

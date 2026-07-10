@@ -116,30 +116,6 @@ def test_revenue_config_overrides_are_transient(monkeypatch):
     ]
 
 
-def test_hive_hints_disabled_uses_transient_config(monkeypatch):
-    loop = load_loop()
-    calls = []
-
-    def fake_cln(*args):
-        calls.append(args)
-        return {"ok": True}
-
-    monkeypatch.setattr(loop.tournament, "cln", fake_cln)
-
-    result = loop.set_hive_hints_disabled()
-
-    assert result["ok"] is True
-    assert calls == [
-        (
-            "revenue-node",
-            "setconfig",
-            "revenue-ops-hive-hints-enabled",
-            "false",
-            "true",
-        )
-    ]
-
-
 def test_pay_between_uses_single_hop_direct_sendpay(monkeypatch):
     loop = load_loop()
     calls = []

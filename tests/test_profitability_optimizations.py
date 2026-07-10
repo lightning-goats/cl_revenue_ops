@@ -260,21 +260,23 @@ class TestOpenCostWriteSkip:
         analyzer.analyze_all_channels(force=True)
         assert db.calls['record_channel_open_cost'] == 0
 
-    def test_write_happens_when_opened_at_differs(self):
-        """A stale opened_at still triggers the corrective write."""
+    def test_stored_opened_at_is_preserved_not_clobbered(self):
+        """The stored opened_at is ground truth (written at actual open
+        time); the analyzer's SCID-based estimate must never overwrite
+        it — a differing stored value is trusted, so no write happens."""
         channels = {"800000x1x0": make_channel_seed("800000x1x0")}
         db = BatchFakeDatabase(channels)
         analyzer = make_analyzer(db, channels)
         seed = channels["800000x1x0"]
-        # opened_at wrong by a day -> must be rewritten
         opened_at = analyzer._get_channel_open_timestamp(
             "800000x1x0", seed['funding_txid'])
+        stored = opened_at - 86400
         db.seed_cost_row("800000x1x0", seed['peer_id'], 2000,
-                         seed['capacity'], opened_at - 86400)
+                         seed['capacity'], stored)
 
         analyzer.analyze_all_channels(force=True)
-        assert db.calls['record_channel_open_cost'] >= 1
-        assert db.cost_rows["800000x1x0"]["opened_at"] == opened_at
+        assert db.calls['record_channel_open_cost'] == 0
+        assert db.cost_rows["800000x1x0"]["opened_at"] == stored
 
     def test_write_happens_when_capacity_differs(self):
         """A capacity change (e.g. splice) triggers the corrective write."""

@@ -46,7 +46,6 @@ def _bootstrap_score_decomposition(
     source_drain_term: float = 0.0,
     dest_value_term: float = 0.0,
     cheap_return_term: float = 0.0,
-    pre_hint_pair_score: float = 0.0,
 ) -> dict:
     """Return the initial explicit score breakdown for a planned pair.
 
@@ -83,7 +82,6 @@ def _bootstrap_score_decomposition(
             "source_drain_term": round(float(source_drain_term), 6),
             "dest_value_term": round(float(dest_value_term), 6),
             "cheap_return_term": round(float(cheap_return_term), 6),
-            "pre_hint_pair_score": round(float(pre_hint_pair_score), 6),
         },
     }
 
@@ -316,8 +314,6 @@ class RebalancePlanner:
                     + dest_value_term
                     + cheap_return_term
                 )
-                pre_hint_score = score
-
                 # Backwards-compat: keep value_score reference for callers and
                 # tests that still inspect it via the bootstrap decomposition.
                 value_score = dest_value
@@ -384,7 +380,6 @@ class RebalancePlanner:
                         source_drain_term=source_drain_term,
                         dest_value_term=dest_value_term,
                         cheap_return_term=cheap_return_term,
-                        pre_hint_pair_score=pre_hint_score,
                     ),
                 ))
 

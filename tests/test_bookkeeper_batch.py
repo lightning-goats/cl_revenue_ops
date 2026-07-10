@@ -274,12 +274,26 @@ class TestOpenCostFromCache:
 
 class TestOpenTimestampNoBkprRpc:
     def test_scid_block_height_estimate(self):
-        """Timestamp is derived from SCID block height without any RPC."""
+        """Timestamp is anchored on the live tip height, not genesis: at
+        real average block times a genesis+height*600 extrapolation lands
+        in the future and every recent channel fell to the 30d fallback."""
         analyzer = _make_analyzer()
+        analyzer.data_service = None
+        analyzer.plugin.rpc.getinfo.return_value = {"blockheight": 950_000}
+        now = int(time.time())
         ts = analyzer._get_channel_open_timestamp("900000x123x0", "sometxid")
-        expected = 1231006505 + (900000 * 600)
-        assert ts == expected
+        expected = now - (950_000 - 900_000) * 600
+        assert abs(ts - expected) < 5
         analyzer.plugin.rpc.call.assert_not_called()
+
+    def test_tip_unavailable_falls_back_to_30d(self):
+        """No usable tip height -> conservative 30-day fallback."""
+        analyzer = _make_analyzer()
+        analyzer.data_service = None
+        analyzer.plugin.rpc.getinfo.side_effect = RuntimeError("rpc down")
+        now = int(time.time())
+        ts = analyzer._get_channel_open_timestamp("900000x123x0", "sometxid")
+        assert abs(ts - (now - 86400 * 30)) < 5
 
     def test_fallback_when_scid_unparseable(self):
         """Bad SCID format falls back to 30 days ago."""

@@ -1174,8 +1174,9 @@ plugin.add_option(
     default='off',
     description=(
         'Base-fee policy (Upgrade A, 2026-04-22). '
-        '"off" (default) and "adaptive" both use revenue-ops-base-fee-msat '
-        'for all channels (the per-role split retired with cl-mycelium).'
+        '"off" (default) and "adaptive" are equivalent: every channel gets '
+        'the internal base fee default of 0 msat (the per-role split was '
+        'retired; there is no revenue-ops-base-fee-msat option).'
     )
 )
 
@@ -1359,13 +1360,13 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-growth-budget-experiment-fraction',
     default='0.10',
-    description='Fraction of trailing net profit available for fleet-learned growth experiments (default: 0.10)'
+    description='INERT since v2.17.0: the growth-experiment credit required the retired fleet prior producer; this option is kept only so existing configs load (default: 0.10)'
 )
 
 plugin.add_option(
     name='revenue-ops-growth-budget-max-extra-sats',
     default='2000',
-    description='Maximum extra sats unlocked by growth experiment credit per budget window (default: 2000)'
+    description='INERT since v2.17.0: caps the growth-experiment credit, which can no longer be granted (fleet prior producer retired); kept only so existing configs load (default: 2000)'
 )
 
 plugin.add_option(
@@ -4398,12 +4399,14 @@ def revenue_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
 
 
 @plugin.method("revenue-set-fee")
-def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool = False) -> Dict[str, Any]:
+def revenue_set_fee(plugin: Plugin, channel_id: str = None, fee_ppm: int = None, force: bool = False) -> Dict[str, Any]:
     """
     Manually set fee for a channel.
 
     Usage: lightning-cli revenue-set-fee channel_id fee_ppm [force=false]
     """
+    if channel_id is None or fee_ppm is None:
+        return {"error": "usage: revenue-set-fee channel_id fee_ppm [force=false]"}
     if fee_controller is None or config is None:
         return {"error": "Plugin not fully initialized"}
 
@@ -4478,9 +4481,9 @@ def revenue_set_fee(plugin: Plugin, channel_id: str, fee_ppm: int, force: bool =
 
 @plugin.method("revenue-rebalance")
 def revenue_rebalance(plugin: Plugin,
-                      from_channel: str,
-                      to_channel: str,
-                      amount_sats: int,
+                      from_channel: str = None,
+                      to_channel: str = None,
+                      amount_sats: int = None,
                       max_fee_sats: Optional[int] = None,
                       force: bool = False) -> Dict[str, Any]:
     """
@@ -4488,6 +4491,8 @@ def revenue_rebalance(plugin: Plugin,
 
     Usage: lightning-cli revenue-rebalance from_channel to_channel amount_sats [max_fee_sats] [force=false]
     """
+    if not from_channel or not to_channel or amount_sats is None:
+        return {"error": "usage: revenue-rebalance from_channel to_channel amount_sats [max_fee_sats] [force=false]"}
     if rebalancer is None:
         return {"error": "Plugin not fully initialized"}
 
@@ -7187,7 +7192,9 @@ def revenue_boltz_wallet(plugin: Plugin) -> Dict[str, Any]:
 
 
 @plugin.method("revenue-boltz-refund")
-def revenue_boltz_refund(plugin: Plugin, swap_id: str, destination: str = None) -> Dict[str, Any]:
+def revenue_boltz_refund(plugin: Plugin, swap_id: str = None, destination: str = None) -> Dict[str, Any]:
+    if not swap_id:
+        return {"error": "usage: revenue-boltz-refund swap_id [destination]"}
     try:
         return _require_boltz_manager().refund(swap_id=swap_id, destination=destination)
     except Exception as e:
@@ -7195,7 +7202,9 @@ def revenue_boltz_refund(plugin: Plugin, swap_id: str, destination: str = None) 
 
 
 @plugin.method("revenue-boltz-claim")
-def revenue_boltz_claim(plugin: Plugin, swap_ids: List[str], destination: str = None) -> Dict[str, Any]:
+def revenue_boltz_claim(plugin: Plugin, swap_ids: List[str] = None, destination: str = None) -> Dict[str, Any]:
+    if not swap_ids:
+        return {"error": "usage: revenue-boltz-claim swap_ids [destination]"}
     try:
         return _require_boltz_manager().claim(swap_ids=swap_ids, destination=destination)
     except Exception as e:
@@ -8916,7 +8925,6 @@ def revenue_boltz_balance_recommendations(
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-auto-cycle-status")
 def _compact_boltz_recommendation(rec: Any) -> Dict[str, Any]:
     """Compact summary of a balance/treasury recommendation for status
     payloads. Skip/plan entries in revenue-boltz-auto-cycle-status embed
@@ -8943,6 +8951,7 @@ def _compact_boltz_recommendation(rec: Any) -> Dict[str, Any]:
     return compact
 
 
+@plugin.method("revenue-boltz-auto-cycle-status")
 def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
     """Return scheduler status for the in-plugin Boltz auto-cycle."""
     with _boltz_auto_cycle_state_lock:
@@ -9154,6 +9163,12 @@ def _execute_boltz_balance_cycle(
             _boltz_balance_last_action[ch_id] = now
 
         if dry_run:
+            # A preview must not consume the live cooldown slot (C1 pre-claim
+            # above) — otherwise a dry-run pass suppresses the next live run
+            # for hours per channel.
+            with _boltz_balance_lock:
+                if _boltz_balance_last_action.get(ch_id) == now:
+                    _boltz_balance_last_action[ch_id] = last_ts
             executed.append({
                 "status": "would_execute",
                 "direction": direction,
@@ -9179,6 +9194,9 @@ def _execute_boltz_balance_cycle(
                         currency = "LBTC"
                 _ok, _why = _boltz_exec_policy_recheck(peer_id, "loop_in")
                 if not _ok:
+                    with _boltz_balance_lock:
+                        if _boltz_balance_last_action.get(ch_id) == now:
+                            _boltz_balance_last_action[ch_id] = last_ts
                     skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id,
                                          "reason": f"policy_recheck_blocked: {_why}"})
                     continue
@@ -9194,6 +9212,9 @@ def _execute_boltz_balance_cycle(
                 exec_peer_id = peer_id
                 _ok, _why = _boltz_exec_policy_recheck(exec_peer_id, "loop_out")
                 if not _ok:
+                    with _boltz_balance_lock:
+                        if _boltz_balance_last_action.get(ch_id) == now:
+                            _boltz_balance_last_action[ch_id] = last_ts
                     skipped_exec.append({"channel_id": ch_id, "peer_id": exec_peer_id,
                                          "reason": f"policy_recheck_blocked: {_why}"})
                     continue
@@ -9210,9 +9231,12 @@ def _execute_boltz_balance_cycle(
             else:
                 raise BoltzCliError(f"Unknown direction: {direction}")
 
-            # Treat accepted/rejected separately.
+            # Treat accepted/rejected/error separately. "error" is a swap
+            # boltzcli reported as failed inside an exit-0 payload (see
+            # BoltzManager._is_error_swap) — like "rejected", it must not
+            # consume budget or hold the cooldown slot.
             status = str(res.get("status") or "")
-            if status in ("accepted", "rejected"):
+            if status in ("accepted", "rejected", "error"):
                 executed.append({
                     "status": status,
                     "direction": direction,
@@ -9227,11 +9251,11 @@ def _execute_boltz_balance_cycle(
                     # C1: Pre-claim already set; just update budget
                     remaining_budget = max(0, remaining_budget - est_fee)
                 else:
-                    # C1: Rejected - restore original cooldown timestamp
+                    # C1: Rejected/errored - restore original cooldown timestamp
                     with _boltz_balance_lock:
                         if _boltz_balance_last_action.get(ch_id) == now:
                             _boltz_balance_last_action[ch_id] = last_ts
-                    skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id, "reason": "execution_rejected", "result": res})
+                    skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id, "reason": f"execution_{status}", "result": res})
             else:
                 executed.append({
                     "status": "unknown",

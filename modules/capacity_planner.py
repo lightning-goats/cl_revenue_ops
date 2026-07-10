@@ -625,6 +625,20 @@ class CapacityPlanner:
                     summary["lnplus"] = _lnplus_summary
                     if _lnplus_summary.get("applied"):
                         opens_this_cycle += 1
+                        # The applied swap is an irreversible commitment of
+                        # on-chain funds (fundchannel within 48h of fill).
+                        # available_sats was computed BEFORE the application,
+                        # so debit the fresh reservation here or a same-cycle
+                        # regular open can spend the swap's capacity and force
+                        # a missed deadline (breaker trip + public defection).
+                        try:
+                            _fresh_reserved = self.profitability.database.lnplus_reserved_sats()
+                            if isinstance(_fresh_reserved, (int, float)) and not isinstance(_fresh_reserved, bool):
+                                available_sats = max(
+                                    0, available_sats - max(0, int(_fresh_reserved) - int(_lnplus_reserved or 0))
+                                )
+                        except Exception:
+                            pass
                 except Exception as e:
                     self.plugin.log(f"LNPLUS: evaluator failed: {e}", level="warn")
 
@@ -1027,11 +1041,30 @@ class CapacityPlanner:
                 estimated_closure_cost = self._estimate_close_cost()
                 reason = fire_sale_reason if is_fire_sale else "STAGNANT"
 
-                if is_hard_bleeder or attempt_count >= 2:
+                # Deadlock guard: defibrillation is policy-impossible for
+                # rebalance_mode=disabled/source_only peers (the executor's
+                # _check_defib_allowed blocks BEFORE anything is recorded),
+                # so attempt_count can never reach 2 — requiring it would
+                # loop DEFIBRILLATE -> policy-skip forever and the capital
+                # would never be redeployable. Waive the prerequisite for
+                # exactly that case; _check_close_allowed still gates the
+                # actual close downstream.
+                defib_policy_blocked = False
+                try:
+                    _defib_ok, _defib_why = self._check_defib_allowed(prof.peer_id)
+                    defib_policy_blocked = (
+                        not _defib_ok and "rebalance_mode=" in str(_defib_why)
+                    )
+                except Exception:
+                    defib_policy_blocked = False
+
+                if is_hard_bleeder or attempt_count >= 2 or defib_policy_blocked:
                     action = "CLOSE"
-                    # Regime change demotes CLOSE to DEFIBRILLATE (unless hard bleeder,
-                    # which is structurally unprofitable regardless of regime shifts)
-                    if regime_change and not is_hard_bleeder:
+                    # Regime change demotes CLOSE to DEFIBRILLATE (unless hard
+                    # bleeder — structurally unprofitable regardless of regime
+                    # shifts — or defib is policy-impossible, where the
+                    # demotion would just re-deadlock the pipeline)
+                    if regime_change and not is_hard_bleeder and not defib_policy_blocked:
                         action = "DEFIBRILLATE"
                         reason = f"{reason} (REGIME CHANGE)"
                 else:
@@ -2375,10 +2408,19 @@ class CapacityPlanner:
                 if o.get("status") == "confirmed"
             )
             min_reserve = getattr(cfg, 'min_wallet_reserve', 500000)
-            available = confirmed - min_reserve
+            # On-chain capacity committed to in-flight LN+ swap opens is not
+            # spendable by regular opens (same rule as the sizing pass).
+            lnplus_reserved = 0
+            try:
+                _r = self.profitability.database.lnplus_reserved_sats()
+                if isinstance(_r, (int, float)) and not isinstance(_r, bool):
+                    lnplus_reserved = max(0, int(_r))
+            except Exception:
+                lnplus_reserved = 0
+            available = confirmed - min_reserve - lnplus_reserved
             if available < required_sats:
-                return False, f"Insufficient funds: {available} available < {required_sats} required (reserve: {min_reserve})"
-            return True, f"Available: {available} sats (reserve: {min_reserve})"
+                return False, f"Insufficient funds: {available} available < {required_sats} required (reserve: {min_reserve}, lnplus_reserved: {lnplus_reserved})"
+            return True, f"Available: {available} sats (reserve: {min_reserve}, lnplus_reserved: {lnplus_reserved})"
         except Exception as e:
             return False, f"Cannot check funds: {e}"
 

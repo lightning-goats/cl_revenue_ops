@@ -288,8 +288,6 @@ class RebalanceRouterV3:
     def _probe_layers(
         self,
         layer_names: Optional[List[str]] = None,
-        *,
-        include_observed_liquidity: bool = True,
     ) -> List[str]:
         """Check which of the requested layers exist on the node.
 
@@ -338,6 +336,21 @@ class RebalanceRouterV3:
         Returns a RouteResult matching the v2 router's shape so the engine
         and executor can consume either router's output transparently.
         """
+        # Self-heal an empty node id: a transient getinfo failure during
+        # engine init froze our_node_id="" for the plugin's lifetime, which
+        # breaks loop detection and first/final-hop direction for ~half of
+        # peers (every sendpay then fails until restart).
+        if not self.our_node_id:
+            try:
+                if self.data_service is not None:
+                    self.our_node_id = str(self.data_service.get_node_id() or "")
+                else:
+                    self.our_node_id = str(
+                        self.plugin.rpc.getinfo().get("id", "") or ""
+                    )
+            except Exception:
+                pass
+
         final_hop_policy = self._v2_helpers._get_final_hop_policy(
             dest_peer_id, dest_channel_id
         )

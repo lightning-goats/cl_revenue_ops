@@ -130,11 +130,12 @@ async def handle_revenue_hive_status(args: Dict) -> Dict:
     elif isinstance(rebalance_debug, dict) and "error" in rebalance_debug:
         result["revenue_hints"] = {"status": "error", "detail": str(rebalance_debug["error"])}
     else:
-        hive_hints = rebalance_debug.get("hive_hints", {}) if isinstance(rebalance_debug, dict) else {}
+        # cl_revenue_ops v2.17.0 removed the hive_hints diagnostic (the
+        # hint integration is gone); a responsive rebalance-debug IS the
+        # health signal now.
         result["revenue_hints"] = {
-            "status": "pass" if isinstance(hive_hints, dict) and hive_hints.get("snapshot_usable") else "warn",
-            "diagnostic": "revenue-rebalance-debug.hive_hints",
-            "hive_hints": hive_hints,
+            "status": "pass",
+            "diagnostic": "revenue-rebalance-debug",
         }
 
     hive_ok = isinstance(result["hive_status"], dict) and "error" not in result["hive_status"]
@@ -344,22 +345,17 @@ async def handle_revenue_ops_health(args: Dict) -> Dict:
     elif isinstance(rebalance_debug, dict) and "error" in rebalance_debug:
         checks["hive_hints"] = {"status": "error", "detail": rebalance_debug["error"]}
     else:
-        hive_hints = rebalance_debug.get("hive_hints", {}) if isinstance(rebalance_debug, dict) else {}
-        if isinstance(hive_hints, dict):
+        if isinstance(rebalance_debug, dict):
+            # cl_revenue_ops v2.17.0 removed the hive_hints diagnostic; a
+            # responsive rebalance-debug IS the health signal now.
             checks["hive_hints"] = {
-                "status": "pass" if hive_hints.get("snapshot_usable") else "warn",
-                "diagnostic": "revenue-rebalance-debug.hive_hints",
-                "snapshot_fresh": hive_hints.get("snapshot_fresh"),
-                "snapshot_usable": hive_hints.get("snapshot_usable"),
-                "stale_fallback": hive_hints.get("stale_fallback"),
-                "snapshot_age_seconds": hive_hints.get("snapshot_age_seconds"),
-                "hints_count": hive_hints.get("hints_count"),
-                "member_hints_count": hive_hints.get("member_hints_count"),
+                "status": "pass",
+                "diagnostic": "revenue-rebalance-debug",
             }
         else:
             checks["hive_hints"] = {
                 "status": "warn",
-                "detail": "revenue-rebalance-debug returned without hive_hints diagnostic",
+                "detail": "revenue-rebalance-debug returned a non-dict payload",
             }
 
     statuses = [check["status"] for check in checks.values()]

@@ -1277,6 +1277,18 @@ class Database:
         except Exception as e:
             self.plugin.log(f"DB migration warning: {e}", level='debug')
 
+        # Drop the 2026-07 de-hive orphans: hive membership confirmations and
+        # the zero-fee-corridor flow instrumentation (v2.16.0 removed all
+        # readers/writers; production DBs still carried the tables).
+        for _drop_stmt in (
+            'DROP TABLE IF EXISTS hive_member_confirmations',
+            'DROP TABLE IF EXISTS corridor_flow_daily',
+        ):
+            try:
+                conn.execute(_drop_stmt)
+            except Exception as e:
+                self.plugin.log(f"DB migration warning: {e}", level='debug')
+
         # Rebalancer efficiency: failure-informed routing columns
         for col, col_type, default in [
             ("last_attempted_ppm", "INTEGER", "0"),
@@ -5353,14 +5365,30 @@ class Database:
         return base_to_sats_floor(row['total_volume_msat']) if row else 0
 
     def get_total_volume_since(self, since_timestamp: int) -> int:
-        """Get total routing volume since a timestamp (in sats)."""
+        """Get total routing volume since a timestamp (in sats).
+
+        Mirrors get_total_routing_revenue's raw+rollup composition (M-16):
+        the forwards table only retains ~days of raw rows, so a 30-day
+        window read from it alone paired month-long revenue with ~a week
+        of volume, inflating apparent effective ppm.
+        """
         conn = self._get_connection()
-        
+        since_day = (int(since_timestamp) // 86400) * 86400
+        today_start = (int(time.time()) // 86400) * 86400
+
         row = conn.execute("""
-            SELECT COALESCE(SUM(out_msat), 0) as total_volume_msat
-            FROM forwards
-            WHERE timestamp >= ?
-        """, (since_timestamp,)).fetchone()
+            SELECT
+                (
+                    SELECT COALESCE(SUM(out_msat), 0)
+                    FROM forwards
+                    WHERE timestamp >= ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(total_out_msat), 0)
+                    FROM daily_forwarding_stats
+                    WHERE date >= ? AND date < ?
+                ) AS total_volume_msat
+        """, (since_timestamp, since_day, today_start)).fetchone()
 
         return base_to_sats_floor(row['total_volume_msat']) if row else 0
 
@@ -5388,15 +5416,26 @@ class Database:
         return [dict(r) for r in rows]
 
     def get_total_forward_count_since(self, since_timestamp: int) -> int:
-        """Get total forward count since a timestamp."""
+        """Get total forward count since a timestamp (raw + daily rollups,
+        same window composition as get_total_routing_revenue)."""
         conn = self._get_connection()
-        
+        since_day = (int(since_timestamp) // 86400) * 86400
+        today_start = (int(time.time()) // 86400) * 86400
+
         row = conn.execute("""
-            SELECT COUNT(*) as count
-            FROM forwards
-            WHERE timestamp >= ?
-        """, (since_timestamp,)).fetchone()
-        
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM forwards
+                    WHERE timestamp >= ?
+                ) +
+                (
+                    SELECT COALESCE(SUM(forward_count), 0)
+                    FROM daily_forwarding_stats
+                    WHERE date >= ? AND date < ?
+                ) AS count
+        """, (since_timestamp, since_day, today_start)).fetchone()
+
         return row['count'] if row else 0
     
     def get_peer_latency_stats(self, peer_id: str, window_seconds: int = 86400) -> Dict[str, float]:

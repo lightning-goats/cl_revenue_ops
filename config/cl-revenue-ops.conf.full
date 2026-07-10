@@ -67,9 +67,9 @@
 # skipped.
 #revenue-ops-neighbor-median-min-competitors=2
 
-# Base-fee policy (Upgrade A). "off" (default) and "adaptive" both apply
-# revenue-ops-base-fee-msat to every channel (the per-role split was retired
-# with the cl-mycelium integration).
+# Base-fee policy (Upgrade A). "off" (default) and "adaptive" are
+# equivalent: every channel gets the internal 0-msat base fee (the
+# per-role split was retired with the cl-mycelium integration).
 #revenue-ops-base-fee-policy=off
 
 # DEPRECATED no-op compatibility flags. The fee market boundary guard was

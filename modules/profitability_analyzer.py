@@ -1982,13 +1982,23 @@ class ChannelProfitabilityAnalyzer:
         if channel_id and 'x' in channel_id:
             try:
                 block_height = int(channel_id.split('x')[0])
-                genesis_timestamp = 1231006505
-                seconds_per_block = 600
-                estimated_timestamp = genesis_timestamp + (block_height * seconds_per_block)
-
+                # Anchor on the live tip: real blocks average under 10 min,
+                # so a genesis + height*600s extrapolation lands months in
+                # the FUTURE at current heights and every recent channel
+                # fell to the 30-day fallback (days_open frozen at 30).
+                current_height = 0
+                try:
+                    if self.data_service is not None:
+                        current_height = int(self.data_service.get_block_height() or 0)
+                    else:
+                        current_height = int(
+                            self.plugin.rpc.getinfo().get("blockheight", 0) or 0
+                        )
+                except Exception:
+                    current_height = 0
                 now = int(time.time())
-                if estimated_timestamp < now:
-                    return estimated_timestamp
+                if current_height >= block_height > 0:
+                    return now - (current_height - block_height) * 600
 
             except (ValueError, IndexError):
                 pass
@@ -2122,18 +2132,28 @@ class ChannelProfitabilityAnalyzer:
         # 100 channels). Falls back to the unconditional write when the full
         # row could not be read (db_cost_row_known is False).
         if open_timestamp is not None and open_cost is not None:
+            # The stored opened_at was written at actual open time (see
+            # record_channel_open_cost callers on the open path) and is
+            # ground truth; open_timestamp here is only an SCID-based
+            # estimate. Never overwrite the former with the latter.
+            stored_opened_at = (
+                db_cost_row.get("opened_at")
+                if (db_cost_row_known and db_cost_row is not None)
+                else None
+            )
+            effective_opened_at = stored_opened_at or open_timestamp
             row_matches = (
                 db_cost_row_known
                 and db_cost_row is not None
                 and db_cost_row.get("open_cost_sats") == open_cost
-                and db_cost_row.get("opened_at") == open_timestamp
+                and db_cost_row.get("opened_at") == effective_opened_at
                 and db_cost_row.get("peer_id") == peer_id
                 and db_cost_row.get("capacity_sats") == capacity_sats
             )
             if not row_matches:
                 self.database.record_channel_open_cost(
                     channel_id, peer_id, open_cost, capacity_sats,
-                    timestamp=open_timestamp
+                    timestamp=effective_opened_at
                 )
 
         # Success-rate-adjusted effective cost

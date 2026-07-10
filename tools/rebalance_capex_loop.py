@@ -703,31 +703,6 @@ def clear_rebalance_cooldowns(node: str = REVENUE) -> dict[str, Any]:
     return tournament.docker_exec(node, "python3", "-c", script)
 
 
-def set_hive_hints_disabled(node: str = REVENUE) -> dict[str, Any]:
-    first = tournament.cln(
-        node,
-        "setconfig",
-        "revenue-ops-hive-hints-enabled",
-        "false",
-        "true",
-    )
-    if first.get("ok", False) and "error" not in first:
-        return {"ok": True, "method": "positional", "result": first}
-    second = tournament.cln(
-        node,
-        "setconfig",
-        "config=revenue-ops-hive-hints-enabled",
-        "val=false",
-        "transient=true",
-    )
-    return {
-        "ok": second.get("ok", False) and "error" not in second,
-        "method": "named",
-        "first": first,
-        "result": second,
-    }
-
-
 def set_revenue_config_overrides(
     overrides: dict[str, Any],
     *,
@@ -1696,7 +1671,9 @@ def main() -> int:
             if not args.skip_disable_cl_hive else
             {"ok": True, "skipped": True}
         )
-        hive_config = set_hive_hints_disabled()
+        # revenue-ops-hive-hints-enabled was unregistered with the de-hive
+        # (v2.17.0); nothing to disable any more.
+        hive_config = {"ok": True, "skipped": True, "reason": "option_removed"}
 
     run_initial_corridor_prepare = (
         (prepare_pure_hive or args.prepare_intrahive_corridor)

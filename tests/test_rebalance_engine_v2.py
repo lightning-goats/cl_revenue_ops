@@ -2532,7 +2532,9 @@ def test_engine_auto_execute_pair_blocks_when_budget_reservation_fails(
     mock_database.update_rebalance_result.assert_called_once()
     uargs, ukwargs = mock_database.update_rebalance_result.call_args
     assert uargs[0] == 99
-    assert uargs[1] == "failed"
+    # Budget blocks never attempted a route: recorded as 'skipped' so the
+    # terminal success-rate aggregate does not count them as failures.
+    assert uargs[1] == "skipped"
     assert "local_budget_block" in (ukwargs.get("error_message") or "")
 
 
@@ -2804,7 +2806,6 @@ def test_low_merit_coordination_final_score_below_high_merit_planner_pair(
         pair_budget_sats=1_000,
         score=0.1,  # normalized low-merit coordination score
         reason_code="coordinated_rebalance",
-        coordination_hint_id="rec-low",
     )
     planner_pair = PairCandidate(
         source_channel_id="300x1x0",

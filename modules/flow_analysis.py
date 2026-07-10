@@ -1414,15 +1414,16 @@ class FlowAnalyzer:
             spendable_msat = parse_msat(channel.get("spendable_msat", 0) or 0)
             receivable_msat = parse_msat(channel.get("receivable_msat", 0) or 0)
 
-            capacity_msat = channel.get("capacity_msat")
+            # listpeerchannels reports capacity as total_msat (the
+            # previously-read capacity_msat/capacity fields don't exist,
+            # so capacity silently degraded to spendable+receivable —
+            # excluding reserves and in-flight HTLCs).
+            capacity_msat = channel.get("total_msat")
             if capacity_msat is None or capacity_msat == 0:
                 # Calculate from spendable + receivable (approximate)
                 capacity = base_to_sats_floor(spendable_msat + receivable_msat)
             else:
                 capacity = base_to_sats_floor(parse_msat(capacity_msat))
-
-            if capacity == 0:
-                capacity = int(channel.get("capacity", 0))
 
             # CLN's spendable_msat already accounts for pending HTLCs and channel reserve.
             our_balance = base_to_sats_floor(spendable_msat)
@@ -1525,10 +1526,23 @@ class FlowAnalyzer:
         )
 
         # Reconcile: remove stale channel_states entries for closed channels.
-        # _get_channels() only returns CHANNELD_NORMAL, so any channel_states
-        # entry not in our active set is from a closed/closing channel.
+        # results only contains CHANNELD_NORMAL channels, but a channel in a
+        # transient non-normal state (splice, upgrade, brief disconnect race)
+        # is NOT closed — wiping it would destroy months of Thompson/Kalman
+        # state. Only wipe channels absent from listpeerchannels entirely.
         try:
             active_channel_ids = set(results.keys())
+            try:
+                raw = (self.data_service.get_peer_channels()
+                       if self.data_service else self.plugin.rpc.listpeerchannels())
+                for _ch in raw.get("channels", []) or []:
+                    _scid = _ch.get("short_channel_id")
+                    if _scid:
+                        active_channel_ids.add(normalize_scid(_scid))
+            except Exception:
+                # Cannot enumerate all states -> skip the wipe this cycle
+                # rather than risk deleting live state.
+                raise
             all_stored = self.database.get_all_channel_states()
             stale_count = 0
             for stored in all_stored:
@@ -1746,8 +1760,8 @@ class FlowAnalyzer:
 
         peer_id = channel.get("peer_id", "")
 
-        # Calculate capacity
-        capacity_msat = channel.get("capacity_msat")
+        # Calculate capacity (listpeerchannels reports it as total_msat)
+        capacity_msat = channel.get("total_msat")
         spendable_msat = parse_msat(channel.get("spendable_msat", 0) or 0)
         receivable_msat = parse_msat(channel.get("receivable_msat", 0) or 0)
 
@@ -2128,6 +2142,12 @@ class FlowAnalyzer:
             # listpeerchannels returns channels grouped by peer
             for channel_info in result.get("channels", []):
                 if channel_info.get("state") == "CHANNELD_NORMAL":
+                    # Copy before annotating: the payload may come from the
+                    # DataService cache and is shared with other consumers —
+                    # mutating it in place leaks these derived keys into
+                    # every reader for the cache TTL (and risks a concurrent
+                    # dict-changed-during-iteration).
+                    channel_info = dict(channel_info)
                     # Extract HTLC limits and current usage
                     # htlc_minimum_msat and htlc_maximum_msat are our advertised limits
                     channel_info["htlc_min_msat"] = channel_info.get("htlc_minimum_msat", 0)

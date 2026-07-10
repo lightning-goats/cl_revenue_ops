@@ -54,12 +54,8 @@ VALID_SKIP_REASONS: frozenset[str] = frozenset({
     # P4-008 in-flight-destination guard: a prior cycle's still-running
     # (possibly orphaned) worker holds an unresolved payment to this dest.
     "dest_inflight",
-    # Produced by the coordination overlay (RA2-1)
-    "not_designated_executor",
-    "coordination_unavailable",
-    "coordination_unresolvable_endpoint",
-    "coordination_preempted",
-    "lease_conflict",
+    # Produced by the engine's lazy policy gate (rebalance_mode/tags)
+    "policy_blocked",
     # Produced by the v3 askrene router specifically
     "unknown_source_node",
     "unknown_dest_node",

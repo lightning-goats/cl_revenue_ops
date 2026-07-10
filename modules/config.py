@@ -850,6 +850,10 @@ class Config:
                 )
         if self.receivable_ratio_floor > self.receivable_ratio_target:
             self.receivable_ratio_floor = self.receivable_ratio_target
+        # Repair a crossed LN+ ring-size band persisted before the
+        # update_runtime cross-check existed (min > max gates out every swap).
+        if self.lnplus_min_participants > self.lnplus_max_participants:
+            self.lnplus_max_participants = self.lnplus_min_participants
         return list(self._override_warnings)
 
     def _apply_override(self, key: str, value: str) -> None:
@@ -908,7 +912,15 @@ class Config:
         field_type = CONFIG_FIELD_TYPES.get(key, str)
         try:
             if field_type == bool:
-                typed_value = value.lower() in ('true', '1', 'yes', 'on')
+                lowered = value.lower()
+                if lowered in ('true', '1', 'yes', 'on'):
+                    typed_value = True
+                elif lowered in ('false', '0', 'no', 'off'):
+                    typed_value = False
+                else:
+                    # A typo ("treu") silently parsed as False and reported
+                    # success — reject instead.
+                    return {"error": f"Invalid boolean for {key}: {value!r} (use true/false)"}
             elif field_type == int:
                 typed_value = int(value)
             elif field_type == float:
@@ -956,6 +968,12 @@ class Config:
                 return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
             if key == 'high_liquidity_threshold' and typed_value <= self.low_liquidity_threshold:
                 return {"error": f"high_liquidity_threshold ({typed_value}) must be greater than low_liquidity_threshold ({self.low_liquidity_threshold})"}
+            # LN+ ring-size band: min > max would silently gate out every
+            # swap (feature-wide no-op), so reject crossed settings.
+            if key == 'lnplus_min_participants' and typed_value > self.lnplus_max_participants:
+                return {"error": f"lnplus_min_participants ({typed_value}) cannot exceed lnplus_max_participants ({self.lnplus_max_participants})"}
+            if key == 'lnplus_max_participants' and typed_value < self.lnplus_min_participants:
+                return {"error": f"lnplus_max_participants ({typed_value}) cannot be less than lnplus_min_participants ({self.lnplus_min_participants})"}
             # Utilization floor/ceiling: mirrors the low/high_liquidity_threshold
             # guard above. Without this, an inverted pair (e.g. floor=0.9,
             # ceiling=0.1) silently pins realized utilization to 0.9 for every

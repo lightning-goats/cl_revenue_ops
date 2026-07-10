@@ -944,8 +944,13 @@ class RebalanceEngine:
 
         def _coerce_float(name: str, default: float) -> float:
             value = getattr(cfg, name, default)
+            if isinstance(value, bool):
+                return float(default)
             if isinstance(value, (int, float)):
-                return float(value) if value else float(default if default else 0.0)
+                # 0.0 is a legitimate configured value (e.g. emergency-ratio
+                # bypass disabled) — mapping falsy to the default silently
+                # re-enabled features the operator turned off.
+                return float(value)
             return float(default)
 
         target_band_low = _coerce_float("low_liquidity_threshold", 0.35)
@@ -1623,12 +1628,14 @@ class RebalanceEngine:
         router: Any,
         exclude: Optional[List[str]],
     ):
-        # Every pair prices on the open market via askrene.
+        # Every pair prices on the open market via askrene, using the
+        # router's configured layer set (askrene_layers; default
+        # "standalone" = none). Forcing layer_names_override=[] here made
+        # the operator's configured layers silently inert at pricing time.
         return self._market_price_pair(
             router,
             pair,
             exclude,
-            market_only_layers=True,
         ), "market"
 
     def _prune_pair_failures(self, key: Tuple[str, str]) -> List[float]:
@@ -2522,6 +2529,16 @@ class RebalanceEngine:
             )
             return None
 
+    @staticmethod
+    def _is_budget_block(result: Optional[ExecutionResult]) -> bool:
+        """True when the result is a budget-reservation block: no route was
+        attempted, so it must not count as a routing failure anywhere
+        (pair futility, persisted cooldowns, destination success rates)."""
+        if result is None or getattr(result, "success", False):
+            return False
+        error = str(getattr(result, "error", "") or "")
+        return error.startswith(("local_budget_block", "zero_budget_blocks"))
+
     def _record_rebalance_result(
         self,
         rebalance_id: Optional[int],
@@ -2611,9 +2628,14 @@ class RebalanceEngine:
                         ).strip(),
                     )
             else:
+                # Budget-reservation blocks never attempted a route: record
+                # them as 'skipped' so the terminal success-rate aggregate
+                # (status IN ('success','failed')) does not count them as
+                # routing failures against the destination.
+                status = "skipped" if self._is_budget_block(result) else "failed"
                 self.database.update_rebalance_result(
                     rebalance_id,
-                    "failed",
+                    status,
                     actual_fee_sats=int(getattr(result, "fee_sats", 0) or 0),
                     actual_fee_msat=int(getattr(result, "fee_msat", 0) or 0),
                     error_message=str(getattr(result, "error", "") or ""),
@@ -2883,6 +2905,18 @@ class RebalanceEngine:
         if amount_sats <= 0:
             return ExecutionResult(success=False, error="invalid_amount")
 
+        # P4-008 applies to explicit executions too: a prior cycle's orphaned
+        # worker may still hold an unresolved sendpay to this destination
+        # (registered in _inflight_dests) even though the cycle lock is free.
+        # Paying it again would double-refill and double-spend budget.
+        if dest_channel_id in self._inflight_dest_snapshot():
+            return ExecutionResult(
+                success=False,
+                error="dest_inflight",
+                amount_sats=amount_sats,
+                route_type=self._executor_mode(),
+            )
+
         self._cycle_router = self._active_router()
         if self._cycle_router is None:
             return ExecutionResult(
@@ -3146,6 +3180,11 @@ class RebalanceEngine:
                             pair.source_channel_id, pair.dest_channel_id
                         )
                         self._clear_persisted_pair_failure(pair)
+                    elif self._is_budget_block(exec_result):
+                        # No route was attempted — a depleted unified budget
+                        # says nothing about this pair's routability, so do
+                        # not charge futility strikes or persisted cooldowns.
+                        pass
                     else:
                         self._record_pair_failure(
                             pair.source_channel_id, pair.dest_channel_id

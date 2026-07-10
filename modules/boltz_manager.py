@@ -1030,6 +1030,10 @@ class BoltzCliManager:
 
     def _is_completed_swap(self, swap: Dict[str, Any]) -> bool:
         st = self._swap_status_text(swap)
+        if "abandoned" in st:
+            # "abandoned" contains "done" — an abandoned swap is terminal
+            # but NOT completed (its estimated fee must not count as spend).
+            return False
         return any(token in st for token in ("success", "completed", "claimed", "done"))
 
     def _get_external_liquidity_costs(self) -> Dict[str, Any]:
@@ -1828,8 +1832,10 @@ class BoltzCliManager:
                     reservation_id, result, est_fee, channel_id, structural=False
                 )
 
+        primary = self._primary_swap_entry(result)
+        status = "error" if self._is_error_swap(primary) else "accepted"
         return {
-            "status": "accepted",
+            "status": status,
             "swap_type": "submarine",
             "amount_sats": amount_sats,
             "funding_currency": source_cur,
@@ -2408,8 +2414,10 @@ class BoltzCliManager:
                 self._finalize_swap_budget_reservation(
                     reservation_id, result, est_fee, channel_id=None, structural=False
                 )
+        primary = self._primary_swap_entry(result)
+        status = "error" if self._is_error_swap(primary) else "accepted"
         return {
-            "status": "accepted",
+            "status": status,
             "amount_sats": amount_sats,
             "from_currency": from_cur,
             "to_currency": to_cur,

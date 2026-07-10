@@ -188,7 +188,7 @@ def effective_drain_discount_max(cfg_like, node_pressure: float) -> float:
 # REASON CODES FOR EXPLAINABILITY
 # =============================================================================
 # Structured reason codes for fee adjustment decisions. These codes enable
-# debugging, auditing, and fleet-wide analysis of fee controller behavior.
+# debugging, auditing, and analysis of fee controller behavior.
 # =============================================================================
 
 class FeeReasonCode(Enum):
@@ -233,7 +233,7 @@ class FeeReasonCode(Enum):
 # Security mitigations:
 # - Bounded observations (max 200 per channel)
 # - Exponential decay on old observations
-# - Fleet-informed priors with confidence weighting
+# - Network-informed priors with confidence weighting
 # =============================================================================
 
 @dataclass
@@ -2706,9 +2706,7 @@ class FeeController:
     # prior so the sample-time bias machinery carries the signal through the
     # early fee cycles (until real observations accumulate).
     INITIAL_PRIOR_NUDGE_WEIGHT = 0.3
-    # One-time prior re-seed (fleet_fee_median-skew era repair): minimum
-    # relative divergence between a quiet channel's stored prior mean and
-    # the CURRENT best prior source before the prior is re-seeded.
+
     # ==========================================================================
     # Issue #20: Flow-Based Ceiling Reduction
     # ==========================================================================
@@ -3201,9 +3199,9 @@ class FeeController:
     def _resolve_base_fee_msat(self, peer_id: str, cfg: Optional['ConfigSnapshot'] = None) -> int:
         """Return base_fee_msat to use for this peer.
 
-        Respects cfg.base_fee_policy ("off" | "adaptive"). Always returns
-        the legacy cfg.base_fee_msat when policy is "off" so back-compat
-        holds when the option is not set.
+        Both base_fee_policy values ("off" | "adaptive") resolve to the
+        internal cfg.base_fee_msat (default 0) — the per-role adaptive
+        split was retired with the fleet integration.
         """
         if cfg is None:
             cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
@@ -5670,6 +5668,11 @@ class FeeController:
 
         # Load cycle state (Issue #32: pass actual fee for desync detection)
         cycle = self._get_cycle_state(channel_id, actual_fee_ppm=raw_chain_fee)
+        # Direction the PREVIOUS broadcast moved in, captured before any
+        # branch overwrites cycle.trend_direction — the same-direction
+        # streak below must compare against this, not the already-updated
+        # field (which made the comparison tautologically true).
+        prev_trend_direction = int(getattr(cycle, "trend_direction", 0) or 0)
         
         # Decision for target fee (Fee Priority Chain)
         # NOTE: FIRE_SALE logic removed in v2.2.3
@@ -7299,9 +7302,10 @@ class FeeController:
             cycle.last_broadcast_fee_ppm = new_fee_ppm
             cycle.last_broadcast_at = now
             cycle.last_state = decision_reason
-            # Telemetry honesty (2026-07-03 audit): the counter was persisted
-            # and emitted but never incremented anywhere.
-            if new_direction != 0 and new_direction == cycle.trend_direction:
+            # Telemetry honesty (2026-07-03 audit): the counter counts the
+            # same-direction streak. Compare against the direction captured
+            # BEFORE this cycle's branches overwrote trend_direction.
+            if new_direction != 0 and new_direction == prev_trend_direction:
                 cycle.consecutive_same_direction += 1
             else:
                 cycle.consecutive_same_direction = 1 if new_direction != 0 else 0
@@ -7994,7 +7998,7 @@ class FeeController:
             ts = GaussianThompsonState()
             ts.prior_std_fee = cfg.thompson_prior_std_fee
 
-            # Apply best available prior: fleet > network > default
+            # Apply best available prior: network gossip > default
             prior = self._select_best_fee_prior(peer_id, scid)
             if prior:
                 ts.prior_mean_fee = prior["mean"]

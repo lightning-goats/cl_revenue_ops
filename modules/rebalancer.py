@@ -22,7 +22,6 @@ from pyln.client import Plugin, RpcError
 
 from .config import Config, ConfigSnapshot
 from .database import Database
-from .rebalance_execution import stable_failure_reason
 from .rebalance_state_v2 import build_state_snapshot as build_state_snapshot_v2
 from .policy_manager import PolicyManager
 from .utils import parse_msat as _shared_parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
@@ -115,9 +114,6 @@ class RebalanceCandidate:
     # Explainability fields
     reason_code: str = RebalanceReasonCode.EV_POSITIVE.value  # Why this rebalance was approved
     bleeder_status: str = "none"  # 'hard', 'soft', or 'none'
-    coordination_hint_type: str = ""
-    coordination_hint_id: str = ""
-    coordination_rank_bonus: float = 0.0
 
     # Direction: "pull" fills to_channel from sources; "push" drains to_channel to destinations
     direction: str = "pull"
@@ -163,9 +159,6 @@ class RebalanceCandidate:
             "num_source_candidates": len(self.source_candidates),
             "reason_code": self.reason_code,
             "bleeder_status": self.bleeder_status,
-            "coordination_hint_type": self.coordination_hint_type,
-            "coordination_hint_id": self.coordination_hint_id,
-            "coordination_rank_bonus": round(self.coordination_rank_bonus, 4),
             "direction": self.direction,
             "hot_channel_protection": self.hot_channel_protection,
             "hot_channel_protection_score": round(self.hot_channel_protection_score, 4),
@@ -697,9 +690,8 @@ class EVRebalancer:
         candidates = []
         # Early-suppression paths (no slots / capital controls) deliberately
         # do NOT report liquidity state: no engine snapshot exists on those
-        # paths. The NORMAL path
-        # reports REAL state derived from the engine cycle snapshot via
-        # _report_liquidity_state_from_cycle.
+        # paths. The NORMAL path derives exhaustion tracking from the
+        # engine cycle result below (see get_boltz_coordination).
 
         # Initialize ephemeral fee cache for this run (cleared at end)
         with self._cache_lock:  # P2-005
@@ -791,6 +783,23 @@ class EVRebalancer:
 
             cycle_result = engine.run_cycle()
 
+            # Exhaustion tracking for get_boltz_coordination(): the original
+            # writers were removed with the v1 engine, leaving the signal
+            # permanently "not exhausted". Derive it from the v2 cycle:
+            # depleted = channels under their target band, profitable = pairs
+            # the planner selected as executable.
+            try:
+                snapshot = getattr(cycle_result, "snapshot", None)
+                if snapshot is not None:
+                    self._last_depleted_count = sum(
+                        1 for ch in getattr(snapshot, "channels", ())
+                        if float(getattr(ch, "local_ratio", 1.0) or 0.0)
+                        < float(getattr(ch, "target_band_low", 0.35) or 0.0)
+                    )
+                self._last_profitable_count = len(cycle_result.candidates or [])
+                self._last_cycle_ts = int(time.time())
+            except Exception:
+                pass
 
             executed = len(cycle_result.executions)
             succeeded = sum(1 for e in cycle_result.executions if e.success)
@@ -1310,10 +1319,8 @@ class EVRebalancer:
         """
         Execute a rebalance for the given candidate.
 
-        Uses RebalanceEngineV2 for all live rebalances.
-        Fleet intelligence still influences planning, but execution flows
-        through the router-v3 plus native execution path for both fleet-planned and
-        network-planned jobs.
+        Uses RebalanceEngineV2 for all live rebalances: router-v3 route
+        discovery plus native explicit-route execution.
         """
         result = {"success": False, "candidate": candidate.to_dict(), "message": ""}
         with self._pending_lock:

@@ -94,7 +94,7 @@ def test_v3_router_empty_layer_override_logs_debug_not_info():
     )
 
     logs.clear()
-    assert r._probe_layers([], include_observed_liquidity=False) == []
+    assert r._probe_layers([]) == []
 
     assert any(level == "debug" and "requested layers=[] found=[]" in msg for level, msg in logs)
     assert not any(level == "info" and "requested layers=[] found=[]" in msg for level, msg in logs)
