@@ -205,7 +205,6 @@ class FeeReasonCode(Enum):
     # Policy overrides
     POLICY_PASSIVE = "policy_passive"     # Peer has passive fee strategy
     POLICY_STATIC = "policy_static"       # Peer has static fee target
-    HIVE_MEMBER_ZERO_FEE = "hive_member_zero_fee"  # Confirmed fleet member zero-fee policy
 
     # Algorithm decisions
     DTS_PID_SAMPLE = "dts_pid_sample"                 # Normal DTS posterior sample
@@ -223,9 +222,6 @@ class FeeReasonCode(Enum):
     SKIP_WAITING_TIME = "skip_waiting_time"       # Observation window too short
     SKIP_WAITING_FORWARDS = "skip_waiting_forwards"  # Not enough forwards for signal
     SKIP_FEE_UNCHANGED = "skip_fee_unchanged"     # Calculated fee equals current fee
-
-
-
 
 
 # =============================================================================
@@ -2198,7 +2194,6 @@ class PIDState:
         return state
 
 
-
 # =============================================================================
 # Per-Channel Fee State
 # =============================================================================
@@ -2555,7 +2550,6 @@ class VegasReflexState:
             return 1.0
         # Smooth curve using square root for gradual response
         return 1.0 + (self.intensity ** 0.5) * 2.0
-
 
 
 @dataclass
@@ -3127,25 +3121,11 @@ class FeeController:
         # crossing wakes sleeping channels; re-armed after decay).
         self._vegas_wake_armed: bool = True
 
-        # Hive hints adapter (injected by main plugin; None = disabled)
+        # cl-mycelium retired: the zero-fee corridor / membership machinery is
+        # gone. hive_hints stays a permanent None so the remaining inert
+        # hint-reading branches (temporal, fleet-fee prior, peer-quality)
+        # resolve to their neutral defaults.
         self.hive_hints = None
-        self._hive_member_set_at: Dict[str, int] = {}
-        self._hive_member_released_peers: set[str] = set()
-        self._hive_member_advisory_peers: set[str] = set()
-        # P2-006: These three hive-gate collections are mutated by the fee cycle
-        # (T2) and by hint-update / forward_event paths (T0) via check-then-act
-        # sequences (`if x in s: s.discard(x)`, get+set+add). A dedicated
-        # fine-grained lock — NOT _state_lock, which the cycle holds across
-        # RPC+DB for a long time — keeps each composite op atomic without
-        # coupling a fast T0 caller to the long cycle lock.
-        self._hive_member_lock = threading.Lock()
-        # Z-2 (2026-07-08, zero-fee hive corridor): in-memory throttles for
-        # the DB-backed durable confirmation. Confirmation writes are
-        # throttled to once per 10 min per peer to avoid write churn; the
-        # "grace held" info log is throttled separately to avoid spam
-        # while a peer sits in the grace window across many cycles.
-        self._hive_member_confirm_last_write: Dict[str, int] = {}
-        self._hive_grace_log_last: Dict[str, int] = {}
 
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
@@ -3225,23 +3205,6 @@ class FeeController:
             name = "active"
         return name, self.FEE_PROFILES[name]
 
-    def _get_hive_fee_bias(self, peer_id: str) -> float:
-        """Return bounded multiplicative fee bias from hive hints. 1.0 if unavailable."""
-        if self.hive_hints is None:
-            return 1.0
-        try:
-            bias = float(self.hive_hints.get_fee_bias(peer_id))
-            metabolic_getter = getattr(self.hive_hints, "get_metabolic_fee_bias", None)
-            if callable(metabolic_getter):
-                metabolic_bias = max(0.95, min(1.05, float(metabolic_getter(peer_id))))
-                bias *= metabolic_bias
-            immune_getter = getattr(self.hive_hints, "get_immune_fee_bias", None)
-            if callable(immune_getter):
-                immune_bias = max(0.95, min(1.05, float(immune_getter(peer_id))))
-                bias *= immune_bias
-            return max(0.9, min(1.1, bias))
-        except Exception:
-            return 1.0
 
     @staticmethod
     def _drain_fee_multiplier(*, local_ratio: float, forward_count: int,
@@ -3262,271 +3225,6 @@ class FeeController:
         excess = (local_ratio - high_threshold) / (1.0 - high_threshold)
         return 1.0 - min(float(discount_max), float(discount_max) * excess)
 
-    def _hive_hint_effective_ttl(self) -> int:
-        if self.hive_hints is None:
-            return 900
-        try:
-            if hasattr(self.hive_hints, "_effective_ttl"):
-                return max(1, int(self.hive_hints._effective_ttl()))
-        except Exception:
-            pass
-        try:
-            status = self.hive_hints.get_status()
-            return max(1, int(status.get("effective_ttl_seconds", 900) or 900))
-        except Exception:
-            return 900
-
-    def _cached_hive_membership_active(self, peer_id: str) -> bool:
-        with self._hive_member_lock:  # P2-006
-            last_set = self._hive_member_set_at.get(peer_id)
-        if last_set is None:
-            return False
-        return int(time.time()) - int(last_set) <= self._hive_hint_effective_ttl() * 2
-
-    def _remember_hive_member(self, peer_id: str) -> bool:
-        with self._hive_member_lock:  # P2-006
-            previous_seen_at = self._hive_member_set_at.get(peer_id)
-            self._hive_member_set_at[peer_id] = int(time.time())
-            if previous_seen_at is None:
-                self._hive_member_advisory_peers.add(peer_id)
-        return previous_seen_at is None
-
-    def _clear_hive_member_cache(self, peer_id: str, *, release: bool) -> None:
-        with self._hive_member_lock:  # P2-006
-            if release and peer_id in self._hive_member_set_at:
-                self._hive_member_released_peers.add(peer_id)
-            self._hive_member_set_at.pop(peer_id, None)
-            self._hive_member_advisory_peers.discard(peer_id)
-
-    def _get_hive_membership_status(self, peer_id: str) -> Dict[str, Any]:
-        if self.hive_hints is None:
-            return {
-                "peer_id": str(peer_id or ""),
-                "known": False,
-                "member": False,
-                "fresh": False,
-                "usable": False,
-                "source": "none",
-            }
-        getter = getattr(self.hive_hints, "get_membership_status", None)
-        if callable(getter):
-            try:
-                status = getter(peer_id)
-                if isinstance(status, dict):
-                    result = {
-                        "peer_id": str(status.get("peer_id") or peer_id or ""),
-                        "known": bool(status.get("known", False)),
-                        "member": bool(status.get("member", False)),
-                        "fresh": bool(status.get("fresh", False)),
-                        "usable": bool(status.get("usable", False)),
-                        "stale_fallback": bool(status.get("stale_fallback", False)),
-                        "source": str(status.get("source") or "unknown"),
-                        "generation": status.get("generation"),
-                        "age_seconds": status.get("age_seconds"),
-                        "effective_ttl_seconds": status.get("effective_ttl_seconds"),
-                    }
-                    # Z-2: every positive membership result is a durability
-                    # signal for the zero-fee grace fallback below.
-                    if result["member"]:
-                        self._confirm_hive_membership_db(peer_id)
-                    return result
-            except Exception:
-                pass
-
-        usable = True
-        fresh = True
-        try:
-            if hasattr(self.hive_hints, "is_usable"):
-                usable = bool(self.hive_hints.is_usable())
-        except Exception:
-            usable = True
-        try:
-            if hasattr(self.hive_hints, "is_fresh"):
-                fresh = bool(self.hive_hints.is_fresh())
-        except Exception:
-            fresh = usable
-        member = False
-        if usable:
-            try:
-                member = bool(self.hive_hints.is_hive_member(peer_id))
-            except Exception:
-                member = False
-        if member:
-            self._confirm_hive_membership_db(peer_id)
-        return {
-            "peer_id": str(peer_id or ""),
-            "known": bool(usable),
-            "member": bool(member),
-            "fresh": bool(fresh),
-            "usable": bool(usable),
-            "source": "legacy_adapter",
-        }
-
-    def _hive_member_zero_fee_active(self, peer_id: str) -> bool:
-        """Return True when this peer is covered by the fleet zero-fee policy."""
-        if not peer_id or self.hive_hints is None:
-            return False
-
-        status = self._get_hive_membership_status(peer_id)
-        if status.get("member"):
-            self._remember_hive_member(peer_id)
-            return True
-
-        if not status.get("usable"):
-            if (
-                status.get("source") not in ("none", "legacy_adapter")
-                and self._cached_hive_membership_active(peer_id)
-            ):
-                return True
-            # Z-2: hive-hint data is entirely unavailable -- before
-            # releasing the peer and forcing a dynamic reprice, check
-            # whether a recent DB-confirmed membership still covers it.
-            if self._hive_zero_fee_grace_active(peer_id):
-                return True
-            self._clear_hive_member_cache(peer_id, release=True)
-            return False
-
-        # P4-001: route the cache read through the locked helper (as
-        # _classify_channel_role already does) rather than a lock-free
-        # _hive_member_set_at.get(); this money-gate site was the one converted
-        # collection reader the P2-006 sweep missed.
-        if self._cached_hive_membership_active(peer_id):
-            return True
-
-        # Z-2: hints are usable but genuinely stale (not just "positively
-        # not a member") -- the grace fallback covers this case too. Fresh
-        # hints that positively assert "not a member" (fresh=True, the
-        # default when the field is absent) must NEVER use a stale
-        # confirmation to override that current signal.
-        if not status.get("fresh", True) and self._hive_zero_fee_grace_active(peer_id):
-            return True
-
-        # Not fresh (or positively not a member): evict any stale entry so
-        # we don't keep re-checking it.
-        self._clear_hive_member_cache(peer_id, release=False)
-
-        return False
-
-    def _hive_zero_fee_stale_grace_seconds(self) -> int:
-        """Z-2: configured grace window (seconds) for the DB-confirmed
-        zero-fee fallback. Defensive against mocked/partial config objects
-        in tests: any non-numeric value falls back to the 7-day default."""
-        cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-        value = getattr(cfg, 'hive_zero_fee_stale_grace_seconds', 604800)
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 604800
-
-    def _hive_zero_fee_grace_active(self, peer_id: str) -> bool:
-        """Z-2: True when a recent DB-confirmed hive membership still
-        covers peer_id, even though live hive-hint data is currently
-        stale/unavailable. Never asserted when hints are fresh and
-        positively say "not a member" -- callers gate on that."""
-        database = getattr(self, "database", None)
-        if not peer_id or database is None:
-            return False
-        getter = getattr(database, "hive_member_last_confirmed", None)
-        if not callable(getter):
-            return False
-        try:
-            last_confirmed_at = getter(peer_id)
-        except Exception:
-            return False
-        if last_confirmed_at is None:
-            return False
-        try:
-            last_confirmed_at = int(last_confirmed_at)
-        except (TypeError, ValueError):
-            return False
-        grace = self._hive_zero_fee_stale_grace_seconds()
-        now = int(time.time())
-        age = now - last_confirmed_at
-        if age < 0 or age >= grace:
-            return False
-        self._log_hive_grace_hold(peer_id, age, grace)
-        return True
-
-    def _confirm_hive_membership_db(self, peer_id: str) -> None:
-        """Z-2: persist a positive hive-membership confirmation, throttled
-        to once per 10 minutes per peer to avoid write churn."""
-        database = getattr(self, "database", None)
-        if not peer_id or database is None:
-            return
-        confirmer = getattr(database, "hive_member_confirm", None)
-        if not callable(confirmer):
-            return
-        throttle = getattr(self, "_hive_member_confirm_last_write", None)
-        if throttle is None:
-            throttle = {}
-            self._hive_member_confirm_last_write = throttle
-        now = int(time.time())
-        lock = getattr(self, "_hive_member_lock", None)
-        if lock is not None:
-            with lock:
-                last = throttle.get(peer_id)
-                if last is not None and now - last < 600:
-                    return
-                throttle[peer_id] = now
-        else:
-            last = throttle.get(peer_id)
-            if last is not None and now - last < 600:
-                return
-            throttle[peer_id] = now
-        try:
-            confirmer(peer_id)
-        except Exception:
-            pass
-
-    def _log_hive_grace_hold(self, peer_id: str, age_seconds: int, grace_seconds: int) -> None:
-        """Z-2: throttled (hourly per peer) info log while zero-fee is held
-        by a stale-hint-window grace confirmation rather than a live hint."""
-        throttle = getattr(self, "_hive_grace_log_last", None)
-        if throttle is None:
-            throttle = {}
-            self._hive_grace_log_last = throttle
-        now = int(time.time())
-        last = throttle.get(peer_id)
-        if last is not None and now - last < 3600:
-            return
-        throttle[peer_id] = now
-        try:
-            age_hours = max(0, age_seconds) // 3600
-            grace_days = max(1, grace_seconds // 86400)
-            self.plugin.log(
-                f"HIVE_MEMBER_FEE: hints stale, zero-fee held by {age_hours}h-old "
-                f"confirmation (grace {grace_days}d) for peer {peer_id[:16]}...",
-                level='info'
-            )
-        except Exception:
-            pass
-
-    def _classify_channel_role(self, peer_id: str) -> str:
-        """Return channel role for base_fee selection.
-
-        V1 (Upgrade A, 2026-04-22) is two-bucket: "intra_fleet" for hive
-        members, "non_hive" for everyone else. Falls back to "non_hive"
-        when hive_hints are unavailable so strangers default to the
-        revenue-capturing branch (consistent with the observed gap vs
-        clboss where hive was losing per-forward fees on non-fleet
-        channels by charging 0 base).
-        """
-        if not peer_id:
-            return "non_hive"
-        if self.hive_hints is None:
-            return "non_hive"
-        status = self._get_hive_membership_status(peer_id)
-        if status.get("member"):
-            self._remember_hive_member(peer_id)
-            return "intra_fleet"
-        if not status.get("usable"):
-            if (
-                status.get("source") not in ("none", "legacy_adapter")
-                and self._cached_hive_membership_active(peer_id)
-            ):
-                return "intra_fleet"
-            return "unknown"
-        return "non_hive"
 
     def _resolve_base_fee_msat(self, peer_id: str, cfg: Optional['ConfigSnapshot'] = None) -> int:
         """Return base_fee_msat to use for this peer.
@@ -3552,18 +3250,10 @@ class FeeController:
             except (TypeError, ValueError):
                 return int(default)
 
-        raw_policy = getattr(cfg, 'base_fee_policy', 'off')
-        policy = raw_policy.lower() if isinstance(raw_policy, str) else 'off'
-        if policy != 'adaptive':
-            return _cfg_int('base_fee_msat', 0)
-        if self.hive_hints is None:
-            return _cfg_int('base_fee_msat', 0)
-        role = self._classify_channel_role(peer_id)
-        if role == "intra_fleet":
-            return _cfg_int('base_fee_msat_intra_fleet', 0)
-        if role == "unknown":
-            return _cfg_int('base_fee_msat', 0)
-        return _cfg_int('base_fee_msat_non_hive', 1000)
+        # cl-mycelium retired: there is no fleet-vs-market role classification,
+        # so 'adaptive' no longer differentiates intra-fleet (0 msat) from
+        # non-hive (1000 msat) — every peer gets the configured base fee.
+        return _cfg_int('base_fee_msat', 0)
 
     @staticmethod
     def _utc_hour() -> int:
@@ -3583,33 +3273,6 @@ class FeeController:
             from datetime import datetime, timezone
             return int(datetime.now(timezone.utc).hour)
 
-    def _get_hive_exploration_multiplier(self, peer_id: str) -> float:
-        """Return bounded DTS variance multiplier from hive intelligence."""
-        if self.hive_hints is None:
-            return 1.0
-
-        multiplier = 1.0
-
-        try:
-            centrality = self.hive_hints.get_centrality(peer_id)
-            corridor_role = self.hive_hints.get_corridor_role(peer_id)
-            if centrality > 0.03 and corridor_role == "owner":
-                multiplier *= 1.5
-        except Exception:
-            pass
-
-        try:
-            elasticity = self.hive_hints.get_fee_elasticity(peer_id)
-            if isinstance(elasticity, (int, float)) and math.isfinite(float(elasticity)):
-                elasticity = abs(float(elasticity))
-                if 0 < elasticity < 0.75:
-                    multiplier *= 1.15
-                elif elasticity > 1.5:
-                    multiplier *= 0.9
-        except Exception:
-            pass
-
-        return max(0.75, min(2.0, multiplier))
 
     def _get_temporal_fee_adjustment(self, peer_id: str) -> float:
         """Return temporal fee multiplier (0.9-1.1) based on traffic patterns.
@@ -3650,85 +3313,6 @@ class FeeController:
         except Exception:
             return 1.0
 
-    def get_hive_fee_hint_debug(self, peer_id: str) -> Dict[str, Any]:
-        """Return read-only fee hint attribution for operator debug surfaces."""
-        if self.hive_hints is None or not peer_id:
-            return {
-                "enabled": self.hive_hints is not None,
-                "peer_id": str(peer_id or ""),
-                "fee_bias": 1.0,
-                "temporal_multiplier": 1.0,
-                "exploration_multiplier": 1.0,
-                "membership": {"known": False, "member": False},
-            }
-
-        status: Dict[str, Any] = {}
-        try:
-            status = self.hive_hints.get_status()
-        except Exception:
-            status = {}
-        if not isinstance(status, dict):
-            status = {}
-
-        membership = self._get_hive_membership_status(peer_id)
-        metabolic_fee_influence: Dict[str, Any] = {
-            "seen": False,
-            "usable": False,
-            "bias": 1.0,
-            "bias_capped": False,
-            "reason_codes": [],
-        }
-        try:
-            status_metabolic = status.get("metabolic_influence") if isinstance(status, dict) else {}
-            peer_effect_getter = getattr(self.hive_hints, "get_metabolic_peer_effect", None)
-            bias_getter = getattr(self.hive_hints, "get_metabolic_fee_bias", None)
-            effect = peer_effect_getter(peer_id) if callable(peer_effect_getter) else {}
-            if not isinstance(effect, dict):
-                effect = {}
-            raw_bias = bias_getter(peer_id) if callable(bias_getter) else 1.0
-            bias = max(0.95, min(1.05, float(raw_bias)))
-            metabolic_fee_influence = {
-                "seen": bool(status_metabolic.get("present", False)) if isinstance(status_metabolic, dict) else bool(effect),
-                "usable": bool(effect.get("usable", False)),
-                "bias": bias,
-                "bias_capped": bool(effect.get("bias_capped", False)) or abs(float(raw_bias) - bias) > 1e-9,
-                "reason_codes": list(effect.get("reason_codes", []) or []),
-            }
-            if effect.get("reason"):
-                metabolic_fee_influence["reason"] = str(effect.get("reason"))
-        except Exception:
-            pass
-
-        debug: Dict[str, Any] = {
-            "enabled": True,
-            "peer_id": str(peer_id or ""),
-            "snapshot_fresh": bool(status.get("snapshot_fresh", False)),
-            "snapshot_usable": bool(status.get("snapshot_usable", False)),
-            "snapshot_source": str(status.get("snapshot_source") or ""),
-            "snapshot_age_seconds": status.get("snapshot_age_seconds"),
-            "effective_ttl_seconds": status.get("effective_ttl_seconds"),
-            "membership": membership,
-            "fee_bias": self._get_hive_fee_bias(peer_id),
-            "temporal_multiplier": self._get_temporal_fee_adjustment(peer_id),
-            "exploration_multiplier": self._get_hive_exploration_multiplier(peer_id),
-            "metabolic_fee_influence": metabolic_fee_influence,
-        }
-
-        for key, getter_name, default in (
-            ("corridor_role", "get_corridor_role", "none"),
-            ("traffic_confidence", "get_traffic_confidence", 0.0),
-            ("fee_elasticity", "get_fee_elasticity", 0.0),
-            ("peer_quality_score", "get_peer_quality_score", 0.5),
-            ("fleet_fee_prior_ppm", "get_fleet_fee_prior", None),
-            ("optimal_fee_estimate_ppm", "get_optimal_fee_estimate", 0),
-        ):
-            try:
-                getter = getattr(self.hive_hints, getter_name, None)
-                debug[key] = getter(peer_id) if callable(getter) else default
-            except Exception:
-                debug[key] = default
-
-        return debug
 
     def _get_network_fee_prior(self, peer_id: str, scid: str) -> dict | None:
         """Get informed prior from network gossip data for a channel.
@@ -3888,22 +3472,6 @@ class FeeController:
         """
         return None
 
-    def _get_hive_market_boundary_fee(
-        self,
-        peer_id: str,
-        cfg: Optional[Any] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Return no hive-derived market boundary.
-
-        Legacy cl-hive `optimal_fee_estimate_ppm` is an advisory/diagnostic
-        field, not a verified competitor quote. Treating it as a cheapest
-        competing edge synchronized unrelated production channels around the
-        same low values when the estimate was polluted by topology/count-like
-        signals. All market-boundary influence is now deprecated; hive hints
-        may still bias the normal DTS/PID controller through the bounded hint
-        path, but they must not create hard market floors or caps.
-        """
-        return None
 
     def _get_neighbor_fee_median(self, peer_id: str, cfg: Optional[Any] = None) -> int | None:
         """Get median fee charged by other nodes to the same peer.
@@ -4198,23 +3766,6 @@ class FeeController:
         except Exception:
             return 0
 
-    def _check_hive_member_fee(self, peer_id: str) -> Optional[int]:
-        """Refresh hive membership state and return the fleet fee if active."""
-        return 0 if self._hive_member_zero_fee_active(peer_id) else None
-
-    def _consume_hive_member_release(self, peer_id: str) -> bool:
-        with self._hive_member_lock:  # P2-006
-            if peer_id in self._hive_member_released_peers:
-                self._hive_member_released_peers.discard(peer_id)
-                return True
-        return False
-
-    def _consume_hive_member_advisory(self, peer_id: str) -> bool:
-        with self._hive_member_lock:  # P2-006
-            if peer_id in self._hive_member_advisory_peers:
-                self._hive_member_advisory_peers.discard(peer_id)
-                return True
-        return False
 
     def _get_context_with_values(
         self,
@@ -5468,55 +5019,9 @@ class FeeController:
 
                 # DYNAMIC strategy continues to normal fee optimization below
 
-            hive_member_fee = self._check_hive_member_fee(peer_id)
-
             # Get channel info
             channel_info = channels.get(channel_id)
             if not channel_info:
-                continue
-
-            if hive_member_fee == 0:
-                current_fee = int(channel_info.get("fee_proportional_millionths", 0) or 0)
-                current_base_fee_msat = parse_msat(channel_info.get("fee_base_msat", 0))
-                if current_fee == 0 and current_base_fee_msat == 0:
-                    skip_reasons["idempotent"] += 1
-                    continue
-                try:
-                    result = self.set_channel_fee(
-                        channel_id,
-                        0,
-                        reason="Hive member: zero-fee fleet policy",
-                        reason_code=FeeReasonCode.HIVE_MEMBER_ZERO_FEE.value,
-                        enforce_limits=False,
-                        channel_info=channel_info,
-                        base_fee_msat_override=0,
-                    )
-                    if not result.get("success"):
-                        self.plugin.log(
-                            f"Error setting hive-member zero fee for {channel_id}: "
-                            f"{result.get('message', 'unknown error')}",
-                            level='error'
-                        )
-                        skip_reasons["error"] += 1
-                        continue
-                    applied_fee_ppm = int(result.get("fee_ppm", 0) or 0)
-                    adjustments.append(FeeAdjustment(
-                        channel_id=channel_id,
-                        peer_id=peer_id,
-                        old_fee_ppm=current_fee,
-                        new_fee_ppm=applied_fee_ppm,
-                        reason="Hive member: zero-fee fleet policy",
-                        algorithm_values={
-                            "hive_member_zero_fee": True,
-                            "current_base_fee_msat": current_base_fee_msat,
-                            "target_base_fee_msat": 0,
-                            "hive_membership": self._get_hive_membership_status(peer_id),
-                        },
-                        reason_code=FeeReasonCode.HIVE_MEMBER_ZERO_FEE.value,
-                    ))
-                except Exception as e:
-                    self.plugin.log(f"Error setting hive-member zero fee for {channel_id}: {e}", level='error')
-                    skip_reasons["error"] += 1
                 continue
 
             try:
@@ -5541,10 +5046,6 @@ class FeeController:
                     forward_count_hint = pre_forward_count
 
                 force_reprice_reason = None
-                if self._consume_hive_member_release(peer_id):
-                    force_reprice_reason = "hive_unavailable"
-                elif self._consume_hive_member_advisory(peer_id):
-                    force_reprice_reason = "hive_member_advisory"
 
                 adjustment = self._adjust_channel_fee(
                     channel_id=channel_id,
@@ -7093,19 +6594,6 @@ class FeeController:
             # DTS: Sample Fee from posterior
             # =====================================================================
 
-            exploration_multiplier = self._get_hive_exploration_multiplier(peer_id)
-            if exploration_multiplier != 1.0:
-                try:
-                    if hasattr(ts_state.thompson, 'scale_variance'):
-                        ts_state.thompson.scale_variance(exploration_multiplier)
-                    self.plugin.log(
-                        f"DTS EXPLORE MULTIPLIER: {peer_id[:12]}... "
-                        f"(multiplier={exploration_multiplier:.2f})",
-                        level='debug'
-                    )
-                except Exception:
-                    pass  # Thompson impl may not support scale_variance; graceful degradation
-
             ctx_tuple = ts_state.thompson.contextual_posteriors.get(context_key)
             if ctx_tuple:
                 context_observation_count = int(ctx_tuple[2])
@@ -7135,15 +6623,13 @@ class FeeController:
             )
             raw_dts_target_ppm = int(dts_fee)
             post_pid_target_ppm = int(dts_fee * pid_multiplier)
-            # Hive hint bias x temporal multiplier: composed and clamped ONCE
-            # (F2 fix, see HIVE_HINT_TOTAL_BIAS_*). The temporal multiplier
-            # used to apply after the hive clamp, letting the composite exceed
-            # the documented +/-10% hint authority. Single multiplication site.
-            hive_fee_bias = self._get_hive_fee_bias(peer_id)
+            # cl-mycelium retired: no hive fee bias. The temporal multiplier is
+            # still clamped into the documented total-bias authority band (the
+            # clamp is preserved so temporal adjustment behavior is unchanged).
             temporal_adj = self._get_temporal_fee_adjustment(peer_id)
             composite_hint_bias = max(
                 self.HIVE_HINT_TOTAL_BIAS_MIN,
-                min(self.HIVE_HINT_TOTAL_BIAS_MAX, hive_fee_bias * temporal_adj),
+                min(self.HIVE_HINT_TOTAL_BIAS_MAX, temporal_adj),
             )
             if composite_hint_bias != 1.0:
                 post_pid_target_ppm = int(post_pid_target_ppm * composite_hint_bias)
@@ -8051,11 +7537,8 @@ class FeeController:
                     "corridor_role": corridor_role,
                     "context_observation_count": context_observation_count,
                     "contextual_sample_used": contextual_sample_used,
-                    "hive_fee_bias": hive_fee_bias,
-                    "hive_temporal_multiplier": temporal_adj,
-                    "hive_composite_hint_bias": composite_hint_bias,
-                    "hive_exploration_multiplier": exploration_multiplier,
-                    "hive_membership": self._get_hive_membership_status(peer_id),
+                    "temporal_multiplier": temporal_adj,
+                    "composite_hint_bias": composite_hint_bias,
                     "drain_multiplier": drain_multiplier,
                     "drain_discount_max_effective": effective_discount_max,
                     "node_receivable_ratio": node_receivable_ratio_value,
@@ -8343,23 +7826,6 @@ class FeeController:
             
             peer_id = channel_info.get("peer_id", "")
             old_fee_ppm = channel_info.get("fee_proportional_millionths", 0)
-            hive_member_zero_fee = self._hive_member_zero_fee_active(peer_id)
-            # DD6/DEF-081: an explicit operator force=true set-fee overrides the
-            # automatic fleet zero-fee policy. force means the operator has
-            # deliberately chosen a non-zero fee on a hive peer (already clamped
-            # to the DD2 [min_fee_ppm, max_fee_ppm] rail at the revenue-set-fee
-            # RPC layer); only automatic cycles and non-force sets keep the
-            # zero-fee fleet policy. Without the force gate the clamp below would
-            # clobber the operator's explicit choice.
-            apply_hive_zero_fee = hive_member_zero_fee and not force
-            if apply_hive_zero_fee:
-                if fee_ppm != 0:
-                    self.plugin.log(
-                        f"HIVE_MEMBER_FEE: {resolved_channel_id[:16]}... forcing 0 ppm fleet policy",
-                        level='debug'
-                    )
-                fee_ppm = 0
-                result["fee_ppm"] = 0
 
             # TS-1: Protect state mutations with _state_lock (RLock allows re-entrant calls).
             # Resolve the reference first so manual full-channel IDs/colon SCIDs update
@@ -8400,8 +7866,6 @@ class FeeController:
                 feebase_msat = int(base_fee_msat_override)
             else:
                 feebase_msat = self._resolve_base_fee_msat(peer_id, cfg)
-            if apply_hive_zero_fee:
-                feebase_msat = 0
             # Use setchannel command
             rpc_params = {
                 "id": resolved_channel_id,
@@ -8774,21 +8238,6 @@ class FeeController:
                         reason_code=FeeReasonCode.POLICY_STATIC.value,
                         channel_info=channel_info
                     )
-
-            if self._hive_member_zero_fee_active(peer_id):
-                self.plugin.log(
-                    f"INITIAL_FEE: {scid[:16]}... hive member; applying zero-fee fleet policy",
-                    level='debug'
-                )
-                return self.set_channel_fee(
-                    scid,
-                    0,
-                    reason="Initial fee: hive member zero-fee fleet policy",
-                    reason_code=FeeReasonCode.HIVE_MEMBER_ZERO_FEE.value,
-                    enforce_limits=False,
-                    channel_info=channel_info,
-                    base_fee_msat_override=0,
-                )
 
             # ── DYNAMIC: DTS prior sample ─────────────────────────────
             ts = GaussianThompsonState()

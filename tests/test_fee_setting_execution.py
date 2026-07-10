@@ -220,42 +220,6 @@ class TestSetChannelFeeLimits:
 
         assert _setchannel_kwargs(mock_plugin)["feeppm"] == 1
 
-    def test_hive_member_forces_zero_fee_and_base_fee(self, mock_plugin, mock_database):
-        from modules.config import Config
-        from modules.fee_controller import FeeController
-
-        channel_id = "123x456x0"
-        peer_id = "02" + "a" * 64
-
-        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=1000, dry_run=False)
-
-        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(
-            channel_id, peer_id, fee_ppm=100
-        )
-        mock_plugin.rpc.setchannel = MagicMock()
-
-        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
-        mock_database.record_fee_change = MagicMock()
-
-        fc = FeeController(mock_plugin, cfg, mock_database)
-        fc.data_service = _make_data_service(mock_plugin)
-        fc.hive_hints = MagicMock()
-        fc.hive_hints.get_membership_status.return_value = {
-            "peer_id": peer_id,
-            "known": True,
-            "member": True,
-            "fresh": True,
-            "usable": True,
-            "source": "datastore",
-        }
-
-        result = fc.set_channel_fee(channel_id, 250, manual=True, enforce_limits=True)
-
-        assert result["success"] is True
-        call_kwargs = _setchannel_kwargs(mock_plugin)
-        assert call_kwargs["feebase"] == 0
-        assert call_kwargs["feeppm"] == 0
-
     def test_force_operator_set_overrides_hive_zero_fee(self, mock_plugin, mock_database):
         # DD6/DEF-081: an explicit operator force=true set-fee on a hive peer
         # applies the operator's fee (clamped to [min,max] per DD2), NOT the
@@ -299,44 +263,6 @@ class TestSetChannelFeeLimits:
         # Operator's explicit fee wins over hive-zero.
         assert call_kwargs["feeppm"] == 250
         assert result["fee_ppm"] == 250
-
-    def test_recent_cached_hive_member_forces_zero_fee_during_hint_outage(self, mock_plugin, mock_database):
-        from modules.config import Config
-        from modules.fee_controller import FeeController
-
-        channel_id = "123x456x0"
-        peer_id = "02" + "a" * 64
-
-        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, base_fee_msat=1000, dry_run=False)
-
-        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(
-            channel_id, peer_id, fee_ppm=100
-        )
-        mock_plugin.rpc.setchannel = MagicMock()
-
-        mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
-        mock_database.record_fee_change = MagicMock()
-
-        fc = FeeController(mock_plugin, cfg, mock_database)
-        fc.data_service = _make_data_service(mock_plugin)
-        fc.hive_hints = MagicMock()
-        fc.hive_hints._effective_ttl.return_value = 900
-        fc.hive_hints.get_membership_status.return_value = {
-            "peer_id": peer_id,
-            "known": False,
-            "member": False,
-            "fresh": False,
-            "usable": False,
-            "source": "datastore",
-        }
-        fc._hive_member_set_at[peer_id] = int(time.time()) - 60
-
-        result = fc.set_channel_fee(channel_id, 250, manual=True, enforce_limits=True)
-
-        assert result["success"] is True
-        call_kwargs = _setchannel_kwargs(mock_plugin)
-        assert call_kwargs["feebase"] == 0
-        assert call_kwargs["feeppm"] == 0
 
     def test_set_channel_fee_normalizes_colon_scid(self, mock_plugin, mock_database):
         from modules.config import Config

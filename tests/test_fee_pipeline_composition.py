@@ -406,7 +406,7 @@ class TestZeroFeeObservationAttribution:
 
 class TestCompositeHintBiasClamp:
 
-    def _post_pid_target(self, mock_plugin, mock_database, hive_bias, temporal):
+    def _post_pid_target(self, mock_plugin, mock_database, temporal):
         fc, cfg = _make_fc(mock_plugin, mock_database)
         # Current fee far from target so neither the alpha guard nor the
         # gossip gate suppresses the adjustment under inspection.
@@ -414,7 +414,6 @@ class TestCompositeHintBiasClamp:
         _stub_broadcasts(fc, chain)
         _prepare_dts_stubs(fc, chain_fee=500, sampled_fee=1000)
 
-        fc._get_hive_fee_bias = lambda peer_id: hive_bias
         fc._get_temporal_fee_adjustment = lambda peer_id: temporal
         fc._get_neighbor_fee_median = lambda *a, **k: None
 
@@ -427,22 +426,22 @@ class TestCompositeHintBiasClamp:
         return result
 
     def test_composite_clamped_to_plus_10pct(self, mock_plugin, mock_database):
-        """1.1 hive x 1.05 temporal = 1.155 must clamp to 1.1 total."""
-        result = self._post_pid_target(mock_plugin, mock_database, 1.1, 1.05)
-        # dts 1000, pid 1.0 -> post_pid must be 1100, not 1155
+        """temporal 1.15 must clamp to the +10% total cap."""
+        result = self._post_pid_target(mock_plugin, mock_database, 1.15)
+        # dts 1000, pid 1.0 -> post_pid must be 1100, not 1150
         assert result.algorithm_values["post_pid_target_ppm"] == 1100
-        assert result.algorithm_values["hive_composite_hint_bias"] == pytest.approx(1.1)
+        assert result.algorithm_values["composite_hint_bias"] == pytest.approx(1.1)
 
     def test_composite_clamped_to_minus_10pct(self, mock_plugin, mock_database):
-        """0.9 hive x 0.97 temporal = 0.873 must clamp to 0.9 total."""
-        result = self._post_pid_target(mock_plugin, mock_database, 0.9, 0.97)
+        """temporal 0.85 must clamp to the -10% total cap."""
+        result = self._post_pid_target(mock_plugin, mock_database, 0.85)
         assert result.algorithm_values["post_pid_target_ppm"] == 900
-        assert result.algorithm_values["hive_composite_hint_bias"] == pytest.approx(0.9)
+        assert result.algorithm_values["composite_hint_bias"] == pytest.approx(0.9)
 
     def test_in_range_composite_applied_exactly_once(self, mock_plugin, mock_database):
-        """1.02 x 1.05 = 1.071 is inside the cap and applies as-is."""
-        result = self._post_pid_target(mock_plugin, mock_database, 1.02, 1.05)
-        assert result.algorithm_values["post_pid_target_ppm"] == int(1000 * 1.02 * 1.05)
+        """temporal 1.07 is inside the cap and applies as-is."""
+        result = self._post_pid_target(mock_plugin, mock_database, 1.07)
+        assert result.algorithm_values["post_pid_target_ppm"] == int(1000 * 1.07)
 
     def test_clamp_constants(self):
         assert FeeController.HIVE_HINT_TOTAL_BIAS_MIN == 0.9

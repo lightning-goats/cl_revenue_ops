@@ -1791,23 +1791,23 @@ class TestMarketBoundaryGuard:
         peer_id = "02" + "5" * 64
         self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(80,))
 
-        # Stubs kept (incident rationale lives in their docstrings)
+        # Stub kept (incident rationale lives in its docstring)
         assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
-        assert fc._get_hive_market_boundary_fee(peer_id, cfg=cfg) is None
 
         # Dead consumers/helpers removed
         assert not hasattr(fc, "_apply_market_boundary_downshift")
         assert not hasattr(fc, "_get_market_boundary_target")
         assert not hasattr(fc, "_market_boundary_has_room")
+        assert not hasattr(fc, "_get_hive_market_boundary_fee")
 
     def test_base_fee_only_policy_change_bypasses_fee_hysteresis(
         self, mock_plugin, mock_database
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        # base_fee_msat resolves to 1500 while the channel currently
+        # broadcasts base 0 — a base-fee-only delta must bypass fee hysteresis.
         cfg.base_fee_policy = "adaptive"
-        cfg.base_fee_msat = 0
-        cfg.base_fee_msat_intra_fleet = 0
-        cfg.base_fee_msat_non_hive = 1500
+        cfg.base_fee_msat = 1500
 
         channel_id = "277x2x0"
         peer_id = "02" + "f" * 64
@@ -1819,7 +1819,6 @@ class TestMarketBoundaryGuard:
         fc.hive_hints = hints
         fc._get_neighbor_fee_median = MagicMock(return_value=None)
         fc._get_market_boundary_fee = MagicMock(return_value=None)
-        fc._get_hive_market_boundary_fee = MagicMock(return_value=None)
         fc._get_rebalance_cost_floor = MagicMock(return_value=None)
         fc._get_channel_rebalance_cost_ppm = MagicMock(return_value=0)
         fc._calculate_floor = MagicMock(return_value=cfg.min_fee_ppm)
@@ -2227,7 +2226,6 @@ class TestMarketBoundaryGuard:
         fc.data_service.set_channel.assert_not_called()
         fc.hive_hints.get_optimal_fee_estimate.assert_not_called()
         assert fc._get_neighbor_fee_median(peer_id) is None
-        assert fc._get_hive_market_boundary_fee(peer_id, cfg=cfg) is None
 
     def test_deprecated_market_boundary_does_not_refresh_stale_support_boundary(
         self, mock_plugin, mock_database

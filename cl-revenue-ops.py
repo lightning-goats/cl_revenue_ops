@@ -3002,16 +3002,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # them instead.
         boltz_manager.structural_envelope_provider = _structural_envelope_sats_provider
 
-    # cl-mycelium retired (2026-07-09): no fleet coordinator. hive_hints is
-    # permanently None; every consumer neutralizes through its getattr defaults.
-    # Injection is kept so those neutral no-op paths stay wired.
+    # cl-mycelium retired (2026-07-09): no fleet coordinator. hive_hints stays
+    # a permanently-None global; consumers that still carry inert hint-reading
+    # branches default self.hive_hints to None themselves — no injection needed.
     global hive_hints
     hive_hints = None
 
-    # Only fee_controller still reads self.hive_hints (permanently None) until
-    # its Phase 3 de-hive lands; the other consumers no longer do.
-    if fee_controller is not None:
-        fee_controller.hive_hints = hive_hints
     if capacity_planner is not None:
         capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
         capacity_planner.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
