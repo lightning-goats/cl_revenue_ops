@@ -157,23 +157,6 @@ ALLOWLIST = [
         "doc": "docs/audit/decision-loops.md (defect 1); "
                "docs/audit/decision-loops/planner-boltz-loops.md (:161-197)",
     },
-    {
-        "sweep": "sweep_planner_boltz_hints",
-        "match": "D1 flag:",
-        "reason": "hive-member DEFIBRILLATE/FEE_REDUCE episodes are "
-                  "permitted-as-implemented pending the D1 follow-up "
-                  "(remove member channels from the dead-capital pipeline)",
-        "doc": "docs/audit/operator-decisions.md (D1)",
-    },
-    {
-        "sweep": "sweep_planner_boltz_hints",
-        "match": "ledger id continuity",
-        "reason": "reconstruction gaps are a corpus-visibility artifact of "
-                  "the bounded (7-day) planner-history RPC window, not "
-                  "plugin behavior",
-        "doc": "docs/audit/decision-loops.md (bounded-echo caveat); "
-               "docs/audit/phase2-summary.md (evidence-quality lessons)",
-    },
 ]
 
 
@@ -213,13 +196,7 @@ def lossy_echo(sweep: str, check: Check) -> bool:
 
 # Checks that pass over an all-zero activity surface: force-vacuous so the
 # owning module reports INCONCLUSIVE rather than a hollow PASS.
-VACUOUS_OVERRIDES = {
-    ("sweep_planner_boltz_hints", "BM-H2"):
-        "boltz dormant corpus-wide (Phase 3 L5 dormancy proof): "
-        "spend<=budget checked against an all-zero surface",
-    ("sweep_planner_boltz_hints", "boltz swap activity present in corpus"):
-        "informational inventory only",
-}
+VACUOUS_OVERRIDES = {}
 
 
 def vacuous_override(sweep: str, check: Check):
@@ -244,8 +221,6 @@ PREFIX_MODULES = [
     (None, "PA-", "profitability_analyzer"),
     (None, "CP-", "capacity_planner"),
     (None, "BM-", "boltz_manager"),
-    (None, "HH-", "hive_hints"),
-    (None, "HH ", "hive_hints"),
     (None, "SL-", "database"),
     (None, "TCB-", "database"),
     (None, "DB", "database"),
@@ -291,18 +266,10 @@ MODULE_ORDER = [
 
 
 def module_for(sweep: str, check: Check) -> str:
-    if sweep == "sweep_routing_stack":
-        return "routing_stack"          # RX/R2/R3/HR/RHR/RCO/NX/RP2 surface
     if sweep == "loop_sweep_planner":
         return "planner_loop"
     if sweep == "check_hermes_forwards_chain":
         return "forwards_chain"
-    if sweep == "sweep_planner_boltz_hints":
-        n = check.name
-        if n.startswith("BM-") or n.startswith("boltz"):
-            return "boltz_manager"
-        if n.startswith("HH"):
-            return "hive_hints"
         return "capacity_planner"       # CP-*, D1 flag, pool, id continuity
     for sw, prefix, module in PREFIX_MODULES:
         if sw not in (None, sweep):
@@ -431,7 +398,7 @@ def parse_data_budget(sweep: str, out: str) -> list[Check]:
 
 
 def parse_node_results(sweep: str, out: str) -> list[Check]:
-    """sweep_planner_boltz_hints / loop_sweep_planner:
+    """loop_sweep_planner:
     '[STATUS] node :: check :: checked=N violations|flagged=V [:: note]'.
     Aggregated across nodes by check name."""
     agg: dict[str, Check] = {}
@@ -455,34 +422,6 @@ def parse_node_results(sweep: str, out: str) -> list[Check]:
     return list(agg.values())
 
 
-ROUTING_GROUPS = [
-    ("C", "candidates", "route/candidate checks C1-C9 (R2/R3/RX/RHR/RCO)"),
-    ("S", "rebalance_history_entries", "history checks S1-S3 (engine/RCO/R3 surface)"),
-    ("O", "segment_observations", "segment-observation checks O0-O2 (R3/RHR/NX surface)"),
-    ("L", None, "spend-ledger checks L1"),
-]
-
-
-def parse_routing_json(sweep: str, out: str) -> list[Check]:
-    data = json.loads(out)
-    counts = data.get("counts") or {}
-    files = data.get("files_scanned") or {}
-    violations = data.get("violations") or {}
-    checks = []
-    for prefix, count_key, desc in ROUTING_GROUPS:
-        vio = 0
-        ex = []
-        for key, info in violations.items():
-            if key.startswith(prefix):
-                vio += int(info.get("count") or 0)
-                ex.extend(info.get("examples") or [])
-        if count_key:
-            checked = int(counts.get(count_key) or 0)
-        else:
-            checked = int(files.get("revenue-spend-ledger.json") or 0)
-        checks.append(Check(sweep, prefix + "*", desc, max(checked, vio),
-                            vio, examples=ex[:3]))
-    return checks
 
 
 def parse_forwards_chain(sweep: str, out: str) -> list[Check]:
@@ -512,9 +451,7 @@ SWEEPS = [
     ("sweep_fee_stack", [], parse_sectioned),
     ("sweep_rebalancer", [], parse_check_report),
     ("sweep_profitability", [], parse_check_report),
-    ("sweep_planner_boltz_hints", [], parse_node_results),
     ("sweep_data_budget", [], parse_data_budget),
-    ("sweep_routing_stack", ["--json"], parse_routing_json),
     ("loop_sweep_fee", [], parse_sectioned),
     ("loop_sweep_rebalance", [], parse_check_report),
     ("loop_sweep_planner", [], parse_node_results),
@@ -528,9 +465,7 @@ SWEEP_RAN_MARKERS = {
     "sweep_fee_stack": "SWEEP RESULTS",
     "sweep_rebalancer": "corpus sweep results",
     "sweep_profitability": "corpus sweep results",
-    "sweep_planner_boltz_hints": "SWEEP RESULTS",
     "sweep_data_budget": "snapshots swept:",
-    "sweep_routing_stack": '"files_scanned"',
     "loop_sweep_fee": "PHASE 3 LOOP SWEEP",
     "loop_sweep_rebalance": "REBALANCE + BUDGET LOOP",
     "loop_sweep_planner": "SWEEP RESULTS",
@@ -576,12 +511,9 @@ SWEEP_MODULES = {
     "sweep_fee_stack": ["fee_controller", "flow_analysis", "policy_manager"],
     "sweep_rebalancer": ["rebalancer", "rebalance_engine_v2"],
     "sweep_profitability": ["profitability_analyzer"],
-    "sweep_planner_boltz_hints": ["capacity_planner", "boltz_manager",
-                                  "hive_hints"],
     "sweep_data_budget": ["database", "capex_budget", "capital_efficiency",
                           METABOLISM_LEDGER_MODULE,
                           "segment_observations", "demand_flow"],
-    "sweep_routing_stack": ["routing_stack"],
     "loop_sweep_fee": ["fee_loop"],
     "loop_sweep_rebalance": ["rebalance_loop"],
     "loop_sweep_planner": ["planner_loop"],
