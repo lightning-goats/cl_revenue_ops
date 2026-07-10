@@ -29,7 +29,6 @@ class ChannelInput:
     # sourced = entry role whose inbound flow earned fees on another exit.
     historical_direct_fee_ppm: float = 0.0
     historical_sourced_fee_ppm: float = 0.0
-    is_hive_member: bool = False
     is_profitable: bool = False
     is_active: bool = False
     cooldown_active: bool = False
@@ -157,7 +156,6 @@ def _normalize_channel_input(value: Any) -> ChannelInput:
             historical_sourced_fee_ppm=_as_nonnegative_float(
                 value.get("historical_sourced_fee_ppm", 0.0)
             ),
-            is_hive_member=_as_bool(value.get("is_hive_member", False)),
             is_profitable=_as_bool(value.get("is_profitable", False)),
             is_active=_as_bool(value.get("is_active", False)),
             cooldown_active=_as_bool(value.get("cooldown_active", False)),
@@ -209,8 +207,6 @@ def _budget_lookup(capex_allocations: Any) -> dict[str, int]:
 
 
 def _value_class(channel: ChannelInput, remaining_budget_sats: int = 0) -> str:
-    if channel.is_hive_member:
-        return "hive"
     if channel.is_profitable:
         return "profitable"
     if channel.is_active:
@@ -332,7 +328,6 @@ def build_state_snapshot(
     target_band_low: float = _DEFAULT_TARGET_BAND_LOW,
     target_band_high: float = _DEFAULT_TARGET_BAND_HIGH,
     target_emergency_low: float = _DEFAULT_TARGET_EMERGENCY_LOW,
-    hive_bootstrap_budget_sats: int = 0,
     flow_facts: Mapping[str, Any] | None = None,
     target_bands: Mapping[str, Tuple[float, float]] | None = None,
     cfg: Any = None,
@@ -361,11 +356,6 @@ def build_state_snapshot(
 
         remaining_budget_sats = max(0, budget_by_channel.get(channel.channel_id, 0))
         budget_source = "capex" if remaining_budget_sats > 0 else "none"
-        if channel.is_hive_member and remaining_budget_sats <= 0:
-            bootstrap_budget = max(0, _as_int(hive_bootstrap_budget_sats, 0))
-            if bootstrap_budget > 0:
-                remaining_budget_sats = bootstrap_budget
-                budget_source = "hive_bootstrap"
         value_class = _value_class(channel, remaining_budget_sats)
         is_valuable = value_class != "neutral"
         cooldown_active = bool(channel.cooldown_active)

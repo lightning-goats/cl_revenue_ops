@@ -20,9 +20,8 @@ from .rebalance_types_v2 import (
 )
 
 
-# Value class scores — hive channels win when routes are cheap, not via fake bonuses
+# Value class scores
 _VALUE_SCORES = {
-    "hive": 3,
     "profitable": 2,
     "active": 1,
     "funded": 1,  # capex budget approved — bootstrap inventory

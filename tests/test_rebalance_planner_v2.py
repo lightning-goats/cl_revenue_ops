@@ -515,31 +515,6 @@ class TestScoring:
         )
         assert abs(pair.score - expected) < 1e-6
 
-    def test_destination_drives_value_term_not_source(self):
-        """Phase 4.1: under the additive model the destination's value class
-        drives the value term -- a hive source paired with an active dest
-        should NOT outrank an active source paired with a hive dest."""
-        planner = RebalancePlanner()
-        # Pair A: hive source -> active dest. Source value should not beat dest.
-        hive_src = _ch(channel_id="hive_src", peer_id="02" + "aa" * 32,
-                       local_ratio=0.85, value_class="hive",
-                       actual_inbound_fee_ppm=100)
-        active_dest = _ch(channel_id="active_dest", peer_id="02" + "bb" * 32,
-                          local_ratio=0.15, value_class="active")
-        # Pair B: active source -> hive dest.
-        active_src = _ch(channel_id="active_src", peer_id="02" + "cc" * 32,
-                         local_ratio=0.85, value_class="active",
-                         actual_inbound_fee_ppm=100)
-        hive_dest = _ch(channel_id="hive_dest", peer_id="02" + "dd" * 32,
-                        local_ratio=0.15, value_class="hive")
-        snap = _snap(hive_src, active_dest, active_src, hive_dest)
-
-        result = planner.plan(snap)
-
-        # Highest-scoring pair should have the hive *destination*.
-        sorted_pairs = sorted(result.selected, key=lambda p: p.score, reverse=True)
-        assert sorted_pairs[0].dest_channel_id == "hive_dest"
-
     def test_more_drained_source_wins_when_value_and_return_tied(self):
         """Phase 2.3: explicit drain preference -- a more over-local source is
         preferred even at the same value class and same return cost."""

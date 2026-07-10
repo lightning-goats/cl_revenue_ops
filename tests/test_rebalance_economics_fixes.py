@@ -471,149 +471,16 @@ def test_f6_router_probability_wins_over_empirical_rate(
 # ---------------------------------------------------------------------------
 
 
-def _f4_snapshot():
-    from modules.rebalance_state_v2 import build_state_snapshot
-
-    return build_state_snapshot(
-        [
-            {
-                "channel_id": "100x1x0",
-                "peer_id": "02" + "1" * 64,
-                "capacity_sats": 1_000_000,
-                "local_sats": 900_000,
-                # 5000+ ppm inbound zeroes the planner's cheap-return term so
-                # planner and overlay scores differ only by the value term.
-                "actual_inbound_fee_ppm": 5_000,
-            },
-            {
-                "channel_id": "200x1x0",
-                "peer_id": "02" + "2" * 64,
-                "capacity_sats": 1_000_000,
-                "local_sats": 100_000,
-            },
-        ],
-        {"channel_budgets": {"200x1x0": {"budget_sats": 10_000}}},
-    )
 
 
-def _f4_hints(priority_score=0.0):
-    return SimpleNamespace(
-        get_rebalance_recommendations=lambda: [
-            {
-                "recommendation_id": "rec-f4",
-                "source_scid": "100x1x0",
-                "sink_scid": "200x1x0",
-                "amount_sats": 100_000,
-                "route_policy": "market_only",
-                "priority_score": priority_score,
-            }
-        ],
-        get_rebalance_campaigns=lambda: [],
-        get_route_segment_leases=lambda: [],
-        is_hive_member=lambda peer_id: False,
-    )
 
 
-def test_f4_overlay_score_matches_planner_coefficients():
-    from modules.rebalance_coordination_overlay import build_coordination_pairs
-    from modules.rebalance_state_v2 import _drain_score, _refill_urgency
-
-    pairs = build_coordination_pairs(
-        _f4_snapshot(), hive_hints=_f4_hints(), our_node_id="03" + "a" * 64
-    )
-
-    assert len(pairs) == 1
-    expected = (
-        0.30 * _refill_urgency(0.1, 0.35) + 0.20 * _drain_score(0.9, 0.65)
-    )
-    assert pairs[0].score == pytest.approx(expected, rel=1e-6)
 
 
-def test_f4_overlay_priority_multiplier_preserved():
-    from modules.rebalance_coordination_overlay import build_coordination_pairs
-    from modules.rebalance_state_v2 import _drain_score, _refill_urgency
-
-    pairs = build_coordination_pairs(
-        _f4_snapshot(),
-        hive_hints=_f4_hints(priority_score=90.0),
-        our_node_id="03" + "a" * 64,
-    )
-
-    base = 0.30 * _refill_urgency(0.1, 0.35) + 0.20 * _drain_score(0.9, 0.65)
-    assert pairs[0].score == pytest.approx(base * 1.135, rel=1e-6)
 
 
-def test_f4_identical_state_planner_and_overlay_scores_comparable():
-    """Identical physical state: the planner score exceeds the overlay
-    score only by its destination-value term (cheap-return zeroed by the
-    5000-ppm inbound fee), i.e. the shared urgency/drain shape uses the
-    same 0.30/0.20 coefficients in both paths."""
-    from modules.rebalance_coordination_overlay import build_coordination_pairs
-    from modules.rebalance_planner_v2 import RebalancePlanner
-
-    snapshot = _f4_snapshot()
-    overlay_pairs = build_coordination_pairs(
-        snapshot, hive_hints=_f4_hints(), our_node_id="03" + "a" * 64
-    )
-    planner_pairs = RebalancePlanner().plan(snapshot).selected
-
-    assert len(overlay_pairs) == 1 and len(planner_pairs) == 1
-    dest_value_term = 1 * 0.20  # value class "funded" = 1
-    assert planner_pairs[0].score == pytest.approx(
-        overlay_pairs[0].score + dest_value_term, rel=1e-6
-    )
 
 
-def test_f4_equalization_score_matches_planner_coefficients(
-    mock_plugin, mock_database
-):
-    from modules.rebalance_state_v2 import (
-        _drain_score,
-        _refill_urgency,
-        build_state_snapshot,
-    )
-
-    engine = _make_engine(mock_plugin, mock_database)
-    engine._hive_router = MagicMock(name="hive_router")
-    engine._hive_router.price_pair.return_value = SimpleNamespace(
-        success=True,
-        route_cost_sats=0,
-        route=[{"channel": "fleet"}],
-        probability_ppm=0,
-        error="",
-    )
-    engine._hive_router.begin_cycle = MagicMock()
-    engine._hive_router.end_cycle = MagicMock()
-    engine._build_snapshot = MagicMock(
-        return_value=build_state_snapshot(
-            [
-                {
-                    "channel_id": "100x1x0",
-                    "peer_id": "02" + "1" * 64,
-                    "capacity_sats": 1_000_000,
-                    "local_sats": 900_000,
-                    "is_hive_member": True,
-                },
-                {
-                    "channel_id": "200x1x0",
-                    "peer_id": "02" + "2" * 64,
-                    "capacity_sats": 1_000_000,
-                    "local_sats": 100_000,
-                    "is_hive_member": True,
-                },
-            ],
-            {},
-        )
-    )
-
-    selected = engine.find_candidates()
-
-    assert len(selected) == 1
-    assert selected[0].reason_code == "hive_equalization"
-    expected = (
-        0.30 * _refill_urgency(0.1, 0.35) + 0.20 * _drain_score(0.9, 0.65)
-    )
-    assert selected[0].score == pytest.approx(expected, rel=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -860,51 +727,6 @@ def test_planner_threads_outbound_fees_to_pair():
     assert pair.dest_out_fee_ppm == 2_200
 
 
-def test_coordination_overlay_threads_outbound_fees_to_pair():
-    from modules.rebalance_coordination_overlay import build_coordination_pairs
-    from modules.rebalance_state_v2 import build_state_snapshot
-
-    snapshot = build_state_snapshot(
-        [
-            {
-                "channel_id": "100x1x0",
-                "peer_id": "02" + "1" * 64,
-                "capacity_sats": 1_000_000,
-                "local_sats": 900_000,
-                "local_out_fee_ppm": 300,
-            },
-            {
-                "channel_id": "200x1x0",
-                "peer_id": "02" + "2" * 64,
-                "capacity_sats": 1_000_000,
-                "local_sats": 100_000,
-                "local_out_fee_ppm": 1_500,
-            },
-        ],
-        {"channel_budgets": {"200x1x0": {"budget_sats": 10_000}}},
-    )
-    hints = SimpleNamespace(
-        get_rebalance_recommendations=lambda: [
-            {
-                "recommendation_id": "rec-1",
-                "source_scid": "100x1x0",
-                "sink_scid": "200x1x0",
-                "amount_sats": 100_000,
-                "route_policy": "market_only",
-            }
-        ],
-        get_rebalance_campaigns=lambda: [],
-        get_route_segment_leases=lambda: [],
-        is_hive_member=lambda peer_id: False,
-    )
-
-    pairs = build_coordination_pairs(
-        snapshot, hive_hints=hints, our_node_id="03" + "a" * 64
-    )
-
-    assert len(pairs) == 1
-    assert pairs[0].source_out_fee_ppm == 300
-    assert pairs[0].dest_out_fee_ppm == 1_500
 
 
 # ---------------------------------------------------------------------------

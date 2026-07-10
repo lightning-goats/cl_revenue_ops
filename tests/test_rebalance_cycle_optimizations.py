@@ -134,7 +134,6 @@ def test_pair_in_futility_never_reaches_router(mock_plugin, mock_database):
     )
     engine._audit = MagicMock()
     engine.router_v3 = MagicMock()
-    engine._hive_router = MagicMock()
 
     now = time.time()
     engine._pair_failures[("100x1x0", "200x1x0")] = [now - 30, now - 20, now - 10]
@@ -159,7 +158,6 @@ def test_pair_in_futility_never_reaches_router(mock_plugin, mock_database):
 
     assert selected == []
     engine.router_v3.price_pair.assert_not_called()
-    engine._hive_router.price_pair.assert_not_called()
     audited_reasons = [
         call.kwargs.get("reason")
         for call in engine._audit.log_skip.call_args_list
@@ -496,95 +494,6 @@ def test_engine_make_executor_injects_cached_node_id(
     executor = engine._make_executor()
 
     assert executor._our_id == OUR_ID
-
-
-# ---------------------------------------------------------------------------
-# 4. HYBRID free hive route skips market pricing
-# ---------------------------------------------------------------------------
-
-
-def _hybrid_pair(prefer_hive_on_tie=True):
-    return SimpleNamespace(
-        source_channel_id="100x1x0",
-        dest_channel_id="200x1x0",
-        source_peer_id="02" + "b" * 64,
-        dest_peer_id="02" + "c" * 64,
-        amount_sats=50_000,
-        pair_budget_sats=10_000,
-        route_decision=RouteDecision(
-            policy=RoutePolicy.HYBRID,
-            priority=RoutePriority.EV_POSITIVE,
-            reason="ev_positive",
-            prefer_hive_on_tie=prefer_hive_on_tie,
-        ),
-    )
-
-
-def test_hybrid_free_hive_route_skips_market_quote(mock_plugin, mock_database):
-    engine = _make_engine(mock_plugin, mock_database)
-    hive_router = MagicMock()
-    hive_router.price_pair.return_value = RouteResult(
-        success=True, route_cost_sats=0, route=[{"channel": "100x1x0"}]
-    )
-    engine._hive_router = hive_router
-    market_router = MagicMock()
-
-    result, label = engine._route_pair(
-        pair=_hybrid_pair(), router=market_router, exclude=None
-    )
-
-    assert label == "hive"
-    assert result.route_cost_sats == 0
-    market_router.price_pair.assert_not_called()
-
-
-def test_hybrid_nonzero_hive_route_still_compares_with_market(
-    mock_plugin, mock_database
-):
-    engine = _make_engine(mock_plugin, mock_database)
-    hive_router = MagicMock()
-    hive_router.price_pair.return_value = RouteResult(
-        success=True, route_cost_sats=5, route=[{"channel": "100x1x0"}]
-    )
-    engine._hive_router = hive_router
-    market_router = MagicMock()
-    market_router.price_pair.return_value = RouteResult(
-        success=True, route_cost_sats=3, route=[{"channel": "300x1x0"}]
-    )
-
-    result, label = engine._route_pair(
-        pair=_hybrid_pair(), router=market_router, exclude=None
-    )
-
-    assert label == "market"
-    assert result.route_cost_sats == 3
-    market_router.price_pair.assert_called_once()
-
-
-def test_hybrid_free_hive_route_without_tie_preference_keeps_market_quote(
-    mock_plugin, mock_database
-):
-    """prefer_hive_on_tie=False must preserve the old double pricing so the
-    market route can still win a 0-cost tie."""
-    engine = _make_engine(mock_plugin, mock_database)
-    hive_router = MagicMock()
-    hive_router.price_pair.return_value = RouteResult(
-        success=True, route_cost_sats=0, route=[{"channel": "100x1x0"}]
-    )
-    engine._hive_router = hive_router
-    market_router = MagicMock()
-    market_router.price_pair.return_value = RouteResult(
-        success=True, route_cost_sats=0, route=[{"channel": "300x1x0"}]
-    )
-
-    result, label = engine._route_pair(
-        pair=_hybrid_pair(prefer_hive_on_tie=False),
-        router=market_router,
-        exclude=None,
-    )
-
-    assert label == "market"
-    market_router.price_pair.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

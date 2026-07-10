@@ -25,7 +25,6 @@ def test_build_state_snapshot_derives_value_classes_and_budget():
                 capacity_sats=1_000_000,
                 local_sats=650_000,
                 actual_inbound_fee_ppm=120,
-                is_hive_member=True,
                 is_profitable=True,
                 is_active=True,
                 cooldown_active=False,
@@ -36,7 +35,6 @@ def test_build_state_snapshot_derives_value_classes_and_budget():
                 capacity_sats=500_000,
                 local_sats=100_000,
                 actual_inbound_fee_ppm=80,
-                is_hive_member=False,
                 is_profitable=False,
                 is_active=True,
                 cooldown_active=True,
@@ -48,7 +46,7 @@ def test_build_state_snapshot_derives_value_classes_and_budget():
     assert [channel.channel_id for channel in state.channels] == ["111x1x0", "222x2x0"]
     assert state.channels[0].local_ratio == 0.65
     assert state.channels[0].actual_inbound_fee_ppm == 120
-    assert state.channels[0].value_class == "hive"
+    assert state.channels[0].value_class == "profitable"
     assert state.channels[0].is_valuable is True
     assert state.channels[0].remaining_budget_sats == 250
     assert state.channels[0].cooldown_active is False
@@ -215,61 +213,6 @@ def test_destination_eligibility_keeps_conservative_value_gate():
     assert channel.dest_eligible is True
     assert channel.dest_reason == ""
     assert channel.source_eligible is True  # also drainable, but not over-local
-
-
-def test_hive_member_without_capex_gets_conservative_bootstrap_budget():
-    """Fresh hive-member channels can be strategically valuable before the
-    capex/profitability cache has a per-channel allocation. The state builder
-    gives them a small explicit budget only when the caller opts in."""
-    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
-
-    state = build_state_snapshot(
-        [
-            ChannelInput(
-                channel_id="300x3x0",
-                peer_id="02" + "h" * 64,
-                capacity_sats=1_000_000,
-                local_sats=20_000,
-                is_hive_member=True,
-            ),
-        ],
-        {},
-        hive_bootstrap_budget_sats=300,
-    )
-
-    channel = state.channels[0]
-    assert channel.value_class == "hive"
-    assert channel.remaining_budget_sats == 300
-    assert channel.budget_source == "hive_bootstrap"
-    assert channel.dest_eligible is True
-    assert channel.dest_reason == ""
-
-
-def test_hive_bootstrap_budget_is_disabled_at_zero():
-    """The bootstrap path is bounded and can be disabled for strict capex-only
-    operation."""
-    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
-
-    state = build_state_snapshot(
-        [
-            ChannelInput(
-                channel_id="301x3x0",
-                peer_id="02" + "i" * 64,
-                capacity_sats=1_000_000,
-                local_sats=20_000,
-                is_hive_member=True,
-            ),
-        ],
-        {},
-        hive_bootstrap_budget_sats=0,
-    )
-
-    channel = state.channels[0]
-    assert channel.value_class == "hive"
-    assert channel.remaining_budget_sats == 0
-    assert channel.budget_source == "none"
-    assert channel.dest_eligible is False
-    assert channel.dest_reason == "no_budget"
 
 
 def test_source_eligibility_blocked_only_by_cooldown():
@@ -499,7 +442,6 @@ def test_build_state_snapshot_injects_flow_facts():
                 capacity_sats=1_000_000,
                 local_sats=650_000,
                 actual_inbound_fee_ppm=120,
-                is_hive_member=True,
                 is_profitable=True,
                 is_active=True,
                 cooldown_active=False,
@@ -534,7 +476,6 @@ def test_build_state_snapshot_injects_target_band():
                 capacity_sats=1_000_000,
                 local_sats=650_000,
                 actual_inbound_fee_ppm=120,
-                is_hive_member=True,
                 is_profitable=True,
                 is_active=True,
                 cooldown_active=False,
@@ -565,7 +506,7 @@ def test_build_state_snapshot_band_falls_back_to_cfg_thresholds():
         [
             ChannelInput(
                 channel_id="A", peer_id="02" + "a" * 64, capacity_sats=1_000_000,
-                local_sats=650_000, actual_inbound_fee_ppm=120, is_hive_member=True,
+                local_sats=650_000, actual_inbound_fee_ppm=120,
                 is_profitable=True, is_active=True, cooldown_active=False,
             ),
         ],
@@ -601,7 +542,6 @@ def test_build_state_snapshot_scores_use_per_channel_band():
                 # ratio 0.75: above the flat high (0.65) but comfortably
                 # inside this channel's own wider band (0.20, 0.80).
                 local_sats=750_000,
-                is_hive_member=True,
                 is_profitable=True,
                 is_active=True,
             ),
@@ -639,7 +579,6 @@ def test_build_state_snapshot_scores_fall_back_to_flat_band_when_no_per_channel_
                 peer_id="02" + "a" * 64,
                 capacity_sats=1_000_000,
                 local_sats=750_000,  # ratio 0.75, above flat high 0.65
-                is_hive_member=True,
                 is_profitable=True,
                 is_active=True,
             ),

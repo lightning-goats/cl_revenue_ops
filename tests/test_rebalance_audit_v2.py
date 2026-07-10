@@ -258,13 +258,9 @@ def test_scraper_finds_known_production_emitters():
     expected_sample = {
         # planner
         "inside_band", "no_partner", "source_ineligible", "dest_ineligible",
-        # coordination overlay
-        "not_designated_executor", "coordination_unavailable",
-        "coordination_unresolvable_endpoint", "coordination_preempted",
-        "lease_conflict",
         # engine
-        "hive_equalization_cooldown", "pair_cooldown", "pair_futility",
-        "below_hold_margin", "cycle_already_running", "fleet_lease_held",
+        "pair_cooldown", "pair_futility",
+        "below_hold_margin", "cycle_already_running",
         "max_pairs_reached", "route_over_budget", "no_route",
         "native_unavailable",
         # state-layer eligibility strings

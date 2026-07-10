@@ -15,22 +15,14 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from .rebalance_audit_v2 import RebalanceAudit
-from .rebalance_coordination_overlay import (
-    build_coordination_overlay,
-    merge_coordination_pairs,
-    pair_segment_bias_multiplier,
-    suppress_leased_pairs,
-)
 from .rebalance_execution import ExecutionResult
 from .rebalance_flow_facts import ChannelFlowFacts, compute_channel_flow_facts
 from .rebalance_native_executor_v2 import NativeRouteExecutor
-from .rebalance_hive_router import RebalanceHiveRouter
 from .rebalance_planner_v2 import RebalancePlanner
 from .rebalance_route_policy import (
     RouteDecision,
     RoutePolicy,
     RoutePriority,
-    _entries,
     decide_route_policy,
 )
 from .rebalance_router_v2 import RouteResult
@@ -137,9 +129,7 @@ class RebalanceEngine:
         database: Any,
         capex_engine: Any = None,
         profitability: Any = None,
-        hive_hints: Any = None,
         data_service: Any = None,
-        hive_router: Any = None,
         segment_observation_store: Any = None,
         global_budget_limit_provider: Any = None,
         external_liquidity_cost_provider: Any = None,
@@ -151,14 +141,10 @@ class RebalanceEngine:
         self._policy_manager = policy_manager
         self._capex_engine = capex_engine
         self._profitability = profitability
-        self._hive_hints = hive_hints
+        # cl-mycelium retired: no fleet hints/router. Kept as a permanent None
+        # so the (now-inert) metabolic/immune bias helpers still resolve.
+        self._hive_hints = None
         self._data_service = data_service
-        self._membership_router = (
-            hive_router if hasattr(hive_router, "is_hive_member") else None
-        )
-        self._hive_router = (
-            hive_router if hasattr(hive_router, "price_pair") else None
-        )
         self._segment_observation_store = segment_observation_store
         self.global_budget_limit_provider = global_budget_limit_provider
         self.external_liquidity_cost_provider = external_liquidity_cost_provider
@@ -222,14 +208,6 @@ class RebalanceEngine:
             )
             # Clean any orphan exclude layers from a previous crashed cycle.
             self._sweep_orphan_exclude_layers()
-            if self._hive_router is None and self._hive_hints is not None:
-                self._hive_router = RebalanceHiveRouter(
-                    plugin=plugin,
-                    our_node_id=our_id,
-                    hive_hints=self._hive_hints,
-                    data_service=self._data_service,
-                    log=self._log,
-                )
 
         self._cycle_router: Optional[Any] = self._active_router()
         self._last_cycle_result: CycleResult = CycleResult()
@@ -1165,11 +1143,6 @@ class RebalanceEngine:
                 else ch.get("fee_proportional_millionths", 0)
             )
 
-            # Hive membership check
-            is_hive = False
-            if peer_id:
-                is_hive = self._is_hive_member(peer_id)
-
             # Profitability check
             is_profitable = False
             is_active = False
@@ -1275,10 +1248,9 @@ class RebalanceEngine:
                 "local_out_fee_ppm": local_out_fee_ppm,
                 "historical_direct_fee_ppm": historical_direct_fee_ppm,
                 "historical_sourced_fee_ppm": historical_sourced_fee_ppm,
-                "is_hive_member": is_hive,
                 "is_profitable": is_profitable,
                 "is_active": is_active,
-                "rebalance_bias": self._get_hive_rebalance_bias(peer_id),
+                "rebalance_bias": 1.0,
                 "cooldown_active": cooldown,
                 "cooldown_override": cooldown_override,
             })
@@ -1313,176 +1285,11 @@ class RebalanceEngine:
             target_band_low=target_band_low,
             target_band_high=target_band_high,
             target_emergency_low=target_emergency_low,
-            hive_bootstrap_budget_sats=int(
-                getattr(cfg, "hive_rebalance_bootstrap_budget_sats", 0) or 0
-            ),
             flow_facts=flow_facts,
             target_bands=target_bands,
             cfg=cfg,
         )
 
-    def _is_hive_member(self, peer_id: str) -> bool:
-        if not peer_id:
-            return False
-        if self._membership_router is not None:
-            try:
-                return bool(self._membership_router.is_hive_member(peer_id))
-            except Exception:
-                pass
-        if self._hive_hints is not None:
-            try:
-                return bool(self._hive_hints.is_hive_member(peer_id))
-            except Exception:
-                pass
-        return False
-
-    def _get_hive_rebalance_bias(self, peer_id: str) -> float:
-        if not peer_id or self._hive_hints is None:
-            return 1.0
-        try:
-            bias = float(self._hive_hints.get_rebalance_bias(peer_id))
-        except Exception:
-            return 1.0
-        return max(0.85, min(1.15, bias))
-
-    def _hive_equalization_overlay(
-        self,
-        snapshot: StateSnapshot,
-        cfg: Any,
-        *,
-        max_chunk_sats: int,
-    ) -> PlanResult:
-        result = PlanResult()
-        if not bool(getattr(cfg, "hive_equalization_enabled", True)):
-            return result
-
-        max_candidates = int(
-            getattr(cfg, "hive_equalization_max_candidates_per_cycle", 1) or 0
-        )
-        if max_candidates <= 0:
-            return result
-
-        low_pct = float(
-            getattr(cfg, "hive_equalization_low_pct", 0.35) or 0.35
-        )
-        high_pct = float(
-            getattr(cfg, "hive_equalization_high_pct", 0.65) or 0.65
-        )
-        cooldown_hours = int(
-            getattr(cfg, "hive_equalization_cooldown_hours", 48) or 0
-        )
-        cooldown_secs = max(0, cooldown_hours * 3600)
-        now = int(time.time())
-
-        hive_high = []
-        hive_low = []
-        for channel in snapshot.channels:
-            if channel.value_class != "hive":
-                continue
-            if channel.local_ratio > high_pct:
-                hive_high.append(channel)
-            elif channel.local_ratio < low_pct:
-                if cooldown_secs > 0 and self.database is not None:
-                    try:
-                        last_ts = self.database.get_last_rebalance_time(
-                            channel.channel_id,
-                            reason_code="hive_equalization",
-                        )
-                    except Exception:
-                        last_ts = None
-                    if last_ts and (now - int(last_ts)) < cooldown_secs:
-                        result.skipped.append(
-                            SkipRecord(
-                                channel_id=channel.channel_id,
-                                reason="hive_equalization_cooldown",
-                                value_class="hive",
-                                detail=f"cooldown_until={int(last_ts) + cooldown_secs}",
-                            )
-                        )
-                        continue
-                hive_low.append(channel)
-
-        candidate_pairs: List[PairCandidate] = []
-        for source in hive_high:
-            source_excess = max(
-                0,
-                int((source.local_ratio - high_pct) * source.capacity_sats),
-            )
-            if source_excess <= 0:
-                continue
-            for dest in hive_low:
-                if source.channel_id == dest.channel_id:
-                    continue
-                dest_need = max(
-                    0,
-                    int((low_pct - dest.local_ratio) * dest.capacity_sats),
-                )
-                amount_sats = min(source_excess, dest_need, max_chunk_sats)
-                if amount_sats <= 0:
-                    continue
-                # Score in planner units so equalization pairs are comparable
-                # with planner and coordination pairs in final ordering.
-                # Audit F4: same coefficients as the planner's role-aware
-                # terms (0.30 x dest urgency + 0.20 x source drain), matching
-                # the coordination overlay's normalization.
-                equalization_score = max(
-                    0.0,
-                    0.30 * _refill_urgency(dest.local_ratio, low_pct)
-                    + 0.20 * _drain_score(source.local_ratio, high_pct),
-                )
-                candidate_pairs.append(
-                    PairCandidate(
-                        source_channel_id=source.channel_id,
-                        dest_channel_id=dest.channel_id,
-                        source_peer_id=source.peer_id,
-                        dest_peer_id=dest.peer_id,
-                        amount_sats=amount_sats,
-                        pair_budget_sats=0,
-                        source_capacity_sats=source.capacity_sats,
-                        dest_capacity_sats=dest.capacity_sats,
-                        source_value_class=source.value_class,
-                        dest_value_class=dest.value_class,
-                        source_budget_source=source.budget_source,
-                        dest_budget_source=dest.budget_source,
-                        source_out_fee_ppm=max(
-                            0, int(getattr(source, "local_out_fee_ppm", 0) or 0)
-                        ),
-                        dest_out_fee_ppm=max(
-                            0, int(getattr(dest, "local_out_fee_ppm", 0) or 0)
-                        ),
-                        score=equalization_score,
-                        source_local_ratio=source.local_ratio,
-                        dest_local_ratio=dest.local_ratio,
-                        reason_code="hive_equalization",
-                        route_decision=RouteDecision(
-                            policy=RoutePolicy.HIVE_ONLY,
-                            priority=RoutePriority.HIVE_EQUALIZATION,
-                            reason="hive_equalization",
-                            allow_market_fallback=False,
-                        ),
-                    )
-                )
-
-        candidate_pairs.sort(
-            key=lambda pair: (
-                -float(pair.score or 0.0),
-                0 if pair.source_peer_id == pair.dest_peer_id else 1,
-                -int(pair.amount_sats or 0),
-            )
-        )
-
-        used_sources: set[str] = set()
-        used_dests: set[str] = set()
-        for pair in candidate_pairs:
-            if len(result.selected) >= max_candidates:
-                break
-            if pair.source_channel_id in used_sources or pair.dest_channel_id in used_dests:
-                continue
-            used_sources.add(pair.source_channel_id)
-            used_dests.add(pair.dest_channel_id)
-            result.selected.append(pair)
-
-        return result
 
     def find_candidates(self) -> List[PairCandidate]:
         """Dry-run: build snapshot, plan, and return candidates without executing.
@@ -1529,60 +1336,9 @@ class RebalanceEngine:
             pair_fee_cap_ppm=pair_fee_cap_ppm,
         )
 
+        # cl-mycelium retired: no coordination overlay, fleet equalization
+        # fallback, or route-segment leases. The planner's own selection stands.
         plan = planner.plan(snapshot)
-        overlay = build_coordination_overlay(
-            snapshot,
-            hive_hints=self._hive_hints,
-            our_node_id=self._get_our_id() or "",
-            target_band_low=target_band_low,
-            target_band_high=target_band_high,
-            max_chunk_sats=max_chunk_sats,
-            pair_fee_cap_ppm=pair_fee_cap_ppm,
-        )
-        plan.skipped.extend(overlay.skipped)
-        planner_max_pairs = getattr(planner, "max_pairs", 10)
-        if not isinstance(planner_max_pairs, int) or planner_max_pairs <= 0:
-            planner_max_pairs = 10
-        reserved = int(getattr(cfg, "rebalance_coordination_reserved_slots", 0) or 0)
-        plan.selected = merge_coordination_pairs(
-            plan,
-            overlay.selected,
-            max_pairs=planner_max_pairs,
-            coordination_reserved_slots=reserved,
-        )
-        if not plan.selected:
-            hive_equalization = self._hive_equalization_overlay(
-                snapshot,
-                cfg,
-                max_chunk_sats=max_chunk_sats,
-            )
-            if hive_equalization.selected:
-                selected_channels = {
-                    channel_id
-                    for pair in hive_equalization.selected
-                    for channel_id in (pair.source_channel_id, pair.dest_channel_id)
-                }
-                plan.skipped = [
-                    skip
-                    for skip in plan.skipped
-                    if skip.channel_id not in selected_channels
-                ]
-            plan.selected = hive_equalization.selected
-            plan.skipped.extend(hive_equalization.skipped)
-
-        # Fleet leases are fleet-wide de-confliction and must bind every
-        # selection path. build_coordination_overlay already suppresses its
-        # own pairs; planner and equalization pairs are checked here against
-        # the same leases.
-        if plan.selected and self._hive_hints is not None:
-            lease_result = suppress_leased_pairs(
-                plan.selected,
-                leases=_entries(self._hive_hints, "get_route_segment_leases"),
-                our_node_id=self._get_our_id() or "",
-                reason="fleet_lease_held",
-            )
-            plan.selected = lease_result.selected
-            plan.skipped.extend(lease_result.skipped)
 
         # P4-008: in-flight-destination guard. Drop any selected pair whose
         # destination still has an outstanding reserve+pay in flight (typically
@@ -1637,13 +1393,10 @@ class RebalanceEngine:
 
         for pair in plan.selected:
             self._route_decision_for_pair(pair)
-            self._apply_segment_score_bias(pair)
             self._apply_metabolic_rebalance_bias(pair)
             self._apply_immune_rebalance_bias(pair)
             self._update_pair_score_decomposition(pair, route_status="planned")
         priority_rank = {
-            RoutePriority.COORDINATED: 0,
-            RoutePriority.HIVE_EQUALIZATION: 1,
             RoutePriority.EV_POSITIVE: 2,
             RoutePriority.BACKGROUND: 3,
         }
@@ -1663,12 +1416,9 @@ class RebalanceEngine:
         if plan.selected:
             router = self._cycle_router
             priced = []
-            hive_router = self._hive_router
             router_begin = getattr(router, "begin_cycle", None)
             if callable(router_begin):
                 router_begin()
-            if hive_router is not None:
-                hive_router.begin_cycle()
             try:
                 for pair in plan.selected:
                     pair_key = self._pair_key(pair)
@@ -1899,8 +1649,6 @@ class RebalanceEngine:
                         continue
 
             finally:
-                if hive_router is not None:
-                    hive_router.end_cycle()
                 router_end = getattr(router, "end_cycle", None)
                 if callable(router_end):
                     router_end()
@@ -1938,22 +1686,10 @@ class RebalanceEngine:
         decision = decide_route_policy(
             pair,
             reason_code=getattr(pair, "reason_code", "") or "ev_positive",
-            hive_hints=self._hive_hints,
         )
         pair.route_decision = decision
         return decision
 
-    def _apply_segment_score_bias(self, pair: PairCandidate) -> None:
-        """Apply bounded fleet segment utility bias to pair scoring."""
-        hive_hints = self._hive_hints
-        if hive_hints is None:
-            return
-        multiplier = pair_segment_bias_multiplier(
-            pair,
-            hive_hints,
-            self._get_our_id() or "",
-        )
-        pair.score = float(getattr(pair, "score", 0.0) or 0.0) * multiplier
 
     def _apply_metabolic_rebalance_bias(self, pair: PairCandidate) -> None:
         """Apply fresh, scoped metabolic influence as a bounded score modifier."""
@@ -2112,29 +1848,6 @@ class RebalanceEngine:
     def _route_error(error: str) -> RouteResult:
         return RouteResult(success=False, error=error)
 
-    def _hybrid_choice(self, hive_result: Any, market_result: Any, decision: Any):
-        if getattr(hive_result, "success", False) and not getattr(market_result, "success", False):
-            return hive_result, "hive"
-        if getattr(market_result, "success", False) and not getattr(hive_result, "success", False):
-            return market_result, "market"
-        if not getattr(hive_result, "success", False) and not getattr(market_result, "success", False):
-            return market_result, "market"
-        hive_cost = int(getattr(hive_result, "route_cost_sats", 0) or 0)
-        market_cost = int(getattr(market_result, "route_cost_sats", 0) or 0)
-        if hive_cost < market_cost:
-            return hive_result, "hive"
-        if market_cost < hive_cost:
-            return market_result, "market"
-        if bool(getattr(decision, "prefer_hive_on_tie", True)):
-            return hive_result, "hive"
-        return market_result, "market"
-
-    @staticmethod
-    def _fail_closed_on_route_failure(decision: Any) -> bool:
-        policy = getattr(decision, "policy", None)
-        if policy not in (RoutePolicy.HIVE_ONLY, RoutePolicy.HYBRID):
-            return False
-        return not bool(getattr(decision, "allow_market_fallback", True))
 
     def _route_pair(
         self,
@@ -2143,69 +1856,14 @@ class RebalanceEngine:
         router: Any,
         exclude: Optional[List[str]],
     ):
-        decision = self._route_decision_for_pair(pair)
-        if decision.policy is RoutePolicy.MARKET_ONLY:
-            return self._market_price_pair(
-                router,
-                pair,
-                exclude,
-                market_only_layers=True,
-            ), "market"
-
-        hive_router = self._hive_router
-        if hive_router is None:
-            if self._fail_closed_on_route_failure(decision):
-                return self._route_error("hive_router_unavailable"), "hive"
-            return self._market_price_pair(
-                router,
-                pair,
-                exclude,
-                market_only_layers=True,
-            ), "market"
-
-        try:
-            hive_result = hive_router.price_pair(
-                pair,
-                decision,
-                exclude=exclude,
-            )
-        except Exception as e:
-            hive_result = self._route_error(f"hive_route_error: {e}")
-
-        if decision.policy is RoutePolicy.HIVE_ONLY:
-            if getattr(hive_result, "success", False) or self._fail_closed_on_route_failure(decision):
-                return hive_result, "hive"
-            return self._market_price_pair(
-                router,
-                pair,
-                exclude,
-                market_only_layers=True,
-            ), "market"
-
-        if (
-            decision.policy is RoutePolicy.HYBRID
-            and getattr(hive_result, "success", False)
-            and int(getattr(hive_result, "route_cost_sats", 0) or 0) == 0
-            and bool(getattr(decision, "prefer_hive_on_tie", True))
-        ):
-            # Free hive route (typical intra-fleet). A market quote cannot
-            # beat zero cost, and prefer_hive_on_tie would pick the hive
-            # route even on a 0-cost tie, so the market pricing pass is
-            # provably redundant — skip its RPCs entirely.
-            return hive_result, "hive"
-
-        market_result = self._market_price_pair(
+        # cl-mycelium retired: no fleet routing — every pair prices on the open
+        # market via askrene, exactly the live path.
+        return self._market_price_pair(
             router,
             pair,
             exclude,
             market_only_layers=True,
-        )
-        if decision.policy is RoutePolicy.HYBRID:
-            if not getattr(hive_result, "success", False) and self._fail_closed_on_route_failure(decision):
-                return hive_result, "hive"
-            return self._hybrid_choice(hive_result, market_result, decision)
-
-        return market_result, "market"
+        ), "market"
 
     def _prune_pair_failures(self, key: Tuple[str, str]) -> List[float]:
         """Drop failure timestamps older than the futility window and return survivors."""
@@ -2630,12 +2288,6 @@ class RebalanceEngine:
         if router is None:
             return first_result
 
-        # Keep the retry conservative: when the hive router owns route choice,
-        # do not call it from an execution worker outside its cycle window.
-        decision = self._route_decision_for_pair(pair)
-        if self._hive_router is not None and decision.policy is not RoutePolicy.MARKET_ONLY:
-            return first_result
-
         retry_data = dict(getattr(first_result, "failure_data", {}) or {})
         retry_data["retry_excluded_channels"] = list(exclusions)
         try:
@@ -2769,10 +2421,6 @@ class RebalanceEngine:
 
         router = self._cycle_router or self._active_router()
         if router is None:
-            return prior_result
-
-        decision = self._route_decision_for_pair(pair)
-        if self._hive_router is not None and decision.policy is not RoutePolicy.MARKET_ONLY:
             return prior_result
 
         original_amount = int(getattr(pair, "amount_sats", 0) or 0)
@@ -3490,12 +3138,9 @@ class RebalanceEngine:
         )
         pair.route_decision = getattr(candidate, "route_decision", None)
 
-        hive_router = self._hive_router
         router_begin = getattr(self._cycle_router, "begin_cycle", None)
         if callable(router_begin):
             router_begin()
-        if hive_router is not None:
-            hive_router.begin_cycle()
         try:
             try:
                 route_result, route_label = self._route_pair(
@@ -3525,20 +3170,9 @@ class RebalanceEngine:
                         level="info",
                     )
         finally:
-            if hive_router is not None:
-                hive_router.end_cycle()
             router_end = getattr(self._cycle_router, "end_cycle", None)
             if callable(router_end):
                 router_end()
-
-        decision = self._route_decision_for_pair(pair)
-        if route_result is not None and not route_result.success and self._fail_closed_on_route_failure(decision):
-            return ExecutionResult(
-                success=False,
-                error=route_result.error or "hive_route_unavailable",
-                amount_sats=amount_sats,
-                route_type="native",
-            )
 
         executor = self._make_executor()
         return self._execute_pair(

@@ -253,75 +253,6 @@ def test_rebalancer_reports_failed_execution(mock_plugin, mock_database):
     assert "0/1" in summary["reason"]
 
 
-def test_active_engine_honors_hive_only_pairs(mock_plugin, mock_database):
-    """Strict hive-only candidates must be priced through the hive router."""
-    from modules.config import Config
-    from modules.rebalance_engine_v2 import RebalanceEngine
-    from modules.rebalance_route_policy import RoutePolicy
-
-    cfg = Config(dry_run=True, rebalance_router="v3")
-    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
-    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
-    mock_plugin.rpc.listpeerchannels.return_value = {"channels": []}
-    mock_plugin.rpc.listchannels.return_value = {"channels": []}
-    mock_plugin.rpc.listconfigs.return_value = {
-        "configs": {"cltv-final": {"value_int": 18}}
-    }
-
-    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
-    engine.router_v3 = MagicMock(name="market_router")
-    engine._hive_router = MagicMock(name="hive_router")
-    engine._audit = MagicMock()
-    engine._audit.log_pick = MagicMock()
-    engine._audit.log_skip = MagicMock()
-    engine._audit.log_cycle_summary = MagicMock()
-    engine._build_snapshot = MagicMock(
-        return_value=SimpleNamespace(
-            channels=[object()],
-            valuable_channel_count=1,
-            total_remaining_budget_sats=10_000,
-        )
-    )
-
-    hive_only_candidate = SimpleNamespace(
-        source_channel_id="100x1x0",
-        dest_channel_id="200x2x0",
-        source_peer_id="03" + "b" * 64,
-        dest_peer_id="03" + "c" * 64,
-        amount_sats=50_000,
-        pair_budget_sats=10_000,
-        dest_out_fee_ppm=1_000,  # sats-EV gate: refill earns 25 sats expected
-        score=1.0,
-        route_decision=SimpleNamespace(
-            policy=RoutePolicy.HIVE_ONLY,
-            allow_market_fallback=False,
-            reason="hive_equalization",
-        ),
-        route_cost_sats=None,
-        route=None,
-    )
-
-    route_result = SimpleNamespace(
-        success=True,
-        route_cost_sats=1,
-        route=[],
-        probability_ppm=0,
-        error="",
-    )
-    engine._hive_router.price_pair.return_value = route_result
-
-    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
-        planner = planner_cls.return_value
-        planner.plan.return_value = SimpleNamespace(
-            selected=[hive_only_candidate],
-            skipped=[],
-        )
-
-        selected = engine.find_candidates()
-
-    assert selected == [hive_only_candidate]
-    engine._hive_router.price_pair.assert_called_once()
-    engine.router_v3.price_pair.assert_not_called()
 
 
 def test_engine_debug_exposes_score_decomposition_for_selected_pairs(
@@ -1202,97 +1133,8 @@ def test_engine_layer_preserves_route_success_fee_and_penalty_terms(
     assert decomp["final_score"] == expected
 
 
-def test_engine_build_snapshot_uses_membership_router_for_hive_value_class(
-    mock_plugin, mock_database
-):
-    from modules.config import Config
-    from modules.rebalance_engine_v2 import RebalanceEngine
-
-    cfg = Config(dry_run=True, rebalance_router="v3")
-    membership_router = MagicMock()
-    membership_router.is_hive_member.return_value = True
-    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
-    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
-    mock_plugin.rpc.listpeerchannels.return_value = {
-        "channels": [
-            {
-                "state": "CHANNELD_NORMAL",
-                "peer_id": "03" + "b" * 64,
-                "short_channel_id": "100x1x0",
-                "total_msat": "2000000msat",
-                "our_amount_msat": "1000000msat",
-                "updates": {
-                    "remote": {"fee_proportional_millionths": 123}
-                },
-            }
-        ]
-    }
-    mock_plugin.rpc.listchannels.return_value = {"channels": []}
-    mock_plugin.rpc.listconfigs.return_value = {
-        "configs": {"cltv-final": {"value_int": 18}}
-    }
-
-    engine = RebalanceEngine(
-        mock_plugin,
-        cfg,
-        mock_database,
-        hive_router=membership_router,
-    )
-
-    snapshot = engine._build_snapshot()
-
-    assert snapshot is not None
-    assert snapshot.channels[0].value_class == "hive"
-    assert snapshot.channels[0].is_valuable is True
-    assert (
-        snapshot.channels[0].remaining_budget_sats
-        == cfg.hive_rebalance_bootstrap_budget_sats
-    )
-    assert snapshot.channels[0].budget_source == "hive_bootstrap"
-    membership_router.is_hive_member.assert_called_once()
 
 
-def test_engine_build_snapshot_carries_hive_rebalance_bias(
-    mock_plugin, mock_database
-):
-    from modules.config import Config
-    from modules.rebalance_engine_v2 import RebalanceEngine
-
-    peer_id = "03" + "b" * 64
-    cfg = Config(dry_run=True, rebalance_router="v3")
-    hive_hints = MagicMock()
-    hive_hints.get_rebalance_bias.return_value = 1.05
-    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
-    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
-    mock_plugin.rpc.listpeerchannels.return_value = {
-        "channels": [
-            {
-                "state": "CHANNELD_NORMAL",
-                "peer_id": peer_id,
-                "short_channel_id": "100x1x0",
-                "total_msat": "2000000msat",
-                "our_amount_msat": "1000000msat",
-                "updates": {"remote": {"fee_proportional_millionths": 123}},
-            }
-        ]
-    }
-    mock_plugin.rpc.listchannels.return_value = {"channels": []}
-    mock_plugin.rpc.listconfigs.return_value = {
-        "configs": {"cltv-final": {"value_int": 18}}
-    }
-
-    engine = RebalanceEngine(
-        mock_plugin,
-        cfg,
-        mock_database,
-        hive_hints=hive_hints,
-    )
-
-    snapshot = engine._build_snapshot()
-
-    assert snapshot is not None
-    assert snapshot.channels[0].rebalance_bias == pytest.approx(1.05)
-    hive_hints.get_rebalance_bias.assert_called_once_with(peer_id)
 
 
 def test_engine_build_snapshot_toggle_off_carries_flat_bands_for_all_channels(
@@ -1517,7 +1359,6 @@ def test_c1_planner_accepts_known_good_pair_and_explains_no_budget_destination()
                 peer_id="03" + "2" * 64,
                 capacity_sats=1_000_000,
                 local_sats=100_000,
-                is_hive_member=True,
                 rebalance_bias=1.05,
             ),
             ChannelInput(
@@ -1548,7 +1389,7 @@ def test_c1_planner_accepts_known_good_pair_and_explains_no_budget_destination()
     assert pair.dest_channel_id == known_good_dest
     assert pair.amount_sats == 250_000
     assert pair.pair_budget_sats == 500
-    assert pair.dest_value_class == "hive"
+    assert pair.dest_value_class == "funded"
     assert pair.score_decomposition["beats_do_nothing"] is True
     skipped = {skip.channel_id: skip.reason for skip in plan.skipped}
     assert skipped[no_budget_dest] == "no_budget"
@@ -1680,117 +1521,8 @@ def test_c1_engine_rejects_route_bait_even_when_route_prices(
     assert skipped["201x1x0"] == "below_hold_margin"
 
 
-def test_engine_falls_back_to_hive_equalization_when_hive_channels_have_no_budget(
-    mock_plugin, mock_database
-):
-    from modules.rebalance_state_v2 import build_state_snapshot
-
-    engine = _make_engine(mock_plugin, mock_database)
-    engine.router_v3 = MagicMock(name="market_router")
-    engine._hive_router = MagicMock(name="hive_router")
-    engine._hive_router.price_pair.return_value = SimpleNamespace(
-        success=True,
-        route_cost_sats=0,
-        route=[{"channel": "fleet"}],
-        probability_ppm=0,
-        error="",
-    )
-    engine._audit = MagicMock()
-    engine._audit.log_pick = MagicMock()
-    engine._audit.log_skip = MagicMock()
-    engine._audit.log_cycle_summary = MagicMock()
-    engine._build_snapshot = MagicMock(
-        return_value=build_state_snapshot(
-            [
-                {
-                    "channel_id": "100x1x0",
-                    "peer_id": "02" + "1" * 64,
-                    "capacity_sats": 1_000_000,
-                    "local_sats": 900_000,
-                    "is_hive_member": True,
-                },
-                {
-                    "channel_id": "200x1x0",
-                    "peer_id": "02" + "2" * 64,
-                    "capacity_sats": 1_000_000,
-                    "local_sats": 100_000,
-                    "is_hive_member": True,
-                },
-            ],
-            {},
-        )
-    )
-
-    selected = engine.find_candidates()
-
-    assert len(selected) == 1
-    assert selected[0].reason_code == "hive_equalization"
-    assert selected[0].pair_budget_sats == 0
-    engine._hive_router.price_pair.assert_called_once()
-    engine.router_v3.price_pair.assert_not_called()
-    assert not any(
-        call.kwargs.get("reason") == "no_budget"
-        or (len(call.args) > 1 and call.args[1] == "no_budget")
-        for call in engine._audit.log_skip.call_args_list
-    )
 
 
-def test_hive_equalization_prefers_direct_same_peer_pair_when_scores_tie(
-    mock_plugin, mock_database
-):
-    from modules.rebalance_state_v2 import build_state_snapshot
-
-    engine = _make_engine(mock_plugin, mock_database)
-    engine.router_v3 = MagicMock(name="market_router")
-    engine._hive_router = MagicMock(name="hive_router")
-    engine._hive_router.price_pair.return_value = SimpleNamespace(
-        success=True,
-        route_cost_sats=0,
-        route=[{"channel": "fleet"}],
-        probability_ppm=0,
-        error="",
-    )
-    engine._audit = MagicMock()
-    engine._audit.log_pick = MagicMock()
-    engine._audit.log_skip = MagicMock()
-    engine._audit.log_cycle_summary = MagicMock()
-    engine._build_snapshot = MagicMock(
-        return_value=build_state_snapshot(
-            [
-                {
-                    "channel_id": "100x1x0",
-                    "peer_id": "02" + "1" * 64,
-                    "capacity_sats": 1_000_000,
-                    "local_sats": 900_000,
-                    "is_hive_member": True,
-                },
-                {
-                    "channel_id": "100x2x0",
-                    "peer_id": "02" + "2" * 64,
-                    "capacity_sats": 1_000_000,
-                    "local_sats": 900_000,
-                    "is_hive_member": True,
-                },
-                {
-                    "channel_id": "200x1x0",
-                    "peer_id": "02" + "2" * 64,
-                    "capacity_sats": 1_000_000,
-                    "local_sats": 100_000,
-                    "is_hive_member": True,
-                },
-            ],
-            {},
-        )
-    )
-
-    selected = engine.find_candidates()
-
-    assert len(selected) == 1
-    assert selected[0].reason_code == "hive_equalization"
-    assert selected[0].source_channel_id == "100x2x0"
-    assert selected[0].dest_channel_id == "200x1x0"
-    engine._hive_router.price_pair.assert_called_once()
-    engine.router_v3.price_pair.assert_not_called()
 
 
 def test_engine_execute_candidate_uses_router_and_executor(mock_plugin, mock_database):
@@ -1978,124 +1710,8 @@ def test_engine_execute_candidate_exports_failure_snapshot(mock_plugin, mock_dat
     assert snapshot["segment_observations"][0]["short_channel_id"] == "200x2x0"
 
 
-def test_engine_applies_segment_score_bias_to_pair_score(mock_plugin, mock_database):
-    from modules.rebalance_types_v2 import PairCandidate
-
-    engine = _make_engine(mock_plugin, mock_database)
-    engine._our_id = "01" + "0" * 64
-
-    class SegmentAwareHints:
-        def get_segment_score(self, short_channel_id, direction, amount_sats=None):
-            if short_channel_id == "100x1x0" and direction == 0:
-                return {"net_utility": 0.8, "confidence": 0.8}
-            if short_channel_id == "200x1x0" and direction == 1:
-                return {"net_utility": 0.8, "confidence": 0.8}
-            return {}
-
-    engine._hive_hints = SegmentAwareHints()
-    pair = PairCandidate(
-        source_channel_id="100x1x0",
-        dest_channel_id="200x1x0",
-        source_peer_id="02" + "b" * 64,
-        dest_peer_id="02" + "c" * 64,
-        amount_sats=250_000,
-        pair_budget_sats=100,
-        score=100.0,
-    )
-
-    engine._apply_segment_score_bias(pair)
-
-    assert pair.score > 100.0
 
 
-def test_engine_merges_coordination_pairs_before_pair_cap(
-    mock_plugin, mock_database
-):
-    from modules.config import Config
-    from modules.rebalance_route_policy import (
-        RouteDecision,
-        RoutePolicy,
-        RoutePriority,
-    )
-    from modules.rebalance_engine_v2 import RebalanceEngine
-    from modules.rebalance_types_v2 import PairCandidate, PlanResult
-
-    cfg = Config(dry_run=True, rebalance_router="v3")
-    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "a" * 64}
-    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
-
-    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
-    engine.router_v3 = MagicMock(name="market_router")
-    engine._audit = MagicMock()
-    engine._audit.log_pick = MagicMock()
-    engine._audit.log_skip = MagicMock()
-    engine._audit.log_cycle_summary = MagicMock()
-    engine._build_snapshot = MagicMock(
-        return_value=SimpleNamespace(
-            channels=[object()],
-            valuable_channel_count=2,
-            total_remaining_budget_sats=20_000,
-        )
-    )
-
-    local_pair = PairCandidate(
-        source_channel_id="300x1x0",
-        dest_channel_id="400x1x0",
-        source_peer_id="03" + "3" * 64,
-        dest_peer_id="03" + "4" * 64,
-        amount_sats=50_000,
-        pair_budget_sats=10_000,
-        dest_out_fee_ppm=1_000,
-        score=10.0,
-    )
-    coordinated_pair = PairCandidate(
-        source_channel_id="100x1x0",
-        dest_channel_id="200x1x0",
-        source_peer_id="03" + "b" * 64,
-        dest_peer_id="03" + "c" * 64,
-        amount_sats=50_000,
-        pair_budget_sats=10_000,
-        dest_out_fee_ppm=1_000,
-        score=0.1,
-        reason_code="coordinated_rebalance",
-        coordination_hint_type="recommendation",
-        coordination_hint_id="rec-1",
-        coordination_rank_bonus=90.0,
-        route_decision=RouteDecision(
-            policy=RoutePolicy.HYBRID,
-            priority=RoutePriority.COORDINATED,
-            reason="coordinated_rebalance",
-            allow_market_fallback=True,
-            hint_id="rec-1",
-            hint_type="recommendation",
-            priority_score=90.0,
-        ),
-    )
-
-    route_result = SimpleNamespace(
-        success=True,
-        route_cost_sats=1,
-        route=[],
-        probability_ppm=0,
-        error="",
-    )
-    engine.router_v3.price_pair.return_value = route_result
-
-    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls, patch(
-        "modules.rebalance_engine_v2.build_coordination_overlay"
-    ) as overlay_builder:
-        planner = planner_cls.return_value
-        planner.max_pairs = 1
-        planner.plan.return_value = PlanResult(selected=[local_pair], skipped=[])
-        overlay_builder.return_value = PlanResult(
-            selected=[coordinated_pair],
-            skipped=[],
-        )
-
-        selected = engine.find_candidates()
-
-    assert selected == [coordinated_pair, local_pair]
-    assert engine.router_v3.price_pair.call_count == 2
 
 
 def test_engine_skips_pairs_with_persisted_cooldown_before_pricing(
@@ -2254,7 +1870,6 @@ def test_engine_native_executor_retries_with_failed_segment_excluded(
     engine = _make_engine(mock_plugin, mock_database)
     engine.config.rebalance_executor = "native"
     engine._cycle_router = MagicMock()
-    engine._hive_router = None
     original_route = [
         {
             "id": "02" + "b" * 64,
@@ -2352,7 +1967,6 @@ def test_engine_native_executor_retries_smaller_partial_amount_after_liquidity_f
     engine = _make_engine(mock_plugin, mock_database)
     engine.config.rebalance_executor = "native"
     engine._cycle_router = MagicMock()
-    engine._hive_router = None
     mock_database.record_rebalance.return_value = 123
 
     pair = PairCandidate(
@@ -3235,56 +2849,6 @@ def _overlay_snapshot():
     )
 
 
-def test_hive_equalization_score_is_normalized_to_planner_units(
-    mock_plugin, mock_database
-):
-    from modules.rebalance_state_v2 import build_state_snapshot
-
-    engine = _make_engine(mock_plugin, mock_database)
-    engine.router_v3 = MagicMock(name="market_router")
-    engine._hive_router = MagicMock(name="hive_router")
-    engine._hive_router.price_pair.return_value = SimpleNamespace(
-        success=True,
-        route_cost_sats=0,
-        route=[{"channel": "fleet"}],
-        probability_ppm=0,
-        error="",
-    )
-    engine._audit = MagicMock()
-    engine._build_snapshot = MagicMock(
-        return_value=build_state_snapshot(
-            [
-                {
-                    "channel_id": "100x1x0",
-                    "peer_id": "02" + "1" * 64,
-                    "capacity_sats": 1_000_000,
-                    "local_sats": 900_000,
-                    "is_hive_member": True,
-                },
-                {
-                    "channel_id": "200x1x0",
-                    "peer_id": "02" + "2" * 64,
-                    "capacity_sats": 1_000_000,
-                    "local_sats": 100_000,
-                    "is_hive_member": True,
-                },
-            ],
-            {},
-        )
-    )
-
-    selected = engine.find_candidates()
-
-    from modules.rebalance_state_v2 import _drain_score, _refill_urgency
-
-    assert len(selected) == 1
-    assert selected[0].reason_code == "hive_equalization"
-    # Audit F4: planner coefficients — 0.30 x urgency + 0.20 x drain.
-    expected = (
-        0.30 * _refill_urgency(0.1, 0.35) + 0.20 * _drain_score(0.9, 0.65)
-    )
-    assert selected[0].score == pytest.approx(expected, rel=1e-4)
-    assert selected[0].score < 2.0
 
 
 def test_coordination_pair_with_negative_ev_is_rejected_by_hold_margin(
@@ -3332,38 +2896,6 @@ def test_coordination_pair_with_negative_ev_is_rejected_by_hold_margin(
     assert "below_hold_margin" in skip_reasons
 
 
-def test_coordination_pair_with_positive_ev_survives_hold_margin(
-    mock_plugin, mock_database
-):
-    """Sanity inverse: a cheap route keeps the coordination pair selected."""
-    engine = _make_engine(mock_plugin, mock_database)
-    engine.router_v3 = MagicMock(name="market_router")
-    engine.router_v3.price_pair.return_value = SimpleNamespace(
-        success=True,
-        route_cost_sats=5,
-        route=[{"channel": "100x1x0"}],
-        probability_ppm=0,
-        error="",
-    )
-    engine._audit = MagicMock()
-    engine._hive_hints = _OverlayHints(
-        recommendations=[
-            {
-                "recommendation_id": "rec-positive-ev",
-                "source_scid": "100x1x0",
-                "sink_scid": "200x1x0",
-                "amount_sats": 120_000,
-                "route_policy": "market_only",
-                "priority_score": 90.0,
-            }
-        ]
-    )
-    engine._build_snapshot = MagicMock(return_value=_overlay_snapshot())
-
-    selected = engine.find_candidates()
-
-    assert len(selected) >= 1
-    assert any(p.coordination_hint_id == "rec-positive-ev" for p in selected)
 
 
 def test_low_merit_coordination_final_score_below_high_merit_planner_pair(
@@ -3413,58 +2945,6 @@ def test_low_merit_coordination_final_score_below_high_merit_planner_pair(
 # -----------------------------------------------------------------------------
 
 
-def test_fleet_lease_suppresses_matching_planner_pair(mock_plugin, mock_database):
-    from modules.rebalance_engine_v2 import RebalanceEngine
-    from modules.config import Config
-    from modules.rebalance_types_v2 import PairCandidate, PlanResult
-
-    cfg = Config(dry_run=True, rebalance_router="v3")
-    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "u" * 64}
-    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
-
-    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
-    engine.router_v3 = MagicMock(name="market_router")
-    engine._audit = MagicMock()
-    engine._hive_hints = _OverlayHints(
-        leases=[
-            {
-                "lease_id": "lease-planner",
-                "owner_member_id": "02other",
-                "route_segments": ["300x1x0>400x1x0"],
-            }
-        ]
-    )
-    engine._build_snapshot = MagicMock(
-        return_value=SimpleNamespace(
-            channels=[object()],
-            valuable_channel_count=2,
-            total_remaining_budget_sats=20_000,
-        )
-    )
-
-    planner_pair = PairCandidate(
-        source_channel_id="300x1x0",
-        dest_channel_id="400x1x0",
-        source_peer_id="03" + "3" * 64,
-        dest_peer_id="03" + "4" * 64,
-        amount_sats=50_000,
-        pair_budget_sats=10_000,
-        score=1.0,
-    )
-
-    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
-        planner = planner_cls.return_value
-        planner.max_pairs = 5
-        planner.plan.return_value = PlanResult(selected=[planner_pair], skipped=[])
-
-        selected = engine.find_candidates()
-
-    assert selected == []
-    plan = engine._last_cycle_result.plan
-    lease_skips = [s for s in plan.skipped if s.reason == "fleet_lease_held"]
-    assert len(lease_skips) == 1
-    assert "lease-planner" in (lease_skips[0].detail or "")
-    engine.router_v3.price_pair.assert_not_called()
 
 
 def test_fleet_lease_owned_by_us_does_not_suppress_planner_pair(
@@ -3533,150 +3013,8 @@ def test_fleet_lease_owned_by_us_does_not_suppress_planner_pair(
 # -----------------------------------------------------------------------------
 
 
-def test_equalization_claimed_source_removed_from_drain_demand(
-    mock_plugin, mock_database
-):
-    from modules.rebalance_state_v2 import build_state_snapshot
-
-    engine = _make_engine(mock_plugin, mock_database)
-    engine.router_v3 = MagicMock(name="market_router")
-    engine._hive_router = MagicMock(name="hive_router")
-    engine._hive_router.price_pair.return_value = SimpleNamespace(
-        success=True,
-        route_cost_sats=0,
-        route=[{"channel": "fleet"}],
-        probability_ppm=0,
-        error="",
-    )
-    engine._audit = MagicMock()
-    engine._build_snapshot = MagicMock(
-        return_value=build_state_snapshot(
-            [
-                {
-                    "channel_id": "100x1x0",
-                    "peer_id": "02" + "1" * 64,
-                    "capacity_sats": 1_000_000,
-                    "local_sats": 900_000,
-                    "is_hive_member": True,
-                },
-                {
-                    "channel_id": "200x1x0",
-                    "peer_id": "02" + "2" * 64,
-                    "capacity_sats": 1_000_000,
-                    "local_sats": 100_000,
-                    "is_hive_member": True,
-                },
-            ],
-            {},
-        )
-    )
-
-    selected = engine.find_candidates()
-
-    assert len(selected) == 1
-    assert selected[0].reason_code == "hive_equalization"
-    drain = engine.get_drain_demand()
-    assert drain is not None
-    assert all(e.channel_id != "100x1x0" for e in drain.entries)
-    assert drain.total_excess_sats == sum(e.excess_sats for e in drain.entries)
 
 
-def test_overlay_claimed_source_removed_from_drain_demand(
-    mock_plugin, mock_database
-):
-    from modules.rebalance_engine_v2 import RebalanceEngine
-    from modules.config import Config
-    from modules.rebalance_route_policy import (
-        RouteDecision,
-        RoutePolicy,
-        RoutePriority,
-    )
-    from modules.rebalance_types_v2 import (
-        DrainDemand,
-        DrainDemandEntry,
-        PairCandidate,
-        PlanResult,
-    )
-
-    cfg = Config(dry_run=True, rebalance_router="v3")
-    mock_plugin.rpc.getinfo.return_value = {"id": "03" + "u" * 64}
-    mock_plugin.rpc.call.return_value = {"layers": [{"layer": "hive-fleet"}]}
-
-    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
-    engine.router_v3 = MagicMock(name="market_router")
-    engine.router_v3.price_pair.return_value = SimpleNamespace(
-        success=True,
-        route_cost_sats=1,
-        route=[{"channel": "100x1x0"}],
-        probability_ppm=0,
-        error="",
-    )
-    engine._audit = MagicMock()
-    engine._build_snapshot = MagicMock(
-        return_value=SimpleNamespace(
-            channels=[object()],
-            valuable_channel_count=2,
-            total_remaining_budget_sats=20_000,
-        )
-    )
-
-    coordination_pair = PairCandidate(
-        source_channel_id="100x1x0",
-        dest_channel_id="200x1x0",
-        source_peer_id="03" + "b" * 64,
-        dest_peer_id="03" + "c" * 64,
-        amount_sats=50_000,
-        pair_budget_sats=10_000,
-        dest_out_fee_ppm=1_000,
-        score=1.0,
-        reason_code="coordinated_rebalance",
-        coordination_hint_type="recommendation",
-        coordination_hint_id="rec-1",
-        route_decision=RouteDecision(
-            policy=RoutePolicy.MARKET_ONLY,
-            priority=RoutePriority.COORDINATED,
-            reason="coordinated_rebalance",
-        ),
-    )
-    drain_demand = DrainDemand(
-        entries=[
-            DrainDemandEntry(
-                channel_id="100x1x0",
-                peer_id="03" + "b" * 64,
-                excess_sats=250_000,
-                drain_score=0.7,
-            ),
-            DrainDemandEntry(
-                channel_id="500x1x0",
-                peer_id="03" + "e" * 64,
-                excess_sats=100_000,
-                drain_score=0.4,
-            ),
-        ],
-        total_excess_sats=350_000,
-        over_local_count=2,
-        paired_count=0,
-    )
-
-    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls, patch(
-        "modules.rebalance_engine_v2.build_coordination_overlay"
-    ) as overlay_builder:
-        planner = planner_cls.return_value
-        planner.max_pairs = 5
-        planner.plan.return_value = PlanResult(
-            selected=[], skipped=[], drain_demand=drain_demand
-        )
-        overlay_builder.return_value = PlanResult(
-            selected=[coordination_pair], skipped=[]
-        )
-
-        selected = engine.find_candidates()
-
-    assert len(selected) == 1
-    drain = engine.get_drain_demand()
-    assert drain is not None
-    assert [e.channel_id for e in drain.entries] == ["500x1x0"]
-    assert drain.total_excess_sats == 100_000
 
 
 # -----------------------------------------------------------------------------
@@ -3713,34 +3051,6 @@ def test_market_price_pair_includes_observed_liquidity_without_hive_layers(
     assert kwargs["include_observed_liquidity"] is True
 
 
-def test_engine_threads_pair_fee_cap_into_coordination_overlay(
-    mock_plugin, mock_database
-):
-    from modules.rebalance_types_v2 import PlanResult
-
-    engine = _make_engine(mock_plugin, mock_database)
-    engine.config.pair_fee_cap_ppm = 1_000
-    engine.config.hive_equalization_enabled = False
-    engine._audit = MagicMock()
-    engine._build_snapshot = MagicMock(
-        return_value=SimpleNamespace(
-            channels=[object()],
-            valuable_channel_count=0,
-            total_remaining_budget_sats=0,
-        )
-    )
-
-    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls, patch(
-        "modules.rebalance_engine_v2.build_coordination_overlay"
-    ) as overlay_builder:
-        planner = planner_cls.return_value
-        planner.max_pairs = 5
-        planner.plan.return_value = PlanResult(selected=[], skipped=[])
-        overlay_builder.return_value = PlanResult(selected=[], skipped=[])
-
-        engine.find_candidates()
-
-    assert overlay_builder.call_args.kwargs["pair_fee_cap_ppm"] == 1_000
 
 
 def test_build_flow_facts_map_computes_realized_utilization_from_db(
