@@ -211,3 +211,50 @@ def test_resolved_rows_are_not_revisited(tmp_path):
 
     second = mod._reconcile_closure_resolutions()
     assert second["checked"] == 0
+
+
+def test_crashed_run_marker_trips_and_disables_sweep(tmp_path):
+    """A leftover inflight marker (previous run died mid-sweep, e.g. the
+    bookkeeper underflow crash) permanently disables the sweep and never
+    touches the bookkeeper again."""
+    mod, db = _make_mod(
+        tmp_path,
+        bkpr_totals={ACCOUNT: (1000, 700)},
+        balances_msat={ACCOUNT: 0},
+    )
+    db.record_channel_closure(
+        channel_id=CHAN, peer_id=PEER, close_type="local_unilateral",
+        closure_fee_sats=1000, bkpr_account=ACCOUNT,
+    )
+    db.set_config_override(mod._CLOSURE_SWEEP_TRIP_KEY, "inflight:12345")
+
+    summary = mod._reconcile_closure_resolutions()
+
+    assert summary["tripped"] == "detected_crashed_run"
+    assert summary["checked"] == 0
+    mod.safe_plugin.rpc.call.assert_not_called()
+    # Marker converted to a permanent trip...
+    tripped = db.get_config_override(mod._CLOSURE_SWEEP_TRIP_KEY)
+    assert tripped and not tripped.startswith("inflight:")
+    # ...and subsequent runs stay disabled without touching anything.
+    again = mod._reconcile_closure_resolutions()
+    assert "tripped" in again
+    mod.safe_plugin.rpc.call.assert_not_called()
+    assert _row(db)["resolution_complete"] == 0
+
+
+def test_clean_run_arms_and_disarms_marker(tmp_path):
+    mod, db = _make_mod(
+        tmp_path,
+        bkpr_totals={ACCOUNT: (1000, 0)},
+        balances_msat={ACCOUNT: 0},
+    )
+    db.record_channel_closure(
+        channel_id=CHAN, peer_id=PEER, close_type="mutual",
+        closure_fee_sats=1000, bkpr_account=ACCOUNT,
+    )
+
+    summary = mod._reconcile_closure_resolutions()
+
+    assert summary["completed"] == 1
+    assert db.get_config_override(mod._CLOSURE_SWEEP_TRIP_KEY) is None

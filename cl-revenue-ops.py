@@ -6806,6 +6806,15 @@ def _get_closure_costs_from_bookkeeper(bkpr_account: str) -> Optional[Dict[str, 
 # reports by then is final for our accounting (timelocks and sweeps resolve
 # in days, not months).
 CLOSURE_RESOLUTION_TIMEOUT_DAYS = 90
+# Write-ahead crash marker for the closure sweep. Set before the first
+# bookkeeper RPC and cleared after a clean finish. If a sweep run dies
+# mid-flight (2026-07-10 lnnode: bkpr-listbalances walked an account with a
+# corrupted ledger — "Account balance underflow" — bookkeeper fatally
+# exited, and being an important plugin it took lightningd down with it),
+# the marker survives and permanently disables the sweep on this node until
+# the operator repairs the bookkeeper ledger and clears the key. This
+# bounds the blast radius to ONE crash per node, ever.
+_CLOSURE_SWEEP_TRIP_KEY = "_closure_sweep_tripped"
 
 
 def _reconcile_closure_resolutions() -> Dict[str, Any]:
@@ -6823,9 +6832,42 @@ def _reconcile_closure_resolutions() -> Dict[str, Any]:
     if database is None or safe_plugin is None:
         return summary
 
+    # Crash-once guard: a marker left by a previous run means that run died
+    # mid-sweep (bookkeeper/lightningd crash while we were querying it).
+    # Never touch the bookkeeper again on this node until the operator
+    # repairs the underlying ledger and clears the marker.
+    tripped = database.get_config_override(_CLOSURE_SWEEP_TRIP_KEY)
+    if tripped and not str(tripped).startswith("inflight:"):
+        summary["tripped"] = str(tripped)
+        return summary
+    if tripped:
+        # Leftover "inflight:" marker == the previous sweep never finished.
+        database.set_config_override(
+            _CLOSURE_SWEEP_TRIP_KEY,
+            f"{int(time.time())}: previous sweep died mid-run (probable "
+            "bookkeeper crash, e.g. account balance underflow) — closure "
+            "sweep disabled on this node. Repair the bookkeeper ledger, "
+            "then clear with: sqlite3 <revenue_ops.db> \"DELETE FROM "
+            f"config_overrides WHERE key='{_CLOSURE_SWEEP_TRIP_KEY}'\"",
+        )
+        plugin.log(
+            "CLOSURE_SWEEP: previous run died mid-sweep — the bookkeeper on "
+            "this node likely has a corrupted account ledger (see 'Account "
+            "balance underflow' in the lightningd log). Sweep permanently "
+            "disabled until the marker is cleared.",
+            level='error'
+        )
+        summary["tripped"] = "detected_crashed_run"
+        return summary
+
     rows = database.get_unresolved_closures()
     if not rows:
         return summary
+
+    # Arm the write-ahead marker before the first bookkeeper RPC.
+    database.set_config_override(
+        _CLOSURE_SWEEP_TRIP_KEY, f"inflight:{int(time.time())}"
+    )
 
     # One balances call for every account: zero balance == fully swept.
     balances_by_account: Dict[str, int] = {}
@@ -6909,6 +6951,9 @@ def _reconcile_closure_resolutions() -> Dict[str, Any]:
         if resolved or aged_out:
             database.mark_closure_complete(channel_id)
             summary["completed"] += 1
+
+    # Clean finish: disarm the crash marker.
+    database.delete_config_override(_CLOSURE_SWEEP_TRIP_KEY)
 
     if summary["updated"] or summary["completed"]:
         plugin.log(
