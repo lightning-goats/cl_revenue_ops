@@ -5,7 +5,7 @@
    rebuilt the identical plan, repeating every per-candidate boltzcli quote.
 2. The pending-swap check short-circuits BEFORE any plan is built.
 3. _build_boltz_balance_plan only runs the per-channel rebalance-success DB
-   query (and hive bias lookup) for channels that actually trip a trigger
+   query for channels that actually trip a trigger
    band — balanced channels skip them entirely.
 """
 
@@ -157,10 +157,6 @@ class TestBalancePlanFilterOrdering:
         mod.database = database
 
         mod.profitability_analyzer = None
-        hive_hints = MagicMock()
-        hive_hints.get_rebalance_bias.return_value = 1.0
-        mod.hive_hints = hive_hints
-        mod.hive_router = None
 
         bm = MagicMock()
         bm.budget.return_value = {}
@@ -171,7 +167,7 @@ class TestBalancePlanFilterOrdering:
         mod._boltz_dynamic_channel_tuning = MagicMock(return_value={})
         return mod
 
-    def test_balanced_channel_never_pays_success_rate_or_hive_queries(self):
+    def test_balanced_channel_never_pays_success_rate_queries(self):
         # 60% local: inside the default 40-80 trigger band -> no direction.
         mod = self._make_planner_module(local_pct=60.0)
 
@@ -180,7 +176,6 @@ class TestBalancePlanFilterOrdering:
         assert "error" not in plan
         assert plan["total_candidates"] == 0
         mod.database.get_channel_rebalance_success_rate.assert_not_called()
-        mod.hive_hints.get_rebalance_bias.assert_not_called()
 
     def test_triggered_channel_still_gets_enrichment(self):
         # 10% local: below the 40% trigger -> loop_in candidate.
@@ -193,7 +188,6 @@ class TestBalancePlanFilterOrdering:
         mod.database.get_channel_rebalance_success_rate.assert_called_once_with(
             "100x1x0", window_days=7
         )
-        mod.hive_hints.get_rebalance_bias.assert_called_with(PEER)
 
     def test_plan_reuses_caller_pending_swap_count(self):
         mod = self._make_planner_module(local_pct=60.0)

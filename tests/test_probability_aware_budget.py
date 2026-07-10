@@ -63,25 +63,6 @@ def test_capex_probability_budget_bonus_has_range_constraint():
     assert 0.5 <= hi <= 1.0  # reasonable upper bound
 
 
-def test_hive_rebalance_bootstrap_budget_config_round_trip():
-    from modules.config import Config
-
-    cfg = Config()
-    assert cfg.hive_rebalance_bootstrap_budget_sats == 300
-    cfg.hive_rebalance_bootstrap_budget_sats = 750
-
-    snap = cfg.snapshot()
-
-    assert snap.hive_rebalance_bootstrap_budget_sats == 750
-
-
-def test_hive_rebalance_bootstrap_budget_in_validation_maps():
-    from modules.config import CONFIG_FIELD_RANGES, CONFIG_FIELD_TYPES
-
-    assert CONFIG_FIELD_TYPES.get("hive_rebalance_bootstrap_budget_sats") is int
-    assert CONFIG_FIELD_RANGES["hive_rebalance_bootstrap_budget_sats"] == (0, 10_000)
-
-
 # ---------------------------------------------------------------------------
 # Engine._probability_adjusted_budget formula
 # ---------------------------------------------------------------------------

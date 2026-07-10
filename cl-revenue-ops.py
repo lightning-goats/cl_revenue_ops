@@ -163,7 +163,6 @@ from modules.utils import normalize_scid, parse_msat
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
 PLUGIN_VERSION = "2.16.0"
-HIVE_HINTS_DIAGNOSTICS_VERSION = "standalone-hints-v1"
 
 # Supply-chain / runtime version floors (Phase 3C).
 # These drive NON-FATAL startup probes: a version below floor logs a warning but
@@ -986,9 +985,7 @@ policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
 lnplus_client = None  # LNPlusClient: LN+ API client (LN+ swap automation)
 lnplus_lifecycle = None  # SwapLifecycle: LN+ obligations watcher / state machine
-hive_hints = None  # cl-mycelium retired: permanently None (neutral seam for consumers)
 capex_engine: Optional[CapexBudgetEngine] = None  # Unified capex budget engine
-hive_router = None  # HiveRouter: shared askrene fleet route discovery
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
 _boltz_balance_lock = threading.Lock()
 # Resource-growth bound: _boltz_balance_last_action only stores per-channel
@@ -1150,8 +1147,7 @@ plugin.add_option(
         '"match": target the median, no undercut. '
         '"premium": price above the median using the same per-corridor '
         'weight that would otherwise undercut. Use "premium" in '
-        'inelastic-demand markets (e.g., hive-coordinated with reliable '
-        'routing) to maximize revenue per forward. '
+        'inelastic-demand markets to maximize revenue per forward. '
         '"competition_aware": apply the median-undercut ONLY when a '
         "competitor is priced at or below DTS's target; preserve DTS when "
         "we're already below every competitor (undercut would otherwise "
@@ -1165,38 +1161,8 @@ plugin.add_option(
     default='off',
     description=(
         'Base-fee policy (Upgrade A, 2026-04-22). '
-        '"off" (default): use revenue-ops-base-fee-msat for all channels. '
-        '"adaptive": apply revenue-ops-base-fee-intra-fleet to hive fleet '
-        'members and revenue-ops-base-fee-non-hive to everyone else. '
-        'Motivated by the 168x per-forward fee gap observed vs clboss.'
-    )
-)
-
-plugin.add_option(
-    name='revenue-ops-base-fee-intra-fleet',
-    default='0',
-    description='Base fee in msat for channels to hive fleet members (default: 0).'
-)
-
-plugin.add_option(
-    name='revenue-ops-base-fee-non-hive',
-    default='1000',
-    description=(
-        'Base fee in msat for channels to non-hive peers when '
-        'revenue-ops-base-fee-policy=adaptive (default: 1000 msat). '
-        'Conservative starting point; clboss observed at 15,307 msat.'
-    )
-)
-
-plugin.add_option(
-    name='revenue-ops-fee-ppm-intra-fleet',
-    default='0',
-    description=(
-        'Proportional fee in ppm for channels to hive fleet members '
-        '(default: 0). Zero-fee internal hops make the fleet the cheap '
-        'corridor; revenue is captured at edge channels; external '
-        'through-flow rebalances the fleet for free. Set nonzero only to '
-        'deliberately opt out of the corridor strategy for this fleet.'
+        '"off" (default) and "adaptive" both use revenue-ops-base-fee-msat '
+        'for all channels (the per-role split retired with cl-mycelium).'
     )
 )
 
@@ -1247,12 +1213,6 @@ def _on_rebalance_tuning_change(plugin_: Plugin, option_name: str, new_value: An
         # final_score is in SATS of expected net value; match CONFIG_FIELD_RANGES.
         'revenue-ops-rebalance-hold-margin': ('rebalance_hold_margin', float, 0.0, 1000.0),
         'revenue-ops-pair-fee-cap-ppm': ('pair_fee_cap_ppm', int, 0, None),
-        'revenue-ops-hive-rebalance-bootstrap-budget-sats': (
-            'hive_rebalance_bootstrap_budget_sats',
-            int,
-            0,
-            None,
-        ),
     }
     if option_name not in tuning_map:
         return
@@ -1293,27 +1253,6 @@ plugin.add_option(
     description='Per-pair fee budget = max(dest capex, ceil(amount * ppm / 1M)). Decouples per-rebalance fee from capex bootstrap (Iter1, default: 1000 = 0.1% of amount; 0 disables)',
     dynamic=True,
     on_change=_on_rebalance_tuning_change,
-)
-
-plugin.add_option(
-    name='revenue-ops-hive-rebalance-bootstrap-budget-sats',
-    default='300',
-    description='Conservative per-pair fee budget for active hive-member channels before capex/profitability history appears (default: 300 sats; 0 disables)',
-    dynamic=True,
-    on_change=_on_rebalance_tuning_change,
-)
-
-plugin.add_option(
-    name='revenue-ops-rebalance-coordination-reserved-slots',
-    default='2',
-    description=(
-        "Reserved slots for coordination pairs (from cl-hive's rebalance_"
-        "recommendations / rebalance_campaigns hints) on top of the "
-        "planner's max_pairs cap. Default 2 lets a small number of "
-        "hive-blessed pairs bypass the cap without letting coordination "
-        "dominate arbitrarily. Set to 0 to restore strict-cap behavior "
-        "(coordination competes inside max_pairs)."
-    )
 )
 
 # Upstream rebalancer patterns (flow-facts / EV / planner tuning). Consumed
@@ -1902,32 +1841,6 @@ plugin.add_option(
     description='LN+ obligations watcher interval in seconds (default: 3600)',
     dynamic=True
 )
-plugin.add_option(
-    name='revenue-ops-hive-zero-fee-stale-grace',
-    default='604800',
-    description=(
-        'Seconds a hive member stays held at zero-fee after live hive-hint '
-        'data goes stale/unavailable, via a durable DB-confirmed membership '
-        '(default: 604800 = 7 days). Past this grace the peer is released '
-        'and dynamic fee control resumes as before.'
-    ),
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-hive-hints-enabled',
-    default='true',
-    description='Enable bounded fee/rebalance bias from cl_hive fleet hints (default: true)'
-)
-plugin.add_option(
-    name='revenue-ops-hive-hints-ttl',
-    default='0',
-    description='Override hint snapshot TTL in seconds; 0 = use snapshot value (default: 0)'
-)
-plugin.add_option(
-    name='revenue-ops-hive-hints-allow-all-hints-m2-scope',
-    default='false',
-    description='Allow lab-only all_hints M2 scope from hive hints (default: false)'
-)
 
 def _on_rebalance_router_change(plugin_: Plugin, option_name: str, new_value: Any) -> None:
     """Validate + log a runtime rebalance-router flip triggered by setconfig.
@@ -1972,10 +1885,10 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-askrene-layers',
-    default='hive-fleet',
+    default='standalone',
     description="CSV of askrene layer names passed to v3 router getroutes calls. "
-                "Missing layers are silently dropped by askrene. Blank values use the default "
-                "'hive-fleet' cl-hive bias; set to 'none' or 'standalone' for no configured layers."
+                "Missing layers are silently dropped by askrene. Blank or 'standalone'/'none' "
+                "values configure no layers (askrene's own gossip view only)."
 )
 
 
@@ -2520,9 +2433,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
         market_fee_mode=options.get('revenue-ops-market-fee-mode', 'undercut').lower(),
         base_fee_policy=options.get('revenue-ops-base-fee-policy', 'off').lower(),
-        base_fee_msat_intra_fleet=_safe_int_opt('revenue-ops-base-fee-intra-fleet', '0'),
-        base_fee_msat_non_hive=_safe_int_opt('revenue-ops-base-fee-non-hive', '1000'),
-        fee_ppm_intra_fleet=_safe_int_opt('revenue-ops-fee-ppm-intra-fleet', '0'),
         neighbor_median_min_competitors=_safe_int_opt('revenue-ops-neighbor-median-min-competitors', '2'),
         fee_profile=str(options.get('revenue-ops-fee-profile', 'active') or 'active').lower(),
         fee_market_boundary_enabled=options.get(
@@ -2555,12 +2465,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         ),
         pair_fee_cap_ppm=_safe_int_opt(
             'revenue-ops-pair-fee-cap-ppm', '1000'
-        ),
-        hive_rebalance_bootstrap_budget_sats=_safe_int_opt(
-            'revenue-ops-hive-rebalance-bootstrap-budget-sats', '300'
-        ),
-        rebalance_coordination_reserved_slots=_safe_int_opt(
-            'revenue-ops-rebalance-coordination-reserved-slots', '2'
         ),
         rebalance_activity_window_seconds=_safe_int_opt(
             'revenue-ops-rebalance-activity-window-seconds', '3600'
@@ -2657,12 +2561,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         lnplus_pending_timeout_days=_safe_int_opt('revenue-ops-lnplus-pending-timeout-days', '7'),
         lnplus_inbound_credit_factor=_safe_float_opt('revenue-ops-lnplus-inbound-credit-factor', '0.5'),
         lnplus_watcher_interval=_safe_int_opt('revenue-ops-lnplus-watcher-interval', '3600'),
-        hive_zero_fee_stale_grace_seconds=_safe_int_opt('revenue-ops-hive-zero-fee-stale-grace', '604800'),
-        hive_hints_enabled=options.get('revenue-ops-hive-hints-enabled', 'true').lower() in ('true', '1', 'yes'),
-        hive_hints_ttl_seconds=_safe_int('revenue-ops-hive-hints-ttl'),
-        hive_hints_allow_all_hints_m2_scope=options.get(
-            'revenue-ops-hive-hints-allow-all-hints-m2-scope', 'false'
-        ).lower() in ('true', '1', 'yes'),
         rebalance_router='v3',
         askrene_layers=str(options.get('revenue-ops-askrene-layers', '') or '').strip() or 'standalone',
     )
@@ -3009,12 +2907,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # them instead.
         boltz_manager.structural_envelope_provider = _structural_envelope_sats_provider
 
-    # cl-mycelium retired (2026-07-09): no fleet coordinator. hive_hints stays
-    # a permanently-None global; consumers that still carry inert hint-reading
-    # branches default self.hive_hints to None themselves — no injection needed.
-    global hive_hints
-    hive_hints = None
-
     if capacity_planner is not None:
         capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
         capacity_planner.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
@@ -3027,7 +2919,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("CapitalEfficiencyAnalyzer initialized")
 
-    # Construct unified capex budget engine (after hive_hints are available)
+    # Construct unified capex budget engine
     capex_engine = CapexBudgetEngine(
         profitability_analyzer=profitability_analyzer,
         database=database,
@@ -3067,12 +2959,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             capacity_planner, lnplus_lifecycle)
     plugin.log("LN+ swap automation initialized")
 
-    # cl-mycelium retired: HiveRouter (shared askrene fleet route discovery) is
-    # gone. hive_router stays permanently None; the guarded consumer branches
-    # that reference it no-op.
-    global hive_router
-    hive_router = None
-
     # Rebalance engine: unified actual-fee pipeline
     from modules.rebalance_engine_v2 import RebalanceEngine
     segment_observation_store = SegmentObservationStore()
@@ -3104,8 +2990,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         capacity_planner.data_service = data_service
     if boltz_manager is not None:
         boltz_manager.data_service = data_service
-    if hive_hints is not None:
-        hive_hints.data_service = data_service
 
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client
@@ -3180,7 +3064,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             try:
                 _hb_cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
                 _record_loop_heartbeat("fee-adjustment", interval_seconds=max(60, _hb_cfg_snap.fee_interval))
-                _refresh_fee_cycle_hive_inputs()
 
                 try:
                     plugin.log("Running scheduled fee adjustment...")
@@ -3570,12 +3453,6 @@ def run_flow_analysis():
         raise
 
 
-def _refresh_fee_cycle_hive_inputs():
-    """cl-mycelium retired: hive inputs are gone. Retained as a no-op seam so
-    the fee-cycle callers don't need restructuring until Phase 3."""
-    return None
-
-
 
 def run_fee_adjustment():
     """
@@ -3758,105 +3635,6 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
     }
 
 
-def _hive_hints_status_for_debug(plugin: Plugin, max_segment_scores: int = 20) -> Dict[str, Any]:
-    """Return read-only hive hint freshness diagnostics for operator surfaces."""
-    hive_refresh_error = ""
-    hive_refresh_attempted = False
-    hive_refresh_diagnostics = None
-
-    if hive_hints:
-        debug_refresher = getattr(hive_hints, "refresh_status_for_debug", None)
-        if callable(debug_refresher):
-            try:
-                candidate_diagnostics = debug_refresher()
-                if isinstance(candidate_diagnostics, dict):
-                    hive_refresh_diagnostics = candidate_diagnostics
-            except Exception as e:
-                hive_refresh_error = str(e)
-                plugin.log(f"Hive hints debug refresh failed: {e}", level='debug')
-
-        if hive_refresh_diagnostics is None:
-            poller = getattr(hive_hints, "poll", None)
-            if callable(poller):
-                hive_refresh_attempted = True
-                try:
-                    poller()
-                except Exception as e:
-                    hive_refresh_error = str(e)
-                    plugin.log(f"Hive hints debug refresh failed: {e}", level='debug')
-
-        try:
-            hive_status = hive_hints.get_status(live_refresh=False)
-        except Exception as e:
-            hive_status = {
-                "snapshot_fresh": False,
-                "snapshot_usable": False,
-                "hints_count": 0,
-                "status_error": str(e),
-            }
-    else:
-        hive_status = {"snapshot_fresh": False, "snapshot_usable": False, "hints_count": 0}
-
-    if not isinstance(hive_status, dict):
-        hive_status = {"snapshot_fresh": False, "snapshot_usable": False, "hints_count": 0}
-
-    if isinstance(hive_refresh_diagnostics, dict):
-        hive_refresh_attempted = bool(hive_refresh_diagnostics.get("refresh_attempted", False))
-        hive_status["cache"] = dict(hive_refresh_diagnostics.get("cache", {}) or {})
-        hive_status["cache_after_refresh"] = dict(hive_refresh_diagnostics.get("cache_after_refresh", {}) or {})
-        hive_status["live_datastore"] = dict(hive_refresh_diagnostics.get("live_datastore", {}) or {})
-        hive_status["live_hive_export"] = dict(hive_refresh_diagnostics.get("live_hive_export", {}) or {})
-        hive_status["fallback"] = dict(hive_refresh_diagnostics.get("fallback", {}) or {})
-        hive_status["status_refresh_needed"] = bool(hive_refresh_diagnostics.get("refresh_needed", False))
-        hive_status["status_refresh_result"] = str(hive_refresh_diagnostics.get("refresh_result") or "")
-
-    hive_status["status_refresh_attempted"] = hive_refresh_attempted
-    hive_status["status_refresh_ok"] = (not hive_refresh_error) and (
-        bool(hive_refresh_diagnostics is not None) or hive_refresh_attempted
-    )
-    if hive_refresh_error:
-        hive_status["status_refresh_error"] = hive_refresh_error
-    hive_status["diagnostics_version"] = HIVE_HINTS_DIAGNOSTICS_VERSION
-
-    segment_scores: List[Dict[str, Any]] = []
-    if hive_hints is not None:
-        getter = getattr(hive_hints, "get_segment_scores", None)
-        if callable(getter):
-            try:
-                raw_scores = getter() or []
-            except Exception:
-                raw_scores = []
-            for raw in raw_scores:
-                if isinstance(raw, dict):
-                    segment_scores.append(dict(raw))
-    segment_scores.sort(
-        key=lambda entry: (
-            -abs(float(entry.get("net_utility", 0.0) or 0.0))
-            * float(entry.get("confidence", 0.0) or 0.0),
-            -float(entry.get("confidence", 0.0) or 0.0),
-            str(entry.get("short_channel_id") or ""),
-            int(entry.get("direction", 0) or 0),
-        )
-    )
-    # P1-012: coerce operator-supplied max_segment_scores; a non-int must not
-    # raise ValueError out of a diagnostic handler.
-    try:
-        max_segment_scores = max(0, int(max_segment_scores or 0))
-    except (ValueError, TypeError):
-        max_segment_scores = 0
-    if max_segment_scores:
-        segment_scores = segment_scores[:max_segment_scores]
-    hive_status["segment_scores_count"] = len(segment_scores)
-    hive_status["segment_scores"] = segment_scores
-    return hive_status
-
-
-@plugin.method("revenue-hive-hints-status")
-def revenue_hive_hints_status(plugin: Plugin, max_segment_scores: int = 20) -> Dict[str, Any]:
-    """Diagnostic: cl-mycelium hint freshness, fallback, and signal coverage."""
-    return _hive_hints_status_for_debug(plugin, max_segment_scores=max_segment_scores)
-
-
 @plugin.method("revenue-rebalance-debug")
 def revenue_rebalance_debug(
     plugin: Plugin,
@@ -3886,38 +3664,6 @@ def revenue_rebalance_debug(
     """
     if rebalancer is None:
         return {"error": "Rebalancer not initialized"}
-
-    def _filtered_segment_scores() -> List[Dict[str, Any]]:
-        if hive_hints is None:
-            return []
-        getter = getattr(hive_hints, "get_segment_scores", None)
-        if not callable(getter):
-            return []
-        try:
-            raw_scores = getter() or []
-        except Exception:
-            return []
-
-        scores: List[Dict[str, Any]] = []
-        for raw in raw_scores:
-            if not isinstance(raw, dict):
-                continue
-            short_channel_id = str(raw.get("short_channel_id") or "").strip()
-            if filter_channel_id and short_channel_id != filter_channel_id:
-                continue
-            scores.append(dict(raw))
-        scores.sort(
-            key=lambda entry: (
-                -abs(float(entry.get("net_utility", 0.0) or 0.0))
-                * float(entry.get("confidence", 0.0) or 0.0),
-                -float(entry.get("confidence", 0.0) or 0.0),
-                str(entry.get("short_channel_id") or ""),
-                int(entry.get("direction", 0) or 0),
-            )
-        )
-        if max_candidates > 0:
-            return scores[:max_candidates]
-        return scores[:20]
 
     filter_channel_id = str(channel_id or "").strip()
     filter_peer_id = str(peer_id or "").strip().lower()
@@ -4217,63 +3963,6 @@ def revenue_rebalance_debug(
     except Exception as e:
         result["channels"]["error"] = str(e)
 
-    hive_refresh_error = ""
-    hive_refresh_attempted = False
-    hive_refresh_diagnostics = None
-    if hive_hints:
-        debug_refresher = getattr(hive_hints, "refresh_status_for_debug", None)
-        if callable(debug_refresher):
-            try:
-                candidate_diagnostics = debug_refresher()
-                if isinstance(candidate_diagnostics, dict):
-                    hive_refresh_diagnostics = candidate_diagnostics
-            except Exception as e:
-                hive_refresh_error = str(e)
-                plugin.log(f"Hive hints debug refresh failed: {e}", level='debug')
-        if hive_refresh_diagnostics is None:
-            poller = getattr(hive_hints, "poll", None)
-            if callable(poller):
-                hive_refresh_attempted = True
-                try:
-                    poller()
-                except Exception as e:
-                    hive_refresh_error = str(e)
-                    plugin.log(f"Hive hints debug refresh failed: {e}", level='debug')
-        try:
-            hive_status = hive_hints.get_status(live_refresh=False)
-        except Exception as e:
-            hive_status = {
-                "snapshot_fresh": False,
-                "snapshot_usable": False,
-                "hints_count": 0,
-                "status_error": str(e),
-            }
-    else:
-        hive_status = {"snapshot_fresh": False, "snapshot_usable": False, "hints_count": 0}
-    if not isinstance(hive_status, dict):
-        hive_status = {"snapshot_fresh": False, "hints_count": 0}
-    if isinstance(hive_refresh_diagnostics, dict):
-        hive_refresh_attempted = bool(hive_refresh_diagnostics.get("refresh_attempted", False))
-        hive_status["cache"] = dict(hive_refresh_diagnostics.get("cache", {}) or {})
-        hive_status["cache_after_refresh"] = dict(hive_refresh_diagnostics.get("cache_after_refresh", {}) or {})
-        hive_status["live_datastore"] = dict(hive_refresh_diagnostics.get("live_datastore", {}) or {})
-        hive_status["live_hive_export"] = dict(hive_refresh_diagnostics.get("live_hive_export", {}) or {})
-        hive_status["fallback"] = dict(hive_refresh_diagnostics.get("fallback", {}) or {})
-        hive_status["status_refresh_needed"] = bool(hive_refresh_diagnostics.get("refresh_needed", False))
-        hive_status["status_refresh_result"] = str(hive_refresh_diagnostics.get("refresh_result") or "")
-    hive_status["status_refresh_attempted"] = hive_refresh_attempted
-    hive_status["status_refresh_ok"] = (not hive_refresh_error) and (
-        bool(hive_refresh_diagnostics is not None) or hive_refresh_attempted
-    )
-    if hive_refresh_error:
-        hive_status["status_refresh_error"] = hive_refresh_error
-    hive_status["diagnostics_version"] = HIVE_HINTS_DIAGNOSTICS_VERSION
-    segment_scores = _filtered_segment_scores()
-    hive_status["segment_scores_count"] = len(segment_scores)
-    if not summary_only:
-        hive_status["segment_scores"] = segment_scores
-    result["hive_hints"] = hive_status
-
     engine = getattr(rebalancer, "rebalance_engine_v2", None)
     if engine is not None and hasattr(engine, "get_last_cycle_debug"):
         try:
@@ -4364,17 +4053,9 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     min_forwards = profile["min_forwards_for_signal"]
     market_boundary_configured = bool(getattr(cfg_snap, "fee_market_boundary_enabled", False))
 
-    # cl-mycelium retired: no hive runtime to refresh. Key retained for API
-    # stability; always reports not-attempted.
-    hive_refresh_debug = {
-        "attempted": False,
-        "ok": False,
-    }
-
     now = int(time.time())
     result = {
         "timestamp": now,
-        "hive_refresh": hive_refresh_debug,
         "config": {
             "fee_interval_seconds": config.fee_interval if config else 1800,
             "fee_profile": profile["name"],
@@ -4455,12 +4136,6 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
 
         chan_state = state_lookup.get(channel_id, {})
         peer_id = str(chan_state.get("peer_id") or "")
-        hive_fee_debug = {}
-        if peer_id and hasattr(fee_controller, "get_hive_fee_hint_debug"):
-            try:
-                hive_fee_debug = fee_controller.get_hive_fee_hint_debug(peer_id)
-            except Exception as e:
-                hive_fee_debug = {"error": str(e)}
         zero_revenue_streak = ts_state.get("zero_revenue_streak", 0)
         zero_flow_guard = _zero_flow_guard_state(
             last_revenue_rate,
@@ -4496,7 +4171,6 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
                 "contextual_sample_used": bool(v2_state.get("last_contextual_sample_used", False)),
                 "contexts_tracked": len(ts_state.get("contextual_posteriors") or {}),
             },
-            "hive": hive_fee_debug,
         })
         result["summary"]["total"] += 1
 
@@ -4506,7 +4180,6 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
 @plugin.method("revenue-fee-cycle")
 def revenue_fee_cycle(plugin: Plugin) -> Dict[str, Any]:
     """Run one fee adjustment cycle immediately."""
-    _refresh_fee_cycle_hive_inputs()
     adjustments = run_fee_adjustment() or []
     return {
         "ok": True,
@@ -6491,9 +6164,6 @@ def _refresh_dynamic_config():
             ("revenue-ops-lnplus-pending-timeout-days", "lnplus_pending_timeout_days", "int"),
             ("revenue-ops-lnplus-inbound-credit-factor", "lnplus_inbound_credit_factor", "float"),
             ("revenue-ops-lnplus-watcher-interval", "lnplus_watcher_interval", "int"),
-            # Z-2 (2026-07-08): zero-fee hive corridor grace period, tunable
-            # at runtime without a daemon restart.
-            ("revenue-ops-hive-zero-fee-stale-grace", "hive_zero_fee_stale_grace_seconds", "int"),
             # E-2 (2026-07 econ audit): class-aware saturated/source min-fee
             # floor, dynamic so fee-band decompression is tunable live.
             ("revenue-ops-min-fee-ppm-saturated", "min_fee_ppm_saturated", "int"),
@@ -7892,18 +7562,6 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
 
     daily_budget_sats = max(0, int(getattr(cfg, "daily_budget_sats", 0) or 0))
     net_profit_sats = int(revenue_sats - actual_total)
-    fleet_growth_prior = None
-    if bool(getattr(cfg, "growth_budget_enabled", False)) and hive_hints is not None:
-        try:
-            getter = getattr(hive_hints, "get_growth_spend_prior", None)
-            if callable(getter):
-                fleet_growth_prior = getter(action_type="rebalance")
-        except Exception as exc:
-            try:
-                plugin.log(f"growth budget prior unavailable: {exc}", level="debug")
-            except Exception:
-                pass
-            fleet_growth_prior = None
     growth_budget = compute_growth_budget_status(
         base_budget_sats=daily_budget_sats,
         net_profit_sats=net_profit_sats,
@@ -7914,7 +7572,6 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
         growth_fraction=float(getattr(cfg, "growth_budget_experiment_fraction", 0.10) or 0.0),
         growth_max_extra_sats=int(getattr(cfg, "growth_budget_max_extra_sats", 0) or 0),
         hard_ceiling_sats=int(getattr(cfg, "growth_budget_hard_ceiling_sats", daily_budget_sats) or daily_budget_sats),
-        fleet_prior=fleet_growth_prior,
     )
     effective_budget_sats = int(growth_budget.get("effective_budget_sats", daily_budget_sats) or 0)
 
@@ -7924,7 +7581,7 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
     # hours between the oldest cost-evidence row and now, capped at the
     # window. When the measurement basis is absent or malformed, report an
     # honest unknown (covered_hours=null) rather than a fabricated
-    # "complete". cl-hive's _ledger_window_coverage reads covered_hours/
+    # "complete". External consumers read covered_hours/
     # coverage_hours numerically and treats null as unknown.
     covered_hours: Optional[float] = None
     coverage_status = "unknown"
@@ -8044,22 +7701,6 @@ def _boltz_exec_policy_recheck(peer_id: str, direction: str) -> Tuple[bool, str]
     PolicyManager is a write-through cache, so this read is fresh-as-DB.
     """
     return _boltz_direction_allowed_by_policy(peer_id, direction)
-
-
-def _hive_route_first_hop_peer(hive_route) -> Optional[str]:
-    """Peer id of a hive route's first hop, or None when undeterminable.
-
-    The loop-out hive-route override re-pins the drain to a different
-    channel; its peer must pass the same policy gate. None means the caller
-    must decline the override (fail closed to the already-checked channel).
-    """
-    try:
-        path = getattr(hive_route, "path", None) or []
-        first = path[0] if path else None
-        peer = first.get("next_node") if isinstance(first, dict) else None
-        return str(peer) if peer else None
-    except Exception:
-        return None
 
 
 def _boltz_direction_allowed_by_policy(peer_id: str, direction: str) -> Tuple[bool, str]:
@@ -8739,7 +8380,7 @@ def _build_boltz_balance_plan(
                 })
                 continue
 
-        # --- Enrichment: DTS posterior, rebalance feasibility, hive hints ---
+        # --- Enrichment: DTS posterior, rebalance feasibility ---
         dts_summary = None
         if fee_controller is not None:
             try:
@@ -8832,14 +8473,6 @@ def _build_boltz_balance_plan(
             if rebal_success.get("total", 0) >= 3 and rebal_success.get("success_rate", 1.0) == 0.0:
                 rebalance_impossible = True
 
-        # Hive hints: rebalance preference and peer quality (via bounded bias)
-        hive_rebal_bias = 1.0
-        if hive_hints is not None:
-            try:
-                hive_rebal_bias = hive_hints.get_rebalance_bias(peer_id)
-            except Exception:
-                pass
-
         allowed, policy_reason = _boltz_direction_allowed_by_policy(peer_id, direction)
         if not allowed:
             skipped.append({"channel_id": channel_id, "peer_id": peer_id, "reason": policy_reason, "direction": direction})
@@ -8892,7 +8525,6 @@ def _build_boltz_balance_plan(
             "posterior_std": posterior_std,
             "broadcast_fee_ppm": broadcast_fee_ppm,
             "rebalance_impossible": rebalance_impossible,
-            "hive_rebal_bias": hive_rebal_bias,
             "flow_state": flow_state,
             "local_pct": local_pct,
             "scid_display": scid_display,
@@ -8956,7 +8588,6 @@ def _build_boltz_balance_plan(
         posterior_std = p["posterior_std"]
         broadcast_fee_ppm = p["broadcast_fee_ppm"]
         rebalance_impossible = p["rebalance_impossible"]
-        hive_rebal_bias = p["hive_rebal_bias"]
         flow_state = p["flow_state"]
         local_pct = p["local_pct"]
         scid_display = p["scid_display"]
@@ -9071,10 +8702,6 @@ def _build_boltz_balance_plan(
         passes_profit_guard = (expected_gross_uplift_sats >= required_profit_threshold_sats) if require_profitable else True
         expected_net_sats = expected_gross_uplift_sats - estimated_fee_sats
 
-        # Apply hive rebalance bias to the net estimate (±15% bounded)
-        if hive_rebal_bias != 1.0:
-            expected_net_sats = int(expected_net_sats * hive_rebal_bias)
-
         # Additional guard for loop-in with no channel pinning support.
         non_pinned_penalty = 0.7 if direction == "loop_in" else 1.0
         risk_adjusted_net_sats = int(expected_net_sats * non_pinned_penalty)
@@ -9091,7 +8718,6 @@ def _build_boltz_balance_plan(
         #   - rebalance_bonus: if native rebalancer can't rebalance, Boltz is the only option
         #   - planner_bonus: capacity planner needs on-chain funds for a channel open
         #   - route_bonus: loop-out through inbound revenue legs creates headroom for more inbound traffic
-        #   - hive_bonus: hive rebalance bias compounds with route-pair signal
         #   - drain_bonus: channels the circular rebalancer reported unplaceable drain first
         multi_goal_value = 0.0
         if direction == "loop_out":
@@ -9106,15 +8732,8 @@ def _build_boltz_balance_plan(
             rebalance_bonus = 1.2 if rebalance_impossible else 1.0
             planner_bonus = 1.25 if planner_funding_deficit > 0 else 1.0
             route_bonus = 1.3 if scid_display in route_pair_in_channels else 1.0
-            hive_bonus = hive_rebal_bias  # ±15% from fleet hints, compounds with route signal
-            # Hive topology: prefer swaps that benefit fleet structure
-            hive_topo = 1.0
-            if hive_router and hive_router.available:
-                hive_topo = hive_router.score_channel_for_hive(
-                    peer_id, direction, liquidity_ratio=local_pct / 100.0
-                )
             drain_bonus = 1.5 if scid_display in drain_demand_scids else 1.0
-            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * rebalance_bonus * planner_bonus * route_bonus * hive_bonus * hive_topo * drain_bonus
+            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * rebalance_bonus * planner_bonus * route_bonus * drain_bonus
 
         candidate = {
             "channel_id": channel_id,
@@ -9169,9 +8788,6 @@ def _build_boltz_balance_plan(
                 "broadcast_fee_ppm": broadcast_fee_ppm,
                 "posterior_mean": round(posterior_mean, 1) if posterior_mean else None,
                 "posterior_std": round(posterior_std, 1) if posterior_std else None,
-            },
-            "hive": {
-                "rebalance_bias": round(hive_rebal_bias, 3),
             },
             "quote": quote_resp,
             "score": {
@@ -9561,35 +9177,8 @@ def _execute_boltz_balance_cycle(
                         currency = _select_boltz_currency("loop_out", amount_sats)
                     except Exception:
                         currency = "LBTC"
-                # Hive route discovery: find cheaper first-hop through fleet
                 exec_ch_id = ch_id
                 exec_peer_id = peer_id
-                if hive_router and hive_router.available and peer_id:
-                    try:
-                        hr = hive_router.discover_route(peer_id, amount_sats)
-                        if hr and hr.source_scid and hr.fee_ppm < 200:
-                            # Lazy-eval audit F2: the override drains a
-                            # DIFFERENT channel — its peer must pass the same
-                            # policy gate; undeterminable peer declines the
-                            # override (the original channel was checked).
-                            _hop_peer = _hive_route_first_hop_peer(hr)
-                            _hop_ok = False
-                            if _hop_peer:
-                                _hop_ok, _hop_why = _boltz_exec_policy_recheck(_hop_peer, "loop_out")
-                            if _hop_peer and _hop_ok:
-                                exec_ch_id = hr.source_scid
-                                plugin.log(
-                                    f"BOLTZ HIVE ROUTE: Using fleet path for loop-out "
-                                    f"({hr.hops} hops, {hr.fee_ppm} ppm, via {hr.source_scid})",
-                                )
-                            else:
-                                plugin.log(
-                                    "BOLTZ HIVE ROUTE: override declined "
-                                    f"(first-hop peer policy: {_hop_why if _hop_peer else 'peer undeterminable'})",
-                                    level="info",
-                                )
-                    except Exception:
-                        pass  # Fall back to original channel selection
                 _ok, _why = _boltz_exec_policy_recheck(exec_peer_id, "loop_out")
                 if not _ok:
                     skipped_exec.append({"channel_id": ch_id, "peer_id": exec_peer_id,

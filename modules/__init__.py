@@ -8,7 +8,7 @@ most modules are imported directly by cl-revenue-ops.py. Module families:
 - Fee pricing: fee_controller (DTS+PID dynamic fee optimization), flow_analysis
   (sink/source detection and flow metrics)
 - Rebalancing: rebalancer, rebalance_engine_v2/executor_v2/native_executor_v2/planner_v2,
-  rebalance_router_v2/v3, rebalance_hive_router, rebalance_route_policy, rebalance_state_v2,
+  rebalance_router_v2/v3, rebalance_route_policy, rebalance_state_v2,
   rebalance_types_v2, rebalance_flow_facts, rebalance_audit_v2, rebalance_coordination_overlay,
   rebalance_execution
 - Capital allocation: capacity_planner (channel opens/closes/defibrillation),

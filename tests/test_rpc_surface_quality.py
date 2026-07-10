@@ -124,9 +124,8 @@ class TestPolicyGatesFailClosedWithoutManager:
 
 
 class TestBoltzExecutionPolicyRecheck:
-    """Lazy-eval audit F2: swap policy was read at plan build, execution
-    happened minutes later with no re-read — and the hive-route override
-    could re-pin the drain to a channel whose peer was never checked."""
+    """Lazy-eval audit F2: swap policy was read at plan build, but execution
+    happens minutes later — the executor must re-read the gate."""
 
     def test_recheck_blocks_when_policy_flipped_after_plan(self, monkeypatch):
         mod = load_plugin_module()
@@ -138,19 +137,3 @@ class TestBoltzExecutionPolicyRecheck:
         ok, reason = mod._boltz_exec_policy_recheck("02" + "a" * 64, "loop_out")
         assert ok is False and "policy_passive" in reason
         assert calls == [("02" + "a" * 64, "loop_out")]
-
-    def test_hive_route_first_hop_peer_extraction(self):
-        mod = load_plugin_module()
-        class HR:  # duck-typed HiveRoute
-            path = [{"short_channel_id_dir": "100x1x0/1",
-                     "next_node": "02" + "c" * 64}]
-        assert mod._hive_route_first_hop_peer(HR()) == "02" + "c" * 64
-
-    def test_hive_route_first_hop_peer_missing_returns_none(self):
-        mod = load_plugin_module()
-        class HR:
-            path = [{"short_channel_id_dir": "100x1x0/1"}]
-        assert mod._hive_route_first_hop_peer(HR()) is None
-        class Empty:
-            path = []
-        assert mod._hive_route_first_hop_peer(Empty()) is None

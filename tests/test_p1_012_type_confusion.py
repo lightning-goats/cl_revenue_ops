@@ -35,11 +35,6 @@ def test_rebalance_non_str_channel(mod):
     assert isinstance(res, dict) and res.get("status") == "error"
 
 
-def test_hive_hints_status_non_int_segment(mod):
-    res = mod.revenue_hive_hints_status(mod.plugin, max_segment_scores="x")
-    assert isinstance(res, dict)
-
-
 def test_dashboard_non_int_window(mod):
     mod.profitability_analyzer = MagicMock()
     mod.database = MagicMock()

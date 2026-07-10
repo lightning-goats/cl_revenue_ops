@@ -94,8 +94,6 @@ PUBLIC_RUNTIME_KEYS = (
     'lnplus_pending_timeout_days',
     'lnplus_inbound_credit_factor',
     'lnplus_watcher_interval',
-    # Z-2 (2026-07-08): durable zero-fee hive corridor grace period.
-    'hive_zero_fee_stale_grace_seconds',
 )
 
 # Type mapping for config fields (for validation)
@@ -173,13 +171,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_drift_override_ratio': float,
     'rebalance_hold_margin': float,
     'pair_fee_cap_ppm': int,
-    'hive_equalization_enabled': bool,
-    'hive_equalization_low_pct': float,
-    'hive_equalization_high_pct': float,
-    'hive_equalization_cooldown_hours': int,
-    'hive_equalization_max_candidates_per_cycle': int,
-    'hive_rebalance_bootstrap_budget_sats': int,
-    'rebalance_coordination_reserved_slots': int,
     # Upstream rebalancer patterns
     'rebalance_activity_window_seconds': int,
     'rebalance_activity_penalty_coeff': float,
@@ -191,9 +182,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'rebalance_size_tiered_targets': bool,
     'rebalance_size_reference_percentile': float,
     'rebalance_small_channel_band_half_width': float,
-    'hive_push_enabled': bool,
-    'hive_push_trigger_ratio': float,
-    'hive_push_target_ratio': float,
     'futility_cooldown_hours': int,
     'inbound_fee_estimate_ppm': int,
     # Vegas Reflex
@@ -218,7 +206,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     # Routing Intelligence Integration
     # Fields present in CONFIG_FIELD_RANGES that need type registration
     'base_fee_msat': int,
-    'fee_ppm_intra_fleet': int,
     'neighbor_median_min_competitors': int,
     'flow_window_days': int,
     'estimated_open_cost_sats': int,
@@ -241,11 +228,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'planner_min_peer_uptime_pct': float,
     'planner_max_fee_rate_sat_vb': float,
     'planner_min_annual_roi_pct': float,
-    # Hive Hints
-    'hive_hints_enabled': bool,
-    'hive_hints_ttl_seconds': int,
-    'hive_hints_allow_all_hints_m2_scope': bool,
-    'hive_zero_fee_stale_grace_seconds': int,
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': float,
     'capex_bootstrap_bps': int,
@@ -343,7 +325,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'max_concurrent_jobs': (1, 20),
     'askrene_max_age_sec': (10, 86400),
     'base_fee_msat': (0, 10000),
-    'fee_ppm_intra_fleet': (0, 1000),
     'neighbor_median_min_competitors': (2, 50),
     'rebalance_min_profit': (0, 1000000),
     'rebalance_min_amount': (1000, 50000000),
@@ -369,12 +350,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # must admit sat-scale bars; 1000 sats is already a very aggressive hold.
     'rebalance_hold_margin': (0.0, 1000.0),
     'pair_fee_cap_ppm': (0, 100000),
-    'hive_equalization_low_pct': (0.0, 1.0),
-    'hive_equalization_high_pct': (0.0, 1.0),
-    'hive_equalization_cooldown_hours': (1, 168),
-    'hive_equalization_max_candidates_per_cycle': (1, 10),
-    'hive_rebalance_bootstrap_budget_sats': (0, 10_000),
-    'rebalance_coordination_reserved_slots': (0, 10),
     # Upstream rebalancer patterns
     'rebalance_activity_window_seconds': (60, 86400),
     'rebalance_activity_penalty_coeff': (0.0, 1.0),
@@ -402,10 +377,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_min_peer_uptime_pct': (0.0, 100.0),
     'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
     'planner_min_annual_roi_pct': (0.0, 100.0),
-    'hive_hints_ttl_seconds': (60, 7200),
     # Z-2 (2026-07-08): 0 disables the grace fallback entirely (immediate
     # release on hint staleness); ceiling is 30 days.
-    'hive_zero_fee_stale_grace_seconds': (0, 2592000),
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': (0.0, 1.0),
     'capex_bootstrap_bps': (0, 100),
@@ -531,31 +504,10 @@ class Config:
     max_fee_ppm: int = 2000        # Ceiling fee in PPM (matches revenue-ops-max-fee-ppm option default; P6-010/DEF-042)
     base_fee_msat: int = 0         # Base fee fallback when base_fee_policy = "off"
 
-    # Adaptive base_fee (Upgrade A, 2026-04-22) — per-channel-role base_fee_msat.
-    # Motivated by the 168x per-forward fee gap observed between clboss-ivan
-    # (15,307 msat base) and hive (0 msat base) in the 2026-04-21 tier runs.
-    # policy = "off" -> use base_fee_msat (legacy). "adaptive" -> classify each
-    # peer and apply role-specific base fee. V1 classification is two-bucket:
-    # hive fleet members get base_fee_msat_intra_fleet (0); everyone else gets
-    # base_fee_msat_non_hive. Gateway/leaf split is deferred until data shows
-    # a single non-hive value is insufficient.
+    # Base-fee policy (Upgrade A, 2026-04-22). The per-channel-role split
+    # ("adaptive": intra-fleet vs everyone else) retired with cl-mycelium;
+    # both values now apply base_fee_msat to every channel.
     base_fee_policy: str = "off"            # off | adaptive
-    base_fee_msat_intra_fleet: int = 0
-    base_fee_msat_non_hive: int = 1000      # conservative default per advisor calibration
-
-    # Intra-fleet proportional fee (operator strategy, 2026-07-08: true
-    # zero-fee hive corridor). ALL hive-internal channels are zero fee (0
-    # base msat / 0 ppm), public and announced. Third parties chaining our
-    # free internal hops into cheap end-to-end routes is DESIRED: the
-    # fleet is the cheap corridor, revenue is captured at edge (non-hive)
-    # channels, and external flow through the mesh performs free
-    # intrafleet rebalancing. This supersedes the prior "revenue leak"
-    # framing (a 2026-04-22 attempt to price 1 ppm on intra-fleet hops to
-    # recapture external transit revenue) — that revenue is now understood
-    # to be captured at the edge instead, so the corridor itself stays
-    # free. Set to a nonzero value only to deliberately opt out of the
-    # corridor strategy for this fleet.
-    fee_ppm_intra_fleet: int = 0
 
     # Minimum competitor count for _get_neighbor_fee_median to return a
     # value. The original threshold of 3 was too strict for small labs /
@@ -569,8 +521,8 @@ class Config:
     # Market-fee mode: how we price relative to the weighted-median of neighbor
     # competitors' fees. Added 2026-04-21 to close the head-to-head-vs-clboss
     # gap. Default "undercut" preserves existing behavior; "premium" prices
-    # above median in inelastic markets where the hive's coordinated routing
-    # means we lose less volume to a price increase than a single operator would.
+    # above median in inelastic markets where we lose less volume to a
+    # price increase than the median-follower would.
     #   - "undercut": price below the median (existing behavior)
     #   - "match":    price at the median
     #   - "premium":  price above the median by the same per-corridor weight
@@ -623,31 +575,6 @@ class Config:
     # Default 1000 ppm = 0.1% of rebalance amount. 0 disables the layer
     # and keeps the Phase 5 capex-only behavior.
     pair_fee_cap_ppm: int = 1000
-    hive_equalization_enabled: bool = True  # Fallback pure-hive inventory equalization
-    hive_equalization_low_pct: float = 0.35  # Lower bound for hive balance band
-    hive_equalization_high_pct: float = 0.65  # Upper bound for hive balance band
-    hive_equalization_cooldown_hours: int = 48  # Longer than standard rebalance cooldown
-    hive_equalization_max_candidates_per_cycle: int = 1
-    # Conservative fee budget for active hive-member channels whose capex
-    # allocation has not appeared yet. Global/weekly budget reservations still
-    # enforce aggregate spend; 0 disables this bootstrap path.
-    hive_rebalance_bootstrap_budget_sats: int = 300
-    hive_push_enabled: bool = True            # Deploy capital to fleet member channels
-    hive_push_trigger_ratio: float = 0.60     # Push when local ratio exceeds this
-    hive_push_target_ratio: float = 0.50      # Push balance toward this ratio
-
-    # Reserved slots for coordination pairs on top of the planner's
-    # max_pairs cap (Phase B.f, 2026-04-23). cl-hive publishes
-    # rebalance_recommendations / rebalance_campaigns via hive-export-hints,
-    # and the documented contract is that those pairs should "materialize
-    # before the normal pair cap is applied." Before this default, they
-    # competed for the planner's 10-slot cap and could be squeezed out
-    # entirely by a crop of EV-positive planner pairs. Default 2 lets up
-    # to two hive-blessed coordination pairs bypass the normal cap without
-    # letting coordination dominate arbitrarily. Set to 0 to restore the
-    # strict-cap behavior.
-    rebalance_coordination_reserved_slots: int = 2
-
     # Upstream rebalancer patterns (flow-facts / EV / planner tuning).
     # Consumed by ChannelFlowFacts (activity + utilization knobs) and by
     # the rebalance engine EV / capacity planner (size-tiering knobs).
@@ -785,18 +712,6 @@ class Config:
     planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
     planner_min_annual_roi_pct: float = 1.0
-    # Hive Hints integration
-    hive_hints_enabled: bool = True
-    hive_hints_ttl_seconds: int = 0  # 0 = use snapshot's ttl_seconds
-    hive_hints_allow_all_hints_m2_scope: bool = False
-    # Z-2 (2026-07-08, zero-fee hive corridor): how long a peer's
-    # last-confirmed hive membership keeps the zero-fee gate held after
-    # live hive-hint data goes stale/unavailable. 7 days is generous on
-    # purpose -- the corridor strategy wants zero-fee held through
-    # extended cl-hive/cl-mycelium outages rather than repricing away from
-    # 0 ppm and back on every hint hiccup. Past this grace, the peer is
-    # released and the dynamic branch reprices as before.
-    hive_zero_fee_stale_grace_seconds: int = 604800
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50       # Fraction of channel contribution for all capex
     capex_bootstrap_bps: int = 10               # Bootstrap: basis points of capacity per 30d
@@ -840,11 +755,6 @@ class Config:
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants on direct construction."""
-        if self.hive_equalization_low_pct >= self.hive_equalization_high_pct:
-            raise ValueError(
-                "hive_equalization_low_pct must be less than "
-                "hive_equalization_high_pct"
-            )
         # Source-heavy drain fields: enforce ranges at construction time so a
         # bad receivable objective or discount cap can never be instantiated.
         for _key in (
@@ -937,11 +847,6 @@ class Config:
                 # realized utilization to the (wrong) floor for every channel.
                 self.rebalance_utilization_floor = max(
                     0.0, self.rebalance_utilization_ceiling - 0.05
-                )
-        if hasattr(self, 'hive_equalization_low_pct') and hasattr(self, 'hive_equalization_high_pct'):
-            if self.hive_equalization_low_pct >= self.hive_equalization_high_pct:
-                self.hive_equalization_low_pct = max(
-                    0.0, self.hive_equalization_high_pct - 0.05
                 )
         if self.receivable_ratio_floor > self.receivable_ratio_target:
             self.receivable_ratio_floor = self.receivable_ratio_target
@@ -1059,10 +964,6 @@ class Config:
                 return {"error": f"rebalance_utilization_floor ({typed_value}) must be less than rebalance_utilization_ceiling ({self.rebalance_utilization_ceiling})"}
             if key == 'rebalance_utilization_ceiling' and typed_value <= self.rebalance_utilization_floor:
                 return {"error": f"rebalance_utilization_ceiling ({typed_value}) must be greater than rebalance_utilization_floor ({self.rebalance_utilization_floor})"}
-            if key == 'hive_equalization_low_pct' and typed_value >= self.hive_equalization_high_pct:
-                return {"error": f"hive_equalization_low_pct ({typed_value}) must be less than hive_equalization_high_pct ({self.hive_equalization_high_pct})"}
-            if key == 'hive_equalization_high_pct' and typed_value <= self.hive_equalization_low_pct:
-                return {"error": f"hive_equalization_high_pct ({typed_value}) must be greater than hive_equalization_low_pct ({self.hive_equalization_low_pct})"}
             # AUDIT FIX I-5: Validate sink/source threshold cross-field consistency
             if key == 'sink_threshold' and typed_value >= self.source_threshold:
                 return {"error": f"sink_threshold ({typed_value}) must be less than source_threshold ({self.source_threshold})"}
@@ -1159,9 +1060,6 @@ class ConfigSnapshot:
     base_fee_msat: int
     market_fee_mode: str
     base_fee_policy: str
-    base_fee_msat_intra_fleet: int
-    base_fee_msat_non_hive: int
-    fee_ppm_intra_fleet: int
     neighbor_median_min_competitors: int
     fee_profile: str
     fee_market_boundary_enabled: bool
@@ -1182,16 +1080,6 @@ class ConfigSnapshot:
     rebalance_drift_override_ratio: float
     rebalance_hold_margin: float
     pair_fee_cap_ppm: int
-    hive_equalization_enabled: bool
-    hive_equalization_low_pct: float
-    hive_equalization_high_pct: float
-    hive_equalization_cooldown_hours: int
-    hive_equalization_max_candidates_per_cycle: int
-    hive_rebalance_bootstrap_budget_sats: int
-    hive_push_enabled: bool
-    hive_push_trigger_ratio: float
-    hive_push_target_ratio: float
-    rebalance_coordination_reserved_slots: int
     futility_cooldown_hours: int
     inbound_fee_estimate_ppm: int
     # Upstream rebalancer patterns
@@ -1292,10 +1180,6 @@ class ConfigSnapshot:
     planner_min_peer_uptime_pct: float = 95.0
     planner_max_fee_rate_sat_vb: float = 50.0
     planner_min_annual_roi_pct: float = 1.0
-    # Hive Hints
-    hive_hints_enabled: bool = True
-    hive_hints_ttl_seconds: int = 0
-    hive_zero_fee_stale_grace_seconds: int = 604800
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50
     capex_bootstrap_bps: int = 10

@@ -34,7 +34,6 @@ class RouteDecision:
     hint_id: str = ""
     hint_type: str = ""
     priority_score: float = 0.0
-    prefer_hive_on_tie: bool = True
 
 
 def decide_route_policy(pair: Any, *, reason_code: str = "") -> RouteDecision:

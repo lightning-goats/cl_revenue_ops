@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Run capex/planner scenario checks with optional cl-hive A/B coverage.
+"""Run capex/planner scenario checks.
 
 This loop is intentionally synthetic: it exercises the planner's decision
 composition so capex regressions can be isolated before live Polar tests add
-topology noise.  By default it keeps the original cl_revenue_ops-only mode;
-``--hive-mode ab`` adds controlled hive hint scenarios.
+topology noise.
 """
 
 from __future__ import annotations
@@ -49,59 +48,7 @@ class ScenarioResult:
     reason: str
 
 
-HIVE_PEER = "02" + "b" * 64
 BASELINE_PEER = "02" + "a" * 64
-
-
-class FakeHiveHints:
-    """Deterministic hive hint source for synthetic A/B scenarios."""
-
-    def __init__(
-        self,
-        *,
-        members: set[str] | None = None,
-        open_hints: dict[str, dict] | None = None,
-        rebalance_bias: dict[str, float] | None = None,
-        corridor_bias: dict[str, float] | None = None,
-        reputation: dict[str, float] | None = None,
-        corridor_roles: dict[str, str] | None = None,
-        closure_recommendations: set[str] | None = None,
-    ):
-        self.members = members or set()
-        self.open_hints = open_hints or {}
-        self.rebalance_bias = rebalance_bias or {}
-        self.corridor_bias = corridor_bias or {}
-        self.reputation = reputation or {}
-        self.corridor_roles = corridor_roles or {}
-        self.closure_recommendations = closure_recommendations or set()
-
-    def get_open_candidates(self):
-        return [
-            (peer_id, hint.copy())
-            for peer_id, hint in self.open_hints.items()
-            if hint.get("open_preference") == "open"
-        ]
-
-    def get_channel_open_hint(self, peer_id: str) -> dict:
-        return self.open_hints.get(peer_id, {}).copy()
-
-    def get_rebalance_bias(self, peer_id: str) -> float:
-        return self.rebalance_bias.get(peer_id, 1.0)
-
-    def get_corridor_utilization_bias(self, peer_id: str) -> float:
-        return self.corridor_bias.get(peer_id, 1.0)
-
-    def get_reputation_score(self, peer_id: str):
-        return self.reputation.get(peer_id)
-
-    def is_hive_member(self, peer_id: str) -> bool:
-        return peer_id in self.members
-
-    def get_corridor_role(self, peer_id: str) -> str:
-        return self.corridor_roles.get(peer_id, "")
-
-    def is_closure_recommended(self, peer_id: str) -> bool:
-        return peer_id in self.closure_recommendations
 
 
 def write_json(path: Path, data) -> None:
@@ -130,7 +77,6 @@ def _planner(
     closed_daily_net_sats: float | None,
     feerate_perkb: int = 1000,
     confirmed_sats: int = 50_000_000,
-    hive_hints=None,
 ) -> tuple[CapacityPlanner, MagicMock]:
     plugin = MagicMock()
     plugin.rpc.feerates.return_value = {"perkb": {"opening": feerate_perkb}}
@@ -173,7 +119,6 @@ def _planner(
     flow.analyze_all_channels.return_value = {}
 
     planner = CapacityPlanner(plugin, profitability, flow)
-    planner.hive_hints = hive_hints
     planner._update_candidate_pool = MagicMock()
     planner._identify_winners = MagicMock(return_value=[])
     planner._identify_losers = MagicMock(return_value=[])
@@ -226,11 +171,9 @@ def _cycle_scenario(
     min_annual_roi_pct: float,
     expect_open: bool,
     mode: str = "disabled",
-    hive_hints=None,
 ) -> ScenarioResult:
     planner, _plugin = _planner(
         closed_daily_net_sats=closed_daily_net_sats,
-        hive_hints=hive_hints,
     )
     cfg = _cfg(min_annual_roi_pct=min_annual_roi_pct)
     summary = planner.execute_cycle(cfg)
@@ -302,293 +245,8 @@ def _baseline_results(*, min_annual_roi_pct: float) -> list[ScenarioResult]:
     ]
 
 
-def _hive_discovery_scenario() -> ScenarioResult:
-    hive = FakeHiveHints(
-        open_hints={
-            HIVE_PEER: {
-                "open_preference": "open",
-                "topology_confidence": 0.8,
-                "suggested_size_bucket": "medium",
-                "reason": "underserved_corridor",
-            }
-        }
-    )
-    disabled, _ = _planner(closed_daily_net_sats=None)
-    disabled.hive_hints = None
-    enabled, _ = _planner(closed_daily_net_sats=None, hive_hints=hive)
-
-    disabled_candidates = disabled._discover_from_hive()
-    enabled_candidates = enabled._discover_from_hive()
-    passed = (
-        len(disabled_candidates) == 0
-        and len(enabled_candidates) == 1
-        and enabled_candidates[0]["peer_id"] == HIVE_PEER
-        and enabled_candidates[0]["source"] == "hive"
-    )
-    return ScenarioResult(
-        name="hive_open_hint_adds_candidate",
-        mode="ab",
-        passed=passed,
-        action="candidate" if enabled_candidates else "none",
-        ev_sats=None,
-        opens=len(enabled_candidates),
-        skipped_reasons=[],
-        reason=(
-            f"disabled_candidates={len(disabled_candidates)}, "
-            f"enabled_candidates={len(enabled_candidates)}"
-        ),
-    )
-
-
-def _hive_score_scenario() -> ScenarioResult:
-    hive = FakeHiveHints(
-        open_hints={
-            HIVE_PEER: {
-                "open_preference": "open",
-                "topology_confidence": 1.0,
-            }
-        },
-        corridor_bias={HIVE_PEER: 1.1},
-        reputation={HIVE_PEER: 90.0},
-    )
-    disabled, _ = _planner(closed_daily_net_sats=None)
-    enabled, _ = _planner(closed_daily_net_sats=None, hive_hints=hive)
-    disabled_score = disabled._score_candidate(HIVE_PEER, 1.0)
-    enabled_score = enabled._score_candidate(HIVE_PEER, 1.0)
-    passed = enabled_score > disabled_score
-    return ScenarioResult(
-        name="hive_score_bias_prioritizes_stronger_peer",
-        mode="ab",
-        passed=passed,
-        action="boost" if passed else "flat",
-        ev_sats=None,
-        opens=0,
-        skipped_reasons=[],
-        reason=f"disabled_score={disabled_score:.3f}, enabled_score={enabled_score:.3f}",
-    )
-
-
-def _hive_avoid_score_scenario() -> ScenarioResult:
-    hive = FakeHiveHints(
-        open_hints={
-            BASELINE_PEER: {
-                "open_preference": "avoid",
-                "topology_confidence": 1.0,
-                "reason": "fleet_avoid",
-            }
-        }
-    )
-    disabled, _ = _planner(closed_daily_net_sats=None)
-    enabled, _ = _planner(closed_daily_net_sats=None, hive_hints=hive)
-    disabled_score = disabled._score_candidate(BASELINE_PEER, 1.0)
-    enabled_score = enabled._score_candidate(BASELINE_PEER, 1.0)
-    passed = enabled_score < disabled_score
-    return ScenarioResult(
-        name="hive_avoid_hint_penalizes_candidate",
-        mode="ab",
-        passed=passed,
-        action="penalize" if passed else "flat",
-        ev_sats=None,
-        opens=0,
-        skipped_reasons=[],
-        reason=f"disabled_score={disabled_score:.3f}, enabled_score={enabled_score:.3f}",
-    )
-
-
-def _hive_ev_bias_scenario(*, min_annual_roi_pct: float) -> ScenarioResult:
-    hive = FakeHiveHints(rebalance_bias={BASELINE_PEER: 1.06})
-    disabled, _ = _planner(closed_daily_net_sats=300)
-    enabled, _ = _planner(closed_daily_net_sats=300, hive_hints=hive)
-    cfg = _cfg(min_annual_roi_pct=min_annual_roi_pct)
-    disabled_ev = disabled._calculate_open_ev(BASELINE_PEER, 10_000_000, cfg)
-    enabled_ev = enabled._calculate_open_ev(BASELINE_PEER, 10_000_000, cfg)
-    passed = disabled_ev <= 0 < enabled_ev
-    return ScenarioResult(
-        name="hive_rebalance_bias_clears_marginal_roi_hurdle",
-        mode="ab",
-        passed=passed,
-        action="accept" if enabled_ev > 0 else "reject",
-        ev_sats=round(float(enabled_ev), 3),
-        opens=0,
-        skipped_reasons=[],
-        reason=f"disabled_ev={disabled_ev:.0f}, enabled_ev={enabled_ev:.0f}",
-    )
-
-
-def _hive_cycle_scenario(*, min_annual_roi_pct: float) -> ScenarioResult:
-    hive = FakeHiveHints(rebalance_bias={BASELINE_PEER: 1.06})
-    disabled = _cycle_scenario(
-        name="cycle_disabled_reference",
-        closed_daily_net_sats=300,
-        min_annual_roi_pct=min_annual_roi_pct,
-        expect_open=False,
-        mode="disabled",
-    )
-    enabled = _cycle_scenario(
-        name="cycle_enabled_reference",
-        closed_daily_net_sats=300,
-        min_annual_roi_pct=min_annual_roi_pct,
-        expect_open=True,
-        mode="enabled",
-        hive_hints=hive,
-    )
-    passed = disabled.passed and enabled.passed and disabled.opens == 0 and enabled.opens > 0
-    return ScenarioResult(
-        name="hive_bias_changes_cycle_decision",
-        mode="ab",
-        passed=passed,
-        action="open" if enabled.opens else "skip",
-        ev_sats=None,
-        opens=enabled.opens,
-        skipped_reasons=disabled.skipped_reasons + enabled.skipped_reasons,
-        reason=f"disabled_opens={disabled.opens}, enabled_opens={enabled.opens}",
-    )
-
-
-def _hive_closure_hint_scenario() -> ScenarioResult:
-    from modules.profitability_analyzer import ProfitabilityClass
-
-    hive = FakeHiveHints(closure_recommendations={BASELINE_PEER})
-    disabled, _ = _planner(closed_daily_net_sats=None)
-    enabled, _ = _planner(closed_daily_net_sats=None, hive_hints=hive)
-    for planner in (disabled, enabled):
-        planner._identify_losers = CapacityPlanner._identify_losers.__get__(
-            planner,
-            CapacityPlanner,
-        )
-        planner.profitability.database.get_top_route_pairs.return_value = []
-        planner.profitability.database.get_diagnostic_rebalance_stats.return_value = {
-            "attempt_count": 0
-        }
-        planner.profitability.database.get_channel_rebalance_success_rate.return_value = None
-        planner.profitability.identify_bleeders_v2.return_value = []
-
-    prof = SimpleNamespace(
-        peer_id=BASELINE_PEER,
-        days_open=45,
-        classification=ProfitabilityClass.UNDERWATER,
-        roi_percent=-5.0,
-        marginal_roi_percent=-10.0,
-        marginal_profit_30d_sats=-100,
-        capacity_sats=5_000_000,
-        opener="local",
-        channel_role=None,
-        revenue=SimpleNamespace(sourced_fee_contribution_sats=0),
-    )
-    flow = SimpleNamespace(
-        confidence=1.0,
-        capacity=5_000_000,
-        daily_volume=100_000,
-        flow_ratio=0.5,
-    )
-
-    disabled_losers = disabled._identify_losers({"100x1x0": prof}, {"100x1x0": flow})
-    enabled_losers = enabled._identify_losers({"100x1x0": prof}, {"100x1x0": flow})
-    enabled_action = enabled_losers[0].get("action") if enabled_losers else "none"
-    passed = (
-        not disabled_losers
-        and len(enabled_losers) == 1
-        and enabled_losers[0].get("hive_closure_flagged") is True
-        and enabled_action == "DEFIBRILLATE"
-    )
-    return ScenarioResult(
-        name="hive_closure_hint_escalates_underwater_peer",
-        mode="ab",
-        passed=passed,
-        action=str(enabled_action).lower(),
-        ev_sats=None,
-        opens=0,
-        skipped_reasons=[],
-        reason=(
-            f"disabled_losers={len(disabled_losers)}, "
-            f"enabled_losers={len(enabled_losers)}, enabled_action={enabled_action}"
-        ),
-    )
-
-
-def _mock_channel_profitability(*, peer_id: str, days_open: int = 1):
-    prof = SimpleNamespace()
-    prof.channel_id = "100x1x0"
-    prof.peer_id = peer_id
-    prof.revenue = SimpleNamespace(
-        total_contribution_msat=0,
-        fees_earned_msat=0,
-        total_forward_count=0,
-    )
-    prof.days_open = days_open
-    prof.capacity_sats = 5_000_000
-    prof.classification = "break_even"
-    prof.marginal_roi = 0.0
-    return prof
-
-
-def _capex_hive_budget_scenario() -> ScenarioResult:
-    cfg = Config().snapshot()
-    prof = _mock_channel_profitability(peer_id=HIVE_PEER, days_open=1)
-
-    disabled = CapexBudgetEngine.__new__(CapexBudgetEngine)
-    disabled._hive_member_check = lambda pid: False
-    disabled._hive_hints = None
-    disabled._capital_efficiency = None
-    disabled._database = MagicMock()
-    disabled._database.get_channel_rebalance_success_rate.return_value = None
-
-    enabled = CapexBudgetEngine.__new__(CapexBudgetEngine)
-    enabled._hive_member_check = lambda pid: pid == HIVE_PEER
-    enabled._hive_hints = FakeHiveHints(members={HIVE_PEER})
-    enabled._capital_efficiency = None
-    enabled._database = MagicMock()
-    enabled._database.get_channel_rebalance_success_rate.return_value = None
-
-    disabled_budget = disabled._compute_channel_budget(
-        ch_id="100x1x0",
-        prof=prof,
-        total_capex_30d_msat=0,
-        bleeder_status="none",
-        cfg=cfg,
-    )
-    enabled_budget = enabled._compute_channel_budget(
-        ch_id="100x1x0",
-        prof=prof,
-        total_capex_30d_msat=0,
-        bleeder_status="none",
-        cfg=cfg,
-    )
-    passed = disabled_budget.tier == "blocked" and enabled_budget.tier == "fleet"
-    return ScenarioResult(
-        name="hive_member_gets_fleet_capex_budget",
-        mode="ab",
-        passed=passed,
-        action=enabled_budget.tier,
-        ev_sats=None,
-        opens=0,
-        skipped_reasons=[],
-        reason=(
-            f"disabled_tier={disabled_budget.tier}, enabled_tier={enabled_budget.tier}, "
-            f"enabled_budget_sats={enabled_budget.budget_sats}"
-        ),
-    )
-
-
-def _hive_ab_results(*, min_annual_roi_pct: float) -> list[ScenarioResult]:
-    return [
-        _hive_discovery_scenario(),
-        _hive_score_scenario(),
-        _hive_avoid_score_scenario(),
-        _hive_ev_bias_scenario(min_annual_roi_pct=min_annual_roi_pct),
-        _hive_cycle_scenario(min_annual_roi_pct=min_annual_roi_pct),
-        _hive_closure_hint_scenario(),
-        _capex_hive_budget_scenario(),
-    ]
-
-
-def run_loop(*, min_annual_roi_pct: float, hive_mode: str = "disabled") -> list[ScenarioResult]:
-    results: list[ScenarioResult] = []
-    if hive_mode in ("disabled", "ab"):
-        results.extend(_baseline_results(min_annual_roi_pct=min_annual_roi_pct))
-    if hive_mode in ("enabled", "ab"):
-        results.extend(_hive_ab_results(min_annual_roi_pct=min_annual_roi_pct))
-    return results
+def run_loop(*, min_annual_roi_pct: float) -> list[ScenarioResult]:
+    return list(_baseline_results(min_annual_roi_pct=min_annual_roi_pct))
 
 
 def write_analysis(
@@ -596,13 +254,11 @@ def write_analysis(
     results: list[ScenarioResult],
     *,
     min_annual_roi_pct: float,
-    hive_mode: str,
 ) -> None:
     passed = sum(1 for item in results if item.passed)
     lines = [
         "# Capex Planner Loop Analysis",
         "",
-        f"- Mode: {hive_mode}",
         f"- Planner annual ROI hurdle: {min_annual_roi_pct:.2f}%",
         f"- Scenarios: {len(results)}",
         f"- Passing scenarios: {passed}",
@@ -618,10 +274,7 @@ def write_analysis(
         )
     lines.append("")
     if passed == len(results):
-        if hive_mode == "disabled":
-            lines.append("Conclusion: planner open EV respects the capital hurdle and preserves explicit legacy override behavior.")
-        else:
-            lines.append("Conclusion: controlled hive hints improve discovery, score/EV selection, and fleet capex treatment without relaxing the capital hurdle.")
+        lines.append("Conclusion: planner open EV respects the capital hurdle and preserves explicit legacy override behavior.")
     else:
         lines.append("Conclusion: one or more planner scenarios failed; inspect loop.json before live Polar comparison.")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -631,12 +284,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--planner-min-annual-roi-pct", type=float, default=Config().planner_min_annual_roi_pct)
-    parser.add_argument(
-        "--hive-mode",
-        choices=("disabled", "enabled", "ab"),
-        default="disabled",
-        help="Run baseline only, hive-only synthetic checks, or disabled/enabled A/B checks.",
-    )
     args = parser.parse_args()
 
     started = time.strftime("%Y%m%dT%H%M%S%z")
@@ -645,12 +292,10 @@ def main() -> int:
 
     results = run_loop(
         min_annual_roi_pct=args.planner_min_annual_roi_pct,
-        hive_mode=args.hive_mode,
     )
     payload = {
         "started": started,
         "mode": "capex_planner",
-        "hive_mode": args.hive_mode,
         "planner_min_annual_roi_pct": args.planner_min_annual_roi_pct,
         "results": [asdict(item) for item in results],
     }
@@ -659,7 +304,6 @@ def main() -> int:
         out_dir / "ANALYSIS.md",
         results,
         min_annual_roi_pct=args.planner_min_annual_roi_pct,
-        hive_mode=args.hive_mode,
     )
     latest = REPO_ROOT / "results" / "capex-planner-loop-latest"
     try:

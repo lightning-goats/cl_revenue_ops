@@ -704,7 +704,8 @@ class ChannelProfitabilityAnalyzer:
     def _push_profitability_summary(self, results: Dict[str, 'ChannelProfitability']) -> None:
         """Push compressed profitability summary to CLN datastore.
 
-        Enables cl-hive to read profitability data without cross-plugin RPC.
+        Enables external consumers to read profitability data without
+        cross-plugin RPC.
         Fire-and-forget -- failures are logged but don't affect analysis.
         """
         import json as _json
@@ -2695,12 +2696,10 @@ class ChannelProfitabilityAnalyzer:
                 pass
 
         # 4. (removed — operator decision D2, 2026-06-12): the structural
-        # UNDERWATER -> BREAK_EVEN reclassification for hive members /
-        # corridor owners / centrality > 0.03 masked real losses on fleet
-        # channels from loss reporting. Losses must stay visible; close
-        # protection for fleet channels is expressed downstream as an
-        # explicit protection reason (capacity_planner._close_protection_reason
-        # -> HIVE_MEMBER), never by falsifying the profitability class.
+        # UNDERWATER -> BREAK_EVEN reclassification masked real losses
+        # from loss reporting. Losses must stay visible; close protection
+        # is expressed downstream as an explicit protection reason, never
+        # by falsifying the profitability class.
 
         # 5. Audit F3: historically-profitable corpse. Lifetime ROI never
         # decays, so a channel that earned well a year ago and has been dead

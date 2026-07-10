@@ -960,8 +960,6 @@ class CapacityPlanner:
                 elif isinstance(bleeder_info, dict):
                     is_hard_bleeder = bool(bleeder_info.get('is_hard_bleeder', False))
 
-            hive_closure_flagged = False
-
             # Logic 1: FIRE SALE mode (Zombie or Deeply Underwater)
             # Guard: require flow data before recommending closure (matches _identify_winners).
             # Without flow data we can't assess channel viability, so demote to DEFIBRILLATE at most.
@@ -996,17 +994,6 @@ class CapacityPlanner:
             if rebal_difficulty > 0.7 and not is_fire_sale and is_stagnant:
                 is_fire_sale = True
                 fire_sale_reason = "STAGNANT+HARD_REBAL"
-
-            # Hive reputation closure: peer has dangerous behavior (force closes,
-            # low HTLC success). Combined with underwater/stagnant, escalate.
-            # On its own (profitable channel), flag but don't force close.
-            if hive_closure_flagged and not is_fire_sale:
-                if prof.marginal_roi_percent < 0:
-                    is_fire_sale = True
-                    fire_sale_reason = "REPUTATION+UNDERWATER"
-                elif is_stagnant:
-                    is_fire_sale = True
-                    fire_sale_reason = "REPUTATION+STAGNANT"
 
             # Remote-opened channels are "free" capacity — raise the bar for closing.
             # They cost us nothing to acquire, so only close if deeply underwater.
@@ -1068,7 +1055,6 @@ class CapacityPlanner:
                     "action": action,
                     # Enrichment fields
                     "is_hard_bleeder": is_hard_bleeder,
-                    "hive_closure_flagged": hive_closure_flagged,
                     "uptime_pct": round(uptime_pct, 1) if isinstance(uptime_pct, (int, float)) else None,
                     "regime_change": regime_change,
                     "is_fire_sale": is_fire_sale,
@@ -1383,7 +1369,6 @@ class CapacityPlanner:
             "opener": opener,
             "action": action,
             "is_hard_bleeder": False,
-            "hive_closure_flagged": False,
             "uptime_pct": round(uptime_pct, 1) if isinstance(uptime_pct, (int, float)) else None,
             "regime_change": False,
             "is_fire_sale": False,

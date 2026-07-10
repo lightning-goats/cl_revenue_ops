@@ -1250,56 +1250,6 @@ def test_engine_build_snapshot_toggle_on_gives_big_channel_wider_band_than_small
     assert small.target_band_high == cfg.high_liquidity_threshold
 
 
-def test_v2_planner_uses_hive_rebalance_bias_for_pair_roles():
-    from modules.rebalance_planner_v2 import RebalancePlanner
-    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
-
-    disfavored_source = "100x1x0"
-    favored_source = "101x1x0"
-    dest = "200x1x0"
-    snapshot = build_state_snapshot(
-        [
-            ChannelInput(
-                channel_id=disfavored_source,
-                peer_id="03" + "1" * 64,
-                capacity_sats=1_000_000,
-                local_sats=900_000,
-                rebalance_bias=1.05,
-            ),
-            ChannelInput(
-                channel_id=favored_source,
-                peer_id="03" + "2" * 64,
-                capacity_sats=1_000_000,
-                local_sats=900_000,
-                rebalance_bias=0.95,
-            ),
-            ChannelInput(
-                channel_id=dest,
-                peer_id="03" + "3" * 64,
-                capacity_sats=1_000_000,
-                local_sats=100_000,
-                rebalance_bias=1.05,
-            ),
-        ],
-        {"channel_budgets": {dest: {"budget_sats": 1_000}}},
-    )
-
-    selected = RebalancePlanner(max_pairs=1).plan(snapshot).selected
-
-    assert len(selected) == 1
-    pair = selected[0]
-    assert pair.source_channel_id == favored_source
-    assert pair.dest_channel_id == dest
-    assert pair.hive_source_rebalance_bias == pytest.approx(0.95)
-    assert pair.hive_dest_rebalance_bias == pytest.approx(1.05)
-    assert pair.hive_hint_score_multiplier == pytest.approx(1.10)
-    inputs = pair.score_decomposition["inputs"]
-    assert inputs["hive_source_rebalance_bias"] == pytest.approx(0.95)
-    assert inputs["hive_dest_rebalance_bias"] == pytest.approx(1.05)
-    assert inputs["hive_hint_score_multiplier"] == pytest.approx(1.10)
-    assert pair.score > inputs["pre_hint_pair_score"]
-
-
 def test_v2_planner_carries_historical_profitability_role_metrics():
     from modules.rebalance_planner_v2 import RebalancePlanner
     from modules.rebalance_state_v2 import build_state_snapshot
@@ -1359,7 +1309,6 @@ def test_c1_planner_accepts_known_good_pair_and_explains_no_budget_destination()
                 peer_id="03" + "2" * 64,
                 capacity_sats=1_000_000,
                 local_sats=100_000,
-                rebalance_bias=1.05,
             ),
             ChannelInput(
                 channel_id=no_budget_dest,
@@ -2730,68 +2679,6 @@ def test_engine_clears_persisted_pair_failure_after_success(
     )
 
 
-def test_metabolic_rebalance_bias_is_bounded_score_modifier(mock_plugin, mock_database):
-    from modules.rebalance_types_v2 import PairCandidate
-
-    engine = _make_engine(mock_plugin, mock_database)
-    hive_hints = MagicMock()
-    hive_hints.get_metabolic_rebalance_bias.return_value = 1.50
-    hive_hints.get_metabolic_peer_effect.return_value = {
-        "usable": True,
-        "bias_capped": True,
-        "reason_codes": ["positive_net_usable_energy"],
-    }
-    engine._hive_hints = hive_hints
-    pair = PairCandidate(
-        source_channel_id="100x1x0",
-        dest_channel_id="200x1x0",
-        source_peer_id="02source",
-        dest_peer_id="02dest",
-        amount_sats=100_000,
-        pair_budget_sats=100,
-        score=10.0,
-    )
-
-    engine._apply_metabolic_rebalance_bias(pair)
-
-    assert pair.score == pytest.approx(11.5)
-    assert pair.metabolic_rebalance_bias == pytest.approx(1.15)
-    assert pair.metabolic_rebalance_influence["bias_capped"] is True
-    engine._update_pair_score_decomposition(pair, route_status="planned")
-    assert pair.score_decomposition["inputs"]["metabolic_rebalance_bias"] == pytest.approx(1.15)
-
-
-def test_immune_rebalance_bias_is_bounded_score_modifier(mock_plugin, mock_database):
-    from modules.rebalance_types_v2 import PairCandidate
-
-    engine = _make_engine(mock_plugin, mock_database)
-    hive_hints = MagicMock()
-    hive_hints.get_immune_rebalance_bias.return_value = 0.50
-    hive_hints.get_immune_peer_effect.return_value = {
-        "usable": True,
-        "bias_capped": True,
-        "reason_codes": ["toxic_peer_detected"],
-    }
-    engine._hive_hints = hive_hints
-    pair = PairCandidate(
-        source_channel_id="100x1x0",
-        dest_channel_id="200x1x0",
-        source_peer_id="02source",
-        dest_peer_id="02dest",
-        amount_sats=100_000,
-        pair_budget_sats=100,
-        score=10.0,
-    )
-
-    engine._apply_immune_rebalance_bias(pair)
-
-    assert pair.score == pytest.approx(8.5)
-    assert pair.immune_rebalance_bias == pytest.approx(0.85)
-    assert pair.immune_rebalance_influence["bias_capped"] is True
-    engine._update_pair_score_decomposition(pair, route_status="planned")
-    assert pair.score_decomposition["inputs"]["immune_rebalance_bias"] == pytest.approx(0.85)
-
-
 # -----------------------------------------------------------------------------
 # Score-unit normalization: coordination/equalization scores live in planner
 # units so the hold-margin EV gate and final ordering are meaningful.
@@ -3013,42 +2900,6 @@ def test_fleet_lease_owned_by_us_does_not_suppress_planner_pair(
 # -----------------------------------------------------------------------------
 
 
-
-
-
-
-# -----------------------------------------------------------------------------
-# Market pricing keeps observed-liquidity failure evidence while still
-# excluding hive bias layers.
-# -----------------------------------------------------------------------------
-
-
-def test_market_price_pair_includes_observed_liquidity_without_hive_layers(
-    mock_plugin, mock_database
-):
-    from modules.rebalance_engine_v2 import RebalanceEngine
-    from modules.rebalance_types_v2 import PairCandidate
-
-    router = MagicMock()
-    pair = PairCandidate(
-        source_channel_id="100x1x0",
-        dest_channel_id="200x1x0",
-        source_peer_id="02" + "1" * 64,
-        dest_peer_id="02" + "2" * 64,
-        amount_sats=50_000,
-        pair_budget_sats=100,
-    )
-
-    RebalanceEngine._market_price_pair(
-        router, pair, None, market_only_layers=True
-    )
-
-    kwargs = router.price_pair.call_args.kwargs
-    # No hive bias layers...
-    assert kwargs["layer_names_override"] == []
-    # ...but observed liquidity stays on: it is OUR failure evidence
-    # (avoid segments we just failed on), not a hive preference.
-    assert kwargs["include_observed_liquidity"] is True
 
 
 

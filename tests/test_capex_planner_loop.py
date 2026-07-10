@@ -20,7 +20,7 @@ def load_loop():
 def test_disabled_loop_keeps_baseline_capex_checks():
     loop = load_loop()
 
-    results = loop.run_loop(min_annual_roi_pct=1.0, hive_mode="disabled")
+    results = loop.run_loop(min_annual_roi_pct=1.0)
 
     assert len(results) == 6
     assert all(item.mode == "disabled" for item in results)

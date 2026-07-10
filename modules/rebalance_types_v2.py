@@ -67,11 +67,6 @@ class PairCandidate:
     # facts, which must yield an identical score to pre-feature behavior.
     source_activity_out_sats: int = 0
     dest_activity_in_sats: int = 0
-    hive_source_rebalance_bias: float = 1.0
-    hive_dest_rebalance_bias: float = 1.0
-    hive_hint_score_multiplier: float = 1.0
-    metabolic_rebalance_bias: float = 1.0
-    metabolic_rebalance_influence: Dict[str, Any] = field(default_factory=dict)
     route_cost_sats: Optional[int] = None
     route: Optional[List[Dict[str, Any]]] = None  # sendpay-ready route from router
     score: float = 0.0

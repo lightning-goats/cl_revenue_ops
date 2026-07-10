@@ -141,9 +141,6 @@ class RebalanceEngine:
         self._policy_manager = policy_manager
         self._capex_engine = capex_engine
         self._profitability = profitability
-        # cl-mycelium retired: no fleet hints/router. Kept as a permanent None
-        # so the (now-inert) metabolic/immune bias helpers still resolve.
-        self._hive_hints = None
         self._data_service = data_service
         self._segment_observation_store = segment_observation_store
         self.global_budget_limit_provider = global_budget_limit_provider
@@ -213,8 +210,8 @@ class RebalanceEngine:
         self._last_cycle_result: CycleResult = CycleResult()
         # Single-flight execution guard. run_cycle() (background loop) and
         # execute_candidate() (manual RPCs) mutate shared cycle state
-        # (_cycle_router, _last_cycle_result, _pair_failures, hive_router
-        # begin_cycle/end_cycle) and can otherwise pay for the same
+        # (_cycle_router, _last_cycle_result, _pair_failures) and can
+        # otherwise pay for the same
         # source->dest pair twice when they overlap. Contenders never block:
         # run_cycle() skips with a 'cycle_already_running' audit marker and
         # execute_candidate() fails fast with error='engine_busy' (same
@@ -653,26 +650,6 @@ class RebalanceEngine:
                 "dest_value_class": str(getattr(pair, "dest_value_class", "") or ""),
                 "source_budget_source": str(getattr(pair, "source_budget_source", "") or ""),
                 "dest_budget_source": str(getattr(pair, "dest_budget_source", "") or ""),
-                "hive_source_rebalance_bias": round(
-                    float(getattr(pair, "hive_source_rebalance_bias", 1.0) or 1.0),
-                    6,
-                ),
-                "hive_dest_rebalance_bias": round(
-                    float(getattr(pair, "hive_dest_rebalance_bias", 1.0) or 1.0),
-                    6,
-                ),
-                "hive_hint_score_multiplier": round(
-                    float(getattr(pair, "hive_hint_score_multiplier", 1.0) or 1.0),
-                    6,
-                ),
-                "metabolic_rebalance_bias": round(
-                    float(getattr(pair, "metabolic_rebalance_bias", 1.0) or 1.0),
-                    6,
-                ),
-                "immune_rebalance_bias": round(
-                    float(getattr(pair, "immune_rebalance_bias", 1.0) or 1.0),
-                    6,
-                ),
             },
         }
 
@@ -716,32 +693,6 @@ class RebalanceEngine:
             "dest_budget_source": str(getattr(pair, "dest_budget_source", "") or ""),
             "source_out_fee_ppm": int(getattr(pair, "source_out_fee_ppm", 0) or 0),
             "dest_out_fee_ppm": int(getattr(pair, "dest_out_fee_ppm", 0) or 0),
-            "hive_source_rebalance_bias": round(
-                float(getattr(pair, "hive_source_rebalance_bias", 1.0) or 1.0),
-                6,
-            ),
-            "hive_dest_rebalance_bias": round(
-                float(getattr(pair, "hive_dest_rebalance_bias", 1.0) or 1.0),
-                6,
-            ),
-            "hive_hint_score_multiplier": round(
-                float(getattr(pair, "hive_hint_score_multiplier", 1.0) or 1.0),
-                6,
-            ),
-            "metabolic_rebalance_bias": round(
-                float(getattr(pair, "metabolic_rebalance_bias", 1.0) or 1.0),
-                6,
-            ),
-            "metabolic_rebalance_influence": copy.deepcopy(
-                getattr(pair, "metabolic_rebalance_influence", {}) or {}
-            ),
-            "immune_rebalance_bias": round(
-                float(getattr(pair, "immune_rebalance_bias", 1.0) or 1.0),
-                6,
-            ),
-            "immune_rebalance_influence": copy.deepcopy(
-                getattr(pair, "immune_rebalance_influence", {}) or {}
-            ),
             "reason_code": pair.reason_code,
             "route_policy": getattr(
                 getattr(getattr(pair, "route_decision", None), "policy", None),
@@ -871,66 +822,8 @@ class RebalanceEngine:
             ],
             "skipped": skipped,
             "executions": executions,
-            "metabolic_rebalance_influence": self._metabolic_rebalance_debug_for_candidates(considered, selected),
-            "immune_rebalance_influence": self._immune_rebalance_debug_for_candidates(considered, selected),
         }
 
-
-    def _metabolic_rebalance_debug_for_candidates(self, considered: List[PairCandidate], selected: List[PairCandidate]) -> Dict[str, Any]:
-        influences = []
-        for pair in list(considered or []) + list(selected or []):
-            influence = getattr(pair, "metabolic_rebalance_influence", {}) or {}
-            if isinstance(influence, dict) and influence:
-                influences.append(influence)
-        reason_codes = []
-        for influence in influences:
-            for code in influence.get("reason_codes", []) or []:
-                code = str(code or "")
-                if code and code not in reason_codes:
-                    reason_codes.append(code)
-        constraints = {}
-        try:
-            getter = getattr(self._hive_hints, "get_metabolic_action_constraints", None)
-            if callable(getter):
-                constraints = getter()
-        except Exception:
-            constraints = {}
-        return {
-            "seen": any(bool(item.get("seen", False)) for item in influences),
-            "usable": any(bool(item.get("usable", False)) for item in influences),
-            "candidate_bias_applied": any(float(item.get("bias", 1.0) or 1.0) != 1.0 for item in influences),
-            "bias_capped": any(bool(item.get("bias_capped", False)) for item in influences),
-            "constraints": constraints if isinstance(constraints, dict) else {},
-            "reason_codes": reason_codes,
-        }
-
-    def _immune_rebalance_debug_for_candidates(self, considered: List[PairCandidate], selected: List[PairCandidate]) -> Dict[str, Any]:
-        influences = []
-        for pair in list(considered or []) + list(selected or []):
-            influence = getattr(pair, "immune_rebalance_influence", {}) or {}
-            if isinstance(influence, dict) and influence:
-                influences.append(influence)
-        reason_codes = []
-        for influence in influences:
-            for code in influence.get("reason_codes", []) or []:
-                code = str(code or "")
-                if code and code not in reason_codes:
-                    reason_codes.append(code)
-        constraints = {}
-        try:
-            getter = getattr(self._hive_hints, "get_immune_action_constraints", None)
-            if callable(getter):
-                constraints = getter()
-        except Exception:
-            constraints = {}
-        return {
-            "seen": any(bool(item.get("seen", False)) for item in influences),
-            "usable": any(bool(item.get("usable", False)) for item in influences),
-            "candidate_bias_applied": any(float(item.get("bias", 1.0) or 1.0) != 1.0 for item in influences),
-            "bias_capped": any(bool(item.get("bias_capped", False)) for item in influences),
-            "constraints": constraints if isinstance(constraints, dict) else {},
-            "reason_codes": reason_codes,
-        }
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
@@ -1250,7 +1143,6 @@ class RebalanceEngine:
                 "historical_sourced_fee_ppm": historical_sourced_fee_ppm,
                 "is_profitable": is_profitable,
                 "is_active": is_active,
-                "rebalance_bias": 1.0,
                 "cooldown_active": cooldown,
                 "cooldown_override": cooldown_override,
             })
@@ -1336,8 +1228,6 @@ class RebalanceEngine:
             pair_fee_cap_ppm=pair_fee_cap_ppm,
         )
 
-        # cl-mycelium retired: no coordination overlay, fleet equalization
-        # fallback, or route-segment leases. The planner's own selection stands.
         plan = planner.plan(snapshot)
 
         # P4-008: in-flight-destination guard. Drop any selected pair whose
@@ -1393,8 +1283,6 @@ class RebalanceEngine:
 
         for pair in plan.selected:
             self._route_decision_for_pair(pair)
-            self._apply_metabolic_rebalance_bias(pair)
-            self._apply_immune_rebalance_bias(pair)
             self._update_pair_score_decomposition(pair, route_status="planned")
         priority_rank = {
             RoutePriority.EV_POSITIVE: 2,
@@ -1691,116 +1579,6 @@ class RebalanceEngine:
         return decision
 
 
-    def _apply_metabolic_rebalance_bias(self, pair: PairCandidate) -> None:
-        """Apply fresh, scoped metabolic influence as a bounded score modifier."""
-        hive_hints = self._hive_hints
-        if hive_hints is None:
-            return
-        try:
-            getter = getattr(hive_hints, "get_metabolic_rebalance_bias", None)
-            if not callable(getter):
-                return
-            raw_bias = float(getter(pair.source_peer_id, pair.dest_peer_id))
-            bias = max(0.85, min(1.15, raw_bias))
-            pair.metabolic_rebalance_bias = bias
-            influence = {
-                "seen": False,
-                "usable": bias != 1.0,
-                "bias": bias,
-                "bias_capped": abs(raw_bias - bias) > 1e-9,
-                "reason_codes": [],
-            }
-            peer_getter = getattr(hive_hints, "get_metabolic_peer_effect", None)
-            if callable(peer_getter):
-                reason_codes = []
-                capped = influence["bias_capped"]
-                seen = False
-                usable = False
-                for peer_id in (pair.source_peer_id, pair.dest_peer_id):
-                    effect = peer_getter(peer_id)
-                    if not isinstance(effect, dict):
-                        continue
-                    seen = seen or bool(effect)
-                    usable = usable or bool(effect.get("usable", False))
-                    capped = capped or bool(effect.get("bias_capped", False))
-                    for code in effect.get("reason_codes", []) or []:
-                        code = str(code or "")
-                        if code and code not in reason_codes:
-                            reason_codes.append(code)
-                influence.update({
-                    "seen": seen,
-                    "usable": usable and bias != 1.0,
-                    "bias_capped": capped,
-                    "reason_codes": reason_codes,
-                })
-            pair.metabolic_rebalance_influence = influence
-            pair.score = float(getattr(pair, "score", 0.0) or 0.0) * bias
-        except Exception:
-            pair.metabolic_rebalance_bias = 1.0
-            pair.metabolic_rebalance_influence = {
-                "seen": False,
-                "usable": False,
-                "bias": 1.0,
-                "bias_capped": False,
-                "reason_codes": [],
-                "reason": "error",
-            }
-
-    def _apply_immune_rebalance_bias(self, pair: PairCandidate) -> None:
-        """Apply fresh, scoped immune influence as a bounded score modifier."""
-        hive_hints = self._hive_hints
-        if hive_hints is None:
-            return
-        try:
-            getter = getattr(hive_hints, "get_immune_rebalance_bias", None)
-            if not callable(getter):
-                return
-            raw_bias = float(getter(pair.source_peer_id, pair.dest_peer_id))
-            bias = max(0.85, min(1.15, raw_bias))
-            pair.immune_rebalance_bias = bias
-            influence = {
-                "seen": False,
-                "usable": bias != 1.0,
-                "bias": bias,
-                "bias_capped": abs(raw_bias - bias) > 1e-9,
-                "reason_codes": [],
-            }
-            peer_getter = getattr(hive_hints, "get_immune_peer_effect", None)
-            if callable(peer_getter):
-                reason_codes = []
-                capped = influence["bias_capped"]
-                seen = False
-                usable = False
-                for peer_id in (pair.source_peer_id, pair.dest_peer_id):
-                    effect = peer_getter(peer_id)
-                    if not isinstance(effect, dict):
-                        continue
-                    seen = seen or bool(effect)
-                    usable = usable or bool(effect.get("usable", False))
-                    capped = capped or bool(effect.get("bias_capped", False))
-                    for code in effect.get("reason_codes", []) or []:
-                        code = str(code or "")
-                        if code and code not in reason_codes:
-                            reason_codes.append(code)
-                influence.update({
-                    "seen": seen,
-                    "usable": usable and bias != 1.0,
-                    "bias_capped": capped,
-                    "reason_codes": reason_codes,
-                })
-            pair.immune_rebalance_influence = influence
-            pair.score = float(getattr(pair, "score", 0.0) or 0.0) * bias
-        except Exception:
-            pair.immune_rebalance_bias = 1.0
-            pair.immune_rebalance_influence = {
-                "seen": False,
-                "usable": False,
-                "bias": 1.0,
-                "bias_capped": False,
-                "reason_codes": [],
-                "reason": "error",
-            }
-
     @staticmethod
     def _market_price_pair(
         router: Any,
@@ -1818,16 +1596,7 @@ class RebalanceEngine:
             "exclude": exclude,
         }
         if market_only_layers:
-            # Exclude hive bias layers, but keep the observed-liquidity
-            # layer: it carries OUR OWN failure evidence (avoid segments we
-            # just failed on), not hive preference, and dropping it lets
-            # market pricing re-propose routes through known-bad segments.
-            kwargs.update(
-                {
-                    "layer_names_override": [],
-                    "include_observed_liquidity": True,
-                }
-            )
+            kwargs.update({"layer_names_override": []})
         try:
             return router.price_pair(**kwargs)
         except TypeError as exc:
@@ -1836,12 +1605,10 @@ class RebalanceEngine:
             message = str(exc)
             if (
                 "layer_names_override" not in message
-                and "include_observed_liquidity" not in message
                 and "unexpected keyword" not in message
             ):
                 raise
             kwargs.pop("layer_names_override", None)
-            kwargs.pop("include_observed_liquidity", None)
             return router.price_pair(**kwargs)
 
     @staticmethod
@@ -1856,8 +1623,7 @@ class RebalanceEngine:
         router: Any,
         exclude: Optional[List[str]],
     ):
-        # cl-mycelium retired: no fleet routing — every pair prices on the open
-        # market via askrene, exactly the live path.
+        # Every pair prices on the open market via askrene.
         return self._market_price_pair(
             router,
             pair,

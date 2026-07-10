@@ -170,7 +170,6 @@ def test_total_cost_budget_status_uses_dynamic_growth_budget_when_enabled():
         growth_budget_max_extra_sats=2_000,
         growth_budget_hard_ceiling_sats=10_000,
     )
-    mod.hive_hints = None
 
     db = MagicMock()
     db.cleanup_stale_spend_reservations.return_value = 0
@@ -210,44 +209,3 @@ def test_total_cost_budget_status_uses_dynamic_growth_budget_when_enabled():
 
 
 
-def test_total_cost_budget_status_uses_bounded_fleet_growth_prior():
-    mod = load_plugin_module()
-    mod.plugin.log = MagicMock()
-    mod.config = Config(
-        daily_budget_sats=1_000,
-        growth_budget_enabled=True,
-        growth_budget_earned_fraction=0.25,
-        growth_budget_experiment_fraction=0.10,
-        growth_budget_max_extra_sats=2_000,
-        growth_budget_hard_ceiling_sats=10_000,
-    )
-    mod.hive_hints = MagicMock()
-    mod.hive_hints.get_growth_spend_prior.return_value = {
-        "usable": True,
-        "beneficial_ratio": 0.80,
-        "sample_count": 8,
-        "advisory_only": True,
-    }
-
-    db = MagicMock()
-    db.cleanup_stale_spend_reservations.return_value = 0
-    db.get_spend_ledger_summary.return_value = {
-        "spent_24h_sats": 0,
-        "reserved_24h_sats": 0,
-        "spent_by_category": {},
-        "reserved_by_category": {},
-    }
-    db.get_total_routing_revenue.return_value = 6_000_000
-    db.get_opening_costs_since.return_value = 10
-    db.get_closure_costs_since.return_value = 20
-    db.get_cost_evidence_coverage.return_value = {"covered_hours": 24, "coverage_status": "complete"}
-    mod.database = db
-    mod._rebalance_liquidity_cost_components = MagicMock(return_value={"spent_24h_sats": 200, "reserved_24h_sats": 50})
-    mod._boltz_liquidity_cost_components = MagicMock(return_value={"spent_24h_sats": 100, "reserved_24h_sats": 25})
-
-    status = mod._compute_total_cost_budget_status(24)
-
-    assert status["growth_budget"]["fleet_prior"]["used"] is True
-    assert status["growth_budget"]["growth_credit_sats"] == 567
-    assert status["effective_budget_sats"] == 2_984
-    mod.hive_hints.get_growth_spend_prior.assert_called_once_with(action_type="rebalance")

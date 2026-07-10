@@ -97,7 +97,7 @@ def test_ordering_invariants_hold_across_signal_grid():
 def test_inverted_caller_bases_rejected_by_plan_build():
     """Caller bases where max tuning could overlap the bands are refused:
     low_trigger + 20 (max boost) >= high_trigger - 15 (max cut)."""
-    mod = _make_planner_module(hive_hints=None)
+    mod = _make_planner_module()
 
     plan = mod._build_boltz_balance_plan(
         require_profitable=False,
@@ -110,7 +110,7 @@ def test_inverted_caller_bases_rejected_by_plan_build():
 
 
 def test_default_caller_bases_accepted():
-    mod = _make_planner_module(hive_hints=None)
+    mod = _make_planner_module()
 
     plan = mod._build_boltz_balance_plan(require_profitable=False)
 

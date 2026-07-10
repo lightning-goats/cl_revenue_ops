@@ -43,7 +43,6 @@ def _make_loser(scid="800000x1x0", peer_id="02" + "a" * 64, marginal_roi=-5.0,
         "action": action,
         "reason": reason,
         "is_hard_bleeder": False,
-        "hive_closure_flagged": False,
         "regime_change": False,
         "opener": "local",
     }

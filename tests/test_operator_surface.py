@@ -62,7 +62,6 @@ def test_public_runtime_keys_are_safety_only():
         "lnplus_pending_timeout_days",
         "lnplus_inbound_credit_factor",
         "lnplus_watcher_interval",
-        "hive_zero_fee_stale_grace_seconds",
     ]
 
 
@@ -72,7 +71,6 @@ def test_internal_knobs_are_not_public():
     assert "enable_vegas_reflex" not in cfg.public_runtime_keys()
     assert "thompson_prior_std_fee" not in cfg.public_runtime_keys()
     assert "askrene_layers" not in cfg.public_runtime_keys()
-    assert "hive_hints_enabled" not in cfg.public_runtime_keys()
 
 
 def test_public_runtime_dict_returns_only_public_keys():
@@ -127,7 +125,6 @@ def test_public_runtime_dict_returns_only_public_keys():
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
         "lnplus_watcher_interval": 3600,
-        "hive_zero_fee_stale_grace_seconds": 604800,
     }
 
 
@@ -137,7 +134,6 @@ def test_runtime_key_classification_distinguishes_public_deprecated_and_internal
     assert cfg.classify_runtime_key("paused") == "public"
     assert cfg.classify_runtime_key("enable_vegas_reflex") == "internal"
     assert cfg.classify_runtime_key("askrene_layers") == "internal"
-    assert cfg.classify_runtime_key("hive_hints_enabled") == "internal"
     assert cfg.classify_runtime_key("dry_run") == "internal"
 
 
@@ -393,155 +389,6 @@ def test_init_logs_native_route_rebalancing(monkeypatch):
     assert not any("getroute + sendpay" in message for message in messages)
 
 
-def test_revenue_rebalance_debug_reports_segment_hint_influence():
-    mod = load_plugin_module()
-    mod.config = Config()
-    mod.data_service = MagicMock()
-    mod.data_service.get_funds.return_value = {"outputs": [], "channels": []}
-    mod.database = MagicMock()
-    mod.database.get_daily_rebalance_spend.return_value = {
-        "total_spent_sats": 0,
-        "total_reserved_sats": 0,
-        "stale_reservations": 0,
-        "job_count": 0,
-        "success_count": 0,
-        "success_rate": 0.0,
-    }
-    mod.database.get_all_channel_states.return_value = []
-    mod._total_cost_budget_status = MagicMock(
-        return_value={
-            "effective_budget_sats": 1000,
-            "remaining_sats": 1000,
-            "actual_spent_by_category": {},
-            "reserved_by_category": {},
-        }
-    )
-    mod._boltz_liquidity_cost_components = MagicMock(
-        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
-    )
-    mod.rebalancer = SimpleNamespace(
-        _get_channels_with_balances=lambda: {},
-        job_manager=SimpleNamespace(active_channels=set()),
-    )
-    mod.hive_hints = MagicMock()
-    mod.hive_hints.get_status.return_value = {
-        "snapshot_fresh": True,
-        "snapshot_age_seconds": 10,
-        "hints_count": 2,
-    }
-    mod.hive_hints.get_segment_scores.return_value = [
-        {
-            "short_channel_id": "123x1x0",
-            "direction": 1,
-            "amount_bucket_sats": 250_000,
-            "success_score": 0.0,
-            "failure_score": 0.7,
-            "net_utility": -0.7,
-            "confidence": 0.8,
-            "observer_count": 2,
-            "last_observed_at": 1_700_000_000,
-        }
-    ]
-
-    result = mod.revenue_rebalance_debug(mod.plugin)
-
-    mod.hive_hints.poll.assert_called_once()
-    assert result["hive_hints"]["status_refresh_attempted"] is True
-    assert result["hive_hints"]["status_refresh_ok"] is True
-    assert result["hive_hints"]["segment_scores_count"] == 1
-    assert result["hive_hints"]["segment_scores"][0]["short_channel_id"] == "123x1x0"
-
-
-def test_revenue_rebalance_debug_exposes_hive_hint_refresh_diagnostics():
-    mod = load_plugin_module()
-    mod.config = Config()
-    mod.data_service = MagicMock()
-    mod.data_service.get_funds.return_value = {"outputs": [], "channels": []}
-    mod.database = MagicMock()
-    mod.database.get_daily_rebalance_spend.return_value = {
-        "total_spent_sats": 0,
-        "total_reserved_sats": 0,
-        "stale_reservations": 0,
-        "job_count": 0,
-        "success_count": 0,
-        "success_rate": 0.0,
-    }
-    mod.database.get_all_channel_states.return_value = []
-    mod._total_cost_budget_status = MagicMock(
-        return_value={
-            "effective_budget_sats": 1000,
-            "remaining_sats": 1000,
-            "actual_spent_by_category": {},
-            "reserved_by_category": {},
-        }
-    )
-    mod._boltz_liquidity_cost_components = MagicMock(
-        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
-    )
-    mod.rebalancer = SimpleNamespace(
-        _get_channels_with_balances=lambda: {},
-        job_manager=SimpleNamespace(active_channels=set()),
-    )
-    mod.hive_hints = MagicMock()
-    mod.hive_hints.refresh_status_for_debug.return_value = {
-        "refresh_needed": True,
-        "refresh_attempted": True,
-        "refresh_result": "refreshed_from_datastore",
-        "cache": {
-            "source": "hive_export_rpc",
-            "age_seconds": 391,
-            "effective_ttl_seconds": 300,
-            "usable": False,
-        },
-        "cache_after_refresh": {
-            "source": "datastore",
-            "age_seconds": 5,
-            "effective_ttl_seconds": 300,
-            "usable": True,
-        },
-        "live_datastore": {
-            "queried": True,
-            "generation": 5915,
-            "age_seconds": 5,
-            "ttl_seconds": 300,
-            "usable": True,
-        },
-        "live_hive_export": {
-            "queried": False,
-            "usable": False,
-        },
-        "fallback": {
-            "needed": False,
-            "reason": "",
-            "used": False,
-            "used_source": "",
-            "stale_fallback_used": False,
-        },
-    }
-    mod.hive_hints.get_status.return_value = {
-        "snapshot_fresh": True,
-        "snapshot_usable": True,
-        "snapshot_age_seconds": 5,
-        "hints_count": 2,
-    }
-    mod.hive_hints.get_segment_scores.return_value = []
-
-    result = mod.revenue_rebalance_debug(mod.plugin)
-
-    mod.hive_hints.refresh_status_for_debug.assert_called_once()
-    mod.hive_hints.poll.assert_not_called()
-    hive_status = result["hive_hints"]
-    assert hive_status["status_refresh_needed"] is True
-    assert hive_status["status_refresh_attempted"] is True
-    assert hive_status["status_refresh_result"] == "refreshed_from_datastore"
-    assert hive_status["cache"]["age_seconds"] == 391
-    assert hive_status["cache"]["source"] == "hive_export_rpc"
-    assert hive_status["cache_after_refresh"]["source"] == "datastore"
-    assert hive_status["live_datastore"]["generation"] == 5915
-    assert hive_status["live_hive_export"]["queried"] is False
-    assert hive_status["fallback"]["needed"] is False
-
-
 def test_revenue_rebalance_debug_includes_last_cycle_score_breakdown():
     mod = load_plugin_module()
     mod.config = Config()
@@ -613,14 +460,6 @@ def test_revenue_rebalance_debug_includes_last_cycle_score_breakdown():
             get_last_cycle_debug=lambda max_candidates=10: engine_debug
         ),
     )
-    mod.hive_hints = MagicMock()
-    mod.hive_hints.get_status.return_value = {
-        "snapshot_fresh": True,
-        "snapshot_age_seconds": 5,
-        "hints_count": 0,
-    }
-    mod.hive_hints.get_segment_scores.return_value = []
-
     result = mod.revenue_rebalance_debug(mod.plugin)
 
     assert result["last_decision"]["reason"] == "no_rebalance_candidates"
@@ -631,32 +470,12 @@ def test_revenue_rebalance_debug_includes_last_cycle_score_breakdown():
     )
 
 
-def test_hive_hint_plugin_options_are_registered():
-    mod = load_plugin_module()
-
-    assert mod.plugin.options["revenue-ops-hive-hints-enabled"]["default"] == "true"
-    assert mod.plugin.options["revenue-ops-hive-hints-ttl"]["default"] == "0"
-    assert mod.plugin.options["revenue-ops-hive-hints-allow-all-hints-m2-scope"]["default"] == "false"
-
-
-def test_hive_hint_all_hints_lab_scope_option_is_parsed_during_init(monkeypatch):
-    mod = load_plugin_module()
-    cfg = _run_init_with_stubbed_dependencies(
-        mod,
-        monkeypatch,
-        {"revenue-ops-hive-hints-allow-all-hints-m2-scope": "true"},
-    )
-
-    assert cfg.hive_hints_allow_all_hints_m2_scope is True
-
-
 def test_rebalance_tuning_plugin_options_are_dynamic():
     mod = load_plugin_module()
 
     for option in (
         "revenue-ops-rebalance-hold-margin",
         "revenue-ops-pair-fee-cap-ppm",
-        "revenue-ops-hive-rebalance-bootstrap-budget-sats",
     ):
         assert mod.plugin.options[option]["dynamic"] is True
         assert mod.plugin.options[option]["on_change"] is mod._on_rebalance_tuning_change
@@ -667,7 +486,6 @@ def test_rebalance_tuning_setconfig_updates_live_config():
     mod.config = SimpleNamespace(
         rebalance_hold_margin=0.0,
         pair_fee_cap_ppm=1000,
-        hive_rebalance_bootstrap_budget_sats=300,
     )
 
     mod._on_rebalance_tuning_change(
@@ -680,15 +498,9 @@ def test_rebalance_tuning_setconfig_updates_live_config():
         "revenue-ops-pair-fee-cap-ppm",
         "750",
     )
-    mod._on_rebalance_tuning_change(
-        mod.plugin,
-        "revenue-ops-hive-rebalance-bootstrap-budget-sats",
-        "125",
-    )
 
     assert mod.config.rebalance_hold_margin == 0.25
     assert mod.config.pair_fee_cap_ppm == 750
-    assert mod.config.hive_rebalance_bootstrap_budget_sats == 125
 
 
 def test_rebalance_tuning_setconfig_rejects_out_of_range_values():
@@ -704,12 +516,11 @@ def test_rebalance_tuning_setconfig_rejects_out_of_range_values():
         )
 
 
-def test_askrene_layer_option_defaults_to_hive_fleet_bias():
+def test_askrene_layer_option_defaults_to_standalone():
     mod = load_plugin_module()
 
-    assert mod.plugin.options["revenue-ops-askrene-layers"]["default"] == "hive-fleet"
+    assert mod.plugin.options["revenue-ops-askrene-layers"]["default"] == "standalone"
     assert "askrene getroutes" in mod.plugin.options["revenue-ops-rebalance-router"]["description"]
-    assert "cl-hive bias" in mod.plugin.options["revenue-ops-askrene-layers"]["description"]
     assert "standalone" in mod.plugin.options["revenue-ops-askrene-layers"]["description"]
 
 
@@ -737,7 +548,6 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "growth_budget_experiment_fraction",
         "growth_budget_hard_ceiling_sats",
         "growth_budget_max_extra_sats",
-        "hive_zero_fee_stale_grace_seconds",
         "htlcmax_balanced_pct",
         "htlcmax_sink_pct",
         "htlcmax_source_pct",
@@ -769,7 +579,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_target",
         "weekly_budget_sats",
     ]
-    assert result["count"] == 49
+    assert result["count"] == 48
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -826,7 +636,6 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
         "lnplus_watcher_interval": 3600,
-        "hive_zero_fee_stale_grace_seconds": 604800,
     }
 
 
@@ -1202,7 +1011,7 @@ def test_total_cost_budget_coverage_unknown_on_garbage_payload():
 
 def test_total_cost_budget_reports_measured_partial_coverage():
     """Coverage fields must reflect the measured evidence span, not the
-    requested window (cl-hive reads covered_hours numerically)."""
+    requested window (external consumers read covered_hours numerically)."""
     mod = _total_cost_budget_module_with_stub_components()
     mod.database.get_cost_evidence_coverage.return_value = {
         "covered_hours": 3.0,
@@ -1308,7 +1117,6 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "lnplus_pending_timeout_days": 7,
         "lnplus_inbound_credit_factor": 0.5,
         "lnplus_watcher_interval": 3600,
-        "hive_zero_fee_stale_grace_seconds": 604800,
     }
     assert "config" not in result
     assert "hive_hints" not in result

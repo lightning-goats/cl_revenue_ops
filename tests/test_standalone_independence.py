@@ -43,11 +43,9 @@ def _assert_no_action_rpc(fake_rpc: MagicMock) -> None:
     assert forbidden == set()
 
 
-def _load_standalone_rpc_module(hive_hints=None):
+def _load_standalone_rpc_module():
     mod = load_plugin_module()
     mod.config = Config(paused=True)
-    mod.hive_hints = hive_hints
-    mod.hive_router = None
     mod.safe_plugin = SimpleNamespace(rpc=MagicMock())
     mod.data_service = MagicMock()
     mod.data_service.get_funds.return_value = {"outputs": [], "channels": []}
@@ -106,21 +104,17 @@ def _load_standalone_rpc_module(hive_hints=None):
     return mod
 
 
-def test_read_only_rpc_surfaces_return_json_without_hive_adapter():
-    mod = _load_standalone_rpc_module(hive_hints=None)
+def test_read_only_rpc_surfaces_return_json_standalone():
+    mod = _load_standalone_rpc_module()
 
     payloads = [
         mod.revenue_status(mod.plugin),
         mod.revenue_fee_debug(mod.plugin),
         mod.revenue_rebalance_debug(mod.plugin),
-        mod.revenue_hive_hints_status(mod.plugin),
     ]
 
     for payload in payloads:
         _assert_jsonable(payload)
         assert isinstance(payload, dict)
-    assert payloads[-1]["snapshot_usable"] is False
-    assert payloads[-1]["hints_count"] == 0
-    assert payloads[-1]["diagnostics_version"] == "standalone-hints-v1"
 
 

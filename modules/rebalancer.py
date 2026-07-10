@@ -126,12 +126,6 @@ class RebalanceCandidate:
     # Optional for backward compatibility; when absent, callers may fall back to primary_source_peer_id.
     source_candidate_peer_ids: List[str] = field(default_factory=list)
 
-    # Hive route discovery: if askrene found a cheap fleet route, store hop count
-    # for RebalanceEngineV2 fleet-aware routing.
-    hive_route_hops: int = 0
-    # True if destination peer is a hive member — enables zero-fee return hop
-    dest_is_hive_member: bool = False
-
     # Backwards compatibility property
     @property
     def from_channel(self) -> str:
@@ -506,9 +500,9 @@ class EVRebalancer:
             "campaign_goal_type": "growth_spend_learning",
             "campaign_target_peer_or_corridor": outcome_details.get("destination_peer_id") or outcome_details.get("sink_scid") or "",
         }
-        # cl-mycelium retired (2026-07-09): growth-spend outcomes were reported
-        # to the fleet coordinator, which no longer exists. No-op in standalone.
-        del payload  # built above; nothing consumes it in standalone mode
+        # cl-mycelium retired (2026-07-09): growth-spend outcomes were
+        # reported to a fleet coordinator that no longer exists.
+        del payload  # built above; nothing consumes it any more
 
 
     @staticmethod
@@ -703,12 +697,7 @@ class EVRebalancer:
         candidates = []
         # Early-suppression paths (no slots / capital controls) deliberately
         # do NOT report liquidity state: no engine snapshot exists on those
-        # paths, and the consumer (cl-hive's record_member_liquidity_report)
-        # overwrites depleted/saturated wholesale — partial updates are not
-        # supported — so writing hardcoded-empty lists with a fresh timestamp
-        # would clobber the last REAL state under sustained suppression.
-        # Skipping lets the previous real payload stand until the
-        # coordinator's TTL ages it out, which is honest. The NORMAL path
+        # paths. The NORMAL path
         # reports REAL state derived from the engine cycle snapshot via
         # _report_liquidity_state_from_cycle.
 
@@ -995,7 +984,6 @@ class EVRebalancer:
         Prioritizes historical actual costs over heuristics.
 
         Priority order:
-        0. Hive member - direct channel, 0 fee
         1. Historical data (high confidence) - Use median, most accurate
         2. Historical data (medium) - Blend with last-hop fee
         3. Historical data (low) - Use with buffer
@@ -1119,10 +1107,9 @@ class EVRebalancer:
         Uses memoization via self._fee_cache to avoid repeated lookups
         within a single find_rebalance_candidates run.
         """
-        # Always use actual peer channel fees, even for fleet members.
-        # cl-hive intends 0 fee but gossip propagation is asynchronous —
-        # the real fee may still be non-zero. Using the actual fee gives
-        # accurate budget estimates and avoids WIRE_FEE_INSUFFICIENT.
+        # Always use actual peer channel fees: gossip propagation is
+        # asynchronous, so the real fee gives accurate budget estimates
+        # and avoids WIRE_FEE_INSUFFICIENT.
 
         # Check cache first (memoization for this run)
         cache_key = (peer_id, int(amount_msat or 0))

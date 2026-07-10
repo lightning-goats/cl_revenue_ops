@@ -10,14 +10,14 @@ from unittest.mock import MagicMock
 
 def test_parse_layer_names_splits_csv():
     from modules.rebalance_router_v3 import _parse_layer_names
-    assert _parse_layer_names("hive-fleet") == ["hive-fleet"]
-    assert _parse_layer_names("hive-fleet,hive-reputation") == [
-        "hive-fleet",
-        "hive-reputation",
+    assert _parse_layer_names("layer-a") == ["layer-a"]
+    assert _parse_layer_names("layer-a,layer-b") == [
+        "layer-a",
+        "layer-b",
     ]
-    assert _parse_layer_names("hive-fleet, hive-reputation ") == [
-        "hive-fleet",
-        "hive-reputation",
+    assert _parse_layer_names("layer-a, layer-b ") == [
+        "layer-a",
+        "layer-b",
     ]
 
 
@@ -63,7 +63,7 @@ def test_v3_router_records_found_and_missing_layers():
     plugin = MagicMock()
     plugin.rpc.call.return_value = {
         "layers": [
-            {"layer": "hive-fleet"},
+            {"layer": "layer-a"},
             {"layer": "revenue-local"},
         ]
     }
@@ -71,14 +71,14 @@ def test_v3_router_records_found_and_missing_layers():
     r = RebalanceRouterV3(
         plugin=plugin,
         our_node_id="03" + "a" * 64,
-        layer_names=["hive-fleet", "hive-reputation"],
+        layer_names=["layer-a", "layer-b"],
         log=lambda m, l: logs.append((l, m)),
     )
-    assert "hive-fleet" in r.found_layers
-    assert "hive-reputation" not in r.found_layers
+    assert "layer-a" in r.found_layers
+    assert "layer-b" not in r.found_layers
     log_text = " ".join(m for _, m in logs)
-    assert "hive-fleet" in log_text
-    assert "hive-reputation" in log_text
+    assert "layer-a" in log_text
+    assert "layer-b" in log_text
 
 
 def test_v3_router_empty_layer_override_logs_debug_not_info():
@@ -89,7 +89,7 @@ def test_v3_router_empty_layer_override_logs_debug_not_info():
     r = RebalanceRouterV3(
         plugin=plugin,
         our_node_id="03" + "a" * 64,
-        layer_names=["hive-fleet"],
+        layer_names=["layer-a"],
         log=lambda m, l: logs.append((l, m)),
     )
 
@@ -100,80 +100,12 @@ def test_v3_router_empty_layer_override_logs_debug_not_info():
     assert not any(level == "info" and "requested layers=[] found=[]" in msg for level, msg in logs)
 
 
-def test_v3_router_includes_live_observed_liquidity_layer_when_present():
-    plugin = MagicMock()
-    data_service = MagicMock()
-    data_service.get_askrene_layers.return_value = {
-        "layers": [
-            {"layer": "hive-fleet"},
-            {"layer": "hive-observed-liquidity"},
-        ]
-    }
-    data_service.get_peer_channels.return_value = {"channels": []}
-    data_service.get_configs.return_value = {
-        "configs": {"cltv-final": {"value_int": 18}}
-    }
-    def get_channels(**kwargs):
-        if kwargs.get("short_channel_id"):
-            return {
-                "channels": [{
-                    "source": SRC_PEER,
-                    "destination": "03" + "x" * 64,
-                    "short_channel_id": kwargs["short_channel_id"],
-                    "fee_per_millionth": 0,
-                    "base_fee_millisatoshi": 0,
-                    "delay": 0,
-                }]
-            }
-        return {
-            "channels": [
-                {
-                    "source": DST_PEER,
-                    "destination": OUR_ID,
-                    "short_channel_id": "200x1x0",
-                    "fee_per_millionth": 0,
-                    "delay": 40,
-                }
-            ]
-        }
-
-    data_service.get_channels.side_effect = get_channels
-    data_service.get_routes.return_value = {
-        "probability_ppm": 990000,
-        "routes": [
-            {
-                "probability_ppm": 990000,
-                "amount_msat": 100000000,
-                "path": _clean_middle_path_peer_A_to_peer_B(),
-            }
-        ],
-    }
-
-    router = _make_v3_router(
-        plugin,
-        layer_names=("hive-fleet",),
-        data_service=data_service,
-    )
-
-    result = router.price_pair(
-        source_channel_id="100x1x0",
-        dest_channel_id="200x1x0",
-        source_peer_id=SRC_PEER,
-        dest_peer_id=DST_PEER,
-        amount_sats=100_000,
-    )
-
-    assert result.success is True
-    assert "hive-observed-liquidity" in data_service.get_routes.call_args.kwargs["layers"]
-
-
 def test_v3_router_layer_override_can_force_market_only_layers():
     plugin = MagicMock()
     data_service = MagicMock()
     data_service.get_askrene_layers.return_value = {
         "layers": [
-            {"layer": "hive-fleet"},
-            {"layer": "hive-observed-liquidity"},
+            {"layer": "operator-layer"},
         ]
     }
     data_service.get_peer_channels.return_value = {"channels": []}
@@ -219,7 +151,7 @@ def test_v3_router_layer_override_can_force_market_only_layers():
 
     router = _make_v3_router(
         plugin,
-        layer_names=("hive-fleet",),
+        layer_names=("operator-layer",),
         data_service=data_service,
     )
 
@@ -230,13 +162,11 @@ def test_v3_router_layer_override_can_force_market_only_layers():
         dest_peer_id=DST_PEER,
         amount_sats=100_000,
         layer_names_override=[],
-        include_observed_liquidity=False,
     )
 
     assert result.success is True
     layers = data_service.get_routes.call_args.kwargs["layers"]
-    assert "hive-fleet" not in layers
-    assert "hive-observed-liquidity" not in layers
+    assert "operator-layer" not in layers
     assert "auto.no_mpp_support" in layers
     assert any(layer.startswith("rebalance-exclude-") for layer in layers)
 
@@ -250,7 +180,7 @@ def test_v3_router_handles_askrene_listlayers_failure():
     r = RebalanceRouterV3(
         plugin=plugin,
         our_node_id="03" + "a" * 64,
-        layer_names=["hive-fleet"],
+        layer_names=["layer-a"],
         log=lambda m, l: logs.append((l, m)),
     )
     assert r.found_layers == []
@@ -1068,7 +998,7 @@ def test_replay_direct_pair_fixture_is_rejected_as_loop():
     r = RebalanceRouterV3(
         plugin=plugin,
         our_node_id="0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3",
-        layer_names=["hive-fleet"],
+        layer_names=["layer-a"],
         log=lambda m, l: None,
     )
     result = r.price_pair(
@@ -1119,7 +1049,7 @@ def test_replay_multi_hop_fixture_succeeds():
     r = RebalanceRouterV3(
         plugin=plugin,
         our_node_id="0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3",
-        layer_names=["hive-fleet"],
+        layer_names=["layer-a"],
         log=lambda m, l: None,
     )
     result = r.price_pair(

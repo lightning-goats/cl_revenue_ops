@@ -1,8 +1,8 @@
 """
 rebalance_router_v3 — Askrene-based route discovery and pricing.
 
-Uses CLN's `getroutes` (askrene plugin, added v24.08) with layer-based
-biasing from cl-hive, plus per-retry throwaway exclude layers (added v24.11).
+Uses CLN's `getroutes` (askrene plugin, added v24.08) with layer support,
+plus per-retry throwaway exclude layers (added v24.11).
 
 Interface contract matches rebalance_router_v2.RebalanceRouter: the planner
 calls price_pair(...) and receives a RouteResult with the same shape. The
@@ -51,15 +51,12 @@ ASKRENE_STANDALONE_LAYER_VALUES = frozenset({
     "false",
     "0",
 })
-OBSERVED_LIQUIDITY_LAYER = "hive-observed-liquidity"
-
-
 def _configured_layer_names(raw: Any) -> List[str]:
     """Normalize operator config into requested askrene layer names.
 
     Blank config values are treated as "use the safe default" rather than
-    "disable every configured layer". Use an explicit standalone sentinel to
-    run without cl-hive bias.
+    "disable every configured layer". The standalone sentinel values run
+    with no configured layers.
     """
     text = "" if raw is None else str(raw).strip()
     if not text:
@@ -195,7 +192,7 @@ class RebalanceRouterV3:
         self.log = log
         self.data_service = data_service
         # Cycle-scoped cache of live askrene layer names. Thread-local (same
-        # pattern as RebalanceHiveRouter) so a manual pricing call on an RPC
+        # pattern) so a manual pricing call on an RPC
         # thread can never serve or clobber the background cycle's cache.
         # When no cycle is active behavior is unchanged: every price_pair
         # re-probes askrene-listlayers.
@@ -308,21 +305,13 @@ class RebalanceRouterV3:
             return []
 
         requested = list(self.layer_names if layer_names is None else layer_names)
-        if (
-            include_observed_liquidity
-            and
-            OBSERVED_LIQUIDITY_LAYER in live_names
-            and OBSERVED_LIQUIDITY_LAYER not in requested
-        ):
-            requested.append(OBSERVED_LIQUIDITY_LAYER)
-
         found = [name for name in requested if name in live_names]
         missing = [name for name in requested if name not in live_names]
 
         msg = f"[router-v3] requested layers={requested} found={found}"
         if missing:
             msg += f" missing={missing}"
-        # price_pair re-probes layers on every route attempt so hive layers can
+        # price_pair re-probes layers on every route attempt so new layers can
         # appear without restarting the plugin. Healthy probes, including the
         # explicit market-only override requested=[], should not spam operator
         # logs at info level.
@@ -343,7 +332,6 @@ class RebalanceRouterV3:
         exclude: Optional[List[str]] = None,
         *,
         layer_names_override: Optional[List[str]] = None,
-        include_observed_liquidity: bool = True,
     ) -> RouteResult:
         """Discover and price a circular rebalance route via askrene getroutes.
 
@@ -378,14 +366,9 @@ class RebalanceRouterV3:
         )
 
         route_amount_msat = (amount_sats + final_hop_fee_sats) * 1000
-        # Re-probe live layers each call so cl-hive layers created after
-        # engine startup are picked up without a plugin restart.
-        layers = list(
-            self._probe_layers(
-                layer_names_override,
-                include_observed_liquidity=include_observed_liquidity,
-            )
-        )
+        # Re-probe live layers each call so layers created after engine
+        # startup are picked up without a plugin restart.
+        layers = list(self._probe_layers(layer_names_override))
         if "auto.no_mpp_support" not in layers:
             layers.append("auto.no_mpp_support")
         # The middle askrene query is source_peer -> dest_peer. If we leave

@@ -240,19 +240,6 @@ def test_segment_observations_producer_payload_matches_contract_and_stale_behavi
     assert observation["confidence"] == 1.0
 
 
-def test_cl_revenue_ops_contract_surfaces_run_without_hive_adapter():
-    mod = load_plugin_module()
-    mod.hive_hints = None
-    mod.hive_router = None
-
-    status = mod.revenue_hive_hints_status(mod.plugin)
-
-    _jsonable(status)
-    assert status["diagnostics_version"] == "standalone-hints-v1"
-    assert status["snapshot_usable"] is False
-    assert status["hints_count"] == 0
-
-
 def test_metabolic_influence_contract_is_documented_as_bounded_advisory_input():
     metabolic = Path("docs/contracts/METABOLIC_INFLUENCE_CONTRACT.md").read_text()
     hive = Path("docs/contracts/HIVE_HINTS_CONTRACT.md").read_text()

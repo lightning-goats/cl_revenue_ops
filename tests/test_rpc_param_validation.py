@@ -125,7 +125,7 @@ def _handler_specs(mod):
 # only fuzzes real operator surfaces, not internal helpers that happen to take
 # a `plugin` first arg.
 RPC_HANDLER_FUNCS = {
-    "revenue_rebalance_cycle", "revenue_status", "revenue_hive_hints_status",
+    "revenue_rebalance_cycle", "revenue_status",
     "revenue_rebalance_debug", "revenue_fee_debug", "revenue_fee_cycle",
     "revenue_analyze", "revenue_wake_all", "revenue_capacity_report",
     "revenue_planner_status", "planner_candidate_sources",
@@ -174,8 +174,8 @@ def test_handler_discovery_covers_full_surface(mod):
     found = {s[0] for s in specs}
     missing = RPC_HANDLER_FUNCS - found
     assert not missing, f"handlers not discovered: {sorted(missing)}"
-    # 58 handlers is the current full surface.
-    assert len(found) == len(RPC_HANDLER_FUNCS) == 58
+    # 57 handlers is the current full surface.
+    assert len(found) == len(RPC_HANDLER_FUNCS) == 57
 
 
 def test_param_matrix_no_leaks(mod):

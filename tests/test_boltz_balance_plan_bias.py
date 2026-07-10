@@ -1,14 +1,12 @@
-"""Regression: _build_boltz_balance_plan must compute hive_rebal_bias.
+"""Regression: _build_boltz_balance_plan must complete for a surviving candidate.
 
-Commit 1aa1205 deleted the assignment but left four uses behind, so any
+Commit 1aa1205 once deleted an assignment but left uses behind, so any
 channel that survived the candidate filters raised NameError and killed the
-whole Boltz balance/treasury plan. These tests run the real planner over a
-candidate that reaches the bias math.
+whole Boltz balance/treasury plan. This test runs the real planner over a
+candidate that reaches the recommendation math end-to-end.
 """
 
 from unittest.mock import MagicMock
-
-import pytest
 
 from tests.plugin_test_utils import load_plugin_module
 
@@ -16,7 +14,7 @@ from tests.plugin_test_utils import load_plugin_module
 PEER = "02" + "b" * 64
 
 
-def _make_planner_module(hive_hints=None):
+def _make_planner_module():
     mod = load_plugin_module()
     mod.plugin.log = MagicMock()
 
@@ -43,8 +41,6 @@ def _make_planner_module(hive_hints=None):
     mod.database = database
 
     mod.profitability_analyzer = None
-    mod.hive_hints = hive_hints
-    mod.hive_router = None
 
     bm = MagicMock()
     bm.budget.return_value = {}
@@ -56,35 +52,13 @@ def _make_planner_module(hive_hints=None):
     return mod
 
 
-def test_balance_plan_completes_without_hive_hints():
-    mod = _make_planner_module(hive_hints=None)
+def test_balance_plan_completes_for_surviving_candidate():
+    mod = _make_planner_module()
 
     plan = mod._build_boltz_balance_plan(require_profitable=False)
 
     assert "error" not in plan
     assert len(plan["recommendations"]) == 1
-    assert plan["recommendations"][0]["hive"]["rebalance_bias"] == 1.0
-
-
-def test_balance_plan_applies_hive_rebalance_bias():
-    hints = MagicMock()
-    hints.get_rebalance_bias.return_value = 1.15
-    mod = _make_planner_module(hive_hints=hints)
-
-    plan = mod._build_boltz_balance_plan(require_profitable=False)
-
-    assert "error" not in plan
     rec = plan["recommendations"][0]
-    assert rec["hive"]["rebalance_bias"] == 1.15
-    hints.get_rebalance_bias.assert_called_with(PEER)
-
-
-def test_balance_plan_neutralizes_hint_bias_failure():
-    hints = MagicMock()
-    hints.get_rebalance_bias.side_effect = RuntimeError("poisoned hint")
-    mod = _make_planner_module(hive_hints=hints)
-
-    plan = mod._build_boltz_balance_plan(require_profitable=False)
-
-    assert "error" not in plan
-    assert plan["recommendations"][0]["hive"]["rebalance_bias"] == 1.0
+    assert rec["direction"] == "loop_in"
+    assert "hive" not in rec

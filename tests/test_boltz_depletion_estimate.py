@@ -17,7 +17,7 @@ from tests.test_boltz_structural_loopout import _make_prof_mock
 
 
 def _depletion_module(kalman_ratio, kalman_velocity=0.001, contrib=30_000):
-    mod = _make_planner_module(hive_hints=None)
+    mod = _make_planner_module()
     from modules.config import Config
     mod.config = Config()
     pa = MagicMock()

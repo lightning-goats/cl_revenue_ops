@@ -18,7 +18,7 @@ def _module_with_contrib(daily_total_30d=30_000):
     """One 97%-local 10M channel: loop-out, raw gap 3.7M sats; contribution
     1000 sats/day; severity (97-80)/20 = 0.85; horizon 3d => full-gap
     heuristic = 1000 x 3 x 0.85 = 2550 sats."""
-    mod = _make_planner_module(hive_hints=None)
+    mod = _make_planner_module()
     from modules.config import Config
     mod.config = Config()  # structural budget 0: heuristic only
     pa = MagicMock()

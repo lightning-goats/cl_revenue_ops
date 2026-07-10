@@ -50,9 +50,7 @@ VALID_SKIP_REASONS: frozenset[str] = frozenset({
     # Produced by the engine's gates and cycle lock (RA2-1)
     "pair_cooldown",
     "below_hold_margin",
-    "hive_equalization_cooldown",
     "cycle_already_running",
-    "fleet_lease_held",
     # P4-008 in-flight-destination guard: a prior cycle's still-running
     # (possibly orphaned) worker holds an unresolved payment to this dest.
     "dest_inflight",

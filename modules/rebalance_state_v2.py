@@ -32,7 +32,6 @@ class ChannelInput:
     is_profitable: bool = False
     is_active: bool = False
     cooldown_active: bool = False
-    rebalance_bias: float = 1.0
     # Phase 3.3: caller-supplied drift override (e.g. computed by the engine
     # from rebalance-history anchor state). When True the destination cooldown
     # gate is skipped regardless of local_ratio vs target_emergency_low.
@@ -61,7 +60,6 @@ class ChannelState:
     dest_urgency: float = 0.0
     source_drain_score: float = 0.0
     budget_source: str = "none"
-    rebalance_bias: float = 1.0
     # Our OWN outbound fee on this channel (ppm) — sats-EV gate input.
     local_out_fee_ppm: int = 0
     historical_direct_fee_ppm: float = 0.0
@@ -129,14 +127,6 @@ def _as_nonnegative_float(value: Any, default: float = 0.0) -> float:
     return parsed
 
 
-def _as_rebalance_bias(value: Any) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return 1.0
-    return max(0.85, min(1.15, parsed))
-
-
 def _normalize_channel_input(value: Any) -> ChannelInput:
     if isinstance(value, ChannelInput):
         return value
@@ -159,7 +149,6 @@ def _normalize_channel_input(value: Any) -> ChannelInput:
             is_profitable=_as_bool(value.get("is_profitable", False)),
             is_active=_as_bool(value.get("is_active", False)),
             cooldown_active=_as_bool(value.get("cooldown_active", False)),
-            rebalance_bias=_as_rebalance_bias(value.get("rebalance_bias", 1.0)),
             cooldown_override=_as_bool(value.get("cooldown_override", False)),
         )
     raise TypeError(f"Unsupported channel input type: {type(value)!r}")
@@ -289,7 +278,7 @@ def _destination_eligibility(
     cooldown_override: bool = False,
 ) -> Tuple[bool, str]:
     """Phase 2.1 destination gate: a refill destination must be a value
-    channel (hive/profitable/active/funded), have remaining capex budget,
+    channel (profitable/active/funded), have remaining capex budget,
     and not be in cooldown. This stays conservative -- destinations
     authorize spend, sources do not.
 
@@ -414,7 +403,6 @@ def build_state_snapshot(
                 dest_urgency=_refill_urgency(local_ratio, scoring_band_low),
                 source_drain_score=_drain_score(local_ratio, scoring_band_high),
                 budget_source=budget_source,
-                rebalance_bias=channel.rebalance_bias,
                 realized_utilization=(facts.realized_utilization if facts else 0.5),
                 utilization_is_realized=(facts.utilization_is_realized if facts else False),
                 activity_out_sats=(facts.out_sats_window if facts else 0),

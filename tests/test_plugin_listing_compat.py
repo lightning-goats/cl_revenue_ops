@@ -126,7 +126,6 @@ def test_plugin_listing_rpc_and_safe_default_contract():
         "revenue-fee-debug",
         "revenue-rebalance-debug",
         "revenue-profitability",
-        "revenue-hive-hints-status",
         "revenue-planner-status",
     }.issubset(methods)
 

@@ -232,7 +232,7 @@ def _make_prof_mock():
 
 
 def _structural_module(scarcity, realized_ppm=500, structural_budget=1000):
-    mod = _make_planner_module(hive_hints=None)
+    mod = _make_planner_module()
     from modules.config import Config
     mod.config = Config(boltz_structural_budget_sats_per_day=structural_budget)
     mod._node_receivable_status = lambda: {
@@ -923,7 +923,7 @@ def test_gate_fails_closed_on_spend_query_error():
 def _drain_module():
     """Two 97%-local channels; neither has structural data (budget=0 keeps it
     neutral so structural credit does not interfere with ordering)."""
-    mod = _make_planner_module(hive_hints=None)
+    mod = _make_planner_module()
     from modules.config import Config
     mod.config = Config(boltz_structural_budget_sats_per_day=0)
     mod._node_receivable_status = lambda: {
