@@ -709,15 +709,6 @@ class TestMiscMethods:
         ds.bkpr_list_account_events()
         plugin.rpc.call.assert_called_once_with("bkpr-listaccountevents", {})
 
-    def test_list_datastore(self):
-        from modules.data_service import DataService
-        plugin = _make_mock_plugin()
-        plugin.rpc.listdatastore.return_value = {"datastore": []}
-        ds = DataService(plugin)
-        result = ds.list_datastore(["hive", "hints"])
-        assert "datastore" in result
-        plugin.rpc.listdatastore.assert_called_once_with(key=["hive", "hints"])
-
     def test_list_plugins(self):
         from modules.data_service import DataService
         plugin = _make_mock_plugin()

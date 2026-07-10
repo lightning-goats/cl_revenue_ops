@@ -730,12 +730,13 @@ class EVRebalancer:
             
             # Check capital controls (pass cfg for thread-safe config access)
             if not self._check_capital_controls(cfg):
+                _blocker = getattr(self, '_capital_control_blocker', 'daily_budget_sats')
                 self._set_last_decision_summary(
                     action="suppressed",
                     reason="capital_controls_blocked",
-                    dominant_input=getattr(self, '_capital_control_blocker', 'daily_budget_sats'),
+                    dominant_input=_blocker,
                     safety_block=True,
-                    budget_blocked=True,
+                    budget_blocked=(_blocker == 'daily_budget_sats'),
                 )
                 return candidates
 
@@ -2042,6 +2043,10 @@ class EVRebalancer:
                         f"{cfg.min_wallet_reserve}",
                         level='warn'
                     )
+                    # Attribution for the decision summary: the blocker is
+                    # the reserve, not the budget (previously the fallback
+                    # default reported daily_budget_sats for this branch).
+                    self._capital_control_blocker = "min_wallet_reserve"
                     return False
             except RpcError:
                 # RPC timeout / failure — skip reserve check, still enforce budget

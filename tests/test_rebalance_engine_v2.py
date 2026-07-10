@@ -2913,6 +2913,9 @@ def test_build_flow_facts_map_computes_realized_utilization_from_db(
     DB-reported flow window into a ChannelFlowFacts with realized
     utilization, keyed by channel_id, without touching the rest of the
     snapshot build."""
+    mock_database.get_all_channel_flow_windows.side_effect = (
+        lambda since: {"A": (600_000, 0, 6)}
+    )
     mock_database.get_channel_flow_window.return_value = (600_000, 0, 6)
     engine = _make_engine(mock_plugin, mock_database)
 

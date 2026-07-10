@@ -937,6 +937,20 @@ class RebalanceEngine:
         """
         if self.database is None:
             return {}
+        # Prefetch both windows once (2 GROUP BY aggregates each) instead of
+        # 4 point queries per channel. Fail-open to the per-channel path.
+        short_windows = long_windows = None
+        try:
+            batch_fn = getattr(self.database, "get_all_channel_flow_windows", None)
+            if callable(batch_fn):
+                activity_window = int(getattr(cfg, "rebalance_activity_window_seconds", 3600) or 3600)
+                util_days = int(getattr(cfg, "rebalance_utilization_window_days", 7) or 7)
+                short_windows = batch_fn(now_ts - activity_window)
+                long_windows = batch_fn(now_ts - util_days * 86_400)
+                if not isinstance(short_windows, dict) or not isinstance(long_windows, dict):
+                    short_windows = long_windows = None
+        except Exception:
+            short_windows = long_windows = None
         flow_facts: Dict[str, ChannelFlowFacts] = {}
         for ch in channels:
             channel_id = ch.get("channel_id")
@@ -944,7 +958,8 @@ class RebalanceEngine:
                 continue
             capacity_sats = int(ch.get("capacity_sats") or 0)
             flow_facts[channel_id] = compute_channel_flow_facts(
-                self.database, channel_id, capacity_sats, now_ts, cfg
+                self.database, channel_id, capacity_sats, now_ts, cfg,
+                short_windows=short_windows, long_windows=long_windows,
             )
         return flow_facts
 

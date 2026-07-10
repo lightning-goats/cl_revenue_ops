@@ -43,7 +43,15 @@ def _cfg_get(cfg, name, default):
     return default if value is None else value
 
 
-def compute_channel_flow_facts(db, channel_id: str, capacity_sats: int, now: int, cfg) -> ChannelFlowFacts:
+def compute_channel_flow_facts(db, channel_id: str, capacity_sats: int, now: int, cfg,
+                               short_windows=None, long_windows=None) -> ChannelFlowFacts:
+    """Per-channel flow facts.
+
+    short_windows/long_windows: optional prefetched maps from
+    Database.get_all_channel_flow_windows (channel_id -> (out, in, count));
+    when provided, no per-channel queries are issued (the rebalance snapshot
+    passes them to avoid a 4-queries-per-channel N+1).
+    """
     if capacity_sats <= 0:
         return _neutral(channel_id)
     try:
@@ -56,8 +64,14 @@ def compute_channel_flow_facts(db, channel_id: str, capacity_sats: int, now: int
         short_since = now - activity_window
         long_since = now - util_days * 86_400
 
-        short_out, short_in, _ = db.get_channel_flow_window(channel_id, short_since)
-        long_out, _long_in, long_count = db.get_channel_flow_window(channel_id, long_since)
+        if short_windows is not None:
+            short_out, short_in, _ = short_windows.get(channel_id, (0, 0, 0))
+        else:
+            short_out, short_in, _ = db.get_channel_flow_window(channel_id, short_since)
+        if long_windows is not None:
+            long_out, _long_in, long_count = long_windows.get(channel_id, (0, 0, 0))
+        else:
+            long_out, _long_in, long_count = db.get_channel_flow_window(channel_id, long_since)
 
         if long_count >= min_forwards:
             raw = long_out / float(capacity_sats)

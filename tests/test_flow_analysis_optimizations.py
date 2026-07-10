@@ -253,7 +253,9 @@ class TestAnalyzeAllChannelsCache:
 
     def test_ttl_is_configurable_attribute(self):
         analyzer, db, scid = self._fresh()
-        assert analyzer._flow_cache_ttl == 300
+        # >= the hourly loop cadence so the 900s rebalance cycle can't force
+        # extra Kalman-consuming refreshes (was 300s).
+        assert analyzer._flow_cache_ttl == 1800
         analyzer._flow_cache_ttl = 0
         analyzer.analyze_all_channels()
         time.sleep(1.1)

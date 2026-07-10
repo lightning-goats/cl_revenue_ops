@@ -798,7 +798,11 @@ class FlowAnalyzer:
         # are atomic). Writes are protected by _analysis_lock.
         self._flow_cache: Dict[str, FlowMetrics] = {}
         self._flow_cache_timestamp: int = 0
-        self._flow_cache_ttl: int = 300  # seconds (configurable attribute)
+        # >= the hourly flow loop cadence: the 900s rebalance cycle forced
+        # "genuine" refreshes ~4x/hour, consuming Kalman observations at ~5x
+        # the designed rate (uncertainty collapse the docstring at
+        # analyze_all_channels warns about).
+        self._flow_cache_ttl: int = 1800  # seconds (configurable attribute)
         self._analysis_lock = threading.Lock()  # Prevent analysis stampede
 
         # One-time purge v2: clear Kalman states missing observation_count.
@@ -1371,7 +1375,9 @@ class FlowAnalyzer:
             Dict mapping channel_id to FlowMetrics
         """
         # Serve cached results while fresh (prevents redundant re-analysis).
-        if not force and self._flow_cache:
+        # Gate on the timestamp, not dict truthiness — an empty result
+        # (0 channels) must still register as a fresh pass.
+        if not force and self._flow_cache_timestamp > 0:
             cache_age = int(time.time()) - self._flow_cache_timestamp
             if cache_age <= self._flow_cache_ttl:
                 return self._flow_cache

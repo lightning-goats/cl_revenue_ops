@@ -3522,16 +3522,29 @@ def run_fee_adjustment():
         raise
 
 
+_dashboard_push_state: Dict[str, Any] = {"ts": 0}
+_DASHBOARD_PUSH_MIN_INTERVAL = 1500  # seconds; ~one rebuild per fee cycle
+
+
 def _push_dashboard_to_datastore() -> None:
-    """Push 30-day dashboard snapshot to datastore."""
+    """Push 30-day dashboard snapshot to datastore.
+
+    Throttled: revenue_dashboard re-runs uncached 30d aggregates (pnl, roc,
+    bleeder scan), and this push used to rebuild it from scratch on every
+    fee cycle purely to refresh a telemetry snapshot.
+    """
     global safe_plugin, profitability_analyzer, database, data_service
     if safe_plugin is None or profitability_analyzer is None or database is None:
+        return
+    now = int(time.time())
+    if now - int(_dashboard_push_state.get("ts", 0) or 0) < _DASHBOARD_PUSH_MIN_INTERVAL:
         return
     try:
         dashboard = revenue_dashboard(plugin, window_days=30)
         if isinstance(dashboard, dict) and "error" not in dashboard:
             if data_service:
                 data_service.datastore_push(["revenue", "dashboard"], dashboard)
+            _dashboard_push_state["ts"] = now
     except Exception:
         pass  # datastore_push handles its own error logging
 
@@ -6961,6 +6974,35 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
         open_cost_sats = channel_cost.get('open_cost_sats', 0) if channel_cost else 0
         opened_at = channel_cost.get('opened_at') if channel_cost else None
         funding_txid = channel_cost.get('funding_txid') if channel_cost else None
+
+        # Plausibility repair for opened_at, mirrored from the profitability
+        # analyzer: rows poisoned by the pre-fix rolling now-30d estimate
+        # otherwise escape into the PERMANENT closed_channels ledger here
+        # (days_open snapshotted from the raw value). Anchor on the live tip:
+        # a stored opened_at deviating from the SCID estimate by more than
+        # max(7d, 15% of estimated age) is repaired with the estimate.
+        try:
+            if channel_id and 'x' in channel_id:
+                _block_height = int(channel_id.split('x')[0])
+                _tip = 0
+                try:
+                    _tip = int(data_service.get_block_height() or 0) if data_service \
+                        else int(safe_plugin.rpc.getinfo().get("blockheight", 0) or 0)
+                except Exception:
+                    _tip = 0
+                _now = int(time.time())
+                if _tip >= _block_height > 0:
+                    _estimate = _now - (_tip - _block_height) * 600
+                    _slack = max(7 * 86400, int(0.15 * max(0, _now - _estimate)))
+                    if not opened_at or abs(int(opened_at) - _estimate) > _slack:
+                        plugin.log(
+                            f"CLOSE_ARCHIVE: repairing implausible opened_at for "
+                            f"{channel_id} ({opened_at} -> {_estimate})",
+                            level='info'
+                        )
+                        opened_at = _estimate
+        except (ValueError, IndexError):
+            pass
 
         # Get closure cost data
         closure_cost = database.get_channel_closure_cost(channel_id)

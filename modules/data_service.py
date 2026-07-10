@@ -472,10 +472,6 @@ class DataService:
 
     # --- Datastore (raw passthrough for reads) ---
 
-    def list_datastore(self, key: List[str]) -> Dict:
-        """Read from CLN datastore. Not cached."""
-        return self._plugin.rpc.listdatastore(key=key)
-
     # --- Misc ---
 
     def list_plugins(self) -> Dict:

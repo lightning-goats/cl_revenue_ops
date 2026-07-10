@@ -4144,11 +4144,20 @@ class Database:
     # P4-021: categories whose reservation represents a COMMITTED on-chain spend
     # (a channel open/close). These are settled explicitly
     # (mark_spend_reservation_spent) or released on RPC failure by the planner —
-    # they must NEVER be blind-released by the stale timeout sweep. Opens/closes
-    # are counted on the unified rail ONLY via spend_events, so if a settle's
-    # spend-event write persistently fails the reservation legitimately stays
-    # 'active' to keep the committed fee counted; blind-releasing it here would
-    # make that committed cost vanish in the overspend-permitting direction.
+    # they must NEVER be blind-released by the stale timeout sweep.
+    # NOTE (2026-07-10 audit): actual open/close SPEND is counted on the
+    # unified rail from the canonical cost tables (channel_costs /
+    # channel_closure_costs via get_opening_costs_since /
+    # get_closure_costs_since) — which also captures closes performed
+    # OUTSIDE the plugin — while spend_events rows in these categories are
+    # EXCLUDED from the generic-ledger bucket
+    # (_normalize_generic_ledger_for_total_cost_budget) precisely to avoid
+    # double-counting. The RESERVATION half below still matters: while a
+    # planner open/close is in flight, only the reservation holds the
+    # committed fee against the budget, so if the settle's spend-event write
+    # persistently fails the reservation legitimately stays 'active';
+    # blind-releasing it would make that committed cost vanish in the
+    # overspend-permitting direction.
     # Mirrors P4-015's protection of pending_settlement budget reservations.
     # P4-022: "boltz" is included — a boltz reservation held active by the
     # P4-019 loud-write path represents a real committed swap cost that the rail
@@ -5234,6 +5243,40 @@ class Database:
 
         return row['forward_count'] if row else 0
 
+    def get_all_channel_flow_windows(
+        self, since_timestamp: int
+    ) -> Dict[str, Tuple[int, int, int]]:
+        """Batched get_channel_flow_window for every channel: two GROUP BY
+        aggregates instead of two point queries per channel (the rebalance
+        snapshot ran 4 queries x N channels per cycle through the
+        per-channel variant).
+
+        Returns:
+            Dict mapping channel_id -> (out_sats, in_sats, forward_count),
+            where forward_count is outbound + inbound forwards (matching the
+            per-channel variant, including its double-count of
+            self-referential forwards).
+        """
+        conn = self._get_connection()
+        result: Dict[str, list] = {}
+        for row in conn.execute("""
+            SELECT out_channel AS ch, COALESCE(SUM(out_msat), 0) AS m, COUNT(*) AS c
+            FROM forwards
+            WHERE timestamp > ? AND out_channel IS NOT NULL
+            GROUP BY out_channel
+        """, (since_timestamp,)):
+            result[row["ch"]] = [base_to_sats_floor(row["m"]), 0, row["c"]]
+        for row in conn.execute("""
+            SELECT in_channel AS ch, COALESCE(SUM(in_msat), 0) AS m, COUNT(*) AS c
+            FROM forwards
+            WHERE timestamp > ? AND in_channel IS NOT NULL
+            GROUP BY in_channel
+        """, (since_timestamp,)):
+            entry = result.setdefault(row["ch"], [0, 0, 0])
+            entry[1] = base_to_sats_floor(row["m"])
+            entry[2] += row["c"]
+        return {ch: (v[0], v[1], v[2]) for ch, v in result.items()}
+
     def get_channel_flow_window(
         self, channel_id: str, since_timestamp: int
     ) -> Tuple[int, int, int]:
@@ -5618,6 +5661,46 @@ class Database:
         """, params).fetchall()
         return [dict(row) for row in rows]
     
+    def get_all_channel_rebalance_success_rates(
+        self, window_days: int = 30
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batched get_channel_rebalance_success_rate for all destinations:
+        one GROUP BY over rebalance_history instead of a point query per
+        channel (the bleeder scan issued one per channel per refresh).
+
+        Returns a dict keyed by to_channel with the same fields as the
+        per-channel variant. Channels with no history are simply absent.
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (window_days * 86400)
+        result: Dict[str, Dict[str, Any]] = {}
+        for row in conn.execute("""
+            SELECT to_channel,
+                SUM(CASE WHEN status IN ('success', 'failed') THEN 1 ELSE 0 END) AS total,
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failures,
+                AVG(CASE WHEN status = 'success' AND amount_sats > 0
+                    THEN (actual_fee_sats * 1000000.0 / amount_sats)
+                    ELSE NULL END) AS avg_cost_ppm,
+                AVG(CASE WHEN status = 'success' THEN amount_sats ELSE NULL END) AS avg_amount
+            FROM rebalance_history
+            WHERE timestamp >= ? AND to_channel IS NOT NULL
+            GROUP BY to_channel
+        """, (cutoff,)):
+            total = int(row["total"] or 0)
+            if total <= 0:
+                continue
+            successes = int(row["successes"] or 0)
+            result[normalize_scid(row["to_channel"])] = {
+                "total": total,
+                "successes": successes,
+                "failures": int(row["failures"] or 0),
+                "success_rate": successes / total,
+                "avg_cost_ppm": float(row["avg_cost_ppm"] or 0.0),
+                "avg_amount_sats": float(row["avg_amount"] or 0.0),
+            }
+        return result
+
     def get_channel_rebalance_success_rate(
         self, channel_id: str, window_days: int = 30
     ) -> Optional[Dict[str, Any]]:

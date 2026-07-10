@@ -594,7 +594,7 @@ class ChannelProfitabilityAnalyzer:
         # Writes are protected by _analysis_lock to prevent concurrent analysis stampede.
         self._profitability_cache: Dict[str, ChannelProfitability] = {}
         self._cache_timestamp: int = 0
-        self._cache_ttl: int = 300  # 5 minutes
+        self._cache_ttl: int = 900  # >= the slowest steady-state caller cadence (rebalance cycle 900s); a 300s TTL made every fee/rebalance wake re-run the full pass (~6x/hour instead of 2)
         self._analysis_lock = threading.Lock()  # Prevent concurrent analysis stampede
 
         # Bleeder classification cache (avoids re-running full analysis per channel)
@@ -623,7 +623,10 @@ class ChannelProfitabilityAnalyzer:
             Dict mapping channel_id to ChannelProfitability
         """
         # Return cached results if still fresh (prevents redundant re-analysis)
-        if not force and self._profitability_cache:
+        # Gate on the timestamp, not dict truthiness: an EMPTY result
+        # (0 channels) is falsy, which made channel-less nodes re-run the
+        # full pass (bkpr RPC + datastore push) on every caller.
+        if not force and self._cache_timestamp > 0:
             cache_age = int(time.time()) - self._cache_timestamp
             if cache_age <= self._cache_ttl:
                 return self._profitability_cache
@@ -1652,6 +1655,17 @@ class ChannelProfitabilityAnalyzer:
             # method is unavailable or a channel is missing from the result.
             all_pnl_30d = self._get_all_full_pnl_batch(window_days)
             all_pnl_7d = self._get_all_full_pnl_batch(7)
+            # Same batching for the success-rate adjustment below: one
+            # GROUP BY instead of a point query per channel per refresh.
+            success_rates_batch = None
+            try:
+                batch_fn = getattr(self.database, "get_all_channel_rebalance_success_rates", None)
+                if callable(batch_fn):
+                    candidate = batch_fn(window_days)
+                    if isinstance(candidate, dict):
+                        success_rates_batch = candidate
+            except Exception:
+                success_rates_batch = None
 
             for channel_id, info in channels.items():
                 try:
@@ -1679,7 +1693,10 @@ class ChannelProfitabilityAnalyzer:
                     net_profit_7d = pnl_7d.get('net_pnl_sats', base_to_sats_floor(pnl_7d.get('net_pnl_msat', 0)))
 
                     # Adjust for success rate — effective cost accounts for failed attempts
-                    success_data = self.database.get_channel_rebalance_success_rate(channel_id, window_days)
+                    if success_rates_batch is not None:
+                        success_data = success_rates_batch.get(normalize_scid(channel_id))
+                    else:
+                        success_data = self.database.get_channel_rebalance_success_rate(channel_id, window_days)
                     if success_data and success_data['total'] >= 3:
                         sr = max(success_data['success_rate'], 0.10)
                         effective_rebalance_cost_30d = int(rebalance_cost_30d / sr)

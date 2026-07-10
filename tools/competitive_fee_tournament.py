@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Run competitive fee-market phases against the local Polar lab.
+"""
+WARNING: this tool calls listdatastore against live nodes. listdatastore
+FULL-SCANS the datastore table synchronously on lightningd's main loop —
+on a node with a bloated datastore this freezes the entire daemon for
+minutes (observed 2026-07-10). Do not run against production nodes unless
+the datastore is known-small.
+Run competitive fee-market phases against the local Polar lab.
 
 This runner assumes the expanded lab topology exists:
 
