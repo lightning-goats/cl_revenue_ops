@@ -472,14 +472,3 @@ class TestNeighborFeeAwareness:
         assert stale_remaining == 0
 
 
-class TestFleetFeePriors:
-    def test_fleet_prior_used_for_initial_fee(self, mock_plugin, mock_config, mock_database):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
-        adapter = MagicMock()
-        adapter.get_fleet_fee_prior.return_value = 350
-        fc.hive_hints = adapter
-        # Fleet prior should be available
-        fee = adapter.get_fleet_fee_prior("02peer")
-        assert fee == 350
-
-

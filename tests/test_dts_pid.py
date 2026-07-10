@@ -1469,110 +1469,6 @@ class TestUpwardProbeWiring:
         assert result.algorithm_values["supported_fee_ceiling_ppm"] == 75
 
 
-class TestFleetSiblingExclusion:
-    """2026-07-03 fee audit H-1: hive fleet members were counted as
-    competitors in the neighbor-fee pools, so fleet nodes sharing a peer
-    undercut EACH OTHER 5-20% per cycle toward the floor. Siblings are
-    allies — their advertised fees must not enter the competitor pool."""
-
-    def _install_gossip_with_sibling(self, fc, *, peer_id, our_id="our-node"):
-        now_ts = int(time.time())
-        channels = [
-            {"source": our_id, "destination": peer_id, "active": True,
-             "fee_per_millionth": 112, "satoshis": 2_000_000,
-             "last_update": now_ts},
-            # Hive siblings: huge, cheap — would dominate the weighted pool.
-            {"source": "hive-sibling", "destination": peer_id, "active": True,
-             "fee_per_millionth": 10, "satoshis": 50_000_000,
-             "last_update": now_ts},
-            {"source": "hive-sibling-2", "destination": peer_id, "active": True,
-             "fee_per_millionth": 10, "satoshis": 40_000_000,
-             "last_update": now_ts},
-        ]
-        for idx, fee in enumerate((100, 200, 300)):
-            channels.append({
-                "source": f"competitor-{idx}", "destination": peer_id,
-                "active": True, "fee_per_millionth": fee,
-                "satoshis": 1_000_000, "last_update": now_ts,
-            })
-        fc.data_service = MagicMock()
-        fc.data_service.get_node_id.return_value = our_id
-        fc.data_service.get_channels.return_value = {"channels": channels}
-        fc._our_node_id = our_id
-        fc.hive_hints = MagicMock()
-        fc.hive_hints.is_hive_member.side_effect = (
-            lambda node_id: str(node_id).startswith("hive-sibling")
-        )
-
-    def test_median_excludes_hive_members(self, mock_plugin, mock_database):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        peer_id = "02" + "c1" * 32
-        self._install_gossip_with_sibling(fc, peer_id=peer_id)
-        median = fc._get_neighbor_fee_median(peer_id, cfg=cfg)
-        assert median == 200, (
-            f"sibling fee dragged the weighted median to {median}"
-        )
-
-    def test_percentile_excludes_hive_members(self, mock_plugin, mock_database):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        peer_id = "02" + "c2" * 32
-        self._install_gossip_with_sibling(fc, peer_id=peer_id)
-        p25 = fc._get_neighbor_fee_percentile(peer_id, 0.25, cfg=cfg)
-        assert p25 == 100, f"sibling fee entered the percentile pool: {p25}"
-
-    def test_undercut_rank_excludes_hive_members(self, mock_plugin, mock_database):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        peer_id = "02" + "c3" * 32
-        self._install_gossip_with_sibling(fc, peer_id=peer_id)
-        pct = fc._get_competitive_undercut_pct(
-            peer_id, "chan", neighbor_median=150, cfg=cfg
-        )
-        # Without the 50M sibling in the pool, we (2M) outrank every real
-        # competitor (1M) -> rank 0.0 -> base undercut 5%.
-        assert pct == pytest.approx(0.05)
-
-
-class TestTemporalHoursUseUtc:
-    """2026-07-03 audit SL-6: hive hints publish peak_hours_utc, but the
-    temporal fee adjustment and context buckets compared them against the
-    host's LOCAL hour (America/Denver = UTC-6/-7), firing the +/-5%
-    adjustment 6-7 hours off for every hinted peer."""
-
-    def test_temporal_adjustment_compares_utc_hours(
-        self, mock_plugin, mock_database, monkeypatch
-    ):
-        import modules.fee_controller as fc_mod
-
-        class SkewedTime:
-            t = 1_750_000_000.0
-
-            @classmethod
-            def time(cls):
-                return cls.t
-
-            @staticmethod
-            def strftime(fmt):
-                return "23"  # local hour — must NOT be used
-
-            @staticmethod
-            def gmtime():
-                import time as real_time
-                return real_time.gmtime(6 * 3600)  # UTC hour 6
-
-        monkeypatch.setattr(fc_mod, "time", SkewedTime)
-
-        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        fc.hive_hints = MagicMock()
-        fc.hive_hints.get_traffic_confidence.return_value = 0.9
-        fc.hive_hints.get_peak_hours.return_value = [6]  # UTC peak
-
-        adj = fc._get_temporal_fee_adjustment("02" + "e1" * 32)
-        assert adj == pytest.approx(1.05), (
-            f"peak-hour comparison used local time: got {adj} "
-            "(0.97 means the UTC peak hour was read as quiet)"
-        )
-
-
 class TestUndercutInventoryGate:
     """2026-07-03 audit M5: the market undercut clamp overrode the PID
     scarcity premium with no inventory condition — a depleted channel
@@ -1814,9 +1710,6 @@ class TestMarketBoundaryGuard:
         current_fee_ppm = 200
         now = int(time.time())
 
-        hints = MagicMock()
-        hints.is_hive_member.return_value = False
-        fc.hive_hints = hints
         fc._get_neighbor_fee_median = MagicMock(return_value=None)
         fc._get_market_boundary_fee = MagicMock(return_value=None)
         fc._get_rebalance_cost_floor = MagicMock(return_value=None)
@@ -2168,7 +2061,7 @@ class TestMarketBoundaryGuard:
         assert "market_boundary" not in result.algorithm_values
         assert "market_boundary_support" not in result.algorithm_values
 
-    def test_hive_optimal_estimate_does_not_create_market_boundary_when_gossip_missing(
+    def test_no_market_boundary_when_gossip_missing(
         self, mock_plugin, mock_database
     ):
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -2178,14 +2071,6 @@ class TestMarketBoundaryGuard:
         peer_id = "02" + "1" * 64
         current_fee_ppm = 100
         self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=())
-        fc.hive_hints = MagicMock()
-        fc.hive_hints.get_optimal_fee_estimate.return_value = 44
-        fc.hive_hints.get_traffic_confidence.return_value = 0.7
-        fc.hive_hints.get_peak_hours.return_value = []
-        fc.hive_hints.get_fee_bias.return_value = 1.0
-        fc.hive_hints.get_centrality.return_value = 0.0
-        fc.hive_hints.get_corridor_role.return_value = "none"
-        fc.hive_hints.get_fee_elasticity.return_value = 0.0
         mock_database.get_volume_since.return_value = 0
         mock_database.get_forward_count_since.return_value = 0
         fc.data_service.set_channel = MagicMock()
@@ -2224,7 +2109,6 @@ class TestMarketBoundaryGuard:
 
         assert result is None
         fc.data_service.set_channel.assert_not_called()
-        fc.hive_hints.get_optimal_fee_estimate.assert_not_called()
         assert fc._get_neighbor_fee_median(peer_id) is None
 
     def test_deprecated_market_boundary_does_not_refresh_stale_support_boundary(

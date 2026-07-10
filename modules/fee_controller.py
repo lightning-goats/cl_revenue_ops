@@ -374,7 +374,7 @@ class GaussianThompsonState:
     CTX_CONFIDENCE_COUNT = 10.0     # Half-saturation obs count for ctx confidence
     CTX_PRECISION_DECAY = 0.98      # Per-update ctx precision decay (re-learnable)
 
-    # Hive exploration multiplier bounds. scale_variance() used to mutate only
+    # Exploration multiplier bounds. scale_variance() used to mutate only
     # posterior_std, which neither sample path reads, so the multiplier never
     # reached the fees actually sampled; it is now stored and consumed by the
     # samplers themselves (scaling the polynomial/Gaussian draw noise).
@@ -449,18 +449,15 @@ class GaussianThompsonState:
 
     # One-shot exploration multiplier armed by scale_variance() and consumed
     # by the next sample_fee/sample_fee_contextual call (the pipeline re-arms
-    # it every cycle when the hive requests exploration)
+    # it every cycle when exploration is requested)
     exploration_boost: float = 1.0
 
     # Tracking
     last_sampled_fee: int = 0
     last_sample_time: int = 0
 
-    # One-shot prior re-seed marker (fleet_fee_median-skew era repair).
-    # 0 = the re-seed check has not resolved yet. Stamped (and persisted)
-    # once _maybe_reseed_skewed_prior resolves against an available prior
-    # source — whether or not a correction was applied — so the check runs
-    # at most once per channel.
+    # One-shot prior re-seed marker (fleet_fee_median-skew era repair,
+    # retired with the fleet prior). Kept for state-blob compatibility.
     reseeded_at: int = 0
 
     # -----------------------------------------------------------------
@@ -2705,10 +2702,6 @@ class FeeController:
     # ==========================================================================
     # Audit F5 (2026-06): initial-fee prior seeding of the PERSISTENT state
     # ==========================================================================
-    # std for the fleet fee prior. NOT the old hardcoded 50: the fleet prior
-    # is an unweighted corridor median, informative but too coarse to justify
-    # near-converged confidence on a channel with zero local observations.
-    FLEET_PRIOR_STD_PPM = 80
     # Weight of the one durable posterior nudge recorded toward the chosen
     # prior so the sample-time bias machinery carries the signal through the
     # early fee cycles (until real observations accumulate).
@@ -2716,9 +2709,6 @@ class FeeController:
     # One-time prior re-seed (fleet_fee_median-skew era repair): minimum
     # relative divergence between a quiet channel's stored prior mean and
     # the CURRENT best prior source before the prior is re-seeded.
-    # See _maybe_reseed_skewed_prior.
-    PRIOR_RESEED_SKEW_FRAC = 0.15
-
     # ==========================================================================
     # Issue #20: Flow-Based Ceiling Reduction
     # ==========================================================================
@@ -2846,18 +2836,6 @@ class FeeController:
     # one per cycle.
     VEGAS_WAKE_INTENSITY_THRESHOLD = 0.5
     VEGAS_WAKE_REARM_INTENSITY = 0.3
-
-    # ==========================================================================
-    # F2 fix (2026-06-10): total hive hint authority over price
-    # ==========================================================================
-    # _get_hive_fee_bias clamps its own output to [0.9, 1.1], but the temporal
-    # traffic multiplier (x0.97-1.05, separately clamped) used to multiply
-    # AFTER that clamp — a composite of up to +15.5% if metabolic/immune hints
-    # ever go live. The two hints are now composed and the COMPOSITE is
-    # clamped before a single multiplication. Invariant: all hive-derived
-    # hints together can never move the target by more than +/-10%.
-    HIVE_HINT_TOTAL_BIAS_MIN = 0.9
-    HIVE_HINT_TOTAL_BIAS_MAX = 1.1
 
     # ==========================================================================
     # P5 fix (2026-06-10): Kalman demand divisor bounds
@@ -3121,12 +3099,6 @@ class FeeController:
         # crossing wakes sleeping channels; re-armed after decay).
         self._vegas_wake_armed: bool = True
 
-        # cl-mycelium retired: the zero-fee corridor / membership machinery is
-        # gone. hive_hints stays a permanent None so the remaining inert
-        # hint-reading branches (temporal, fleet-fee prior, peer-quality)
-        # resolve to their neutral defaults.
-        self.hive_hints = None
-
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
 
@@ -3232,12 +3204,6 @@ class FeeController:
         Respects cfg.base_fee_policy ("off" | "adaptive"). Always returns
         the legacy cfg.base_fee_msat when policy is "off" so back-compat
         holds when the option is not set.
-
-        When policy is "adaptive" but hive_hints is not yet wired (plugin
-        startup race before cl-revenue-ops.py:1783 injects the adapter),
-        fall back to the legacy cfg.base_fee_msat rather than classifying
-        every unknown peer as non_hive — this prevents the ~30s startup
-        window from charging intra-fleet channels 1000 msat.
         """
         if cfg is None:
             cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
@@ -3250,18 +3216,16 @@ class FeeController:
             except (TypeError, ValueError):
                 return int(default)
 
-        # cl-mycelium retired: there is no fleet-vs-market role classification,
-        # so 'adaptive' no longer differentiates intra-fleet (0 msat) from
-        # non-hive (1000 msat) — every peer gets the configured base fee.
+        # cl-mycelium retired: there is no role classification any more —
+        # every peer gets the configured base fee.
         return _cfg_int('base_fee_msat', 0)
 
     @staticmethod
     def _utc_hour() -> int:
         """Current hour in UTC (SL-6, 2026-07-03 audit).
 
-        Hive hints publish peak_hours_utc; comparing them against the
-        host's LOCAL hour fired the temporal adjustment and peak context
-        buckets 6-7 hours off for every hinted peer.
+        The context time bucket is defined in UTC; using the host's LOCAL
+        hour skewed the peak/normal/low buckets by 6-7 hours.
         """
         try:
             return int(time.gmtime().tm_hour)
@@ -3272,46 +3236,6 @@ class FeeController:
             # skew SL-6 fixed (E-4.9, 2026-07 econ audit).
             from datetime import datetime, timezone
             return int(datetime.now(timezone.utc).hour)
-
-
-    def _get_temporal_fee_adjustment(self, peer_id: str) -> float:
-        """Return temporal fee multiplier (0.9-1.1) based on traffic patterns.
-
-        During peak hours for a peer: maintain/increase fees (1.0-1.1)
-        During quiet hours: reduce slightly to attract flow (0.9-1.0)
-        Drain direction: inbound_heavy peers get slight reduction, outbound_heavy get increase.
-
-        Gated by traffic_confidence > 0.5 to avoid acting on noisy data.
-        """
-        if not self.hive_hints:
-            return 1.0
-
-        try:
-            confidence = self.hive_hints.get_traffic_confidence(peer_id)
-            if not isinstance(confidence, (int, float)) or confidence <= 0.5:
-                return 1.0
-
-            current_hour = self._utc_hour()  # peak_hours are UTC (SL-6)
-
-            multiplier = 1.0
-
-            # Peak/quiet hour adjustment
-            peak_hours = self.hive_hints.get_peak_hours(peer_id)
-            if peak_hours:
-                if current_hour in peak_hours:
-                    multiplier *= 1.05  # +5% during peak
-                else:
-                    multiplier *= 0.97  # -3% during quiet
-
-            # Drain direction is handled by hive-traffic askrene layer
-            # (bias-channel in the rebalancing direction).  Applying it here
-            # as well would double-incentivize the same direction.
-
-            # Clamp to [0.9, 1.1]
-            return max(0.9, min(1.1, multiplier))
-
-        except Exception:
-            return 1.0
 
 
     def _get_network_fee_prior(self, peer_id: str, scid: str) -> dict | None:
@@ -3362,20 +3286,6 @@ class FeeController:
                 prior_std = max(50, (max_fee - min_fee) // 2)
             else:
                 prior_std = max(50, median_fee // 2)
-
-            # Hive quality signal: high-quality peers get tighter priors (faster convergence)
-            if self.hive_hints:
-                try:
-                    quality_getter = getattr(self.hive_hints, "get_peer_quality_score", None)
-                    quality = quality_getter(peer_id) if callable(quality_getter) else 0.5
-                    if isinstance(quality, (int, float)) and quality > 0:
-                        quality = max(0.0, min(1.0, float(quality)))
-                        # High quality (0.8+) tightens std by up to 40%.
-                        # Low quality (0.2-) widens std by up to 30%.
-                        quality_factor = 1.0 - (quality - 0.5) * 0.8  # 0.5->1.0, 1.0->0.6, 0.0->1.4
-                        prior_std = max(30, int(prior_std * quality_factor))
-                except Exception:
-                    pass
 
             return {"mean": median_fee, "std": prior_std}
         except Exception:
@@ -3476,10 +3386,7 @@ class FeeController:
     def _get_neighbor_fee_median(self, peer_id: str, cfg: Optional[Any] = None) -> int | None:
         """Get median fee charged by other nodes to the same peer.
 
-        Uses gossip-based listchannels data only. Hive optimal-fee estimates are
-        intentionally ignored here because they are not direct peer-market
-        samples and must not synchronize unrelated channels around one fleet
-        hint value.
+        Uses gossip-based listchannels data only.
 
         Returns None if insufficient data (need >= 3 neighbors for gossip).
         Result is cached for 30 minutes to avoid expensive calls.
@@ -3515,8 +3422,6 @@ class FeeController:
             weighted_fees = []
             for ch in peer_channels:
                 if ch.get("source") == our_id:
-                    continue
-                if self._is_fleet_sibling(ch.get("source")):
                     continue
                 if not ch.get("active", False):
                     continue
@@ -3558,20 +3463,6 @@ class FeeController:
             return result
         except Exception:
             return None
-
-    def _is_fleet_sibling(self, node_id: Optional[str]) -> bool:
-        """True when a gossip channel's source is another hive fleet member.
-
-        Siblings are allies, not competition: counting their advertised fees
-        in the competitor pools made fleet nodes sharing a peer undercut
-        each other 5-20% per cycle toward the floor (2026-07-03 audit H-1).
-        """
-        if not node_id or not self.hive_hints:
-            return False
-        try:
-            return bool(self.hive_hints.is_hive_member(node_id))
-        except Exception:
-            return False
 
     @staticmethod
     def _is_cln_default_fee(ch: dict) -> bool:
@@ -3623,8 +3514,6 @@ class FeeController:
             fees = []
             for ch in peer_channels:
                 if ch.get("source") == our_id:
-                    continue
-                if self._is_fleet_sibling(ch.get("source")):
                     continue
                 if not ch.get("active", False):
                     continue
@@ -3691,7 +3580,7 @@ class FeeController:
                     continue
                 if ch.get("source") == our_id:
                     our_capacity = max(our_capacity, cap)
-                elif ch.get("active", False) and not self._is_fleet_sibling(ch.get("source")):
+                elif ch.get("active", False):
                     competitor_capacities.append(cap)
 
             if not competitor_capacities or our_capacity <= 0:
@@ -3799,28 +3688,11 @@ class FeeController:
         else:
             balance = "saturated"
 
-        current_hour = self._utc_hour()  # hive peak_hours are UTC (SL-6)
+        current_hour = self._utc_hour()  # time bucket is UTC (SL-6)
         time_bucket = "low" if current_hour < 6 else ("peak" if current_hour >= 18 else "normal")
-        if self.hive_hints:
-            try:
-                confidence = self.hive_hints.get_traffic_confidence(peer_id)
-                peak_hours = self.hive_hints.get_peak_hours(peer_id)
-                if isinstance(confidence, (int, float)) and confidence > 0.5 and peak_hours:
-                    time_bucket = "peak" if current_hour in set(peak_hours) else "normal"
-            except Exception:
-                pass
 
         role = "P"  # Primary by default
-        if self.hive_hints:
-            try:
-                hint_role = str(self.hive_hints.get_corridor_role(peer_id) or "").lower()
-                if hint_role in {"secondary", "edge", "leaf"}:
-                    role = "S"
-                elif hint_role in {"owner", "primary", "hub"}:
-                    role = "P"
-            except Exception:
-                pass
-        elif flow_state in {"sink", "dormant", "unknown"}:
+        if flow_state in {"sink", "dormant", "unknown"}:
             role = "S"
 
         context_key = f"{balance}:{time_bucket}:{role}"
@@ -5769,9 +5641,6 @@ class FeeController:
         corridor_role = "P"
         contextual_sample_used = False
         context_observation_count = 0
-        hive_fee_bias = 1.0
-        temporal_adj = 1.0
-        composite_hint_bias = 1.0
         exploration_multiplier = 1.0
         drain_multiplier = 1.0
         effective_discount_max = float(getattr(cfg, "drain_fee_discount_max", 0.0))
@@ -6400,18 +6269,6 @@ class FeeController:
 
             # Load channel fee state
             ts_state = self._get_channel_fee_state(channel_id, peer_id, actual_fee_ppm=raw_chain_fee)
-            # One-time repair of skewed-era priors while the state is in
-            # hand — resolves at most once per channel, so the sampled
-            # distribution below already reflects the corrected prior.
-            # See _maybe_reseed_skewed_prior.
-            try:
-                self._maybe_reseed_skewed_prior(channel_id, peer_id, ts_state)
-            except Exception as reseed_err:
-                self.plugin.log(
-                    f"PRIOR_RESEED: check failed for {channel_id[:16]}...: "
-                    f"{reseed_err}",
-                    level='debug'
-                )
             observation_count = len(ts_state.thompson.observations)
             sparse_data_conservative = self._is_sparse_data_channel(
                 observation_count=observation_count,
@@ -6623,16 +6480,6 @@ class FeeController:
             )
             raw_dts_target_ppm = int(dts_fee)
             post_pid_target_ppm = int(dts_fee * pid_multiplier)
-            # cl-mycelium retired: no hive fee bias. The temporal multiplier is
-            # still clamped into the documented total-bias authority band (the
-            # clamp is preserved so temporal adjustment behavior is unchanged).
-            temporal_adj = self._get_temporal_fee_adjustment(peer_id)
-            composite_hint_bias = max(
-                self.HIVE_HINT_TOTAL_BIAS_MIN,
-                min(self.HIVE_HINT_TOTAL_BIAS_MAX, temporal_adj),
-            )
-            if composite_hint_bias != 1.0:
-                post_pid_target_ppm = int(post_pid_target_ppm * composite_hint_bias)
             # Drain pressure: bounded discount for stagnant over-local channels
             # ("sell what you're long"). Bias only — min_fee_ppm rails still
             # clamp downstream. Off by default (drain_fee_discount_max=0.0).
@@ -6674,8 +6521,6 @@ class FeeController:
                     f"(multiplier={drain_multiplier:.3f}){node_bias_note}",
                     level='debug'
                 )
-            # Temporal fee adjustment is composed with the hive bias above
-            # (F2): it must share the single +/-10% hint clamp, not stack.
             # Neighbor fee context: soft attraction toward market median
             # Only pull DOWN toward market, never up — being cheaper is fine.
             neighbor_median = self._get_neighbor_fee_median(peer_id, cfg=cfg)
@@ -6734,8 +6579,8 @@ class FeeController:
             # configured mode. "undercut" (default) prices below the median to win
             # volume. "match" targets the median. "premium" prices above the median
             # using the same per-corridor weight that would otherwise undercut —
-            # used in inelastic markets where hive coordination means we retain
-            # volume at higher margins (added 2026-04-21 to close vs-clboss gap).
+            # used in inelastic markets where we retain volume at higher
+            # margins (added 2026-04-21 to close vs-clboss gap).
             if neighbor_market_usable:
                 mode = getattr(cfg, 'market_fee_mode', 'undercut') if cfg else 'undercut'
                 # E-4.1: premium mode inverts the capacity-rank mapping —
@@ -6925,11 +6770,11 @@ class FeeController:
                     level='debug'
                 )
 
-            # Market boundary guard removed: both boundary providers
-            # (_get_market_boundary_fee / _get_hive_market_boundary_fee) are
-            # deprecated hard-None stubs — see their docstrings for the
-            # incident rationale — so the guard/support/downshift consumers
-            # were unreachable dead code and have been deleted.
+            # Market boundary guard removed: the boundary provider
+            # (_get_market_boundary_fee) is a deprecated hard-None stub —
+            # see its docstring for the incident rationale — so the
+            # guard/support/downshift consumers were unreachable dead code
+            # and have been deleted.
 
             # Supported-fee ceiling (2026-06-12): cap the target at headroom
             # above the fee region the earning evidence actually supports.
@@ -7086,13 +6931,12 @@ class FeeController:
             delta_cap_ppm = damping_info["max_delta_ppm"]
             delta_cap_applied = damping_info["cap_applied"]
 
-            hive_tag = f", hive={hive_fee_bias:.2f}" if hive_fee_bias != 1.0 else ""
             zero_flow_tag = (
                 f", guard={zero_flow_guard_reason}" if zero_flow_guard_reason else ""
             )
             decision_reason = (
                 f"dts_pid (dts={dts_fee}, pid={pid_multiplier:.2f}, "
-                f"flow={flow_state_str}{hive_tag}{zero_flow_tag})"
+                f"flow={flow_state_str}{zero_flow_tag})"
             )
 
             # Update volume tracking
@@ -7537,8 +7381,6 @@ class FeeController:
                     "corridor_role": corridor_role,
                     "context_observation_count": context_observation_count,
                     "contextual_sample_used": contextual_sample_used,
-                    "temporal_multiplier": temporal_adj,
-                    "composite_hint_bias": composite_hint_bias,
                     "drain_multiplier": drain_multiplier,
                     "drain_discount_max_effective": effective_discount_max,
                     "node_receivable_ratio": node_receivable_ratio_value,
@@ -8010,29 +7852,15 @@ class FeeController:
     ) -> Optional[Dict[str, Any]]:
         """Select the best available fee prior source for a channel.
 
-        Priority: fleet-informed prior (most reliable — real forward data;
-        read from the cached hint snapshot, no RPC) > network gossip prior >
-        None (caller keeps the defaults).
+        Priority: network gossip prior > None (caller keeps the defaults).
 
         allow_rpc=False skips the network-gossip fallback: that path is an
         uncached listchannels RPC, so per-cycle callers running inside the
-        locked channel loop (see _maybe_reseed_skewed_prior) must not take
-        it. Out-of-cycle callers (set_initial_fee) keep the full chain.
+        locked channel loop must not take it. Out-of-cycle callers
+        (set_initial_fee) keep the full chain.
 
         Returns {"mean", "std", "source"} or None when no source has data.
         """
-        if self.hive_hints:
-            try:
-                fleet_fee = self.hive_hints.get_fleet_fee_prior(peer_id)
-                if fleet_fee and fleet_fee > 0:
-                    return {
-                        "mean": fleet_fee,
-                        "std": self.FLEET_PRIOR_STD_PPM,
-                        "source": "fleet",
-                    }
-            except Exception:
-                pass
-
         if not allow_rpc:
             return None
 
@@ -8044,83 +7872,6 @@ class FeeController:
                 "source": "network",
             }
         return None
-
-    def _maybe_reseed_skewed_prior(
-        self,
-        channel_id: str,
-        peer_id: str,
-        fee_state: 'ChannelFeeState',
-    ) -> bool:
-        """One-time-per-channel Thompson prior re-seed (skewed-prior repair).
-
-        Channels opened while get_fleet_fee_prior returned a skewed
-        fleet_fee_median had their PERSISTENT priors seeded from that skew
-        (set_initial_fee, audit F5). Active channels self-correct through
-        observations, but quiet channels (< MIN_OBSERVATIONS) keep sampling
-        around the bad prior forever.
-
-        Called from the fee cycle where the channel's state is already in
-        hand (cheap: the fleet prior getter reads the cached hint snapshot;
-        no new RPC — allow_rpc=False skips the uncached gossip fallback,
-        which is fine because the skew era seeded priors FROM the fleet
-        median, so the affected population has fleet priors). When the
-        state has fewer than MIN_OBSERVATIONS observations and its
-        prior_mean_fee diverges by more than PRIOR_RESEED_SKEW_FRAC from the
-        CURRENT best prior source (same selection helper as
-        set_initial_fee), the prior is re-seeded and one durable nudge
-        recorded, mirroring initial-fee seeding.
-
-        The check resolves AT MOST ONCE per channel: thompson.reseeded_at is
-        stamped and persisted whenever a prior source was available — whether
-        or not a correction was applied — so this never becomes recurring
-        per-cycle work. If no source has data yet (e.g. hint snapshot not
-        warmed), the marker is left unset and the check retries next cycle.
-
-        Returns True when the prior was actually re-seeded.
-        """
-        ts = getattr(fee_state, "thompson", None)
-        if not isinstance(ts, GaussianThompsonState):
-            return False
-        if getattr(ts, "reseeded_at", 0):
-            return False  # Already resolved — at most once per channel
-        if len(ts.observations) >= GaussianThompsonState.MIN_OBSERVATIONS:
-            # Active channel: the posterior is observation-driven, the
-            # prior no longer matters enough to touch.
-            return False
-
-        try:
-            prior = self._select_best_fee_prior(
-                peer_id, channel_id, allow_rpc=False
-            )
-        except Exception:
-            prior = None
-        if not prior:
-            return False  # No evidence available yet; retry next cycle
-
-        best_mean = float(prior["mean"])
-        if best_mean <= 0:
-            return False
-
-        current_mean = float(ts.prior_mean_fee)
-        reseeded = False
-        if abs(current_mean - best_mean) > best_mean * self.PRIOR_RESEED_SKEW_FRAC:
-            ts.prior_mean_fee = prior["mean"]
-            ts.prior_std_fee = prior["std"]
-            ts.record_posterior_nudge(
-                best_mean, self.INITIAL_PRIOR_NUDGE_WEIGHT
-            )
-            reseeded = True
-            self.plugin.log(
-                f"PRIOR_RESEED: {channel_id[:16]}... prior_mean "
-                f"{int(current_mean)} -> {prior['mean']} ppm "
-                f"({prior['source']} prior; "
-                f"{len(ts.observations)} observations)",
-                level='info'
-            )
-
-        ts.reseeded_at = int(time.time())
-        self._save_channel_fee_state(channel_id, fee_state)
-        return reseeded
 
     def set_initial_fee(self, channel_id: str, peer_id: str) -> Optional[Dict[str, Any]]:
         """

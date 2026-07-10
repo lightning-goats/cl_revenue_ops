@@ -220,8 +220,8 @@ class TestSetChannelFeeLimits:
 
         assert _setchannel_kwargs(mock_plugin)["feeppm"] == 1
 
-    def test_force_operator_set_overrides_hive_zero_fee(self, mock_plugin, mock_database):
-        # DD6/DEF-081: an explicit operator force=true set-fee on a hive peer
+    def test_force_operator_set_wins(self, mock_plugin, mock_database):
+        # DD6/DEF-081: an explicit operator force=true set-fee
         # applies the operator's fee (clamped to [min,max] per DD2), NOT the
         # automatic fleet zero-fee policy.
         from modules.config import Config
@@ -242,15 +242,6 @@ class TestSetChannelFeeLimits:
 
         fc = FeeController(mock_plugin, cfg, mock_database)
         fc.data_service = _make_data_service(mock_plugin)
-        fc.hive_hints = MagicMock()
-        fc.hive_hints.get_membership_status.return_value = {
-            "peer_id": peer_id,
-            "known": True,
-            "member": True,
-            "fresh": True,
-            "usable": True,
-            "source": "datastore",
-        }
 
         # Mirror the revenue-set-fee force=true call path: manual operator set,
         # economic clamp bypassed, force flag set.
@@ -260,7 +251,7 @@ class TestSetChannelFeeLimits:
 
         assert result["success"] is True
         call_kwargs = _setchannel_kwargs(mock_plugin)
-        # Operator's explicit fee wins over hive-zero.
+        # Operator's explicit fee wins.
         assert call_kwargs["feeppm"] == 250
         assert result["fee_ppm"] == 250
 
@@ -935,8 +926,7 @@ class TestSetInitialFeePersistentPriorSeeding:
     CHANNEL_ID = "123x456x0"
     PEER_ID = "02" + "a" * 64
 
-    def _make_controller(self, mock_plugin, mock_database,
-                         fleet_fee=None, network_prior=None):
+    def _make_controller(self, mock_plugin, mock_database, network_prior=None):
         from modules.config import Config
         from modules.fee_controller import FeeController
 
@@ -957,41 +947,21 @@ class TestSetInitialFeePersistentPriorSeeding:
         fc = FeeController(mock_plugin, cfg, mock_database)
         fc.data_service = _make_data_service(mock_plugin)
 
-        if fleet_fee is not None:
-            hints = MagicMock()
-            hints.is_hive_member.return_value = False
-            hints.get_fleet_fee_prior.return_value = fleet_fee
-            fc.hive_hints = hints
-        else:
-            fc.hive_hints = None
         fc._get_network_fee_prior = MagicMock(return_value=network_prior)
         return fc
-
-    def test_fleet_prior_seeds_persistent_state(self, mock_plugin, mock_database):
-        """Fleet prior of 2500 must land in the PERSISTENT thompson state
-        (mean=2500, std=80) with a durable posterior_bias entry."""
-        fc = self._make_controller(mock_plugin, mock_database, fleet_fee=2500)
-        result = fc.set_initial_fee(self.CHANNEL_ID, self.PEER_ID)
-
-        assert result is not None
-        state = fc._channel_fee_states.get(self.CHANNEL_ID)
-        assert state is not None, "Persistent fee state was never created"
-        assert state.thompson.prior_mean_fee == 2500
-        # std=80, NOT the throwaway's hardcoded 50: an unweighted corridor
-        # median doesn't justify near-converged confidence.
-        assert state.thompson.prior_std_fee == 80
-        targets = [entry[0] for entry in state.thompson.posterior_bias]
-        assert 2500.0 in targets, "Durable nudge toward the prior missing"
 
     def test_seeded_state_pulls_first_cycle_sample_toward_prior(
         self, mock_plugin, mock_database
     ):
         """First regular cycle's sample must be measurably pulled toward the
-        fleet prior compared to an unseeded control (fixed seed)."""
+        seeded prior compared to an unseeded control (fixed seed)."""
         import random
         from modules.fee_controller import GaussianThompsonState
 
-        fc = self._make_controller(mock_plugin, mock_database, fleet_fee=2500)
+        fc = self._make_controller(
+            mock_plugin, mock_database,
+            network_prior={"mean": 2500, "std": 80},
+        )
         fc.set_initial_fee(self.CHANNEL_ID, self.PEER_ID)
 
         seeded = fc._channel_fee_states[self.CHANNEL_ID].thompson
@@ -1006,7 +976,7 @@ class TestSetInitialFeePersistentPriorSeeding:
             f"Seeded sample {seeded_fee} not pulled toward 2500 "
             f"vs control {control_fee}"
         )
-        assert seeded_fee > 1500, "Seeded sample should be near the fleet prior"
+        assert seeded_fee > 1500, "Seeded sample should be near the seeded prior"
 
     def test_gossip_prior_seeds_persistent_state_with_own_std(
         self, mock_plugin, mock_database
@@ -1015,7 +985,7 @@ class TestSetInitialFeePersistentPriorSeeding:
         state keeping its own quality-adjusted std."""
         fc = self._make_controller(
             mock_plugin, mock_database,
-            fleet_fee=None, network_prior={"mean": 700, "std": 120},
+            network_prior={"mean": 700, "std": 120},
         )
         fc.set_initial_fee(self.CHANNEL_ID, self.PEER_ID)
 
@@ -1026,27 +996,13 @@ class TestSetInitialFeePersistentPriorSeeding:
         targets = [entry[0] for entry in state.thompson.posterior_bias]
         assert 700.0 in targets
 
-    def test_fleet_prior_takes_precedence_over_gossip(
-        self, mock_plugin, mock_database
-    ):
-        """Selection order unchanged: fleet > gossip > default."""
-        fc = self._make_controller(
-            mock_plugin, mock_database,
-            fleet_fee=2500, network_prior={"mean": 700, "std": 120},
-        )
-        fc.set_initial_fee(self.CHANNEL_ID, self.PEER_ID)
-
-        state = fc._channel_fee_states[self.CHANNEL_ID]
-        assert state.thompson.prior_mean_fee == 2500
-        assert state.thompson.prior_std_fee == 80
-
     def test_default_prior_path_leaves_persistent_state_unseeded(
         self, mock_plugin, mock_database
     ):
         """No fleet/gossip prior: the persistent state keeps its defaults
         and no posterior_bias entry is recorded."""
         fc = self._make_controller(
-            mock_plugin, mock_database, fleet_fee=None, network_prior=None,
+            mock_plugin, mock_database, network_prior=None,
         )
         result = fc.set_initial_fee(self.CHANNEL_ID, self.PEER_ID)
 
@@ -1060,7 +1016,7 @@ class TestSetInitialFeePersistentPriorSeeding:
         """PASSIVE policy still skips entirely — no fee set, no seeding."""
         from modules.policy_manager import PolicyManager, FeeStrategy, PeerPolicy
 
-        fc = self._make_controller(mock_plugin, mock_database, fleet_fee=2500)
+        fc = self._make_controller(mock_plugin, mock_database)
         pm = MagicMock(spec=PolicyManager)
         pm.get_policy.return_value = PeerPolicy(
             peer_id=self.PEER_ID, strategy=FeeStrategy.PASSIVE
@@ -1077,7 +1033,7 @@ class TestSetInitialFeePersistentPriorSeeding:
         """STATIC policy sets its target without touching the thompson prior."""
         from modules.policy_manager import PolicyManager, FeeStrategy, PeerPolicy
 
-        fc = self._make_controller(mock_plugin, mock_database, fleet_fee=2500)
+        fc = self._make_controller(mock_plugin, mock_database)
         pm = MagicMock(spec=PolicyManager)
         pm.get_policy.return_value = PeerPolicy(
             peer_id=self.PEER_ID, strategy=FeeStrategy.STATIC, fee_ppm_target=250
