@@ -43,6 +43,13 @@ def _parse_layer_names(csv: str) -> List[str]:
 
 
 DEFAULT_ASKRENE_LAYERS = "standalone"
+# askrene's MCF runtime grows with amount and graph size: measured on lnnode
+# (153MB gossip store, idle 4-core box) a circular 500k-sat query takes
+# ~6-8s and a 2M-sat query ~16s — right past the global 15s RPC ceiling,
+# so every large-pair pricing call timed out deterministically
+# (the steady "RPC timeout after 15s on getroutes" trickle). The RPC proxy
+# accepts a per-call ceiling extension for exactly this case.
+GETROUTES_RPC_TIMEOUT_SECONDS = 45
 ASKRENE_STANDALONE_LAYER_VALUES = frozenset({
     "none",
     "off",
@@ -451,7 +458,11 @@ class RebalanceRouterV3:
                 "final_cltv": required_final_cltv,
             }
             if self.data_service is not None:
-                result = self.data_service.get_routes(**route_kwargs)
+                # timeout extends the RPC proxy ceiling only; DataService
+                # strips it before the payload reaches CLN's strict schema.
+                result = self.data_service.get_routes(
+                    timeout=GETROUTES_RPC_TIMEOUT_SECONDS, **route_kwargs
+                )
             else:
                 result = self.plugin.rpc.getroutes(**route_kwargs)
         except Exception as e:
