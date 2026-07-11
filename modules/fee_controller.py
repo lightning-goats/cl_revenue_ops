@@ -2759,12 +2759,62 @@ class FeeController:
     # the controller already computes.
     SATURATED_OUTBOUND_RATIO = 0.85
 
+    # Flow-aware exemption from the saturated carve-out (2026-07-11, live
+    # finding on lnnode): a channel can sit at 94-97% local while turning
+    # over multiples of its capacity per week with in ~= out. That is a
+    # BALANCED ROUTER, not stuck inventory — inbound refills whatever the
+    # discount drains, so pricing below the floor cannot reduce the balance;
+    # it only gives margin away on volume that flows anyway (observed:
+    # effective earned ~50-78ppm vs 15-36ppm advertised). Exempt such
+    # channels from the carve-out; genuinely draining (out >> in) and dead
+    # (no turnover) channels keep it.
+    FLOW_BALANCED_WINDOW_SECONDS = 7 * 86400
+    FLOW_BALANCED_MAX_NET_RATIO = 0.33      # |out-in| / (out+in) below this = balanced
+    FLOW_BALANCED_MIN_WEEKLY_TURNOVER = 0.25  # (out+in) / capacity per window
+    _FLOW_WINDOW_CACHE_TTL = 900
+
+    def _get_flow_window_map(self) -> Optional[Dict[str, Tuple[int, int, int]]]:
+        """7d directional flow per channel, batch-fetched and cycle-cached."""
+        now = time.time()
+        cached = getattr(self, "_flow_window_cache", None)
+        if cached is not None and (now - cached[0]) < self._FLOW_WINDOW_CACHE_TTL:
+            return cached[1]
+        window_map = None
+        try:
+            batch_fn = getattr(self.database, "get_all_channel_flow_windows", None)
+            if callable(batch_fn):
+                candidate = batch_fn(int(now) - self.FLOW_BALANCED_WINDOW_SECONDS)
+                if isinstance(candidate, dict):
+                    window_map = candidate
+        except Exception:
+            window_map = None
+        self._flow_window_cache = (now, window_map)
+        return window_map
+
+    def _is_flow_balanced_router(self, channel_id: str, capacity_sats: int) -> bool:
+        """True when recent flow shows this channel self-balances at volume."""
+        if not channel_id or capacity_sats <= 0:
+            return False
+        window_map = self._get_flow_window_map()
+        if not window_map:
+            return False
+        out_sats, in_sats, _count = window_map.get(channel_id, (0, 0, 0))
+        gross = out_sats + in_sats
+        if gross <= 0:
+            return False
+        if gross < capacity_sats * self.FLOW_BALANCED_MIN_WEEKLY_TURNOVER:
+            return False
+        net_ratio = abs(out_sats - in_sats) / gross
+        return net_ratio <= self.FLOW_BALANCED_MAX_NET_RATIO
+
     def _effective_min_fee_ppm(
         self,
         cfg: Any,
         *,
         flow_state: Optional[str] = None,
         outbound_ratio: Optional[float] = None,
+        channel_id: Optional[str] = None,
+        capacity_sats: int = 0,
     ) -> int:
         """Class-aware config min-fee floor (E-2, operator-approved).
 
@@ -2796,6 +2846,11 @@ class FeeController:
         except (TypeError, ValueError):
             is_saturated = False
         if is_source or is_saturated:
+            # Flow-aware exemption: a high-local channel whose recent flow
+            # is balanced at healthy turnover is a self-refilling router —
+            # the discount cannot drain it, so keep the normal floor.
+            if channel_id and self._is_flow_balanced_router(channel_id, capacity_sats):
+                return base
             return sat_floor
         return base
 
@@ -5753,7 +5808,8 @@ class FeeController:
         # floor, flow bias, vegas multiplier and REBALANCE_FLOOR below still
         # compose exactly as before (max), so cost recovery never drops.
         effective_min_fee_ppm = self._effective_min_fee_ppm(
-            cfg, flow_state=flow_state, outbound_ratio=outbound_ratio
+            cfg, flow_state=flow_state, outbound_ratio=outbound_ratio,
+            channel_id=channel_id, capacity_sats=capacity,
         )
         opener = channel_info.get("opener", "local")
         base_floor_ppm = self._calculate_floor(capacity, chain_costs=chain_costs, peer_id=peer_id, opener=opener)

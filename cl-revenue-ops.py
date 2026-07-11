@@ -1108,7 +1108,10 @@ plugin.add_option(
         'Class-aware min-fee floor (PPM) for channels classified saturated '
         '(outbound >= 85% of capacity) or source. Applied only when set '
         'BELOW revenue-ops-min-fee-ppm; 0 (default) allows true cheap '
-        'egress on saturated edges. Cost-recovery floors still apply.'
+        'egress on saturated edges. Cost-recovery floors still apply. '
+        'Flow-aware exemption: high-local channels whose 7d flow is '
+        'balanced at healthy turnover (self-refilling routers the discount '
+        'cannot drain) keep the normal min-fee-ppm floor.'
     ),
     dynamic=True
 )

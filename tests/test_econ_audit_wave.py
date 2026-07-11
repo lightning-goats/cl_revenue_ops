@@ -386,6 +386,72 @@ class TestEffectiveMinFeePpm:
         assert fc._effective_min_fee_ppm(cfg, flow_state="balanced", outbound_ratio=boundary) == 0
         assert fc._effective_min_fee_ppm(cfg, flow_state="balanced", outbound_ratio=boundary - 0.01) == 50
 
+    # -- Flow-aware exemption (2026-07-11): balanced routers keep the floor --
+
+    def _fc_with_flows(self, mock_plugin, mock_database, windows):
+        fc = self._fc(mock_plugin, mock_database)
+        mock_database.get_all_channel_flow_windows.side_effect = (
+            lambda since: dict(windows)
+        )
+        return fc
+
+    def test_flow_balanced_router_keeps_global_floor(self, mock_plugin, mock_database):
+        """94% local but in ~= out at high turnover: the discount cannot
+        drain it, so the saturated carve-out must not apply."""
+        fc = self._fc_with_flows(
+            mock_plugin, mock_database,
+            {"931199x1231x0": (18_000_000, 19_000_000, 200)},  # 3.7x weekly turnover, net ~3%
+        )
+        cfg = self._cfg(min_fee=50, sat_floor=0)
+        assert fc._effective_min_fee_ppm(
+            cfg, flow_state="balanced", outbound_ratio=0.94,
+            channel_id="931199x1231x0", capacity_sats=10_000_000,
+        ) == 50
+
+    def test_truly_draining_channel_keeps_carve_out(self, mock_plugin, mock_database):
+        """out >> in: the discount is working — carve-out stays."""
+        fc = self._fc_with_flows(
+            mock_plugin, mock_database,
+            {"100x1x0": (8_000_000, 500_000, 40)},  # heavy net outflow
+        )
+        cfg = self._cfg(min_fee=50, sat_floor=0)
+        assert fc._effective_min_fee_ppm(
+            cfg, flow_state="balanced", outbound_ratio=0.94,
+            channel_id="100x1x0", capacity_sats=10_000_000,
+        ) == 0
+
+    def test_dead_saturated_channel_keeps_carve_out(self, mock_plugin, mock_database):
+        """No turnover at all: nothing to protect — carve-out stays."""
+        fc = self._fc_with_flows(mock_plugin, mock_database, {})
+        cfg = self._cfg(min_fee=50, sat_floor=0)
+        assert fc._effective_min_fee_ppm(
+            cfg, flow_state="balanced", outbound_ratio=0.97,
+            channel_id="200x1x0", capacity_sats=5_000_000,
+        ) == 0
+
+    def test_low_turnover_balanced_keeps_carve_out(self, mock_plugin, mock_database):
+        """Tiny balanced flow is not evidence of a self-refilling router."""
+        fc = self._fc_with_flows(
+            mock_plugin, mock_database,
+            {"300x1x0": (100_000, 110_000, 3)},  # 4% weekly turnover
+        )
+        cfg = self._cfg(min_fee=50, sat_floor=0)
+        assert fc._effective_min_fee_ppm(
+            cfg, flow_state="balanced", outbound_ratio=0.95,
+            channel_id="300x1x0", capacity_sats=5_000_000,
+        ) == 0
+
+    def test_source_class_also_gets_flow_exemption(self, mock_plugin, mock_database):
+        fc = self._fc_with_flows(
+            mock_plugin, mock_database,
+            {"400x1x0": (3_000_000, 2_800_000, 60)},
+        )
+        cfg = self._cfg(min_fee=50, sat_floor=0)
+        assert fc._effective_min_fee_ppm(
+            cfg, flow_state="source", outbound_ratio=0.50,
+            channel_id="400x1x0", capacity_sats=5_000_000,
+        ) == 50
+
 
 class TestSaturatedFloorPipeline:
     """Floor stack + execution clamp honor the class floor end-to-end."""

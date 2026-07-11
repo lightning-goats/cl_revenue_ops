@@ -48,6 +48,9 @@
 # >= 85% of capacity) or source. Applied only when set BELOW min-fee-ppm; 0
 # (default) allows true cheap egress on saturated edges. Cost-recovery floors
 # still apply.
+# NOTE: high-local channels whose recent flow is BALANCED at healthy
+# turnover (in ~= out; self-refilling routers) are exempt — the discount
+# cannot drain them, so they keep the normal min-fee-ppm floor.
 #revenue-ops-min-fee-ppm-saturated=0
 
 # Fee ceiling - maximum fee rate
