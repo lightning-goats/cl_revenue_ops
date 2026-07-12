@@ -81,6 +81,7 @@ Seed catalog (code → owning layer → kind):
 |---|---|---|
 | BUDGET_EXHAUSTED | governor | rejection |
 | AUTHORITY_LEVEL_BLOCKED | governor | rejection |
+| PAUSED | governor | rejection |
 | INTENT_STALE | arbiter | deferral |
 | INTENT_SUPERSEDED | arbiter | rejection |
 | CHANNEL_PROTECTED | governor | rejection |
