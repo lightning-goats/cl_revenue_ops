@@ -130,7 +130,8 @@ class EconShadow:
                         idempotency_key=env.idempotency_key,
                         cycle_id=env.snapshot_id,
                         at=int(now),
-                        details={"explanation": env.explanation.render()},
+                        details={"explanation": env.explanation.render(),
+                                 "target": env.target},
                     )
                     recorded += 1
                 except Exception as e:

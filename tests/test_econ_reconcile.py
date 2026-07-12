@@ -119,6 +119,50 @@ def test_apply_then_reconcile_is_clean(ledger):
     assert state.reserved_msat == {"c" * 64: 5_000, "d" * 64: 7_000}
 
 
+class TestFeeIntentCompleteness:
+    def _intent(self, ledger, cycle_ts, n=1):
+        for i in range(n):
+            ledger.append(
+                event_type="intent_proposed", intent_id=f"int-{cycle_ts}-{i}",
+                idempotency_key=f"{cycle_ts:032d}{i:032d}",
+                cycle_id=f"fee-cycle-{cycle_ts}", at=cycle_ts, details={})
+
+    def test_complete_capture(self, ledger):
+        self._intent(ledger, NOW - 1800, n=4)
+        self._intent(ledger, NOW, n=2)
+        changes = ([{"timestamp": NOW - 1800}] * 4
+                   + [{"timestamp": NOW + 3}] * 2)  # rows a moment later
+        from modules.econ_reconcile import fee_intent_completeness
+        result = fee_intent_completeness(ledger, changes, now=NOW)
+        assert result["complete"] is True
+        assert result["cycles_checked"] == 2
+
+    def test_missing_cycle_flagged(self, ledger):
+        self._intent(ledger, NOW - 3600, n=4)
+        changes = ([{"timestamp": NOW - 3600}] * 4
+                   + [{"timestamp": NOW}] * 3)  # cycle never journaled
+        from modules.econ_reconcile import fee_intent_completeness
+        result = fee_intent_completeness(ledger, changes, now=NOW)
+        assert result["complete"] is False
+        assert result["mismatched_cycles"][str(NOW)] == {
+            "fee_changes": 3, "intents": 0}
+
+    def test_pre_shadow_history_out_of_scope(self, ledger):
+        self._intent(ledger, NOW, n=2)
+        changes = ([{"timestamp": NOW - 50_000}] * 5  # pre-shadow
+                   + [{"timestamp": NOW}] * 2)
+        from modules.econ_reconcile import fee_intent_completeness
+        result = fee_intent_completeness(ledger, changes, now=NOW)
+        assert result["complete"] is True
+        assert result["cycles_checked"] == 1
+
+    def test_no_intent_data(self, ledger):
+        from modules.econ_reconcile import fee_intent_completeness
+        result = fee_intent_completeness(ledger, [{"timestamp": NOW}],
+                                         now=NOW)
+        assert result["status"] == "no_intent_data"
+
+
 def test_apply_skips_quarantined(ledger):
     _append(ledger, "budget_reserved", amounts={"reserved_msat": 3_000},
             at=NOW - 7200)

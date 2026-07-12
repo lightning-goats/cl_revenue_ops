@@ -123,6 +123,18 @@ class EconLedger:
             conn.commit()
             return int(cur.lastrowid)
 
+    def count_events(self, event_type: str = None) -> int:
+        """Durable event count (optionally by type)."""
+        with self._connect() as conn:
+            if event_type is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM econ_ledger_events").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM econ_ledger_events "
+                    "WHERE event_type = ?", (event_type,)).fetchone()
+            return int(row[0])
+
     def events(self, since_id: int = 0) -> list:
         with self._connect() as conn:
             rows = conn.execute(

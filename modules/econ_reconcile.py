@@ -132,6 +132,62 @@ def reconcile(ledger: EconLedger, db_states: Dict[str, dict], now: int,
     )
 
 
+def fee_intent_completeness(ledger: EconLedger, fee_changes: list,
+                            now: int, window_seconds: int = 86400,
+                            tolerance_seconds: int = 120) -> dict:
+    """Compare authoritative fee_changes rows against ledgered fee
+    intents per cycle (the manual cross-check that exposed the
+    2026-07-12 thread-affinity capture loss, automated).
+
+    Only cycles AFTER the first ledgered fee intent are judged —
+    pre-shadow history is out of scope. Cycle timestamps are matched
+    with a tolerance because the journal stamp and the fee_changes rows
+    are written seconds apart within one cycle.
+    """
+    intents_by_ts: dict = {}
+    for event in ledger.events():
+        if event["event_type"] != "intent_proposed":
+            continue
+        cycle = str(event["cycle_id"])
+        if not cycle.startswith("fee-cycle-"):
+            continue
+        try:
+            ts = int(cycle.rsplit("-", 1)[1])
+        except ValueError:
+            continue
+        intents_by_ts[ts] = intents_by_ts.get(ts, 0) + 1
+
+    if not intents_by_ts:
+        return {"status": "no_intent_data", "cycles_checked": 0,
+                "complete": None, "mismatched_cycles": {}}
+
+    window_start = max(int(now) - int(window_seconds),
+                       min(intents_by_ts))
+    changes_by_ts: dict = {}
+    for row in fee_changes or []:
+        ts = int(row.get("timestamp", 0) or 0)
+        if ts >= window_start:
+            changes_by_ts[ts] = changes_by_ts.get(ts, 0) + 1
+
+    mismatched = {}
+    for change_ts in sorted(changes_by_ts):
+        matched_intents = sum(
+            count for intent_ts, count in intents_by_ts.items()
+            if abs(intent_ts - change_ts) <= tolerance_seconds)
+        if matched_intents != changes_by_ts[change_ts]:
+            mismatched[str(change_ts)] = {
+                "fee_changes": changes_by_ts[change_ts],
+                "intents": matched_intents,
+            }
+    return {
+        "status": "ok",
+        "window_start": window_start,
+        "cycles_checked": len(changes_by_ts),
+        "complete": not mismatched,
+        "mismatched_cycles": mismatched,
+    }
+
+
 def apply(ledger: EconLedger, report: ReconciliationReport,
           now: int) -> int:
     """Append one reconciliation_completed event per RESOLVABLE

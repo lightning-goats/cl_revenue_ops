@@ -5728,11 +5728,20 @@ def revenue_econ_snapshot(plugin: Plugin) -> Dict[str, Any]:
                 config.snapshot() if config else object(),
                 "receivable_ratio_target", 0.0) or 0.0),
         )
+        intents_durable = None
+        try:
+            _ledger = econ_shadow.ledger_for_reconciliation()
+            if _ledger is not None:
+                intents_durable = _ledger.count_events("intent_proposed")
+        except Exception:
+            pass
         return {
             "enabled": True,
             "snapshot": wire,
             "approximations": approximations,
+            # Session counter (resets on reload) + durable ledger count.
             "intents_recorded_total": econ_shadow.intents_recorded_total,
+            "intents_ledger_total": intents_durable,
         }
     except Exception as e:
         return {"enabled": True, "error": str(e)}
@@ -5774,6 +5783,14 @@ def revenue_econ_reconcile(plugin: Plugin, apply: bool = False,
                 for d in report.divergences
             ],
         }
+        try:
+            recent_changes = database.get_recent_fee_changes(limit=500)
+            result["fee_intent_completeness"] = (
+                econ_reconcile.fee_intent_completeness(
+                    ledger, recent_changes, now=int(time.time())))
+        except Exception as completeness_err:
+            result["fee_intent_completeness"] = {
+                "status": "error", "error": str(completeness_err)}
         if apply:
             result["applied"] = econ_reconcile.apply(
                 ledger, report, now=int(time.time()))
