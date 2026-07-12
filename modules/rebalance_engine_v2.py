@@ -139,6 +139,9 @@ class RebalanceEngine:
         self.config = config
         self.database = database
         self._policy_manager = policy_manager
+        # Phase 2C: optional shadow-governor (EconShadow), injected at
+        # plugin init; None = no shadow. Fail-open by contract.
+        self.econ_shadow = None
         self._capex_engine = capex_engine
         self._profitability = profitability
         self._data_service = data_service
@@ -1934,6 +1937,17 @@ class RebalanceEngine:
         # the authoritative cross-category rail.
         budget_limit = max(0, effective_budget)
 
+        # Phase 2D (docs/planning/2026-07-12-refactor-phase2-governed-
+        # rebalance.md): flag-gated authorization boundary. The strict
+        # `is True` check keeps MagicMock/absent snapshots on the legacy
+        # path. When governed, the SAME reserve_budget call runs as the
+        # governor's delegate — identical accounting, new gate.
+        if getattr(cfg, "econ_governor_rebalance_enabled", False) is True:
+            return self._governed_reserve_execution_budget(
+                pair, reservation_id=reservation_id,
+                max_fee_sats=max_fee_sats, cfg=cfg,
+                budget_limit=budget_limit, since_ts=since_ts, now=now)
+
         try:
             reserved, remaining = self.database.reserve_budget(
                 reservation_id=reservation_id,
@@ -1956,6 +1970,12 @@ class RebalanceEngine:
                 route_type=self._executor_mode(),
             )
 
+        # Phase 2C shadow (docs/planning/2026-07-12-refactor-phase2-
+        # governed-rebalance.md): record the governor's parallel verdict
+        # on this real reservation decision. Fail-open by contract.
+        self._shadow_authorize_reservation(
+            pair, max_fee_sats, reserved, remaining, budget_limit, cfg, now)
+
         if reserved:
             return True, None
 
@@ -1968,6 +1988,145 @@ class RebalanceEngine:
             ),
             route_type=self._executor_mode(),
         )
+
+    def _governed_reserve_execution_budget(self, pair, *, reservation_id,
+                                           max_fee_sats, cfg, budget_limit,
+                                           since_ts, now):
+        """Phase 2D: GovernorFacade.authorize() is the reservation gate.
+
+        The facade delegates to the SAME Database.reserve_budget call
+        (closure below), reserving under the caller's reservation_id so
+        the legacy release/spent finish paths work unchanged. Any
+        internal error FAILS CLOSED — no spend without authorization.
+        """
+        amount = int(getattr(pair, "amount_sats", 0) or 0)
+        try:
+            from .econ_intents import Explanation, make_intent
+            from .econ_types import Micro, Msat, SignedMsat, UnixTime
+            from .governor_facade import GovernorFacade
+
+            outcome = {}
+
+            def _reserve_delegate(**_facade_kwargs):
+                reserved, remaining = self.database.reserve_budget(
+                    reservation_id=reservation_id,
+                    amount_sats=max_fee_sats,
+                    channel_id=pair.dest_channel_id,
+                    budget_limit=budget_limit,
+                    since_timestamp=since_ts,
+                    weekly_budget_limit=getattr(
+                        cfg, "weekly_budget_sats", None),
+                    weekly_since_timestamp=int(now) - 7 * 86400,
+                )
+                outcome["remaining"] = remaining
+                return bool(reserved)
+
+            ledger = None
+            shadow = getattr(self, "econ_shadow", None)
+            if shadow is not None:
+                try:
+                    ledger = shadow.ledger_for_reconciliation()
+                except Exception:
+                    ledger = None
+
+            facade = GovernorFacade(
+                reserve_spend=_reserve_delegate,
+                release_spend=self.database.release_budget_reservation,
+                is_paused=lambda: getattr(cfg, "paused", False) is True,
+                ledger=ledger,
+            )
+            env = make_intent(
+                intent_type="REBALANCE",
+                snapshot_id=f"rebalance-cycle-{int(now)}",
+                created_at=UnixTime(int(now)),
+                expires_at=UnixTime(int(now) + 600),
+                target=str(pair.dest_channel_id),
+                amount_msat=Msat(amount * 1000),
+                expected_benefit_msat=SignedMsat(0),
+                max_cost_msat=Msat(int(max_fee_sats) * 1000),
+                capital_committed_msat=Msat(amount * 1000),
+                confidence_micro=Micro(0),
+                reason_codes=(),
+                explanation=Explanation("rebalance_reservation", (
+                    ("source", str(pair.source_channel_id)),
+                    ("dest", str(pair.dest_channel_id)),
+                    ("amount_sats", amount),
+                    ("max_fee_sats", int(max_fee_sats)),
+                )),
+                preconditions=(),
+                priority=50,
+                budget_bucket="rebalance",
+                origin_policy="rebalance_engine_governed",
+                reversible=False,
+            )
+            if ledger is not None:
+                try:
+                    ledger.append(
+                        event_type="intent_proposed",
+                        intent_id=env.intent_id.value,
+                        idempotency_key=env.idempotency_key,
+                        cycle_id=env.snapshot_id,
+                        at=int(now),
+                        details={"target": env.target, "governed": True},
+                    )
+                except Exception:
+                    pass
+
+            decision = facade.authorize(env, int(now))
+            if decision.authorized:
+                return True, None
+            if decision.reason_code == "BUDGET_EXHAUSTED":
+                remaining = outcome.get("remaining", 0)
+                return False, ExecutionResult(
+                    success=False,
+                    amount_sats=amount,
+                    error=(
+                        f"local_budget_block: {remaining} sats remaining "
+                        f"of {budget_limit} unified budget"
+                    ),
+                    route_type=self._executor_mode(),
+                )
+            return False, ExecutionResult(
+                success=False,
+                amount_sats=amount,
+                error=f"governor_block: {decision.reason_code}",
+                route_type=self._executor_mode(),
+            )
+        except Exception as exc:
+            # Fail CLOSED: an authorization-path failure must never allow
+            # an ungoverned spend.
+            self._log(
+                f"governed reservation failed closed for "
+                f"{getattr(pair, 'source_channel_id', '?')}->"
+                f"{getattr(pair, 'dest_channel_id', '?')}: {exc}",
+                level="warn",
+            )
+            return False, ExecutionResult(
+                success=False,
+                amount_sats=amount,
+                error=f"governor_block: internal_error ({exc})",
+                route_type=self._executor_mode(),
+            )
+
+    def _shadow_authorize_reservation(self, pair, max_fee_sats, reserved,
+                                      remaining, budget_limit, cfg, now):
+        """Phase 2C: guarded shadow-governor hook; never affects the
+        legacy decision above."""
+        shadow = getattr(self, "econ_shadow", None)
+        if shadow is None:
+            return
+        try:
+            shadow.shadow_authorize_rebalance(
+                pair=pair,
+                max_fee_sats=max_fee_sats,
+                legacy_reserved=bool(reserved),
+                remaining_sats=remaining,
+                budget_limit_sats=budget_limit,
+                paused=bool(getattr(cfg, "paused", False) is True),
+                now=int(now),
+            )
+        except Exception as exc:
+            self._log(f"econ shadow skipped: {exc}", level="debug")
 
     def _finish_execution_budget(
         self,

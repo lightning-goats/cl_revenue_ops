@@ -193,6 +193,69 @@ class TestSpendJournal:
         shadow.note_spend_released(object())  # type: ignore[arg-type]
 
 
+class TestShadowAuthorizeRebalance:
+    """Phase 2C: parallel governor verdict on real rebalance decisions."""
+
+    def _pair(self):
+        return SimpleNamespace(
+            source_channel_id="100x1x0", dest_channel_id="200x1x0",
+            source_peer_id="02" + "a" * 64, dest_peer_id="02" + "b" * 64,
+            amount_sats=500_000, score=0.298)
+
+    def _call(self, shadow, *, legacy_reserved, remaining=900,
+              paused=False, max_fee=100):
+        shadow.shadow_authorize_rebalance(
+            pair=self._pair(), max_fee_sats=max_fee,
+            legacy_reserved=legacy_reserved, remaining_sats=remaining,
+            budget_limit_sats=1000, paused=paused, now=NOW)
+
+    def _events(self, tmp_path):
+        return EconLedger(str(tmp_path / "econ_ledger.db")).events()
+
+    def test_agreement_authorized(self, tmp_path):
+        shadow = _shadow(tmp_path)
+        self._call(shadow, legacy_reserved=True, remaining=900)
+        events = self._events(tmp_path)
+        assert [e["event_type"] for e in events] == [
+            "intent_proposed", "intent_authorized"]
+        details = events[1]["details"]
+        assert details["shadow"] is True
+        assert details["agrees"] is True
+        assert details["legacy_reserved"] is True
+
+    def test_agreement_budget_rejected(self, tmp_path):
+        shadow = _shadow(tmp_path)
+        self._call(shadow, legacy_reserved=False, remaining=50, max_fee=100)
+        events = self._events(tmp_path)
+        assert events[1]["event_type"] == "intent_rejected"
+        assert events[1]["details"]["reason_code"] == "BUDGET_EXHAUSTED"
+        assert events[1]["details"]["agrees"] is True
+
+    def test_divergence_flagged(self, tmp_path):
+        shadow = _shadow(tmp_path)
+        # Legacy reserved but shadow thinks budget insufficient.
+        self._call(shadow, legacy_reserved=True, remaining=50, max_fee=100)
+        events = self._events(tmp_path)
+        assert events[1]["details"]["agrees"] is False
+        assert events[1]["details"]["approximate_budget_check"] is True
+
+    def test_paused_rejects(self, tmp_path):
+        shadow = _shadow(tmp_path)
+        self._call(shadow, legacy_reserved=False, paused=True)
+        events = self._events(tmp_path)
+        assert events[1]["details"]["reason_code"] == "PAUSED"
+
+    def test_disabled_or_garbage_never_raises(self, tmp_path):
+        shadow = _shadow(tmp_path, enabled=False)
+        self._call(shadow, legacy_reserved=True)
+        assert not (tmp_path / "econ_ledger.db").exists()
+        shadow = _shadow(tmp_path)
+        shadow.shadow_authorize_rebalance(
+            pair=SimpleNamespace(), max_fee_sats=None,
+            legacy_reserved=True, remaining_sats=None,
+            budget_limit_sats=None, paused=False, now=NOW)  # no raise
+
+
 class TestConfigFlag:
     def test_flag_defaults_off_and_is_runtime_settable(self):
         from modules.config import PUBLIC_RUNTIME_KEYS, Config, ConfigSnapshot

@@ -278,6 +278,14 @@ ALLOWLIST = {
         "diagnostic shock (T7, via execute_candidate(reserve_budget=True), P4-020); "
         "full effective budget inside BEGIN IMMEDIATE (P4-016).",
     ),
+    ("rebalance_engine_v2.py", "_reserve_delegate", "reserve_budget"): (
+        ATOMIC_RESERVE, 1,
+        "Phase 2D governed entry (2026-07-12): GovernorFacade delegate closure "
+        "inside _governed_reserve_execution_budget — the SAME atomic "
+        "reserve_budget call as the legacy site above, reserved under the "
+        "caller's reservation_id; active only when "
+        "econ_governor_rebalance_enabled is true.",
+    ),
     # --- Daemon spender 5/6: defibrillation diagnostic shock (T7) -----------
     ("rebalancer.py", "_execute_candidate_v2", "execute_candidate"): (
         ATOMIC_RESERVE, 1,

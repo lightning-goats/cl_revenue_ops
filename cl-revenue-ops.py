@@ -3001,6 +3001,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             policy_manager=policy_manager,
         )
         rebalancer.data_service = data_service
+        # Phase 2C: shadow-governor on real rebalance reservations.
+        try:
+            rebalancer.rebalance_engine_v2.econ_shadow = econ_shadow
+        except Exception:
+            pass
         plugin.log("RebalanceEngine initialized")
 
     if fee_controller is not None:

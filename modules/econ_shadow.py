@@ -209,6 +209,94 @@ class EconShadow:
         self._journal("reservation_released", reservation_id,
                       details={"reason": str(reason)})
 
+    def shadow_authorize_rebalance(self, *, pair: Any, max_fee_sats: Any,
+                                   legacy_reserved: bool,
+                                   remaining_sats: Any,
+                                   budget_limit_sats: Any, paused: bool,
+                                   now: int) -> None:
+        """Phase 2C: record the governor's PARALLEL verdict on a real
+        rebalance reservation decision. The legacy atomic reserve stays
+        authoritative; the shadow's budget check is a read-only
+        approximation of `remaining` and is labeled as such. Never
+        raises."""
+        try:
+            if not self.enabled():
+                return
+            ledger = self._get_ledger()
+            if ledger is None:
+                return
+            max_fee = int(max_fee_sats)
+            env = make_intent(
+                intent_type="REBALANCE",
+                snapshot_id=f"rebalance-cycle-{int(now)}",
+                created_at=UnixTime(int(now)),
+                expires_at=UnixTime(int(now) + 600),
+                target=str(pair.dest_channel_id),
+                amount_msat=Msat(int(pair.amount_sats) * 1000),
+                expected_benefit_msat=SignedMsat(0),
+                max_cost_msat=Msat(max_fee * 1000),
+                capital_committed_msat=Msat(int(pair.amount_sats) * 1000),
+                confidence_micro=Micro(0),
+                reason_codes=(),
+                explanation=Explanation("rebalance_reservation", (
+                    ("source", str(pair.source_channel_id)),
+                    ("dest", str(pair.dest_channel_id)),
+                    ("amount_sats", int(pair.amount_sats)),
+                    ("max_fee_sats", max_fee),
+                    ("score", float(getattr(pair, "score", 0.0) or 0.0)),
+                )),
+                preconditions=(),
+                priority=50,
+                budget_bucket="rebalance",
+                origin_policy="rebalance_engine_shadow",
+                reversible=False,
+            )
+            if paused:
+                verdict, reason = "intent_rejected", "PAUSED"
+            elif remaining_sats is not None \
+                    and max_fee > int(remaining_sats):
+                verdict, reason = "intent_rejected", "BUDGET_EXHAUSTED"
+            else:
+                verdict, reason = "intent_authorized", ""
+            agrees = (verdict == "intent_authorized") == bool(legacy_reserved)
+            ledger.append(
+                event_type="intent_proposed",
+                intent_id=env.intent_id.value,
+                idempotency_key=env.idempotency_key,
+                cycle_id=env.snapshot_id,
+                at=int(now),
+                details={"explanation": env.explanation.render(),
+                         "target": env.target, "shadow": True},
+            )
+            details = {
+                "shadow": True,
+                "legacy_reserved": bool(legacy_reserved),
+                "agrees": agrees,
+                "approximate_budget_check": True,
+                "remaining_sats": (None if remaining_sats is None
+                                   else int(remaining_sats)),
+                "budget_limit_sats": (None if budget_limit_sats is None
+                                      else int(budget_limit_sats)),
+            }
+            if reason:
+                details["reason_code"] = reason
+            ledger.append(
+                event_type=verdict,
+                intent_id=env.intent_id.value,
+                idempotency_key=env.idempotency_key,
+                cycle_id=env.snapshot_id,
+                at=int(now),
+                details=details,
+            )
+            if not agrees:
+                self._log(
+                    f"shadow-authorize DIVERGENCE on {env.target}: "
+                    f"legacy_reserved={legacy_reserved} shadow={verdict} "
+                    f"(remaining={remaining_sats}, max_fee={max_fee})",
+                    level="warn")
+        except Exception as e:
+            self._log(f"shadow_authorize_rebalance failed open: {e}")
+
     def ledger_for_reconciliation(self) -> Optional[EconLedger]:
         """The lazy ledger, for the reconciliation sweep (Phase 2
         pilot B). None when disabled or unavailable."""
