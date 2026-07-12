@@ -77,6 +77,10 @@ PUBLIC_RUNTIME_KEYS = (
     'htlcmax_source_pct',
     'htlcmax_sink_pct',
     'htlcmax_balanced_pct',
+    # Refactor Phase 1 shadow (docs/planning/2026-07-12-refactor-phase1-
+    # wiring.md): observe-mode intent recording + snapshot preview.
+    # Read-only wrt node state; default off.
+    'econ_shadow_enabled',
     # LN+ liquidity swap automation (13 runtime controls)
     'lnplus_swaps_enabled',
     'lnplus_execute_applications',
@@ -142,6 +146,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'htlcmax_source_pct': float,
     'htlcmax_sink_pct': float,
     'htlcmax_balanced_pct': float,
+    'econ_shadow_enabled': bool,
     'expansion_treasury_enabled': bool,
     'expansion_treasury_onchain_target_sats': int,
     'expansion_treasury_min_deficit_sats': int,
@@ -433,6 +438,10 @@ class Config:
     htlcmax_source_pct: float = 0.50
     htlcmax_sink_pct: float = 0.25
     htlcmax_balanced_pct: float = 0.45
+    # Refactor Phase 1 shadow: observe-mode intent recording into
+    # econ_ledger.db + revenue-econ-snapshot preview. Read-only wrt node
+    # state; default off (docs/planning/2026-07-12-refactor-phase1-wiring.md).
+    econ_shadow_enabled: bool = False
     # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
     expansion_treasury_enabled: bool = False
     expansion_treasury_onchain_target_sats: int = 5_000_000
@@ -1145,6 +1154,9 @@ class ConfigSnapshot:
     htlcmax_source_pct: float = 0.50
     htlcmax_sink_pct: float = 0.25
     htlcmax_balanced_pct: float = 0.45
+    # Refactor Phase 1 shadow flag — mirrored from Config (a key missing
+    # from the snapshot reads as absent in production).
+    econ_shadow_enabled: bool = False
     # E-2: class-aware min-fee floor for saturated/source channels (0 =
     # allow true cheap egress). Missing-from-snapshot kills the feature in
     # production (getattr fallback), so it MUST be mirrored here.

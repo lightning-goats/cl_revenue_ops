@@ -147,3 +147,15 @@ class TestSnapshotPreview:
             channels=None, profitability={}, budget={}, now=NOW)
         assert wire is None
         assert approx
+
+
+class TestConfigFlag:
+    def test_flag_defaults_off_and_is_runtime_settable(self):
+        from modules.config import PUBLIC_RUNTIME_KEYS, Config, ConfigSnapshot
+        import dataclasses
+        assert Config().econ_shadow_enabled is False
+        assert "econ_shadow_enabled" in PUBLIC_RUNTIME_KEYS
+        # A key missing from the snapshot mirror reads as absent in
+        # production — pin the mirror.
+        assert any(f.name == "econ_shadow_enabled"
+                   for f in dataclasses.fields(ConfigSnapshot))

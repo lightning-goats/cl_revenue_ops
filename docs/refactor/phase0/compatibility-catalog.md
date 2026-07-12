@@ -22,11 +22,11 @@ Full 64-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
 
 ## Config surface
 
-Owner: `modules/config.py` — a single `Config` dataclass (131 fields)
+Owner: `modules/config.py` — a single `Config` dataclass (132 fields)
 plus the `config_overrides` table (`revenue-config set` persists
 overrides; precedence documented in README.md §revenue-config).
 
-- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (48, listed below).
+- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (49, listed below).
 - Immutable at runtime: `db_path`, `dry_run` (`IMMUTABLE_CONFIG_KEYS` —
   dry_run is immutable so enabling it cannot HIDE actions).
 - The refactor's Workstream I risk-profile work must preserve every
@@ -58,7 +58,7 @@ dataclass is normative).
 
 ---
 
-### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 48)
+### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 49)
 
 - `paused`
 - `daily_budget_sats`
@@ -96,6 +96,7 @@ dataclass is normative).
 - `htlcmax_source_pct`
 - `htlcmax_sink_pct`
 - `htlcmax_balanced_pct`
+- `econ_shadow_enabled` (added 2026-07-12, Phase 1 wiring)
 - `lnplus_swaps_enabled`
 - `lnplus_execute_applications`
 - `lnplus_swap_preference_margin`
@@ -109,7 +110,7 @@ dataclass is normative).
 - `lnplus_inbound_credit_factor`
 - `lnplus_watcher_interval`
 
-### Full Config dataclass surface (131 fields with defaults)
+### Full Config dataclass surface (132 fields with defaults)
 
 | Field | Default | Runtime-settable |
 |---|---|---|
@@ -138,6 +139,7 @@ dataclass is normative).
 | `htlcmax_source_pct` | `0.5` | yes |
 | `htlcmax_sink_pct` | `0.25` | yes |
 | `htlcmax_balanced_pct` | `0.45` | yes |
+| `econ_shadow_enabled` | `False` | yes |
 | `expansion_treasury_enabled` | `False` |  |
 | `expansion_treasury_onchain_target_sats` | `5000000` |  |
 | `expansion_treasury_min_deficit_sats` | `250000` |  |
