@@ -124,3 +124,41 @@ class TestReplay:
         assert state.total_spent_msat == 0
         assert state.reserved_msat == {}
         assert state.terminal == {}
+
+
+class TestReconciliationReplay:
+    """Phase 2 pilot B: reconciliation_completed corrects replay state
+    (corrections are new events — the append-only rule)."""
+
+    def test_reconciliation_zeroes_stale_reservation(self, ledger):
+        _append(ledger, "budget_reserved", amounts={"reserved_msat": 5_000})
+        _append(ledger, "reconciliation_completed",
+                amounts={"reserved_msat": 0},
+                details={"kind": "ledger_stale_reservation"})
+        state = ledger.replay()
+        assert state.reserved_msat == {}
+
+    def test_reconciliation_sets_missing_reservation(self, ledger):
+        _append(ledger, "reconciliation_completed",
+                amounts={"reserved_msat": 4_000},
+                details={"kind": "ledger_missing_reservation"})
+        state = ledger.replay()
+        assert state.reserved_msat == {KEY: 4_000}
+
+    def test_reconciliation_cost_adds_spend_once(self, ledger):
+        _append(ledger, "budget_reserved", amounts={"reserved_msat": 5_000})
+        _append(ledger, "reconciliation_completed",
+                amounts={"reserved_msat": 0, "cost_msat": 3_000},
+                details={"kind": "ledger_stale_reservation",
+                         "terminal": True})
+        state = ledger.replay()
+        assert state.spent_msat == {KEY: 3_000}
+        assert state.reserved_msat == {}
+        assert state.terminal == {KEY: "reconciliation_completed"}
+
+    def test_reconciliation_never_overwrites_terminal(self, ledger):
+        _append(ledger, "execution_succeeded")
+        _append(ledger, "reconciliation_completed",
+                amounts={"reserved_msat": 0}, details={"terminal": True})
+        state = ledger.replay()
+        assert state.terminal == {KEY: "execution_succeeded"}

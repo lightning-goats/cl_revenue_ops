@@ -154,6 +154,18 @@ class EconLedger:
                 reserved[key] = max(0, reserved.get(key, 0) - cost)
             elif etype == "reservation_released":
                 reserved[key] = 0
+            elif etype == "reconciliation_completed":
+                # Phase 2 pilot B: reconciliation SETS the reservation
+                # absolutely (ledger corrected to DB truth); optional
+                # cost adds spend; terminal only when explicitly marked.
+                amounts_dict = amounts or {}
+                if "reserved_msat" in amounts_dict:
+                    reserved[key] = int(amounts_dict["reserved_msat"])
+                if "cost_msat" in amounts_dict:
+                    spent[key] = spent.get(key, 0) + int(
+                        amounts_dict["cost_msat"])
+                if (event["details"] or {}).get("terminal"):
+                    terminal.setdefault(key, etype)
             elif etype in _TERMINAL_EVENTS:
                 terminal.setdefault(key, etype)  # first terminal wins
         return LedgerState(
