@@ -126,6 +126,29 @@ class TestReplay:
         assert state.terminal == {}
 
 
+def test_ledger_usable_across_threads(ledger):
+    """Regression for the 2026-07-12 production finding: the fee loop,
+    RPC handlers, and spend hooks all touch the ledger from different
+    threads; sqlite thread-affinity must not drop events."""
+    import threading
+
+    errors = []
+
+    def worker(i):
+        try:
+            _append(ledger, "intent_proposed", key=f"{i:064d}")
+        except Exception as e:  # pragma: no cover - the assertion target
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert len(ledger.events()) == 8
+
+
 class TestReconciliationReplay:
     """Phase 2 pilot B: reconciliation_completed corrects replay state
     (corrections are new events — the append-only rule)."""

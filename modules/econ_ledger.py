@@ -66,22 +66,32 @@ class EconLedger:
     """Append-only sqlite-backed event ledger."""
 
     def __init__(self, path: str):
-        self._conn = sqlite3.connect(path)
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS econ_ledger_events (
-                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                intent_id TEXT NOT NULL,
-                idempotency_key TEXT NOT NULL,
-                cycle_id TEXT NOT NULL,
-                at INTEGER NOT NULL,
-                amounts_json TEXT NOT NULL,
-                details_json TEXT NOT NULL
+        # Per-operation connections: the ledger is touched from multiple
+        # plugin threads (fee loop, RPC handlers, spend hooks) and sqlite
+        # connections are thread-bound. Event volume is tiny, so opening
+        # per call is cheap and removes the thread-affinity failure mode
+        # observed live on 2026-07-12 ("SQLite objects created in a
+        # thread can only be used in that same thread").
+        self._path = path
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS econ_ledger_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    cycle_id TEXT NOT NULL,
+                    at INTEGER NOT NULL,
+                    amounts_json TEXT NOT NULL,
+                    details_json TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-        self._conn.commit()
+            conn.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._path, timeout=5.0)
 
     def append(self, *, event_type: str, intent_id: str,
                idempotency_key: str, cycle_id: str, at: int,
@@ -101,25 +111,27 @@ class EconLedger:
                     or not (I64_MIN <= value <= U63_MAX):
                 raise EconArithmeticError(
                     f"ledger amount {name}={value!r} must be a checked int")
-        cur = self._conn.execute(
-            "INSERT INTO econ_ledger_events "
-            "(event_type, intent_id, idempotency_key, cycle_id, at, "
-            " amounts_json, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (event_type, intent_id, idempotency_key, cycle_id, at,
-             json.dumps(amounts, sort_keys=True),
-             json.dumps(details or {}, sort_keys=True)),
-        )
-        self._conn.commit()
-        return int(cur.lastrowid)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO econ_ledger_events "
+                "(event_type, intent_id, idempotency_key, cycle_id, at, "
+                " amounts_json, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (event_type, intent_id, idempotency_key, cycle_id, at,
+                 json.dumps(amounts, sort_keys=True),
+                 json.dumps(details or {}, sort_keys=True)),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
 
     def events(self, since_id: int = 0) -> list:
-        rows = self._conn.execute(
-            "SELECT event_id, event_type, intent_id, idempotency_key, "
-            "cycle_id, at, amounts_json, details_json "
-            "FROM econ_ledger_events WHERE event_id > ? "
-            "ORDER BY event_id",
-            (since_id,),
-        ).fetchall()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT event_id, event_type, intent_id, idempotency_key, "
+                "cycle_id, at, amounts_json, details_json "
+                "FROM econ_ledger_events WHERE event_id > ? "
+                "ORDER BY event_id",
+                (since_id,),
+            ).fetchall()
         return [
             {
                 "event_id": r[0],
