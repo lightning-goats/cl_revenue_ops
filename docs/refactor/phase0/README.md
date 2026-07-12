@@ -23,8 +23,33 @@ All deliverables are COMPLETE as of 2026-07-12 (branch
 production mutation path and public contract documented; golden fixtures
 cover the principal decision classes (fee damping/floor, htlc_max,
 rebalance planning, profitability/role_30d, close protection, Boltz
-dry-run, LN+ gates — 88 golden/pin tests). **Awaiting operator review
-before Phase 1 begins** (refactor.md line 1068).
+dry-run, LN+ gates — 88 golden/pin tests). Operator approved Phase 1 on
+2026-07-12.
+
+## Phase 1 foundations tranche (2026-07-12)
+
+Plan: `docs/planning/2026-07-12-refactor-phase1-foundations.md`. All
+additive — no pre-existing file modified, nothing imported by the live
+plugin yet:
+
+| Module | Tests | Purpose |
+|---|---|---|
+| `modules/econ_types.py` | `tests/test_econ_types.py` | checked Msat/Sat/Ppm/Micro/UnixTime/ids (J2) |
+| `modules/reason_codes.py` | `tests/test_reason_codes.py` | stable reason-code catalog v0 (J4, +PAUSED) |
+| `modules/cycle_context.py` | `tests/test_cycle_context.py` | injected clock/seed (J3) |
+| `modules/econ_snapshot.py` | `tests/test_econ_snapshot.py` | canonical snapshot types + builder (Workstream A) |
+| `modules/econ_intents.py` | `tests/test_econ_intents.py` | typed intent envelope, deterministic idempotency (Workstream B) |
+| `schemas/intent.v0.schema.json` | `tests/test_schema_validity.py` | intent wire contract |
+| `modules/econ_ledger.py` | `tests/test_econ_ledger.py` | append-only ledger + replay (Workstream E) |
+| `modules/governor_facade.py` | `tests/test_governor_facade.py` | delegating governor + oversubscription proof (Workstream D) |
+
+Suite after tranche: **3300 passed** (+88). Phase 1 exit gate holds:
+golden parity untouched, no new component has live authority.
+
+**Next tranche (needs operator go-ahead — starts modifying production
+files):** shadow snapshot emission in a live cycle, RPC output from
+projections, ledger attached to revenue_ops.db, governor routing
+(Phase 2 entry).
 
 ## Contradictions
 

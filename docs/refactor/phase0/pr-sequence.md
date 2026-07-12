@@ -25,14 +25,24 @@ compat evidence — per refactor.md PR requirements):
 
  1. Canonical snapshot types + parity tests  (spec PR-2; golden
     fixtures from `tests/golden/` are the parity oracle)
+    — LANDED 2026-07-12 as `modules/econ_snapshot.py` (Phase 1 tranche)
  2. Typed intents + structured explanations  (spec PR-3)
+    — LANDED 2026-07-12 as `modules/econ_intents.py`
  3. Versioned schemas v1 freeze + reason codes + fixture harness in CI
     (spec PR-4; builds on `schemas/` + `tools/conformance/`)
+    — PARTIAL: v0 schemas + `modules/reason_codes.py` landed; v1 freeze
+    and CI wiring remain
  4. Checked Msat/fixed-point types + cycle context (clock/seed
     injection)  (spec PR-5; kills `portability-hazards.md` §1–§3 at
     decision seams)
+    — FOUNDATION LANDED: `modules/econ_types.py` + `modules/cycle_context.py`;
+    adoption at decision seams remains
  5. Append-only ledger schema + replay tests  (spec PR-6)
+    — LANDED as `modules/econ_ledger.py` (own sqlite file; production
+    wiring is Phase 2)
  6. Governor facade delegating to current checks  (spec PR-7)
+    — LANDED as `modules/governor_facade.py` (delegation-only; live
+    routing is Phase 2)
  7. Durable reservations unification (4→1)  (spec PR-8)
  8. Intent arbiter in shadow mode  (spec PR-9)
  9. Fee policy migration  (spec PR-10)
