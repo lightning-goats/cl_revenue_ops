@@ -26,3 +26,12 @@ Captured 2026-07-12 in worktree branch `worktree-refactor`.
   `docs/audit/deep/prod-baseline-T0.md` (53 MiB DB) — its "node 2 gap" is
   moot: fleet is single-node since 2026-07-11
 - CLN runtime floor: v24.11.1 (`docs/CORE_LIGHTNING_COMPATIBILITY.md`)
+
+## Phase 0 exit (2026-07-12)
+
+- Suite after Phase 0: **3212 passed, 1 skipped** (98 tests added:
+  4 inventory pins, 88 golden/harness, 2 schema, 3 conformance,
+  1 harness self-test)
+- `git diff 5e8f747 --stat -- modules/ cl-revenue-ops.py` — EMPTY
+  (zero production-code changes)
+- `python3 tools/conformance/validate_fixtures.py` — exit 0
