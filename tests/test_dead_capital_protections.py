@@ -77,6 +77,12 @@ def _make_prof(
     prof.days_open = 200
     prof.opener = "local"
     prof.channel_role = channel_role
+    # Audit F2: the close gate now judges the 30d window. These tests model
+    # CURRENTLY-active roles/fees, so mirror the role into role_30d and use
+    # the lifetime sourced-fee fallback (no 30d window fetched). Staleness
+    # divergence (lifetime != 30d) is covered in test_capacity_planner.py.
+    prof.role_30d = channel_role
+    prof.window_30d_available = False
     prof.revenue.sourced_fee_contribution_sats = sourced_fee_sats
     prof.marginal_profit_30d_sats = 0
     return prof

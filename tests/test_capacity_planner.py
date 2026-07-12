@@ -866,16 +866,17 @@ class TestEnrichedLosers:
         assert losers[0]["is_hard_bleeder"] is False
 
     def test_inbound_gateway_protected_from_closure(self):
-        """INBOUND_GATEWAY channels with marginal_roi > -50% are protected."""
+        """CURRENT (30d) INBOUND_GATEWAY with marginal_roi > -50% is protected."""
         from modules.profitability_analyzer import ChannelRole
 
         planner, prof_analyzer = _make_loser_planner()
         scid = "100x200x0"
         prof = _make_loser_prof(marginal_roi_percent=-30.0)
         prof.channel_role = ChannelRole.INBOUND_GATEWAY
+        prof.role_30d = ChannelRole.INBOUND_GATEWAY
         flow = _make_loser_flow()
 
-        # Even with attempt_count >= 2, inbound gateway is protected
+        # Even with attempt_count >= 2, an active inbound gateway is protected
         prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
 
         losers = planner._identify_losers({scid: prof}, {scid: flow})
@@ -883,13 +884,14 @@ class TestEnrichedLosers:
         assert len(losers) == 0
 
     def test_inbound_gateway_closed_when_deeply_underwater(self):
-        """INBOUND_GATEWAY with marginal_roi < -50% can be closed."""
+        """Active INBOUND_GATEWAY with marginal_roi < -50% can be closed."""
         from modules.profitability_analyzer import ChannelRole
 
         planner, prof_analyzer = _make_loser_planner()
         scid = "100x200x0"
         prof = _make_loser_prof(marginal_roi_percent=-60.0)
         prof.channel_role = ChannelRole.INBOUND_GATEWAY
+        prof.role_30d = ChannelRole.INBOUND_GATEWAY
         flow = _make_loser_flow()
 
         prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
@@ -897,6 +899,74 @@ class TestEnrichedLosers:
         losers = planner._identify_losers({scid: prof}, {scid: flow})
 
         assert len(losers) == 1
+
+    def test_stale_lifetime_gateway_not_protected(self):
+        """Audit F2: a lifetime gateway that decayed to DORMANT in the 30d
+        window must NOT keep gateway protection — dead ex-gateways were
+        held at DEFIBRILLATE forever (944960x2625x1 et al., 2026-07-12)."""
+        from modules.profitability_analyzer import ChannelRole
+
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof(marginal_roi_percent=-30.0)
+        prof.channel_role = ChannelRole.INBOUND_GATEWAY  # stale lifetime role
+        prof.role_30d = ChannelRole.DORMANT              # honest current role
+        flow = _make_loser_flow()
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+
+    def test_stale_alltime_sourced_fee_not_protected(self):
+        """Audit F2: all-time sourced fees must not protect a channel whose
+        30d window sourced nothing."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof(marginal_roi_percent=-30.0)
+        prof.window_30d_available = True
+        prof.sourced_fee_30d_msat = 0
+        prof.revenue.sourced_fee_contribution_sats = 917  # earned months ago
+        flow = _make_loser_flow()
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 1
+
+    def test_current_sourced_fee_protected(self):
+        """A channel sourcing >100 sats of fees in the 30d window keeps
+        SOURCED_FEE_CONTRIBUTION protection (marginal_roi > -50%)."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof(marginal_roi_percent=-30.0)
+        prof.window_30d_available = True
+        prof.sourced_fee_30d_msat = 150_000  # 150 sats in-window
+        flow = _make_loser_flow()
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 0
+
+    def test_lifetime_sourced_fee_fallback_without_window(self):
+        """Without a fetched 30d window the gate falls back to the lifetime
+        figure (fail-safe: missing data must not weaken protection)."""
+        planner, prof_analyzer = _make_loser_planner()
+        scid = "100x200x0"
+        prof = _make_loser_prof(marginal_roi_percent=-30.0)
+        prof.window_30d_available = False
+        prof.revenue.sourced_fee_contribution_sats = 917
+        flow = _make_loser_flow()
+
+        prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
+
+        losers = planner._identify_losers({scid: prof}, {scid: flow})
+
+        assert len(losers) == 0
 
     def test_kalman_regime_change_demotes_to_defibrillate(self):
         """Regime change demotes CLOSE to DEFIBRILLATE."""

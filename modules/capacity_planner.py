@@ -1130,7 +1130,15 @@ class CapacityPlanner:
 
         # Channel role protection -- INBOUND_GATEWAYs source volume for all
         # outbound channels; closing one has outsized negative impact.
-        channel_role = getattr(prof, 'channel_role', None)
+        # Audit F2: judged on the TRAILING 30d WINDOW (role_30d), not the
+        # lifetime role — a channel that sourced volume months ago decayed
+        # to DORMANT and must not stay a protected gateway forever (that
+        # held proven-dead channels at DEFIBRILLATE daily, 2026-07-12).
+        # role_30d itself falls back to the lifetime role when no 30d
+        # window was fetched; the getattr fallback covers legacy objects.
+        channel_role = getattr(prof, 'role_30d', None)
+        if channel_role is None:
+            channel_role = getattr(prof, 'channel_role', None)
         is_inbound_gateway = False
         try:
             if channel_role is not None:
@@ -1149,14 +1157,22 @@ class CapacityPlanner:
 
         # Protect channels that source significant fee contribution
         # regardless of their own ROI — they enable other channels' revenue.
-        # Uses all-time sourced contribution from ChannelRevenue (not 30d window)
-        # because channels with a history of sourcing are worth protecting even
-        # if recent volume is lower. Avoids modifying ChannelProfitability dataclass.
-        sourced_fee_sats = getattr(getattr(prof, 'revenue', None), 'sourced_fee_contribution_sats', 0)
-        try:
-            sourced_fee_sats = int(sourced_fee_sats)
-        except (TypeError, ValueError):
-            sourced_fee_sats = 0
+        # Audit F2: judged on the TRAILING 30d WINDOW — the all-time figure
+        # kept channels that sourced fees months ago protected forever. The
+        # lifetime figure remains the fail-safe fallback when no 30d window
+        # was fetched (missing data must not weaken protection).
+        if getattr(prof, 'window_30d_available', False) is True:
+            sourced_fee_raw = getattr(prof, 'sourced_fee_30d_msat', 0)
+            try:
+                sourced_fee_sats = int(sourced_fee_raw) // 1000
+            except (TypeError, ValueError):
+                sourced_fee_sats = 0
+        else:
+            sourced_fee_sats = getattr(getattr(prof, 'revenue', None), 'sourced_fee_contribution_sats', 0)
+            try:
+                sourced_fee_sats = int(sourced_fee_sats)
+            except (TypeError, ValueError):
+                sourced_fee_sats = 0
         if sourced_fee_sats > 100 and prof.marginal_roi_percent > -50.0:
             return "SOURCED_FEE_CONTRIBUTION"  # Protect significant inbound sources
 

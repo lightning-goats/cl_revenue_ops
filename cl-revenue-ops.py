@@ -192,7 +192,7 @@ from modules.utils import normalize_scid, parse_msat
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.17.1"
+PLUGIN_VERSION = "2.18.0"
 
 # Supply-chain / runtime version floors (Phase 3C).
 # These drive NON-FATAL startup probes: a version below floor logs a warning but
