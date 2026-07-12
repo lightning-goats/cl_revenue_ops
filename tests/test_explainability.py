@@ -172,6 +172,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "htlcmax_balanced_pct",
         "econ_shadow_enabled",
         "econ_governor_rebalance_enabled",
+        "econ_governor_planner_enabled",
         # LN+ liquidity swap automation
         "lnplus_swaps_enabled",
         "lnplus_execute_applications",
@@ -225,6 +226,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "htlcmax_balanced_pct": 0.45,
         "econ_shadow_enabled": False,
         "econ_governor_rebalance_enabled": False,
+        "econ_governor_planner_enabled": False,
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,

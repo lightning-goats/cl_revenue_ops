@@ -2905,6 +2905,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # Phase 2 pilot: journal the generic spend lifecycle (all callers
         # of Database.reserve_spend/settle/release) into the econ ledger.
         database.spend_journal = econ_shadow
+        # Phase 2E: governor/ledger plumbing for planner reservations.
+        capacity_planner.econ_shadow = econ_shadow
     except Exception as e:
         econ_shadow = None
         plugin.log(f"EconShadow unavailable: {e}", level='warn')

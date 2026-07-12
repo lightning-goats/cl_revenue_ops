@@ -286,6 +286,14 @@ ALLOWLIST = {
         "caller's reservation_id; active only when "
         "econ_governor_rebalance_enabled is true.",
     ),
+    ("capacity_planner.py", "_planner_reserve_delegate", "reserve_spend"): (
+        ATOMIC_RESERVE, 1,
+        "Phase 2E governed entry (2026-07-12): GovernorFacade delegate closure "
+        "inside _governed_reserve_spend — the SAME atomic reserve_spend call "
+        "as the legacy _execute_open/_execute_close sites, same "
+        "reservation_id/kwargs; active only when "
+        "econ_governor_planner_enabled is true.",
+    ),
     # --- Daemon spender 5/6: defibrillation diagnostic shock (T7) -----------
     ("rebalancer.py", "_execute_candidate_v2", "execute_candidate"): (
         ATOMIC_RESERVE, 1,

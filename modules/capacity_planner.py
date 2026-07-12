@@ -3195,8 +3195,11 @@ class CapacityPlanner:
         reservation_id = f"planner-open-{peer_id[:16]}-{int(time.time())}"
         reservation_active = False
         if db:
-            try:
-                reservation_active = bool(db.reserve_spend(
+            if self._planner_governor_enabled():
+                # Phase 2E: governor-gated reservation (same reserve_spend
+                # underneath; fail-closed).
+                reservation_active = self._governed_reserve_spend(
+                    db,
                     reservation_id=reservation_id,
                     amount_sats=estimated_cost,
                     category="channel_open",
@@ -3204,10 +3207,24 @@ class CapacityPlanner:
                     metadata={"peer_id": peer_id, "amount_sats": amount_sats},
                     effective_budget_sats=eff_budget,
                     since_timestamp=budget_since,
-                ))
-            except Exception as e:
-                self.plugin.log(f"Budget reservation failed: {e}", level='warn')
-                reservation_active = False
+                    intent_type="OPEN_CHANNEL",
+                    target=peer_id,
+                    committed_sats=amount_sats,
+                )
+            else:
+                try:
+                    reservation_active = bool(db.reserve_spend(
+                        reservation_id=reservation_id,
+                        amount_sats=estimated_cost,
+                        category="channel_open",
+                        subcategory="automated",
+                        metadata={"peer_id": peer_id, "amount_sats": amount_sats},
+                        effective_budget_sats=eff_budget,
+                        since_timestamp=budget_since,
+                    ))
+                except Exception as e:
+                    self.plugin.log(f"Budget reservation failed: {e}", level='warn')
+                    reservation_active = False
 
             if not reservation_active:
                 if action_id:
@@ -3422,6 +3439,121 @@ class CapacityPlanner:
             return True, "defib allowed"
         except Exception as e:
             return False, f"Defib policy check failed (fail closed): {e}"
+
+    # Phase 2E: optional shadow/governor plumbing (EconShadow), injected
+    # at plugin init; None = ledgerless governed mode still works.
+    econ_shadow = None
+
+    def _planner_governor_enabled(self) -> bool:
+        """Phase 2E: strict flag check (MagicMock/absent snapshots stay
+        on the legacy path)."""
+        try:
+            cfg = self.config.snapshot() \
+                if self.config is not None and hasattr(self.config, "snapshot") \
+                else self.config
+            return getattr(cfg, "econ_governor_planner_enabled", False) is True
+        except Exception:
+            return False
+
+    def _governed_reserve_spend(self, db, *, reservation_id, amount_sats,
+                                category, subcategory, metadata,
+                                effective_budget_sats, since_timestamp,
+                                intent_type, target, committed_sats):
+        """Phase 2E: GovernorFacade.authorize() gates this planner
+        reservation (docs/planning/2026-07-12-refactor-phase2-governed-
+        planner.md). The delegate performs the IDENTICAL reserve_spend
+        call — same reservation_id, kwargs, and unified-budget
+        enforcement — so settle/release finish paths are unchanged.
+        FAILS CLOSED on any internal error: no spend without
+        authorization."""
+        try:
+            import time as _time
+
+            from .econ_intents import Explanation, make_intent
+            from .econ_types import Micro, Msat, SignedMsat, UnixTime
+            from .governor_facade import GovernorFacade
+
+            now = int(_time.time())
+
+            def _planner_reserve_delegate(**_facade_kwargs):
+                return bool(db.reserve_spend(
+                    reservation_id=reservation_id,
+                    amount_sats=amount_sats,
+                    category=category,
+                    subcategory=subcategory,
+                    metadata=metadata,
+                    effective_budget_sats=effective_budget_sats,
+                    since_timestamp=since_timestamp,
+                ))
+
+            ledger = None
+            shadow = getattr(self, "econ_shadow", None)
+            if shadow is not None:
+                try:
+                    ledger = shadow.ledger_for_reconciliation()
+                except Exception:
+                    ledger = None
+
+            cfg = self.config.snapshot() \
+                if self.config is not None and hasattr(self.config, "snapshot") \
+                else self.config
+            facade = GovernorFacade(
+                reserve_spend=_planner_reserve_delegate,
+                release_spend=db.release_spend_reservation,
+                is_paused=lambda: getattr(cfg, "paused", False) is True,
+                ledger=ledger,
+            )
+            committed = int(committed_sats or 0)
+            env = make_intent(
+                intent_type=intent_type,
+                snapshot_id=f"planner-cycle-{now}",
+                created_at=UnixTime(now),
+                expires_at=UnixTime(now + 600),
+                target=str(target),
+                amount_msat=(Msat(committed * 1000) if committed > 0
+                             else None),
+                expected_benefit_msat=SignedMsat(0),
+                max_cost_msat=Msat(int(amount_sats) * 1000),
+                capital_committed_msat=Msat(committed * 1000),
+                confidence_micro=Micro(0),
+                reason_codes=(),
+                explanation=Explanation("planner_reservation", (
+                    ("category", str(category)),
+                    ("target", str(target)),
+                    ("reserve_sats", int(amount_sats)),
+                    ("committed_sats", committed),
+                )),
+                preconditions=(),
+                priority=50,
+                budget_bucket=str(category),
+                origin_policy="capacity_planner_governed",
+                reversible=False,
+            )
+            if ledger is not None:
+                try:
+                    ledger.append(
+                        event_type="intent_proposed",
+                        intent_id=env.intent_id.value,
+                        idempotency_key=env.idempotency_key,
+                        cycle_id=env.snapshot_id,
+                        at=now,
+                        details={"target": env.target, "governed": True,
+                                 "category": str(category)},
+                    )
+                except Exception:
+                    pass
+            decision = facade.authorize(env, now)
+            if not decision.authorized:
+                self.plugin.log(
+                    f"Governor blocked planner {category} reservation for "
+                    f"{str(target)[:20]}: {decision.reason_code}",
+                    level='info')
+            return bool(decision.authorized)
+        except Exception as e:
+            self.plugin.log(
+                f"Governed planner reservation failed closed "
+                f"({category}, {str(target)[:20]}): {e}", level='warn')
+            return False
 
     def _check_close_allowed(self, peer_id: str) -> tuple:
         """Check if a channel close is allowed for this peer.
@@ -3663,25 +3795,43 @@ class CapacityPlanner:
         close_reservation_active = False
         if db:
             eff_budget, budget_since = self._unified_reserve_budget_params()
-            try:
-                close_reservation_active = bool(db.reserve_spend(
+            close_metadata = {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "estimated_close_cost_sats": estimated_cost,
+                "reserved_close_fee_sats": reserved_close_fee_sats,
+                "close_fee_cap_source": fee_plan.get("source"),
+            }
+            if self._planner_governor_enabled():
+                # Phase 2E: governor-gated reservation (same reserve_spend
+                # underneath; fail-closed).
+                close_reservation_active = self._governed_reserve_spend(
+                    db,
                     reservation_id=close_reservation_id,
                     amount_sats=reserved_close_fee_sats,
                     category="channel_close",
                     subcategory=reason if reason else "automated",
-                    metadata={
-                        "channel_id": channel_id,
-                        "peer_id": peer_id,
-                        "estimated_close_cost_sats": estimated_cost,
-                        "reserved_close_fee_sats": reserved_close_fee_sats,
-                        "close_fee_cap_source": fee_plan.get("source"),
-                    },
+                    metadata=close_metadata,
                     effective_budget_sats=eff_budget,
                     since_timestamp=budget_since,
-                ))
-            except Exception as e:
-                self.plugin.log(f"Close budget reservation failed: {e}", level='warn')
-                close_reservation_active = False
+                    intent_type="CLOSE_CHANNEL",
+                    target=channel_id,
+                    committed_sats=0,
+                )
+            else:
+                try:
+                    close_reservation_active = bool(db.reserve_spend(
+                        reservation_id=close_reservation_id,
+                        amount_sats=reserved_close_fee_sats,
+                        category="channel_close",
+                        subcategory=reason if reason else "automated",
+                        metadata=close_metadata,
+                        effective_budget_sats=eff_budget,
+                        since_timestamp=budget_since,
+                    ))
+                except Exception as e:
+                    self.plugin.log(f"Close budget reservation failed: {e}", level='warn')
+                    close_reservation_active = False
             if not close_reservation_active:
                 if action_id:
                     try:

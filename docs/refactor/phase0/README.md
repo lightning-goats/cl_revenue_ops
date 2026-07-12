@@ -114,9 +114,26 @@ Plan: `docs/planning/2026-07-12-refactor-phase2-reconcile.md`.
 
 Suite after tranche: **3352 passed**.
 
-**Next tranche (Phase 2 continuation):** per-spender migration to
-`GovernorFacade.authorize()` (rebalance engine first) toward "no
-executor reachable without authorization".
+## Phase 2C/2D/2E — per-spender governor migration (2026-07-12)
+
+- 2C/2D (`docs/planning/2026-07-12-refactor-phase2-governed-rebalance.md`):
+  rebalance reservations shadow-authorized (2C) and, behind
+  `econ_governor_rebalance_enabled` (FLIPPED ON in production, config
+  v72), gated by GovernorFacade with the same atomic reserve_budget
+  delegate, fail-closed.
+- 2E (`docs/planning/2026-07-12-refactor-phase2-governed-planner.md`):
+  planner open/close reservations behind `econ_governor_planner_enabled`
+  (default off) via one governed choke point
+  (`CapacityPlanner._governed_reserve_spend`), identical reserve_spend
+  kwargs, OPEN_CHANNEL/CLOSE_CHANNEL intents + authorization ledgered.
+- Also landed: intent arbiter in shadow mode (`modules/econ_arbiter.py`),
+  fee-intent completeness detector in revenue-econ-reconcile, ledger
+  thread-affinity fix (live-found), durable intent counters.
+
+**Remaining Phase 2 migrations:** LN+ funding reservation
+(`lnplus_swaps.py:1439`), Boltz capex wrappers, fee-broadcast (SET_FEE)
+governance; then reconciliation automation and the 4→1 reservations
+unification.
 
 ## Contradictions
 

@@ -85,6 +85,9 @@ PUBLIC_RUNTIME_KEYS = (
     # facade (same reserve_budget accounting, new authorization
     # boundary). Instant rollback by setting false. Default off.
     'econ_governor_rebalance_enabled',
+    # Refactor Phase 2E: planner open/close reservations gated by the
+    # governor facade (same reserve_spend accounting). Default off.
+    'econ_governor_planner_enabled',
     # LN+ liquidity swap automation (13 runtime controls)
     'lnplus_swaps_enabled',
     'lnplus_execute_applications',
@@ -152,6 +155,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'htlcmax_balanced_pct': float,
     'econ_shadow_enabled': bool,
     'econ_governor_rebalance_enabled': bool,
+    'econ_governor_planner_enabled': bool,
     'expansion_treasury_enabled': bool,
     'expansion_treasury_onchain_target_sats': int,
     'expansion_treasury_min_deficit_sats': int,
@@ -450,6 +454,8 @@ class Config:
     # Refactor Phase 2D: governor-gated rebalance reservations (see
     # docs/planning/2026-07-12-refactor-phase2-governed-rebalance.md).
     econ_governor_rebalance_enabled: bool = False
+    # Refactor Phase 2E: governor-gated planner open/close reservations.
+    econ_governor_planner_enabled: bool = False
     # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
     expansion_treasury_enabled: bool = False
     expansion_treasury_onchain_target_sats: int = 5_000_000
@@ -1166,6 +1172,7 @@ class ConfigSnapshot:
     # from the snapshot reads as absent in production).
     econ_shadow_enabled: bool = False
     econ_governor_rebalance_enabled: bool = False
+    econ_governor_planner_enabled: bool = False
     # E-2: class-aware min-fee floor for saturated/source channels (0 =
     # allow true cheap egress). Missing-from-snapshot kills the feature in
     # production (getattr fallback), so it MUST be mirrored here.
