@@ -139,3 +139,14 @@ def test_none_amount_allowed():
     env = make_intent(**_fields(amount_msat=None))
     assert env.amount_msat is None
     assert to_wire(env)["amount_msat"] is None
+
+
+def test_wire_form_validates_against_schema():
+    jsonschema = pytest.importorskip("jsonschema")
+    import json
+    import pathlib
+    schema = json.loads(
+        (pathlib.Path(__file__).resolve().parent.parent / "schemas"
+         / "intent.v0.schema.json").read_text())
+    env = make_intent(**_fields(reason_codes=("COOLDOWN_ACTIVE",)))
+    jsonschema.validate(to_wire(env), schema)

@@ -1,0 +1,39 @@
+{
+  "amount_msat": 250,
+  "budget_bucket": "fees",
+  "capital_committed_msat": 0,
+  "confidence_micro": 900000,
+  "created_at": 1752400000,
+  "expected_benefit_msat": 1000,
+  "expires_at": 1752400600,
+  "explanation": {
+    "components": [
+      [
+        "baseline_ppm",
+        200
+      ],
+      [
+        "target_ppm",
+        250
+      ]
+    ],
+    "kind": "fee_target"
+  },
+  "idempotency_key": "6c2b15a006a25c08fe08c168a35029d97ba300297d340888981612d856f2686e",
+  "intent_id": "int-6c2b15a006a25c08",
+  "intent_type": "SET_FEE",
+  "max_cost_msat": 0,
+  "origin_policy": "fee_policy",
+  "preconditions": [
+    "channel_active"
+  ],
+  "priority": 50,
+  "reason_codes": [
+    "COOLDOWN_ACTIVE"
+  ],
+  "reversible": true,
+  "schema_name": "intent",
+  "schema_version": 0,
+  "snapshot_id": "cycle-000001",
+  "target": "123x456x0"
+}
