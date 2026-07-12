@@ -135,9 +135,16 @@ Suite after tranche: **3352 passed**.
   carries NO pause gate (invariant 6, matching the legacy path) and the
   intent is tagged CONTRACT_OBLIGATION with priority 80.
 
-**Remaining Phase 2 migrations:** Boltz capex wrappers, fee-broadcast
-(SET_FEE) governance; then reconciliation automation and the 4→1
-reservations unification.
+- 2G: Boltz pre-create swap reservations behind
+  `econ_governor_boltz_enabled` via
+  `BoltzCliManager._governed_open_reservation` (flag arrives by provider
+  — the manager holds its own BoltzCliConfig). SWAP_IN/SWAP_OUT intents
+  threaded from loop_in/loop_out/chainswap. NOTE: governed mode fails
+  CLOSED on infra error — a deliberate flag-gated strengthening of the
+  legacy infra-error fail-open (both behaviors pinned by tests).
+
+**Remaining Phase 2 migrations:** fee-broadcast (SET_FEE) governance;
+then reconciliation automation and the 4→1 reservations unification.
 
 ## Contradictions
 

@@ -2932,6 +2932,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # capex gate inside the manager — the envelope + unified budget gate
         # them instead.
         boltz_manager.structural_envelope_provider = _structural_envelope_sats_provider
+        # Phase 2G: governor/ledger plumbing for Boltz swap reservations.
+        try:
+            boltz_manager.econ_shadow = econ_shadow
+            boltz_manager.econ_governor_enabled_provider = (
+                lambda: getattr(config.snapshot(),
+                                "econ_governor_boltz_enabled", False) is True
+                if config is not None else False)
+        except Exception:
+            pass
 
     if capacity_planner is not None:
         capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider

@@ -1604,11 +1604,123 @@ class BoltzCliManager:
     # ---------------------------------------------------------------------
     # P4-014 / DD1: atomic unified-budget reservation around swap creation
     # ---------------------------------------------------------------------
+    # Phase 2G: optional governor/ledger plumbing, injected at plugin
+    # init (BoltzCliManager holds its own BoltzCliConfig, so the main
+    # config's flag arrives via provider like the other cross-module
+    # hooks). None = legacy behavior.
+    econ_shadow = None
+    econ_governor_enabled_provider = None
+
+    def _boltz_governor_enabled(self) -> bool:
+        try:
+            provider = self.econ_governor_enabled_provider
+            return bool(provider is not None and provider() is True)
+        except Exception:
+            return False
+
+    def _governed_open_reservation(self, *, reservation_id, fee, channel_id,
+                                   subcat, effective_budget, intent_type,
+                                   structural):
+        """Phase 2G: GovernorFacade.authorize() gates the pre-create swap
+        reservation. The delegate performs the IDENTICAL
+        reserve_boltz_swap_budget call. FAILS CLOSED on internal error
+        (returns False = swap rejected) — a deliberate, flag-gated
+        strengthening of the legacy infra-error fail-open; flag off
+        restores legacy exactly. No pause gate (matching legacy: Boltz
+        is gated by its own enable flags)."""
+        try:
+            import time as _time
+
+            from .econ_intents import Explanation, make_intent
+            from .econ_types import Micro, Msat, SignedMsat, UnixTime
+            from .governor_facade import GovernorFacade
+
+            now = int(_time.time())
+
+            def _boltz_reserve_delegate(**_facade_kwargs):
+                return bool(self._capex_engine.reserve_boltz_swap_budget(
+                    reservation_id=reservation_id,
+                    estimated_fee_sats=fee,
+                    channel_id=channel_id,
+                    effective_budget_sats=effective_budget,
+                    subcategory=subcat,
+                ))
+
+            ledger = None
+            if self.econ_shadow is not None:
+                try:
+                    ledger = self.econ_shadow.ledger_for_reconciliation()
+                except Exception:
+                    ledger = None
+
+            facade = GovernorFacade(
+                reserve_spend=_boltz_reserve_delegate,
+                release_spend=lambda rid: bool(
+                    self._capex_engine.release_boltz_swap_reservation(rid)),
+                is_paused=lambda: False,
+                ledger=ledger,
+            )
+            env = make_intent(
+                intent_type=intent_type,
+                snapshot_id=f"boltz-swap-{now}",
+                created_at=UnixTime(now),
+                expires_at=UnixTime(now + 600),
+                target=str(channel_id or "onchain"),
+                amount_msat=None,
+                expected_benefit_msat=SignedMsat(0),
+                max_cost_msat=Msat(int(fee) * 1000),
+                capital_committed_msat=Msat(0),
+                confidence_micro=Micro(0),
+                reason_codes=(),
+                explanation=Explanation("boltz_swap_reservation", (
+                    ("subcategory", str(subcat)),
+                    ("structural", bool(structural)),
+                    ("estimated_fee_sats", int(fee)),
+                )),
+                preconditions=(),
+                priority=50,
+                budget_bucket="boltz",
+                origin_policy="boltz_manager_governed",
+                reversible=False,
+            )
+            if ledger is not None:
+                try:
+                    ledger.append(
+                        event_type="intent_proposed",
+                        intent_id=env.intent_id.value,
+                        idempotency_key=env.idempotency_key,
+                        cycle_id=env.snapshot_id,
+                        at=now,
+                        details={"target": env.target, "governed": True,
+                                 "subcategory": str(subcat)},
+                    )
+                except Exception:
+                    pass
+            decision = facade.authorize(env, now)
+            if not decision.authorized:
+                try:
+                    self.plugin.log(
+                        f"BOLTZ: governor blocked swap reservation "
+                        f"({subcat}): {decision.reason_code}", level="warn")
+                except Exception:
+                    pass
+                return False
+            return reservation_id
+        except Exception as e:
+            try:
+                self.plugin.log(
+                    f"BOLTZ: governed reservation failed closed: {e}",
+                    level="warn")
+            except Exception:
+                pass
+            return False
+
     def _open_swap_budget_reservation(
         self,
         estimated_fee_sats: int,
         channel_id: Optional[str],
         structural: bool = False,
+        intent_type: str = "SWAP_OUT",
     ):
         """Reserve the swap's estimated cost against the unified cross-category
         budget BEFORE the swap is created, so a concurrent rebalance reserve both
@@ -1638,6 +1750,14 @@ class BoltzCliManager:
             return None
         reservation_id = f"boltz-swap:{uuid.uuid4().hex}"
         subcat = "structural" if structural else "swap_fee"
+        if self._boltz_governor_enabled():
+            # Phase 2G: governor-gated reservation (same
+            # reserve_boltz_swap_budget underneath; fail-closed).
+            return self._governed_open_reservation(
+                reservation_id=reservation_id, fee=fee,
+                channel_id=channel_id, subcat=subcat,
+                effective_budget=effective_budget,
+                intent_type=intent_type, structural=structural)
         try:
             ok = self._capex_engine.reserve_boltz_swap_budget(
                 reservation_id=reservation_id,
@@ -1809,7 +1929,9 @@ class BoltzCliManager:
             # P4-014 / DD1: atomically reserve the swap's committed cost against
             # the unified cross-category budget before creating it.
             est_fee = int(budget_check.get("estimated_fee_sats", 0) or 0)
-            reservation_id = self._open_swap_budget_reservation(est_fee, channel_id, structural=False)
+            reservation_id = self._open_swap_budget_reservation(
+                est_fee, channel_id, structural=False,
+                intent_type="SWAP_IN")
             if reservation_id is False:
                 return {
                     "status": "rejected",
@@ -1973,7 +2095,9 @@ class BoltzCliManager:
         # unified cross-category budget before creating it. Stash the context so
         # the loop_out wrapper settles (created) or releases (failed/exception).
         est_fee = int(budget_check.get("estimated_fee_sats", 0) or 0)
-        reservation_id = self._open_swap_budget_reservation(est_fee, channel_id, structural=structural)
+        reservation_id = self._open_swap_budget_reservation(
+            est_fee, channel_id, structural=structural,
+            intent_type="SWAP_OUT")
         if reservation_id is False:
             return {
                 "status": "rejected",
@@ -2381,8 +2505,11 @@ class BoltzCliManager:
             # commitment; reject the swap if the unified budget would be
             # exceeded (mirrors loop_in / loop_out, P4-014).
             est_fee = int(budget_check.get("estimated_fee_sats", 0) or 0)
+            # Chainswap (BTC<->LBTC): closest wire intent type is SWAP_OUT;
+            # the explanation carries subcategory for the distinction.
             reservation_id = self._open_swap_budget_reservation(
-                est_fee, channel_id=None, structural=False
+                est_fee, channel_id=None, structural=False,
+                intent_type="SWAP_OUT"
             )
             if reservation_id is False:
                 return {
