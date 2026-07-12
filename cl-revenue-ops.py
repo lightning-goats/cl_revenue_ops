@@ -2902,6 +2902,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # contract; inert unless econ_shadow_enabled is set.
     try:
         econ_shadow = EconShadow(safe_plugin, config)
+        # Phase 2 pilot: journal the generic spend lifecycle (all callers
+        # of Database.reserve_spend/settle/release) into the econ ledger.
+        database.spend_journal = econ_shadow
     except Exception as e:
         econ_shadow = None
         plugin.log(f"EconShadow unavailable: {e}", level='warn')
