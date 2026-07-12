@@ -149,6 +149,50 @@ class TestSnapshotPreview:
         assert approx
 
 
+class TestSpendJournal:
+    """Phase 2 pilot: legacy spend-path journaling (no intent envelope;
+    reservation_id doubles as intent/idempotency identity)."""
+
+    def test_disabled_records_nothing(self, tmp_path):
+        shadow = _shadow(tmp_path, enabled=False)
+        shadow.note_spend_reserved("res-1", 3, "rebalance")
+        shadow.note_spend_settled("res-1", 2)
+        shadow.note_spend_released("res-1")
+        assert not (tmp_path / "econ_ledger.db").exists()
+
+    def test_full_lifecycle_events_and_replay(self, tmp_path):
+        shadow = _shadow(tmp_path)
+        shadow.note_spend_reserved("res-1", 3, "rebalance")
+        shadow.note_spend_settled("res-1", 2, "rebalance")
+        ledger = EconLedger(str(tmp_path / "econ_ledger.db"))
+        types = [e["event_type"] for e in ledger.events()]
+        assert types == ["budget_reserved", "cost_recorded",
+                         "execution_succeeded", "reservation_released"]
+        assert ledger.events()[0]["cycle_id"] == "spend-rebalance"
+        state = ledger.replay()
+        assert state.reserved_msat == {}  # settle consumed it
+        assert state.spent_msat == {"res-1": 2000}
+        assert state.terminal == {"res-1": "execution_succeeded"}
+
+    def test_release_only_replays_to_zero(self, tmp_path):
+        shadow = _shadow(tmp_path)
+        shadow.note_spend_reserved("res-2", 5, "planner")
+        shadow.note_spend_released("res-2", reason="stale")
+        ledger = EconLedger(str(tmp_path / "econ_ledger.db"))
+        events = ledger.events()
+        assert events[-1]["event_type"] == "reservation_released"
+        assert events[-1]["details"]["reason"] == "stale"
+        state = ledger.replay()
+        assert state.reserved_msat == {}
+        assert state.spent_msat == {}
+
+    def test_garbage_inputs_never_raise(self, tmp_path):
+        shadow = _shadow(tmp_path)
+        shadow.note_spend_reserved(None, "x", 3)  # type: ignore[arg-type]
+        shadow.note_spend_settled("", None)  # type: ignore[arg-type]
+        shadow.note_spend_released(object())  # type: ignore[arg-type]
+
+
 class TestConfigFlag:
     def test_flag_defaults_off_and_is_runtime_settable(self):
         from modules.config import PUBLIC_RUNTIME_KEYS, Config, ConfigSnapshot

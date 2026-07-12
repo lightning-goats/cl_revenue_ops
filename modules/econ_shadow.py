@@ -142,6 +142,74 @@ class EconShadow:
             return 0
 
     # ------------------------------------------------------------------
+    # legacy spend-path journal (Phase 2 pilot A)
+    #
+    # The generic spend lifecycle (Database.reserve_spend / settle /
+    # release) predates typed intents, so reservation_id doubles as both
+    # intent_id and idempotency_key. Same fail-open + flag contract as
+    # everything else in this class. Timestamps are audit stamps
+    # (int(time.time())), not decision inputs.
+    # ------------------------------------------------------------------
+    def _journal(self, event_type: str, reservation_id: Any,
+                 category: str = "", amounts: Optional[dict] = None,
+                 details: Optional[dict] = None) -> None:
+        try:
+            if not self.enabled():
+                return
+            rid = str(reservation_id or "").strip()
+            if not rid:
+                return
+            ledger = self._get_ledger()
+            if ledger is None:
+                return
+            import time as _time
+            ledger.append(
+                event_type=event_type,
+                intent_id=rid,
+                idempotency_key=rid,
+                cycle_id=f"spend-{str(category or 'generic')}",
+                at=int(_time.time()),
+                amounts=amounts or {},
+                details=details or {},
+            )
+        except Exception as e:
+            self._log(f"spend journal skipped ({event_type}): {e}")
+
+    def note_spend_reserved(self, reservation_id: Any, amount_sats: Any,
+                            category: str = "") -> None:
+        try:
+            amounts = {"reserved_msat": int(amount_sats) * 1000}
+        except (TypeError, ValueError):
+            self._log(f"note_spend_reserved skipped: bad amount "
+                      f"{amount_sats!r}")
+            return
+        self._journal("budget_reserved", reservation_id, category,
+                      amounts=amounts)
+
+    def note_spend_settled(self, reservation_id: Any,
+                           actual_spent_sats: Any,
+                           category: str = "") -> None:
+        try:
+            amounts = {"cost_msat": int(actual_spent_sats) * 1000}
+        except (TypeError, ValueError):
+            self._log(f"note_spend_settled skipped: bad amount "
+                      f"{actual_spent_sats!r}")
+            return
+        self._journal("cost_recorded", reservation_id, category,
+                      amounts=amounts)
+        self._journal("execution_succeeded", reservation_id, category)
+        # DB semantics: settle is terminal for the whole reservation —
+        # the unused remainder is released (spec reservation machine:
+        # reserved -> spent, unused portion -> released).
+        self._journal("reservation_released", reservation_id, category,
+                      details={"reason": "settled"})
+
+    def note_spend_released(self, reservation_id: Any,
+                            reason: str = "released") -> None:
+        self._journal("reservation_released", reservation_id,
+                      details={"reason": str(reason)})
+
+    # ------------------------------------------------------------------
     # on-demand snapshot preview
     # ------------------------------------------------------------------
     def build_snapshot_preview(self, *, channels: Any,
