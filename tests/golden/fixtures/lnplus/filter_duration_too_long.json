@@ -1,0 +1,6 @@
+{
+  "overrides": {
+    "duration_months": 12
+  },
+  "rejection": "terms:duration exceeds cap"
+}

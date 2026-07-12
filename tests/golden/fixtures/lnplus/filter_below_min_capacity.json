@@ -1,0 +1,6 @@
+{
+  "overrides": {
+    "capacity_sats": 500000
+  },
+  "rejection": "terms:capacity 500000 below planner min 1000000"
+}

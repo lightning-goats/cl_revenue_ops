@@ -1,0 +1,6 @@
+{
+  "overrides": {
+    "participant_max_count": 2
+  },
+  "rejection": "terms:fewer than 3 participants"
+}

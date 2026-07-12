@@ -1,0 +1,6 @@
+{
+  "overrides": {
+    "participant_waiting_for_count": 2
+  },
+  "rejection": "fill_state:not the last open slot"
+}

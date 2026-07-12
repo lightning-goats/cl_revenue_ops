@@ -1,0 +1,6 @@
+{
+  "overrides": {
+    "platform": "lnd"
+  },
+  "rejection": "terms:LND/BOS swap \u2014 we are CLN"
+}
