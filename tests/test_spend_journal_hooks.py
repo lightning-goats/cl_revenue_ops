@@ -91,6 +91,23 @@ def test_bulk_stale_release_hooks(db):
         assert c.kwargs.get("reason") == "stale"
 
 
+def test_get_spend_reservation_states(db):
+    """Phase 2 pilot B: read-only state accessor for reconciliation."""
+    db.reserve_spend(reservation_id="a1", amount_sats=3, category="planner")
+    db.reserve_spend(reservation_id="a2", amount_sats=4, category="planner")
+    db.reserve_spend(reservation_id="a3", amount_sats=5, category="boltz")
+    db.mark_spend_reservation_spent("a2")
+    db.release_spend_reservation("a3")
+
+    states = db.get_spend_reservation_states()
+    assert states["a1"] == {"status": "active", "reserved_sats": 3}
+    assert states["a2"] == {"status": "spent", "reserved_sats": 4}
+    assert states["a3"] == {"status": "released", "reserved_sats": 5}
+
+    subset = db.get_spend_reservation_states(["a1", "nope"])
+    assert set(subset) == {"a1"}
+
+
 def test_raising_journal_never_breaks_operations(db):
     journal = MagicMock()
     journal.note_spend_reserved.side_effect = RuntimeError("boom")

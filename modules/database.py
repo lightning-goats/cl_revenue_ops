@@ -4017,6 +4017,38 @@ class Database:
             self.plugin.log(f"Spend reservation failed: {e}", level='error')
             return False
 
+    def get_spend_reservation_states(
+        self, reservation_ids: Optional[List[str]] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """READ-ONLY: reservation status map for ledger reconciliation
+        (Phase 2 pilot B). {rid: {"status", "reserved_sats"}}. When
+        reservation_ids is None, returns all rows (capped 10000)."""
+        conn = self._get_connection()
+        if reservation_ids is not None:
+            ids = [str(r) for r in reservation_ids if str(r or "").strip()]
+            if not ids:
+                return {}
+            qmarks = ",".join(["?"] * len(ids))
+            rows = conn.execute(
+                f"SELECT reservation_id, status, reserved_sats "
+                f"FROM spend_reservations WHERE reservation_id IN ({qmarks}) "
+                f"ORDER BY reservation_id",
+                tuple(ids),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT reservation_id, status, reserved_sats "
+                "FROM spend_reservations ORDER BY reservation_id "
+                "LIMIT 10000",
+            ).fetchall()
+        return {
+            str(r["reservation_id"]): {
+                "status": str(r["status"]),
+                "reserved_sats": int(r["reserved_sats"] or 0),
+            }
+            for r in rows
+        }
+
     def release_spend_reservation(self, reservation_id: str) -> bool:
         conn = self._get_connection()
         cursor = conn.execute("""
