@@ -149,7 +149,10 @@ def fee_intent_completeness(ledger: EconLedger, fee_changes: list,
         if event["event_type"] != "intent_proposed":
             continue
         cycle = str(event["cycle_id"])
-        if not cycle.startswith("fee-cycle-"):
+        # fee-cycle-<ts>: post-hoc batch recording (observe mode);
+        # fee-broadcast-<ts>: per-broadcast governed recording (2H).
+        if not (cycle.startswith("fee-cycle-")
+                or cycle.startswith("fee-broadcast-")):
             continue
         try:
             ts = int(cycle.rsplit("-", 1)[1])

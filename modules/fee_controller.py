@@ -7475,6 +7475,92 @@ class FeeController:
 
         return None, None, f"Channel {channel_ref} not found"
 
+    # Phase 2H: optional governor/ledger plumbing (EconShadow), injected
+    # at plugin init.
+    econ_shadow = None
+
+    def _fee_governor_enabled(self) -> bool:
+        """Strict flag check (MagicMock/absent snapshots stay legacy)."""
+        try:
+            cfg = self.config.snapshot() \
+                if hasattr(self.config, "snapshot") else self.config
+            return getattr(cfg, "econ_governor_fees_enabled",
+                           False) is True
+        except Exception:
+            return False
+
+    def _governed_authorize_fee_broadcast(self, *, channel_id, fee_ppm,
+                                          old_fee_ppm, reason, reason_code):
+        """Phase 2H: authorize one automated fee broadcast. Zero worst-
+        case cost (reversible policy change) — the facade authorizes
+        without reserving; the gates are paused/stale plus the ledger
+        trail. Returns (authorized, reason_code_str); FAILS CLOSED."""
+        try:
+            import time as _time
+
+            from .econ_intents import Explanation, make_intent
+            from .econ_types import Micro, Msat, SignedMsat, UnixTime
+            from .governor_facade import GovernorFacade
+
+            now = int(_time.time())
+            cfg = self.config.snapshot() \
+                if hasattr(self.config, "snapshot") else self.config
+
+            ledger = None
+            if self.econ_shadow is not None:
+                try:
+                    ledger = self.econ_shadow.ledger_for_reconciliation()
+                except Exception:
+                    ledger = None
+
+            facade = GovernorFacade(
+                reserve_spend=lambda **_kw: True,  # zero-cost: never called
+                release_spend=lambda _rid: True,
+                is_paused=lambda: getattr(cfg, "paused", False) is True,
+                ledger=ledger,
+            )
+            env = make_intent(
+                intent_type="SET_FEE",
+                snapshot_id=f"fee-broadcast-{now}",
+                created_at=UnixTime(now),
+                expires_at=UnixTime(now + 600),
+                target=str(channel_id),
+                amount_msat=None,
+                expected_benefit_msat=SignedMsat(0),
+                max_cost_msat=Msat(0),
+                capital_committed_msat=Msat(0),
+                confidence_micro=Micro(0),
+                reason_codes=(),
+                explanation=Explanation("fee_broadcast", (
+                    ("old_fee_ppm", int(old_fee_ppm or 0)),
+                    ("new_fee_ppm", int(fee_ppm)),
+                    ("reason", str(reason)),
+                    ("controller_reason_code", str(reason_code or "")),
+                )),
+                preconditions=(),
+                priority=50,
+                budget_bucket="fees",
+                origin_policy="fee_controller_governed",
+                reversible=True,
+            )
+            if ledger is not None:
+                try:
+                    ledger.append(
+                        event_type="intent_proposed",
+                        intent_id=env.intent_id.value,
+                        idempotency_key=env.idempotency_key,
+                        cycle_id=env.snapshot_id,
+                        at=now,
+                        details={"target": env.target, "governed": True,
+                                 "explanation": env.explanation.render()},
+                    )
+                except Exception:
+                    pass
+            decision = facade.authorize(env, now)
+            return bool(decision.authorized), str(decision.reason_code)
+        except Exception as e:
+            return False, f"internal_error ({e})"
+
     def set_channel_fee(self, channel_id: str, fee_ppm: int,
                        reason: str = "manual", manual: bool = False,
                        reason_code: Optional[str] = None,
@@ -7620,6 +7706,30 @@ class FeeController:
                 rpc_params["htlcmin"] = f"{htlcmin_msat}msat"
             if htlcmax_msat is not None:
                 rpc_params["htlcmax"] = f"{htlcmax_msat}msat"
+
+            # Phase 2H: automated broadcasts pass the governor (paused/
+            # stale gate + audit trail; zero-cost so no reservation).
+            # Manual operator sets stay direct (operator-constraint
+            # precedence + legacy behavior). Fail-closed: an unauthorized
+            # or errored authorization skips the broadcast; the channel
+            # is repriced next cycle.
+            if not manual and self._fee_governor_enabled():
+                gov_ok, gov_reason = self._governed_authorize_fee_broadcast(
+                    channel_id=resolved_channel_id,
+                    fee_ppm=fee_ppm,
+                    old_fee_ppm=old_fee_ppm,
+                    reason=reason,
+                    reason_code=reason_code,
+                )
+                if not gov_ok:
+                    result["message"] = f"governor_block: {gov_reason}"
+                    result["governor_blocked"] = True
+                    self.plugin.log(
+                        f"Governor blocked fee broadcast for "
+                        f"{resolved_channel_id[:13]} "
+                        f"({old_fee_ppm}->{fee_ppm} ppm): {gov_reason}",
+                        level='info')
+                    return result
 
             rpc_result = self.data_service.set_channel(**rpc_params)
             (

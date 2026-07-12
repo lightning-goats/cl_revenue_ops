@@ -94,6 +94,10 @@ PUBLIC_RUNTIME_KEYS = (
     # Refactor Phase 2G: Boltz pre-create swap reservations gated by the
     # governor facade. Default off.
     'econ_governor_boltz_enabled',
+    # Refactor Phase 2H: automated fee broadcasts gated by the governor
+    # (paused/stale + audit trail; zero-cost, no reservation). Manual
+    # revenue-set-fee stays operator-direct. Default off.
+    'econ_governor_fees_enabled',
     # LN+ liquidity swap automation (13 runtime controls)
     'lnplus_swaps_enabled',
     'lnplus_execute_applications',
@@ -164,6 +168,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'econ_governor_planner_enabled': bool,
     'econ_governor_lnplus_enabled': bool,
     'econ_governor_boltz_enabled': bool,
+    'econ_governor_fees_enabled': bool,
     'expansion_treasury_enabled': bool,
     'expansion_treasury_onchain_target_sats': int,
     'expansion_treasury_min_deficit_sats': int,
@@ -468,6 +473,8 @@ class Config:
     econ_governor_lnplus_enabled: bool = False
     # Refactor Phase 2G: governor-gated Boltz swap reservations.
     econ_governor_boltz_enabled: bool = False
+    # Refactor Phase 2H: governor-gated automated fee broadcasts.
+    econ_governor_fees_enabled: bool = False
     # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
     expansion_treasury_enabled: bool = False
     expansion_treasury_onchain_target_sats: int = 5_000_000
@@ -1187,6 +1194,7 @@ class ConfigSnapshot:
     econ_governor_planner_enabled: bool = False
     econ_governor_lnplus_enabled: bool = False
     econ_governor_boltz_enabled: bool = False
+    econ_governor_fees_enabled: bool = False
     # E-2: class-aware min-fee floor for saturated/source channels (0 =
     # allow true cheap egress). Missing-from-snapshot kills the feature in
     # production (getattr fallback), so it MUST be mirrored here.

@@ -2907,6 +2907,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database.spend_journal = econ_shadow
         # Phase 2E: governor/ledger plumbing for planner reservations.
         capacity_planner.econ_shadow = econ_shadow
+        # Phase 2H: governor/ledger plumbing for fee broadcasts.
+        fee_controller.econ_shadow = econ_shadow
     except Exception as e:
         econ_shadow = None
         plugin.log(f"EconShadow unavailable: {e}", level='warn')
@@ -3528,8 +3530,15 @@ def run_fee_adjustment():
 
         # Phase 1 shadow: record this cycle's decisions as typed intents.
         # Fail-open by contract — a shadow failure must never affect fees.
+        # Phase 2H: skipped when fee broadcasts are GOVERNED — each
+        # broadcast then records its own pre-authorization trail, and
+        # double-recording would skew the completeness detector.
         try:
-            if econ_shadow is not None and econ_shadow.enabled():
+            _cfg_gov = config.snapshot() if config else None
+            _fees_governed = getattr(
+                _cfg_gov, "econ_governor_fees_enabled", False) is True
+            if econ_shadow is not None and econ_shadow.enabled() \
+                    and not _fees_governed:
                 econ_shadow.record_fee_intents(adjustments, int(time.time()))
         except Exception as _shadow_err:
             plugin.log(f"econ shadow skipped: {_shadow_err}", level='debug')

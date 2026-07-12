@@ -89,14 +89,18 @@ class GovernorFacade:
                 at=now,
                 amounts={"max_cost_msat": env.max_cost_msat.value},
             )
-            self._ledger.append(
-                event_type="budget_reserved",
-                intent_id=env.intent_id.value,
-                idempotency_key=env.idempotency_key,
-                cycle_id=env.snapshot_id,
-                at=now,
-                amounts={"reserved_msat": token.reserved_msat},
-            )
+            if token.reserved_msat > 0:
+                # Zero-cost intents (reversible fee/HTLC changes) are
+                # authorized without a reservation — recording one would
+                # misstate the ledger.
+                self._ledger.append(
+                    event_type="budget_reserved",
+                    intent_id=env.intent_id.value,
+                    idempotency_key=env.idempotency_key,
+                    cycle_id=env.snapshot_id,
+                    at=now,
+                    amounts={"reserved_msat": token.reserved_msat},
+                )
         return GovernorDecision(True, token, "")
 
     def release(self, token: AuthorizationToken, now: int) -> bool:

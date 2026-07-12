@@ -143,8 +143,17 @@ Suite after tranche: **3352 passed**.
   CLOSED on infra error — a deliberate flag-gated strengthening of the
   legacy infra-error fail-open (both behaviors pinned by tests).
 
-**Remaining Phase 2 migrations:** fee-broadcast (SET_FEE) governance;
-then reconciliation automation and the 4→1 reservations unification.
+- 2H: automated fee broadcasts behind `econ_governor_fees_enabled` —
+  the governed gate sits in `FeeController.set_channel_fee` immediately
+  before the setchannel RPC (zero-cost authorization: paused/stale gate
+  + per-broadcast audit trail, no reservation). Manual revenue-set-fee
+  stays operator-direct. Post-hoc cycle recording is skipped when
+  governed (per-broadcast trails replace it); the completeness detector
+  accepts both recording modes. The facade no longer emits
+  budget_reserved for zero-cost tokens.
+
+**Remaining Phase 2 work:** reconciliation automation and the 4→1
+reservations unification; then the Phase 2 exit-gate review.
 
 ## Contradictions
 

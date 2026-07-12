@@ -175,6 +175,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "econ_governor_planner_enabled",
         "econ_governor_lnplus_enabled",
         "econ_governor_boltz_enabled",
+        "econ_governor_fees_enabled",
         # LN+ liquidity swap automation
         "lnplus_swaps_enabled",
         "lnplus_execute_applications",
@@ -231,6 +232,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "econ_governor_planner_enabled": False,
         "econ_governor_lnplus_enabled": False,
         "econ_governor_boltz_enabled": False,
+        "econ_governor_fees_enabled": False,
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,

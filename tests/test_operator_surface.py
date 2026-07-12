@@ -54,6 +54,7 @@ def test_public_runtime_keys_are_safety_only():
         "econ_governor_planner_enabled",
         "econ_governor_lnplus_enabled",
         "econ_governor_boltz_enabled",
+        "econ_governor_fees_enabled",
         # LN+ liquidity swap automation
         "lnplus_swaps_enabled",
         "lnplus_execute_applications",
@@ -123,6 +124,7 @@ def test_public_runtime_dict_returns_only_public_keys():
         "econ_governor_planner_enabled": False,
         "econ_governor_lnplus_enabled": False,
         "econ_governor_boltz_enabled": False,
+        "econ_governor_fees_enabled": False,
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,
@@ -546,6 +548,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "daily_budget_sats",
         "drain_fee_discount_max",
         "econ_governor_boltz_enabled",
+        "econ_governor_fees_enabled",
         "econ_governor_lnplus_enabled",
         "econ_governor_planner_enabled",
         "econ_governor_rebalance_enabled",
@@ -594,7 +597,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_target",
         "weekly_budget_sats",
     ]
-    assert result["count"] == 53
+    assert result["count"] == 54
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -644,6 +647,7 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "econ_governor_planner_enabled": False,
         "econ_governor_lnplus_enabled": False,
         "econ_governor_boltz_enabled": False,
+        "econ_governor_fees_enabled": False,
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,
@@ -1129,6 +1133,7 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "econ_governor_planner_enabled": False,
         "econ_governor_lnplus_enabled": False,
         "econ_governor_boltz_enabled": False,
+        "econ_governor_fees_enabled": False,
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,

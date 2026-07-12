@@ -162,6 +162,20 @@ class TestFeeIntentCompleteness:
                                          now=NOW)
         assert result["status"] == "no_intent_data"
 
+    def test_governed_per_broadcast_intents_count(self, ledger):
+        """Phase 2H: governed mode records one fee-broadcast-<ts> intent
+        per setchannel; the detector must count them like cycle batches."""
+        for i in range(3):
+            ledger.append(
+                event_type="intent_proposed", intent_id=f"int-b{i}",
+                idempotency_key=f"{i:064d}",
+                cycle_id=f"fee-broadcast-{NOW + i}", at=NOW + i, details={})
+        changes = [{"timestamp": NOW}, {"timestamp": NOW + 1},
+                   {"timestamp": NOW + 2}]
+        from modules.econ_reconcile import fee_intent_completeness
+        result = fee_intent_completeness(ledger, changes, now=NOW)
+        assert result["complete"] is True
+
     def test_changes_straddling_seconds_are_one_cycle(self, ledger):
         """Live false-positive 2026-07-12: one cycle's 8 fee_changes rows
         landed as 3@:41 + 5@:42 against 8 intents — must be complete."""
