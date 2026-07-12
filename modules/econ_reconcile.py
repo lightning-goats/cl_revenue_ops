@@ -169,20 +169,34 @@ def fee_intent_completeness(ledger: EconLedger, fee_changes: list,
         if ts >= window_start:
             changes_by_ts[ts] = changes_by_ts.get(ts, 0) + 1
 
+    # One fee cycle can write its fee_changes rows across adjacent
+    # seconds (observed live 2026-07-12: 3 rows at :41 + 5 at :42 for a
+    # single 8-change cycle). Cluster change timestamps within the
+    # tolerance into cycles BEFORE comparing, or fragments false-positive
+    # against the whole cycle's intent count.
+    clusters = []  # [start_ts, end_ts, change_count]
+    for ts in sorted(changes_by_ts):
+        if clusters and ts - clusters[-1][1] <= tolerance_seconds:
+            clusters[-1][1] = ts
+            clusters[-1][2] += changes_by_ts[ts]
+        else:
+            clusters.append([ts, ts, changes_by_ts[ts]])
+
     mismatched = {}
-    for change_ts in sorted(changes_by_ts):
+    for start_ts, end_ts, change_count in clusters:
         matched_intents = sum(
             count for intent_ts, count in intents_by_ts.items()
-            if abs(intent_ts - change_ts) <= tolerance_seconds)
-        if matched_intents != changes_by_ts[change_ts]:
-            mismatched[str(change_ts)] = {
-                "fee_changes": changes_by_ts[change_ts],
+            if start_ts - tolerance_seconds <= intent_ts
+            <= end_ts + tolerance_seconds)
+        if matched_intents != change_count:
+            mismatched[str(start_ts)] = {
+                "fee_changes": change_count,
                 "intents": matched_intents,
             }
     return {
         "status": "ok",
         "window_start": window_start,
-        "cycles_checked": len(changes_by_ts),
+        "cycles_checked": len(clusters),
         "complete": not mismatched,
         "mismatched_cycles": mismatched,
     }

@@ -162,6 +162,16 @@ class TestFeeIntentCompleteness:
                                          now=NOW)
         assert result["status"] == "no_intent_data"
 
+    def test_changes_straddling_seconds_are_one_cycle(self, ledger):
+        """Live false-positive 2026-07-12: one cycle's 8 fee_changes rows
+        landed as 3@:41 + 5@:42 against 8 intents — must be complete."""
+        self._intent(ledger, NOW - 2, n=8)
+        changes = ([{"timestamp": NOW}] * 3 + [{"timestamp": NOW + 1}] * 5)
+        from modules.econ_reconcile import fee_intent_completeness
+        result = fee_intent_completeness(ledger, changes, now=NOW)
+        assert result["complete"] is True
+        assert result["cycles_checked"] == 1
+
 
 def test_apply_skips_quarantined(ledger):
     _append(ledger, "budget_reserved", amounts={"reserved_msat": 3_000},
