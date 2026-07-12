@@ -97,9 +97,25 @@ Boltz capex reservations):
 
 Suite after tranche: **3334 passed**.
 
-**Next tranches (Phase 2 continuation):** ledger↔DB reconciliation
-sweep + EXTERNAL_OUTCOME_UNKNOWN handling; then per-spender migration
-to `GovernorFacade.authorize()` (rebalance engine first) toward "no
+## Phase 2 pilot B — reconciliation sweep (2026-07-12)
+
+Plan: `docs/planning/2026-07-12-refactor-phase2-reconcile.md`.
+
+- `modules/econ_reconcile.py` — classifies ledger↔DB divergences
+  (`ledger_stale_reservation`, `ledger_missing_reservation`,
+  `db_missing`, `amount_mismatch`, `unknown_outcome`); the ledger
+  reconciles TO spend_reservations truth via append-only
+  `reconciliation_completed` events (replay honors them); ambiguous
+  outcomes are QUARANTINED with EXTERNAL_OUTCOME_UNKNOWN, never
+  auto-resolved.
+- `Database.get_spend_reservation_states` — read-only accessor.
+- `revenue-econ-reconcile` RPC (dry-run default; `apply=true` writes
+  ledger events only; never touches revenue_ops.db). Surface 65→66.
+
+Suite after tranche: **3352 passed**.
+
+**Next tranche (Phase 2 continuation):** per-spender migration to
+`GovernorFacade.authorize()` (rebalance engine first) toward "no
 executor reachable without authorization".
 
 ## Contradictions

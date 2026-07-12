@@ -121,3 +121,64 @@ class TestSnapshotRpc:
         result = mod.revenue_econ_snapshot(mod.plugin)
         assert result["enabled"] is True
         assert "error" in result or result.get("snapshot") is None
+
+
+class TestReconcileRpc:
+    def _mod(self, tmp_path):
+        import os
+        import tempfile
+        from modules.database import Database
+        from modules.econ_shadow import EconShadow
+
+        mod = load_plugin_module()
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        mod.database = Database(db_path, MagicMock())
+        mod.database.initialize()
+        cfg = MagicMock()
+        cfg.snapshot.return_value = SimpleNamespace(
+            econ_shadow_enabled=True)
+        cfg.db_path = db_path
+        shadow = EconShadow(MagicMock(), cfg,
+                            ledger_path=str(tmp_path / "ledger.db"))
+        mod.database.spend_journal = shadow
+        mod.econ_shadow = shadow
+        return mod
+
+    def test_disabled_reports_disabled(self):
+        mod = load_plugin_module()
+        mod.econ_shadow = None
+        assert mod.revenue_econ_reconcile(mod.plugin)["enabled"] is False
+
+    def test_dry_run_then_apply(self, tmp_path):
+        mod = self._mod(tmp_path)
+        # Journaled reserve, then settle with journaling DISABLED —
+        # a real ledger_stale_reservation divergence.
+        mod.database.reserve_spend(reservation_id="op-1", amount_sats=3,
+                                   category="planner")
+        mod.econ_shadow._config.snapshot.return_value = SimpleNamespace(
+            econ_shadow_enabled=False)
+        mod.database.mark_spend_reservation_spent("op-1")
+        mod.econ_shadow._config.snapshot.return_value = SimpleNamespace(
+            econ_shadow_enabled=True)
+
+        dry = mod.revenue_econ_reconcile(mod.plugin)
+        assert dry["enabled"] is True
+        assert [d["kind"] for d in dry["divergences"]] == [
+            "ledger_stale_reservation"]
+        assert "applied" not in dry  # dry-run default
+
+        applied = mod.revenue_econ_reconcile(mod.plugin, apply=True)
+        assert applied["applied"] == 1
+        clean = mod.revenue_econ_reconcile(mod.plugin)
+        assert clean["divergences"] == []
+
+    def test_rpc_never_raises(self):
+        mod = load_plugin_module()
+        shadow = MagicMock()
+        shadow.enabled.return_value = True
+        shadow.ledger_for_reconciliation.side_effect = RuntimeError("boom")
+        mod.econ_shadow = shadow
+        mod.database = None
+        result = mod.revenue_econ_reconcile(mod.plugin)
+        assert result["enabled"] is True and "error" in result

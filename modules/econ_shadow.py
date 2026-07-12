@@ -209,6 +209,13 @@ class EconShadow:
         self._journal("reservation_released", reservation_id,
                       details={"reason": str(reason)})
 
+    def ledger_for_reconciliation(self) -> Optional[EconLedger]:
+        """The lazy ledger, for the reconciliation sweep (Phase 2
+        pilot B). None when disabled or unavailable."""
+        if not self.enabled():
+            return None
+        return self._get_ledger()
+
     # ------------------------------------------------------------------
     # on-demand snapshot preview
     # ------------------------------------------------------------------

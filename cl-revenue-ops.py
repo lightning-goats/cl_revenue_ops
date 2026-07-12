@@ -5733,6 +5733,50 @@ def revenue_econ_snapshot(plugin: Plugin) -> Dict[str, Any]:
         return {"enabled": True, "error": str(e)}
 
 
+@plugin.method("revenue-econ-reconcile")
+def revenue_econ_reconcile(plugin: Plugin, apply: bool = False,
+                           stale_after_seconds: int = 3600) -> Dict[str, Any]:
+    """Reconcile the econ ledger against spend_reservations truth
+    (Phase 2 pilot B). Dry-run by default; apply=true appends
+    reconciliation_completed events to econ_ledger.db. NEVER writes
+    revenue_ops.db. Requires econ_shadow_enabled."""
+    try:
+        from modules import econ_reconcile
+        if econ_shadow is None or not econ_shadow.enabled():
+            return {"enabled": False,
+                    "hint": "revenue-config set econ_shadow_enabled true"}
+        ledger = econ_shadow.ledger_for_reconciliation()
+        if ledger is None or database is None:
+            return {"enabled": True, "error": "ledger or database unavailable"}
+        db_states = database.get_spend_reservation_states()
+        report = econ_reconcile.reconcile(
+            ledger, db_states, now=int(time.time()),
+            stale_after_seconds=max(60, int(stale_after_seconds)))
+        result = {
+            "enabled": True,
+            "checked": report.checked,
+            "matched": report.matched,
+            "divergences": [
+                {
+                    "kind": d.kind,
+                    "key": d.key,
+                    "ledger_reserved_msat": d.ledger_reserved_msat,
+                    "db_status": d.db_status,
+                    "db_reserved_sats": d.db_reserved_sats,
+                    "quarantined": d.resolution is None,
+                    "details": d.details,
+                }
+                for d in report.divergences
+            ],
+        }
+        if apply:
+            result["applied"] = econ_reconcile.apply(
+                ledger, report, now=int(time.time()))
+        return result
+    except Exception as e:
+        return {"enabled": True, "error": str(e)}
+
+
 @plugin.method("revenue-health")
 def revenue_health(plugin: Plugin) -> Dict[str, Any]:
     """
