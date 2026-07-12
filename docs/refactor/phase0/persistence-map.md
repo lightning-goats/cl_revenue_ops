@@ -77,6 +77,15 @@ State that must survive restart and its current recovery path:
 - `dead_capital_stage` — staged closes pending execution
 - In-flight sendpay: recovered via waitsendpay/listpays on next cycle
 
+## Econ ledger (Phase 1 wiring, 2026-07-12)
+
+`econ_ledger.db` — a SEPARATE sqlite file beside `revenue_ops.db`, owned
+by `modules/econ_ledger.py` (table `econ_ledger_events`, append-only).
+Created lazily by `modules/econ_shadow.py` only when
+`econ_shadow_enabled` is set; records `intent_proposed` events from live
+fee cycles. Not part of the production DB schema (the table pin test
+scans `modules/database.py` only). Becomes authoritative in Phase 2.
+
 ## CLN datastore keys (telemetry projections, read-only contracts)
 
 Writers: `data_service.datastore_push` (`modules/data_service.py:461`) +

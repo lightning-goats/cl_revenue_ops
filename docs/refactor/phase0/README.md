@@ -46,10 +46,38 @@ plugin yet:
 Suite after tranche: **3300 passed** (+88). Phase 1 exit gate holds:
 golden parity untouched, no new component has live authority.
 
-**Next tranche (needs operator go-ahead — starts modifying production
-files):** shadow snapshot emission in a live cycle, RPC output from
-projections, ledger attached to revenue_ops.db, governor routing
-(Phase 2 entry).
+## Phase 1 wiring tranche (2026-07-12, operator-approved)
+
+Plan: `docs/planning/2026-07-12-refactor-phase1-wiring.md`. First
+production-file changes of the refactor — deliberately minimal:
+
+- `modules/econ_shadow.py` (+`tests/test_econ_shadow.py`) — fail-open
+  shadow: records live fee decisions as SET_FEE intent proposals in
+  `econ_ledger.db` (own sqlite file beside revenue_ops.db) and builds
+  on-demand snapshot previews with declared approximations.
+- `modules/config.py` — `econ_shadow_enabled` runtime flag, DEFAULT
+  FALSE, registered in all four config surfaces (48→49 runtime keys).
+- `cl-revenue-ops.py` — three guarded touchpoints: init construction,
+  fee-cycle tail recording, `revenue-econ-snapshot` read-only RPC
+  (surface 64→65). Wiring tests prove a broken/absent shadow cannot
+  affect the fee cycle (`tests/test_econ_shadow_wiring.py`).
+
+Suite after tranche: **3318 passed**. With the flag off (default) the
+deployed node's behavior is unchanged.
+
+### Rollout (operator)
+
+1. Deploy branch; restart plugin (or dynamic reload).
+2. `lightning-cli revenue-config set econ_shadow_enabled true`
+3. After a fee cycle: `lightning-cli revenue-econ-snapshot` — inspect
+   the preview + `approximations`; `econ_ledger.db` accrues
+   `intent_proposed` events.
+4. Roll back anytime: `revenue-config set econ_shadow_enabled false`.
+
+**Next tranche (needs operator go-ahead):** Phase 2 entry — route the
+generic spend path through the governor facade, make the ledger
+authoritative for new actions, rebuild compatibility histories as
+projections, restart/duplicate-callback/reconciliation tests.
 
 ## Contradictions
 
