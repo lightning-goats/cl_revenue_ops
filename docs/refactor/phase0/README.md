@@ -130,10 +130,14 @@ Suite after tranche: **3352 passed**.
   fee-intent completeness detector in revenue-econ-reconcile, ledger
   thread-affinity fix (live-found), durable intent counters.
 
-**Remaining Phase 2 migrations:** LN+ funding reservation
-(`lnplus_swaps.py:1439`), Boltz capex wrappers, fee-broadcast (SET_FEE)
-governance; then reconciliation automation and the 4→1 reservations
-unification.
+- 2F: LN+ swap-open reservations behind `econ_governor_lnplus_enabled`
+  via `SwapLifecycle._governed_reserve_spend` — obligation fulfillment
+  carries NO pause gate (invariant 6, matching the legacy path) and the
+  intent is tagged CONTRACT_OBLIGATION with priority 80.
+
+**Remaining Phase 2 migrations:** Boltz capex wrappers, fee-broadcast
+(SET_FEE) governance; then reconciliation automation and the 4→1
+reservations unification.
 
 ## Contradictions
 

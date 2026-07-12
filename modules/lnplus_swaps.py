@@ -655,6 +655,119 @@ class SwapLifecycle:
 
     _BACKFILL_FLAG = _BACKFILL_FLAG
 
+    # Phase 2F: optional governor/ledger plumbing (EconShadow), injected
+    # at plugin init.
+    econ_shadow = None
+
+    def _lnplus_governor_enabled(self) -> bool:
+        """Phase 2F: strict flag check (MagicMock/absent snapshots stay
+        on the legacy path)."""
+        try:
+            cfg = self._config.snapshot() \
+                if self._config is not None \
+                and hasattr(self._config, "snapshot") else self._config
+            return getattr(cfg, "econ_governor_lnplus_enabled",
+                           False) is True
+        except Exception:
+            return False
+
+    def _governed_reserve_spend(self, *, reservation_id, amount_sats,
+                                metadata, effective_budget_sats,
+                                since_timestamp, swap_id, peer_id,
+                                capacity_sats):
+        """Phase 2F: GovernorFacade.authorize() gates the LN+ swap-open
+        reservation. Fulfilling an ACCEPTED swap is a CONTRACTUAL
+        OBLIGATION (refactor invariant 6): the legacy path carries no
+        pause gate here and neither does the governed one — is_paused is
+        pinned False and the intent carries CONTRACT_OBLIGATION. The
+        delegate performs the IDENTICAL reserve_spend call; FAILS CLOSED
+        on internal error (caller treats False as retry-next-pass, same
+        as a legacy budget refusal)."""
+        try:
+            import time as _time
+
+            from .econ_intents import Explanation, make_intent
+            from .econ_types import Micro, Msat, SignedMsat, UnixTime
+            from .governor_facade import GovernorFacade
+
+            now = int(_time.time())
+
+            def _lnplus_reserve_delegate(**_facade_kwargs):
+                return bool(self._db.reserve_spend(
+                    reservation_id=reservation_id,
+                    amount_sats=amount_sats,
+                    category="channel_open",
+                    subcategory="lnplus_swap",
+                    metadata=metadata,
+                    effective_budget_sats=effective_budget_sats,
+                    since_timestamp=since_timestamp,
+                ))
+
+            ledger = None
+            if self.econ_shadow is not None:
+                try:
+                    ledger = self.econ_shadow.ledger_for_reconciliation()
+                except Exception:
+                    ledger = None
+
+            facade = GovernorFacade(
+                reserve_spend=_lnplus_reserve_delegate,
+                release_spend=self._db.release_spend_reservation,
+                # Invariant 6: obligation fulfillment is never pause-gated.
+                is_paused=lambda: False,
+                ledger=ledger,
+            )
+            committed = int(capacity_sats or 0)
+            env = make_intent(
+                intent_type="OPEN_CHANNEL",
+                snapshot_id=f"lnplus-swap-{swap_id}",
+                created_at=UnixTime(now),
+                expires_at=UnixTime(now + 600),
+                target=str(peer_id),
+                amount_msat=(Msat(committed * 1000) if committed > 0
+                             else None),
+                expected_benefit_msat=SignedMsat(0),
+                max_cost_msat=Msat(int(amount_sats) * 1000),
+                capital_committed_msat=Msat(committed * 1000),
+                confidence_micro=Micro(0),
+                reason_codes=("CONTRACT_OBLIGATION",),
+                explanation=Explanation("lnplus_swap_open", (
+                    ("swap_id", str(swap_id)),
+                    ("peer", str(peer_id)),
+                    ("capacity_sats", committed),
+                    ("reserve_sats", int(amount_sats)),
+                )),
+                preconditions=(),
+                priority=80,
+                budget_bucket="channel_open",
+                origin_policy="lnplus_lifecycle_governed",
+                reversible=False,
+            )
+            if ledger is not None:
+                try:
+                    ledger.append(
+                        event_type="intent_proposed",
+                        intent_id=env.intent_id.value,
+                        idempotency_key=env.idempotency_key,
+                        cycle_id=env.snapshot_id,
+                        at=now,
+                        details={"target": env.target, "governed": True,
+                                 "swap_id": str(swap_id)},
+                    )
+                except Exception:
+                    pass
+            decision = facade.authorize(env, now)
+            if not decision.authorized:
+                self._plugin.log(
+                    f"LNPLUS: governor blocked swap-open reservation for "
+                    f"swap {swap_id}: {decision.reason_code}", level="warn")
+            return bool(decision.authorized)
+        except Exception as e:
+            self._plugin.log(
+                f"LNPLUS: governed reservation failed closed for swap "
+                f"{swap_id}: {e}", level="warn")
+            return False
+
     def __init__(self, plugin, rpc, database, config, client, policy_manager,
                  ignore_peer_fn=None, estimate_open_cost_fn=None, budget_params_fn=None):
         self._plugin = plugin
@@ -1435,22 +1548,36 @@ class SwapLifecycle:
             eff_budget, budget_since = (self._budget_params_fn() if self._budget_params_fn
                                          else (None, None))
             reservation_id = f"lnplus-open-{sid}-{int(time.time())}"
-            try:
-                reservation_active = bool(self._db.reserve_spend(
+            if self._lnplus_governor_enabled():
+                # Phase 2F: governor-gated reservation (same reserve_spend
+                # underneath; fail-closed; no pause gate — invariant 6).
+                reservation_active = self._governed_reserve_spend(
                     reservation_id=reservation_id,
                     amount_sats=estimated_cost,
-                    category="channel_open",
-                    subcategory="lnplus_swap",
                     metadata={"swap_id": sid, "peer_id": peer},
                     effective_budget_sats=eff_budget,
                     since_timestamp=budget_since,
-                ))
-            except Exception as e:
-                self._plugin.log(
-                    f"LNPLUS: budget reservation failed for swap {sid} — "
-                    f"retrying next pass ({e})", level="warn")
-                self._maybe_trip_deadline_miss(row, sid, deadline, now)
-                return
+                    swap_id=sid,
+                    peer_id=peer,
+                    capacity_sats=int(row["capacity_sats"]),
+                )
+            else:
+                try:
+                    reservation_active = bool(self._db.reserve_spend(
+                        reservation_id=reservation_id,
+                        amount_sats=estimated_cost,
+                        category="channel_open",
+                        subcategory="lnplus_swap",
+                        metadata={"swap_id": sid, "peer_id": peer},
+                        effective_budget_sats=eff_budget,
+                        since_timestamp=budget_since,
+                    ))
+                except Exception as e:
+                    self._plugin.log(
+                        f"LNPLUS: budget reservation failed for swap {sid} — "
+                        f"retrying next pass ({e})", level="warn")
+                    self._maybe_trip_deadline_miss(row, sid, deadline, now)
+                    return
             if not reservation_active:
                 self._plugin.log(
                     f"LNPLUS: budget reservation failed for swap {sid} — "

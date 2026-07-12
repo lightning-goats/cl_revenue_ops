@@ -286,6 +286,14 @@ ALLOWLIST = {
         "caller's reservation_id; active only when "
         "econ_governor_rebalance_enabled is true.",
     ),
+    ("lnplus_swaps.py", "_lnplus_reserve_delegate", "reserve_spend"): (
+        ATOMIC_RESERVE, 1,
+        "Phase 2F governed entry (2026-07-12): GovernorFacade delegate closure "
+        "inside SwapLifecycle._governed_reserve_spend — the SAME atomic "
+        "reserve_spend call as the legacy _execute_swap_open site, same "
+        "reservation_id/kwargs; active only when econ_governor_lnplus_enabled "
+        "is true. Obligation fulfillment: no pause gate (invariant 6).",
+    ),
     ("capacity_planner.py", "_planner_reserve_delegate", "reserve_spend"): (
         ATOMIC_RESERVE, 1,
         "Phase 2E governed entry (2026-07-12): GovernorFacade delegate closure "
