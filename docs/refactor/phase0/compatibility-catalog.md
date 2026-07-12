@@ -1,7 +1,7 @@
 # Public compatibility catalog (baseline 5e8f747)
 
 What the refactor MUST keep working (refactor invariants 2 and 3).
-Pin test: `tests/test_rpc_surface_inventory.py` (64 methods).
+Pin test: `tests/test_rpc_surface_inventory.py` (65 methods; 64 at baseline + `revenue-econ-snapshot`, a read-only Phase 1 diagnostic with NO compatibility promise yet).
 
 ## RPC surface
 
@@ -18,7 +18,7 @@ Classification per method: `docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md`
 (header refreshed 2026-07-09; body dated 2026-05-20 — refresh during
 Workstream I).
 
-Full 64-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
+Full 65-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
 
 ## Config surface
 

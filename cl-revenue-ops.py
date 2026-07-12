@@ -56,6 +56,7 @@ from modules.capital_efficiency import CapitalEfficiencyAnalyzer
 from modules.segment_observations import SegmentObservationStore
 from modules.lnplus_swaps import LNPlusClient, SwapEvaluator, SwapLifecycle
 from modules.utils import normalize_scid, parse_msat
+from modules.econ_shadow import EconShadow
 
 
 # =============================================================================
@@ -1016,6 +1017,7 @@ boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (option
 lnplus_client = None  # LNPlusClient: LN+ API client (LN+ swap automation)
 lnplus_lifecycle = None  # SwapLifecycle: LN+ obligations watcher / state machine
 capex_engine: Optional[CapexBudgetEngine] = None  # Unified capex budget engine
+econ_shadow: Optional[EconShadow] = None  # Phase 1 shadow: observe-mode intents + snapshot preview (fail-open)
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
 _boltz_balance_lock = threading.Lock()
 # Resource-growth bound: _boltz_balance_last_action only stores per-channel
@@ -2315,7 +2317,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, boltz_manager, capex_engine, data_service, lnplus_client, lnplus_lifecycle
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, boltz_manager, capex_engine, data_service, lnplus_client, lnplus_lifecycle, econ_shadow
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -2895,6 +2897,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         policy_manager,
         profitability_analyzer,
     )
+    # Phase 1 shadow (docs/planning/2026-07-12-refactor-phase1-wiring.md):
+    # observe-mode intent recording + snapshot preview. Fail-open by
+    # contract; inert unless econ_shadow_enabled is set.
+    try:
+        econ_shadow = EconShadow(safe_plugin, config)
+    except Exception as e:
+        econ_shadow = None
+        plugin.log(f"EconShadow unavailable: {e}", level='warn')
     rebalancer = EVRebalancer(
         safe_plugin, config, database, policy_manager,
     )
@@ -3491,6 +3501,14 @@ def run_fee_adjustment():
     try:
         adjustments = fee_controller.adjust_all_fees()
         plugin.log(f"Fee adjustment complete: {len(adjustments)} channels adjusted")
+
+        # Phase 1 shadow: record this cycle's decisions as typed intents.
+        # Fail-open by contract — a shadow failure must never affect fees.
+        try:
+            if econ_shadow is not None and econ_shadow.enabled():
+                econ_shadow.record_fee_intents(adjustments, int(time.time()))
+        except Exception as _shadow_err:
+            plugin.log(f"econ shadow skipped: {_shadow_err}", level='debug')
 
         # Push status + profitability to datastore for external consumers.
         # This keeps local reporting cheap and consistent.
@@ -5649,6 +5667,67 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
     except Exception as e:
         plugin.log(f"Error generating revenue dashboard: {e}", level='error')
         return {"error": str(e)}
+
+
+@plugin.method("revenue-econ-snapshot")
+def revenue_econ_snapshot(plugin: Plugin) -> Dict[str, Any]:
+    """READ-ONLY Phase 1 preview of the canonical EconomicSnapshot
+    (docs/planning/2026-07-12-refactor-phase1-wiring.md).
+
+    Assembled on demand from existing caches; placeholder fields are
+    declared in `approximations`. Requires econ_shadow_enabled. Internal
+    diagnostic — no compatibility promise yet.
+    """
+    try:
+        if econ_shadow is None or not econ_shadow.enabled():
+            return {"enabled": False,
+                    "hint": "revenue-config set econ_shadow_enabled true"}
+        channels = []
+        try:
+            if data_service is not None:
+                channels = (data_service.get_peer_channels() or {}).get(
+                    "channels", []) or []
+        except Exception as e:
+            return {"enabled": True, "snapshot": None,
+                    "approximations": [f"channel read failed: {e}"]}
+        profitability = {}
+        try:
+            if profitability_analyzer is not None:
+                profitability = profitability_analyzer.analyze_all_channels(
+                    force=False) or {}
+        except Exception:
+            profitability = {}
+        budget = {}
+        try:
+            cfg_snap = config.snapshot() if config else None
+            if database is not None and cfg_snap is not None:
+                status = database.get_budget_status(
+                    int(time.time()) - 24 * 3600) or {}
+                budget = {
+                    "cap_sats": int(getattr(cfg_snap, "daily_budget_sats", 0)
+                                    or 0),
+                    "reserved_sats": int(status.get("reserved", 0) or 0),
+                    "spent_sats": int(status.get("spent", 0) or 0),
+                }
+        except Exception:
+            budget = {}
+        wire, approximations = econ_shadow.build_snapshot_preview(
+            channels=channels,
+            profitability=profitability,
+            budget=budget,
+            now=int(time.time()),
+            receivable_ratio_target=float(getattr(
+                config.snapshot() if config else object(),
+                "receivable_ratio_target", 0.0) or 0.0),
+        )
+        return {
+            "enabled": True,
+            "snapshot": wire,
+            "approximations": approximations,
+            "intents_recorded_total": econ_shadow.intents_recorded_total,
+        }
+    except Exception as e:
+        return {"enabled": True, "error": str(e)}
 
 
 @plugin.method("revenue-health")

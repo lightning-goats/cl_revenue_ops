@@ -23,6 +23,7 @@ EXPECTED_RPC_METHODS = frozenset({
     "revenue-ban", "revenue-unban", "revenue-list-banned", "revenue-policy",
     "revenue-report", "revenue-hot-channel-protection-peers",
     "revenue-config", "revenue-dashboard", "revenue-health",
+    "revenue-econ-snapshot",
     "revenue-cleanup-closed", "revenue-clear-reservations",
     "revenue-total-cost-budget", "revenue-capex-status",
     "revenue-spend-ledger", "revenue-spend-reserve", "revenue-spend-release",
@@ -57,4 +58,6 @@ def test_rpc_surface_matches():
 
 
 def test_expected_count():
-    assert len(EXPECTED_RPC_METHODS) == 64
+    # 64 at baseline 5e8f747; +1 revenue-econ-snapshot (Phase 1 wiring,
+    # 2026-07-12, read-only diagnostic).
+    assert len(EXPECTED_RPC_METHODS) == 65
