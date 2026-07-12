@@ -1,0 +1,126 @@
+"""Phase 1: append-only economic action ledger with replay."""
+import pytest
+
+from modules.econ_ledger import EVENT_TYPES, EconLedger
+from modules.econ_types import EconArithmeticError
+
+KEY = "a" * 64
+KEY2 = "b" * 64
+
+
+@pytest.fixture
+def ledger(tmp_path):
+    return EconLedger(str(tmp_path / "econ_ledger.db"))
+
+
+def _append(ledger, event_type, key=KEY, at=1_752_400_000, amounts=None,
+            details=None):
+    return ledger.append(
+        event_type=event_type, intent_id="int-" + key[:16],
+        idempotency_key=key, cycle_id="cycle-000001", at=at,
+        amounts=amounts or {}, details=details or {})
+
+
+def test_vocabulary_is_exactly_the_spec():
+    assert set(EVENT_TYPES) == {
+        "intent_proposed", "intent_rejected", "intent_deferred",
+        "intent_authorized", "budget_reserved", "execution_started",
+        "execution_succeeded", "execution_failed",
+        "execution_outcome_unknown", "cost_recorded",
+        "reservation_released", "reconciliation_completed",
+    }
+
+
+def test_append_and_ordered_readback(ledger):
+    id1 = _append(ledger, "intent_proposed")
+    id2 = _append(ledger, "intent_authorized")
+    assert id2 > id1
+    events = ledger.events()
+    assert [e["event_type"] for e in events] == [
+        "intent_proposed", "intent_authorized"]
+    assert events[0]["idempotency_key"] == KEY
+
+
+def test_invalid_event_type_rejected(ledger):
+    with pytest.raises(EconArithmeticError):
+        _append(ledger, "made_up_event")
+
+
+def test_invalid_amount_rejected(ledger):
+    with pytest.raises(EconArithmeticError):
+        _append(ledger, "budget_reserved", amounts={"reserved_msat": 1.5})
+
+
+def test_existing_rows_immutable_across_appends(ledger):
+    _append(ledger, "intent_proposed")
+    before = ledger.events()
+    _append(ledger, "intent_authorized")
+    after = ledger.events()
+    assert after[: len(before)] == before
+    assert not any(hasattr(ledger, m) for m in ("update", "delete"))
+
+
+class TestReplay:
+    def test_full_lifecycle(self, ledger):
+        _append(ledger, "intent_proposed")
+        _append(ledger, "intent_authorized")
+        _append(ledger, "budget_reserved",
+                amounts={"reserved_msat": 5_000})
+        _append(ledger, "execution_started")
+        _append(ledger, "execution_succeeded")
+        _append(ledger, "cost_recorded", amounts={"cost_msat": 3_000})
+        _append(ledger, "reservation_released")
+        state = ledger.replay()
+        assert state.reserved_msat.get(KEY, 0) == 0
+        assert state.spent_msat[KEY] == 3_000
+        assert state.total_spent_msat == 3_000
+        assert state.terminal[KEY] == "execution_succeeded"
+        assert state.anomalies == ()
+
+    def test_reservation_outstanding(self, ledger):
+        _append(ledger, "budget_reserved", amounts={"reserved_msat": 5_000})
+        state = ledger.replay()
+        assert state.reserved_msat[KEY] == 5_000
+        assert state.total_spent_msat == 0
+
+    def test_duplicate_terminal_events_harmless(self, ledger):
+        _append(ledger, "budget_reserved", amounts={"reserved_msat": 5_000})
+        _append(ledger, "execution_succeeded")
+        _append(ledger, "execution_succeeded")  # duplicate callback
+        _append(ledger, "cost_recorded", amounts={"cost_msat": 2_000})
+        _append(ledger, "cost_recorded", amounts={"cost_msat": 2_000})
+        state = ledger.replay()
+        # duplicate cost records ARE two records (corrections are new
+        # events); duplicate terminal transitions are ignored.
+        assert state.terminal[KEY] == "execution_succeeded"
+        assert state.spent_msat[KEY] == 4_000
+
+    def test_duplicate_reservation_idempotent(self, ledger):
+        _append(ledger, "budget_reserved", amounts={"reserved_msat": 5_000})
+        _append(ledger, "budget_reserved", amounts={"reserved_msat": 5_000})
+        state = ledger.replay()
+        assert state.reserved_msat[KEY] == 5_000
+
+    def test_cost_without_reservation_is_anomalous_not_free(self, ledger):
+        _append(ledger, "cost_recorded", amounts={"cost_msat": 7_000})
+        state = ledger.replay()
+        assert state.spent_msat[KEY] == 7_000  # never free budget
+        assert state.reserved_msat.get(KEY, 0) == 0  # never negative
+        assert any(KEY in a for a in state.anomalies)
+
+    def test_two_intents_tracked_independently(self, ledger):
+        _append(ledger, "budget_reserved", key=KEY,
+                amounts={"reserved_msat": 1_000})
+        _append(ledger, "budget_reserved", key=KEY2,
+                amounts={"reserved_msat": 2_000})
+        _append(ledger, "intent_rejected", key=KEY2)
+        state = ledger.replay()
+        assert state.reserved_msat[KEY] == 1_000
+        assert state.terminal.get(KEY2) == "intent_rejected"
+        assert KEY not in state.terminal
+
+    def test_empty_ledger(self, ledger):
+        state = ledger.replay()
+        assert state.total_spent_msat == 0
+        assert state.reserved_msat == {}
+        assert state.terminal == {}
