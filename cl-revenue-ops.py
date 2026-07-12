@@ -48,6 +48,7 @@ from modules.policy_manager import (
     PeerPolicy,
     READ_ONLY_POLICY_ACTIONS,
     TACTICAL_POLICY_ACTIONS,
+    BANNED_TAG,
 )
 from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
 from modules.capex_budget import CapexBudgetEngine
@@ -2281,11 +2282,17 @@ def _lnplus_ignore_peer(peer_id: str, reason: str) -> None:
     try:
         if policy_manager is None:
             return
+        # set_policy REPLACES tags: merge with the existing set so durable
+        # operator tags (banned, no_close, protect) survive the ignore.
+        existing_tags = list(policy_manager.get_policy(peer_id).tags)
+        merged_tags = list(dict.fromkeys(
+            existing_tags + ["ignored", "lnplus-swap", str(reason or "lnplus-swap")]
+        ))
         policy_manager.set_policy(
             peer_id=peer_id,
             strategy="passive",
             rebalance_mode="disabled",
-            tags=["ignored", "lnplus-swap", str(reason or "lnplus-swap")],
+            tags=merged_tags,
         )
     except Exception as e:
         try:
@@ -2960,7 +2967,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if capacity_planner is not None:
         capacity_planner.lnplus_evaluator = SwapEvaluator(
             safe_plugin, safe_plugin.rpc, database, config, lnplus_client,
-            capacity_planner, lnplus_lifecycle)
+            capacity_planner, lnplus_lifecycle,
+            policy_manager=policy_manager)
     plugin.log("LN+ swap automation initialized")
 
     # Rebalance engine: unified actual-fee pipeline
@@ -4915,6 +4923,77 @@ def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
         "count": len(ignored),
         "warning": "DEPRECATED: Use 'revenue-policy list' instead."
     }
+
+
+@plugin.method("revenue-ban")
+def revenue_ban(plugin: Plugin, peer_id: str, reason: str = "operator", **kwargs) -> Dict[str, Any]:
+    """
+    Ban a peer: the planner will never open channels to it, the LN+
+    evaluator rejects any swap that includes it, and fee/rebalance
+    management stops (passive strategy, rebalancing disabled).
+
+    Existing channels are NOT closed and in-flight swap obligations are
+    NOT abandoned — the ban gates new capital commitments only.
+
+    Usage: lightning-cli revenue-ban peer_id [reason]
+    """
+    if policy_manager is None:
+        return {"error": "Plugin not initialized"}
+    if not re.match(r'^[0-9a-fA-F]{66}$', str(peer_id or "")):
+        return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
+    try:
+        policy = policy_manager.ban_peer(peer_id, reason=reason)
+    except (ValueError, RuntimeError) as e:
+        return {"status": "error", "error": str(e)}
+    plugin.log(f"OPERATOR BAN: {peer_id} — {reason}", level="info")
+    return {
+        "status": "success",
+        "action": "ban",
+        "peer_id": peer_id,
+        "reason": reason,
+        "tags": policy.tags,
+        "message": (
+            "Peer banned: no channel opens, no LN+ swaps, no fee/rebalance "
+            "management. Existing channels and in-flight swaps are untouched."
+        ),
+    }
+
+
+@plugin.method("revenue-unban")
+def revenue_unban(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
+    """
+    Lift an operator ban set by revenue-ban. The peer returns to dynamic
+    fee management with rebalancing enabled; other tags are preserved.
+
+    Usage: lightning-cli revenue-unban peer_id
+    """
+    if policy_manager is None:
+        return {"error": "Plugin not initialized"}
+    if not re.match(r'^[0-9a-fA-F]{66}$', str(peer_id or "")):
+        return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
+    try:
+        policy = policy_manager.unban_peer(peer_id)
+    except (ValueError, RuntimeError) as e:
+        return {"status": "error", "error": str(e)}
+    plugin.log(f"OPERATOR UNBAN: {peer_id}", level="info")
+    return {
+        "status": "success",
+        "action": "unban",
+        "peer_id": peer_id,
+        "tags": policy.tags,
+    }
+
+
+@plugin.method("revenue-list-banned")
+def revenue_list_banned(plugin: Plugin) -> Dict[str, Any]:
+    """List all operator-banned peers (revenue-ban)."""
+    if policy_manager is None:
+        return {"error": "Plugin not initialized"}
+    banned = [
+        {"peer_id": p.peer_id, "tags": p.tags, "banned_at": p.updated_at}
+        for p in policy_manager.get_peers_by_tag(BANNED_TAG)
+    ]
+    return {"banned_peers": banned, "count": len(banned)}
 
 
 

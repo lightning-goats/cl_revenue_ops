@@ -241,7 +241,8 @@ _IDENTIFIERS = ("A", "B", "C", "D", "E")
 class SwapEvaluator:
     """Pre-application gate chain (spec gates 0-9). At most one apply per cycle."""
 
-    def __init__(self, plugin, rpc, database, config, client, planner, lifecycle):
+    def __init__(self, plugin, rpc, database, config, client, planner, lifecycle,
+                 policy_manager=None):
         self._plugin = plugin
         self.rpc = rpc
         self._db = database
@@ -249,6 +250,8 @@ class SwapEvaluator:
         self._client = client
         self._planner = planner
         self._lifecycle = lifecycle
+        # Optional: enables the operator-ban veto in gate 5 (revenue-ban).
+        self._policy_manager = policy_manager
 
     def run_cycle(self, cfg, best_regular_ev: float) -> Dict:
         summary = {"applied": False, "recommended": False, "swap_id": None,
@@ -360,6 +363,18 @@ class SwapEvaluator:
                 return "peer_quality:invalid participant pubkey"
             if our_id and pk == our_id:
                 return "own_node:we are already in this swap"
+            # Operator ban (revenue-ban): a banned pubkey anywhere in the
+            # ring vetoes the swap. Fail closed — an unreadable policy
+            # source must not let a banned peer through.
+            if self._policy_manager is not None:
+                try:
+                    if self._policy_manager.is_peer_banned(pk):
+                        return f"peer_quality:{pk[:16]} operator-banned"
+                except Exception as e:
+                    self._plugin.log(
+                        f"LNPLUS: ban lookup failed for {pk[:16]} ({e}) — "
+                        "rejecting swap (fail closed)", level="warn")
+                    return f"peer_quality:{pk[:16]} ban lookup failed (fail closed)"
             if not (p.get("address_1") or p.get("address_2")):
                 return f"peer_quality:{pk[:16]} publishes no address"
             pos = int(p.get("positive_ratings_count") or 0)

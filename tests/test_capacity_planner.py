@@ -5461,6 +5461,16 @@ class TestOpensAndDefibsRespectPolicy:
         allowed, _ = planner._check_open_allowed("02" + "a" * 64)
         assert allowed is True
 
+    def test_open_blocked_for_banned_peer(self):
+        # revenue-ban sets passive too, but the tag alone must block opens
+        # even if the strategy later drifts back to dynamic.
+        planner = self._planner_with_policy(strategy="dynamic")
+        policy = planner.policy_manager.get_policy.return_value
+        policy.has_tag.side_effect = lambda t: t == "banned"
+        allowed, reason = planner._check_open_allowed("02" + "a" * 64)
+        assert allowed is False
+        assert "banned" in reason.lower()
+
     def test_open_fails_closed_without_policy_manager(self):
         planner = self._planner_with_policy()
         planner.policy_manager = None

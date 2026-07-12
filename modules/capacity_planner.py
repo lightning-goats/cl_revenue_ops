@@ -3376,6 +3376,13 @@ class CapacityPlanner:
             strategy_str = strategy.value if hasattr(strategy, "value") else str(strategy)
             if strategy_str == "passive":
                 return False, "Peer policy is passive — open blocked"
+            # Operator ban (revenue-ban) sets passive too, but the tag alone
+            # must block opens even if the strategy later drifts.
+            if hasattr(policy, "has_tag"):
+                if policy.has_tag("banned"):
+                    return False, "Peer is operator-banned — open blocked"
+            elif "banned" in (getattr(policy, "tags", None) or []):
+                return False, "Peer is operator-banned — open blocked"
             return True, "open allowed"
         except Exception as e:
             return False, f"Open policy check failed (fail closed): {e}"

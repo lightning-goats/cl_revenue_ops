@@ -54,6 +54,10 @@ MAX_POLICY_CHANGES_PER_MINUTE = 10  # Rate limit per peer
 READ_ONLY_POLICY_ACTIONS = frozenset({"list", "get", "find", "changes"})
 TACTICAL_POLICY_ACTIONS = frozenset({"set", "delete", "tag", "untag", "batch"})
 
+# Operator ban (revenue-ban): durable tag consulted by the capacity
+# planner's open gate and the LN+ swap evaluator's participant gate.
+BANNED_TAG = "banned"
+
 
 class FeeStrategy(Enum):
     """Fee control strategy for a peer."""
@@ -821,6 +825,68 @@ class PolicyManager:
         self._load_cache()
         with self._cache_lock:
             return [p for p in self._cache.values() if p.has_tag(tag) and not p.is_expired()]
+
+    # =========================================================================
+    # Operator Bans
+    # =========================================================================
+
+    def ban_peer(self, peer_id: str, reason: str = "") -> PeerPolicy:
+        """
+        Operator ban: never open channels to, or enter LN+ swaps with, this
+        peer. Implemented as passive strategy + disabled rebalancing (the
+        canonical 'unmanaged' state) plus the durable BANNED_TAG that the
+        planner open gate and LN+ gate 5 enforce. Existing tags (e.g.
+        no_close) are preserved; any policy expiry is cleared — bans are
+        permanent until unban_peer.
+
+        Existing channels are NOT closed and in-flight swap obligations are
+        NOT abandoned: the ban only gates new capital commitments.
+        """
+        self._validate_peer_id(peer_id)
+        existing = self.get_policy(peer_id)
+        new_tags = list(existing.tags)
+        if BANNED_TAG not in new_tags:
+            new_tags.append(BANNED_TAG)
+        policy = self.set_policy(
+            peer_id,
+            strategy=FeeStrategy.PASSIVE.value,
+            rebalance_mode=RebalanceMode.DISABLED.value,
+            tags=new_tags,
+            expires_in_hours=0,  # clear any expiry: bans do not lapse
+        )
+        try:
+            self.plugin.log(
+                f"PolicyManager: peer {peer_id[:16]}... BANNED"
+                + (f" — {reason}" if reason else ""),
+                level="info",
+            )
+        except Exception:
+            pass
+        return policy
+
+    def unban_peer(self, peer_id: str) -> PeerPolicy:
+        """
+        Lift an operator ban: removes BANNED_TAG (other tags are preserved)
+        and returns the peer to dynamic fee management with rebalancing
+        enabled.
+        """
+        self._validate_peer_id(peer_id)
+        existing = self.get_policy(peer_id)
+        new_tags = [t for t in existing.tags if t != BANNED_TAG]
+        return self.set_policy(
+            peer_id,
+            strategy=FeeStrategy.DYNAMIC.value,
+            rebalance_mode=RebalanceMode.ENABLED.value,
+            tags=new_tags,
+        )
+
+    def is_peer_banned(self, peer_id: str) -> bool:
+        """
+        True when the operator has banned this peer (BANNED_TAG on a
+        non-expired policy). Deliberately does NOT swallow lookup errors:
+        gate call sites decide their own failure direction (fail closed).
+        """
+        return self.get_policy(peer_id).has_tag(BANNED_TAG)
 
     def get_peers_by_strategy(self, strategy: FeeStrategy) -> List[PeerPolicy]:
         """

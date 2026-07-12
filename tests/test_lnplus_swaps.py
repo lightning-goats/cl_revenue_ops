@@ -448,7 +448,8 @@ def _swap_fixture(**overrides):
     return swap
 
 
-def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None):
+def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None,
+                    policy_manager=None):
     cfg = Config()
     for k, v in (cfg_overrides or {}).items():
         setattr(cfg, k, v)
@@ -472,7 +473,8 @@ def _make_evaluator(cfg_overrides=None, swaps=None, inflight=False, breaker=None
     lifecycle.breaker_tripped.return_value = breaker
     lifecycle.has_inflight.return_value = inflight
     lifecycle.reconcile_ok.return_value = True
-    ev = SwapEvaluator(plugin, rpc, db, cfg, client, planner, lifecycle)
+    ev = SwapEvaluator(plugin, rpc, db, cfg, client, planner, lifecycle,
+                       policy_manager=policy_manager)
     return ev, cfg, client, db
 
 
@@ -2261,3 +2263,55 @@ class TestRatingRetryAndNotifications:
         client.get_notifications.side_effect = LNPlusError("down")
         result = lc.run_watcher_once()
         assert "errors" in result and not result["errors"]
+
+
+class TestOperatorBanGate:
+    """Gate 5 extension: an operator-banned pubkey (revenue-ban) anywhere in
+    the ring vetoes the swap; a cancelled/banned slot's stale pubkey does
+    not; an unreadable policy source fails closed."""
+
+    def _pm(self, banned_pk=None, error=None):
+        pm = MagicMock()
+        if error is not None:
+            pm.is_peer_banned.side_effect = error
+        else:
+            pm.is_peer_banned.side_effect = lambda pk: pk == banned_pk
+        return pm
+
+    def test_banned_participant_vetoes_swap(self):
+        ev, cfg, _, _ = _make_evaluator(policy_manager=self._pm(banned_pk=PK_A))
+        result = ev.run_cycle(cfg, 0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "peer_quality" and "operator-banned" in r["reason"]
+                   for r in result["rejections"])
+
+    def test_unbanned_participants_not_vetoed(self):
+        ev, cfg, _, _ = _make_evaluator(policy_manager=self._pm(banned_pk=None))
+        result = ev.run_cycle(cfg, 0.0)
+        assert not any("operator-banned" in r.get("reason", "")
+                       for r in result["rejections"])
+
+    def test_cancelled_slot_ban_not_checked(self):
+        # A cancelled participant is no longer party to the swap: their
+        # (banned) pubkey must not veto on our behalf (B12 semantics).
+        swap = _swap_fixture()
+        swap["participants"][0]["cancelled"] = True
+        ev, cfg, _, _ = _make_evaluator(
+            swaps=[swap], policy_manager=self._pm(banned_pk=PK_A))
+        result = ev.run_cycle(cfg, 0.0)
+        assert not any("operator-banned" in r.get("reason", "")
+                       for r in result["rejections"])
+
+    def test_ban_lookup_failure_fails_closed(self):
+        ev, cfg, _, _ = _make_evaluator(
+            policy_manager=self._pm(error=RuntimeError("policy source down")))
+        result = ev.run_cycle(cfg, 0.0)
+        assert result["applied"] is False
+        assert any(r["gate"] == "peer_quality" and "ban lookup failed" in r["reason"]
+                   for r in result["rejections"])
+
+    def test_no_policy_manager_means_no_ban_gate(self):
+        ev, cfg, _, _ = _make_evaluator(policy_manager=None)
+        result = ev.run_cycle(cfg, 0.0)
+        assert not any("operator-banned" in r.get("reason", "")
+                       for r in result["rejections"])
