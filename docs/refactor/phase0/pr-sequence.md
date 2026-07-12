@@ -38,8 +38,9 @@ compat evidence — per refactor.md PR requirements):
     — FOUNDATION LANDED: `modules/econ_types.py` + `modules/cycle_context.py`;
     adoption at decision seams remains
  5. Append-only ledger schema + replay tests  (spec PR-6)
-    — LANDED as `modules/econ_ledger.py` (own sqlite file; production
-    wiring is Phase 2)
+    — LANDED as `modules/econ_ledger.py`; Phase 2 pilot A wired it to
+    the FULL generic spend lifecycle via Database.spend_journal hooks
+    with restart/duplicate replay proofs
  6. Governor facade delegating to current checks  (spec PR-7)
     — LANDED as `modules/governor_facade.py` (delegation-only; live
     routing is Phase 2)

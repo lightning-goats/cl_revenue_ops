@@ -74,10 +74,33 @@ deployed node's behavior is unchanged.
    `intent_proposed` events.
 4. Roll back anytime: `revenue-config set econ_shadow_enabled false`.
 
-**Next tranche (needs operator go-ahead):** Phase 2 entry — route the
-generic spend path through the governor facade, make the ledger
-authoritative for new actions, rebuild compatibility histories as
-projections, restart/duplicate-callback/reconciliation tests.
+## Phase 2 pilot A — generic-spend ledger journaling (2026-07-12)
+
+Plan: `docs/planning/2026-07-12-refactor-phase2-pilot.md`. The econ
+ledger now journals 100% of the generic spend lifecycle at its choke
+point (`Database.reserve_spend` / `mark_spend_reservation_spent` /
+`release_spend_reservation(s)`), covering operator spend RPCs AND every
+automated spender on that path (planner opens/closes, LN+ funding,
+Boltz capex reservations):
+
+- `EconShadow.note_spend_reserved/settled/released` — same fail-open +
+  `econ_shadow_enabled` contract; settle emits cost_recorded +
+  execution_succeeded + reservation_released (unused remainder released,
+  matching the DB's terminal-settle semantics).
+- `modules/database.py` — `spend_journal` attribute (default None) +
+  four guarded post-success hooks; a raising journal cannot affect any
+  spend outcome (tested).
+- Replay proofs (`tests/test_spend_replay.py`): restart reconstruction
+  matches the DB's active reservations; duplicate settle callbacks are
+  harmless; stale-release recovery replays clean; a mid-stream disable
+  leaves an honest gap (divergence DETECTION = reconciliation tranche).
+
+Suite after tranche: **3334 passed**.
+
+**Next tranches (Phase 2 continuation):** ledger↔DB reconciliation
+sweep + EXTERNAL_OUTCOME_UNKNOWN handling; then per-spender migration
+to `GovernorFacade.authorize()` (rebalance engine first) toward "no
+executor reachable without authorization".
 
 ## Contradictions
 

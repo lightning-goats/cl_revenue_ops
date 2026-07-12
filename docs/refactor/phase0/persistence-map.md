@@ -83,7 +83,9 @@ State that must survive restart and its current recovery path:
 by `modules/econ_ledger.py` (table `econ_ledger_events`, append-only).
 Created lazily by `modules/econ_shadow.py` only when
 `econ_shadow_enabled` is set; records `intent_proposed` events from live
-fee cycles. Not part of the production DB schema (the table pin test
+fee cycles AND (Phase 2 pilot A) the full generic spend lifecycle
+(budget_reserved / cost_recorded / execution_succeeded /
+reservation_released) via `Database.spend_journal` hooks. Not part of the production DB schema (the table pin test
 scans `modules/database.py` only). Becomes authoritative in Phase 2.
 
 ## CLN datastore keys (telemetry projections, read-only contracts)
