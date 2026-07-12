@@ -1,0 +1,25 @@
+{
+  "drain_demand": {
+    "entries": [],
+    "over_local_count": 0,
+    "paired_count": 0,
+    "total_excess_sats": 0
+  },
+  "selected": [],
+  "skipped": [
+    {
+      "channel_id": "aaa",
+      "detail": null,
+      "reason": "cooldown_active",
+      "remaining_budget_sats": 5000,
+      "value_class": "active"
+    },
+    {
+      "channel_id": "bbb",
+      "detail": "no over-local channels available",
+      "reason": "no_partner",
+      "remaining_budget_sats": 5000,
+      "value_class": "active"
+    }
+  ]
+}

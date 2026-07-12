@@ -1,0 +1,33 @@
+{
+  "drain_demand": {
+    "entries": [
+      {
+        "channel_id": "aaa",
+        "drain_score": 0.0,
+        "excess_sats": 500000,
+        "peer_id": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "value_class": "active"
+      }
+    ],
+    "over_local_count": 1,
+    "paired_count": 0,
+    "total_excess_sats": 500000
+  },
+  "selected": [],
+  "skipped": [
+    {
+      "channel_id": "bbb",
+      "detail": null,
+      "reason": "inside_band",
+      "remaining_budget_sats": 5000,
+      "value_class": "active"
+    },
+    {
+      "channel_id": "aaa",
+      "detail": "no over-remote channels available",
+      "reason": "no_partner",
+      "remaining_budget_sats": 5000,
+      "value_class": "active"
+    }
+  ]
+}
