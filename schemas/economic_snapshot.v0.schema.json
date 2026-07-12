@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.cl-revenue-ops.invalid/economic_snapshot.v0.schema.json",
+  "title": "EconomicSnapshot v0 (draft, Phase 0 proposal)",
+  "description": "Canonical immutable per-cycle economic snapshot (docs/planning/refactor.md Workstream A). DRAFT: additionalProperties stays true until v1 freezes. Field-to-source mapping: docs/refactor/phase0/snapshot-mapping.md. Numeric rules: docs/refactor/phase0/wire-contract-spec.md.",
+  "type": "object",
+  "required": ["schema_name", "schema_version", "snapshot_id",
+               "observed_at", "evidence_window_seconds", "node", "channels"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_name": {"const": "economic_snapshot"},
+    "schema_version": {"const": 0},
+    "snapshot_id": {"type": "string", "minLength": 1},
+    "observed_at": {"type": "integer", "minimum": 0},
+    "evidence_window_seconds": {"type": "integer", "minimum": 0},
+    "node": {
+      "type": "object",
+      "required": ["total_local_msat", "total_remote_msat",
+                   "receivable_objective_msat", "onchain_confirmed_msat",
+                   "reserved_msat", "daily_budget", "pending_operations",
+                   "external_obligations"],
+      "additionalProperties": true,
+      "properties": {
+        "total_local_msat": {"type": "integer", "minimum": 0},
+        "total_remote_msat": {"type": "integer", "minimum": 0},
+        "receivable_objective_msat": {"type": "integer", "minimum": 0},
+        "onchain_confirmed_msat": {"type": "integer", "minimum": 0},
+        "reserved_msat": {"type": "integer", "minimum": 0},
+        "daily_budget": {
+          "type": "object",
+          "required": ["cap_msat", "reserved_msat", "spent_msat"],
+          "additionalProperties": true,
+          "properties": {
+            "cap_msat": {"type": "integer", "minimum": 0},
+            "reserved_msat": {"type": "integer", "minimum": 0},
+            "spent_msat": {"type": "integer", "minimum": 0}
+          }
+        },
+        "pending_operations": {"type": "array", "items": {"type": "object"}},
+        "external_obligations": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "channels": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/channel_snapshot"}
+    }
+  },
+  "$defs": {
+    "channel_snapshot": {
+      "type": "object",
+      "required": ["channel_id", "peer_id", "capacity_msat", "local_msat",
+                   "remote_msat", "spendable_msat", "receivable_msat",
+                   "exit_revenue_msat", "sourced_value_msat",
+                   "rebalance_cost_msat", "capital_cost_msat",
+                   "net_value_msat", "exit_volume_msat",
+                   "sourced_volume_msat", "forward_count",
+                   "sourced_forward_count", "role", "lifecycle",
+                   "protections", "confidence_micro"],
+      "additionalProperties": true,
+      "properties": {
+        "channel_id": {"type": "string", "pattern": "^[0-9]+x[0-9]+x[0-9]+$"},
+        "peer_id": {"type": "string", "pattern": "^0[23][0-9a-f]{64}$"},
+        "capacity_msat": {"type": "integer", "minimum": 0},
+        "local_msat": {"type": "integer", "minimum": 0},
+        "remote_msat": {"type": "integer", "minimum": 0},
+        "spendable_msat": {"type": "integer", "minimum": 0},
+        "receivable_msat": {"type": "integer", "minimum": 0},
+        "exit_revenue_msat": {"type": "integer", "minimum": 0},
+        "sourced_value_msat": {"type": "integer", "minimum": 0},
+        "rebalance_cost_msat": {"type": "integer", "minimum": 0},
+        "capital_cost_msat": {"type": "integer", "minimum": 0},
+        "net_value_msat": {"type": "integer"},
+        "exit_volume_msat": {"type": "integer", "minimum": 0},
+        "sourced_volume_msat": {"type": "integer", "minimum": 0},
+        "forward_count": {"type": "integer", "minimum": 0},
+        "sourced_forward_count": {"type": "integer", "minimum": 0},
+        "role": {
+          "description": "Union of today's two classification vocabularies (profitability ChannelRole + flow ChannelState); the unified single authority narrows this in v1.",
+          "enum": ["SOURCE", "SINK", "ROUTER", "BALANCED",
+                    "INBOUND_GATEWAY", "OUTBOUND_GATEWAY", "DORMANT",
+                    "UNKNOWN"]
+        },
+        "lifecycle": {"enum": ["CANDIDATE", "OPENING", "EVALUATING",
+                                "PRODUCTIVE", "PROTECTED",
+                                "UNDERPERFORMING", "RECYCLING", "CLOSING"]},
+        "protections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["reason", "owner", "expires_at"],
+            "additionalProperties": true,
+            "properties": {
+              "reason": {"type": "string"},
+              "owner": {"type": "string"},
+              "expires_at": {"type": ["integer", "null"]}
+            }
+          }
+        },
+        "confidence_micro": {"type": "integer", "minimum": 0,
+                              "maximum": 1000000}
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema_name": "economic_snapshot",
+      "schema_version": 0,
+      "snapshot_id": "cycle-000001",
+      "observed_at": 1752300000,
+      "evidence_window_seconds": 2592000,
+      "node": {
+        "total_local_msat": 500000000000,
+        "total_remote_msat": 300000000000,
+        "receivable_objective_msat": 400000000000,
+        "onchain_confirmed_msat": 100000000000,
+        "reserved_msat": 5000000000,
+        "daily_budget": {"cap_msat": 10000000000,
+                          "reserved_msat": 2000000000,
+                          "spent_msat": 1000000000},
+        "pending_operations": [],
+        "external_obligations": []
+      },
+      "channels": [
+        {
+          "channel_id": "123x456x0",
+          "peer_id": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "capacity_msat": 2000000000000,
+          "local_msat": 1200000000000,
+          "remote_msat": 800000000000,
+          "spendable_msat": 1180000000000,
+          "receivable_msat": 780000000000,
+          "exit_revenue_msat": 2000000,
+          "sourced_value_msat": 1500000,
+          "rebalance_cost_msat": 800000,
+          "capital_cost_msat": 400000,
+          "net_value_msat": 2300000,
+          "exit_volume_msat": 900000000000,
+          "sourced_volume_msat": 700000000000,
+          "forward_count": 142,
+          "sourced_forward_count": 96,
+          "role": "ROUTER",
+          "lifecycle": "PRODUCTIVE",
+          "protections": [
+            {"reason": "lnplus_contract", "owner": "lnplus",
+             "expires_at": 1755000000}
+          ],
+          "confidence_micro": 850000
+        }
+      ]
+    }
+  ]
+}
