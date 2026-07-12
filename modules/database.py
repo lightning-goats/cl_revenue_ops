@@ -307,6 +307,11 @@ class Database:
         """
         self.db_path = os.path.expanduser(db_path)
         self.plugin = plugin
+        # Phase 2 pilot (docs/planning/2026-07-12-refactor-phase2-pilot.md):
+        # optional spend-lifecycle journal (EconShadow). None = no journaling.
+        # Hooks fire only AFTER successful state changes and are guarded —
+        # they can never affect an authorization outcome.
+        self.spend_journal = None
         # Thread-local storage for connections (Thread Safety)
         self._local = threading.local()
         # EH-6: Track all thread connections for shutdown cleanup
@@ -3998,6 +4003,11 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
             """, (rid, cat, subcategory, amount, now, reference_id, channel_id, meta_json))
             conn.execute("COMMIT")
+            if self.spend_journal is not None:
+                try:
+                    self.spend_journal.note_spend_reserved(rid, amount, cat)
+                except Exception as journal_err:
+                    self.plugin.log(f"spend journal skipped: {journal_err}", level='debug')
             return True
         except Exception as e:
             try:
@@ -4014,7 +4024,13 @@ class Database:
             SET status = 'released'
             WHERE reservation_id = ? AND status = 'active'
         """, (str(reservation_id),))
-        return cursor.rowcount > 0
+        released = cursor.rowcount > 0
+        if released and self.spend_journal is not None:
+            try:
+                self.spend_journal.note_spend_released(str(reservation_id))
+            except Exception as journal_err:
+                self.plugin.log(f"spend journal skipped: {journal_err}", level='debug')
+        return released
 
     def mark_spend_reservation_spent(self, reservation_id: str, actual_spent_sats: Optional[int] = None,
                                      source: Optional[str] = None, record_event: bool = False) -> bool:
@@ -4061,6 +4077,15 @@ class Database:
                     conn.execute("ROLLBACK")
                     return False
             conn.execute("COMMIT")
+            if changed and self.spend_journal is not None:
+                try:
+                    settled = self._sanitize_amount(
+                        actual_spent_sats if actual_spent_sats is not None
+                        else row["reserved_sats"], "actual_spent_sats")
+                    self.spend_journal.note_spend_settled(
+                        rid, settled, row["category"])
+                except Exception as journal_err:
+                    self.plugin.log(f"spend journal skipped: {journal_err}", level='debug')
             return changed
         except Exception:
             try:
@@ -4246,6 +4271,13 @@ class Database:
             except Exception:
                 pass
             raise
+        if self.spend_journal is not None:
+            for released_id in ids:
+                try:
+                    self.spend_journal.note_spend_released(
+                        released_id, reason="stale")
+                except Exception as journal_err:
+                    self.plugin.log(f"spend journal skipped: {journal_err}", level='debug')
         return {
             "released_count": len(ids),
             "released_sats": released_sats,
