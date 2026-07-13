@@ -61,6 +61,7 @@ def test_public_runtime_keys_are_safety_only():
         "econ_cycle_boltz_enabled",
         "econ_ev_populated",
         "authority_level",
+        "risk_profile",
         # LN+ liquidity swap automation
         "lnplus_swaps_enabled",
         "lnplus_execute_applications",
@@ -137,6 +138,7 @@ def test_public_runtime_dict_returns_only_public_keys():
         "econ_cycle_boltz_enabled": False,
         "econ_ev_populated": False,
         "authority_level": "capital",
+        "risk_profile": "custom",
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,
@@ -613,9 +615,10 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "planner_min_annual_roi_pct",
         "receivable_ratio_floor",
         "receivable_ratio_target",
+        "risk_profile",
         "weekly_budget_sats",
     ]
-    assert result["count"] == 60
+    assert result["count"] == 61
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -672,6 +675,7 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "econ_cycle_boltz_enabled": False,
         "econ_ev_populated": False,
         "authority_level": "capital",
+        "risk_profile": "custom",
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,
@@ -1164,6 +1168,7 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "econ_cycle_boltz_enabled": False,
         "econ_ev_populated": False,
         "authority_level": "capital",
+        "risk_profile": "custom",
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,

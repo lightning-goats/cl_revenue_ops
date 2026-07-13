@@ -182,6 +182,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "econ_cycle_boltz_enabled",
         "econ_ev_populated",
         "authority_level",
+        "risk_profile",
         # LN+ liquidity swap automation
         "lnplus_swaps_enabled",
         "lnplus_execute_applications",
@@ -245,6 +246,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "econ_cycle_boltz_enabled": False,
         "econ_ev_populated": False,
         "authority_level": "capital",
+        "risk_profile": "custom",
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,

@@ -36,7 +36,7 @@ Evidence pins are against branch `refactor-phase1-shadow` @ `ab34d6f`
 | Risk | MEDIUM when shipped as `custom`-default (a resolver bug could still perturb effective config — pinned by an exact-parity test over all 142 fields). Non-custom activation is HIGH and out of scope. |
 | Behavior change | None (custom-default). |
 | Rollback | `revenue-config set risk_profile custom`; flag/PR revert. |
-| Status | **not_met** |
+| Status | **partial** — PR 7 SHIPPED 2026-07-13: risk_profile key (enum preserve/conservative/balanced/growth/custom, default custom = exact parity, pinned field-for-field), resolver applying bundles at startup to non-explicit keys only (explicit > profile > default), 141-field classification with coverage pin, bundles restricted to economic_risk keys (safety/authority/ceilings excluded, pinned). Remaining: PR 8 preview/diff + observe-only comparison; non-custom activation stays operator-directed. |
 
 ### Gap 3: Deprecated no-op removal
 
