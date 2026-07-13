@@ -3835,6 +3835,24 @@ class Database:
               )
         """, (cutoff,))
         count = cursor.rowcount
+        # Phase 2J dual-path: unified rebalance reservations live in
+        # spend_reservations (category='rebalance') and must inherit the
+        # SAME stale timeout and the SAME P4-015 in-flight-HTLC skip
+        # (reservation_id == str(rebalance_history.id) is unchanged).
+        try:
+            unified_cursor = conn.execute("""
+                UPDATE spend_reservations
+                SET status = 'released'
+                WHERE status = 'active' AND category = 'rebalance'
+                  AND reserved_at < ?
+                  AND reservation_id NOT IN (
+                      SELECT CAST(id AS TEXT) FROM rebalance_history
+                      WHERE status = 'pending_settlement'
+                  )
+            """, (cutoff,))
+            count += unified_cursor.rowcount
+        except sqlite3.OperationalError:
+            pass  # minimal/partial schemas (tests, tooling)
         if count > 0:
             self.plugin.log(f"Cleaned up {count} stale budget reservations", level='info')
         return count
@@ -4611,12 +4629,26 @@ class Database:
             WHERE timestamp >= ?
         """, (cutoff,)).fetchone()
 
-        # Get current active reservations
+        # Get current active reservations (Phase 2J: unified rebalance
+        # holds live in spend_reservations under category='rebalance';
+        # the legacy table carries only pre-unification rows).
         reserved = conn.execute("""
             SELECT COALESCE(SUM(reserved_sats), 0) as total_reserved
             FROM budget_reservations
             WHERE status = 'active' AND reserved_at >= ?
         """, (cutoff,)).fetchone()
+        unified_reserved = 0
+        try:
+            unified_row = conn.execute("""
+                SELECT COALESCE(SUM(reserved_sats), 0) as total_reserved
+                FROM spend_reservations
+                WHERE status = 'active' AND category = 'rebalance'
+                  AND reserved_at >= ?
+            """, (cutoff,)).fetchone()
+            unified_reserved = int(
+                unified_row['total_reserved'] if unified_row else 0)
+        except sqlite3.OperationalError:
+            pass  # minimal/partial schemas
 
         # Get stale reservation count (Issue #24)
         stale_count = self.count_stale_reservations()
@@ -4626,7 +4658,8 @@ class Database:
         completed_count = stats['completed_count'] if stats else 0
         success_count = stats['success_count'] if stats else 0
         failed_count = stats['failed_count'] if stats else 0
-        total_reserved = reserved['total_reserved'] if reserved else 0
+        total_reserved = (reserved['total_reserved'] if reserved else 0) \
+            + unified_reserved
 
         # Calculate success rate based on completed jobs only (exclude pending_async)
         success_rate = (success_count / completed_count * 100) if completed_count > 0 else 0.0

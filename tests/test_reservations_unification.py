@@ -182,6 +182,72 @@ class TestUnifiedBehavior:
         status = db.get_budget_status(SINCE)
         assert status["reserved"] == 70
 
+    def test_daily_rebalance_spend_sees_unified_holds(self, db):
+        db.reserve_budget(reservation_id="reb-1", amount_sats=60,
+                          channel_id="c", budget_limit=1000,
+                          since_timestamp=SINCE)
+        spend = db.get_daily_rebalance_spend(window_hours=24)
+        assert spend["total_reserved_sats"] == 60
+
+    def test_stale_cleanup_covers_unified_rows(self, db):
+        db.reserve_budget(reservation_id="reb-old", amount_sats=30,
+                          channel_id="c", budget_limit=1000,
+                          since_timestamp=SINCE)
+        # Age the row past the 4h default.
+        conn = db._get_connection()
+        conn.execute(
+            "UPDATE spend_reservations SET reserved_at = ? "
+            "WHERE reservation_id = 'reb-old'",
+            (NOW - 20_000,))
+        conn.commit()
+        cleaned = db.cleanup_stale_reservations(max_age_seconds=14_400)
+        assert cleaned == 1
+        states = db.get_spend_reservation_states(["reb-old"])
+        assert states["reb-old"]["status"] == "released"
+
+    def test_stale_cleanup_skips_pending_settlement(self, db):
+        """P4-015 in-flight HTLC guard must protect unified rows too."""
+        rebalance_id = db.record_rebalance(
+            from_channel="100x1x0", to_channel="200x1x0",
+            amount_sats=1000, max_fee_sats=3, expected_profit_sats=1,
+            status="pending_settlement")
+        db.reserve_budget(reservation_id=str(rebalance_id), amount_sats=3,
+                          channel_id="200x1x0", budget_limit=1000,
+                          since_timestamp=SINCE)
+        conn = db._get_connection()
+        conn.execute(
+            "UPDATE spend_reservations SET reserved_at = ? "
+            "WHERE reservation_id = ?", (NOW - 20_000, str(rebalance_id)))
+        conn.commit()
+        assert db.cleanup_stale_reservations(max_age_seconds=14_400) == 0
+        states = db.get_spend_reservation_states([str(rebalance_id)])
+        assert states[str(rebalance_id)]["status"] == "active"
+
+    def test_unified_breakdown_counts_each_hold_once(self, db):
+        """_total_cost_budget_status: unified rebalance holds appear in
+        the rebalance bucket and are excluded from the ledger bucket."""
+        from tests.plugin_test_utils import load_plugin_module
+        mod = load_plugin_module()
+        mod.database = db
+        cfg = MagicMock()
+        cfg.snapshot.return_value = SimpleNamespace(
+            daily_budget_sats=1000, weekly_budget_sats=35_000,
+            total_cost_budget_window_hours=24,
+            growth_budget_enabled=False, paused=False)
+        mod.config = cfg
+        mod.boltz_manager = None
+        mod.capacity_planner = None
+        db.reserve_budget(reservation_id="reb-1", amount_sats=70,
+                          channel_id="c", budget_limit=1000,
+                          since_timestamp=SINCE)
+        db.reserve_spend(reservation_id="gen-1", amount_sats=20,
+                         category="channel_open")
+        status = mod._total_cost_budget_status(force_fresh=True)
+        by_cat = status["reserved_by_category"]
+        assert by_cat["rebalance"] == 70
+        assert by_cat["ledger"] == 20  # excludes the rebalance hold
+        assert sum(by_cat.values()) == 90  # each hold exactly once
+
     def test_mixed_path_concurrency_cannot_oversubscribe(self, db):
         cap = 10
         granted = []

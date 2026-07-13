@@ -8043,10 +8043,18 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
         "close": closure_cost_sats,
         "ledger": int(generic_ledger.get("spent_24h_sats", 0) or 0),
     }
+    # Phase 2J: unified rebalance reservations live in the generic ledger
+    # under category='rebalance' AND are already counted in the
+    # "rebalance" bucket (get_daily_rebalance_spend sums both halves) —
+    # exclude them from the "ledger" bucket so each hold counts once.
+    _ledger_reserved = int(generic_ledger.get("reserved_24h_sats", 0) or 0)
+    _ledger_rebalance_reserved = int(
+        (generic_ledger.get("reserved_by_category", {}) or {}).get(
+            "rebalance", 0) or 0)
     reserved_by_category = {
         "rebalance": int(rebalance.get("reserved_24h_sats", 0) or 0),
         "boltz": int(boltz.get("reserved_24h_sats", 0) or 0),
-        "ledger": int(generic_ledger.get("reserved_24h_sats", 0) or 0),
+        "ledger": max(0, _ledger_reserved - _ledger_rebalance_reserved),
     }
 
     actual_total = sum(max(0, int(v or 0)) for v in actual_by_category.values())
