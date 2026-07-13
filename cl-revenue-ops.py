@@ -9540,6 +9540,16 @@ def _arbitrate_boltz_recommendations(recommendations):
 
         now = int(_time.time())
         cycle_id = f"boltz-arb-{now}"
+        # PR 3c: stamp the canonical snapshot into this cycle's swap
+        # intents; the hub's TTL cache keeps the manager's subsequent
+        # governed reservations on the same ref. Fallback: synthetic.
+        snap_ref = None
+        if econ_shadow is not None:
+            try:
+                snap_ref = econ_shadow.snapshot_ref(now)
+            except Exception:
+                snap_ref = None
+        arb_snapshot_id = (snap_ref or {}).get("snapshot_id") or cycle_id
         recs_with_keys = []
         envs = []
         for rec in recommendations:
@@ -9551,7 +9561,7 @@ def _arbitrate_boltz_recommendations(recommendations):
                 fee = int(economics.get("estimated_swap_fee_sats", 0) or 0)
                 env = make_intent(
                     intent_type=intent_type,
-                    snapshot_id=cycle_id,
+                    snapshot_id=arb_snapshot_id,
                     created_at=UnixTime(now),
                     expires_at=UnixTime(now + 600),
                     target=str(rec.get("channel_id") or "onchain"),

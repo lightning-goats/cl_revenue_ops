@@ -145,7 +145,13 @@ with a freshness gate rather than per-cycle injection:
    intents and governed planner reservations carry real snapshot ids
    from the hub (stash per arbitration, 600s age bound, synthetic
    labels as fail-open fallback).
-3. **3c Boltz**: snapshot_id threading only (:1675) — no read migration.
+3. **3c Boltz — DONE (2026-07-13)**: snapshot_id threading only (no
+   read migration needed). Both sites — the balance-cycle batch
+   arbitration in cl-revenue-ops.py and the manager's governed swap
+   reservation — carry real snapshot ids from the hub; the hub's TTL
+   cache keeps a cycle's arbitration and its per-recommendation
+   reservations on the same ref. Synthetic labels remain as the
+   fail-open fallback.
 4. **3d LN+**: latest-snapshot + freshness gate for :302/:349/:431;
    snapshot_id threading (:734).
 5. **3e fees** (LAST, highest risk): snapshot-sourced market prior,

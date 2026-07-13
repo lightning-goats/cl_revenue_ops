@@ -1621,6 +1621,18 @@ class BoltzCliManager:
         except Exception:
             return False
 
+    def _snapshot_ref(self, now):
+        """PR 3c: canonical-snapshot reference from the shadow hub
+        (TTL-cached there). None -> callers keep the synthetic label
+        (exact pre-adoption behavior)."""
+        shadow = getattr(self, "econ_shadow", None)
+        if shadow is None:
+            return None
+        try:
+            return shadow.snapshot_ref(int(now))
+        except Exception:
+            return None
+
     def _governed_open_reservation(self, *, reservation_id, fee, channel_id,
                                    subcat, effective_budget, intent_type,
                                    structural):
@@ -1670,9 +1682,11 @@ class BoltzCliManager:
                 registry=registry,
                 authority_check=self.econ_authority_check_provider,
             )
+            snap_ref = self._snapshot_ref(now)
             env = make_intent(
                 intent_type=intent_type,
-                snapshot_id=f"boltz-swap-{now}",
+                snapshot_id=(snap_ref or {}).get("snapshot_id")
+                or f"boltz-swap-{now}",
                 created_at=UnixTime(now),
                 expires_at=UnixTime(now + 600),
                 target=str(channel_id or "onchain"),

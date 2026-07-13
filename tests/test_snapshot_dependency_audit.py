@@ -129,7 +129,9 @@ def test_synthetic_snapshot_ids_still_present_until_migrated():
         # 3b DONE: planner threads real snapshot refs; synthetic label
         # survives only as the fail-open fallback.
         "modules/capacity_planner.py": 'or f"planner-cycle-',
-        "modules/boltz_manager.py": 'snapshot_id=f"boltz-swap-',
+        # 3c DONE: Boltz threads real snapshot refs; synthetic label
+        # survives only as the fail-open fallback.
+        "modules/boltz_manager.py": 'or f"boltz-swap-',
         "modules/lnplus_swaps.py": 'snapshot_id=f"lnplus-swap-',
     }
     for rel, marker in expected.items():
