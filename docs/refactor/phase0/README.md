@@ -212,6 +212,17 @@ core. Zero golden changes — all 14 close-protection fixtures
 byte-identical. Resolves Phase 0 duplication finding: protections were
 distributed across four owners.
 
+## Phase 3D — rebalance-mode consolidation (2026-07-13)
+
+Finding: the heavy F4 unification already existed (one engine pipeline
+for all modes; hot-channel protection already a pair-level
+priority/budget modifier). The gap was representation:
+`modules/rebalance_modes.py` now expresses the spec's mode table as
+data (priority, budget bucket, rail/accounting ownership, deadline),
+and the rebalancer's engine call sites route through it — kwargs parity
+with the legacy boolean combinations is pinned by test. Spec
+contradiction #7 recorded below.
+
 ## Contradictions
 
 Places where the repository contradicts an assumption in
@@ -240,6 +251,11 @@ Places where the repository contradicts an assumption in
 5. `schema_version` is write-only by operator ruling DD9/MIG-3 — the
    spec's migration tooling (Workstream E) must carry its own version
    gate rather than rely on the DB one.
+7. The spec's F4 table lists Diagnostic as "No spend"; the repo's
+   diagnostic mode (defibrillation shock) is deliberately a BOUNDED
+   spend under `diagnostic_rebalance_max_fee_sats`, reserved atomically
+   (P4-020) — a free probe cannot prove routability. Repo reality kept;
+   the mode table documents it.
 6. The spec's ChannelSnapshot proposes one `role` authority; the repo
    has TWO live vocabularies (flow `ChannelState`, profitability
    `ChannelRole`/`role_30d`). The v0 schema carries the union enum;

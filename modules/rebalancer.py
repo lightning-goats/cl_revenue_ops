@@ -1509,8 +1509,10 @@ class EVRebalancer:
 
             if self.rebalance_engine_v2:
                 try:
+                    from .rebalance_modes import engine_kwargs
                     exec_result = self._execute_candidate_v2(
-                        candidate, rebalance_id=rebalance_id
+                        candidate, rebalance_id=rebalance_id,
+                        **engine_kwargs("manual")
                     )
                     if exec_result.success:
                         actual_fee_sats = self._record_successful_rebalance_fee(
@@ -1823,9 +1825,10 @@ class EVRebalancer:
                 # to 'success' with the actual fee, so this path must NOT call
                 # _record_successful_rebalance_fee again (it would double-count
                 # the cost).
+                from .rebalance_modes import engine_kwargs
                 exec_result = self._execute_candidate_v2(
-                    candidate, rebalance_id=rebalance_id, reserve_budget=True,
-                    account_costs=True,
+                    candidate, rebalance_id=rebalance_id,
+                    **engine_kwargs("diagnostic")
                 )
                 if exec_result.success:
                     actual_fee_sats = base_to_sats_ceil(
@@ -1979,7 +1982,9 @@ class EVRebalancer:
             self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no rebalance engine available")
             return {"success": False, "error": "no rebalance engine available"}
 
-        exec_result = self._execute_candidate_v2(cand, rebalance_id=rebalance_id)
+        from .rebalance_modes import engine_kwargs
+        exec_result = self._execute_candidate_v2(
+            cand, rebalance_id=rebalance_id, **engine_kwargs("manual"))
 
         if exec_result.success:
             fee_sats = self._record_successful_rebalance_fee(
