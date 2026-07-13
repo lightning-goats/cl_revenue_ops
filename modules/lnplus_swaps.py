@@ -707,11 +707,16 @@ class SwapLifecycle:
                 ))
 
             ledger = None
+            registry = None
             if self.econ_shadow is not None:
                 try:
                     ledger = self.econ_shadow.ledger_for_reconciliation()
                 except Exception:
                     ledger = None
+                try:
+                    registry = self.econ_shadow.arbitration_registry()
+                except Exception:
+                    registry = None
 
             facade = GovernorFacade(
                 reserve_spend=_lnplus_reserve_delegate,
@@ -719,6 +724,7 @@ class SwapLifecycle:
                 # Invariant 6: obligation fulfillment is never pause-gated.
                 is_paused=lambda: False,
                 ledger=ledger,
+                registry=registry,
             )
             committed = int(capacity_sats or 0)
             env = make_intent(

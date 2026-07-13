@@ -23,7 +23,7 @@ recorded/proposed intents for evaluation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .econ_intents import IntentEnvelope, is_expired
 from .econ_types import UnixTime
@@ -70,6 +70,53 @@ def _sort_key(env: IntentEnvelope):
         env.target,
         env.intent_id.value,
     )
+
+
+class ActiveIntentRegistry:
+    """Phase 3F: live arbitration state at the governor boundary.
+
+    Tracks unexpired in-flight intents so `GovernorFacade.authorize()`
+    can reject conflicts BEFORE granting: duplicate idempotency keys
+    (INTENT_SUPERSEDED) and rebalances into a channel with an active
+    close intent (CONFLICT_CLOSE_REBALANCE — capital preservation
+    outranks liquidity maintenance, spec precedence). Thread-safe;
+    entries expire with their envelope and are released with their
+    reservation."""
+
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self._active: Dict[str, IntentEnvelope] = {}
+
+    def _prune(self, now: int) -> None:
+        expired = [key for key, env in self._active.items()
+                   if now >= env.expires_at.value]
+        for key in expired:
+            del self._active[key]
+
+    def check_and_register(self, env: IntentEnvelope,
+                           now: int) -> Optional[str]:
+        """Reason code blocking this intent, or None (then registered)."""
+        with self._lock:
+            self._prune(int(now))
+            if env.idempotency_key in self._active:
+                return "INTENT_SUPERSEDED"
+            if env.intent_type == "REBALANCE":
+                for active in self._active.values():
+                    if active.intent_type == "CLOSE_CHANNEL" \
+                            and active.target == env.target:
+                        return "CONFLICT_CLOSE_REBALANCE"
+            self._active[env.idempotency_key] = env
+            return None
+
+    def release(self, idempotency_key: str) -> None:
+        with self._lock:
+            self._active.pop(str(idempotency_key), None)
+
+    def active_count(self, now: int) -> int:
+        with self._lock:
+            self._prune(int(now))
+            return len(self._active)
 
 
 @dataclass(frozen=True)

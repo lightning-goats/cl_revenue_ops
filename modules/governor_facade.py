@@ -50,17 +50,39 @@ class GovernorFacade:
     def __init__(self, *, reserve_spend: Callable[..., bool],
                  release_spend: Callable[..., bool],
                  is_paused: Callable[[], bool],
-                 ledger: Optional[EconLedger] = None):
+                 ledger: Optional[EconLedger] = None,
+                 registry=None):
         self._reserve_spend = reserve_spend
         self._release_spend = release_spend
         self._is_paused = is_paused
         self._ledger = ledger
+        # Phase 3F: optional ActiveIntentRegistry — live conflict
+        # arbitration at the authorization boundary.
+        self._registry = registry
 
     def authorize(self, env: IntentEnvelope, now: int) -> GovernorDecision:
         if self._is_paused():
             return GovernorDecision(False, None, "PAUSED")
         if is_expired(env, UnixTime(now)):
             return GovernorDecision(False, None, "INTENT_STALE")
+
+        if self._registry is not None:
+            conflict = self._registry.check_and_register(env, int(now))
+            if conflict:
+                if self._ledger is not None:
+                    try:
+                        self._ledger.append(
+                            event_type="intent_rejected",
+                            intent_id=env.intent_id.value,
+                            idempotency_key=env.idempotency_key,
+                            cycle_id=env.snapshot_id,
+                            at=now,
+                            details={"reason_code": conflict,
+                                     "arbitration": True},
+                        )
+                    except Exception:
+                        pass
+                return GovernorDecision(False, None, conflict)
 
         reserve_sats = env.max_cost_msat.to_sats_ceil().value
         if reserve_sats > 0:
@@ -104,6 +126,11 @@ class GovernorFacade:
         return GovernorDecision(True, token, "")
 
     def release(self, token: AuthorizationToken, now: int) -> bool:
+        if self._registry is not None:
+            try:
+                self._registry.release(token.reservation_id)
+            except Exception:
+                pass
         released = bool(self._release_spend(token.reservation_id))
         if self._ledger is not None:
             self._ledger.append(

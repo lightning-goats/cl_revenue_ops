@@ -236,6 +236,21 @@ are layer-guarded against RPC/subprocess/HTTP; external wire formats
 (boltzcli strings, LN+ base URL) cannot leak outside their adapters.
 Mutation-path and spender-guard pins updated consciously.
 
+## Phase 3F-1 — live arbitration at the governor (2026-07-13)
+
+`ActiveIntentRegistry` (econ_arbiter.py): a shared, thread-safe
+in-flight-intent registry consulted by `GovernorFacade.authorize()`
+behind `econ_arbiter_enabled` (default off). Live rules v0: duplicate
+idempotency keys (INTENT_SUPERSEDED) and rebalance-into-closing-channel
+(CONFLICT_CLOSE_REBALANCE) — the spec's headline conflict, enforced
+cross-path (a planner close authorization blocks a subsequent engine
+rebalance authorization on the same channel, tested end-to-end).
+Rejections ledgered with `arbitration: true`. Entries expire with their
+envelopes and release with their reservations. Full batch arbitration
+(the pure `arbitrate()` over a cycle's intent set) awaits Workstream H
+cycle orchestration — inherited items 3F-2 (ledger authorization
+authority) and 3F-3 (history projections) are the next increments.
+
 ## Contradictions
 
 Places where the repository contradicts an assumption in

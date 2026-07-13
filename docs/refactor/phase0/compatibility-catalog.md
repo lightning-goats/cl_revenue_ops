@@ -22,11 +22,11 @@ Full 66-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
 
 ## Config surface
 
-Owner: `modules/config.py` — a single `Config` dataclass (137 fields)
+Owner: `modules/config.py` — a single `Config` dataclass (138 fields)
 plus the `config_overrides` table (`revenue-config set` persists
 overrides; precedence documented in README.md §revenue-config).
 
-- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (54, listed below).
+- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (55, listed below).
 - Immutable at runtime: `db_path`, `dry_run` (`IMMUTABLE_CONFIG_KEYS` —
   dry_run is immutable so enabling it cannot HIDE actions).
 - The refactor's Workstream I risk-profile work must preserve every
@@ -58,7 +58,7 @@ dataclass is normative).
 
 ---
 
-### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 54)
+### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 55)
 
 - `paused`
 - `daily_budget_sats`
@@ -102,6 +102,7 @@ dataclass is normative).
 - `econ_governor_lnplus_enabled` (added 2026-07-12, Phase 2F)
 - `econ_governor_boltz_enabled` (added 2026-07-12, Phase 2G)
 - `econ_governor_fees_enabled` (added 2026-07-12, Phase 2H)
+- `econ_arbiter_enabled` (added 2026-07-13, Phase 3F)
 - `lnplus_swaps_enabled`
 - `lnplus_execute_applications`
 - `lnplus_swap_preference_margin`
@@ -115,7 +116,7 @@ dataclass is normative).
 - `lnplus_inbound_credit_factor`
 - `lnplus_watcher_interval`
 
-### Full Config dataclass surface (137 fields with defaults)
+### Full Config dataclass surface (138 fields with defaults)
 
 | Field | Default | Runtime-settable |
 |---|---|---|
@@ -150,6 +151,7 @@ dataclass is normative).
 | `econ_governor_lnplus_enabled` | `False` | yes |
 | `econ_governor_boltz_enabled` | `False` | yes |
 | `econ_governor_fees_enabled` | `False` | yes |
+| `econ_arbiter_enabled` | `False` | yes |
 | `expansion_treasury_enabled` | `False` |  |
 | `expansion_treasury_onchain_target_sats` | `5000000` |  |
 | `expansion_treasury_min_deficit_sats` | `250000` |  |

@@ -1647,11 +1647,16 @@ class BoltzCliManager:
                 ))
 
             ledger = None
+            registry = None
             if self.econ_shadow is not None:
                 try:
                     ledger = self.econ_shadow.ledger_for_reconciliation()
                 except Exception:
                     ledger = None
+                try:
+                    registry = self.econ_shadow.arbitration_registry()
+                except Exception:
+                    registry = None
 
             facade = GovernorFacade(
                 reserve_spend=_boltz_reserve_delegate,
@@ -1659,6 +1664,7 @@ class BoltzCliManager:
                     self._capex_engine.release_boltz_swap_reservation(rid)),
                 is_paused=lambda: False,
                 ledger=ledger,
+                registry=registry,
             )
             env = make_intent(
                 intent_type=intent_type,

@@ -2022,18 +2022,24 @@ class RebalanceEngine:
                 return bool(reserved)
 
             ledger = None
+            registry = None
             shadow = getattr(self, "econ_shadow", None)
             if shadow is not None:
                 try:
                     ledger = shadow.ledger_for_reconciliation()
                 except Exception:
                     ledger = None
+                try:
+                    registry = shadow.arbitration_registry()
+                except Exception:
+                    registry = None
 
             facade = GovernorFacade(
                 reserve_spend=_reserve_delegate,
                 release_spend=self.database.release_budget_reservation,
                 is_paused=lambda: getattr(cfg, "paused", False) is True,
                 ledger=ledger,
+                registry=registry,
             )
             env = make_intent(
                 intent_type="REBALANCE",

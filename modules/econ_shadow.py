@@ -306,6 +306,27 @@ class EconShadow:
         return self._get_ledger()
 
     # ------------------------------------------------------------------
+    # live arbitration (Phase 3F)
+    # ------------------------------------------------------------------
+    _intent_registry = None
+
+    def arbitration_registry(self):
+        """The shared ActiveIntentRegistry when live arbitration is
+        enabled (econ_arbiter_enabled), else None. One registry per
+        shadow instance — all governed paths consult the same state."""
+        try:
+            cfg = self._config.snapshot() \
+                if hasattr(self._config, "snapshot") else self._config
+            if getattr(cfg, "econ_arbiter_enabled", False) is not True:
+                return None
+            if self._intent_registry is None:
+                from .econ_arbiter import ActiveIntentRegistry
+                self._intent_registry = ActiveIntentRegistry()
+            return self._intent_registry
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
     # automated reconciliation sweep (Phase 2I)
     # ------------------------------------------------------------------
     _last_reconcile_at = 0

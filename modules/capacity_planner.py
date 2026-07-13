@@ -3410,12 +3410,17 @@ class CapacityPlanner:
                 ))
 
             ledger = None
+            registry = None
             shadow = getattr(self, "econ_shadow", None)
             if shadow is not None:
                 try:
                     ledger = shadow.ledger_for_reconciliation()
                 except Exception:
                     ledger = None
+                try:
+                    registry = shadow.arbitration_registry()
+                except Exception:
+                    registry = None
 
             cfg = self.config.snapshot() \
                 if self.config is not None and hasattr(self.config, "snapshot") \
@@ -3425,6 +3430,7 @@ class CapacityPlanner:
                 release_spend=db.release_spend_reservation,
                 is_paused=lambda: getattr(cfg, "paused", False) is True,
                 ledger=ledger,
+                registry=registry,
             )
             committed = int(committed_sats or 0)
             env = make_intent(

@@ -7485,11 +7485,18 @@ class FeeController:
                 except Exception:
                     ledger = None
 
+            registry = None
+            if self.econ_shadow is not None:
+                try:
+                    registry = self.econ_shadow.arbitration_registry()
+                except Exception:
+                    registry = None
             facade = GovernorFacade(
                 reserve_spend=lambda **_kw: True,  # zero-cost: never called
                 release_spend=lambda _rid: True,
                 is_paused=lambda: getattr(cfg, "paused", False) is True,
                 ledger=ledger,
+                registry=registry,
             )
             env = make_intent(
                 intent_type="SET_FEE",
