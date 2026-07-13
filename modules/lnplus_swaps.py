@@ -721,7 +721,9 @@ class SwapLifecycle:
             facade = GovernorFacade(
                 reserve_spend=_lnplus_reserve_delegate,
                 release_spend=self._db.release_spend_reservation,
-                # Invariant 6: obligation fulfillment is never pause-gated.
+                # Invariant 6: obligation fulfillment is never pause- or
+                # authority-gated — the swap was accepted under whatever
+                # authority applied at application time.
                 is_paused=lambda: False,
                 ledger=ledger,
                 registry=registry,

@@ -59,6 +59,7 @@ def test_public_runtime_keys_are_safety_only():
         "econ_cycle_rebalance_enabled",
         "econ_cycle_planner_enabled",
         "econ_cycle_boltz_enabled",
+        "authority_level",
         # LN+ liquidity swap automation
         "lnplus_swaps_enabled",
         "lnplus_execute_applications",
@@ -133,6 +134,7 @@ def test_public_runtime_dict_returns_only_public_keys():
         "econ_cycle_rebalance_enabled": False,
         "econ_cycle_planner_enabled": False,
         "econ_cycle_boltz_enabled": False,
+        "authority_level": "capital",
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,
@@ -550,6 +552,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
     result = mod.revenue_config(mod.plugin, "list-mutable")
 
     assert result["mutable_keys"] == [
+        "authority_level",
         "boltz_auto_cycle_enabled",
         "boltz_structural_budget_sats_per_day",
         "capex_probability_budget_bonus",
@@ -609,7 +612,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_target",
         "weekly_budget_sats",
     ]
-    assert result["count"] == 58
+    assert result["count"] == 59
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -664,6 +667,7 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "econ_cycle_rebalance_enabled": False,
         "econ_cycle_planner_enabled": False,
         "econ_cycle_boltz_enabled": False,
+        "authority_level": "capital",
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,
@@ -1154,6 +1158,7 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "econ_cycle_rebalance_enabled": False,
         "econ_cycle_planner_enabled": False,
         "econ_cycle_boltz_enabled": False,
+        "authority_level": "capital",
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,

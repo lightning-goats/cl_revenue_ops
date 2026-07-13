@@ -1610,6 +1610,9 @@ class BoltzCliManager:
     # hooks). None = legacy behavior.
     econ_shadow = None
     econ_governor_enabled_provider = None
+    # Phase 4: callable -> bool, True when authority level permits swaps
+    # ('capital'). None = ungated (legacy).
+    econ_authority_check_provider = None
 
     def _boltz_governor_enabled(self) -> bool:
         try:
@@ -1665,6 +1668,7 @@ class BoltzCliManager:
                 is_paused=lambda: False,
                 ledger=ledger,
                 registry=registry,
+                authority_check=self.econ_authority_check_provider,
             )
             env = make_intent(
                 intent_type=intent_type,

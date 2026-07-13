@@ -2941,6 +2941,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 lambda: getattr(config.snapshot(),
                                 "econ_governor_boltz_enabled", False) is True
                 if config is not None else False)
+            from modules.governor_facade import authority_allows
+            boltz_manager.econ_authority_check_provider = (
+                lambda: authority_allows(
+                    getattr(config.snapshot(), "authority_level",
+                            "capital") if config is not None else "capital",
+                    "capital"))
         except Exception:
             pass
 

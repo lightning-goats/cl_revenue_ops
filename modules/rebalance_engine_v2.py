@@ -2034,12 +2034,16 @@ class RebalanceEngine:
                 except Exception:
                     registry = None
 
+            from .governor_facade import authority_allows
             facade = GovernorFacade(
                 reserve_spend=_reserve_delegate,
                 release_spend=self.database.release_budget_reservation,
                 is_paused=lambda: getattr(cfg, "paused", False) is True,
                 ledger=ledger,
                 registry=registry,
+                authority_check=lambda: authority_allows(
+                    getattr(cfg, "authority_level", "capital"),
+                    "liquidity"),
             )
             env = make_intent(
                 intent_type="REBALANCE",

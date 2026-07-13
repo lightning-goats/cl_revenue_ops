@@ -28,6 +28,20 @@ from .econ_intents import IntentEnvelope, is_expired
 from .econ_ledger import EconLedger
 from .econ_types import UnixTime
 
+# Phase 4 (Workstream I): the global authority ladder. Governed actions
+# whose required level exceeds the configured level are rejected with
+# AUTHORITY_LEVEL_BLOCKED. Unknown configured values fail CLOSED to
+# 'observe' (a typo must never grant authority).
+AUTHORITY_LEVELS = {"observe": 0, "fees": 1, "liquidity": 2, "capital": 3}
+
+
+def authority_allows(configured_level, required_level: str) -> bool:
+    configured = AUTHORITY_LEVELS.get(
+        str(configured_level or "").strip().lower(), 0)
+    required = AUTHORITY_LEVELS.get(
+        str(required_level or "").strip().lower(), 3)
+    return configured >= required
+
 
 @dataclass(frozen=True)
 class AuthorizationToken:
@@ -54,7 +68,8 @@ class GovernorFacade:
                  release_spend: Callable[..., bool],
                  is_paused: Callable[[], bool],
                  ledger: Optional[EconLedger] = None,
-                 registry=None):
+                 registry=None,
+                 authority_check=None):
         self._reserve_spend = reserve_spend
         self._release_spend = release_spend
         self._is_paused = is_paused
@@ -62,6 +77,9 @@ class GovernorFacade:
         # Phase 3F: optional ActiveIntentRegistry — live conflict
         # arbitration at the authorization boundary.
         self._registry = registry
+        # Phase 4: optional authority gate — callable returning True when
+        # the configured authority level permits this action.
+        self._authority_check = authority_check
 
     def authorize(self, env: IntentEnvelope, now: int,
                   reservation_id: Optional[str] = None) -> GovernorDecision:
@@ -75,6 +93,14 @@ class GovernorFacade:
         idempotent by replay semantics."""
         if self._is_paused():
             return GovernorDecision(False, None, "PAUSED")
+        if self._authority_check is not None:
+            try:
+                allowed = bool(self._authority_check())
+            except Exception:
+                allowed = False  # fail closed
+            if not allowed:
+                return GovernorDecision(False, None,
+                                        "AUTHORITY_LEVEL_BLOCKED")
         if is_expired(env, UnixTime(now)):
             return GovernorDecision(False, None, "INTENT_STALE")
 

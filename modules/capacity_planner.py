@@ -3553,12 +3553,15 @@ class CapacityPlanner:
             cfg = self.config.snapshot() \
                 if self.config is not None and hasattr(self.config, "snapshot") \
                 else self.config
+            from .governor_facade import authority_allows
             facade = GovernorFacade(
                 reserve_spend=_planner_reserve_delegate,
                 release_spend=db.release_spend_reservation,
                 is_paused=lambda: getattr(cfg, "paused", False) is True,
                 ledger=ledger,
                 registry=registry,
+                authority_check=lambda: authority_allows(
+                    getattr(cfg, "authority_level", "capital"), "capital"),
             )
             committed = int(committed_sats or 0)
             env = make_intent(

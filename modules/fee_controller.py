@@ -7491,12 +7491,15 @@ class FeeController:
                     registry = self.econ_shadow.arbitration_registry()
                 except Exception:
                     registry = None
+            from .governor_facade import authority_allows
             facade = GovernorFacade(
                 reserve_spend=lambda **_kw: True,  # zero-cost: never called
                 release_spend=lambda _rid: True,
                 is_paused=lambda: getattr(cfg, "paused", False) is True,
                 ledger=ledger,
                 registry=registry,
+                authority_check=lambda: authority_allows(
+                    getattr(cfg, "authority_level", "capital"), "fees"),
             )
             env = make_intent(
                 intent_type="SET_FEE",
