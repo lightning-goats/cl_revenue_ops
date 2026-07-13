@@ -92,7 +92,7 @@ Evidence pins are against branch `refactor-phase1-shadow` @ `ab34d6f`
 | Risk | HIGH at flip time (execution-order change is the J3 reordering deliberately deferred earlier); LOW for the audit. |
 | Behavior change | Audit: none. Population flip: YES — intended, flag-gated, separately approved. |
 | Rollback | Flag off. |
-| Status | **not_met** (audit never performed; fields unpopulated) |
+| Status | **partial** — AUDIT COMPLETE 2026-07-13 (`docs/refactor/phase0/ev-coverage-matrix.md`): all ten action classes mapped to the common contract with file:line evidence; every spend path already computes real EV terms (richer than the contract in places — p_success, structural credits, lockup haircuts); exception classes assigned; envelope population plan + ordering-impact analysis + boolean-retirement verdict recorded. Envelope fields remain unpopulated until PR 6 (flag-gated; flip needs operator approval). |
 
 ### Gap 7: DTS+PID fee-controller deviation
 
