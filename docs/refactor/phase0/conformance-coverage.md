@@ -45,7 +45,7 @@ Scenario classes: 40/40. Documented gaps: 0 (listed last — these are honest ho
 | `37-clock-seed-determinism` | determinism | Workstream J: identical (fields, clock) -> identical ids; no hidden entropy in the authoritative path | generated | case.json |
 | `38-partial-batch-completion` | arbitration | Workstream H: a batch completes partially — survivors ordered, each rejection carries its own reason code | generated | case.json |
 | `39-bookkeeper-present-absent` | failure_mode | Workstream G: bookkeeper is an optional evidence source | modules/profitability_analyzer.py:_get_open_cost_from_bookkeeper | case.json |
-| `40-sanitized-production-decisions` | production_capture | DoD 17: replaying real production lifecycles reproduces the reference ledger state | generated | case.json, expected-ledger-events.json |
+| `40-sanitized-production-decisions` | production_capture | DoD 17: replaying real production lifecycles reproduces the reference ledger state | generated | case.json, expected-ledger-events.json, expected-projections.json |
 
 ## Reason-code / rule coverage
 
