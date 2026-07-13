@@ -66,6 +66,27 @@ def test_absent_shadow_is_harmless():
     mod.fee_controller.adjust_all_fees.assert_called_once()
 
 
+def test_fee_cycle_triggers_reconciliation_sweep():
+    shadow = MagicMock()
+    shadow.enabled.return_value = True
+    mod = _fee_module(shadow)
+    mod.database = MagicMock()
+    mod.run_fee_adjustment()
+    shadow.maybe_run_reconciliation.assert_called_once()
+    args = shadow.maybe_run_reconciliation.call_args.args
+    assert args[0] is mod.database
+
+
+def test_raising_sweep_never_breaks_fee_cycle():
+    shadow = MagicMock()
+    shadow.enabled.return_value = True
+    shadow.maybe_run_reconciliation.side_effect = RuntimeError("boom")
+    mod = _fee_module(shadow)
+    mod.database = MagicMock()
+    mod.run_fee_adjustment()  # must not raise
+    mod.fee_controller.adjust_all_fees.assert_called_once()
+
+
 class TestSnapshotRpc:
     def test_shadow_none_reports_disabled(self):
         mod = load_plugin_module()

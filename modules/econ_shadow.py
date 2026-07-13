@@ -306,6 +306,74 @@ class EconShadow:
         return self._get_ledger()
 
     # ------------------------------------------------------------------
+    # automated reconciliation sweep (Phase 2I)
+    # ------------------------------------------------------------------
+    _last_reconcile_at = 0
+
+    def maybe_run_reconciliation(self, database, now: int,
+                                 min_interval_seconds: int = 3600):
+        """Hourly self-throttled sweep: auto-applies resolvable ledger
+        divergences (append-only corrections toward DB truth), WARNS on
+        quarantined unknown outcomes every sweep until reconciled, and
+        WARNS on fee-intent completeness gaps. Writes only the econ
+        ledger; never revenue_ops.db. Fail-open: returns None on any
+        failure, disablement, or throttle."""
+        try:
+            if not self.enabled() or database is None:
+                return None
+            if int(now) - int(self._last_reconcile_at) < int(
+                    min_interval_seconds):
+                return None
+            ledger = self._get_ledger()
+            if ledger is None:
+                return None
+
+            from . import econ_reconcile
+
+            db_states = database.get_spend_reservation_states()
+            report = econ_reconcile.reconcile(ledger, db_states,
+                                              now=int(now))
+            applied = econ_reconcile.apply(ledger, report, now=int(now))
+            quarantined = [d for d in report.divergences
+                           if d.resolution is None]
+            for divergence in quarantined:
+                self._log(
+                    f"quarantined unknown outcome awaiting reconciliation "
+                    f"(EXTERNAL_OUTCOME_UNKNOWN): {divergence.key[:16]} "
+                    f"age={divergence.details.get('age_seconds')}s",
+                    level="warn")
+
+            completeness_ok = None
+            try:
+                changes = database.get_recent_fee_changes(limit=500)
+                completeness = econ_reconcile.fee_intent_completeness(
+                    ledger, changes, now=int(now))
+                if completeness.get("status") == "ok":
+                    completeness_ok = bool(completeness.get("complete"))
+                    if not completeness_ok:
+                        self._log(
+                            f"fee-intent completeness gap: "
+                            f"{completeness.get('mismatched_cycles')}",
+                            level="warn")
+            except Exception as e:
+                self._log(f"completeness check skipped: {e}")
+
+            self._last_reconcile_at = int(now)
+            summary = {
+                "checked": report.checked,
+                "divergences": len(report.divergences),
+                "applied": applied,
+                "quarantined": len(quarantined),
+                "completeness_ok": completeness_ok,
+            }
+            level = "info" if (report.divergences or applied) else "debug"
+            self._log(f"reconciliation sweep: {summary}", level=level)
+            return summary
+        except Exception as e:
+            self._log(f"reconciliation sweep failed open: {e}")
+            return None
+
+    # ------------------------------------------------------------------
     # on-demand snapshot preview
     # ------------------------------------------------------------------
     def build_snapshot_preview(self, *, channels: Any,

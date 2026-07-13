@@ -3543,6 +3543,16 @@ def run_fee_adjustment():
         except Exception as _shadow_err:
             plugin.log(f"econ shadow skipped: {_shadow_err}", level='debug')
 
+        # Phase 2I: hourly self-throttled reconciliation sweep (ledger
+        # corrections + quarantine/completeness alerts). Fail-open.
+        try:
+            if econ_shadow is not None and database is not None:
+                econ_shadow.maybe_run_reconciliation(
+                    database, int(time.time()))
+        except Exception as _sweep_err:
+            plugin.log(f"reconciliation sweep skipped: {_sweep_err}",
+                       level='debug')
+
         # Push status + profitability to datastore for external consumers.
         # This keeps local reporting cheap and consistent.
         try:

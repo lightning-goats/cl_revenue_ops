@@ -187,6 +187,21 @@ class TestFeeIntentCompleteness:
         assert result["cycles_checked"] == 1
 
 
+def test_in_flight_reservation_retained_even_without_db_row(ledger):
+    """Spec: ambiguous outcomes RETAIN the reservation. A started
+    execution with no DB row must NOT be auto-zeroed as db_missing —
+    fresh in-flight is silent; stale surfaces only as quarantine."""
+    _append(ledger, "budget_reserved", amounts={"reserved_msat": 3_000},
+            at=NOW - 60)
+    _append(ledger, "execution_started", at=NOW - 60)
+    report = reconcile(ledger, {}, now=NOW)  # fresh: nothing reported
+    assert report.divergences == ()
+    report_stale = reconcile(ledger, {}, now=NOW + 7200)
+    assert [d.kind for d in report_stale.divergences] == ["unknown_outcome"]
+    assert report_stale.divergences[0].resolution is None
+    assert apply(ledger, report_stale, now=NOW + 7200) == 0
+
+
 def test_apply_skips_quarantined(ledger):
     _append(ledger, "budget_reserved", amounts={"reserved_msat": 3_000},
             at=NOW - 7200)

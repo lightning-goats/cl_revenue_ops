@@ -152,8 +152,16 @@ Suite after tranche: **3352 passed**.
   accepts both recording modes. The facade no longer emits
   budget_reserved for zero-cost tokens.
 
-**Remaining Phase 2 work:** reconciliation automation and the 4→1
-reservations unification; then the Phase 2 exit-gate review.
+- 2I: automated reconciliation — hourly self-throttled sweep in the
+  fee-loop tail (`EconShadow.maybe_run_reconciliation`): auto-applies
+  resolvable ledger corrections, WARNS every sweep on quarantined
+  EXTERNAL_OUTCOME_UNKNOWN keys and on fee-intent completeness gaps.
+  Spec-correctness fix found by TDD: in-flight executions (started, no
+  terminal) now RETAIN their reservations — never auto-zeroed as
+  db_missing — surfacing only as quarantine once stale.
+
+**Remaining Phase 2 work:** the 4→1 reservations unification; then the
+Phase 2 exit-gate review.
 
 ## Contradictions
 

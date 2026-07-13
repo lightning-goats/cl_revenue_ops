@@ -68,9 +68,17 @@ def reconcile(ledger: EconLedger, db_states: Dict[str, dict], now: int,
     divergences = []
     matched = 0
 
-    keys = sorted(set(ledger_outstanding)
-                  | {k for k, s in db_states.items()
-                     if s.get("status") == "active"})
+    # Spec reservation machine: an execution with no terminal outcome
+    # RETAINS its reservation until reconciled — such keys are excluded
+    # from resolvable classification entirely (fresh in-flight is
+    # normal; stale in-flight surfaces below as quarantined
+    # unknown_outcome, never auto-resolved).
+    in_flight = set(_started_without_terminal(ledger))
+
+    keys = sorted((set(ledger_outstanding)
+                   | {k for k, s in db_states.items()
+                      if s.get("status") == "active"})
+                  - in_flight)
     for key in keys:
         ledger_msat = int(ledger_outstanding.get(key, 0))
         db_row = db_states.get(key)
