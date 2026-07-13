@@ -643,7 +643,16 @@ def s40():
                           amounts=event["amounts"],
                           details=event["details"])
         state = ledger.replay()
+    projection = {
+        "schema_name": "ledger_projection", "schema_version": 0,
+        "reserved_msat": dict(state.reserved_msat),
+        "spent_msat": dict(state.spent_msat),
+        "total_spent_msat": state.total_spent_msat,
+        "terminal": dict(state.terminal),
+        "anomalies": list(state.anomalies),
+    }
     return {
+        "expected-projections.json": projection,
         "expected-ledger-events.json": {
             "schema_name": "conformance_case", "schema_version": 0,
             "case": "production-capture-events", "category":

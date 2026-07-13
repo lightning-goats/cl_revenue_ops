@@ -46,4 +46,7 @@ clustering) — all before evaluation start; zero flag rollbacks ever.
 - 2026-07-13: `econ_ev_populated` flipped true (operator-approved) —
   inside the window by hours; treated as part of the evaluated
   configuration.
+- 2026-07-13: `econ_conflict_rules_extended` flipped true
+  (operator-approved, config v82) — strictly conservative (can only
+  reject more); treated as part of the evaluated configuration.
 - (append future entries here)

@@ -35,7 +35,7 @@ flag-gated.
 | 12 | Deprecated no-ops and duplicate paths removed | pending_time_gate (2026-08-12; prep COMPLETE — scanner READY on lnnode, staged acceptance tests, by-symbol checklist) — duplicate implementations are gone or transition-only; the one deprecated no-op (`rebalance_min_profit`) and remaining transition paths have an ANNOUNCED 30-day removal window (contract-compatibility-policy.md) — same-day removal would violate the spec's own window rule. |
 | 13 | Golden/invariant/failure-injection/integration/production gates | partial (per-category evidence filed in governance-evidence-report.md; two declared gaps: pyln minimum-CLN integration not exercised in this environment; full daemon restart deferred to node maintenance): 88+ goldens (zero unexplained fixture changes across the entire refactor), invariant/failure tests throughout; integration matrix pre-existing; production validation pipeline running. |
 | 14 | Economic outcomes no worse within evaluation window | pending_time_gate (window 2026-07-13 → 2026-08-12 per production-evaluation-spec.md; frozen baseline + thresholds + confounder rules filed; interim report captured): the window is time-based. Evidence so far: routing revenue uninterrupted through ~20 deploys; zero governance-caused failures. The existing daily validation pipeline carries the formal comparison. |
-| 15 | Contracts versioned, language-neutral, independently validated | partial (narrowed 2026-07-13: snapshot+intent v1 frozen; ledger_event.v0 + conformance_case.v0 published with the corpus; PROJECTIONS schema still outstanding): v1 FROZEN (closed objects), standalone validator, corpus. |
+| 15 | Contracts versioned, language-neutral, independently validated | met (2026-07-13: snapshot+intent v1 FROZEN; ledger_event.v0, conformance_case.v0, and ledger_projection.v0 published — the corpus emits a schema-typed replay projection for the production capture; standalone validator covers all five schema families). |
 | 16 | Deterministic semantics explicit | met: wire-contract spec; cycle determinism byte-pinned. |
 | 17 | Conformance corpus sufficient for another implementation | met (2026-07-13, PR 9 — 40 scenario classes, reference-generated expecteds, byte-identical regeneration pin, coverage report, sanitized production capture, zero documented gaps after PR 10): schemas+rules+corpus suffice structurally; corpus grows with production capture (E4). |
 | 18 | Rust shadow-only until gates | not_applicable — excluded by operator directive (2026-07-13). |
@@ -55,15 +55,14 @@ recorded as completed work.
 ## Verdict (revised 2026-07-13, post gap-closure PRs 1–12)
 
 The governed architecture is implemented, tested (3,703), and operating
-in production with per-capability rollback. Status: **13 met, 2
+in production with per-capability rollback. Status: **14 met, 1
 partial, 2 pending_time_gate, 1 not_applicable.**
 
-**Architectural completion: NOT yet declared — two named residuals**
-(both small, neither time-gated): item 13's two evidence gaps
-(pyln-based minimum-CLN integration not exercised in this environment;
-full daemon restart deferred to node maintenance) and item 15's
-projections schema publication. When those close, architectural
-completion may be declared.
+**Architectural completion: NOT yet declared — one named residual**:
+item 13's two evidence gaps (pyln-based minimum-CLN integration not
+exercised in this environment; full daemon restart deferred to node
+maintenance). Both are operational-evidence items, not code gaps; when
+exercised, architectural completion may be declared.
 
 **Original-DoD completion: NOT declared** (operator constraint 10) —
 it additionally requires the 2026-08-12 removals (prep complete,
