@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lightning-goats/cl_revenue_ops/schemas/ledger_event.v0.schema.json",
+  "title": "Econ ledger event v0 (draft, Phase F)",
+  "description": "One append-only econ-ledger event as stored/read by EconLedger. Replay semantics: budget_reserved sets, cost_recorded consumes, reservation_released zeroes, reconciliation_completed sets absolutely, terminal events are first-wins; unknown types ignored.",
+  "type": "object",
+  "required": [
+    "schema_name",
+    "schema_version",
+    "event_type",
+    "intent_id",
+    "idempotency_key",
+    "cycle_id",
+    "at"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema_name": {
+      "const": "ledger_event"
+    },
+    "schema_version": {
+      "const": 0
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "intent_proposed",
+        "intent_rejected",
+        "intent_deferred",
+        "intent_authorized",
+        "budget_reserved",
+        "execution_started",
+        "execution_succeeded",
+        "execution_failed",
+        "execution_outcome_unknown",
+        "cost_recorded",
+        "reservation_released",
+        "reconciliation_completed",
+        "snapshot_created"
+      ]
+    },
+    "intent_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "cycle_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "at": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "amounts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer"
+      }
+    },
+    "details": {
+      "type": "object"
+    }
+  },
+  "examples": [
+    {
+      "schema_name": "ledger_event",
+      "schema_version": 0,
+      "event_type": "budget_reserved",
+      "intent_id": "i1",
+      "idempotency_key": "k1",
+      "cycle_id": "c1",
+      "at": 1752400000,
+      "amounts": {
+        "reserved_msat": 400000
+      },
+      "details": {}
+    }
+  ]
+}

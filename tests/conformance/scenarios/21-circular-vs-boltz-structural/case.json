@@ -1,0 +1,16 @@
+{
+ "case": "circular-rebalance-vs-boltz-structural",
+ "category": "documented_gap",
+ "expected": {
+  "implemented": false
+ },
+ "inputs": {
+  "rule": "circular rebalance vs Boltz structural action on the same channel"
+ },
+ "notes": [
+  "DOCUMENTED GAP: SWAP intents and REBALANCE intents share the live registry but no cross-type rule exists beyond close-vs-rebalance. Phase G work item."
+ ],
+ "requirement": "Spec conflict rule: rebalance vs structural swap",
+ "schema_name": "conformance_case",
+ "schema_version": 0
+}

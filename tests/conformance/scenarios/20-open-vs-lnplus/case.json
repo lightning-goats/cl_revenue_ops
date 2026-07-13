@@ -1,0 +1,16 @@
+{
+ "case": "open-vs-lnplus-conflict",
+ "category": "documented_gap",
+ "expected": {
+  "implemented": false
+ },
+ "inputs": {
+  "rule": "channel open vs LN+ liquidity swap on the same peer"
+ },
+ "notes": [
+  "DOCUMENTED GAP: requires LN+ JOIN intents that do not exist yet (recorded at planner-loop cutover). The rule must land with LN+ application intents (Phase G work item)."
+ ],
+ "requirement": "Spec conflict rule: open vs LN+",
+ "schema_name": "conformance_case",
+ "schema_version": 0
+}

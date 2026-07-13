@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lightning-goats/cl_revenue_ops/schemas/conformance_case.v0.schema.json",
+  "title": "Conformance case v0 (draft, Phase F corpus)",
+  "description": "One portable behavioral case: explicit inputs and the authoritative expected outputs, generated from (or pinned against) the reference implementation. Authoritative comparisons per spec J5: integers, enums, ordering, reason codes, lifecycle transitions, authorization outcomes are exact; prose and _diag fields are excluded.",
+  "type": "object",
+  "required": [
+    "schema_name",
+    "schema_version",
+    "case",
+    "category",
+    "inputs",
+    "expected"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema_name": {
+      "const": "conformance_case"
+    },
+    "schema_version": {
+      "const": 0
+    },
+    "case": {
+      "type": "string",
+      "minLength": 1
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "classification",
+        "fee_stage",
+        "admission",
+        "rebalance_mode",
+        "arbitration",
+        "authorization",
+        "reservation",
+        "ledger",
+        "intent_semantics",
+        "determinism",
+        "failure_mode",
+        "production_capture",
+        "documented_gap"
+      ]
+    },
+    "requirement": {
+      "type": "string"
+    },
+    "inputs": {
+      "type": "object"
+    },
+    "expected": {
+      "type": "object"
+    },
+    "source": {
+      "type": "string"
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema_name": "conformance_case",
+      "schema_version": 0,
+      "case": "example",
+      "category": "determinism",
+      "inputs": {
+        "a": 1
+      },
+      "expected": {
+        "b": 2
+      }
+    }
+  ]
+}
