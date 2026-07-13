@@ -64,7 +64,7 @@ Evidence pins are against branch `refactor-phase1-shadow` @ `ab34d6f`
 | Risk | NONE (measurement only). |
 | Behavior change | None. |
 | Rollback | n/a. |
-| Status | **pending_time_gate** (window close per spec, proposed 2026-08-12) |
+| Status | **pending_time_gate** (window 2026-07-13 → 2026-08-12 RUNNING — PR 12 SHIPPED: production-evaluation-spec.md defines start/end/baseline/node/config/completeness/red-yellow-green thresholds/confounder rules/minimum evidence; interim report freezes the baseline anchors incl. the declared forwards-history limitation and the 5.6x weekly variance that motivates the 85% GREEN band) |
 
 ### Gap 5: Conformance corpus coverage
 
