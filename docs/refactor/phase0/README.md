@@ -290,6 +290,45 @@ worst-ROI-first execution order deliberately PRESERVED among survivors
 open-vs-liquidity-swap conflict rule needs LN+ JOIN intents that do not
 exist yet.
 
+## Workstream H — Boltz-loop cutover (2026-07-13)
+
+Behind `econ_cycle_boltz_enabled` (default off): the Boltz auto-balance
+recommendation list passes through batch `arbitrate()` at one seam in
+`_execute_boltz_balance_cycle` before per-recommendation execution.
+Direction-aware intent typing (loop_in → SWAP_IN, loop_out/chainswap →
+SWAP_OUT) so opposite-direction swaps on one channel are distinct
+intents, dedup drops exact duplicates, legacy plan-ranked order
+preserved among survivors, rejections ledgered. Fail-open like the
+other two loop stages; the downstream governed reservation
+(`econ_governor_boltz_enabled`) still fails closed. All three spend
+loops now share the same arbitration front door.
+
+## Phase 4 (Workstream I) — global authority levels (2026-07-13)
+
+`authority_level` runtime key (observe < fees < liquidity < capital,
+default `capital` = current behavior) enforced INSIDE the governor
+facade: after the pause gate and before any reservation, a per-path
+`authority_check` closure evaluates `authority_allows(configured,
+required)`; failure or a raising check → fail-closed
+`AUTHORITY_LEVEL_BLOCKED`. Path requirements: fee mutations require
+`fees`, rebalance spends `liquidity`, planner opens/closes and Boltz
+swaps `capital`. LN+ obligation fulfillment is deliberately ungated
+(invariant 6 — accepted obligations complete even when new-action
+creation is disabled). Unknown configured values fail closed to
+observe; unknown required values demand the top level.
+
+## Operator surface — risk_profile disposition (2026-07-13)
+
+The spec's `risk_profile` (conservative/balanced/aggressive bundling of
+budget/ROI/hysteresis defaults) is NOT implemented; recorded as
+completion exception E3 (`completion-review.md`). Rationale: binding
+coherent defaults across the 142-field surface on a live node is a
+tuning project, not a refactor step — a wrong bundle silently moves ~30
+economic knobs at once. `authority_level` ships the safety half of the
+spec's small-operator-surface item (what the node MAY do);
+`risk_profile` (how aggressively) remains an optional follow-up with
+its own golden/EV validation.
+
 ## Contradictions
 
 Places where the repository contradicts an assumption in
@@ -328,6 +367,16 @@ Places where the repository contradicts an assumption in
    `ChannelRole`/`role_30d`). The v0 schema carries the union enum;
    narrowing to one authority is Workstream A work, not a Phase 0
    assumption.
+8. The spec's fee model (`fee = baseline × liquidity_multiplier ×
+   market_multiplier`, Workstream B) does not describe the repo's
+   engine: fees come from DTS thompson-sampling targets shaped by a PID
+   controller, then constrained. Forcing the multiplicative
+   decomposition would falsify the algorithm the goldens pin. Smallest
+   correction (taken): keep the real engine; make the spec's CONSTRAINT
+   stages explicit instead — rails → max-change rate → deadband →
+   cooldown are individually goldened and exposed via
+   `revenue-fee-debug`. The decomposition itself is recorded here as
+   not-forced, per the spec's own contradiction rule.
 
 ## Prior-art reuse
 

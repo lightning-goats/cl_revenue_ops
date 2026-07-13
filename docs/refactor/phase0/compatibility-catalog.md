@@ -22,11 +22,11 @@ Full 67-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
 
 ## Config surface
 
-Owner: `modules/config.py` — a single `Config` dataclass (140 fields)
+Owner: `modules/config.py` — a single `Config` dataclass (142 fields)
 plus the `config_overrides` table (`revenue-config set` persists
 overrides; precedence documented in README.md §revenue-config).
 
-- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (57, listed below).
+- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (59, listed below).
 - Immutable at runtime: `db_path`, `dry_run` (`IMMUTABLE_CONFIG_KEYS` —
   dry_run is immutable so enabling it cannot HIDE actions).
 - The refactor's Workstream I risk-profile work must preserve every
@@ -58,7 +58,7 @@ dataclass is normative).
 
 ---
 
-### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 57)
+### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 59)
 
 - `paused`
 - `daily_budget_sats`
@@ -105,6 +105,8 @@ dataclass is normative).
 - `econ_arbiter_enabled` (added 2026-07-13, Phase 3F)
 - `econ_cycle_rebalance_enabled` (added 2026-07-13, Workstream H cutover)
 - `econ_cycle_planner_enabled` (added 2026-07-13, Workstream H cutover)
+- `econ_cycle_boltz_enabled` (added 2026-07-13, Workstream H cutover)
+- `authority_level` (added 2026-07-13, Phase 4 Workstream I; observe/fees/liquidity/capital, default `capital`)
 - `lnplus_swaps_enabled`
 - `lnplus_execute_applications`
 - `lnplus_swap_preference_margin`
@@ -118,7 +120,7 @@ dataclass is normative).
 - `lnplus_inbound_credit_factor`
 - `lnplus_watcher_interval`
 
-### Full Config dataclass surface (140 fields with defaults)
+### Full Config dataclass surface (142 fields with defaults)
 
 | Field | Default | Runtime-settable |
 |---|---|---|
@@ -156,6 +158,8 @@ dataclass is normative).
 | `econ_arbiter_enabled` | `False` | yes |
 | `econ_cycle_rebalance_enabled` | `False` | yes |
 | `econ_cycle_planner_enabled` | `False` | yes |
+| `econ_cycle_boltz_enabled` | `False` | yes |
+| `authority_level` | `'capital'` | yes |
 | `expansion_treasury_enabled` | `False` |  |
 | `expansion_treasury_onchain_target_sats` | `5000000` |  |
 | `expansion_treasury_min_deficit_sats` | `250000` |  |

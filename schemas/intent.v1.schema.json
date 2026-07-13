@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.cl-revenue-ops.invalid/intent.v1.schema.json",
+  "title": "IntentEnvelope v1 (FROZEN)",
+  "description": "FROZEN v1 contract (2026-07-13): unknown fields REJECTED (additionalProperties false); enum wire values and required sets are stable; breaking changes require v2 with migration fixtures. Compatibility policy: docs/refactor/phase0/contract-compatibility-policy.md. Typed economic intent proposal (docs/planning/refactor.md Workstream B). An intent is a proposal, never an authorization. Python implementation: modules/econ_intents.py. Numeric/determinism rules: docs/refactor/phase0/wire-contract-spec.md.",
+  "type": "object",
+  "required": [
+    "schema_name",
+    "schema_version",
+    "intent_id",
+    "intent_type",
+    "idempotency_key",
+    "snapshot_id",
+    "created_at",
+    "expires_at",
+    "target",
+    "amount_msat",
+    "expected_benefit_msat",
+    "max_cost_msat",
+    "capital_committed_msat",
+    "confidence_micro",
+    "reason_codes",
+    "explanation",
+    "preconditions",
+    "priority",
+    "budget_bucket",
+    "origin_policy",
+    "reversible"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_name": {
+      "const": "intent"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "intent_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]{1,64}$"
+    },
+    "intent_type": {
+      "enum": [
+        "SET_FEE",
+        "SET_HTLC_MAX",
+        "REBALANCE",
+        "OPEN_CHANNEL",
+        "CLOSE_CHANNEL",
+        "SWAP_IN",
+        "SWAP_OUT",
+        "JOIN_LIQUIDITY_SWAP",
+        "MAINTAIN_ONCHAIN_RESERVE"
+      ]
+    },
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "snapshot_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "expires_at": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "target": {
+      "type": "string",
+      "minLength": 1
+    },
+    "amount_msat": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "expected_benefit_msat": {
+      "type": "integer"
+    },
+    "max_cost_msat": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "capital_committed_msat": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "confidence_micro": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]*$"
+      }
+    },
+    "explanation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "components"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "components": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {}
+            ]
+          }
+        }
+      }
+    },
+    "preconditions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "budget_bucket": {
+      "type": "string",
+      "minLength": 1
+    },
+    "origin_policy": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reversible": {
+      "type": "boolean"
+    }
+  },
+  "examples": [
+    {
+      "amount_msat": 250,
+      "budget_bucket": "fees",
+      "capital_committed_msat": 0,
+      "confidence_micro": 900000,
+      "created_at": 1752400000,
+      "expected_benefit_msat": 1000,
+      "expires_at": 1752400600,
+      "explanation": {
+        "components": [
+          [
+            "baseline_ppm",
+            200
+          ],
+          [
+            "target_ppm",
+            250
+          ]
+        ],
+        "kind": "fee_target"
+      },
+      "idempotency_key": "6c2b15a006a25c08fe08c168a35029d97ba300297d340888981612d856f2686e",
+      "intent_id": "int-6c2b15a006a25c08",
+      "intent_type": "SET_FEE",
+      "max_cost_msat": 0,
+      "origin_policy": "fee_policy",
+      "preconditions": [
+        "channel_active"
+      ],
+      "priority": 50,
+      "reason_codes": [
+        "COOLDOWN_ACTIVE"
+      ],
+      "reversible": true,
+      "schema_name": "intent",
+      "schema_version": 1,
+      "snapshot_id": "cycle-000001",
+      "target": "123x456x0"
+    }
+  ]
+}

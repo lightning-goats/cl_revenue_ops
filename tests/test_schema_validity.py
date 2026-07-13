@@ -24,4 +24,4 @@ def test_schema_is_valid_and_example_validates(path):
     for example in schema["examples"]:
         jsonschema.validate(example, schema)
     assert schema["properties"]["schema_name"]["const"]
-    assert schema["properties"]["schema_version"]["const"] == 0
+    assert schema["properties"]["schema_version"]["const"] in (0, 1)
