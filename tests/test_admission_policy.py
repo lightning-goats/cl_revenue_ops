@@ -22,8 +22,15 @@ def _cfg(**over):
 def test_module_is_pure_of_plugin_dependencies():
     import inspect
     source = inspect.getsource(admission_policy)
-    for forbidden in ("plugin", "rpc", "Database", "time.time", "random"):
+    for forbidden in ("self.plugin", ".rpc.", "from .database",
+                      "import time", "import random", "Database("):
         assert forbidden not in source, forbidden
+    import_lines = [line for line in source.splitlines()
+                    if line.startswith(("import ", "from "))]
+    allowed = {"from __future__ import annotations",
+               "from typing import Any, Dict, Optional",
+               "from .utils import parse_msat, sats_to_base"}
+    assert set(import_lines) <= allowed, import_lines
 
 
 def test_direct_matches_shim():

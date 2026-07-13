@@ -186,6 +186,18 @@ constant aliases. Zero golden-fixture changes — the Phase 0 htlcmax
 goldens prove byte-identical extraction. Pattern established for the
 remaining Phase 3 policy extractions.
 
+## Phase 3B — single classification authority (2026-07-13)
+
+`modules/classification.py` now owns the classification vocabulary
+(both `ChannelState` and `ChannelRole` enums, re-exported by the
+analyzers for import compatibility), the flow-state decision (kalman
+thresholds + hysteresis/veto balance fallback), and the 30d revenue-role
+decision. The two concepts remain semantically DISTINCT — the
+unification is one pure authority computing both from analyzer-supplied
+evidence (DB reads/DTS widening stay in the analyzers). Zero golden or
+existing-test changes: byte-identical extraction. Resolves Phase 0
+duplication finding #1 (decision-owners.md).
+
 ## Contradictions
 
 Places where the repository contradicts an assumption in

@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple
 from enum import Enum
+
+from . import classification as _classification
 import json
 import time
 import threading
@@ -148,20 +150,10 @@ class ProfitabilityClass(Enum):
     ZOMBIE = "zombie"              # Underwater + failed diagnostic recovery
 
 
-class ChannelRole(Enum):
-    """
-    Channel flow role classification based on directional activity.
-
-    Helps identify what purpose a channel serves in the routing topology:
-    - INBOUND_GATEWAY: Primarily sources volume from the network (>70% inbound)
-    - OUTBOUND_GATEWAY: Primarily exits payments to the network (>70% outbound)
-    - BALANCED: Roughly equal flow in both directions (within 70/30)
-    - DORMANT: Little to no flow in either direction
-    """
-    INBOUND_GATEWAY = "inbound_gateway"    # >70% of activity is sourcing inbound
-    OUTBOUND_GATEWAY = "outbound_gateway"  # >70% of activity is exit outbound
-    BALANCED = "balanced"                   # Flow in both directions
-    DORMANT = "dormant"                     # No significant activity
+# Phase 3B: the classification vocabulary lives in the single
+# classification authority (modules/classification.py); re-exported
+# here so every existing importer keeps working unchanged.
+ChannelRole = _classification.ChannelRole
 
 
 @dataclass
@@ -410,21 +402,13 @@ class ChannelProfitability:
         Falls back to the lifetime channel_role when no 30d window was
         fetched (window_30d_available is False).
         """
-        if not self.window_30d_available:
-            return self.channel_role
-
-        total_forwards = self.total_forward_count_30d
-        if total_forwards < 10:
-            return ChannelRole.DORMANT
-
-        inbound_ratio = self.sourced_forward_count_30d / total_forwards
-        outbound_ratio = self.forward_count_30d / total_forwards
-        if inbound_ratio > 0.70:
-            return ChannelRole.INBOUND_GATEWAY
-        elif outbound_ratio > 0.70:
-            return ChannelRole.OUTBOUND_GATEWAY
-        else:
-            return ChannelRole.BALANCED
+        # Phase 3B: the decision lives in the classification authority.
+        return _classification.revenue_role_30d(
+            window_30d_available=self.window_30d_available,
+            forward_count_30d=self.forward_count_30d,
+            sourced_forward_count_30d=self.sourced_forward_count_30d,
+            lifetime_role=self.channel_role,
+        )
 
     @property
     def marginal_roi_reliable(self) -> bool:

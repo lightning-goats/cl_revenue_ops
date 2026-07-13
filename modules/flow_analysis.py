@@ -33,6 +33,8 @@ import math
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
+
+from . import classification as _classification
 from typing import Dict, List, Optional, Any, Tuple
 from pyln.client import Plugin, RpcError
 from .utils import normalize_scid, parse_msat, base_to_sats_floor
@@ -127,14 +129,14 @@ KALMAN_MIN_OBSERVATIONS = 5  # Minimum observation count before Kalman can overr
 KALMAN_MIN_UPDATE_INTERVAL_SECS = 300
 
 # BALANCED_ACTIVE classification: distinguish busy two-way channels from dormant ones
-BALANCED_ACTIVE_TURNOVER_THRESHOLD = 0.01  # 1% of capacity per day
+BALANCED_ACTIVE_TURNOVER_THRESHOLD = _classification.BALANCED_ACTIVE_TURNOVER_THRESHOLD  # 1% of capacity per day
 
 # F6 (2026-06 audit): DORMANT vocabulary. The fee controller has 'dormant'
 # branches (rebalance-cost floor exemption — no flow to amortize costs
 # against) that never activated because the classifier never emitted the
 # state. A channel is DORMANT when turnover < 1%/day AND the Kalman net-flow
 # estimate is below this threshold.
-DORMANT_KALMAN_RATIO_THRESHOLD = 0.01
+DORMANT_KALMAN_RATIO_THRESHOLD = _classification.DORMANT_KALMAN_RATIO_THRESHOLD
 
 # =============================================================================
 # F1 (2026-06 audit): Balance-position hysteresis + Kalman direction veto
@@ -145,16 +147,16 @@ DORMANT_KALMAN_RATIO_THRESHOLD = 0.01
 # rebalance-cost floor (sinks exempt) and flipping the PID balance target.
 # Asymmetric enter/exit bands hold the previous class until the channel
 # moves decisively out of its band.
-SINK_ENTER_OUTBOUND_RATIO = 0.78    # become SINK when outbound ratio rises above
-SINK_EXIT_OUTBOUND_RATIO = 0.72     # stop being SINK when outbound ratio falls below
-SOURCE_ENTER_OUTBOUND_RATIO = 0.22  # become SOURCE when outbound ratio falls below
-SOURCE_EXIT_OUTBOUND_RATIO = 0.28   # stop being SOURCE when outbound ratio rises above
+SINK_ENTER_OUTBOUND_RATIO = _classification.SINK_ENTER_OUTBOUND_RATIO    # become SINK when outbound ratio rises above
+SINK_EXIT_OUTBOUND_RATIO = _classification.SINK_EXIT_OUTBOUND_RATIO     # stop being SINK when outbound ratio falls below
+SOURCE_ENTER_OUTBOUND_RATIO = _classification.SOURCE_ENTER_OUTBOUND_RATIO  # become SOURCE when outbound ratio falls below
+SOURCE_EXIT_OUTBOUND_RATIO = _classification.SOURCE_EXIT_OUTBOUND_RATIO   # stop being SOURCE when outbound ratio rises above
 
 # F1c: Kalman veto for balance-position labels. A channel that is currently
 # full but measurably DRAINING (kalman_ratio > +0.05/day) is not a SINK; one
 # that is empty but measurably FILLING (kalman_ratio < -0.05/day) is not a
 # SOURCE. The structural label must never contradict a measured flow trend.
-KALMAN_BALANCE_VETO_RATIO = 0.05
+KALMAN_BALANCE_VETO_RATIO = _classification.KALMAN_BALANCE_VETO_RATIO
 
 # F2: drain estimates at or below this are indistinguishable from noise —
 # estimate_depletion_hours() returns None rather than an absurd horizon.
@@ -649,33 +651,10 @@ class KalmanFlowFilter:
         return abs(self.state.last_innovation) > threshold * expected_innovation_std
 
 
-class ChannelState(Enum):
-    """
-    Classification of channel flow state.
-
-    SOURCE: Net outflow - channel is draining
-    SINK: Net inflow - channel is filling
-    BALANCED: Roughly equal flow - ideal state
-    BALANCED_ACTIVE: High-turnover two-way channel (balanced but busy)
-    DORMANT: Essentially no flow at all (turnover < 1%/day, no net trend)
-    UNKNOWN: Not enough data to classify
-    CONGESTED: HTLC slots near exhaustion (>80% used)
-
-    Note: the fee controller also recognizes 'router' as a flow_state, but
-    this classifier does not emit it yet — those branches are reserved.
-    """
-    SOURCE = "source"
-    SINK = "sink"
-    BALANCED = "balanced"
-    BALANCED_ACTIVE = "balanced_active"
-    DORMANT = "dormant"
-    UNKNOWN = "unknown"
-    CONGESTED = "congested"
-
-    @property
-    def is_balanced(self) -> bool:
-        """True for both BALANCED and BALANCED_ACTIVE."""
-        return self in (ChannelState.BALANCED, ChannelState.BALANCED_ACTIVE)
+# Phase 3B: the classification vocabulary lives in the single
+# classification authority (modules/classification.py); re-exported
+# here so every existing importer keeps working unchanged.
+ChannelState = _classification.ChannelState
 
 
 @dataclass
@@ -1197,19 +1176,18 @@ class FlowAnalyzer:
             except Exception:
                 pass
 
-            if kalman_ratio > source_thresh:
-                metrics.state = ChannelState.SOURCE
-            elif kalman_ratio < sink_thresh:
-                metrics.state = ChannelState.SINK
-            else:
-                # Kalman ratio is small — use balance position as structural
-                # signal (matching EMA fallback logic). F1: hysteresis on the
-                # previous class + veto from the fresh Kalman estimate.
-                outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
-                turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
-                metrics.state = self._classify_balance_position(
-                    outbound_ratio, previous_state, kalman_ratio, turnover,
-                )
+            # Phase 3B: the decision is the classification authority's;
+            # evidence prep (thresholds incl. DTS widening) stays here.
+            outbound_ratio = our_balance / capacity if capacity > 0 else 0.5
+            turnover = metrics.daily_volume / capacity if capacity > 0 else 0.0
+            metrics.state = _classification.flow_state(
+                kalman_ratio=kalman_ratio,
+                source_threshold=source_thresh,
+                sink_threshold=sink_thresh,
+                outbound_ratio=outbound_ratio,
+                previous_state=previous_state,
+                turnover=turnover,
+            )
 
     # =========================================================================
     # v2.0 IMPROVEMENT METHODS
@@ -1908,50 +1886,10 @@ class FlowAnalyzer:
         kalman_ratio: float,
         turnover: float,
     ) -> ChannelState:
-        """Classify via balance position when net flow is too weak to decide.
-
-        F1 (2026-06 audit): hysteresis bands keyed on the PREVIOUS class
-        prevent boundary channels from flapping each cycle, and a Kalman
-        direction veto stops a draining-but-currently-full channel from being
-        labelled SINK (or a filling-but-empty one SOURCE).
-
-        Args:
-            outbound_ratio: our_balance / capacity (0..1)
-            previous_state: previous cycle's class string (e.g. "sink"), or
-                None when no prior state exists
-            kalman_ratio: best available Kalman flow estimate (fresh estimate
-                on the Kalman path, previous cycle's persisted value on the
-                EMA path)
-            turnover: daily_volume / capacity
-        """
-        prev = (previous_state or "").lower()
-
-        sink_band = (
-            SINK_EXIT_OUTBOUND_RATIO if prev == ChannelState.SINK.value
-            else SINK_ENTER_OUTBOUND_RATIO
-        )
-        source_band = (
-            SOURCE_EXIT_OUTBOUND_RATIO if prev == ChannelState.SOURCE.value
-            else SOURCE_ENTER_OUTBOUND_RATIO
-        )
-
-        # F1c: direction veto — never label against a measured flow trend.
-        sink_vetoed = kalman_ratio > KALMAN_BALANCE_VETO_RATIO
-        source_vetoed = kalman_ratio < -KALMAN_BALANCE_VETO_RATIO
-
-        if outbound_ratio > sink_band and not sink_vetoed:
-            return ChannelState.SINK
-        if outbound_ratio < source_band and not source_vetoed:
-            return ChannelState.SOURCE
-
-        if turnover > BALANCED_ACTIVE_TURNOVER_THRESHOLD:
-            return ChannelState.BALANCED_ACTIVE
-        # F6: turnover <= 1%/day here; with no measurable net trend either,
-        # the channel is DORMANT (activates the fee controller's dormant
-        # branches, e.g. the rebalance-cost floor exemption).
-        if abs(kalman_ratio) < DORMANT_KALMAN_RATIO_THRESHOLD:
-            return ChannelState.DORMANT
-        return ChannelState.BALANCED
+        """Phase 3B: delegating shim — the decision lives in the
+        classification authority (modules/classification.py)."""
+        return _classification.classify_balance_position(
+            outbound_ratio, previous_state, kalman_ratio, turnover)
 
     def _calculate_metrics(
         self, channel_id: str, peer_id: str,
