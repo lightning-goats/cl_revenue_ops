@@ -2078,7 +2078,8 @@ class RebalanceEngine:
                 except Exception:
                     pass
 
-            decision = facade.authorize(env, int(now))
+            decision = facade.authorize(env, int(now),
+                                        reservation_id=reservation_id)
             if decision.authorized:
                 return True, None
             if decision.reason_code == "BUDGET_EXHAUSTED":

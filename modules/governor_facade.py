@@ -37,6 +37,9 @@ class AuthorizationToken:
     reserved_msat: int
     budget_bucket: str
     issued_at: int
+    # Envelope idempotency key — the arbitration registry's slot key
+    # (may differ from reservation_id on legacy-compat paths).
+    arbitration_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -60,7 +63,16 @@ class GovernorFacade:
         # arbitration at the authorization boundary.
         self._registry = registry
 
-    def authorize(self, env: IntentEnvelope, now: int) -> GovernorDecision:
+    def authorize(self, env: IntentEnvelope, now: int,
+                  reservation_id: Optional[str] = None) -> GovernorDecision:
+        """Live finding 2026-07-13: governed paths reserve under their
+        CALLER's reservation_id (legacy finish-path compatibility) while
+        the facade ledgered under the envelope key — every governed
+        spend created a phantom ledger reservation the hourly sweep then
+        auto-corrected as db_missing. The facade now keys its token and
+        budget_reserved event by the ACTUAL reservation id; the spend
+        journal's duplicate budget_reserved under the same key is
+        idempotent by replay semantics."""
         if self._is_paused():
             return GovernorDecision(False, None, "PAUSED")
         if is_expired(env, UnixTime(now)):
@@ -84,10 +96,11 @@ class GovernorFacade:
                         pass
                 return GovernorDecision(False, None, conflict)
 
+        effective_reservation_id = str(reservation_id or env.idempotency_key)
         reserve_sats = env.max_cost_msat.to_sats_ceil().value
         if reserve_sats > 0:
             ok = self._reserve_spend(
-                reservation_id=env.idempotency_key,
+                reservation_id=effective_reservation_id,
                 amount_sats=reserve_sats,
                 category=env.budget_bucket,
             )
@@ -97,10 +110,11 @@ class GovernorFacade:
         token = AuthorizationToken(
             token_id="auth-" + env.idempotency_key[:16],
             intent_id=env.intent_id.value,
-            reservation_id=env.idempotency_key,
+            reservation_id=effective_reservation_id,
             reserved_msat=reserve_sats * 1000,
             budget_bucket=env.budget_bucket,
             issued_at=now,
+            arbitration_key=env.idempotency_key,
         )
         if self._ledger is not None:
             self._ledger.append(
@@ -118,7 +132,7 @@ class GovernorFacade:
                 self._ledger.append(
                     event_type="budget_reserved",
                     intent_id=env.intent_id.value,
-                    idempotency_key=env.idempotency_key,
+                    idempotency_key=effective_reservation_id,
                     cycle_id=env.snapshot_id,
                     at=now,
                     amounts={"reserved_msat": token.reserved_msat},
@@ -128,7 +142,8 @@ class GovernorFacade:
     def release(self, token: AuthorizationToken, now: int) -> bool:
         if self._registry is not None:
             try:
-                self._registry.release(token.reservation_id)
+                self._registry.release(
+                    token.arbitration_key or token.reservation_id)
             except Exception:
                 pass
         released = bool(self._release_spend(token.reservation_id))

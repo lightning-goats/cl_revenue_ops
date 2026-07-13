@@ -104,6 +104,65 @@ class TestFacadeIntegration:
         assert facade.authorize(env, NOW).authorized is True  # dup fine
 
 
+class TestReservationKeyCoherence:
+    """Live finding 2026-07-13 (first governed rebalance in production):
+    the facade ledgered budget_reserved under the ENVELOPE key while the
+    delegate reserved under the caller's reservation_id — every governed
+    spend left a phantom ledger reservation for the sweep to correct.
+    Pin: with reservation_id passed, the ledger trail keys consistently
+    and replays clean with ZERO reconciliation needed."""
+
+    def test_governed_spend_replays_clean(self, tmp_path):
+        from modules.econ_ledger import EconLedger
+        from modules.econ_reconcile import reconcile
+        ledger = EconLedger(str(tmp_path / "l.db"))
+        facade = GovernorFacade(
+            reserve_spend=MagicMock(return_value=True),
+            release_spend=MagicMock(return_value=True),
+            is_paused=lambda: False, ledger=ledger)
+        env = _intent()
+        env = make_intent(
+            intent_type="REBALANCE", snapshot_id="s1",
+            created_at=UnixTime(NOW), expires_at=UnixTime(NOW + 600),
+            target="111x222x0", amount_msat=None,
+            expected_benefit_msat=SignedMsat(0),
+            max_cost_msat=Msat(400_000),  # nonzero -> reservation
+            capital_committed_msat=Msat(0), confidence_micro=Micro(0),
+            reason_codes=(), explanation=Explanation("t", (("x", 1),)),
+            preconditions=(), priority=50, budget_bucket="rebalance",
+            origin_policy="test", reversible=False)
+        decision = facade.authorize(env, NOW, reservation_id="504")
+        assert decision.authorized
+        assert decision.token.reservation_id == "504"
+        assert decision.token.arbitration_key == env.idempotency_key
+        facade.release(decision.token, NOW + 5)
+
+        events = ledger.events()
+        reserved_keys = {e["idempotency_key"] for e in events
+                         if e["event_type"] == "budget_reserved"}
+        released_keys = {e["idempotency_key"] for e in events
+                         if e["event_type"] == "reservation_released"}
+        assert reserved_keys == {"504"} == released_keys
+        state = ledger.replay()
+        assert state.reserved_msat == {}  # no phantom
+        report = reconcile(ledger, {}, now=NOW + 10)
+        assert report.divergences == ()  # nothing for the sweep to fix
+
+    def test_registry_slot_freed_despite_key_split(self):
+        registry = ActiveIntentRegistry()
+        facade = GovernorFacade(
+            reserve_spend=MagicMock(return_value=True),
+            release_spend=MagicMock(return_value=True),
+            is_paused=lambda: False, registry=registry)
+        env = _intent()
+        decision = facade.authorize(env, NOW, reservation_id="504")
+        assert decision.authorized
+        facade.release(decision.token, NOW)
+        # The arbitration slot (keyed by envelope key) must be free.
+        assert facade.authorize(env, NOW,
+                                reservation_id="505").authorized is True
+
+
 class TestShadowAccessor:
     def _shadow(self, tmp_path, arbiter=True):
         from modules.econ_shadow import EconShadow

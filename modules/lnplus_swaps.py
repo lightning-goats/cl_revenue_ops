@@ -765,7 +765,8 @@ class SwapLifecycle:
                     )
                 except Exception:
                     pass
-            decision = facade.authorize(env, now)
+            decision = facade.authorize(env, now,
+                                        reservation_id=reservation_id)
             if not decision.authorized:
                 self._plugin.log(
                     f"LNPLUS: governor blocked swap-open reservation for "

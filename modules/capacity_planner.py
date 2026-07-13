@@ -3471,7 +3471,8 @@ class CapacityPlanner:
                     )
                 except Exception:
                     pass
-            decision = facade.authorize(env, now)
+            decision = facade.authorize(env, now,
+                                        reservation_id=reservation_id)
             if not decision.authorized:
                 self.plugin.log(
                     f"Governor blocked planner {category} reservation for "
