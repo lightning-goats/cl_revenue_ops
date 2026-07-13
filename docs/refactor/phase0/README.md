@@ -264,6 +264,19 @@ output across runs and input orderings. No execution authority;
 per-loop execution cutover and SET_FEE generation (needs the Phase 4
 fee-policy migration for seed-injected DTS) are the next steps.
 
+## Workstream H — rebalance-loop execution cutover (2026-07-13)
+
+First per-loop cutover, behind `econ_cycle_rebalance_enabled` (default
+off): inside `run_cycle`, the FINAL execution list passes through cycle
+intent generation + batch `arbitrate()` — dedup and deterministic J3
+ordering now govern what executes and in what order, with rejected
+pairs audit-recorded and ledgered (`arbitration:*` skip reasons,
+`intent_rejected` events with `batch: true`). All legacy telemetry,
+cooldown bookkeeping, and executor mechanics preserved (the stage
+inserts at one seam before executor dispatch, structurally pinned).
+Fail-OPEN by design: an ordering-stage error reverts to the legacy list
+while downstream authorization still fails closed.
+
 ## Contradictions
 
 Places where the repository contradicts an assumption in

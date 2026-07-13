@@ -2115,6 +2115,96 @@ class RebalanceEngine:
                 route_type=self._executor_mode(),
             )
 
+    def _cycle_arbitration_enabled(self) -> bool:
+        try:
+            cfg = self._config_snapshot()
+            return getattr(cfg, "econ_cycle_rebalance_enabled",
+                           False) is True
+        except Exception:
+            return False
+
+    def _arbitrate_execution_list(self, live_candidates, result):
+        """Workstream H: batch-arbitrate the final execution list.
+        Returns the J3-ordered survivors; rejected pairs get skip
+        records and ledgered intent_rejected events. Fail-open."""
+        if not self._cycle_arbitration_enabled():
+            return live_candidates
+        try:
+            import time as _time
+
+            from .cycle_context import CycleContext
+            from .econ_arbiter import arbitrate
+            from .econ_cycle import rebalance_intent_pairs
+            from .econ_types import UnixTime
+
+            now = int(_time.time())
+            cycle_id = f"rebalance-arb-{now}"
+            ctx = CycleContext(cycle_id=cycle_id,
+                               cycle_time=UnixTime(now), seed=0,
+                               snapshot_id=cycle_id)
+            env_pairs = rebalance_intent_pairs(live_candidates, ctx)
+            pair_by_key = {env.idempotency_key: pair
+                           for env, pair in env_pairs}
+            arbitration = arbitrate([env for env, _ in env_pairs], now=now)
+
+            ledger = None
+            shadow = getattr(self, "econ_shadow", None)
+            if shadow is not None:
+                try:
+                    ledger = shadow.ledger_for_reconciliation()
+                except Exception:
+                    ledger = None
+            for env, code, detail in arbitration.rejected:
+                pair = pair_by_key.get(env.idempotency_key)
+                if pair is not None:
+                    result.audit_records.append(SkipRecord(
+                        channel_id=pair.dest_channel_id,
+                        reason=f"arbitration:{code}",
+                        value_class="valuable",
+                        remaining_budget_sats=int(
+                            getattr(pair, "pair_budget_sats", 0) or 0),
+                        detail=detail,
+                    ))
+                    try:
+                        self._audit.log_skip(
+                            channel_id=pair.dest_channel_id,
+                            reason=f"arbitration:{code}",
+                            value_class="valuable",
+                            remaining_budget_sats=int(
+                                getattr(pair, "pair_budget_sats", 0) or 0),
+                            detail=detail,
+                            router="v3",
+                        )
+                    except Exception:
+                        pass
+                if ledger is not None:
+                    try:
+                        ledger.append(
+                            event_type="intent_rejected",
+                            intent_id=env.intent_id.value,
+                            idempotency_key=env.idempotency_key,
+                            cycle_id=cycle_id,
+                            at=now,
+                            details={"reason_code": code,
+                                     "arbitration": True,
+                                     "batch": True, "detail": detail},
+                        )
+                    except Exception:
+                        pass
+            ordered = [pair_by_key[env.idempotency_key]
+                       for env in arbitration.ordered
+                       if env.idempotency_key in pair_by_key]
+            self._log(
+                f"cycle arbitration: {len(live_candidates)} candidates -> "
+                f"{len(ordered)} ordered, "
+                f"{len(arbitration.rejected)} rejected",
+                level="info" if arbitration.rejected else "debug")
+            return ordered
+        except Exception as exc:
+            self._log(f"cycle arbitration failed open: {exc}",
+                      level="warn")
+            return live_candidates
+
     def _shadow_authorize_reservation(self, pair, max_fee_sats, reserved,
                                       remaining, budget_limit, cfg, now):
         """Phase 2C: guarded shadow-governor hook; never affects the
@@ -3294,6 +3384,18 @@ class RebalanceEngine:
                 continue
             live_candidates.append(pair)
 
+        result.candidates = list(live_candidates)
+        if not live_candidates:
+            self._cache_cycle_result(result)
+            return result
+
+        # Workstream H cutover: the live execution list passes through
+        # cycle intent generation + batch arbitration (dedup +
+        # deterministic J3 ordering) when econ_cycle_rebalance_enabled.
+        # Fail-OPEN: an arbitration-stage error falls back to the legacy
+        # list — downstream authorization still fails closed.
+        live_candidates = self._arbitrate_execution_list(
+            live_candidates, result)
         result.candidates = list(live_candidates)
         if not live_candidates:
             self._cache_cycle_result(result)

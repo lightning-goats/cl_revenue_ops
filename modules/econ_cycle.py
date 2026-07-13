@@ -61,41 +61,53 @@ class CycleResult:
         return canonical_json(self.to_wire())
 
 
+def rebalance_intent_pairs(pairs: List[Any], ctx: CycleContext
+                           ) -> List[Tuple[IntentEnvelope, Any]]:
+    """Like rebalance_intents_from_pairs but keeps the (envelope, pair)
+    association — the execution cutover needs to map arbitrated
+    envelopes back to their candidates."""
+    out = []
+    for pair in sorted(pairs, key=lambda p: (str(p.dest_channel_id),
+                                             str(p.source_channel_id))):
+        env = _rebalance_intent(pair, ctx)
+        out.append((env, pair))
+    return out
+
+
 def rebalance_intents_from_pairs(pairs: List[Any],
                                  ctx: CycleContext) -> List[IntentEnvelope]:
     """Map pure-planner PairCandidates to REBALANCE intent envelopes.
     Deterministic: envelope fields derive only from pair data + ctx."""
-    intents = []
-    for pair in sorted(pairs, key=lambda p: (str(p.dest_channel_id),
-                                             str(p.source_channel_id))):
-        amount = int(getattr(pair, "amount_sats", 0) or 0)
-        max_fee = int(getattr(pair, "pair_budget_sats", 0) or 0)
-        intents.append(make_intent(
-            intent_type="REBALANCE",
-            snapshot_id=ctx.snapshot_id,
-            created_at=ctx.cycle_time,
-            expires_at=ctx.cycle_time.plus_seconds(600),
-            target=str(pair.dest_channel_id),
-            amount_msat=Msat(amount * 1000),
-            expected_benefit_msat=SignedMsat(0),
-            max_cost_msat=Msat(max_fee * 1000),
-            capital_committed_msat=Msat(amount * 1000),
-            confidence_micro=Micro(0),
-            reason_codes=(),
-            explanation=Explanation("cycle_rebalance", (
-                ("source", str(pair.source_channel_id)),
-                ("dest", str(pair.dest_channel_id)),
-                ("amount_sats", amount),
-                ("score", round(float(getattr(pair, "score", 0.0) or 0.0),
-                                6)),
-            )),
-            preconditions=(),
-            priority=50,
-            budget_bucket="rebalance",
-            origin_policy="econ_cycle_shadow",
-            reversible=False,
-        ))
-    return intents
+    return [env for env, _pair in rebalance_intent_pairs(pairs, ctx)]
+
+
+def _rebalance_intent(pair: Any, ctx: CycleContext) -> IntentEnvelope:
+    amount = int(getattr(pair, "amount_sats", 0) or 0)
+    max_fee = int(getattr(pair, "pair_budget_sats", 0) or 0)
+    return make_intent(
+        intent_type="REBALANCE",
+        snapshot_id=ctx.snapshot_id,
+        created_at=ctx.cycle_time,
+        expires_at=ctx.cycle_time.plus_seconds(600),
+        target=str(pair.dest_channel_id),
+        amount_msat=Msat(amount * 1000),
+        expected_benefit_msat=SignedMsat(0),
+        max_cost_msat=Msat(max_fee * 1000),
+        capital_committed_msat=Msat(amount * 1000),
+        confidence_micro=Micro(0),
+        reason_codes=(),
+        explanation=Explanation("cycle_rebalance", (
+            ("source", str(pair.source_channel_id)),
+            ("dest", str(pair.dest_channel_id)),
+            ("amount_sats", amount),
+            ("score", round(float(getattr(pair, "score", 0.0) or 0.0), 6)),
+        )),
+        preconditions=(),
+        priority=50,
+        budget_bucket="rebalance",
+        origin_policy="econ_cycle_shadow",
+        reversible=False,
+    )
 
 
 def plan_cycle(*, pairs: List[Any], ctx: CycleContext,
