@@ -5836,6 +5836,36 @@ def revenue_econ_reconcile(plugin: Plugin, apply: bool = False,
         return {"enabled": True, "error": str(e)}
 
 
+_econ_cycle_seq = 0
+
+
+@plugin.method("revenue-econ-cycle")
+def revenue_econ_cycle(plugin: Plugin) -> Dict[str, Any]:
+    """READ-ONLY Workstream H shadow cycle: one collection pass, pure
+    intent generation from planner candidates, BATCH arbitration under
+    the J3 ladder. No execution authority — publishes and ledgers only.
+    Requires econ_shadow_enabled. Internal diagnostic."""
+    global _econ_cycle_seq
+    try:
+        if econ_shadow is None or not econ_shadow.enabled():
+            return {"enabled": False,
+                    "hint": "revenue-config set econ_shadow_enabled true"}
+        engine = getattr(rebalancer, "rebalance_engine_v2", None) \
+            if rebalancer is not None else None
+        if engine is None:
+            return {"enabled": True, "error": "rebalance engine unavailable"}
+        from modules.econ_cycle import run_shadow_cycle
+        _econ_cycle_seq += 1
+        result = run_shadow_cycle(
+            rebalance_engine=engine, econ_shadow=econ_shadow,
+            now=int(time.time()), cycle_seq=_econ_cycle_seq)
+        if result is None:
+            return {"enabled": True, "error": "shadow cycle failed open"}
+        return {"enabled": True, "cycle": result}
+    except Exception as e:
+        return {"enabled": True, "error": str(e)}
+
+
 @plugin.method("revenue-health")
 def revenue_health(plugin: Plugin) -> Dict[str, Any]:
     """

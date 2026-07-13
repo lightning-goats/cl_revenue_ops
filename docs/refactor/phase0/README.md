@@ -251,6 +251,19 @@ envelopes and release with their reservations. Full batch arbitration
 cycle orchestration — inherited items 3F-2 (ledger authorization
 authority) and 3F-3 (history projections) are the next increments.
 
+## Workstream H — shadow cycle skeleton (2026-07-13)
+
+`modules/econ_cycle.py`: the spec's cycle running deterministically in
+shadow — one collection pass (engine candidate planning, read-only),
+CycleContext with derived seed, pure REBALANCE intent generation from
+planner candidates, BATCH arbitration via the pure `arbitrate()` (J3
+ladder over a real cycle's intent set — 3F's batch gap closed in
+shadow), ledgered + published via the read-only `revenue-econ-cycle`
+RPC (surface 66→67). Determinism acceptance pinned: byte-identical
+output across runs and input orderings. No execution authority;
+per-loop execution cutover and SET_FEE generation (needs the Phase 4
+fee-policy migration for seed-injected DTS) are the next steps.
+
 ## Contradictions
 
 Places where the repository contradicts an assumption in
