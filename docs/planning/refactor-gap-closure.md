@@ -45,7 +45,7 @@ Evidence pins are against branch `refactor-phase1-shadow` @ `ab34d6f`
 | Requirement | Remove deprecated no-ops after one announced compatibility window + migration check. |
 | Current | `rebalance_min_profit` shimmed (`config.py:585`), classified deprecated, startup-warned with replacement guidance (Workstream I detection, `ab34d6f`); window announced to 2026-08-12 (`docs/refactor/phase0/contract-compatibility-policy.md`). |
 | Evidence | `DEPRECATED_RUNTIME_KEYS` (`config.py:292`); `_detect_shadowed_and_deprecated`; `tests/test_config_contradictions.py::TestDeprecatedOptions`. |
-| Exact gap | Migration scanner, removal-ready tests, exact-deletion checklist (Phase H prep); actual removal is calendar-bound. |
+| Exact gap | PREP COMPLETE (PR 11, 2026-07-13): scanner (tools/deprecation_scan.py) reports READY on lnnode today; staged post-removal acceptance tests (strict xfail); by-symbol deletion checklist (removal-checklist-2026-08-12.md) for all three window items; disclosure pin (exactly one deprecated key). Only the calendar remains. |
 | Remedy | Phase H before window: scanner (config file + DB overrides + datastore scan for the key), removal checklist, rejection/migration tests staged. After 2026-08-12: execute checklist. |
 | Risk | LOW (prep is inert; removal is small and checklisted). |
 | Behavior change | None until removal date. |
