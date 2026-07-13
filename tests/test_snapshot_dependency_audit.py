@@ -53,7 +53,9 @@ PINNED_COUNTS = {
     ("rebalance", "database"): 18,
     ("rebalance", "wall_clock"): 10,
     ("planner", "analyzer_cache"): 6,
-    ("planner", "live_rpc"): 24,
+    # 3b: 24 -> 20 (dead _has_direct_peer_channel/_is_peer_connected
+    # removed; 4 live-RPC sites gone)
+    ("planner", "live_rpc"): 20,
     ("planner", "database"): 11,
     ("planner", "wall_clock"): 11,
     ("boltz", "analyzer_cache"): 0,
@@ -124,7 +126,9 @@ def test_synthetic_snapshot_ids_still_present_until_migrated():
         # 3a DONE: rebalance threads real snapshot refs; the synthetic
         # label survives only as the documented fail-open FALLBACK.
         "modules/rebalance_engine_v2.py": 'or f"rebalance-cycle-',
-        "modules/capacity_planner.py": 'snapshot_id=f"planner-cycle-',
+        # 3b DONE: planner threads real snapshot refs; synthetic label
+        # survives only as the fail-open fallback.
+        "modules/capacity_planner.py": 'or f"planner-cycle-',
         "modules/boltz_manager.py": 'snapshot_id=f"boltz-swap-',
         "modules/lnplus_swaps.py": 'snapshot_id=f"lnplus-swap-',
     }

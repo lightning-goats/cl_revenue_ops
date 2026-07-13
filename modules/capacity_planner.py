@@ -157,6 +157,9 @@ class CapacityPlanner:
         self._observed_daily_ppm_cache: tuple | None = None
         # F8: per-cycle cached listpeerchannels result (set by execute_cycle)
         self._cycle_peer_channels: list | None = None
+        # PR 3b: per-cycle frozen bleeder projection + snapshot ref
+        self._cycle_bleeders: dict | None = None
+        self._cycle_snapshot_ref: dict | None = None
 
     def set_capex_engine(self, engine: 'CapexBudgetEngine'):
         """Inject the unified capex budget engine."""
@@ -264,6 +267,27 @@ class CapacityPlanner:
         self._cycle_nodes_by_id.clear()
         self._observed_daily_ppm_cache = None
         self._cycle_peer_channels = None
+        # PR 3b: per-cycle frozen projections/refs — never cross cycles.
+        self._cycle_bleeders = None
+        self._cycle_snapshot_ref = None
+
+    def _snapshot_ref(self, now):
+        """PR 3b: canonical-snapshot reference for this cycle's intents.
+        Prefers the ref stashed at arbitration time (intra-cycle
+        consistency, 600s age bound); else asks the shadow hub
+        (TTL-cached). None -> callers keep the synthetic per-loop label
+        (exact pre-adoption behavior)."""
+        ref = getattr(self, "_cycle_snapshot_ref", None)
+        if ref and ref.get("snapshot_id") and (
+                int(now) - int(ref.get("observed_at", 0)) <= 600):
+            return ref
+        shadow = getattr(self, "econ_shadow", None)
+        if shadow is None:
+            return None
+        try:
+            return shadow.snapshot_ref(int(now))
+        except Exception:
+            return None
 
     def _get_cached_channels(self, peer_id: str, direction: str = "destination") -> list:
         """Get listchannels result, cached for this cycle."""
@@ -916,17 +940,23 @@ class CapacityPlanner:
             except Exception:
                 pass
 
-        # Get bleeder classification for all channels
-        bleeders = {}
-        try:
-            bleeder_list = self.profitability.identify_bleeders_v2() or []
-            # Convert list to dict keyed by channel_id for O(1) lookup
-            for b in bleeder_list:
-                cid = getattr(b, 'channel_id', None)
-                if cid:
-                    bleeders[cid] = b
-        except Exception:
-            pass
+        # Get bleeder classification for all channels — frozen per cycle
+        # (PR 3b): one projection at first use, cleared by
+        # _init_cycle_cache, so selection never observes a
+        # mid-cycle recomputation.
+        bleeders = self._cycle_bleeders
+        if bleeders is None:
+            bleeders = {}
+            try:
+                bleeder_list = self.profitability.identify_bleeders_v2() or []
+                # Convert list to dict keyed by channel_id for O(1) lookup
+                for b in bleeder_list:
+                    cid = getattr(b, 'channel_id', None)
+                    if cid:
+                        bleeders[cid] = b
+            except Exception:
+                pass
+            self._cycle_bleeders = bleeders
 
         for scid, prof in all_profitability.items():
             flow_metrics = all_flow.get(scid)
@@ -1880,45 +1910,9 @@ class CapacityPlanner:
         except Exception:
             return ""
 
-    def _has_direct_peer_channel(self, peer_id: str) -> bool:
-        """Return True when we already have a normal direct channel to peer_id."""
-        if not peer_id:
-            return False
-        try:
-            if self.data_service is not None:
-                result = self.data_service.get_peer_channels(peer_id=peer_id)
-            else:
-                result = self.plugin.rpc.call("listpeerchannels", {"id": peer_id})
-        except Exception:
-            return False
-
-        channels = result.get("channels", []) if isinstance(result, dict) else []
-        for channel in channels:
-            if not isinstance(channel, dict):
-                continue
-            if channel.get("state") == "CHANNELD_NORMAL":
-                return True
-        return False
-
-    def _is_peer_connected(self, peer_id: str) -> bool:
-        """Return True when peer_id is currently connected, channel or not."""
-        if not peer_id:
-            return False
-        try:
-            if self.data_service is not None:
-                result = self.data_service.get_peers()
-            else:
-                result = self.plugin.rpc.call("listpeers", {"id": peer_id})
-        except Exception:
-            return False
-
-        peers = result.get("peers", []) if isinstance(result, dict) else []
-        for peer in peers:
-            if not isinstance(peer, dict):
-                continue
-            if str(peer.get("id") or "") == peer_id and bool(peer.get("connected", False)):
-                return True
-        return False
+    # PR 3b: _has_direct_peer_channel/_is_peer_connected removed — no
+    # callers existed (dead live-RPC read paths found by the
+    # snapshot-dependency audit).
 
     def _discover_from_demand_flow(self, all_flow, existing_peers: set) -> List[Dict]:
         """Strategy 6: Find candidates adjacent to our sink peers."""
@@ -3401,6 +3395,18 @@ class CapacityPlanner:
 
             now = int(_time.time())
             cycle_id = f"planner-arb-{now}"
+            # PR 3b: stamp the canonical snapshot into this cycle's
+            # close intents; stash the ref so governed reservations of
+            # the SAME cycle share it. Fallback: the synthetic label.
+            snap_ref = None
+            shadow_hub = getattr(self, "econ_shadow", None)
+            if shadow_hub is not None:
+                try:
+                    snap_ref = shadow_hub.snapshot_ref(now)
+                except Exception:
+                    snap_ref = None
+            self._cycle_snapshot_ref = snap_ref
+            arb_snapshot_id = (snap_ref or {}).get("snapshot_id") or cycle_id
             envs = []
             env_by_key = {}
             losers_with_keys = []  # parallel (loser, key), duplicates kept
@@ -3411,7 +3417,7 @@ class CapacityPlanner:
                     continue
                 env = make_intent(
                     intent_type="CLOSE_CHANNEL",
-                    snapshot_id=cycle_id,
+                    snapshot_id=arb_snapshot_id,
                     created_at=UnixTime(now),
                     expires_at=UnixTime(now + 600),
                     target=scid,
@@ -3564,9 +3570,11 @@ class CapacityPlanner:
                     getattr(cfg, "authority_level", "capital"), "capital"),
             )
             committed = int(committed_sats or 0)
+            snap_ref = self._snapshot_ref(now)
             env = make_intent(
                 intent_type=intent_type,
-                snapshot_id=f"planner-cycle-{now}",
+                snapshot_id=(snap_ref or {}).get("snapshot_id")
+                or f"planner-cycle-{now}",
                 created_at=UnixTime(now),
                 expires_at=UnixTime(now + 600),
                 target=str(target),

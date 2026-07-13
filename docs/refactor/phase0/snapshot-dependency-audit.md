@@ -131,10 +131,20 @@ with a freshness gate rather than per-cycle injection:
    per cycle for intra-cycle consistency with a 600s age bound. The
    synthetic labels remain ONLY as the fail-open fallback (hub absent /
    shadow disabled / provider error → exact pre-adoption behavior).
-2. **3b planner**: freeze one profitability projection at cycle entry;
-   replace :922/:2831 with the projection; move peer
-   connectivity/exposure into snapshot channel/peer state
-   (:1909/:1889/:2486); thread snapshot_id (:3414/:3569).
+2. **3b planner — DONE (2026-07-13)**, with three audit corrections
+   found during implementation: (a) `_has_direct_peer_channel` /
+   `_is_peer_connected` (:1889/:1909) had NO callers — dead live-RPC
+   paths, now REMOVED (planner live_rpc pin 24→20); (b)
+   `_peer_exposure_cap_reason` (:2486) already freezes per cycle via
+   `_cycle_peer_channels` (primed by execute_cycle:494) — the live read
+   is only its unprimed fallback; (c) `_observed_node_daily_ppm`
+   (:2831) is already primed at cycle entry by `_seed_revenue_anchor`
+   (execute_cycle:372, generate_report:219) — the live read is only the
+   unprimed fallback. Implemented: bleeder classification (:922) frozen
+   per cycle (`_cycle_bleeders`, cleared by `_init_cycle_cache`); close
+   intents and governed planner reservations carry real snapshot ids
+   from the hub (stash per arbitration, 600s age bound, synthetic
+   labels as fail-open fallback).
 3. **3c Boltz**: snapshot_id threading only (:1675) — no read migration.
 4. **3d LN+**: latest-snapshot + freshness gate for :302/:349/:431;
    snapshot_id threading (:734).
