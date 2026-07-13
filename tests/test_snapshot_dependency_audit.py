@@ -63,7 +63,12 @@ PINNED_COUNTS = {
     ("boltz", "database"): 0,
     ("boltz", "wall_clock"): 5,
     ("lnplus", "analyzer_cache"): 0,
-    ("lnplus", "live_rpc"): 12,
+    # 3d: 12 -> 13. Mid-decision reads MOVED, not multiplied: per-swap
+    # getinfo became the process-constant _our_id cache; the
+    # existing-channel gate consults a pass-entry capture
+    # (_capture_peers_with_channels, construction-class) with the old
+    # per-swap read kept only as the fail-open fallback.
+    ("lnplus", "live_rpc"): 13,
     ("lnplus", "database"): 0,
     ("lnplus", "wall_clock"): 12,
     ("admission", "analyzer_cache"): 0,

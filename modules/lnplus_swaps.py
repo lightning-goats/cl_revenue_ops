@@ -252,6 +252,37 @@ class SwapEvaluator:
         self._lifecycle = lifecycle
         # Optional: enables the operator-ban veto in gate 5 (revenue-ban).
         self._policy_manager = policy_manager
+        # PR 3d: process-constant node id + per-pass frozen peer set.
+        self._our_id_cache: Optional[str] = None
+        self._pass_peers_with_channels: Optional[set] = None
+
+    def _our_id(self) -> Optional[str]:
+        """Our node id — a process constant, cached on first success
+        (PR 3d: replaces a per-swap live getinfo read)."""
+        if self._our_id_cache:
+            return self._our_id_cache
+        try:
+            our_id = self.rpc.getinfo().get("id")
+        except Exception:
+            return None
+        if our_id:
+            self._our_id_cache = str(our_id)
+        return self._our_id_cache
+
+    def _capture_peers_with_channels(self) -> Optional[set]:
+        """PR 3d: freeze ONE peer-channel observation at pass entry —
+        the existing-channel gate consults this set instead of issuing
+        a live read per swap. ANY channel row counts (matching the
+        legacy per-peer read, including pending/closing states). None on
+        failure -> per-swap live fallback (exact pre-adoption path)."""
+        try:
+            channels = (self.rpc.listpeerchannels() or {}).get(
+                "channels", []) or []
+            return {str(c.get("peer_id"))
+                    for c in channels
+                    if isinstance(c, dict) and c.get("peer_id")}
+        except Exception:
+            return None
 
     def run_cycle(self, cfg, best_regular_ev: float) -> Dict:
         summary = {"applied": False, "recommended": False, "swap_id": None,
@@ -278,6 +309,10 @@ class SwapEvaluator:
         except LNPlusError as e:
             self._plugin.log(f"LNPLUS: get_applicable_swaps failed: {e}", level="warn")
             return summary
+
+        # PR 3d: freeze the pass's peer-channel observation before the
+        # gate loop — per-swap gates never issue their own live reads.
+        self._pass_peers_with_channels = self._capture_peers_with_channels()
 
         qualifying = []
         for swap in swaps:
@@ -344,11 +379,7 @@ class SwapEvaluator:
 
     def _check_participants(self, swap, cfg) -> Optional[str]:
         """Gate 5 (peer quality, one bad peer vetoes) + own-node check."""
-        our_id = None
-        try:
-            our_id = self.rpc.getinfo().get("id")
-        except Exception:
-            pass
+        our_id = self._our_id()  # PR 3d: process-constant, cached
         participants = swap.get("participants") or []
         if not participants:
             return "peer_quality:no visible participants"
@@ -427,6 +458,13 @@ class SwapEvaluator:
         outbound_peer = self._infer_assignment(swap).get("outbound_peer")
         if not outbound_peer:
             return None
+        # PR 3d: consult the pass-frozen peer set; live per-peer read
+        # only as the fail-open fallback when the capture failed.
+        frozen = self._pass_peers_with_channels
+        if frozen is not None:
+            if str(outbound_peer) not in frozen:
+                return None
+            return "terms:existing channel to assigned outbound peer"
         try:
             channels = self.rpc.listpeerchannels(outbound_peer).get("channels", []) or []
         except Exception:
@@ -756,14 +794,28 @@ class SwapLifecycle:
             )
             if ledger is not None:
                 try:
+                    details = {"target": env.target, "governed": True,
+                               "swap_id": str(swap_id)}
+                    # PR 3d: canonical-snapshot linkage as EVIDENCE only.
+                    # The envelope's swap-scoped snapshot_id is deliberately
+                    # untouched — it carries the obligation's cross-attempt
+                    # idempotency (the key hashes snapshot_id).
+                    try:
+                        snap_ref = (self.econ_shadow.snapshot_ref(now)
+                                    if getattr(self, "econ_shadow", None)
+                                    is not None else None)
+                        if snap_ref and snap_ref.get("snapshot_id"):
+                            details["canonical_snapshot_id"] = str(
+                                snap_ref["snapshot_id"])
+                    except Exception:
+                        pass
                     ledger.append(
                         event_type="intent_proposed",
                         intent_id=env.intent_id.value,
                         idempotency_key=env.idempotency_key,
                         cycle_id=env.snapshot_id,
                         at=now,
-                        details={"target": env.target, "governed": True,
-                                 "swap_id": str(swap_id)},
+                        details=details,
                     )
                 except Exception:
                     pass

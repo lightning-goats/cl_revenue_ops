@@ -152,8 +152,21 @@ with a freshness gate rather than per-cycle injection:
    cache keeps a cycle's arbitration and its per-recommendation
    reservations on the same ref. Synthetic labels remain as the
    fail-open fallback.
-4. **3d LN+**: latest-snapshot + freshness gate for :302/:349/:431;
-   snapshot_id threading (:734).
+4. **3d LN+ — DONE (2026-07-13)**, with two audit corrections and one
+   deliberate exception: (a) `_feerate_ok` (:302) was ALREADY a single
+   pass-entry observation (run_cycle calls it once before the swap
+   loop) — reclassified construction, no change; (b) the per-swap
+   `getinfo` (:349) read a process CONSTANT — now cached
+   (`_our_id`); (c) the per-swap existing-channel read (:431) now
+   consults ONE pass-entry capture (`_capture_peers_with_channels`,
+   any-state semantics preserved) with the live per-peer read as the
+   fail-open fallback. EXCEPTION — snapshot_id threading (:734) is
+   deliberately NOT applied: the swap-scoped `lnplus-swap-{id}` label
+   carries the obligation's cross-attempt idempotency (the idempotency
+   key hashes snapshot_id, not created_at); replacing it would break
+   retry dedup for contractual opens. The canonical-snapshot linkage is
+   recorded as ledger EVIDENCE (`canonical_snapshot_id` in the
+   intent_proposed details) instead.
 5. **3e fees** (LAST, highest risk): snapshot-sourced market prior,
    neighbor stats, chain costs, channel state (:3126/:3276/:3382/
    :3230/:8185/:8341); DTS+PID controller state explicitly EXCLUDED
