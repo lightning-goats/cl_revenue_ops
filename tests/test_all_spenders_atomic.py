@@ -293,6 +293,13 @@ ALLOWLIST = {
         "+ (ok, remaining) via _return_remaining) — one atomic reservation "
         "implementation; the legacy budget_reservations insert no longer runs.",
     ),
+    ("lnplus_swaps.py", "_execute_swap_open", "fund_channel"): (
+        ATOMIC_RESERVE, 1,
+        "Phase 3E (2026-07-13): the LN+ swap-open now prefers the CLN "
+        "adapter (data_service.fund_channel) over raw rpc.fundchannel — "
+        "same reservation-gated flow, adapter-owned cache invalidation; "
+        "the raw fallback remains for un-wired construction.",
+    ),
     ("lnplus_swaps.py", "_lnplus_reserve_delegate", "reserve_spend"): (
         ATOMIC_RESERVE, 1,
         "Phase 2F governed entry (2026-07-12): GovernorFacade delegate closure "

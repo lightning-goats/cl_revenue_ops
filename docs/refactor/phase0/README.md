@@ -223,6 +223,19 @@ and the rebalancer's engine call sites route through it — kwargs parity
 with the legacy boolean combinations is pinned by test. Spec
 contradiction #7 recorded below.
 
+## Phase 3E — adapter-isolation formalization (2026-07-13)
+
+The adapter set is now explicit and guard-tested
+(`tests/test_adapter_boundaries.py`): CLN adapter = `data_service.py`
+(+ its execution arm `rebalance_native_executor_v2.py` — declared part
+of the boundary, not a bypass); Boltz adapter = `boltz_manager.py`
+(subprocess); LN+ adapter = `LNPlusClient` (HTTP). Changes: the CLN
+adapter gained `connect_peer`/`sign_message`; the LN+ swap-open flow
+now prefers the adapter (raw fallback kept); policy/decision modules
+are layer-guarded against RPC/subprocess/HTTP; external wire formats
+(boltzcli strings, LN+ base URL) cannot leak outside their adapters.
+Mutation-path and spender-guard pins updated consciously.
+
 ## Contradictions
 
 Places where the repository contradicts an assumption in

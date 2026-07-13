@@ -2991,8 +2991,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             capacity_planner._unified_reserve_budget_params if capacity_planner is not None else None
         ))
     # Phase 2F: governor/ledger plumbing for LN+ swap-open reservations.
+    # Phase 3E: CLN-adapter routing for the swap-open flow.
     try:
         lnplus_lifecycle.econ_shadow = econ_shadow
+        lnplus_lifecycle.data_service = data_service
     except Exception:
         pass
     if capacity_planner is not None:

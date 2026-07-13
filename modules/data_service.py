@@ -290,6 +290,18 @@ class DataService:
         self.invalidate("listpeerchannels")
         return result
 
+    def connect_peer(self, target: str) -> Dict:
+        """Connect to a peer (Phase 3E: adapter surface for the LN+
+        swap-open flow). Invalidates the peers cache."""
+        result = self._plugin.rpc.connect(target)
+        self.invalidate("listpeers")
+        return result
+
+    def sign_message(self, message: str) -> Dict:
+        """Sign a message with the node key (Phase 3E: adapter surface
+        for LN+ API authentication)."""
+        return self._plugin.rpc.signmessage(message)
+
     # --- Route discovery ---
 
     def get_route(self, node_id: str, amount_msat: int, **kwargs) -> Dict:

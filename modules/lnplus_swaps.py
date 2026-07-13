@@ -658,6 +658,9 @@ class SwapLifecycle:
     # Phase 2F: optional governor/ledger plumbing (EconShadow), injected
     # at plugin init.
     econ_shadow = None
+    # Phase 3E: optional CLN adapter (DataService), injected at plugin
+    # init; raw-RPC fallback preserved when absent.
+    data_service = None
 
     def _lnplus_governor_enabled(self) -> bool:
         """Phase 2F: strict flag check (MagicMock/absent snapshots stay
@@ -1527,7 +1530,12 @@ class SwapLifecycle:
                 addr = None
             target = f"{peer}@{addr}" if addr else peer
             try:
-                self.rpc.connect(target)
+                # Phase 3E: prefer the CLN adapter (cache-coherent);
+                # raw-RPC fallback when not wired.
+                if self.data_service is not None:
+                    self.data_service.connect_peer(target)
+                else:
+                    self.rpc.connect(target)
             except Exception as e:
                 self._plugin.log(f"LNPLUS: connect to {peer} failed for swap {sid}: {e}", level="warn")
                 self._maybe_trip_deadline_miss(row, sid, deadline, now)
@@ -1586,7 +1594,17 @@ class SwapLifecycle:
                 return
 
             try:
-                result = self.rpc.fundchannel(peer, int(row["capacity_sats"]), feerate=feerate)
+                # Phase 3E: prefer the CLN adapter (invalidates funds/
+                # channel caches); raw-RPC fallback when not wired.
+                if self.data_service is not None:
+                    fund_params = {"id": peer,
+                                   "amount": int(row["capacity_sats"])}
+                    if feerate is not None:
+                        fund_params["feerate"] = feerate
+                    result = self.data_service.fund_channel(**fund_params)
+                else:
+                    result = self.rpc.fundchannel(
+                        peer, int(row["capacity_sats"]), feerate=feerate)
             except Exception as e:
                 self._plugin.log(f"LNPLUS: fundchannel to {peer} failed for swap {sid}: {e}", level="error")
                 self._release_swap_open_reservation(reservation_id, sid)
