@@ -121,7 +121,9 @@ def test_synthetic_snapshot_ids_still_present_until_migrated():
     replaces. When a PR threads real snapshot ids, remove its entry here
     and check the box in the audit doc's migration work list."""
     expected = {
-        "modules/rebalance_engine_v2.py": 'snapshot_id=f"rebalance-cycle-',
+        # 3a DONE: rebalance threads real snapshot refs; the synthetic
+        # label survives only as the documented fail-open FALLBACK.
+        "modules/rebalance_engine_v2.py": 'or f"rebalance-cycle-',
         "modules/capacity_planner.py": 'snapshot_id=f"planner-cycle-',
         "modules/boltz_manager.py": 'snapshot_id=f"boltz-swap-',
         "modules/lnplus_swaps.py": 'snapshot_id=f"lnplus-swap-',

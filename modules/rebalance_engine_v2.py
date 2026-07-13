@@ -2045,9 +2045,11 @@ class RebalanceEngine:
                     getattr(cfg, "authority_level", "capital"),
                     "liquidity"),
             )
+            snap_ref = self._snapshot_ref(now)
             env = make_intent(
                 intent_type="REBALANCE",
-                snapshot_id=f"rebalance-cycle-{int(now)}",
+                snapshot_id=(snap_ref or {}).get("snapshot_id")
+                or f"rebalance-cycle-{int(now)}",
                 created_at=UnixTime(int(now)),
                 expires_at=UnixTime(int(now) + 600),
                 target=str(pair.dest_channel_id),
@@ -2127,10 +2129,31 @@ class RebalanceEngine:
         except Exception:
             return False
 
+    def _snapshot_ref(self, now) -> Optional[dict]:
+        """PR 3a: canonical-snapshot reference for this cycle's intents.
+        Prefers the ref stashed at arbitration time (intra-cycle
+        consistency); else asks the shadow hub (TTL-cached). None means
+        callers fall back to the synthetic per-loop label — the exact
+        pre-adoption behavior."""
+        ref = getattr(self, "_cycle_snapshot_ref", None)
+        if ref and ref.get("snapshot_id") and (
+                int(now) - int(ref.get("observed_at", 0)) <= 600):
+            return ref
+        shadow = getattr(self, "econ_shadow", None)
+        if shadow is None:
+            return None
+        try:
+            return shadow.snapshot_ref(int(now))
+        except Exception:
+            return None
+
     def _arbitrate_execution_list(self, live_candidates, result):
         """Workstream H: batch-arbitrate the final execution list.
         Returns the J3-ordered survivors; rejected pairs get skip
         records and ledgered intent_rejected events. Fail-open."""
+        # PR 3a: never carry a snapshot ref across cycles — it is
+        # (re)stashed below only when this stage actually runs.
+        self._cycle_snapshot_ref = None
         if not self._cycle_arbitration_enabled():
             return live_candidates
         try:
@@ -2143,9 +2166,21 @@ class RebalanceEngine:
 
             now = int(_time.time())
             cycle_id = f"rebalance-arb-{now}"
+            # PR 3a: stamp the canonical snapshot into this cycle's
+            # intents; stash the ref so the governed reservations of the
+            # SAME cycle share it. Fallback: the synthetic label.
+            snap_ref = None
+            shadow_hub = getattr(self, "econ_shadow", None)
+            if shadow_hub is not None:
+                try:
+                    snap_ref = shadow_hub.snapshot_ref(now)
+                except Exception:
+                    snap_ref = None
+            self._cycle_snapshot_ref = snap_ref
             ctx = CycleContext(cycle_id=cycle_id,
                                cycle_time=UnixTime(now), seed=0,
-                               snapshot_id=cycle_id)
+                               snapshot_id=(snap_ref or {}).get(
+                                   "snapshot_id") or cycle_id)
             env_pairs = rebalance_intent_pairs(live_candidates, ctx)
             pair_by_key = {env.idempotency_key: pair
                            for env, pair in env_pairs}

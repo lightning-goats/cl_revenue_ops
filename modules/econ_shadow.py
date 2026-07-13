@@ -41,6 +41,12 @@ class EconShadow:
         self._ledger_failed = False
         self._ledger_path = ledger_path or self._default_ledger_path()
         self.intents_recorded_total = 0
+        # PR 3a (gap-closure Phase B): canonical-snapshot service for
+        # policy adoption. The provider (wired by the plugin) assembles
+        # a full snapshot wire dict; the ref cache bounds builds to at
+        # most one per max_age window.
+        self.snapshot_provider = None
+        self._snapshot_ref_cache: Optional[Tuple[dict, int]] = None
 
     # ------------------------------------------------------------------
     # plumbing
@@ -83,6 +89,46 @@ class EconShadow:
             self._ledger_failed = True
             self._log(f"ledger unavailable ({e}) — shadow recording "
                       f"disabled for this session", level="warn")
+            return None
+
+    # ------------------------------------------------------------------
+    # canonical snapshot service (PR 3a)
+    # ------------------------------------------------------------------
+    def snapshot_ref(self, now: int,
+                     max_age_seconds: int = 300) -> Optional[dict]:
+        """TTL-cached reference to a freshly built canonical snapshot:
+        ``{"snapshot_id", "observed_at"}``, or None (fail-open — callers
+        keep their pre-adoption synthetic labels). Each fresh build is
+        ledgered as ``snapshot_created`` so intent snapshot_ids resolve
+        against the ledger."""
+        try:
+            if not self.enabled() or self.snapshot_provider is None:
+                return None
+            cached = self._snapshot_ref_cache
+            if cached is not None and int(now) - cached[1] < max_age_seconds:
+                return cached[0]
+            wire, _approximations = self.snapshot_provider()
+            if not wire or not wire.get("snapshot_id"):
+                return None
+            ref = {"snapshot_id": str(wire["snapshot_id"]),
+                   "observed_at": int(wire.get("observed_at", int(now)))}
+            self._snapshot_ref_cache = (ref, int(now))
+            ledger = self._get_ledger()
+            if ledger is not None:
+                try:
+                    ledger.append(
+                        event_type="snapshot_created",
+                        intent_id=ref["snapshot_id"],
+                        idempotency_key=ref["snapshot_id"],
+                        cycle_id=ref["snapshot_id"],
+                        at=int(now),
+                        details={"observed_at": ref["observed_at"]},
+                    )
+                except Exception:
+                    pass
+            return ref
+        except Exception as e:
+            self._log(f"snapshot_ref failed open: {e}")
             return None
 
     # ------------------------------------------------------------------

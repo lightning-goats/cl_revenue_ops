@@ -2902,6 +2902,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # contract; inert unless econ_shadow_enabled is set.
     try:
         econ_shadow = EconShadow(safe_plugin, config)
+        # PR 3a: policies obtain TTL-cached canonical-snapshot refs from
+        # the hub; the provider shares the RPC's assembly path.
+        econ_shadow.snapshot_provider = _assemble_econ_snapshot
         # Phase 2 pilot: journal the generic spend lifecycle (all callers
         # of Database.reserve_spend/settle/release) into the econ ledger.
         database.spend_journal = econ_shadow
@@ -5720,6 +5723,48 @@ def revenue_dashboard(plugin: Plugin, window_days: int = 30) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+def _assemble_econ_snapshot() -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """Assemble the canonical EconomicSnapshot wire dict from the live
+    caches. Shared by the revenue-econ-snapshot RPC and the shadow hub's
+    snapshot_provider (PR 3a policy adoption). Raises only if the
+    channel read fails — every other input degrades with a declared
+    approximation."""
+    channels = []
+    if data_service is not None:
+        channels = (data_service.get_peer_channels() or {}).get(
+            "channels", []) or []
+    profitability = {}
+    try:
+        if profitability_analyzer is not None:
+            profitability = profitability_analyzer.analyze_all_channels(
+                force=False) or {}
+    except Exception:
+        profitability = {}
+    budget = {}
+    try:
+        cfg_snap = config.snapshot() if config else None
+        if database is not None and cfg_snap is not None:
+            status = database.get_budget_status(
+                int(time.time()) - 24 * 3600) or {}
+            budget = {
+                "cap_sats": int(getattr(cfg_snap, "daily_budget_sats", 0)
+                                or 0),
+                "reserved_sats": int(status.get("reserved", 0) or 0),
+                "spent_sats": int(status.get("spent", 0) or 0),
+            }
+    except Exception:
+        budget = {}
+    return econ_shadow.build_snapshot_preview(
+        channels=channels,
+        profitability=profitability,
+        budget=budget,
+        now=int(time.time()),
+        receivable_ratio_target=float(getattr(
+            config.snapshot() if config else object(),
+            "receivable_ratio_target", 0.0) or 0.0),
+    )
+
+
 @plugin.method("revenue-econ-snapshot")
 def revenue_econ_snapshot(plugin: Plugin) -> Dict[str, Any]:
     """READ-ONLY Phase 1 preview of the canonical EconomicSnapshot
@@ -5733,44 +5778,11 @@ def revenue_econ_snapshot(plugin: Plugin) -> Dict[str, Any]:
         if econ_shadow is None or not econ_shadow.enabled():
             return {"enabled": False,
                     "hint": "revenue-config set econ_shadow_enabled true"}
-        channels = []
         try:
-            if data_service is not None:
-                channels = (data_service.get_peer_channels() or {}).get(
-                    "channels", []) or []
+            wire, approximations = _assemble_econ_snapshot()
         except Exception as e:
             return {"enabled": True, "snapshot": None,
                     "approximations": [f"channel read failed: {e}"]}
-        profitability = {}
-        try:
-            if profitability_analyzer is not None:
-                profitability = profitability_analyzer.analyze_all_channels(
-                    force=False) or {}
-        except Exception:
-            profitability = {}
-        budget = {}
-        try:
-            cfg_snap = config.snapshot() if config else None
-            if database is not None and cfg_snap is not None:
-                status = database.get_budget_status(
-                    int(time.time()) - 24 * 3600) or {}
-                budget = {
-                    "cap_sats": int(getattr(cfg_snap, "daily_budget_sats", 0)
-                                    or 0),
-                    "reserved_sats": int(status.get("reserved", 0) or 0),
-                    "spent_sats": int(status.get("spent", 0) or 0),
-                }
-        except Exception:
-            budget = {}
-        wire, approximations = econ_shadow.build_snapshot_preview(
-            channels=channels,
-            profitability=profitability,
-            budget=budget,
-            now=int(time.time()),
-            receivable_ratio_target=float(getattr(
-                config.snapshot() if config else object(),
-                "receivable_ratio_target", 0.0) or 0.0),
-        )
         intents_durable = None
         try:
             _ledger = econ_shadow.ledger_for_reconciliation()

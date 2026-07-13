@@ -28,6 +28,7 @@ def test_vocabulary_is_exactly_the_spec():
         "execution_succeeded", "execution_failed",
         "execution_outcome_unknown", "cost_recorded",
         "reservation_released", "reconciliation_completed",
+        "snapshot_created",
     }
 
 

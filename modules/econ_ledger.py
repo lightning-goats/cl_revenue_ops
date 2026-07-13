@@ -45,6 +45,9 @@ EVENT_TYPES = (
     "cost_recorded",
     "reservation_released",
     "reconciliation_completed",
+    # PR 3a: a canonical snapshot was built and served to policies;
+    # intent snapshot_ids resolve against these. Ignored by replay.
+    "snapshot_created",
 )
 
 _TERMINAL_EVENTS = frozenset({

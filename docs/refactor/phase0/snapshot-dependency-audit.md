@@ -123,9 +123,14 @@ with a freshness gate rather than per-cycle injection:
 
 ## Migration work list (feeds PRs 3a–3e)
 
-1. **3a rebalance**: source pre-collected planning facts from the
-   snapshot builder; thread `snapshot_id` into intents (replace
-   `f"rebalance-cycle-{int(now)}"` at rebalance_engine_v2.py:2050).
+1. **3a rebalance — DONE (2026-07-13)**: the shadow hub serves
+   TTL-cached canonical-snapshot refs (`EconShadow.snapshot_ref`,
+   provider = the revenue-econ-snapshot assembly, each fresh build
+   ledgered as `snapshot_created`); the arbitration context and all
+   governed rebalance intents carry the real snapshot id, stashed once
+   per cycle for intra-cycle consistency with a 600s age bound. The
+   synthetic labels remain ONLY as the fail-open fallback (hub absent /
+   shadow disabled / provider error → exact pre-adoption behavior).
 2. **3b planner**: freeze one profitability projection at cycle entry;
    replace :922/:2831 with the projection; move peer
    connectivity/exposure into snapshot channel/peer state
