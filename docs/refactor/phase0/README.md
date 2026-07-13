@@ -277,6 +277,19 @@ inserts at one seam before executor dispatch, structurally pinned).
 Fail-OPEN by design: an ordering-stage error reverts to the legacy list
 while downstream authorization still fails closed.
 
+## Workstream H — planner-loop cutover (2026-07-13)
+
+Behind `econ_cycle_planner_enabled` (default off): the close list is
+batch-arbitrated at SELECTION time — dedup with skipped-reason +
+ledgered rejections, and surviving CLOSE_CHANNEL intents register in
+the shared live registry so rebalances into scheduled-close channels
+are rejected from selection onward (the spec's "scheduled for closure"
+conflict rule, made real end-to-end and tested cross-facade). Legacy
+worst-ROI-first execution order deliberately PRESERVED among survivors
+(J3 reordering waits for real EV fields, Phase 4). Opens deferred: the
+open-vs-liquidity-swap conflict rule needs LN+ JOIN intents that do not
+exist yet.
+
 ## Contradictions
 
 Places where the repository contradicts an assumption in

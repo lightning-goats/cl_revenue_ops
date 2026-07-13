@@ -437,6 +437,11 @@ class CapacityPlanner:
         close_limit = configured_close_limit if configured_close_limit > 0 else None
         closeable = [l for l in losers if l.get("action") == "CLOSE"]
         sorted_closeable = sorted(closeable, key=lambda x: x.get("marginal_roi", 0))
+        # Workstream H cutover: batch-arbitrate the close list (dedup +
+        # selection-time conflict arming). Legacy worst-ROI-first order
+        # is PRESERVED among survivors; fail-open.
+        sorted_closeable = self._arbitrate_close_list(
+            sorted_closeable, summary)
         for loser in sorted_closeable:
             # Recommendation-only close logging should not be suppressed by the
             # executed-close budget. A zero limit means "no close execution";
@@ -3366,6 +3371,129 @@ class CapacityPlanner:
     # Phase 2E: optional shadow/governor plumbing (EconShadow), injected
     # at plugin init; None = ledgerless governed mode still works.
     econ_shadow = None
+
+    def _planner_cycle_arbitration_enabled(self) -> bool:
+        try:
+            cfg = self.config.snapshot() \
+                if self.config is not None and hasattr(self.config, "snapshot") \
+                else self.config
+            return getattr(cfg, "econ_cycle_planner_enabled",
+                           False) is True
+        except Exception:
+            return False
+
+    def _arbitrate_close_list(self, sorted_closeable, summary):
+        """Workstream H (planner): batch-arbitrate the selected close
+        list. Dedup drops repeats; SURVIVORS KEEP the legacy
+        worst-ROI-first order (J3 reordering waits for real EV fields,
+        Phase 4); surviving CLOSE_CHANNEL intents register in the shared
+        live registry so rebalances into scheduled-close channels are
+        rejected from SELECTION time (spec conflict rule). Fail-open."""
+        if not self._planner_cycle_arbitration_enabled():
+            return sorted_closeable
+        try:
+            import time as _time
+
+            from .cycle_context import CycleContext
+            from .econ_arbiter import arbitrate
+            from .econ_intents import Explanation, make_intent
+            from .econ_types import Micro, Msat, SignedMsat, UnixTime
+
+            now = int(_time.time())
+            cycle_id = f"planner-arb-{now}"
+            envs = []
+            env_by_key = {}
+            losers_with_keys = []  # parallel (loser, key), duplicates kept
+            for loser in sorted_closeable:
+                scid = str(loser.get("scid") or "")
+                if not scid:
+                    losers_with_keys.append((loser, None))
+                    continue
+                env = make_intent(
+                    intent_type="CLOSE_CHANNEL",
+                    snapshot_id=cycle_id,
+                    created_at=UnixTime(now),
+                    expires_at=UnixTime(now + 600),
+                    target=scid,
+                    amount_msat=None,
+                    expected_benefit_msat=SignedMsat(0),
+                    max_cost_msat=Msat(0),
+                    capital_committed_msat=Msat(0),
+                    confidence_micro=Micro(0),
+                    reason_codes=(),
+                    explanation=Explanation("planner_close_selection", (
+                        ("scid", scid),
+                        ("marginal_roi",
+                         round(float(loser.get("marginal_roi", 0) or 0), 6)),
+                        ("reason", str(loser.get("reason", ""))),
+                    )),
+                    preconditions=(),
+                    priority=50,
+                    budget_bucket="channel_close",
+                    origin_policy="capacity_planner_cycle",
+                    reversible=False,
+                )
+                envs.append(env)
+                env_by_key[env.idempotency_key] = env
+                losers_with_keys.append((loser, env.idempotency_key))
+            arbitration = arbitrate(envs, now=now)
+
+            shadow = getattr(self, "econ_shadow", None)
+            ledger = None
+            registry = None
+            if shadow is not None:
+                try:
+                    ledger = shadow.ledger_for_reconciliation()
+                except Exception:
+                    ledger = None
+                try:
+                    registry = shadow.arbitration_registry()
+                except Exception:
+                    registry = None
+
+            surviving_keys = {env.idempotency_key
+                              for env in arbitration.ordered}
+            for env, code, detail in arbitration.rejected:
+                summary["skipped_reasons"].append(
+                    f"Close arbitration rejected {env.target}: {code}")
+                if ledger is not None:
+                    try:
+                        ledger.append(
+                            event_type="intent_rejected",
+                            intent_id=env.intent_id.value,
+                            idempotency_key=env.idempotency_key,
+                            cycle_id=cycle_id,
+                            at=now,
+                            details={"reason_code": code,
+                                     "arbitration": True, "batch": True},
+                        )
+                    except Exception:
+                        pass
+            # Arm the live conflict rule from selection time: a channel
+            # SCHEDULED for closure must not receive rebalances.
+            if registry is not None:
+                for key in surviving_keys:
+                    try:
+                        registry.check_and_register(env_by_key[key], now)
+                    except Exception:
+                        pass
+            # Legacy order preserved among survivors; a duplicate key
+            # keeps only its FIRST occurrence.
+            seen = set()
+            survivors = []
+            for loser, key in losers_with_keys:
+                if key is None:
+                    survivors.append(loser)  # unmappable: keep (fail open)
+                    continue
+                if key in surviving_keys and key not in seen:
+                    seen.add(key)
+                    survivors.append(loser)
+            return survivors
+        except Exception as e:
+            self.plugin.log(
+                f"planner close arbitration failed open: {e}",
+                level='warn')
+            return sorted_closeable
 
     def _planner_governor_enabled(self) -> bool:
         """Phase 2E: strict flag check (MagicMock/absent snapshots stay
