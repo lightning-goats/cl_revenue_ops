@@ -742,7 +742,8 @@ class TestRebalanceUtilizationFloorCeilingGuard:
 
         warnings = cfg.load_overrides(database)
 
-        assert warnings == []
+        # Workstream I: the repair still happens but is no longer silent.
+        assert len(warnings) == 1 and "Contradictory" in warnings[0]
         assert cfg.rebalance_utilization_ceiling == 0.1
         assert cfg.rebalance_utilization_floor == pytest.approx(0.05)
         assert cfg.snapshot().rebalance_utilization_floor == pytest.approx(0.05)

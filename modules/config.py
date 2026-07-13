@@ -291,6 +291,49 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
 # semantics. Kept as a deprecated compatibility shim so config files load.
 DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset({'rebalance_min_profit'})
 
+# Replacement guidance surfaced in the startup deprecation warning.
+DEPRECATED_KEY_REPLACEMENTS: Dict[str, str] = {
+    'rebalance_min_profit': 'rebalance_hold_margin',
+}
+
+# Workstream I: settings whose effect is entirely gated behind a boolean
+# flag. An explicit override of a gated key while its gate is off is
+# "shadowed" — legal, but it does nothing until the gate is enabled, so
+# startup warns instead of leaving the operator to discover it.
+SHADOWED_SETTING_GATES: Dict[str, tuple] = {
+    'growth_budget_enabled': (
+        'growth_budget_earned_fraction',
+        'growth_budget_experiment_fraction',
+        'growth_budget_max_extra_sats',
+        'growth_budget_hard_ceiling_sats',
+    ),
+    'fee_market_boundary_enabled': (
+        'fee_market_boundary_min_competitors',
+        'fee_market_boundary_margin_ppm',
+    ),
+    'lnplus_swaps_enabled': (
+        'lnplus_execute_applications',
+        'lnplus_swap_preference_margin',
+        'lnplus_max_duration_months',
+        'lnplus_min_peer_positive_ratings',
+        'lnplus_min_peer_rank',
+        'lnplus_max_participants',
+        'lnplus_min_participants',
+        'lnplus_apply_feerate_ceiling',
+        'lnplus_pending_timeout_days',
+        'lnplus_inbound_credit_factor',
+        'lnplus_watcher_interval',
+    ),
+    'expansion_treasury_enabled': (
+        'expansion_treasury_onchain_target_sats',
+        'expansion_treasury_min_deficit_sats',
+        'expansion_treasury_preferred_currency',
+        'expansion_treasury_max_actions',
+        'expansion_treasury_min_source_local_pct',
+        'expansion_treasury_exclude_protected',
+    ),
+}
+
 # Range constraints for numeric fields
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'min_fee_ppm': (5, 100000),  # CRITICAL-02 FIX: Minimum 5 PPM to ensure economic viability
@@ -848,31 +891,84 @@ class Config:
             if hasattr(self, key) and key not in IMMUTABLE_CONFIG_KEYS:
                 self._apply_override(key, value)
         self._version = database.get_config_version()
+        # Workstream I: shadowed/deprecated detection runs against the keys
+        # the operator EXPLICITLY overrode, before repairs mutate anything.
+        self._detect_shadowed_and_deprecated(set(overrides))
         # M-R5-2 FIX: Post-load cross-field invariant repair.
         # Overrides applied individually may violate cross-field constraints
         # (e.g., min_fee_ppm > max_fee_ppm from TOCTOU race or manual DB edits).
+        # Workstream I: each repair now also WARNS — silent repair left the
+        # operator unaware their persisted settings contradict each other.
         if self.min_fee_ppm > self.max_fee_ppm:
+            self._override_warnings.append(
+                f"Contradictory settings: min_fee_ppm ({self.min_fee_ppm}) > "
+                f"max_fee_ppm ({self.max_fee_ppm}); repaired min_fee_ppm to "
+                f"{self.max_fee_ppm}")
             self.min_fee_ppm = self.max_fee_ppm
         if hasattr(self, 'low_liquidity_threshold') and hasattr(self, 'high_liquidity_threshold'):
             if self.low_liquidity_threshold >= self.high_liquidity_threshold:
                 # M-R6-1 FIX: Clamp to 0.0 to prevent negative values when
                 # high_liquidity_threshold is very small (e.g., < 0.05).
-                self.low_liquidity_threshold = max(0.0, self.high_liquidity_threshold - 0.05)
+                repaired = max(0.0, self.high_liquidity_threshold - 0.05)
+                self._override_warnings.append(
+                    f"Contradictory settings: low_liquidity_threshold "
+                    f"({self.low_liquidity_threshold}) >= high_liquidity_threshold "
+                    f"({self.high_liquidity_threshold}); repaired low to {repaired}")
+                self.low_liquidity_threshold = repaired
         if hasattr(self, 'rebalance_utilization_floor') and hasattr(self, 'rebalance_utilization_ceiling'):
             if self.rebalance_utilization_floor >= self.rebalance_utilization_ceiling:
                 # Mirrors the low_liquidity_threshold/high_liquidity_threshold
                 # repair: an inverted floor/ceiling pair would otherwise pin
                 # realized utilization to the (wrong) floor for every channel.
-                self.rebalance_utilization_floor = max(
-                    0.0, self.rebalance_utilization_ceiling - 0.05
-                )
+                repaired = max(0.0, self.rebalance_utilization_ceiling - 0.05)
+                self._override_warnings.append(
+                    f"Contradictory settings: rebalance_utilization_floor "
+                    f"({self.rebalance_utilization_floor}) >= ceiling "
+                    f"({self.rebalance_utilization_ceiling}); repaired floor to "
+                    f"{repaired}")
+                self.rebalance_utilization_floor = repaired
         if self.receivable_ratio_floor > self.receivable_ratio_target:
+            self._override_warnings.append(
+                f"Contradictory settings: receivable_ratio_floor "
+                f"({self.receivable_ratio_floor}) > receivable_ratio_target "
+                f"({self.receivable_ratio_target}); repaired floor to target")
             self.receivable_ratio_floor = self.receivable_ratio_target
         # Repair a crossed LN+ ring-size band persisted before the
         # update_runtime cross-check existed (min > max gates out every swap).
         if self.lnplus_min_participants > self.lnplus_max_participants:
+            self._override_warnings.append(
+                f"Contradictory settings: lnplus_min_participants "
+                f"({self.lnplus_min_participants}) > lnplus_max_participants "
+                f"({self.lnplus_max_participants}); repaired max to min")
             self.lnplus_max_participants = self.lnplus_min_participants
+        # Warn-only (no repair): a daily budget above the weekly budget is
+        # individually legal but the weekly cap binds first, so the daily
+        # figure can never be spent in a single day.
+        if self.daily_budget_sats > self.weekly_budget_sats:
+            self._override_warnings.append(
+                f"Contradictory settings: daily_budget_sats "
+                f"({self.daily_budget_sats}) > weekly_budget_sats "
+                f"({self.weekly_budget_sats}); the weekly cap binds first")
         return list(self._override_warnings)
+
+    def _detect_shadowed_and_deprecated(self, explicit_keys: set) -> None:
+        """Workstream I startup detection: explicitly-set options that are
+        deprecated no-ops, or whose effect is shadowed by an off gate flag."""
+        for key in sorted(explicit_keys & DEPRECATED_RUNTIME_KEYS):
+            replacement = DEPRECATED_KEY_REPLACEMENTS.get(key)
+            hint = f"; use {replacement}" if replacement else ""
+            self._override_warnings.append(
+                f"Deprecated option {key} is set — it is a no-op{hint} "
+                f"(scheduled for removal after the announced compatibility "
+                f"window)")
+        for gate, gated_keys in SHADOWED_SETTING_GATES.items():
+            if getattr(self, gate, False):
+                continue
+            for key in gated_keys:
+                if key in explicit_keys:
+                    self._override_warnings.append(
+                        f"Shadowed setting: {key} is set but {gate} is "
+                        f"false — it has no effect until the gate is enabled")
 
     def _apply_override(self, key: str, value: str) -> None:
         """Apply a single override with type conversion and range validation."""

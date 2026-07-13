@@ -317,6 +317,19 @@ swaps `capital`. LN+ obligation fulfillment is deliberately ungated
 creation is disabled). Unknown configured values fail closed to
 observe; unknown required values demand the top level.
 
+## Workstream I — startup contradiction/shadow/deprecation detection (2026-07-13)
+
+`Config.load_overrides` now WARNS on everything it detects at startup
+(logged at plugin start via the existing override-warning path): the
+six cross-field contradictions (fee rails, liquidity thresholds,
+utilization band, receivable ratios, LN+ ring band — still repaired,
+no longer silently — plus daily>weekly budget, warn-only since the
+weekly cap simply binds first); explicitly-overridden settings shadowed
+by an off gate flag (`SHADOWED_SETTING_GATES`: growth budget, fee
+market boundary, LN+, expansion treasury groups); and deprecated
+options with replacement guidance (`DEPRECATED_KEY_REPLACEMENTS`).
+Detection fires only for explicit overrides — defaults never spam.
+
 ## Operator surface — risk_profile disposition (2026-07-13)
 
 The spec's `risk_profile` (conservative/balanced/aggressive bundling of
