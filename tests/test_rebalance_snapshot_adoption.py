@@ -105,9 +105,9 @@ class TestArbitrationAdoption:
         seen = {}
         real = econ_cycle.rebalance_intent_pairs
 
-        def spy(candidates, ctx):
+        def spy(candidates, ctx, **kwargs):
             seen["ctx"] = ctx
-            return real(candidates, ctx)
+            return real(candidates, ctx, **kwargs)
 
         monkeypatch.setattr(econ_cycle, "rebalance_intent_pairs", spy)
         engine._arbitrate_execution_list([_pair()], CycleResult())

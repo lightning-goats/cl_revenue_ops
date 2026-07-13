@@ -110,6 +110,10 @@ PUBLIC_RUNTIME_KEYS = (
     # Workstream H cutover: Boltz balance-cycle recommendations pass
     # through batch arbitration (dedup, ledgered). Default off.
     'econ_cycle_boltz_enabled',
+    # PR 6 (gap-closure Phase E): populate real EV/confidence in intent
+    # envelopes. CAUTION: flipping changes J3 batch-arbitration ORDER in
+    # the cutover loops (EV sorts before target). Default off = zeros.
+    'econ_ev_populated',
     # Phase 4 (Workstream I): global authority level — observe < fees <
     # liquidity < capital. Governed actions above the level are blocked
     # with AUTHORITY_LEVEL_BLOCKED. Default 'capital' preserves current
@@ -190,6 +194,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'econ_cycle_rebalance_enabled': bool,
     'econ_cycle_planner_enabled': bool,
     'econ_cycle_boltz_enabled': bool,
+    'econ_ev_populated': bool,
     'authority_level': str,
     'expansion_treasury_enabled': bool,
     'expansion_treasury_onchain_target_sats': int,
@@ -548,6 +553,7 @@ class Config:
     econ_cycle_planner_enabled: bool = False
     # Workstream H: cycle-arbitrated Boltz recommendations.
     econ_cycle_boltz_enabled: bool = False
+    econ_ev_populated: bool = False
     # Phase 4: global authority level (observe|fees|liquidity|capital).
     authority_level: str = "capital"
     # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
@@ -1327,6 +1333,7 @@ class ConfigSnapshot:
     econ_cycle_rebalance_enabled: bool = False
     econ_cycle_planner_enabled: bool = False
     econ_cycle_boltz_enabled: bool = False
+    econ_ev_populated: bool = False
     authority_level: str = "capital"
     # E-2: class-aware min-fee floor for saturated/source channels (0 =
     # allow true cheap egress). Missing-from-snapshot kills the feature in

@@ -59,6 +59,7 @@ def test_public_runtime_keys_are_safety_only():
         "econ_cycle_rebalance_enabled",
         "econ_cycle_planner_enabled",
         "econ_cycle_boltz_enabled",
+        "econ_ev_populated",
         "authority_level",
         # LN+ liquidity swap automation
         "lnplus_swaps_enabled",
@@ -134,6 +135,7 @@ def test_public_runtime_dict_returns_only_public_keys():
         "econ_cycle_rebalance_enabled": False,
         "econ_cycle_planner_enabled": False,
         "econ_cycle_boltz_enabled": False,
+        "econ_ev_populated": False,
         "authority_level": "capital",
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
@@ -562,6 +564,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "econ_cycle_boltz_enabled",
         "econ_cycle_planner_enabled",
         "econ_cycle_rebalance_enabled",
+        "econ_ev_populated",
         "econ_governor_boltz_enabled",
         "econ_governor_fees_enabled",
         "econ_governor_lnplus_enabled",
@@ -612,7 +615,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "receivable_ratio_target",
         "weekly_budget_sats",
     ]
-    assert result["count"] == 59
+    assert result["count"] == 60
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -667,6 +670,7 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "econ_cycle_rebalance_enabled": False,
         "econ_cycle_planner_enabled": False,
         "econ_cycle_boltz_enabled": False,
+        "econ_ev_populated": False,
         "authority_level": "capital",
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
@@ -1158,6 +1162,7 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "econ_cycle_rebalance_enabled": False,
         "econ_cycle_planner_enabled": False,
         "econ_cycle_boltz_enabled": False,
+        "econ_ev_populated": False,
         "authority_level": "capital",
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,

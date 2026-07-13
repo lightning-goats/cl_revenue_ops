@@ -2046,6 +2046,17 @@ class RebalanceEngine:
                     "liquidity"),
             )
             snap_ref = self._snapshot_ref(now)
+            # PR 6 (econ_ev_populated): real EV/confidence from the
+            # pair's sats-EV decomposition; flag off keeps zeros.
+            ev_benefit, ev_confidence = SignedMsat(0), Micro(0)
+            if getattr(cfg, "econ_ev_populated", False) is True:
+                from .econ_ev import benefit_msat_from_sats, confidence_micro
+                decomp = getattr(pair, "score_decomposition", None) or {}
+                if "final_score_sats" in decomp:
+                    ev_benefit = benefit_msat_from_sats(
+                        decomp.get("final_score_sats"))
+                    ev_confidence = confidence_micro(
+                        decomp.get("p_success"))
             env = make_intent(
                 intent_type="REBALANCE",
                 snapshot_id=(snap_ref or {}).get("snapshot_id")
@@ -2054,10 +2065,10 @@ class RebalanceEngine:
                 expires_at=UnixTime(int(now) + 600),
                 target=str(pair.dest_channel_id),
                 amount_msat=Msat(amount * 1000),
-                expected_benefit_msat=SignedMsat(0),
+                expected_benefit_msat=ev_benefit,
                 max_cost_msat=Msat(int(max_fee_sats) * 1000),
                 capital_committed_msat=Msat(amount * 1000),
-                confidence_micro=Micro(0),
+                confidence_micro=ev_confidence,
                 reason_codes=(),
                 explanation=Explanation("rebalance_reservation", (
                     ("source", str(pair.source_channel_id)),
@@ -2181,7 +2192,13 @@ class RebalanceEngine:
                                cycle_time=UnixTime(now), seed=0,
                                snapshot_id=(snap_ref or {}).get(
                                    "snapshot_id") or cycle_id)
-            env_pairs = rebalance_intent_pairs(live_candidates, ctx)
+            try:
+                ev_enabled = getattr(self._config_snapshot(),
+                                     "econ_ev_populated", False) is True
+            except Exception:
+                ev_enabled = False
+            env_pairs = rebalance_intent_pairs(live_candidates, ctx,
+                                               ev_enabled=ev_enabled)
             pair_by_key = {env.idempotency_key: pair
                            for env, pair in env_pairs}
             arbitration = arbitrate([env for env, _ in env_pairs], now=now)

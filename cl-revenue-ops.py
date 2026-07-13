@@ -9608,6 +9608,11 @@ def _arbitrate_boltz_recommendations(recommendations):
             except Exception:
                 snap_ref = None
         arb_snapshot_id = (snap_ref or {}).get("snapshot_id") or cycle_id
+        # PR 6 (econ_ev_populated): real risk-adjusted EV from the
+        # recommendation economics; flag off keeps zeros. EV here is
+        # EVIDENCE — survivors deliberately keep legacy plan order.
+        ev_on = getattr(cfg, "econ_ev_populated", False) is True
+        from modules.econ_ev import benefit_msat_from_sats
         recs_with_keys = []
         envs = []
         for rec in recommendations:
@@ -9617,6 +9622,11 @@ def _arbitrate_boltz_recommendations(recommendations):
                     else "SWAP_OUT"
                 economics = rec.get("economics") or {}
                 fee = int(economics.get("estimated_swap_fee_sats", 0) or 0)
+                ev_benefit = (
+                    benefit_msat_from_sats(
+                        economics.get("risk_adjusted_net_sats"))
+                    if ev_on and "risk_adjusted_net_sats" in economics
+                    else SignedMsat(0))
                 env = make_intent(
                     intent_type=intent_type,
                     snapshot_id=arb_snapshot_id,
@@ -9624,7 +9634,7 @@ def _arbitrate_boltz_recommendations(recommendations):
                     expires_at=UnixTime(now + 600),
                     target=str(rec.get("channel_id") or "onchain"),
                     amount_msat=None,
-                    expected_benefit_msat=SignedMsat(0),
+                    expected_benefit_msat=ev_benefit,
                     max_cost_msat=Msat(max(0, fee) * 1000),
                     capital_committed_msat=Msat(0),
                     confidence_micro=Micro(0),

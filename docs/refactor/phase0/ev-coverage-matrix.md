@@ -155,13 +155,27 @@ gating and audit trail, no budget reservation (zero-cost skip).
 | LN+ | `_swap_ev × 1000` | `reliability × 1e6` | obligation path stays exception |
 | Fees | 0 (exception class 4) | 0 | ADR-001 |
 
-**Ordering impact (the PR 6 flip risk):** the J3 ladder sorts
-`-EV` before `-confidence` and target; today every envelope EV is 0, so
-batch order falls through to priority/target. Populating real EVs
-REORDERS execution in all three cutover loops — richest-EV first. This
-is the deliberately-deferred J3 reordering; the flip requires the
-shadow order-comparison and separate operator approval (gap-closure
-§F.2).
+**Ordering impact (the PR 6 flip risk — CORRECTED during
+implementation):** the J3 ladder sorts `-EV` before `-confidence` and
+target, but only the REBALANCE loop consumes J3 output order — the
+Boltz and planner stages deliberately preserve legacy plan order among
+survivors. So flipping `econ_ev_populated` reorders execution in the
+rebalance loop only (richest-EV first, pinned by test); for Boltz and
+planner closes the populated EV is evidence, order unchanged (pinned).
+Adopting J3 order for those two loops is a separate, explicit decision.
+The flip still requires operator approval (gap-closure §F.2).
+
+**PR 6 implementation record (2026-07-13):** `modules/econ_ev.py`
+(checked contract helpers, conservative missing-data rules) +
+`econ_ev_populated` flag (default off, count 60). Populated:
+rebalance batch + governed rebalance reservations
+(`final_score_sats`/`p_success` from `pair.score_decomposition`),
+Boltz batch (`risk_adjusted_net_sats`). Deliberately zero: planner
+closes (benefit undefined pending a definition pass), planner opens
+(EV not threaded to `_execute_open` — candidate for a later pass),
+LN+ obligation and fee paths (exception classes 2 and 4). All
+directive property tests pass (monotonicity ×4, conservative missing
+data, checked integer semantics).
 
 ## Duplicate "worth doing" booleans (retirement candidates)
 

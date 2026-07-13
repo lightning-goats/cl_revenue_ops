@@ -61,15 +61,20 @@ class CycleResult:
         return canonical_json(self.to_wire())
 
 
-def rebalance_intent_pairs(pairs: List[Any], ctx: CycleContext
+def rebalance_intent_pairs(pairs: List[Any], ctx: CycleContext,
+                           ev_enabled: bool = False,
                            ) -> List[Tuple[IntentEnvelope, Any]]:
     """Like rebalance_intents_from_pairs but keeps the (envelope, pair)
     association — the execution cutover needs to map arbitrated
-    envelopes back to their candidates."""
+    envelopes back to their candidates.
+
+    ev_enabled (PR 6, econ_ev_populated): populate the envelope's
+    EV/confidence from pair.score_decomposition (final_score_sats /
+    p_success). Default False keeps the byte-pinned zeros."""
     out = []
     for pair in sorted(pairs, key=lambda p: (str(p.dest_channel_id),
                                              str(p.source_channel_id))):
-        env = _rebalance_intent(pair, ctx)
+        env = _rebalance_intent(pair, ctx, ev_enabled=ev_enabled)
         out.append((env, pair))
     return out
 
@@ -81,9 +86,17 @@ def rebalance_intents_from_pairs(pairs: List[Any],
     return [env for env, _pair in rebalance_intent_pairs(pairs, ctx)]
 
 
-def _rebalance_intent(pair: Any, ctx: CycleContext) -> IntentEnvelope:
+def _rebalance_intent(pair: Any, ctx: CycleContext,
+                      ev_enabled: bool = False) -> IntentEnvelope:
     amount = int(getattr(pair, "amount_sats", 0) or 0)
     max_fee = int(getattr(pair, "pair_budget_sats", 0) or 0)
+    benefit, confidence = SignedMsat(0), Micro(0)
+    if ev_enabled:
+        from .econ_ev import benefit_msat_from_sats, confidence_micro
+        decomp = getattr(pair, "score_decomposition", None) or {}
+        if "final_score_sats" in decomp:
+            benefit = benefit_msat_from_sats(decomp.get("final_score_sats"))
+            confidence = confidence_micro(decomp.get("p_success"))
     return make_intent(
         intent_type="REBALANCE",
         snapshot_id=ctx.snapshot_id,
@@ -91,10 +104,10 @@ def _rebalance_intent(pair: Any, ctx: CycleContext) -> IntentEnvelope:
         expires_at=ctx.cycle_time.plus_seconds(600),
         target=str(pair.dest_channel_id),
         amount_msat=Msat(amount * 1000),
-        expected_benefit_msat=SignedMsat(0),
+        expected_benefit_msat=benefit,
         max_cost_msat=Msat(max_fee * 1000),
         capital_committed_msat=Msat(amount * 1000),
-        confidence_micro=Micro(0),
+        confidence_micro=confidence,
         reason_codes=(),
         explanation=Explanation("cycle_rebalance", (
             ("source", str(pair.source_channel_id)),

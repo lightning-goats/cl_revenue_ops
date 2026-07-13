@@ -92,7 +92,7 @@ Evidence pins are against branch `refactor-phase1-shadow` @ `ab34d6f`
 | Risk | HIGH at flip time (execution-order change is the J3 reordering deliberately deferred earlier); LOW for the audit. |
 | Behavior change | Audit: none. Population flip: YES — intended, flag-gated, separately approved. |
 | Rollback | Flag off. |
-| Status | **partial** — AUDIT COMPLETE 2026-07-13 (`docs/refactor/phase0/ev-coverage-matrix.md`): all ten action classes mapped to the common contract with file:line evidence; every spend path already computes real EV terms (richer than the contract in places — p_success, structural credits, lockup haircuts); exception classes assigned; envelope population plan + ordering-impact analysis + boolean-retirement verdict recorded. Envelope fields remain unpopulated until PR 6 (flag-gated; flip needs operator approval). |
+| Status | **partial** — AUDIT COMPLETE 2026-07-13 (`docs/refactor/phase0/ev-coverage-matrix.md`): all ten action classes mapped to the common contract with file:line evidence; every spend path already computes real EV terms (richer than the contract in places — p_success, structural credits, lockup haircuts); exception classes assigned; envelope population plan + ordering-impact analysis + boolean-retirement verdict recorded. PR 6 SHIPPED 2026-07-13: modules/econ_ev.py contract helpers + econ_ev_populated flag (default OFF); rebalance batch/reserve and Boltz batch populate real EV/confidence when flipped; monotonicity and conservative-failure property tests in. Ordering correction: only the rebalance loop consumes J3 order — the flip reorders that loop alone. Flip remains on the operator-approval list. |
 
 ### Gap 7: DTS+PID fee-controller deviation
 
