@@ -179,6 +179,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "econ_arbiter_enabled",
         "econ_cycle_rebalance_enabled",
         "econ_cycle_planner_enabled",
+        "econ_cycle_boltz_enabled",
         # LN+ liquidity swap automation
         "lnplus_swaps_enabled",
         "lnplus_execute_applications",
@@ -239,6 +240,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "econ_arbiter_enabled": False,
         "econ_cycle_rebalance_enabled": False,
         "econ_cycle_planner_enabled": False,
+        "econ_cycle_boltz_enabled": False,
         "lnplus_swaps_enabled": True,
         "lnplus_execute_applications": True,
         "lnplus_swap_preference_margin": 0.2,

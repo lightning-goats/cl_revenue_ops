@@ -9503,6 +9503,102 @@ def revenue_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False,
         return {"error": str(e)}
 
 
+def _arbitrate_boltz_recommendations(recommendations):
+    """Workstream H (Boltz): batch-arbitrate balance-cycle
+    recommendations behind econ_cycle_boltz_enabled. Dedup drops
+    repeats (ledgered); LEGACY plan order preserved among survivors
+    (EV-based J3 reordering waits for Phase 4 fields). Fail-open."""
+    try:
+        cfg = config.snapshot() if config else None
+        if getattr(cfg, "econ_cycle_boltz_enabled", False) is not True:
+            return recommendations
+        if not recommendations:
+            return recommendations
+        import time as _time
+
+        from modules.econ_arbiter import arbitrate
+        from modules.econ_intents import Explanation, make_intent
+        from modules.econ_types import Micro, Msat, SignedMsat, UnixTime
+
+        now = int(_time.time())
+        cycle_id = f"boltz-arb-{now}"
+        recs_with_keys = []
+        envs = []
+        for rec in recommendations:
+            try:
+                direction = str(rec.get("direction") or "loop_out")
+                intent_type = "SWAP_IN" if direction == "loop_in" \
+                    else "SWAP_OUT"
+                economics = rec.get("economics") or {}
+                fee = int(economics.get("estimated_swap_fee_sats", 0) or 0)
+                env = make_intent(
+                    intent_type=intent_type,
+                    snapshot_id=cycle_id,
+                    created_at=UnixTime(now),
+                    expires_at=UnixTime(now + 600),
+                    target=str(rec.get("channel_id") or "onchain"),
+                    amount_msat=None,
+                    expected_benefit_msat=SignedMsat(0),
+                    max_cost_msat=Msat(max(0, fee) * 1000),
+                    capital_committed_msat=Msat(0),
+                    confidence_micro=Micro(0),
+                    reason_codes=(),
+                    explanation=Explanation("boltz_recommendation", (
+                        ("direction", direction),
+                        ("channel", str(rec.get("channel_id") or "")),
+                        ("amount_sats",
+                         int(rec.get("amount_sats", 0) or 0)),
+                    )),
+                    preconditions=(),
+                    priority=50,
+                    budget_bucket="boltz",
+                    origin_policy="boltz_cycle",
+                    reversible=False,
+                )
+                envs.append(env)
+                recs_with_keys.append((rec, env.idempotency_key))
+            except Exception:
+                recs_with_keys.append((rec, None))  # keep (fail open)
+        arbitration = arbitrate(envs, now=now)
+        surviving = {env.idempotency_key for env in arbitration.ordered}
+        ledger = None
+        if econ_shadow is not None:
+            try:
+                ledger = econ_shadow.ledger_for_reconciliation()
+            except Exception:
+                ledger = None
+        if ledger is not None:
+            for env, code, detail in arbitration.rejected:
+                try:
+                    ledger.append(
+                        event_type="intent_rejected",
+                        intent_id=env.intent_id.value,
+                        idempotency_key=env.idempotency_key,
+                        cycle_id=cycle_id,
+                        at=now,
+                        details={"reason_code": code,
+                                 "arbitration": True, "batch": True},
+                    )
+                except Exception:
+                    pass
+        seen = set()
+        survivors = []
+        for rec, key in recs_with_keys:
+            if key is None:
+                survivors.append(rec)
+            elif key in surviving and key not in seen:
+                seen.add(key)
+                survivors.append(rec)
+        return survivors
+    except Exception as _arb_err:
+        try:
+            plugin.log(f"boltz arbitration failed open: {_arb_err}",
+                       level="warn")
+        except Exception:
+            pass
+        return recommendations
+
+
 def _execute_boltz_balance_cycle(
     *,
     dry_run: bool = True,
@@ -9578,6 +9674,10 @@ def _execute_boltz_balance_cycle(
         return plan
 
     recommendations = list(plan.get("recommendations", []))
+    # Workstream H cutover: batch-arbitrate the recommendation list
+    # (dedup + ledgered rejections; legacy plan order preserved among
+    # survivors). Fail-open.
+    recommendations = _arbitrate_boltz_recommendations(recommendations)
     budget = plan.get("budget", {}) if isinstance(plan.get("budget"), dict) else {}
     remaining_budget = int(budget.get("remaining_24h_sats_estimate", 0) or 0)
     # P1-012 class: coerce operator-supplied cooldown_hours; a non-numeric must

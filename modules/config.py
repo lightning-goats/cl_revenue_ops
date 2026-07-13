@@ -107,6 +107,9 @@ PUBLIC_RUNTIME_KEYS = (
     # Workstream H cutover: planner close list passes through batch
     # arbitration (dedup + selection-time conflict arming). Default off.
     'econ_cycle_planner_enabled',
+    # Workstream H cutover: Boltz balance-cycle recommendations pass
+    # through batch arbitration (dedup, ledgered). Default off.
+    'econ_cycle_boltz_enabled',
     # LN+ liquidity swap automation (13 runtime controls)
     'lnplus_swaps_enabled',
     'lnplus_execute_applications',
@@ -181,6 +184,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'econ_arbiter_enabled': bool,
     'econ_cycle_rebalance_enabled': bool,
     'econ_cycle_planner_enabled': bool,
+    'econ_cycle_boltz_enabled': bool,
     'expansion_treasury_enabled': bool,
     'expansion_treasury_onchain_target_sats': int,
     'expansion_treasury_min_deficit_sats': int,
@@ -493,6 +497,8 @@ class Config:
     econ_cycle_rebalance_enabled: bool = False
     # Workstream H: cycle-arbitrated planner close list.
     econ_cycle_planner_enabled: bool = False
+    # Workstream H: cycle-arbitrated Boltz recommendations.
+    econ_cycle_boltz_enabled: bool = False
     # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
     expansion_treasury_enabled: bool = False
     expansion_treasury_onchain_target_sats: int = 5_000_000
@@ -1216,6 +1222,7 @@ class ConfigSnapshot:
     econ_arbiter_enabled: bool = False
     econ_cycle_rebalance_enabled: bool = False
     econ_cycle_planner_enabled: bool = False
+    econ_cycle_boltz_enabled: bool = False
     # E-2: class-aware min-fee floor for saturated/source channels (0 =
     # allow true cheap egress). Missing-from-snapshot kills the feature in
     # production (getattr fallback), so it MUST be mirrored here.
