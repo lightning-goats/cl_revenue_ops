@@ -78,3 +78,21 @@ closure of Phase 2 therefore requires OPERATOR ACCEPTANCE of:
 With acceptance, Phase 3 (single classification authority, unified
 rebalancer modes, lifecycle/protection ownership, adapter isolation)
 opens on a governed, audited, restart-proven foundation.
+
+## Operator acceptance (2026-07-13)
+
+Sat ACCEPTED dispositions (a), (b), (c). **Phase 2 is formally closed;
+Phase 3 is open.** The accepted deferrals are tracked as Phase 3
+inherited work: ledger authorization authority, history projections;
+flag-hardening remains Phase 5.
+
+### Phase 3 tranche order (planned)
+
+| Tranche | Item | Rationale |
+|---|---|---|
+| 3A | Admission-control extraction (htlc_max out of FeeController) | smallest seam, fully goldened, establishes the policy-extraction pattern |
+| 3B | Single classification authority (ChannelState vs role_30d) | widest consumer base; golden role fixtures are the parity oracle |
+| 3C | Lifecycle/protection ownership service | close pipeline is live; consolidates no_close/LN+/hot-channel/close-protection |
+| 3D | Rebalance-mode consolidation (hot/normal/structural/manual/diagnostic) | Workstream F4 |
+| 3E | Adapter isolation formalization (Boltz subprocess, LN+ HTTP) | builds on governed wrappers |
+| 3F | Arbiter live activation + ledger authorization authority + history projections | inherited Phase 2 deferrals; needs 3A–3D intents flowing |
