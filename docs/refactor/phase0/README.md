@@ -174,8 +174,17 @@ Suite after tranche: **3352 passed**.
   calculator — with 2J the FOUR budget implementations share ONE
   reservation store.
 
-**Remaining Phase 2 work:** the exit-gate review (restart/live evidence
-across all governed paths).
+**Phase 2 CLOSED 2026-07-13** (exit review + operator acceptance:
+`phase2-exit-review.md`). Inherited deferrals tracked under Phase 3F.
+
+## Phase 3A — admission-control extraction (2026-07-13)
+
+`modules/admission_policy.py` now owns the dynamic htlc_max valve
+(Workstream F3): pure functions of (cfg, channel_info, flow_state),
+constants moved verbatim, FeeController reduced to delegating shims +
+constant aliases. Zero golden-fixture changes — the Phase 0 htlcmax
+goldens prove byte-identical extraction. Pattern established for the
+remaining Phase 3 policy extractions.
 
 ## Contradictions
 

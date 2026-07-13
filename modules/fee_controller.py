@@ -65,6 +65,7 @@ from enum import Enum
 from pyln.client import Plugin, RpcError
 
 from .config import Config, ChainCostDefaults, LiquidityBuckets
+from . import admission_policy as _admission_policy
 from .database import Database
 from .policy_manager import PolicyManager, FeeStrategy, PeerPolicy
 from .utils import normalize_scid, parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
@@ -2862,14 +2863,17 @@ class FeeController:
     # its flow class (observed live: 0 sats local advertising ~4.95M htlc_max
     # — inviting doomed HTLCs). htlc_max = min(flow-class cap, depletion cap)
     # where depletion cap = clamp(spendable x 0.85, 10k sats, capacity).
-    HTLCMAX_DEPLETION_SPENDABLE_FRACTION = 0.85
-    HTLCMAX_FLOOR_MSAT = 10_000_000  # 10k sats — existing valve floor
+    # Phase 3A: canonical values live in modules/admission_policy.py;
+    # these class aliases keep existing consumers (and the Phase 0
+    # golden anchors) working unchanged.
+    HTLCMAX_DEPLETION_SPENDABLE_FRACTION = _admission_policy.DEPLETION_SPENDABLE_FRACTION
+    HTLCMAX_FLOOR_MSAT = _admission_policy.FLOOR_MSAT
     # Gossip-churn guard: the class-keyed valve only rebroadcast on flow-state
     # transitions; the depletion term varies with every forward. An htlcmax
     # delta alone forces a setchannel broadcast ONLY when it moves more than
     # this fraction of the currently advertised value (it still piggybacks
     # exactly on any broadcast that happens anyway).
-    HTLCMAX_UPDATE_DEADBAND_FRAC = 0.10
+    HTLCMAX_UPDATE_DEADBAND_FRAC = _admission_policy.UPDATE_DEADBAND_FRAC
 
     def _compute_dynamic_htlcmax_msat(
         self,
@@ -2877,51 +2881,19 @@ class FeeController:
         channel_info: Dict[str, Any],
         flow_state: str,
     ) -> Optional[int]:
-        """Return the valve's target htlc_max (msat), or None when disabled.
-
-        Keeps the operator's flow-class pct knobs as the UPPER shape and
-        applies the live-depletion cap whenever the valve is enabled.
-        """
-        enabled = getattr(cfg, 'enable_dynamic_htlcmax', False)
-        if isinstance(enabled, str):
-            enabled = enabled.lower() in ("true", "1", "yes")
-        else:
-            enabled = enabled is True
-        if not enabled:
-            return None
-        capacity_msat = sats_to_base(channel_info.get("capacity", 0))
-        if capacity_msat <= 0:
-            return None
-        if flow_state == "source":
-            target_msat = int(capacity_msat * cfg.htlcmax_source_pct)
-        elif flow_state == "sink":
-            target_msat = int(capacity_msat * cfg.htlcmax_sink_pct)
-        else:
-            target_msat = int(capacity_msat * cfg.htlcmax_balanced_pct)
-
-        # E-1: live-depletion cap — spendable outbound is what can actually
-        # forward; advertising more invites doomed HTLCs.
-        spendable_msat = parse_msat(channel_info.get("spendable_msat", 0))
-        depletion_cap_msat = int(
-            spendable_msat * self.HTLCMAX_DEPLETION_SPENDABLE_FRACTION
-        )
-        target_msat = min(target_msat, depletion_cap_msat)
-
-        # Safety bounds: never below 10,000 sats or above capacity.
-        return max(self.HTLCMAX_FLOOR_MSAT, min(target_msat, capacity_msat))
+        """Phase 3A: DELEGATING SHIM — admission control is its own
+        policy now (modules/admission_policy.py, Workstream F3). Kept so
+        every existing caller and the Phase 0 golden fixtures stay
+        byte-identical."""
+        from .admission_policy import compute_htlcmax_msat
+        return compute_htlcmax_msat(cfg, channel_info, flow_state)
 
     def _htlcmax_delta_exceeds_deadband(
         self, new_msat: int, current_msat: int
     ) -> bool:
-        """True when the htlcmax move is big enough to justify a broadcast
-        on its own (E-1 churn guard; see HTLCMAX_UPDATE_DEADBAND_FRAC)."""
-        new_msat = int(new_msat)
-        current_msat = int(current_msat)
-        if new_msat == current_msat:
-            return False
-        if current_msat <= 0:
-            return True  # unset/zero on chain: always advertise the valve
-        return abs(new_msat - current_msat) > current_msat * self.HTLCMAX_UPDATE_DEADBAND_FRAC
+        """Phase 3A: delegating shim (see modules/admission_policy.py)."""
+        from .admission_policy import delta_exceeds_deadband
+        return delta_exceeds_deadband(new_msat, current_msat)
 
     # =============================================================================
     # GOSSIP REFRESH FOR FROZEN CHANNEL DETECTION
