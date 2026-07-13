@@ -2978,6 +2978,17 @@ class FeeController:
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
 
+        # PR 3e (gap-closure Phase B): per-cycle observation freeze.
+        # Active ({}) only around _adjust_all_fees_inner; None means no
+        # cycle -> every read is pure legacy passthrough. Within a cycle
+        # each observation (market prior, neighbor stats, inbound
+        # gossip, chain costs, channel state) is computed at most once
+        # and is immutable — the policy cannot observe a mid-cycle TTL
+        # refresh or gossip change. DTS+PID controller state is
+        # deliberately NOT frozen here (Phase C: controller_state is a
+        # distinct input).
+        self._cycle_observations: Optional[Dict] = None
+
         # PERF: per-channel memo of the persisted shared fields
         # (last_gossip_refresh / last_broadcast_at / dynamic_htlcmin_baseline_msat).
         # Lets _build_merged_fee_strategy_row skip the full-row DB re-read
@@ -3114,7 +3125,58 @@ class FeeController:
             return int(datetime.now(timezone.utc).hour)
 
 
+    # ------------------------------------------------------------------
+    # PR 3e: per-cycle frozen observations. Each wrapper memoizes its
+    # _live body for the duration of one fee cycle (memo active) and is
+    # a pure passthrough otherwise. Freezing at first use inside the
+    # cycle keeps the FIRST computation byte-identical to legacy.
+    # ------------------------------------------------------------------
+    def _frozen_observation(self, key, compute):
+        memo = self._cycle_observations
+        if memo is None:
+            return compute()
+        if key not in memo:
+            memo[key] = compute()
+        return memo[key]
+
     def _get_network_fee_prior(self, peer_id: str, scid: str) -> dict | None:
+        return self._frozen_observation(
+            ("network_prior", str(peer_id), str(scid)),
+            lambda: self._get_network_fee_prior_live(peer_id, scid))
+
+    def _get_peer_inbound_channels(self, peer_id: str,
+                                   ttl_seconds: int = 1800,
+                                   force_refresh: bool = False) -> list:
+        return self._frozen_observation(
+            ("inbound_channels", str(peer_id)),
+            lambda: self._get_peer_inbound_channels_live(
+                peer_id, ttl_seconds=ttl_seconds,
+                force_refresh=force_refresh))
+
+    def _get_neighbor_fee_median(self, peer_id: str,
+                                 cfg: Optional[Any] = None) -> int | None:
+        return self._frozen_observation(
+            ("neighbor_median", str(peer_id)),
+            lambda: self._get_neighbor_fee_median_live(peer_id, cfg))
+
+    def _get_neighbor_fee_percentile(self, peer_id: str, pct: float,
+                                     cfg: Optional[Any] = None) -> int | None:
+        return self._frozen_observation(
+            ("neighbor_pct", str(peer_id), float(pct)),
+            lambda: self._get_neighbor_fee_percentile_live(
+                peer_id, pct, cfg))
+
+    def _get_dynamic_chain_costs(self) -> Optional[Dict[str, int]]:
+        return self._frozen_observation(
+            ("chain_costs",),
+            lambda: self._get_dynamic_chain_costs_live())
+
+    def _get_channels_info(self) -> Dict[str, Dict[str, Any]]:
+        return self._frozen_observation(
+            ("channels_info",),
+            lambda: self._get_channels_info_live())
+
+    def _get_network_fee_prior_live(self, peer_id: str, scid: str) -> dict | None:
         """Get informed prior from network gossip data for a channel.
 
         Uses the peer's own fee rates as a market signal, weighted by
@@ -3206,7 +3268,7 @@ class FeeController:
             return max(2 * interval, 3900)
         return 3900
 
-    def _get_peer_inbound_channels(
+    def _get_peer_inbound_channels_live(
         self,
         peer_id: str,
         ttl_seconds: int = 1800,
@@ -3259,7 +3321,7 @@ class FeeController:
         return None
 
 
-    def _get_neighbor_fee_median(self, peer_id: str, cfg: Optional[Any] = None) -> int | None:
+    def _get_neighbor_fee_median_live(self, peer_id: str, cfg: Optional[Any] = None) -> int | None:
         """Get median fee charged by other nodes to the same peer.
 
         Uses gossip-based listchannels data only.
@@ -3364,7 +3426,7 @@ class FeeController:
             base = ch.get("fee_base_msat")
         return base == 1000
 
-    def _get_neighbor_fee_percentile(self, peer_id: str, pct: float, cfg: Optional[Any] = None) -> int | None:
+    def _get_neighbor_fee_percentile_live(self, peer_id: str, pct: float, cfg: Optional[Any] = None) -> int | None:
         """Return the `pct`-th percentile of competitor fees for this peer.
 
         Phase D.1 (2026-04-23): competition_aware originally preserved DTS
@@ -4415,9 +4477,14 @@ class FeeController:
                 )
                 self.plugin.log("Fee adjustment suppressed: revenue-ops is paused", level='info')
                 return []
-            return self._adjust_all_fees_inner(
-                prefetched_channels=prefetched_channels, cfg=cfg
-            )
+            # PR 3e: freeze this cycle's observations; always thawed.
+            self._cycle_observations = {}
+            try:
+                return self._adjust_all_fees_inner(
+                    prefetched_channels=prefetched_channels, cfg=cfg
+                )
+            finally:
+                self._cycle_observations = None
         finally:
             self._state_lock.release()
 
@@ -7527,14 +7594,28 @@ class FeeController:
             )
             if ledger is not None:
                 try:
+                    details = {"target": env.target, "governed": True,
+                               "explanation": env.explanation.render()}
+                    # PR 3e: canonical-snapshot linkage as EVIDENCE only —
+                    # the timestamped label keeps its identity semantics
+                    # (same rationale as LN+; the idempotency key hashes
+                    # snapshot_id).
+                    try:
+                        shadow = getattr(self, "econ_shadow", None)
+                        snap_ref = (shadow.snapshot_ref(now)
+                                    if shadow is not None else None)
+                        if snap_ref and snap_ref.get("snapshot_id"):
+                            details["canonical_snapshot_id"] = str(
+                                snap_ref["snapshot_id"])
+                    except Exception:
+                        pass
                     ledger.append(
                         event_type="intent_proposed",
                         intent_id=env.intent_id.value,
                         idempotency_key=env.idempotency_key,
                         cycle_id=env.snapshot_id,
                         at=now,
-                        details={"target": env.target, "governed": True,
-                                 "explanation": env.explanation.render()},
+                        details=details,
                     )
                 except Exception:
                     pass
@@ -8169,7 +8250,7 @@ class FeeController:
 
         return max(1, int(floor_ppm))
     
-    def _get_dynamic_chain_costs(self) -> Optional[Dict[str, int]]:
+    def _get_dynamic_chain_costs_live(self) -> Optional[Dict[str, int]]:
         """
         Get dynamic chain cost estimates from feerates RPC.
         
@@ -8328,7 +8409,7 @@ class FeeController:
     # Heuristic Helper Methods
     # =========================================================================
 
-    def _get_channels_info(self) -> Dict[str, Dict[str, Any]]:
+    def _get_channels_info_live(self) -> Dict[str, Dict[str, Any]]:
         """
         Get current info for all channels.
 

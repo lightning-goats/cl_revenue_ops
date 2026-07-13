@@ -167,12 +167,20 @@ with a freshness gate rather than per-cycle injection:
    retry dedup for contractual opens. The canonical-snapshot linkage is
    recorded as ledger EVIDENCE (`canonical_snapshot_id` in the
    intent_proposed details) instead.
-5. **3e fees** (LAST, highest risk): snapshot-sourced market prior,
-   neighbor stats, chain costs, channel state (:3126/:3276/:3382/
-   :3230/:8185/:8341); DTS+PID controller state explicitly EXCLUDED
-   from migration (Phase C contract keeps `controller_state` a
-   distinct input); byte-parity goldens on identical inputs before any
-   flag flip; snapshot_id threading (:7511).
+5. **3e fees — DONE (2026-07-13)**: per-cycle observation freeze. The
+   six flagged reads (market prior, neighbor median/percentile TTL
+   caches, inbound gossip, chain feerates, channel state) are wrapped
+   by `_frozen_observation` — a memo active only around
+   `_adjust_all_fees_inner` (always thawed in a finally). Within one
+   fee cycle each observation computes at most once and is immutable;
+   the policy cannot observe a mid-cycle TTL refresh or gossip change.
+   Memo inactive (manual sets, RPC debug, prefetch) = pure legacy
+   passthrough; the first in-cycle computation is byte-identical to
+   legacy (all 88 goldens unchanged). DTS+PID controller state
+   deliberately excluded (Phase C: `controller_state` is a distinct
+   input). Fee intents keep timestamped identity labels (LN+
+   rationale); `canonical_snapshot_id` recorded as ledger evidence in
+   `intent_proposed` details.
 
 Staleness: the governor already rejects stale envelopes (`STALE`);
 migration makes that gate meaningful by having intents carry real
