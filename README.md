@@ -13,13 +13,29 @@ Core Lightning owns node runtime.
 
 `cl_revenue_ops` is the local executor: it decides what is safe, applies local budgets and policy, and uses Core Lightning RPCs for execution when operator controls allow it.
 
+## Economic Governance
+
+Every economic mutation — fee broadcasts (including `htlc_max`), rebalances, channel opens/closes, Boltz swaps, LN+ obligations — flows through one governed core:
+
+```text
+canonical EconomicSnapshot -> typed intents -> arbiter -> governor -> execution -> append-only ledger
+```
+
+- **Typed intents**: each action is an idempotent envelope carrying its EV, confidence, cost cap, and snapshot reference.
+- **Arbiter**: duplicate, stale, and conflicting intents (close-vs-rebalance, duplicate opens, rebalance-vs-structural-swap, contradictory fee changes) are rejected with stable reason codes, both in batch and live via a shared registry.
+- **Governor**: fail-closed authorization on every path — pause gate, `authority_level` gate, conflict registry, staleness, then atomic budget reservation. LN+ obligation fulfillment is exempt from pause/authority (an accepted swap is a debt) but never from authorization or the ledger.
+- **Ledger**: an append-only event log (`econ_ledger.db`) with hourly self-reconciliation against the reservation store; replay reconstructs state.
+- All of it is flag-gated (`econ_*` runtime keys, `revenue-config list-mutable` shows them) with instant per-capability rollback.
+
+The wire contracts are versioned and language-neutral: see [`schemas/`](schemas/) (economic_snapshot, intent, ledger_event, ledger_projection, conformance_case), the conformance corpus under `tests/conformance/scenarios/` (40 scenario classes, validated by the standalone `tools/conformance/validate_fixtures.py`), and [ADR-001](docs/refactor/adr/ADR-001-dts-pid-fee-controller.md) for the fee-controller contract (DTS+PID is authoritative; rails -> rate-limit -> deadband -> cooldown).
+
 ## What Operators Need To Know
 
 - This is the executor. It owns local fee execution, rebalance execution, planner/capex decisions, profitability analysis, and budgets.
 - All spending decisions are local and bounded by this plugin's controls.
 - Live rebalances execute through `RebalanceEngineV2` using native explicit-route execution; route discovery is pinned to the `v3`/askrene router path.
 - There is no Sling dependency.
-- The normal runtime controls are `paused`, `daily_budget_sats`, fee rails, and planner execution caps. (`fee_market_boundary_*` and `rebalance_min_profit` are deprecated no-ops kept only for config-file compatibility — see Day-1 Operator Workflow.)
+- The normal runtime controls are `paused`, `daily_budget_sats`, fee rails, `authority_level` (what the node MAY do: `observe` < `fees` < `liquidity` < `capital`), `risk_profile` (coherent economic-risk defaults: `preserve`/`conservative`/`balanced`/`growth`/`custom`; preview any change with `revenue-profile-preview` before activating), and planner execution caps. (`fee_market_boundary_*` and `rebalance_min_profit` are deprecated no-ops scheduled for removal after the announced 2026-08-12 compatibility window — see `docs/refactor/phase0/contract-compatibility-policy.md`.)
 - The primary operator surfaces are `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug`.
 - The normal workflow is decision explainability first, knob tuning second.
 - Auto fee bands are enabled by default. Manual policy bands are fallback only when an auto band is not yet available.
@@ -201,7 +217,7 @@ lightning-cli plugin start ~/.lightning/plugins/cl_revenue_ops/cl-revenue-ops.py
 
 ## Production Validation Automation
 
-This repo includes a read-only daily validation pipeline for tracking the production effect of recent fee, capex, and rebalance changes across `lnnode` and `hive-nexus-02`.
+This repo includes a read-only daily validation pipeline for tracking the production effect of recent fee, capex, and rebalance changes on `lnnode` (single production node since 2026-07-11). It also feeds the running production economic evaluation (`docs/refactor/phase0/production-evaluation-spec.md`, window ending 2026-08-12).
 
 - Edit `config/revenue_validation.yaml` and replace each node `t0` placeholder with the actual deploy timestamp before enabling the timer.
 - The timer runs once per day at `06:00` in the control host's local timezone. The intended host timezone for this workflow is `America/Denver`.
@@ -235,7 +251,7 @@ Saved artifacts:
 ## Day-1 Operator Workflow
 
 1. Start the plugin and check `revenue-status`.
-2. Set only the safety rails you actually want to constrain: `paused`, `daily_budget_sats`, `min_fee_ppm`, `max_fee_ppm`, and `fee_profile`. (The `fee_market_boundary_*` controls and `rebalance_min_profit` are deprecated no-ops kept only for config compatibility; they have no effect — minimum-profit gating is now enforced by the sats-EV gate and `rebalance_hold_margin`.)
+2. Set only the safety rails you actually want to constrain: `paused`, `daily_budget_sats`, `min_fee_ppm`, `max_fee_ppm`, `fee_profile`, and `authority_level` (default `capital`; dial DOWN to restrict what the node may do). `risk_profile` stays `custom` unless you explicitly adopt a bundle — run `revenue-profile-preview <name>` first to see the exact diff. (The `fee_market_boundary_*` controls and `rebalance_min_profit` are deprecated no-ops with an announced removal date of 2026-08-12; minimum-profit gating is enforced by the sats-EV gate and `rebalance_hold_margin`.)
 3. Let the executor run.
 4. Use `revenue-fee-debug` and `revenue-rebalance-debug` to understand holds, clamps, and actions before touching anything else.
 Example runtime adjustments:
@@ -260,6 +276,10 @@ lightning-cli revenue-config set daily_budget_sats 10000
 | `revenue-analyze` | Trigger immediate analysis |
 | `revenue-wake-all` | Wake the background loops immediately |
 | `revenue-planner-candidate-sources` | Diagnostic: candidate pipeline strategy breakdown |
+| `revenue-profile-preview [name]` | Diagnostic: risk-profile diff/comparison before activation |
+| `revenue-econ-snapshot` | Diagnostic: the canonical economic snapshot (governance core) |
+| `revenue-econ-reconcile` | Diagnostic: ledger-vs-reservations reconciliation state |
+| `revenue-econ-cycle` | Diagnostic: deterministic shadow economic cycle |
 
 See [docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md) for the full action/mutation RPC inventory across all subsystems (fees, rebalancing, planner, Boltz, LN+).
 
@@ -282,8 +302,13 @@ The read-only operator surfaces `revenue-status`, `revenue-fee-debug`, and `reve
 - Contract index: [docs/contracts/README.md](docs/contracts/README.md)
 - Standalone independence audit: [docs/audits/2026-05-19-standalone-independence-audit.md](docs/audits/2026-05-19-standalone-independence-audit.md)
 - Hive/mycelium removal record: [docs/audit/HIVE_REMOVAL_PLAN.md](docs/audit/HIVE_REMOVAL_PLAN.md)
+- Economic-core wire contracts: [schemas/](schemas/) + compatibility policy: [docs/refactor/phase0/contract-compatibility-policy.md](docs/refactor/phase0/contract-compatibility-policy.md)
+- Fee-controller contract (ADR-001): [docs/refactor/adr/ADR-001-dts-pid-fee-controller.md](docs/refactor/adr/ADR-001-dts-pid-fee-controller.md)
+- Refactor completion review: [docs/refactor/phase0/completion-review.md](docs/refactor/phase0/completion-review.md)
+- Governance evidence report: [docs/refactor/phase0/governance-evidence-report.md](docs/refactor/phase0/governance-evidence-report.md)
 
 ## More Detail
 
 - Minimal config example: [config/cl-revenue-ops.conf.minimal](config/cl-revenue-ops.conf.minimal)
 - Full config example: [config/cl-revenue-ops.conf.full](config/cl-revenue-ops.conf.full)
+- Note: the governance keys (`econ_*`, `authority_level`, `risk_profile`) are RUNTIME controls (`revenue-config set`), not config-file options — `revenue-config list-mutable` enumerates them.
