@@ -1100,91 +1100,14 @@ class CapacityPlanner:
         flow_metrics,
         route_pair_channels,
     ) -> Optional[str]:
-        """Return why a channel must not be recommended for closure, or None.
-
-        Single source of truth for the protective closure gates used by both
-        the regular loser pipeline and the dead-capital staging pipeline:
-        - Kalman confidence gate (unreliable flow data)
-        - Inbound-gateway ROI protection
-        - Sourced-fee-contribution protection
-        - Route-pair (revenue route) protection
-        """
-        from .profitability_analyzer import ChannelRole
-
-        # Kalman confidence gate -- block closure only when the Kalman
-        # estimate is load-bearing (recent/mixed activity with low
-        # confidence). F3 (audit): zero forwards over a full window FORCES
-        # confidence to the 0.1 floor, and the dead-capital path REQUIRES
-        # zero forwards — gating on bare confidence made CLOSE unreachable
-        # (staging parked at DEFIBRILLATE forever). Zero flow over a full
-        # window on a mature channel is HIGH-confidence evidence of
-        # inactivity: the inactivity itself is the signal.
-        if flow_metrics:
-            confidence = getattr(flow_metrics, 'confidence', 1.0)
-            # Guard against non-numeric (e.g. MagicMock) or None
-            if not isinstance(confidence, (int, float)):
-                confidence = 1.0
-            confidence = confidence or 1.0
-            if confidence < 0.5 and not self._inactivity_is_signal(prof, flow_metrics):
-                return "KALMAN_LOW_CONFIDENCE"  # Don't recommend closure with unreliable data
-
-        # Channel role protection -- INBOUND_GATEWAYs source volume for all
-        # outbound channels; closing one has outsized negative impact.
-        # Audit F2: judged on the TRAILING 30d WINDOW (role_30d), not the
-        # lifetime role — a channel that sourced volume months ago decayed
-        # to DORMANT and must not stay a protected gateway forever (that
-        # held proven-dead channels at DEFIBRILLATE daily, 2026-07-12).
-        # role_30d itself falls back to the lifetime role when no 30d
-        # window was fetched; the getattr fallback covers legacy objects.
-        channel_role = getattr(prof, 'role_30d', None)
-        if channel_role is None:
-            channel_role = getattr(prof, 'channel_role', None)
-        is_inbound_gateway = False
-        try:
-            if channel_role is not None:
-                if isinstance(channel_role, ChannelRole):
-                    is_inbound_gateway = channel_role == ChannelRole.INBOUND_GATEWAY
-                elif hasattr(channel_role, 'value'):
-                    is_inbound_gateway = channel_role.value in ('INBOUND_GATEWAY', 'inbound_gateway')
-                else:
-                    is_inbound_gateway = str(channel_role) in ('INBOUND_GATEWAY', 'inbound_gateway')
-        except Exception:
-            pass
-
-        # Protect inbound gateways — they source traffic for the fleet
-        if is_inbound_gateway and prof.marginal_roi_percent >= -30.0:
-            return "INBOUND_GATEWAY"  # Protect inbound gateways (tighter threshold)
-
-        # Protect channels that source significant fee contribution
-        # regardless of their own ROI — they enable other channels' revenue.
-        # Audit F2: judged on the TRAILING 30d WINDOW — the all-time figure
-        # kept channels that sourced fees months ago protected forever. The
-        # lifetime figure remains the fail-safe fallback when no 30d window
-        # was fetched (missing data must not weaken protection).
-        if getattr(prof, 'window_30d_available', False) is True:
-            sourced_fee_raw = getattr(prof, 'sourced_fee_30d_msat', 0)
-            try:
-                sourced_fee_sats = int(sourced_fee_raw) // 1000
-            except (TypeError, ValueError):
-                sourced_fee_sats = 0
-        else:
-            sourced_fee_sats = getattr(getattr(prof, 'revenue', None), 'sourced_fee_contribution_sats', 0)
-            try:
-                sourced_fee_sats = int(sourced_fee_sats)
-            except (TypeError, ValueError):
-                sourced_fee_sats = 0
-        if sourced_fee_sats > 100 and prof.marginal_roi_percent > -50.0:
-            return "SOURCED_FEE_CONTRIBUTION"  # Protect significant inbound sources
-
-        # Route-pair protection: channels on proven revenue routes have network value
-        # beyond their individual ROI.  Closing one kills the paired channel's revenue.
-        is_on_revenue_route = scid_display in (route_pair_channels or set())
-        if is_on_revenue_route:
-            # Revenue route channels: protect until -30% ROI
-            if prof.marginal_roi_percent > -30.0:
-                return "REVENUE_ROUTE"  # Protect revenue route channels
-
-        return None
+        """Phase 3C: delegating shim — the protective closure gates live
+        in the protection service (modules/protection_service.py), which
+        is now their single owner. Reason strings unchanged (pinned by
+        tests/golden/fixtures/close_protection/)."""
+        from .protection_service import close_protection_reason
+        return close_protection_reason(
+            scid_display, prof, flow_metrics, route_pair_channels,
+            flow_window_days=self._flow_window_days())
 
     def _flow_window_days(self) -> int:
         """Resolve the flow-analysis window length in days (default 7)."""
@@ -3573,23 +3496,12 @@ class CapacityPlanner:
         try:
             policy = self.policy_manager.get_policy(peer_id)
 
-            # Static and passive policy channels are never auto-closed
-            strategy = policy.strategy
-            strategy_str = strategy.value if hasattr(strategy, 'value') else str(strategy)
-            if strategy_str == "static":
-                return False, "Channel has static policy — close blocked"
-            if strategy_str == "passive":
-                return False, "Channel has passive policy — close blocked"
-
-            # Protected channels are never closed
-            if hasattr(policy, 'has_tag'):
-                if policy.has_tag("protect") or policy.has_tag("no_close"):
-                    tag = "protect" if policy.has_tag("protect") else "no_close"
-                    return False, f"Channel tagged '{tag}' — close blocked"
-            elif hasattr(policy, 'tags') and policy.tags:
-                for tag in ("protect", "no_close"):
-                    if tag in policy.tags:
-                        return False, f"Channel tagged '{tag}' — close blocked"
+            # Phase 3C: the policy-gate decision lives in the protection
+            # service; this caller keeps its fail-closed wrapper.
+            from .protection_service import policy_close_block
+            blocked = policy_close_block(policy)
+            if blocked:
+                return False, blocked
 
         except Exception as e:
             self.plugin.log(f"Policy check failed for {peer_id[:12]}...: {e}", level='warn')

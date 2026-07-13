@@ -198,6 +198,20 @@ evidence (DB reads/DTS widening stay in the analyzers). Zero golden or
 existing-test changes: byte-identical extraction. Resolves Phase 0
 duplication finding #1 (decision-owners.md).
 
+## Phase 3C — lifecycle/protection ownership service (2026-07-13)
+
+`modules/protection_service.py` is the single owner of "may this channel
+be closed": the economic close-protection gates (5e8f747 semantics,
+verbatim), the operator policy gate, and the LN+ contract window — all
+pure, evidence-injected, expressed as owned expiring `Protection`
+records (the canonical wire type). Includes the spec's explicit
+`ChannelLifecycle` model (values pinned equal to the snapshot schema
+enum) with a minimal v0 derivation. The capacity planner now delegates
+both `_close_protection_reason` and the `_check_close_allowed` policy
+core. Zero golden changes — all 14 close-protection fixtures
+byte-identical. Resolves Phase 0 duplication finding: protections were
+distributed across four owners.
+
 ## Contradictions
 
 Places where the repository contradicts an assumption in
