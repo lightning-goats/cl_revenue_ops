@@ -262,3 +262,66 @@ def resolve_profile(profile: Any,
     explicit = set(explicit_keys or ())
     return {key: value for key, value in bundle.items()
             if key not in explicit}
+
+
+def preview_profile(current_values: Dict[str, Any], profile: Any,
+                    explicit_keys: Iterable[str]) -> Dict[str, Any]:
+    """PR 8: read-only preview of what selecting `profile` would change
+    at the next restart, against the CURRENT effective values.
+
+    Per bundle key: current value, profile value, whether an explicit
+    override blocks the profile (precedence), and whether the key would
+    actually change. Includes a contradiction pre-check over the merged
+    result for the known cross-field pair the bundles can affect
+    (daily vs weekly budget). Never mutates anything."""
+    name = str(profile or "").strip().lower()
+    if name not in PROFILE_BUNDLES:
+        return {"error": f"unknown profile: {profile!r}",
+                "valid_profiles": list(PROFILE_NAMES)}
+    explicit = set(explicit_keys or ())
+    bundle = PROFILE_BUNDLES[name]
+    changes, blocked, unchanged = [], [], []
+    merged = dict(current_values)
+    for key in sorted(bundle):
+        profile_value = bundle[key]
+        current = current_values.get(key)
+        entry = {"key": key, "current": current,
+                 "profile_value": profile_value}
+        if key in explicit:
+            entry["blocked_by"] = "explicit_override"
+            blocked.append(entry)
+        elif current == profile_value:
+            unchanged.append(entry)
+        else:
+            merged[key] = profile_value
+            changes.append(entry)
+    contradictions = []
+    try:
+        daily = merged.get("daily_budget_sats")
+        weekly = merged.get("weekly_budget_sats")
+        if isinstance(daily, (int, float)) and isinstance(weekly,
+                                                          (int, float)) \
+                and daily > weekly:
+            contradictions.append(
+                f"daily_budget_sats ({daily}) > weekly_budget_sats "
+                f"({weekly}) in the merged result; the weekly cap "
+                f"binds first")
+    except Exception:
+        pass
+    return {
+        "profile": name,
+        "would_change": changes,
+        "blocked_by_explicit_override": blocked,
+        "already_equal": unchanged,
+        "contradiction_precheck": contradictions,
+        "activation": "takes effect at plugin restart after "
+                      "`revenue-config set risk_profile " + name + "`",
+    }
+
+
+def preview_all(current_values: Dict[str, Any],
+                explicit_keys: Iterable[str]) -> Dict[str, Any]:
+    """PR 8 observe-only comparison: every profile's delta from the
+    current effective configuration, side by side."""
+    return {name: preview_profile(current_values, name, explicit_keys)
+            for name in PROFILE_NAMES if name != "custom"}

@@ -5585,6 +5585,51 @@ def revenue_hot_channel_protection_peers(plugin: Plugin, action: str = "list", p
         return {"error": str(e)}
 
 
+@plugin.method("revenue-profile-preview")
+def revenue_profile_preview(plugin: Plugin,
+                            profile: Optional[str] = None) -> Dict[str, Any]:
+    """READ-ONLY risk-profile preview/diff (gap-closure Phase D, PR 8).
+
+    With `profile`: what selecting it would change at the next restart —
+    per-key current vs profile value, explicit-override precedence
+    blocks, contradiction pre-check. Without: the observe-only
+    comparison of every profile against current effective config.
+    Mutates nothing; activation is always the separate
+    `revenue-config set risk_profile <name>` + restart. Internal
+    diagnostic — no compatibility promise yet.
+    """
+    try:
+        if config is None or database is None:
+            return {"error": "Plugin not fully initialized"}
+        from modules.risk_profiles import (
+            PROFILE_BUNDLES,
+            preview_all,
+            preview_profile,
+        )
+        overrides = database.get_all_config_overrides() or {}
+        explicit = set(overrides) - {"risk_profile"}
+        bundle_keys = set()
+        for bundle in PROFILE_BUNDLES.values():
+            bundle_keys |= set(bundle)
+        current = {key: getattr(config, key, None) for key in bundle_keys}
+        active = str(getattr(config, "risk_profile", "custom") or "custom")
+        persisted = str(overrides.get("risk_profile", active)
+                        or active).strip().lower()
+        header = {
+            "active_profile": active,
+            "persisted_profile": persisted,
+            "pending_restart": persisted != active,
+            "explicit_override_keys": sorted(explicit & bundle_keys),
+        }
+        if profile is not None:
+            header["preview"] = preview_profile(current, profile, explicit)
+        else:
+            header["comparison"] = preview_all(current, explicit)
+        return header
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @plugin.method("revenue-config")
 def revenue_config(
     plugin: Plugin,

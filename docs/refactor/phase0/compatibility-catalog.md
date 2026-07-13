@@ -1,7 +1,7 @@
 # Public compatibility catalog (baseline 5e8f747)
 
 What the refactor MUST keep working (refactor invariants 2 and 3).
-Pin test: `tests/test_rpc_surface_inventory.py` (67 methods; 64 at baseline + econ-shadow diagnostics `revenue-econ-snapshot`, `revenue-econ-reconcile`, `revenue-econ-cycle`, NO compatibility promise yet).
+Pin test: `tests/test_rpc_surface_inventory.py` (68 methods; 64 at baseline + econ-shadow diagnostics `revenue-econ-snapshot`, `revenue-econ-reconcile`, `revenue-econ-cycle` + risk-profile diagnostic `revenue-profile-preview` (PR 8, read-only), NO compatibility promise yet).
 
 ## RPC surface
 

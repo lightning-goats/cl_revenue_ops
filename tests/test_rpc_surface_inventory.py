@@ -24,7 +24,7 @@ EXPECTED_RPC_METHODS = frozenset({
     "revenue-report", "revenue-hot-channel-protection-peers",
     "revenue-config", "revenue-dashboard", "revenue-health",
     "revenue-econ-snapshot", "revenue-econ-reconcile",
-    "revenue-econ-cycle",
+    "revenue-econ-cycle", "revenue-profile-preview",
     "revenue-cleanup-closed", "revenue-clear-reservations",
     "revenue-total-cost-budget", "revenue-capex-status",
     "revenue-spend-ledger", "revenue-spend-reserve", "revenue-spend-release",
@@ -61,5 +61,6 @@ def test_rpc_surface_matches():
 def test_expected_count():
     # 64 at baseline 5e8f747; + econ-shadow diagnostics (no compat
     # promise yet): revenue-econ-snapshot (Phase 1), revenue-econ-
-    # reconcile (Phase 2B), revenue-econ-cycle (Workstream H shadow).
-    assert len(EXPECTED_RPC_METHODS) == 67
+    # reconcile (Phase 2B), revenue-econ-cycle (Workstream H shadow),
+    # revenue-profile-preview (PR 8, read-only risk-profile diff).
+    assert len(EXPECTED_RPC_METHODS) == 68
