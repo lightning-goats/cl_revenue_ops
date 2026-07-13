@@ -303,27 +303,38 @@ def s19():
 
 
 def s20():
+    lnplus = _env("OPEN_CHANNEL", target="02" + "b" * 64,
+                  amount=2_000_000, priority=80, bucket="channel_open",
+                  policy="lnplus_lifecycle_governed")
+    planner = _env("OPEN_CHANNEL", target="02" + "b" * 64,
+                   amount=1_000_000, priority=50, bucket="channel_open",
+                   policy="planner")
+    result = arbitrate([planner, lnplus], now=NOW, extended_rules=True)
     return {"case.json": _case(
-        "open-vs-lnplus-conflict", "documented_gap",
-        {"rule": "channel open vs LN+ liquidity swap on the same peer"},
-        {"implemented": False},
-        "Spec conflict rule: open vs LN+",
-        notes=["DOCUMENTED GAP: requires LN+ JOIN intents that do not "
-               "exist yet (recorded at planner-loop cutover). The rule "
-               "must land with LN+ application intents (Phase G work "
-               "item)."])}
+        "open-vs-lnplus-conflict", "arbitration",
+        {"intents": [to_wire(planner), to_wire(lnplus)],
+         "extended_rules": True},
+        _arb_wire(result),
+        "Spec conflict rule: open vs LN+ — both paths emit OPEN_CHANNEL "
+        "to the peer; CONFLICT_DUPLICATE_OPEN rejects the lower-priority "
+        "one (the LN+ obligation at priority 80 wins)",
+        notes=["Gated by econ_conflict_rules_extended (PR 10)."])}
 
 
 def s21():
+    swap = _env("SWAP_OUT", target="111x222x0", amount=250_000,
+                bucket="rebalance", policy="boltz")
+    reb = _env("REBALANCE", target="111x222x0")
+    result = arbitrate([reb, swap], now=NOW, extended_rules=True)
     return {"case.json": _case(
-        "circular-rebalance-vs-boltz-structural", "documented_gap",
-        {"rule": "circular rebalance vs Boltz structural action on the "
-                 "same channel"},
-        {"implemented": False},
-        "Spec conflict rule: rebalance vs structural swap",
-        notes=["DOCUMENTED GAP: SWAP intents and REBALANCE intents share "
-               "the live registry but no cross-type rule exists beyond "
-               "close-vs-rebalance. Phase G work item."])}
+        "circular-rebalance-vs-boltz-structural", "arbitration",
+        {"intents": [to_wire(reb), to_wire(swap)],
+         "extended_rules": True},
+        _arb_wire(result),
+        "Spec conflict rule: rebalance vs structural swap — the "
+        "structural SWAP_OUT outranks; CONFLICT_REBALANCE_SWAP rejects "
+        "the circular rebalance (live registry blocks both directions)",
+        notes=["Gated by econ_conflict_rules_extended (PR 10)."])}
 
 
 def s22():

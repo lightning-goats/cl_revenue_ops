@@ -79,6 +79,7 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "econ_cycle_planner_enabled": "authority_control",
     "econ_cycle_boltz_enabled": "authority_control",
     "econ_ev_populated": "authority_control",
+    "econ_conflict_rules_extended": "authority_control",
     "planner_enabled": "authority_control",
     "planner_dry_run": "authority_control",
     "planner_execute_closes": "authority_control",

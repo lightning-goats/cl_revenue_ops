@@ -367,7 +367,18 @@ class EconShadow:
                 return None
             if self._intent_registry is None:
                 from .econ_arbiter import ActiveIntentRegistry
-                self._intent_registry = ActiveIntentRegistry()
+
+                def _extended_rules() -> bool:
+                    # PR 10: extra conflict rules gated by their own
+                    # flag; read live so a flip needs no restart.
+                    snap = self._config.snapshot() \
+                        if hasattr(self._config, "snapshot") \
+                        else self._config
+                    return getattr(snap, "econ_conflict_rules_extended",
+                                   False) is True
+
+                self._intent_registry = ActiveIntentRegistry(
+                    extended_rules_provider=_extended_rules)
             return self._intent_registry
         except Exception:
             return None

@@ -60,6 +60,7 @@ def test_public_runtime_keys_are_safety_only():
         "econ_cycle_planner_enabled",
         "econ_cycle_boltz_enabled",
         "econ_ev_populated",
+        "econ_conflict_rules_extended",
         "authority_level",
         "risk_profile",
         # LN+ liquidity swap automation
@@ -137,6 +138,7 @@ def test_public_runtime_dict_returns_only_public_keys():
         "econ_cycle_planner_enabled": False,
         "econ_cycle_boltz_enabled": False,
         "econ_ev_populated": False,
+        "econ_conflict_rules_extended": False,
         "authority_level": "capital",
         "risk_profile": "custom",
         "lnplus_swaps_enabled": True,
@@ -563,6 +565,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "daily_budget_sats",
         "drain_fee_discount_max",
         "econ_arbiter_enabled",
+        "econ_conflict_rules_extended",
         "econ_cycle_boltz_enabled",
         "econ_cycle_planner_enabled",
         "econ_cycle_rebalance_enabled",
@@ -618,7 +621,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "risk_profile",
         "weekly_budget_sats",
     ]
-    assert result["count"] == 61
+    assert result["count"] == 62
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -674,6 +677,7 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "econ_cycle_planner_enabled": False,
         "econ_cycle_boltz_enabled": False,
         "econ_ev_populated": False,
+        "econ_conflict_rules_extended": False,
         "authority_level": "capital",
         "risk_profile": "custom",
         "lnplus_swaps_enabled": True,
@@ -1167,6 +1171,7 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "econ_cycle_planner_enabled": False,
         "econ_cycle_boltz_enabled": False,
         "econ_ev_populated": False,
+        "econ_conflict_rules_extended": False,
         "authority_level": "capital",
         "risk_profile": "custom",
         "lnplus_swaps_enabled": True,

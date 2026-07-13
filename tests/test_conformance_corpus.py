@@ -53,9 +53,9 @@ def test_documented_gaps_are_explicit_not_silent():
             assert case.get("notes"), \
                 f"{case_path}: gap without explanation"
             assert case["expected"] == {"implemented": False}
-    # Exactly the two known unimplemented conflict rules.
-    assert gaps == ["20-open-vs-lnplus",
-                    "21-circular-vs-boltz-structural"]
+    # PR 10 closed both former gaps (open-vs-LN+, rebalance-vs-swap)
+    # behind econ_conflict_rules_extended — no documented gaps remain.
+    assert gaps == []
 
 
 def test_coverage_report_maps_all_scenarios():

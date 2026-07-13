@@ -9700,7 +9700,10 @@ def _arbitrate_boltz_recommendations(recommendations):
                 recs_with_keys.append((rec, env.idempotency_key))
             except Exception:
                 recs_with_keys.append((rec, None))  # keep (fail open)
-        arbitration = arbitrate(envs, now=now)
+        arbitration = arbitrate(
+            envs, now=now,
+            extended_rules=getattr(cfg, "econ_conflict_rules_extended",
+                                   False) is True)
         surviving = {env.idempotency_key for env in arbitration.ordered}
         ledger = None
         if econ_shadow is not None:

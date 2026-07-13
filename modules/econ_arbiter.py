@@ -83,10 +83,23 @@ class ActiveIntentRegistry:
     entries expire with their envelope and are released with their
     reservation."""
 
-    def __init__(self):
+    def __init__(self, extended_rules_provider=None):
         import threading
         self._lock = threading.Lock()
         self._active: Dict[str, IntentEnvelope] = {}
+        # PR 10 (econ_conflict_rules_extended): callable -> bool. None
+        # or an erroring provider = legacy rules only (fail to current
+        # behavior, never to stricter).
+        self._extended_rules_provider = extended_rules_provider
+
+    def _extended(self) -> bool:
+        provider = self._extended_rules_provider
+        if provider is None:
+            return False
+        try:
+            return provider() is True
+        except Exception:
+            return False
 
     def _prune(self, now: int) -> None:
         expired = [key for key, env in self._active.items()
@@ -106,6 +119,25 @@ class ActiveIntentRegistry:
                     if active.intent_type == "CLOSE_CHANNEL" \
                             and active.target == env.target:
                         return "CONFLICT_CLOSE_REBALANCE"
+            if self._extended():
+                # PR 10: duplicate opens to one peer (covers the spec's
+                # open-vs-LN+ rule — both paths emit OPEN_CHANNEL to the
+                # peer; first-registered wins live).
+                if env.intent_type == "OPEN_CHANNEL":
+                    for active in self._active.values():
+                        if active.intent_type == "OPEN_CHANNEL" \
+                                and active.target == env.target:
+                            return "CONFLICT_DUPLICATE_OPEN"
+                # PR 10: circular rebalance vs structural swap on one
+                # channel — EITHER active intent blocks the other (no
+                # overlapping opposite work live).
+                if env.intent_type in ("REBALANCE", "SWAP_OUT"):
+                    other = ("SWAP_OUT" if env.intent_type == "REBALANCE"
+                             else "REBALANCE")
+                    for active in self._active.values():
+                        if active.intent_type == other \
+                                and active.target == env.target:
+                            return "CONFLICT_REBALANCE_SWAP"
             self._active[env.idempotency_key] = env
             return None
 
@@ -126,7 +158,8 @@ class ArbitrationResult:
     superseded: Dict[str, str]  # rejected intent_id -> superseding id
 
 
-def arbitrate(intents: List[IntentEnvelope], now: int) -> ArbitrationResult:
+def arbitrate(intents: List[IntentEnvelope], now: int,
+              extended_rules: bool = False) -> ArbitrationResult:
     now_t = UnixTime(int(now))
     # Deterministic working order regardless of input order.
     candidates = sorted(intents, key=_sort_key)
@@ -182,6 +215,38 @@ def arbitrate(intents: List[IntentEnvelope], now: int) -> ArbitrationResult:
                              f"target {env.target} has a close intent"))
             continue
         final.append(env)
+
+    if extended_rules:
+        # 5. Duplicate opens to one peer — best-sorted (higher priority,
+        # e.g. an LN+ obligation at 80) wins; covers open-vs-LN+.
+        open_winner: Dict[str, IntentEnvelope] = {}
+        step5 = []
+        for env in final:
+            if env.intent_type == "OPEN_CHANNEL":
+                winner = open_winner.get(env.target)
+                if winner is not None:
+                    rejected.append((env, "CONFLICT_DUPLICATE_OPEN",
+                                     f"target {env.target} already has "
+                                     f"an open intent"))
+                    superseded[env.intent_id.value] = \
+                        winner.intent_id.value
+                    continue
+                open_winner[env.target] = env
+            step5.append(env)
+        # 6. Circular rebalance vs structural swap on one channel — the
+        # structural SWAP_OUT outranks (capital-structure intent beats
+        # liquidity maintenance, same precedence logic as close).
+        swap_targets = {env.target for env in step5
+                        if env.intent_type == "SWAP_OUT"}
+        final = []
+        for env in step5:
+            if env.intent_type == "REBALANCE" \
+                    and env.target in swap_targets:
+                rejected.append((env, "CONFLICT_REBALANCE_SWAP",
+                                 f"target {env.target} has a structural "
+                                 f"swap intent"))
+                continue
+            final.append(env)
 
     return ArbitrationResult(
         ordered=tuple(final),

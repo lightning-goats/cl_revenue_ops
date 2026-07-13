@@ -3442,7 +3442,15 @@ class CapacityPlanner:
                 envs.append(env)
                 env_by_key[env.idempotency_key] = env
                 losers_with_keys.append((loser, env.idempotency_key))
-            arbitration = arbitrate(envs, now=now)
+            try:
+                extended = getattr(
+                    self.config.snapshot()
+                    if hasattr(self.config, "snapshot") else self.config,
+                    "econ_conflict_rules_extended", False) is True
+            except Exception:
+                extended = False
+            arbitration = arbitrate(envs, now=now,
+                                    extended_rules=extended)
 
             shadow = getattr(self, "econ_shadow", None)
             ledger = None

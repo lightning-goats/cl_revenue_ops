@@ -2193,15 +2193,20 @@ class RebalanceEngine:
                                snapshot_id=(snap_ref or {}).get(
                                    "snapshot_id") or cycle_id)
             try:
-                ev_enabled = getattr(self._config_snapshot(),
-                                     "econ_ev_populated", False) is True
+                cfg_now = self._config_snapshot()
+                ev_enabled = getattr(cfg_now, "econ_ev_populated",
+                                     False) is True
+                extended = getattr(cfg_now, "econ_conflict_rules_extended",
+                                   False) is True
             except Exception:
                 ev_enabled = False
+                extended = False
             env_pairs = rebalance_intent_pairs(live_candidates, ctx,
                                                ev_enabled=ev_enabled)
             pair_by_key = {env.idempotency_key: pair
                            for env, pair in env_pairs}
-            arbitration = arbitrate([env for env, _ in env_pairs], now=now)
+            arbitration = arbitrate([env for env, _ in env_pairs], now=now,
+                                    extended_rules=extended)
 
             ledger = None
             shadow = getattr(self, "econ_shadow", None)

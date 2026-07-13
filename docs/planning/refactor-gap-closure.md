@@ -119,7 +119,7 @@ Evidence pins are against branch `refactor-phase1-shadow` @ `ab34d6f`
 | Risk | LOW-MEDIUM (new conflict rules are live arbitration changes — each flag-gated or shipped as registry extensions with tests). |
 | Behavior change | Evidence: none. New conflict rules: yes, small, gated. |
 | Rollback | Per-rule revert; registry rules are additive. |
-| Status | **partial** |
+| Status | **met (evidence report filed; 2 rules await flag flip)** — PR 10 SHIPPED 2026-07-13: docs/refactor/phase0/governance-evidence-report.md consolidates typed-intent coverage per mutation category (htlc_max verified governed via the set_channel_fee gate), the 9-rule conflict-matrix disposition (6 implemented incl. new CONFLICT_DUPLICATE_OPEN and CONFLICT_REBALANCE_SWAP behind econ_conflict_rules_extended, 3 assigned with owners), LN+ governor semantics, executor/adapter inventories with three tripwires, and per-category test evidence with two honest gaps (pyln minimum-CLN integration not exercised here; full daemon restart deferred to node maintenance). Corpus scenarios 20/21 converted from documented gaps to real generated cases. |
 
 ## B. Corrected Definition-of-Done statuses (replaces MET-with-scope)
 

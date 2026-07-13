@@ -114,6 +114,10 @@ PUBLIC_RUNTIME_KEYS = (
     # envelopes. CAUTION: flipping changes J3 batch-arbitration ORDER in
     # the cutover loops (EV sorts before target). Default off = zeros.
     'econ_ev_populated',
+    # PR 10 (gap-closure Phase G): extra arbiter conflict rules —
+    # duplicate opens per peer (covers open-vs-LN+), rebalance vs
+    # structural swap. Default off = the three original rules only.
+    'econ_conflict_rules_extended',
     # Phase 4 (Workstream I): global authority level — observe < fees <
     # liquidity < capital. Governed actions above the level are blocked
     # with AUTHORITY_LEVEL_BLOCKED. Default 'capital' preserves current
@@ -200,6 +204,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'econ_cycle_planner_enabled': bool,
     'econ_cycle_boltz_enabled': bool,
     'econ_ev_populated': bool,
+    'econ_conflict_rules_extended': bool,
     'authority_level': str,
     'risk_profile': str,
     'expansion_treasury_enabled': bool,
@@ -562,6 +567,7 @@ class Config:
     # Workstream H: cycle-arbitrated Boltz recommendations.
     econ_cycle_boltz_enabled: bool = False
     econ_ev_populated: bool = False
+    econ_conflict_rules_extended: bool = False
     # Phase 4: global authority level (observe|fees|liquidity|capital).
     authority_level: str = "capital"
     risk_profile: str = "custom"
@@ -1364,6 +1370,7 @@ class ConfigSnapshot:
     econ_cycle_planner_enabled: bool = False
     econ_cycle_boltz_enabled: bool = False
     econ_ev_populated: bool = False
+    econ_conflict_rules_extended: bool = False
     authority_level: str = "capital"
     risk_profile: str = "custom"
     # E-2: class-aware min-fee floor for saturated/source channels (0 =

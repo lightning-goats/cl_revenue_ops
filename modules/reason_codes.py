@@ -36,6 +36,9 @@ _CODES = (
     ReasonCode("FEE_RAIL_CLAMPED", "policy", "clamp"),
     ReasonCode("COOLDOWN_ACTIVE", "policy", "hold"),
     ReasonCode("CONFLICT_CLOSE_REBALANCE", "arbiter", "rejection"),
+    # PR 10 (Phase G) extended rules, econ_conflict_rules_extended:
+    ReasonCode("CONFLICT_DUPLICATE_OPEN", "arbiter", "rejection"),
+    ReasonCode("CONFLICT_REBALANCE_SWAP", "arbiter", "rejection"),
     ReasonCode("EXTERNAL_CIRCUIT_BREAKER", "executor", "deferral"),
     ReasonCode("EXTERNAL_OUTCOME_UNKNOWN", "reconciliation", "unknown"),
     ReasonCode("ARITHMETIC_OVERFLOW", "any", "failure"),

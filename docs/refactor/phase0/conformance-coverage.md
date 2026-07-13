@@ -2,7 +2,7 @@
 
 Generator: `tools/conformance/generate_scenarios.py` (deterministic; regenerating must be byte-identical). Validation: `tools/conformance/validate_fixtures.py` — no plugin imports. Golden-derived cases copy fixture bytes verbatim; generated cases are produced BY the reference implementation.
 
-Scenario classes: 40/40. Documented gaps: 2 (listed last — these are honest holes with pointers, not silent omissions).
+Scenario classes: 40/40. Documented gaps: 0 (listed last — these are honest holes with pointers, not silent omissions).
 
 | # Scenario | Category | Requirement | Source | Files |
 |---|---|---|---|---|
@@ -25,8 +25,8 @@ Scenario classes: 40/40. Documented gaps: 2 (listed last — these are honest ho
 | `17-manual-diagnostic-rebalance` | rebalance_mode | F4 + contradiction #7: manual is operator-directed; diagnostic is a BOUNDED spend (evidence purchase), not free | generated | case.json |
 | `18-conflicting-close-rebalance` | arbitration | J3/spec conflict rule: rebalance into a channel scheduled for closure is rejected (CONFLICT_CLOSE_REBALANCE) | generated | case.json |
 | `19-protected-close-rejection` | authorization | F5: protection tags veto closure before any intent exists | tests/golden/fixtures/close_protection/allowed_protect_tag_blocks.json | case.json |
-| `20-open-vs-lnplus` | documented_gap | Spec conflict rule: open vs LN+ | generated | case.json |
-| `21-circular-vs-boltz-structural` | documented_gap | Spec conflict rule: rebalance vs structural swap | generated | case.json |
+| `20-open-vs-lnplus` | arbitration | Spec conflict rule: open vs LN+ — both paths emit OPEN_CHANNEL to the peer; CONFLICT_DUPLICATE_OPEN rejects the lower-priority one (the LN+ obligation at priority 80 wins) | generated | case.json |
+| `21-circular-vs-boltz-structural` | arbitration | Spec conflict rule: rebalance vs structural swap — the structural SWAP_OUT outranks; CONFLICT_REBALANCE_SWAP rejects the circular rebalance (live registry blocks both directions) | generated | case.json |
 | `22-budget-exhaustion` | authorization | DoD 4/5: refused reservation -> BUDGET_EXHAUSTED, no spend | generated | case.json |
 | `23-concurrent-reservation-contention` | reservation | DoD 5: atomic reservations cannot jointly oversubscribe | generated | case.json |
 | `24-restart-outstanding-reservation` | reservation | DoD 5: reservations survive restart (durable store) | generated | case.json |
@@ -58,5 +58,3 @@ Scenario classes: 40/40. Documented gaps: 2 (listed last — these are honest ho
 
 ## Documented gaps
 
-- `20-open-vs-lnplus`: Spec conflict rule: open vs LN+ — see the case's notes for the blocking dependency.
-- `21-circular-vs-boltz-structural`: Spec conflict rule: rebalance vs structural swap — see the case's notes for the blocking dependency.
