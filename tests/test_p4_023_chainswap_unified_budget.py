@@ -125,8 +125,11 @@ def test_chainswap_reserves_and_settles_when_budget_available(tmp_path):
     assert res.get("status") == "accepted"
     assert len(create_calls) == 1, "createchainswap subprocess did not run"
     conn = db._get_connection()
+    # Phase 2J: the reserve_budget setup hold now correctly lives in
+    # spend_reservations (category='rebalance'); scope to the flow under test.
     active = conn.execute(
-        "SELECT COALESCE(SUM(reserved_sats),0) FROM spend_reservations WHERE status='active'"
+        "SELECT COALESCE(SUM(reserved_sats),0) FROM spend_reservations "
+        "WHERE status='active' AND category != 'rebalance'"
     ).fetchone()[0]
     events = conn.execute(
         "SELECT COALESCE(SUM(amount_sats),0) FROM spend_events WHERE category='boltz'"

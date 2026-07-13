@@ -107,8 +107,12 @@ def test_planner_open_reserves_and_settles_when_budget_available(tmp_path):
     planner._rpc_fundchannel.assert_called_once()
     conn = db._get_connection()
     # After settle: open committed as a spend event, no dangling reservation.
+    # Phase 2J: the reserve_budget setup hold now correctly lives in
+    # spend_reservations (category='rebalance'); this assertion scopes to
+    # the flow under test.
     active_gen = conn.execute(
-        "SELECT COALESCE(SUM(reserved_sats),0) FROM spend_reservations WHERE status='active'"
+        "SELECT COALESCE(SUM(reserved_sats),0) FROM spend_reservations "
+        "WHERE status='active' AND category != 'rebalance'"
     ).fetchone()[0]
     events = conn.execute(
         "SELECT COALESCE(SUM(amount_sats),0) FROM spend_events WHERE category='channel_open'"

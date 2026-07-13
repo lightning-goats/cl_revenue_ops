@@ -3721,18 +3721,27 @@ class Database:
         Returns:
             Tuple of (success: bool, remaining_budget: int)
         """
-        conn = self._get_connection()
+        # Phase 2J (docs/planning/2026-07-13-refactor-phase2-unification.md):
+        # COMPATIBILITY WRAPPER over the generic spend ledger — one atomic
+        # reservation implementation. New reservations land in
+        # spend_reservations (category='rebalance'); both atomic sums
+        # already count both tables, so totals are unchanged. The legacy
+        # budget_reservations table is transition-read-only (release/settle
+        # below fall back to it for rows created before this change);
+        # _reserve_budget_atomic is retained for parity tests.
         try:
-            return _reserve_budget_atomic(
-                conn, reservation_id, amount_sats, channel_id,
-                budget_limit, since_timestamp,
-                weekly_budget_limit, weekly_since_timestamp,
+            return self.reserve_spend(
+                reservation_id=reservation_id,
+                amount_sats=amount_sats,
+                category="rebalance",
+                channel_id=channel_id,
+                effective_budget_sats=budget_limit,
+                since_timestamp=since_timestamp,
+                weekly_budget_limit=weekly_budget_limit,
+                weekly_since_timestamp=weekly_since_timestamp,
+                _return_remaining=True,
             )
         except Exception as e:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception as rb_err:
-                self.plugin.log(f"ROLLBACK failed in reserve_budget: {rb_err}", level='error')
             self.plugin.log(f"Budget reservation failed: {e}", level='error')
             return (False, 0)
 
@@ -3746,6 +3755,11 @@ class Database:
         Returns:
             True if released, False if not found
         """
+        # Phase 2J dual-path: unified rows live in spend_reservations;
+        # the legacy-table fallback covers reservations created before
+        # the unification deploy (drains to zero, removed in Phase 5).
+        if self.release_spend_reservation(str(reservation_id)):
+            return True
         conn = self._get_connection()
         cursor = conn.execute("""
             UPDATE budget_reservations
@@ -3768,6 +3782,15 @@ class Database:
         Returns:
             True if marked, False if not found
         """
+        # Phase 2J dual-path: unified rows first (record_event=False —
+        # actual rebalance costs stay in rebalance_costs, exactly as the
+        # docstring above says, so nothing double-counts); legacy-table
+        # fallback for pre-unification rows.
+        if self.mark_spend_reservation_spent(
+                str(reservation_id),
+                actual_spent_sats=actual_spent,
+                record_event=False):
+            return True
         conn = self._get_connection()
         cursor = conn.execute("""
             UPDATE budget_reservations
@@ -3901,7 +3924,10 @@ class Database:
                      subcategory: Optional[str] = None, reference_id: Optional[str] = None,
                      channel_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
                      effective_budget_sats: Optional[int] = None,
-                     since_timestamp: Optional[int] = None) -> bool:
+                     since_timestamp: Optional[int] = None,
+                     weekly_budget_limit: Optional[int] = None,
+                     weekly_since_timestamp: Optional[int] = None,
+                     _return_remaining: bool = False):
         """Create a generic spend reservation.
 
         DD1 / P1-003: when ``effective_budget_sats`` is provided, the unified
@@ -3916,17 +3942,26 @@ class Database:
         """
         conn = self._get_connection()
         now = int(time.time())
+
+        def _result(ok: bool, remaining: int = 0):
+            # Phase 2J: _return_remaining=True is the unified
+            # (ok, remaining) contract used by the reserve_budget
+            # compatibility wrapper; the public signature stays bool.
+            return (ok, int(remaining)) if _return_remaining else ok
+
         amount = self._sanitize_amount(amount_sats, "reserved_sats")
         if amount <= 0:
-            return False
+            return _result(False)
         rid = str(reservation_id or "").strip()
         if not rid:
-            return False
+            return _result(False)
         cat = str(category or "").strip().lower()
         if not cat:
-            return False
+            return _result(False)
         meta_json = json.dumps(metadata or {}, sort_keys=True) if metadata else None
         enforce_budget = effective_budget_sats is not None
+        daily_remaining = 0
+        weekly_remaining = None
         budget_since = int(since_timestamp) if since_timestamp is not None else (now - 24 * 3600)
         # P2-003: The terminal-state guard SELECT and the INSERT OR REPLACE are a
         # read-then-write pair. Wrap them in one BEGIN IMMEDIATE so the status
@@ -3952,7 +3987,7 @@ class Database:
                         "resurrect to active",
                         level='warn',
                     )
-                    return False
+                    return _result(False)
                 if str(status) == "active":
                     # Re-reserving an active id REPLACES its amount, so only the
                     # delta counts against the budget (avoid double-counting).
@@ -3988,7 +4023,8 @@ class Database:
                 gen_committed = int(gen_committed_row[0] if gen_committed_row else 0)
                 # Exclude this id's current active amount (it is being replaced).
                 already = gen_reserved + reb_reserved + reb_committed + gen_committed - existing_active_sats
-                if amount + already > int(effective_budget_sats):
+                daily_remaining = int(effective_budget_sats) - already
+                if amount > daily_remaining:
                     conn.execute("ROLLBACK")
                     self.plugin.log(
                         f"Spend reservation {rid} rejected: unified budget "
@@ -3996,7 +4032,36 @@ class Database:
                         f"(requested {amount} + committed/reserved {already})",
                         level='warn',
                     )
-                    return False
+                    return _result(False, daily_remaining)
+
+                # Phase 2J: optional weekly cap, byte-matched to the legacy
+                # _reserve_budget_atomic weekly sum shape (window filter on
+                # committed costs/events; active holds counted in full).
+                if weekly_budget_limit is not None \
+                        and weekly_since_timestamp is not None:
+                    weekly_spent_row = conn.execute(
+                        "SELECT COALESCE(SUM(cost_sats), 0) FROM rebalance_costs WHERE timestamp >= ?",
+                        (int(weekly_since_timestamp),),
+                    ).fetchone()
+                    weekly_spent = int(weekly_spent_row[0] if weekly_spent_row else 0)
+                    weekly_gen_spent_row = conn.execute(
+                        "SELECT COALESCE(SUM(amount_sats), 0) FROM spend_events WHERE timestamp >= ?",
+                        (int(weekly_since_timestamp),),
+                    ).fetchone()
+                    weekly_gen_spent = int(weekly_gen_spent_row[0] if weekly_gen_spent_row else 0)
+                    weekly_already = (weekly_spent + reb_reserved + gen_reserved
+                                      + weekly_gen_spent - existing_active_sats)
+                    weekly_remaining = int(weekly_budget_limit) - weekly_already
+                    if amount > weekly_remaining:
+                        conn.execute("ROLLBACK")
+                        self.plugin.log(
+                            f"Spend reservation {rid} rejected: weekly budget "
+                            f"{weekly_budget_limit} would be exceeded "
+                            f"(requested {amount} + committed/reserved "
+                            f"{weekly_already})",
+                            level='warn',
+                        )
+                        return _result(False, weekly_remaining)
             conn.execute("""
                 INSERT OR REPLACE INTO spend_reservations
                 (reservation_id, category, subcategory, reserved_sats, reserved_at, reference_id, channel_id, status, metadata_json)
@@ -4008,14 +4073,19 @@ class Database:
                     self.spend_journal.note_spend_reserved(rid, amount, cat)
                 except Exception as journal_err:
                     self.plugin.log(f"spend journal skipped: {journal_err}", level='debug')
-            return True
+            if not enforce_budget:
+                return _result(True, 0)
+            after = daily_remaining - amount
+            if weekly_remaining is not None:
+                after = min(after, weekly_remaining - amount)
+            return _result(True, after)
         except Exception as e:
             try:
                 conn.execute("ROLLBACK")
             except Exception:
                 pass
             self.plugin.log(f"Spend reservation failed: {e}", level='error')
-            return False
+            return _result(False)
 
     def get_spend_reservation_states(
         self, reservation_ids: Optional[List[str]] = None
@@ -4603,11 +4673,26 @@ class Database:
                 WHERE timestamp >= ?
             """, (since_timestamp,)).fetchone()
 
+            # Phase 2J: unified rebalance reservations live in
+            # spend_reservations (category='rebalance'); legacy table
+            # holds only pre-unification transition rows. Same age
+            # filter on both halves (reporting semantics unchanged).
             reserved_row = conn.execute("""
                 SELECT COALESCE(SUM(reserved_sats), 0) as reserved
                 FROM budget_reservations
                 WHERE status = 'active' AND reserved_at >= ?
             """, (since_timestamp,)).fetchone()
+            try:
+                unified_row = conn.execute("""
+                    SELECT COALESCE(SUM(reserved_sats), 0) as reserved
+                    FROM spend_reservations
+                    WHERE status = 'active' AND category = 'rebalance'
+                      AND reserved_at >= ?
+                """, (since_timestamp,)).fetchone()
+            except sqlite3.OperationalError:
+                # Minimal/partial schemas (tests, tooling) may lack the
+                # generic ledger table.
+                unified_row = None
             conn.execute("COMMIT")
         except Exception:
             try:
@@ -4618,6 +4703,8 @@ class Database:
 
         spent = spent_row['spent'] if spent_row else 0
         reserved = reserved_row['reserved'] if reserved_row else 0
+        if unified_row is not None:
+            reserved += unified_row['reserved']
 
         return {
             'spent': spent,

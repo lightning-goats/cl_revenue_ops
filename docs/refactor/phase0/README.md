@@ -160,8 +160,22 @@ Suite after tranche: **3352 passed**.
   terminal) now RETAIN their reservations — never auto-zeroed as
   db_missing — surfacing only as quarantine once stale.
 
-**Remaining Phase 2 work:** the 4→1 reservations unification; then the
-Phase 2 exit-gate review.
+- 2J: reservations unification stage 1
+  (`docs/planning/2026-07-13-refactor-phase2-unification.md`) —
+  `reserve_budget` is now a compatibility wrapper over `reserve_spend`
+  (category='rebalance'): one atomic reservation implementation with
+  weekly-cap support and the `(ok, remaining)` contract preserved
+  (parity-tested against the retained `_reserve_budget_atomic`).
+  Dual-path release/settle services pre-deploy legacy rows;
+  `get_budget_status` counts both halves; rebalance reservations now
+  journal to the econ ledger for free. `budget_reservations` is
+  transition-read-only (formal removal in Phase 5). Capex wrappers
+  already delegated to the generic ledger; growth budget is a limit
+  calculator — with 2J the FOUR budget implementations share ONE
+  reservation store.
+
+**Remaining Phase 2 work:** the exit-gate review (restart/live evidence
+across all governed paths).
 
 ## Contradictions
 

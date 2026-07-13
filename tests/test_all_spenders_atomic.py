@@ -286,6 +286,13 @@ ALLOWLIST = {
         "caller's reservation_id; active only when "
         "econ_governor_rebalance_enabled is true.",
     ),
+    ("database.py", "reserve_budget", "reserve_spend"): (
+        ATOMIC_RESERVE, 1,
+        "Phase 2J unification (2026-07-13): reserve_budget is a compatibility "
+        "wrapper delegating to reserve_spend (category='rebalance', weekly cap "
+        "+ (ok, remaining) via _return_remaining) — one atomic reservation "
+        "implementation; the legacy budget_reservations insert no longer runs.",
+    ),
     ("lnplus_swaps.py", "_lnplus_reserve_delegate", "reserve_spend"): (
         ATOMIC_RESERVE, 1,
         "Phase 2F governed entry (2026-07-12): GovernorFacade delegate closure "
