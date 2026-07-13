@@ -4140,6 +4140,45 @@ def _zero_flow_guard_state(
     return None
 
 
+def _fee_debug_controller_block(v2_state: Dict[str, Any],
+                                fee_state: Dict[str, Any],
+                                is_sleeping: Any,
+                                sleep_until: Any) -> Dict[str, Any]:
+    """ADR-001: per-channel controller components for revenue-fee-debug.
+    Reads only persisted state (v2_state_json); purely additive output.
+    PID terms reported pre-capacity-scale."""
+    pid = fee_state.get("pid_state") or v2_state.get("pid_state") or {}
+
+    def _f(key, default=0.0):
+        try:
+            return float(pid.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    kp, ki, kd = _f("kp", 2.0), _f("ki", 0.1), _f("kd", 0.0)
+    ewma_error = _f("ewma_error")
+    integral_error = _f("integral_error")
+    return {
+        "algorithm_version": v2_state.get("algorithm_version",
+                                          "dts_pid_v1"),
+        "pid": {
+            "kp": kp, "ki": ki, "kd": kd,
+            "ewma_error": ewma_error,
+            "integral_error": integral_error,
+            "integral_clamp": _f("integral_clamp", 3.0),
+            "p_term_unscaled": kp * ewma_error,
+            "i_term_unscaled": ki * integral_error,
+            "d_term": 0.0,
+        },
+        "stages": {
+            "cooldown": {
+                "sleeping": bool(is_sleeping),
+                "sleep_until": int(sleep_until or 0),
+            },
+        },
+    }
+
+
 @plugin.method("revenue-fee-debug")
 def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     """
@@ -4163,8 +4202,20 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     market_boundary_configured = bool(getattr(cfg_snap, "fee_market_boundary_enabled", False))
 
     now = int(time.time())
+    # ADR-001 (PR 4): the debug surface names the REAL controller and
+    # its staged-constraint contract — never multiplicative factors.
+    try:
+        last_cycle_decision = fee_controller.get_last_decision_summary()
+    except Exception:
+        last_cycle_decision = None
     result = {
         "timestamp": now,
+        "controller_contract": {
+            "algorithm": "dts_pid_v1",
+            "stage_order": ["rails", "rate_limit", "deadband", "cooldown"],
+            "adr": "docs/refactor/adr/ADR-001-dts-pid-fee-controller.md",
+        },
+        "last_cycle_decision": last_cycle_decision,
         "config": {
             "fee_interval_seconds": config.fee_interval if config else 1800,
             "fee_profile": profile["name"],
@@ -4280,6 +4331,13 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
                 "contextual_sample_used": bool(v2_state.get("last_contextual_sample_used", False)),
                 "contexts_tracked": len(ts_state.get("contextual_posteriors") or {}),
             },
+            # ADR-001 (PR 4): real controller components. PID terms are
+            # pre-capacity-scale (runtime scales gains by
+            # 1/log2(capacity/1e6+2); multiplier = 1.5**(p+i), clamped
+            # to [0.5, 2.0]). Cooldown/deadband stage state is the
+            # sleep/hysteresis surface above (is_sleeping/skip_reason).
+            "controller": _fee_debug_controller_block(
+                v2_state, _fee_state, is_sleeping, sleep_until),
         })
         result["summary"]["total"] += 1
 

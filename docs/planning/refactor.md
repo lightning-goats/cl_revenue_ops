@@ -400,33 +400,56 @@ Do not mechanically replace domain rules that represent safety, contractual obli
 
 ### F2. Fee policy
 
-Express the unclamped target as:
+> **AMENDED 2026-07-13 (ADR-001, operator-accepted).** The original
+> multiplicative decomposition below is an `approved_deviation`: it does
+> not describe the repository's DTS+PID controller, and forcing it would
+> falsify the goldened algorithm. Authoritative contract:
+> `docs/refactor/adr/ADR-001-dts-pid-fee-controller.md`.
+
+Express the fee policy through a controller-neutral contract:
 
 ```text
-target_fee = economic_baseline * liquidity_pressure * market_correction
+raw_fee_target = fee_controller(snapshot, controller_state, configuration)
+
+final_fee_target =
+    cooldown(
+        deadband(
+            rate_limit(
+                rails(raw_fee_target)
+            )
+        )
+    )
 ```
 
-Then apply, in order:
+DTS+PID is the authoritative `fee_controller`: the Thompson posterior
+proposes the revenue-seeking target, the PID multiplier manages
+liquidity balance, and their blend is the raw target. `controller_state`
+(posteriors, PID integrator, sleep state) is an explicit input distinct
+from the snapshot's observations.
+
+Constraint stages apply in order:
 
 1. Fee rails.
 2. Maximum rate of change.
 3. Deadband.
 4. Cooldown.
 
-Auto fee bands become evidence for baseline or market correction, not a parallel policy authority.
+Auto fee bands are evidence or bounds for the controller, not a parallel
+policy authority.
 
-`revenue-fee-debug` must expose at least:
+`revenue-fee-debug` must expose the REAL controller components, at least:
 
 ```text
-economic baseline
-liquidity multiplier
-market multiplier
-raw target
-rail/rate clamp
-deadband result
-cooldown result
-final target or hold reason
+DTS posterior state and last sampled target
+PID term components and controller state/version
+stage state (rails/rate-limit/deadband/cooldown surfaces)
+final target or hold reason, with stable reason codes
 ```
+
+*Historical record (approved_deviation, superseded by ADR-001):* the
+original proposal expressed the unclamped target as
+`target_fee = economic_baseline * liquidity_pressure * market_correction`
+and required fee-debug to expose those multiplicative factors.
 
 ### F3. Admission control (`htlc_max`)
 
@@ -811,7 +834,7 @@ Before architectural changes:
 ### Phase 4: Simplify policies and operator surface
 
 - Normalize action evaluation onto the common EV contract.
-- Simplify fee calculation to baseline × liquidity × market, followed by common constraints.
+- Fee calculation follows the controller-neutral contract of ADR-001 (DTS+PID authoritative, staged constraints); the baseline × liquidity × market simplification is an approved_deviation.
 - Convert hot-channel handling into priority/budget modifiers.
 - Introduce authority levels and node-wide risk profiles.
 - Add effective-config and migration diagnostics.

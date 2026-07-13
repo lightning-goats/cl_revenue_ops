@@ -106,7 +106,7 @@ Evidence pins are against branch `refactor-phase1-shadow` @ `ab34d6f`
 | Risk | LOW (docs + additive debug fields). |
 | Behavior change | None to fee decisions. |
 | Rollback | Revert PR. |
-| Status | **approved_deviation** (pending the ADR + spec amendment that formalize it — until merged, formally `partial`) |
+| Status | **approved_deviation** — FORMALIZED 2026-07-13: ADR-001 accepted (`docs/refactor/adr/ADR-001-dts-pid-fee-controller.md`), refactor.md §F2 + Phase 4 bullet amended to the controller-neutral contract with the original decomposition preserved as the deviation record, fee-debug exposes real controller components (contract block, cycle decision summary, per-channel PID terms + version + stage state; additive only). |
 
 ### Gap 8: Provisionally met architecture claims
 
