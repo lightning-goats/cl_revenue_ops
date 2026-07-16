@@ -29,10 +29,13 @@ import random
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from modules.fee_controller import GaussianThompsonState  # noqa: E402
+from modules.config import Config  # noqa: E402
+from modules.fee_controller import FeeController, GaussianThompsonState  # noqa: E402
 
 NOW = 1_752_400_000
 
@@ -278,9 +281,276 @@ def gen_mat3(outdir: Path) -> None:
     _write(outdir / "matvec.json", {"now": NOW, "cases": matvec_cases})
 
 
+# ---------------------------------------------------------------------------
+# rails: FEE_PROFILES tables + the pure rail stages (Phase 4 Task 5) —
+# _resolve_fee_profile, _get_fee_step_cap, _get_target_blend_ratio,
+# _blend_fee_target, _get_exploration_fee_target, _zero_flow_streak_thresholds,
+# _apply_zero_flow_ratchet_guard, _kalman_demand_factor,
+# _exploration_std_threshold. The real FeeController methods are the oracle;
+# nothing here reimplements the algorithm.
+# ---------------------------------------------------------------------------
+
+def _controller() -> FeeController:
+    return FeeController(MagicMock(), MagicMock(spec=Config), MagicMock())
+
+
+def _profile_settings_to_dict(settings) -> dict:
+    d = settings.to_dict()
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, float):
+            out[k] = _r(v)
+        else:
+            out[k] = v
+    return out
+
+
+def gen_rails(outdir: Path) -> None:
+    fc = _controller()
+
+    # --- profiles.json: both FEE_PROFILES tables + name-resolution fallback.
+    profile_cases = []
+    for raw_name in ("active", "ACTIVE", "Active", "conservative",
+                     "CONSERVATIVE", "bogus", "", "active "):
+        cfg = SimpleNamespace(fee_profile=raw_name)
+        resolved_name, settings = fc._resolve_fee_profile(cfg)
+        profile_cases.append({
+            "input_name": raw_name,
+            "resolved_name": resolved_name,
+            "settings": _profile_settings_to_dict(settings),
+        })
+    _write(outdir / "profiles.json", {"now": NOW, "cases": profile_cases})
+
+    # --- step_cap.json: fee_step_cap boundary + ceil-rounding vectors.
+    step_cap_cases = []
+    for current, woke, profile_name in [
+        (1, False, "active"),
+        (1, True, "active"),
+        (0, False, "active"),
+        (-5, False, "active"),
+        (100, False, "conservative"),   # exact half-integer boundary (25.0)
+        (101, False, "conservative"),   # 25.25 -> ceil 26
+        (201, False, "conservative"),   # 50.25 -> ceil 51
+        (200, False, "conservative"),   # 50.0 exact
+        (1000, False, "active"),        # scaled (500) >> min_delta (100)
+        (1000, True, "active"),         # wake ratio 0.20 -> 200
+        (5, False, "conservative"),     # scaled below min_delta -> min wins
+        (3, True, "conservative"),      # wake: ceil(3*0.10)=1 -> min 10 wins
+    ]:
+        cfg = SimpleNamespace(fee_profile=profile_name)
+        cap = fc._get_fee_step_cap(current, woke, cfg=cfg)
+        step_cap_cases.append({
+            "current_fee_ppm": current, "woke_from_sleep": woke,
+            "profile_name": profile_name, "expected": cap,
+        })
+    _write(outdir / "step_cap.json", {"now": NOW, "cases": step_cap_cases})
+
+    # --- blend.json: target_blend_ratio band edges + blend_fee_target
+    # (incl. the +-1 minimum-step rule both directions).
+    blend_ratio_cases = []
+    for std in (300.0, 200.0, 199.999999, 150.0, 100.0, 99.999999,
+                75.0, 50.0, 49.999999, 10.0, 0.0):
+        for woke in (False, True):
+            for profile_name in ("active", "conservative"):
+                cfg = SimpleNamespace(fee_profile=profile_name)
+                ratio = fc._get_target_blend_ratio(
+                    woke_from_sleep=woke, sparse_data_conservative=False,
+                    posterior_std=std, cfg=cfg)
+                blend_ratio_cases.append({
+                    "posterior_std": _r(std), "woke_from_sleep": woke,
+                    "profile_name": profile_name, "expected": _r(ratio),
+                })
+    _write(outdir / "blend_ratio.json", {"now": NOW, "cases": blend_ratio_cases})
+
+    blend_target_cases = []
+    for (current, bounded_target, woke, sparse, std, profile_name) in [
+        (1000, 1003, False, False, 100.0, "active"),   # requested=3, ratio .30 -> round(0.9)=1
+        (1000, 997, False, False, 100.0, "active"),    # requested=-3 -> round(-0.9)=-1
+        (1000, 1001, False, False, 100.0, "active"),   # requested=1 -> round(0.3)=0 -> +-1 min-step (+1)
+        (1000, 999, False, False, 100.0, "active"),    # requested=-1 -> round(-0.3)=0 -> min-step (-1)
+        (1000, 1000, False, False, 100.0, "active"),   # requested=0 -> stays 0, no min-step
+        (500, 1500, True, False, 250.0, "active"),     # woke caps ratio to wake_target_blend_ratio
+        (500, 1500, False, True, 30.0, "conservative"),  # sparse flag plumbed to diag only
+        (2000, 100, False, False, 40.0, "active"),     # tight posterior, large cut
+    ]:
+        cfg = SimpleNamespace(fee_profile=profile_name)
+        blended, diag = fc._blend_fee_target(
+            current, bounded_target, woke, sparse, posterior_std=std, cfg=cfg)
+        blend_target_cases.append({
+            "current_fee_ppm": current, "bounded_target_ppm": bounded_target,
+            "woke_from_sleep": woke, "sparse_data_conservative": sparse,
+            "posterior_std": _r(std), "profile_name": profile_name,
+            "expected_blended_target_ppm": blended,
+            "expected_diag": {
+                "blend_ratio": _r(diag["blend_ratio"]),
+                "blended_delta_ppm": diag["blended_delta_ppm"],
+                "sparse_data_conservative": diag["sparse_data_conservative"],
+            },
+        })
+    _write(outdir / "blend_target.json", {"now": NOW, "cases": blend_target_cases})
+
+    # --- exploration.json: floor-pin, sparse halving, ceil/headroom/discount
+    # interplay (8+ vectors).
+    exploration_cases = []
+    for (current, floor_ppm, cfg_min, sparse, effective_min) in [
+        (50, 100, 10, False, None),      # current <= floor -> exploration_floor
+        (100, 100, 10, False, None),     # current == floor (<=) -> floor
+        (1000, 100, 10, False, None),    # headroom candidate wins under discount ceiling
+        (1000, 100, 10, True, None),     # sparse halving of discount + wider headroom ratio
+        (110, 100, 10, False, None),     # near floor: discounted ceiling clamps to floor
+        (300, 100, 10, False, None),     # discounted ceiling binds above floor
+        (1000, 50, 10, False, 200),      # effective_min_fee_ppm overrides cfg floor
+        (10, 4, 1, False, None),         # small integers exercise ceil rounding
+        (10, 4, 1, True, None),          # small integers, sparse
+        (750, 300, 10, False, None),     # mid-range, non-sparse
+    ]:
+        cfg = SimpleNamespace(min_fee_ppm=cfg_min)
+        target = fc._get_exploration_fee_target(
+            current, floor_ppm, cfg, sparse, effective_min_fee_ppm=effective_min)
+        exploration_cases.append({
+            "current_fee_ppm": current, "floor_ppm": floor_ppm,
+            "cfg_min_fee_ppm": cfg_min, "sparse_data_conservative": sparse,
+            "effective_min_fee_ppm": effective_min, "expected": target,
+        })
+    _write(outdir / "exploration.json", {"now": NOW, "cases": exploration_cases})
+
+    # --- zero_flow_thresholds.json: cadence scaling (gap-cap, downshift>=guard).
+    zft_cases = []
+    for gap, cycle in [
+        (0.0, 0.5), (-5.0, 0.5), (48.0, 0.5), (float("nan"), 0.5),
+        (48.0, 0.0), (48.0, float("nan")), (1000.0, 0.5), (1.0, 1.0),
+        (168.0, 0.5), (200.0, 0.5),
+    ]:
+        guard, downshift = fc._zero_flow_streak_thresholds(gap, cycle)
+        zft_cases.append({
+            "gap_ema_hours": _r(gap), "cycle_hours": _r(cycle),
+            "expected_guard": guard, "expected_downshift": downshift,
+        })
+    _write(outdir / "zero_flow_thresholds.json", {"now": NOW, "cases": zft_cases})
+
+    # --- zero_flow_guard.json: all three tags, hold-vs-downshift interval
+    # arithmetic (thresh / thresh+11 / thresh+12 @ interval 12), trickle
+    # reclassification, floor-override raise, custom guard/downshift streaks.
+    zfg_cases = []
+
+    def _guard_case(label, **kwargs):
+        applied, tag = fc._apply_zero_flow_ratchet_guard(**kwargs)
+        zfg_cases.append({
+            "label": label,
+            "inputs": {
+                "current_fee": kwargs["current_fee"],
+                "target_fee": kwargs["target_fee"],
+                "min_fee": kwargs["min_fee"],
+                "zero_revenue_streak": kwargs["zero_revenue_streak"],
+                "forwards_since_update": kwargs["forwards_since_update"],
+                "revenue_rate": _r(kwargs["revenue_rate"]),
+                "supported_fee_ceiling": (
+                    _r(kwargs["supported_fee_ceiling"])
+                    if kwargs.get("supported_fee_ceiling") is not None else None),
+                "earning_anchor_ppm": (
+                    _r(kwargs["earning_anchor_ppm"])
+                    if kwargs.get("earning_anchor_ppm") is not None else None),
+                "guard_streak": kwargs.get("guard_streak"),
+                "downshift_streak": kwargs.get("downshift_streak"),
+                "rate_is_meaningful": kwargs.get("rate_is_meaningful"),
+            },
+            "expected_fee": applied,
+            "expected_tag": tag,
+        })
+
+    _guard_case("passthrough_nonzero_rate", current_fee=500, target_fee=800,
+                min_fee=10, zero_revenue_streak=20, forwards_since_update=0,
+                revenue_rate=1.5)
+    _guard_case("passthrough_nonzero_forwards", current_fee=500, target_fee=800,
+                min_fee=10, zero_revenue_streak=20, forwards_since_update=3,
+                revenue_rate=0.0)
+    _guard_case("passthrough_streak_below_guard", current_fee=500,
+                target_fee=800, min_fee=10, zero_revenue_streak=2,
+                forwards_since_update=0, revenue_rate=0.0)
+    _guard_case("hold_at_guard_thresh_lower_target", current_fee=500,
+                target_fee=300, min_fee=10, zero_revenue_streak=8,
+                forwards_since_update=0, revenue_rate=0.0)
+    _guard_case("hold_at_guard_thresh_higher_target_blocked",
+                current_fee=500, target_fee=900, min_fee=10,
+                zero_revenue_streak=8, forwards_since_update=0,
+                revenue_rate=0.0)
+    _guard_case("floor_override_raise", current_fee=50, target_fee=40,
+                min_fee=100, zero_revenue_streak=8, forwards_since_update=0,
+                revenue_rate=0.0)
+    _guard_case("downshift_step_at_thresh", current_fee=1000, target_fee=1200,
+                min_fee=10, zero_revenue_streak=24, forwards_since_update=0,
+                revenue_rate=0.0)
+    _guard_case("hold_at_thresh_plus_11", current_fee=1000, target_fee=1200,
+                min_fee=10, zero_revenue_streak=35, forwards_since_update=0,
+                revenue_rate=0.0)
+    _guard_case("downshift_step_at_thresh_plus_12", current_fee=1000,
+                target_fee=1200, min_fee=10, zero_revenue_streak=36,
+                forwards_since_update=0, revenue_rate=0.0)
+    _guard_case("downshift_capped_by_supported_ceiling", current_fee=1000,
+                target_fee=1200, min_fee=10, zero_revenue_streak=24,
+                forwards_since_update=0, revenue_rate=0.0,
+                supported_fee_ceiling=700.0)
+    _guard_case("downshift_soft_anchor_floor_absorbs_step", current_fee=1000,
+                target_fee=100, min_fee=10, zero_revenue_streak=24,
+                forwards_since_update=0, revenue_rate=0.0,
+                earning_anchor_ppm=1900.0)
+    _guard_case("downshift_anchor_floor_override_raise", current_fee=500,
+                target_fee=100, min_fee=10, zero_revenue_streak=24,
+                forwards_since_update=0, revenue_rate=0.0,
+                earning_anchor_ppm=1900.0)
+    _guard_case("trickle_reclassified_as_silence", current_fee=500,
+                target_fee=300, min_fee=10, zero_revenue_streak=8,
+                forwards_since_update=2, revenue_rate=0.4,
+                rate_is_meaningful=False)
+    _guard_case("meaningful_rate_not_reclassified", current_fee=500,
+                target_fee=300, min_fee=10, zero_revenue_streak=8,
+                forwards_since_update=2, revenue_rate=0.4,
+                rate_is_meaningful=True)
+    _guard_case("custom_guard_streak_used", current_fee=500, target_fee=300,
+                min_fee=10, zero_revenue_streak=4, forwards_since_update=0,
+                revenue_rate=0.0, guard_streak=4)
+    _guard_case("falsy_zero_guard_streak_falls_back_to_default",
+                current_fee=500, target_fee=300, min_fee=10,
+                zero_revenue_streak=8, forwards_since_update=0,
+                revenue_rate=0.0, guard_streak=0)
+    _write(outdir / "zero_flow_guard.json", {"now": NOW, "cases": zfg_cases})
+
+    # --- kalman.json: _kalman_demand_factor curve (10 points).
+    kalman_cases = []
+    for ed in (0.0, 0.01, 0.05, 0.25, 0.4999999, 0.5, 0.75, 1.0, 1.5, 10.0):
+        kalman_cases.append({
+            "expected_demand": _r(ed),
+            "expected": _r(fc._kalman_demand_factor(ed)),
+        })
+    _write(outdir / "kalman.json", {"now": NOW, "cases": kalman_cases})
+
+    # --- std_threshold.json: _exploration_std_threshold curve (10 points).
+    std_threshold_cases = []
+    for fee in (0, 1, -50, 500, 2499, 2500, 2501, 5000, 25000, 100000):
+        std_threshold_cases.append({
+            "current_fee_ppm": fee,
+            "expected": _r(fc._exploration_std_threshold(fee)),
+        })
+    _write(outdir / "std_threshold.json",
+           {"now": NOW, "cases": std_threshold_cases})
+
+    # --- unroutable.json: _is_unroutable_zero_window.
+    unroutable_cases = []
+    for rate, spendable in [
+        (0.0, 24999.0), (0.0, 25000.0), (0.0, 25001.0),
+        (1.0, 100.0), (-1.0, 0.0), (0.0, 0.0),
+    ]:
+        unroutable_cases.append({
+            "revenue_rate": _r(rate), "spendable_sats": _r(spendable),
+            "expected": fc._is_unroutable_zero_window(rate, spendable),
+        })
+    _write(outdir / "unroutable.json", {"now": NOW, "cases": unroutable_cases})
+
+
 SUITES = {
     "pyrand": gen_pyrand,
     "mat3": gen_mat3,
+    "rails": gen_rails,
 }
 
 
