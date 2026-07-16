@@ -826,6 +826,22 @@ def gen_state_dict(outdir: Path) -> None:
         d0, {"future_alias_note": "café ☃ router-étiquette"},
     ))
 
+    # 7: a legacy float-typed observation fee (thompson_aimd_v1-era blobs
+    # may carry `fee_ppm` as a JSON float) alongside a current int-typed fee
+    # in the SAME observations list. `from_dict`/`to_dict` never cast
+    # observation[0] (just like prior_mean_fee/prior_std_fee — see that
+    # struct doc comment), so the JSON int/float typing of each observation
+    # fee must survive the round trip independently, byte-identical to
+    # Python's own `json.dumps`.
+    d5 = {
+        "weight_scheme": "exposure_v2",
+        "observations": [
+            [250.0, 12.5, 1.0, NOW - 3600, "peak"],
+            [250, 12.5, 1.0, NOW - 3600, "peak"],
+        ],
+    }
+    cases.append(_state_dict_case("float_and_int_observation_fee_roundtrip", d5))
+
     _write(outdir / "cases.json", {"now": NOW, "cases": cases})
 
 
