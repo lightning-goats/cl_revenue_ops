@@ -423,6 +423,7 @@ def gen_reclassification_cases(rng: Random):
            fee_state, now_val, initial_kalman_state=None, fallback_confidence=1.0):
         channel_id = f"chan_{label}"
         fake, kf = make_fake_analyzer(channel_id, initial_state=initial_kalman_state, fee_state=fee_state)
+        initial_state_out = state_dict(kf.state)
         fa.time.time = lambda: float(now_val)
 
         metrics = fa.FlowMetrics(
@@ -446,6 +447,7 @@ def gen_reclassification_cases(rng: Random):
         overridden = metrics.state != fa.ChannelState.UNKNOWN
         return {
             "id": label,
+            "initial_state": initial_state_out,
             "capacity": capacity,
             "our_balance": our_balance,
             "daily_volume": daily_volume,
@@ -456,6 +458,8 @@ def gen_reclassification_cases(rng: Random):
             "last_forward_ts": last_forward_ts,
             "previous_state": previous_state,
             "posterior_variance": fee_state_variance_of(fee_state),
+            "source_threshold": bits(fake.config.source_threshold),
+            "sink_threshold": bits(fake.config.sink_threshold),
             "now": now_val,
             "fallback_confidence": bits(fallback_confidence),
             "kalman_flow_ratio": bits(metrics.kalman_flow_ratio),
@@ -672,7 +676,18 @@ def gen_temporal_profile_cases(rng: Random):
             fa.time.time = lambda nv=now_val: float(nv)
             updated = fa.update_temporal_profile(existing, histogram, daily_forwards)
             steps.append({
-                "histogram": [{"out_sats": h["out_sats"], "in_sats": h["in_sats"], "count": h["count"]}
+                # Bit-pattern hex, NOT plain JSON numbers: serde_json's
+                # default (non-"arbitrary_precision") float parser is not
+                # always correctly-rounded to the nearest f64 (observed
+                # empirically -- a 1-ULP miss on a value like
+                # 49.734184829473676 -- whereas Rust's own
+                # `str::parse::<f64>()` IS correctly-rounded and matches
+                # Python bit-for-bit). Every float in this fixture format
+                # goes through `bits()` for exactly this reason; these
+                # three were the one place that had drifted from that
+                # convention.
+                "histogram": [{"out_sats": bits(h["out_sats"]), "in_sats": bits(h["in_sats"]),
+                               "count": bits(h["count"])}
                               for h in histogram],
                 "daily_forwards": daily_forwards,
                 "now": now_val,
@@ -808,7 +823,7 @@ def gen_classify_candidate_cases(rng: Random):
             "channels": channels,
             "role": profile.role,
             "confidence": bits(profile.confidence),
-            "gossip_signals": dict(profile.gossip_signals),
+            "gossip_signals": {k: bits(v) for k, v in profile.gossip_signals.items()},
             "has_liquidity_ads": profile.has_liquidity_ads,
         }
 
