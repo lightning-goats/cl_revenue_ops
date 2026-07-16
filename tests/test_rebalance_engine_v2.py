@@ -1563,9 +1563,15 @@ def test_engine_execute_candidate_fails_closed_when_route_pricing_raises(
     engine._execute_pair.assert_not_called()
 
 
-def test_engine_execute_candidate_continues_when_local_route_pricing_fails(
+def test_engine_execute_candidate_fails_fast_when_local_route_pricing_fails(
     mock_plugin, mock_database
 ):
+    # Historical note: under the sling executor (removed 2026-07) a failed
+    # local pricing continued to _execute_pair because sling discovered its
+    # own routes. The native executor requires an explicit route, so the
+    # fall-through became a guaranteed 'native_route_invalid: missing_route'
+    # failure that masked the real getroutes error and burned a budget
+    # reservation per attempt. Pricing failure must now return immediately.
     from modules.rebalance_executor_v2 import ExecutionResult
 
     engine = _make_engine(mock_plugin, mock_database)
@@ -1593,11 +1599,13 @@ def test_engine_execute_candidate_continues_when_local_route_pricing_fails(
 
     result = engine.execute_candidate(candidate)
 
-    assert result.success is True
+    assert result.success is False
+    assert result.error.startswith("route_pricing_failed:")
+    assert "no_route" in result.error
     assert result.route_type == "native"
     engine.router_v3.price_pair.assert_called_once()
     assert engine.router_v3.price_pair.call_args.kwargs["exclude"] is None
-    engine._execute_pair.assert_called_once()
+    engine._execute_pair.assert_not_called()
 
 
 def test_engine_execute_candidate_exports_failure_snapshot(mock_plugin, mock_database):

@@ -3325,6 +3325,20 @@ class RebalanceEngine:
                         f"{route_result.error or 'no_route'} ({route_label})",
                         level="info",
                     )
+                    # A failed pricing means there is no route to execute.
+                    # Falling through to _execute_pair with route=None made
+                    # the executor fail as 'native_route_invalid:
+                    # missing_route', masking the real getroutes error and
+                    # burning a budget reservation per attempt.
+                    return ExecutionResult(
+                        success=False,
+                        error=(
+                            f"route_pricing_failed: "
+                            f"{route_result.error or 'no_route'} ({route_label})"
+                        ),
+                        amount_sats=amount_sats,
+                        route_type="native",
+                    )
         finally:
             router_end = getattr(self._cycle_router, "end_cycle", None)
             if callable(router_end):

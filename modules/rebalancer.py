@@ -37,6 +37,12 @@ if TYPE_CHECKING:
 # budget) — a typo cannot authorize huge diagnostic spend.
 DIAGNOSTIC_FEE_CAP_CEILING_SATS = 10_000
 
+# Bound on how many shock sources the defibrillator tries per run. Each
+# failed pricing costs a getroutes call and a rebalance_history row; a
+# route-availability failure is source-specific, so a small fallback list
+# covers the pathological-source case without spraying attempts.
+DIAGNOSTIC_MAX_SOURCE_ATTEMPTS = 3
+
 
 # =============================================================================
 # REASON CODES FOR EXPLAINABILITY
@@ -1691,6 +1697,21 @@ class EVRebalancer:
 
         return result
 
+    @staticmethod
+    def _is_source_route_failure(error: Optional[str]) -> bool:
+        """True when an execution failure means no route exists from the
+        chosen source — pricing failed or the route never validated, so no
+        payment was attempted and retrying from another source is safe."""
+        text = str(error or "")
+        return any(
+            marker in text
+            for marker in (
+                "route_pricing_failed",
+                "native_route_invalid",
+                "no_route",
+            )
+        )
+
     def diagnostic_rebalance(self, channel_id: str) -> Dict[str, Any]:
         """
         Trigger a "Channel Defibrillator" sequence:
@@ -1734,13 +1755,18 @@ class EVRebalancer:
                     "message": "Exploration flag set, but no sources available for active shock."
                 }
             
-            # Sort by spendable capacity desc, pick the best
-            best_source_id, best_source_info = sorted(
-                valid_sources, 
-                key=lambda x: x[1].get('spendable_sats', 0), 
+            # Sort by spendable capacity desc. The shock retries down this
+            # list when route pricing says a source cannot route: picking
+            # only the single largest source made the diagnostic fail forever
+            # when that source's peer is unroutable (e.g. Tallship advertises
+            # 600/1201/2016 CLTV deltas, so askrene can never build a route
+            # from it within its 2016 delay ceiling).
+            ranked_sources = sorted(
+                valid_sources,
+                key=lambda x: x[1].get('spendable_sats', 0),
                 reverse=True
-            )[0]
-            
+            )[:DIAGNOSTIC_MAX_SOURCE_ATTEMPTS]
+
             # Construct a diagnostic candidate (50k sats - small enough to be OpEx)
             shock_amount = 50_000
 
@@ -1765,29 +1791,7 @@ class EVRebalancer:
             # Note: outbound_fee is 0 because the active shock itself is not the
             # fee-controller path; the controller-side exploration remains non-zero.
             inbound_fee = self._estimate_inbound_fee(dest_info.get('peer_id', ''))
-            
-            candidate = RebalanceCandidate(
-                source_candidates=[best_source_id],
-                to_channel=channel_id,
-                primary_source_peer_id=best_source_info.get('peer_id', ''),
-                to_peer_id=dest_info.get('peer_id', ''),
-                amount_sats=shock_amount,
-                amount_msat=sats_to_base(shock_amount),
-                outbound_fee_ppm=0,
-                inbound_fee_ppm=inbound_fee,
-                source_fee_ppm=best_source_info.get('fee_ppm', 0),
-                weighted_opp_cost_ppm=0,
-                spread_ppm=0,  # Likely negative, we don't care for diagnostic
-                max_budget_sats=max_fee_sats,  # Configured diagnostic fee cap (D4)
-                max_budget_msat=sats_to_base(max_fee_sats),
-                max_fee_ppm=max_fee_ppm,  # Derived from the sat cap (D4)
-                expected_profit_sats=-50,  # Expect a small loss (diagnostic cost)
-                liquidity_ratio=0.5,
-                dest_flow_state="diagnostic",
-                dest_turnover_rate=0.0,
-                source_turnover_rate=0.0
-            )
-            
+
             # Capital Controls Check - diagnostic rebalances count against daily budget
             if not self._check_capital_controls():
                 self.plugin.log("Defibrillator Active Shock blocked by capital controls", level='warn')
@@ -1799,20 +1803,48 @@ class EVRebalancer:
                     "message": "Zero-Fee flag set, but Active Shock blocked: daily budget exhausted or reserve too low"
                 }
 
-            # Record in database (direct diagnostic execution bypasses normal job flow)
-            rebalance_id = self.database.record_rebalance(
-                from_channel=best_source_id,
-                to_channel=channel_id,
-                amount_sats=shock_amount,
-                max_fee_sats=max_fee_sats,
-                expected_profit_sats=-50,
-                rebalance_type='diagnostic',
-                reason_code='defibrillator'
-            )
-
             actual_fee_sats = None
+            shock_ok = False
+            shock_pending = False
             shock_budget_blocked = False
-            if self.rebalance_engine_v2:
+            for source_id, source_info in ranked_sources:
+                candidate = RebalanceCandidate(
+                    source_candidates=[source_id],
+                    to_channel=channel_id,
+                    primary_source_peer_id=source_info.get('peer_id', ''),
+                    to_peer_id=dest_info.get('peer_id', ''),
+                    amount_sats=shock_amount,
+                    amount_msat=sats_to_base(shock_amount),
+                    outbound_fee_ppm=0,
+                    inbound_fee_ppm=inbound_fee,
+                    source_fee_ppm=source_info.get('fee_ppm', 0),
+                    weighted_opp_cost_ppm=0,
+                    spread_ppm=0,  # Likely negative, we don't care for diagnostic
+                    max_budget_sats=max_fee_sats,  # Configured diagnostic fee cap (D4)
+                    max_budget_msat=sats_to_base(max_fee_sats),
+                    max_fee_ppm=max_fee_ppm,  # Derived from the sat cap (D4)
+                    expected_profit_sats=-50,  # Expect a small loss (diagnostic cost)
+                    liquidity_ratio=0.5,
+                    dest_flow_state="diagnostic",
+                    dest_turnover_rate=0.0,
+                    source_turnover_rate=0.0
+                )
+
+                # Record in database (direct diagnostic execution bypasses normal job flow)
+                rebalance_id = self.database.record_rebalance(
+                    from_channel=source_id,
+                    to_channel=channel_id,
+                    amount_sats=shock_amount,
+                    max_fee_sats=max_fee_sats,
+                    expected_profit_sats=-50,
+                    rebalance_type='diagnostic',
+                    reason_code='defibrillator'
+                )
+
+                if not self.rebalance_engine_v2:
+                    self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no rebalance engine available")
+                    break
+
                 # P4-020: reserve the shock's fee cap atomically on the unified
                 # cross-category rail (reserve_budget=True). If the budget is
                 # exhausted by other categories' reservations the engine returns
@@ -1851,10 +1883,19 @@ class EVRebalancer:
                     not shock_ok and not shock_pending
                     and "local_budget_block" in str(getattr(exec_result, "error", "") or "")
                 )
-            else:
-                self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no rebalance engine available")
-                shock_ok = False
-                shock_pending = False
+                if shock_ok or shock_pending or shock_budget_blocked:
+                    break
+                # Only a route-availability failure justifies trying the next
+                # source: no payment was attempted, so a retry cannot double-
+                # pay. Any other failure stops the sequence (a payment may
+                # have gone out, or the cause is not source-specific).
+                if not self._is_source_route_failure(exec_result.error):
+                    break
+                self.plugin.log(
+                    f"Defibrillator: source {source_id} unroutable "
+                    f"({exec_result.error}); trying next source",
+                    level='info',
+                )
 
             # Audit (defibrillation honesty): report the ACTUAL shock
             # outcome. A failed or still-pending shock delivered no
