@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""AST-extract the `Config` dataclass's field types plus its public/deprecated
-runtime-key classification sets from modules/config.py.
+"""AST-extract the `Config` dataclass's field types, its public/deprecated
+runtime-key classification sets, and its override-validation tables
+(CONFIG_FIELD_RANGES, STRING_ENUM_VALID_VALUES) from modules/config.py.
 
 Run from the repo root (~/bin/cl_revenue_ops-port):
 
@@ -11,6 +12,13 @@ The output feeds crates/revops/src/config_types.rs in the Rust port
 Python type (so `revenue-r-config get` can convert a resolved CLN option
 value to the JSON scalar shape Python would emit) and to replicate
 `Config.classify_runtime_key` (PUBLIC_RUNTIME_KEYS / DEPRECATED_RUNTIME_KEYS).
+`ranges`/`enums` feed `revops::config_resolve::validate_override`, the Rust
+port of `Config._apply_override`'s range/enum gate
+(modules/config.py:1015-1047) -- CONFIG_FIELD_RANGES has 96 entries as of
+this writing (large enough that hand-transcription risks drift), so both
+tables are AST-extracted here rather than transcribed, even though
+STRING_ENUM_VALID_VALUES (5 entries) alone would have been small enough to
+transcribe by hand with line citations.
 
 Only `int`/`float`/`bool`/`str` fields with a plain `Name` annotation are
 captured -- this naturally excludes the dataclass's non-configurable,
@@ -39,6 +47,8 @@ tree = ast.parse(open("modules/config.py").read())
 fields = {}
 public_keys = None
 deprecated_keys = None
+ranges = None
+enums = None
 
 for node in ast.walk(tree):
     if isinstance(node, ast.ClassDef) and node.name == "Config":
@@ -54,11 +64,21 @@ for node in ast.walk(tree):
     elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
         if node.target.id == "DEPRECATED_RUNTIME_KEYS":
             deprecated_keys = sorted(literal_or_call_arg(node.value))
+        elif node.target.id == "CONFIG_FIELD_RANGES":
+            raw_ranges = literal_or_call_arg(node.value)
+            ranges = {k: list(v) for k, v in raw_ranges.items()}
+        elif node.target.id == "STRING_ENUM_VALID_VALUES":
+            raw_enums = literal_or_call_arg(node.value)
+            enums = {k: list(v) for k, v in raw_enums.items()}
 
 if public_keys is None:
     sys.exit("PUBLIC_RUNTIME_KEYS not found in modules/config.py")
 if deprecated_keys is None:
     sys.exit("DEPRECATED_RUNTIME_KEYS not found in modules/config.py")
+if ranges is None:
+    sys.exit("CONFIG_FIELD_RANGES not found in modules/config.py")
+if enums is None:
+    sys.exit("STRING_ENUM_VALID_VALUES not found in modules/config.py")
 if len(sys.argv) != 2:
     print(f"usage: {sys.argv[0]} <output.json>", file=sys.stderr)
     sys.exit(1)
@@ -67,9 +87,12 @@ out = {
     "fields": fields,
     "public_keys": public_keys,
     "deprecated_keys": deprecated_keys,
+    "ranges": ranges,
+    "enums": enums,
 }
 json.dump(out, open(sys.argv[1], "w"), indent=1)
 print(
     f"{len(fields)} fields, {len(public_keys)} public keys, "
-    f"{len(deprecated_keys)} deprecated keys -> {sys.argv[1]}"
+    f"{len(deprecated_keys)} deprecated keys, {len(ranges)} ranges, "
+    f"{len(enums)} enums -> {sys.argv[1]}"
 )
