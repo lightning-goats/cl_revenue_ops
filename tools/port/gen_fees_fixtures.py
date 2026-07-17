@@ -1774,6 +1774,888 @@ def gen_vegas(outdir: Path) -> None:
     })
 
 
+# ---------------------------------------------------------------------------
+# cycle: end-to-end single-channel fee-cycle decision traces through the REAL
+# `FeeController._adjust_all_fees_channel_loop` / `_adjust_channel_fee`
+# (Phase 4 Task 10). Seeded global `random`, module-clock frozen per cycle,
+# scripted plugin/database/data_service doubles (pattern copied from
+# tests/test_fee_controller*.py — NOT imported). Every float in the fixture
+# (inputs AND expectations) is encoded as {"__f__": repr(x)} so the Rust
+# replay keeps the int/float distinction and compares via py_repr.
+# ---------------------------------------------------------------------------
+
+import modules.fee_controller as _fc_mod
+from modules.fee_controller import (  # noqa: E402
+    ChannelCycleState,
+    ChannelFeeState,
+)
+from modules.policy_manager import FeeStrategy as _FeeStrategy  # noqa: E402
+from modules.policy_manager import PeerPolicy as _PeerPolicy  # noqa: E402
+
+_REAL_TIME = time
+
+
+class _FrozenTime:
+    """Module-clock stand-in for `modules.fee_controller.time`."""
+
+    def __init__(self, now):
+        self.now = float(now)
+
+    def time(self):
+        return self.now
+
+    def gmtime(self, *args):
+        return _REAL_TIME.gmtime(args[0] if args else self.now)
+
+    def strftime(self, *args, **kwargs):
+        return _REAL_TIME.strftime(*args, **kwargs)
+
+
+def _enc(obj):
+    """Recursively encode floats as {"__f__": repr} (bools stay bools)."""
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, float):
+        return {"__f__": repr(obj)}
+    if isinstance(obj, dict):
+        return {str(k): _enc(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_enc(v) for v in obj]
+    return obj
+
+
+class _CycleDb:
+    """Scripted Database double (dict-driven, deterministic)."""
+
+    def __init__(self, scn):
+        self.scn = scn
+        self.volume_map = {}
+        self.forward_map = {}
+        self.probe_flag = None
+        self.cost_history = []
+        self.peer_fee_history = None
+        self.latency = {"avg": 0.0, "std": 0.0}
+        self.last_forward_ts = None
+        self.fee_change_records = []
+        self.cleared_probes = []
+
+    @staticmethod
+    def _lookup(m, since):
+        if str(int(since)) in m:
+            return m[str(int(since))]
+        return m.get("default", 0)
+
+    def get_volume_since(self, channel_id, since):
+        return self._lookup(self.volume_map, since)
+
+    def get_forward_count_since(self, channel_id, since):
+        return self._lookup(self.forward_map, since)
+
+    def get_channel_probe(self, channel_id):
+        return self.probe_flag
+
+    def clear_channel_probe(self, channel_id):
+        self.cleared_probes.append(channel_id)
+        self.probe_flag = None
+
+    def get_channel_cost_history(self, channel_id, since_timestamp=None):
+        return list(self.cost_history)
+
+    def get_historical_inbound_fee_ppm(self, peer_id, window_days=30,
+                                       min_samples=4):
+        return self.peer_fee_history
+
+    def get_peer_latency_stats(self, peer_id, window_seconds=86400):
+        return dict(self.latency)
+
+    def get_last_forward_time(self, channel_id):
+        return self.last_forward_ts
+
+    def get_fee_strategy_state(self, channel_id):
+        return {"channel_id": channel_id}
+
+    def get_all_channel_flow_windows(self, since):
+        return {}
+
+    def record_fee_change(self, **kw):
+        self.fee_change_records.append(kw)
+
+    def update_fee_strategy_state(self, **kw):
+        pass
+
+
+class _CycleDataService:
+    """Scripted data_service double (gossip + setchannel echo)."""
+
+    def __init__(self, our_id):
+        self.our_id = our_id
+        self.gossip = []  # listchannels(destination=peer) rows
+        self.set_channel_calls = []
+
+    def get_node_id(self):
+        return self.our_id
+
+    def get_channels(self, source=None, destination=None):
+        return {"channels": list(self.gossip)}
+
+    def set_channel(self, **params):
+        self.set_channel_calls.append(dict(params))
+        return {
+            "channels": [{
+                "short_channel_id": params["id"],
+                "fee_proportional_millionths": params["feeppm"],
+            }]
+        }
+
+
+class _StaticPolicyManager:
+    def __init__(self, policy):
+        self._policy = policy
+
+    def get_policy(self, peer_id):
+        return self._policy
+
+
+_CYCLE_SKIP_KEYS = [
+    "policy_passive", "policy_static", "temporary_overlay", "sleeping",
+    "waiting_time", "waiting_forwards", "alpha_guard", "fee_unchanged",
+    "gossip_hysteresis", "idempotent", "error",
+]
+
+_CYCLE_FEE_SCALARS = (
+    "last_revenue_rate", "last_fee_ppm", "last_broadcast_fee_ppm",
+    "last_update", "last_broadcast_at", "last_state", "is_sleeping",
+    "sleep_until", "stable_cycles", "forward_count_since_update",
+    "last_volume_sats", "last_gossip_refresh", "last_vegas_multiplier",
+)
+
+
+def _policy_to_fixture(policy):
+    if policy is None:
+        return None
+    return {
+        "strategy": policy.strategy.value,
+        "fee_ppm_target": policy.fee_ppm_target,
+        "fee_multiplier_min": policy.fee_multiplier_min,
+        "fee_multiplier_max": policy.fee_multiplier_max,
+    }
+
+
+def _base_cfg(**over):
+    cfg = {
+        "min_fee_ppm": 10,
+        "max_fee_ppm": 5000,
+        "min_fee_ppm_saturated": 0,
+        "fee_interval": 1800,
+        "flow_interval": 3600,
+        "htlc_congestion_threshold": 0.8,
+        "market_fee_mode": "undercut",
+        "neighbor_median_min_competitors": 3,
+        "drain_fee_discount_max": 0.0,
+        "high_liquidity_threshold": 0.7,
+        "fee_profile": "active",
+        "base_fee_msat": 0,
+        "enable_dynamic_htlcmax": False,
+        "htlcmax_source_pct": 0.5,
+        "htlcmax_sink_pct": 0.9,
+        "htlcmax_balanced_pct": 0.75,
+        "paused": False,
+        "node_drain_bias_enabled": False,
+        "econ_governor_fees_enabled": False,
+        "vegas_decay_rate": 0.85,
+    }
+    cfg.update(over)
+    return cfg
+
+
+def _channel_info(cid, peer, *, fee_ppm, capacity, spendable_msat,
+                  opener="local", base_fee_msat=0, htlc_min_msat=0,
+                  htlc_max_msat=0, htlcs=None, max_accepted=483):
+    info = {
+        "channel_id": cid,
+        "short_channel_id": cid,
+        "full_channel_id": "f" * 64,
+        "peer_id": peer,
+        "capacity": capacity,
+        "spendable_msat": spendable_msat,
+        "receivable_msat": max(0, capacity * 1000 - spendable_msat),
+        "fee_base_msat": base_fee_msat,
+        "fee_proportional_millionths": fee_ppm,
+        "htlc_minimum_msat": htlc_min_msat,
+        "htlc_min_msat": htlc_min_msat,
+        "htlc_maximum_msat": htlc_max_msat,
+        "htlc_max_msat": htlc_max_msat,
+        "opener": opener,
+        "has_htlc_data": htlcs is not None,
+        "max_accepted_htlcs": max_accepted,
+        "our_htlcs_in_flight": htlcs or 0,
+    }
+    return info
+
+
+def _fee_state_scalars(st):
+    return {k: getattr(st, k) for k in _CYCLE_FEE_SCALARS}
+
+
+def _post_fee_state(st):
+    ts = st.thompson
+    return {
+        "posterior_mean": ts.posterior_mean,
+        "posterior_std": ts.posterior_std,
+        "zero_revenue_streak": ts.zero_revenue_streak,
+        "observation_count": len(ts.observations),
+        "last_sampled_fee": ts.last_sampled_fee,
+        "pid_state": st.pid.to_dict(),
+        "scalars": _fee_state_scalars(st),
+        "last_context_key": st.last_context_key,
+        "last_contextual_sample_used": st.last_contextual_sample_used,
+    }
+
+
+def _make_controller(cfg_dict, db, ds, our_id, policy=None,
+                     marginal_roi=None):
+    plugin = MagicMock()
+    plugin.log = MagicMock()
+    plugin.rpc.getinfo.return_value = {"id": our_id}
+    cfg_ns = SimpleNamespace(**cfg_dict)
+    config = MagicMock()
+    config.snapshot.return_value = cfg_ns
+    config.dry_run = False
+    config.vegas_decay_rate = cfg_dict["vegas_decay_rate"]
+    config.max_fee_ppm = cfg_dict["max_fee_ppm"]
+    pm = _StaticPolicyManager(policy) if policy is not None else None
+    prof = None
+    if marginal_roi is not None:
+        prof = MagicMock()
+        prof.get_profitability.return_value = SimpleNamespace(
+            marginal_roi_percent=marginal_roi)
+    fc = FeeController(plugin, config, db, policy_manager=pm,
+                       profitability_analyzer=prof)
+    fc.data_service = ds
+    fc._our_node_id = our_id
+    return fc, cfg_ns
+
+
+def gen_cycle(outdir: Path) -> None:  # noqa: C901
+    our_id = "02" + "aa" * 32
+    peer = "03" + "bb" * 32
+    cid = "820x1x0"
+
+    def gossip_row(src_i, fee, sats, age_s=600, active=True, base=500):
+        return {
+            "source": "02" + f"{src_i:02d}" * 32,
+            "active": active,
+            "fee_per_millionth": fee,
+            "satoshis": sats,
+            "amount_msat": sats * 1000,
+            "last_update": NOW - age_s,
+            "base_fee_millisatoshi": base,
+        }
+
+    def build_fee_state(obs, *, contextual=(), scalars=None, nudges=(),
+                        pid_scalars=None):
+        """Construct a ChannelFeeState through the REAL update paths."""
+        st = ChannelFeeState()
+        for (ts, fee, rate, hours, bucket) in obs:
+            _fc_mod.time = _FrozenTime(ts)
+            st.thompson.update_posterior(
+                fee=fee, revenue_rate=rate, hours=hours, time_bucket=bucket)
+        for (ts, key, fee, rate, bucket) in contextual:
+            _fc_mod.time = _FrozenTime(ts)
+            st.thompson.update_contextual(
+                context_key=key, fee=fee, revenue_rate=rate,
+                time_bucket=bucket)
+        for (ts, value, weight) in nudges:
+            _fc_mod.time = _FrozenTime(ts)
+            st.thompson.record_posterior_nudge(float(value), float(weight))
+        for k, v in (scalars or {}).items():
+            setattr(st, k, v)
+        for k, v in (pid_scalars or {}).items():
+            setattr(st.pid, k, v)
+        return st
+
+    def run_scenario(spec):
+        """Drive the real channel loop for each cycle; return fixture."""
+        random.seed(spec["seed"])
+        cfg_dict = spec["cfg"]
+        db = _CycleDb(spec)
+        ds = _CycleDataService(our_id)
+        ds.gossip = spec.get("gossip", [])
+        db.latency = spec.get("latency", {"avg": 0.0, "std": 0.0})
+        db.cost_history = spec.get("cost_history", [])
+        db.peer_fee_history = spec.get("peer_fee_history")
+        db.probe_flag = spec.get("probe_flag")
+        db.last_forward_ts = spec.get("last_forward_time")
+        policy = spec.get("policy")
+        try:
+            fc, cfg_ns = _make_controller(
+                cfg_dict, db, ds, our_id, policy=policy,
+                marginal_roi=spec.get("marginal_roi"))
+            fc._vegas_state.intensity = spec.get("vegas_intensity", 0.0)
+
+            cycle_state = ChannelCycleState(**spec["cycle_state"])
+            fee_state = spec["fee_state_builder"]()
+            initial = {
+                "cycle": _enc(dict(spec["cycle_state"])),
+                "fee": {
+                    "thompson_state": _enc(fee_state.thompson.to_dict()),
+                    "pid_state": _enc(fee_state.pid.to_dict()),
+                    "scalars": _enc(_fee_state_scalars(fee_state)),
+                },
+            }
+            fc._cycle_states[cid] = cycle_state
+            fc._channel_fee_states[cid] = fee_state
+
+            cycles_out = []
+            for cyc in spec["cycles"]:
+                now = cyc["now"]
+                _fc_mod.time = _FrozenTime(now)
+                db.volume_map = cyc.get("volume_since", {"default": 0})
+                db.forward_map = cyc.get("forward_count_since",
+                                         {"default": 0})
+                if "probe_flag" in cyc:
+                    db.probe_flag = cyc["probe_flag"]
+                if "last_forward_time" in cyc:
+                    db.last_forward_ts = cyc["last_forward_time"]
+                info = cyc["channel_info"]
+                state_row = cyc["state_row"]
+                adjustments = []
+                skips = {k: 0 for k in _CYCLE_SKIP_KEYS}
+                fc._cycle_observations = {("channels_info",): {cid: info}}
+                fc._cycle_batch_active = True
+                fc._pending_fee_strategy_rows.clear()
+                fc._cycle_peer_latency_memo.clear()
+                try:
+                    fc._adjust_all_fees_channel_loop(
+                        channel_states=[state_row],
+                        channels={cid: info},
+                        chain_costs=cyc.get("chain_costs"),
+                        cfg=cfg_ns,
+                        adjustments=adjustments,
+                        skip_reasons=skips,
+                        node_drain_bias_effective_cap=None,
+                        node_receivable_ratio_value=None,
+                        node_drain_pressure_value=None,
+                    )
+                finally:
+                    fc._cycle_batch_active = False
+                    fc._flush_pending_fee_strategy_rows()
+                    fc._cycle_observations = None
+
+                assert skips["error"] == 0, (spec["name"], skips)
+                active_skips = {k: v for k, v in skips.items() if v > 0}
+                assert len(adjustments) + sum(active_skips.values()) == 1, (
+                    spec["name"], adjustments, active_skips)
+                post_cycle = fc._cycle_states.get(cid)
+                post_fee = fc._channel_fee_states.get(cid)
+                expected = {
+                    "adjustment": (_enc(adjustments[0].to_dict())
+                                   if adjustments else None),
+                    "skip_reason": (next(iter(active_skips))
+                                    if active_skips else None),
+                    "set_channel_calls": len(ds.set_channel_calls),
+                    "post_cycle_state": _enc(
+                        FeeController._serialize_cycle_state_payload(
+                            post_cycle)),
+                    "post_fee_state": _enc(_post_fee_state(post_fee)),
+                    "rng_next_random": repr(random.random()),
+                }
+                cycles_out.append({
+                    "now": now,
+                    "state_row": _enc(state_row),
+                    "channel_info": _enc(info),
+                    "chain_costs": _enc(cyc.get("chain_costs")),
+                    "volume_since": db.volume_map,
+                    "forward_count_since": db.forward_map,
+                    "probe_flag": bool(db.probe_flag)
+                    if "probe_flag" in cyc else None,
+                    "last_forward_time": db.last_forward_ts,
+                    "expected": expected,
+                })
+                if "assert_branch" in cyc:
+                    assert cyc["assert_branch"](adjustments, active_skips), (
+                        spec["name"], now,
+                        [a.to_dict() for a in adjustments], active_skips)
+        finally:
+            _fc_mod.time = _REAL_TIME
+
+        return {
+            "name": spec["name"],
+            "seed": spec["seed"],
+            "our_id": our_id,
+            "channel_id": cid,
+            "peer_id": peer,
+            "cfg": _enc(cfg_dict),
+            "policy": _policy_to_fixture(policy),
+            "gossip": _enc(ds.gossip),
+            "latency": _enc(db.latency),
+            "cost_history": _enc(spec.get("cost_history", [])),
+            "peer_fee_history": _enc(spec.get("peer_fee_history")),
+            "probe_flag": bool(spec.get("probe_flag")),
+            "last_forward_time": spec.get("last_forward_time"),
+            "vegas_intensity": _enc(spec.get("vegas_intensity", 0.0)),
+            "marginal_roi": _enc(spec.get("marginal_roi")),
+            "initial_state": initial,
+            "cycles": cycles_out,
+        }
+
+    # ---- shared building blocks -------------------------------------
+    H = 3600
+    ago = lambda h: NOW - int(h * H)  # noqa: E731
+
+    def dense_obs(base_fee=200.0, rate=12.0, n=8, start_h=40.0, step_h=4.0):
+        """>= MIN_OBSERVATIONS meaningful observations, tight posterior."""
+        out = []
+        for i in range(n):
+            out.append((ago(start_h - i * step_h),
+                        base_fee + (i % 3) * 4.0, rate + (i % 2) * 0.8,
+                        4.0, "normal"))
+        return out
+
+    def cycle_state(**over):
+        base = dict(
+            last_revenue_rate=8.0, last_fee_ppm=200, trend_direction=1,
+            step_ppm=50, last_update=ago(2.0), last_broadcast_at=ago(2.0),
+            consecutive_same_direction=0, is_sleeping=False, sleep_until=0,
+            stable_cycles=0, last_broadcast_fee_ppm=200,
+            last_state="dts_pid", forward_count_since_update=0,
+            last_volume_sats=0, congestion_active=False,
+            congestion_quiet_cycles=0, congestion_entry_fee_ppm=0,
+            pending_target_ppm=0, last_gossip_refresh=0,
+            dynamic_htlcmin_baseline_msat=None,
+        )
+        base.update(over)
+        return base
+
+    def fee_scalars(**over):
+        base = dict(
+            last_revenue_rate=8.0, last_fee_ppm=200,
+            last_broadcast_fee_ppm=200, last_update=ago(2.0),
+            last_broadcast_at=ago(2.0), last_state="balanced",
+            is_sleeping=False, sleep_until=0, stable_cycles=0,
+        )
+        base.update(over)
+        return base
+
+    plain_info = _channel_info(cid, peer, fee_ppm=200, capacity=2_000_000,
+                               spendable_msat=1_000_000_000)
+    plain_row = {"channel_id": cid, "peer_id": peer, "state": "balanced",
+                 "updated_at": NOW - 600, "kalman_flow_ratio": 0.2,
+                 "kalman_velocity": 0.01}
+    competitors = [gossip_row(1, 420, 4_000_000), gossip_row(2, 500, 6_000_000),
+                   gossip_row(3, 380, 3_000_000, age_s=7200),
+                   gossip_row(4, 10, 1_000_000, base=1000),  # CLN default: filtered
+                   gossip_row(5, 460, 8_000_000, active=False)]  # inactive
+
+    scenarios = []
+
+    # 1. sleeping-hold: asleep, timer not expired, no spike.
+    scenarios.append({
+        "name": "sleeping_hold", "seed": 101, "cfg": _base_cfg(),
+        "cycle_state": cycle_state(is_sleeping=True, sleep_until=NOW + 3 * H,
+                                   stable_cycles=3, last_update=ago(1.0)),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(), scalars=fee_scalars(
+                is_sleeping=True, sleep_until=NOW + 3 * H, stable_cycles=3,
+                last_update=ago(1.0), last_revenue_rate=8.0)),
+        "cycles": [{
+            "now": NOW, "channel_info": plain_info, "state_row": plain_row,
+            "volume_since": {str(ago(1.0)): 45_000, "default": 45_000},
+            "forward_count_since": {"default": 2},
+            "assert_branch": lambda adj, sk: sk == {"sleeping": 1},
+        }],
+    })
+
+    # 2. timer-wake: sleep timer expired -> wake, DTS+PID with wake damping.
+    scenarios.append({
+        "name": "timer_wake", "seed": 102, "cfg": _base_cfg(),
+        "gossip": competitors,
+        "cycle_state": cycle_state(is_sleeping=True, sleep_until=NOW - 60,
+                                   stable_cycles=3, last_update=ago(3.0)),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(base_fee=420.0, rate=30.0, n=10),
+            scalars=fee_scalars(
+                is_sleeping=True, sleep_until=NOW - 60, stable_cycles=3,
+                last_update=ago(3.0))),
+        "cycles": [{
+            "now": NOW, "channel_info": plain_info, "state_row": plain_row,
+            "volume_since": {str(ago(3.0)): 900_000, "default": 900_000},
+            "forward_count_since": {"default": 6},
+            "assert_branch": lambda adj, sk: (
+                len(adj) == 1
+                and adj[0].algorithm_values["wake_reason"]
+                == "sleep_timer_expired"),
+        }],
+    })
+
+    # 3. spike-wake: still inside sleep window, revenue spike wakes it.
+    scenarios.append({
+        "name": "spike_wake", "seed": 103, "cfg": _base_cfg(),
+        "gossip": competitors,
+        "cycle_state": cycle_state(is_sleeping=True, sleep_until=NOW + 3 * H,
+                                   stable_cycles=3, last_update=ago(2.0)),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(base_fee=420.0, rate=30.0, n=10),
+            scalars=fee_scalars(
+                is_sleeping=True, sleep_until=NOW + 3 * H, stable_cycles=3,
+                last_update=ago(2.0), last_revenue_rate=4.0)),
+        "cycles": [{
+            "now": NOW, "channel_info": plain_info, "state_row": plain_row,
+            "volume_since": {str(ago(2.0)): 2_500_000, "default": 2_500_000},
+            "forward_count_since": {"default": 9},
+            "assert_branch": lambda adj, sk: (
+                len(adj) == 1
+                and adj[0].algorithm_values["wake_reason"] == "revenue_spike"),
+        }],
+    })
+
+    # 4. congestion episode: entry edge -> damped follow-up -> 2-quiet exit.
+    congested_info = _channel_info(cid, peer, fee_ppm=200,
+                                   capacity=2_000_000,
+                                   spendable_msat=1_000_000_000,
+                                   htlcs=28, max_accepted=30)
+    calm_info = _channel_info(cid, peer, fee_ppm=400, capacity=2_000_000,
+                              spendable_msat=1_000_000_000, htlcs=1,
+                              max_accepted=30)
+    scenarios.append({
+        "name": "congestion_episode", "seed": 104, "cfg": _base_cfg(),
+        "gossip": competitors,
+        "cycle_state": cycle_state(),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(), scalars=fee_scalars()),
+        "cycles": [
+            {  # entry edge: undamped jump to the cap
+                "now": NOW, "channel_info": congested_info,
+                "state_row": plain_row,
+                "volume_since": {"default": 1_200_000},
+                "forward_count_since": {"default": 7},
+                "assert_branch": lambda adj, sk: (
+                    len(adj) == 1 and adj[0].reason_code == "congestion"),
+            },
+            {  # still congested: damped follow-up through blend/delta-cap
+                "now": NOW + 1800,
+                "channel_info": _channel_info(
+                    cid, peer, fee_ppm=400, capacity=2_000_000,
+                    spendable_msat=1_000_000_000, htlcs=28, max_accepted=30),
+                "state_row": plain_row,
+                "volume_since": {"default": 800_000},
+                "forward_count_since": {"default": 5},
+            },
+            {  # quiet cycle 1 (inside episode, DTS+PID path)
+                "now": NOW + 3600, "channel_info": calm_info,
+                "state_row": plain_row,
+                "volume_since": {"default": 500_000},
+                "forward_count_since": {"default": 4},
+            },
+            {  # quiet cycle 2 -> episode ends
+                "now": NOW + 5400, "channel_info": calm_info,
+                "state_row": plain_row,
+                "volume_since": {"default": 400_000},
+                "forward_count_since": {"default": 4},
+            },
+        ],
+    })
+
+    # 5. exploration (probe flag, no traffic): bounded low-fee target.
+    scenarios.append({
+        "name": "exploration_low_fee", "seed": 105, "cfg": _base_cfg(),
+        "probe_flag": 1,
+        "cycle_state": cycle_state(last_fee_ppm=400,
+                                   last_broadcast_fee_ppm=400,
+                                   last_state="LOW_FEE_EXPLORATION"),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(n=3),
+            scalars=fee_scalars(last_fee_ppm=400,
+                                last_broadcast_fee_ppm=400)),
+        "cycles": [{
+            "now": NOW,
+            "channel_info": _channel_info(cid, peer, fee_ppm=400,
+                                          capacity=2_000_000,
+                                          spendable_msat=1_000_000_000),
+            "state_row": plain_row,
+            "volume_since": {"default": 0},
+            "forward_count_since": {"default": 0},
+            "assert_branch": lambda adj, sk: (
+                (not adj) or adj[0].reason_code == "low_fee_exploration"),
+        }],
+    })
+
+    # 6. exploration success: traffic observed -> flag cleared, safe hold.
+    scenarios.append({
+        "name": "exploration_success", "seed": 106, "cfg": _base_cfg(),
+        "probe_flag": 1,
+        "cycle_state": cycle_state(last_fee_ppm=60,
+                                   last_broadcast_fee_ppm=60,
+                                   last_state="LOW_FEE_EXPLORATION"),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(n=3),
+            scalars=fee_scalars(last_fee_ppm=60, last_broadcast_fee_ppm=60)),
+        "cycles": [{
+            "now": NOW,
+            "channel_info": _channel_info(cid, peer, fee_ppm=60,
+                                          capacity=2_000_000,
+                                          spendable_msat=1_000_000_000),
+            "state_row": plain_row,
+            "volume_since": {"default": 700_000},
+            "forward_count_since": {"default": 5},
+            "assert_branch": lambda adj, sk: (
+                len(adj) == 1
+                and adj[0].reason_code == "low_fee_exploration_success"),
+        }],
+    })
+
+    # 7. plain DTS+PID with competitive undercut clamp (tight posterior,
+    #    healthy outbound, competitors well above the floor).
+    scenarios.append({
+        "name": "dts_pid_undercut", "seed": 107, "cfg": _base_cfg(),
+        "gossip": competitors, "marginal_roi": 42.3567,
+        "cycle_state": cycle_state(last_fee_ppm=600,
+                                   last_broadcast_fee_ppm=600),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(base_fee=700.0, rate=25.0, n=10),
+            scalars=fee_scalars(last_fee_ppm=600,
+                                last_broadcast_fee_ppm=600)),
+        "cycles": [{
+            "now": NOW,
+            "channel_info": _channel_info(cid, peer, fee_ppm=600,
+                                          capacity=2_000_000,
+                                          spendable_msat=1_100_000_000),
+            "state_row": plain_row,
+            "volume_since": {"default": 1_500_000},
+            "forward_count_since": {"default": 8},
+        }],
+    })
+
+    # 8. sparse-data channel: neighbor-median posterior nudge path.
+    scenarios.append({
+        "name": "sparse_median_nudge", "seed": 108, "cfg": _base_cfg(),
+        "gossip": competitors,
+        "cycle_state": cycle_state(),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(n=2), scalars=fee_scalars()),
+        "cycles": [{
+            "now": NOW, "channel_info": plain_info, "state_row": plain_row,
+            "volume_since": {"default": 400_000},
+            "forward_count_since": {"default": 4},
+        }],
+    })
+
+    # 9. zero-flow hold: streak past the guard threshold, raise frozen.
+    def zf_state(streak_obs):
+        def build():
+            obs = dense_obs(base_fee=900.0, rate=30.0, n=6, start_h=400.0,
+                            step_h=4.0)
+            for i in range(streak_obs):
+                obs.append((ago(300.0 - i * 0.5), 900.0, 0.0, 0.5, "normal"))
+            return build_fee_state(
+                obs, scalars=fee_scalars(last_fee_ppm=900,
+                                         last_broadcast_fee_ppm=900,
+                                         last_revenue_rate=0.0))
+        return build
+
+    zf_info = _channel_info(cid, peer, fee_ppm=900, capacity=2_000_000,
+                            spendable_msat=1_000_000_000)
+    zf_row = dict(plain_row, kalman_flow_ratio=0.0, kalman_velocity=0.0)
+    scenarios.append({
+        "name": "zero_flow_hold", "seed": 109, "cfg": _base_cfg(),
+        "cycle_state": cycle_state(last_fee_ppm=900,
+                                   last_broadcast_fee_ppm=900,
+                                   last_revenue_rate=0.0),
+        "fee_state_builder": zf_state(20),
+        "last_forward_time": ago(30.0),
+        "cycles": [{
+            "now": NOW, "channel_info": zf_info, "state_row": zf_row,
+            "volume_since": {"default": 0},
+            "forward_count_since": {"default": 0},
+        }],
+    })
+
+    # 10. zero-flow downshift: streak lands exactly on a downshift boundary.
+    scenarios.append({
+        "name": "zero_flow_downshift", "seed": 110, "cfg": _base_cfg(),
+        "cycle_state": cycle_state(last_fee_ppm=900,
+                                   last_broadcast_fee_ppm=900,
+                                   last_revenue_rate=0.0),
+        "fee_state_builder": zf_state(31),
+        "last_forward_time": ago(40.0),
+        "cycles": [{
+            "now": NOW, "channel_info": zf_info, "state_row": zf_row,
+            "volume_since": {"default": 0},
+            "forward_count_since": {"default": 0},
+            "assert_branch": lambda adj, sk: (
+                len(adj) == 1 and adj[0].algorithm_values[
+                    "zero_flow_guard_reason"] == "zero_flow_downshift"),
+        }],
+    })
+
+    # 11. floor-inversion: rebalance cost floor above the flow-reduced
+    #     discovery ceiling; ceiling wins, floor lowered.
+    scenarios.append({
+        "name": "floor_inversion", "seed": 111,
+        "cfg": _base_cfg(max_fee_ppm=1000),
+        "cost_history": [
+            {"timestamp": ago(100.0), "cost_sats": 900, "amount_sats": 800_000},
+            {"timestamp": ago(90.0), "cost_sats": 850, "amount_sats": 700_000},
+            {"timestamp": ago(80.0), "cost_sats": 950, "amount_sats": 750_000},
+            {"timestamp": ago(70.0), "cost_sats": 880, "amount_sats": 650_000},
+        ],
+        "last_forward_time": ago(8 * 24.0),
+        "cycle_state": cycle_state(last_fee_ppm=600,
+                                   last_broadcast_fee_ppm=650),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(base_fee=600.0, rate=6.0, n=6),
+            scalars=fee_scalars(last_fee_ppm=600,
+                                last_broadcast_fee_ppm=650)),
+        "cycles": [{
+            "now": NOW,
+            "channel_info": _channel_info(cid, peer, fee_ppm=600,
+                                          capacity=2_000_000,
+                                          spendable_msat=1_000_000_000),
+            "state_row": dict(plain_row, state="source"),
+            "volume_since": {"default": 300_000},
+            "forward_count_since": {"default": 4},
+        }],
+    })
+
+    # 12. gossip-gate suppress -> pending-anchor blend across cycles.
+    anchor_policy = _PeerPolicy(
+        peer_id=peer, strategy=_FeeStrategy.DYNAMIC, fee_ppm_target=1200,
+        fee_multiplier_min=1.0, fee_multiplier_max=1.05)
+    scenarios.append({
+        "name": "gossip_gate_pending_anchor", "seed": 112,
+        "cfg": _base_cfg(), "policy": anchor_policy,
+        "cycle_state": cycle_state(last_fee_ppm=1000,
+                                   last_broadcast_fee_ppm=1080,
+                                   last_broadcast_at=ago(2.0)),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(base_fee=1105.0, rate=30.0, n=12, step_h=3.0),
+            scalars=fee_scalars(last_fee_ppm=1000,
+                                last_broadcast_fee_ppm=1080)),
+        "last_forward_time": ago(0.5),
+        "cycles": [
+            {
+                "now": NOW,
+                "channel_info": _channel_info(cid, peer, fee_ppm=1000,
+                                              capacity=2_000_000,
+                                              spendable_msat=1_000_000_000),
+                "state_row": plain_row,
+                "volume_since": {"default": 2_000_000},
+                "forward_count_since": {"default": 8},
+                "assert_branch": lambda adj, sk: (
+                    sk.get("gossip_hysteresis") == 1
+                    or sk.get("alpha_guard") == 1),
+            },
+            {
+                "now": NOW + 1800,
+                "channel_info": _channel_info(cid, peer, fee_ppm=1000,
+                                              capacity=2_000_000,
+                                              spendable_msat=1_000_000_000),
+                "state_row": plain_row,
+                "volume_since": {"default": 2_000_000},
+                "forward_count_since": {"default": 8},
+                "assert_branch": lambda adj, sk: len(adj) == 1,
+            },
+        ],
+    })
+
+    # 13. PASSIVE policy: skipped at the loop level.
+    scenarios.append({
+        "name": "policy_passive", "seed": 113, "cfg": _base_cfg(),
+        "policy": _PeerPolicy(peer_id=peer, strategy=_FeeStrategy.PASSIVE),
+        "cycle_state": cycle_state(),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(n=3), scalars=fee_scalars()),
+        "cycles": [{
+            "now": NOW, "channel_info": plain_info, "state_row": plain_row,
+            "volume_since": {"default": 100_000},
+            "forward_count_since": {"default": 2},
+            "assert_branch": lambda adj, sk: sk == {"policy_passive": 1},
+        }],
+    })
+
+    # 14. STATIC policy: fixed-fee override broadcast through the loop.
+    scenarios.append({
+        "name": "policy_static", "seed": 114, "cfg": _base_cfg(),
+        "policy": _PeerPolicy(peer_id=peer, strategy=_FeeStrategy.STATIC,
+                              fee_ppm_target=750),
+        "cycle_state": cycle_state(last_fee_ppm=500,
+                                   last_broadcast_fee_ppm=500),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(n=3),
+            scalars=fee_scalars(last_fee_ppm=500,
+                                last_broadcast_fee_ppm=500)),
+        "cycles": [{
+            "now": NOW,
+            "channel_info": _channel_info(cid, peer, fee_ppm=500,
+                                          capacity=2_000_000,
+                                          spendable_msat=1_000_000_000),
+            "state_row": plain_row,
+            "volume_since": {"default": 100_000},
+            "forward_count_since": {"default": 2},
+            "assert_branch": lambda adj, sk: (
+                len(adj) == 1 and adj[0].reason_code == "policy_static"
+                and adj[0].new_fee_ppm == 750),
+        }],
+    })
+
+    # 15. gossip-refresh nudge: converged idle channel, 24h frozen.
+    scenarios.append({
+        "name": "gossip_refresh_nudge", "seed": 115, "cfg": _base_cfg(),
+        "policy": _PeerPolicy(
+            peer_id=peer, strategy=_FeeStrategy.DYNAMIC, fee_ppm_target=200,
+            fee_multiplier_min=1.0, fee_multiplier_max=1.0),
+        "last_forward_time": ago(30.0),
+        "cycle_state": cycle_state(last_fee_ppm=200,
+                                   last_broadcast_fee_ppm=200,
+                                   last_broadcast_at=ago(30.0),
+                                   last_update=ago(1.0),
+                                   last_revenue_rate=0.0),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(base_fee=200.0, rate=1.0, n=6),
+            scalars=fee_scalars(last_broadcast_at=ago(30.0),
+                                last_revenue_rate=0.0)),
+        "cycles": [{
+            "now": NOW, "channel_info": plain_info, "state_row": plain_row,
+            "volume_since": {"default": 0},
+            "forward_count_since": {"default": 0},
+            "assert_branch": lambda adj, sk: (
+                len(adj) == 1 and adj[0].reason_code == "gossip_refresh"),
+        }],
+    })
+
+    # 16. saturated source with class-aware min fee + drain discount.
+    scenarios.append({
+        "name": "saturated_drain_discount", "seed": 116,
+        "cfg": _base_cfg(min_fee_ppm=50, min_fee_ppm_saturated=5,
+                         drain_fee_discount_max=0.3),
+        "gossip": competitors,
+        "cycle_state": cycle_state(last_fee_ppm=300,
+                                   last_broadcast_fee_ppm=300),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(base_fee=300.0, rate=10.0, n=8),
+            scalars=fee_scalars(last_fee_ppm=300,
+                                last_broadcast_fee_ppm=300)),
+        "cycles": [{
+            "now": NOW,
+            "channel_info": _channel_info(cid, peer, fee_ppm=300,
+                                          capacity=2_000_000,
+                                          spendable_msat=1_900_000_000),
+            "state_row": dict(plain_row, state="source"),
+            "volume_since": {"default": 0},
+            "forward_count_since": {"default": 0},
+        }],
+    })
+
+    fixtures = [run_scenario(s) for s in scenarios]
+    _write(outdir / "scenarios.json", {
+        "now": NOW,
+        "description": "end-to-end single-channel fee cycle decision traces "
+                       "(REAL _adjust_all_fees_channel_loop, seeded random, "
+                       "frozen module clock)",
+        "scenarios": fixtures,
+    })
+
+
 SUITES = {
     "pyrand": gen_pyrand,
     "mat3": gen_mat3,
@@ -1784,6 +2666,7 @@ SUITES = {
     "state_dict": gen_state_dict,
     "floors": gen_floors,
     "vegas": gen_vegas,
+    "cycle": gen_cycle,
 }
 
 
