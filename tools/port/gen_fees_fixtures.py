@@ -39,6 +39,7 @@ from modules.fee_controller import (  # noqa: E402
     FeeController,
     GaussianThompsonState,
     PIDState,
+    VegasReflexState,
 )
 
 NOW = 1_752_400_000
@@ -1290,6 +1291,489 @@ def gen_state_dict(outdir: Path) -> None:
     _write(outdir / "cases.json", {"now": NOW, "cases": cases})
 
 
+# ---------------------------------------------------------------------------
+# floors: evidence-backed floors (Phase 4 Task 6) — _calculate_floor,
+# _get_dynamic_chain_costs_live, _get_rebalance_cost_floor,
+# _get_flow_adjusted_ceiling, _detect_congestion, _effective_min_fee_ppm.
+# The real FeeController methods are the oracle; nothing here reimplements
+# the algorithm. Chain-cost defaults come from ChainCostDefaults directly
+# (imported, not hand-copied).
+# ---------------------------------------------------------------------------
+
+def gen_floors(outdir: Path) -> None:
+    from modules.config import ChainCostDefaults
+
+    # --- calculate_floor.json ---------------------------------------------
+    floor_cases = []
+
+    def _floor_case(name, *, capacity_sats, chain_costs, peer_latency, opener):
+        fc = _controller()
+        if peer_latency is not None:
+            fc.database.get_peer_latency_stats.return_value = peer_latency
+            peer_id = "03" + "ab" * 32
+        else:
+            peer_id = None
+        expected = fc._calculate_floor(
+            capacity_sats, chain_costs=chain_costs, peer_id=peer_id, opener=opener
+        )
+        floor_cases.append({
+            "name": name,
+            "capacity_sats": capacity_sats,
+            "chain_costs": chain_costs,
+            "peer_latency": peer_latency,
+            "opener": opener,
+            "expected_floor_ppm": expected,
+        })
+
+    _floor_case(
+        "risk_premium_wins_no_stall",
+        capacity_sats=2_000_000,
+        chain_costs={"open_cost_sats": 2500, "close_cost_sats": 1500, "sat_per_vbyte": 15.0},
+        peer_latency=None,
+        opener="local",
+    )
+    _floor_case(
+        # P8-002 regression pin: risk premium wins the max() AND the stall
+        # markup must apply to the WINNING term (not the base floor that
+        # lost the max()).
+        "stall_multiplier_after_max_p8_002_regression",
+        capacity_sats=2_000_000,
+        chain_costs={"open_cost_sats": 2500, "close_cost_sats": 1500, "sat_per_vbyte": 15.0},
+        peer_latency={"avg": 15.0, "std": 1.0},
+        opener="local",
+    )
+    _floor_case(
+        "stall_multiplier_only_no_dynamic_costs",
+        capacity_sats=2_000_000,
+        chain_costs=None,
+        peer_latency={"avg": 0.0, "std": 6.0},
+        opener="local",
+    )
+    _floor_case(
+        "peer_latency_below_thresholds_no_stall",
+        capacity_sats=2_000_000,
+        chain_costs=None,
+        peer_latency={"avg": 5.0, "std": 2.0},
+        opener="local",
+    )
+    _floor_case(
+        "risk_premium_zero_sat_per_vbyte_skipped",
+        capacity_sats=2_000_000,
+        chain_costs={"open_cost_sats": 2500, "close_cost_sats": 1500, "sat_per_vbyte": 0.0},
+        peer_latency=None,
+        opener="local",
+    )
+    _floor_case(
+        "remote_opener_with_risk_premium",
+        capacity_sats=500_000,
+        chain_costs={"open_cost_sats": 2500, "close_cost_sats": 1500, "sat_per_vbyte": 20.0},
+        peer_latency=None,
+        opener="remote",
+    )
+    _floor_case(
+        "avg_threshold_boundary_10_0_not_triggered",
+        capacity_sats=2_000_000,
+        chain_costs=None,
+        peer_latency={"avg": 10.0, "std": 0.0},
+        opener="local",
+    )
+    _floor_case(
+        "avg_threshold_boundary_10_0001_triggered",
+        capacity_sats=2_000_000,
+        chain_costs=None,
+        peer_latency={"avg": 10.0001, "std": 0.0},
+        opener="local",
+    )
+    _write(outdir / "calculate_floor.json", {"now": NOW, "cases": floor_cases})
+
+    # --- pinned_constants.json (ChainCostDefaults, transcribed) -----------
+    _write(outdir / "pinned_constants.json", {
+        "CHANNEL_OPEN_COST_SATS": ChainCostDefaults.CHANNEL_OPEN_COST_SATS,
+        "CHANNEL_CLOSE_COST_SATS": ChainCostDefaults.CHANNEL_CLOSE_COST_SATS,
+        "CHANNEL_LIFETIME_DAYS": ChainCostDefaults.CHANNEL_LIFETIME_DAYS,
+        "DAILY_VOLUME_SATS": ChainCostDefaults.DAILY_VOLUME_SATS,
+        "REBALANCE_FLOOR_WINDOW_DAYS": FeeController.REBALANCE_FLOOR_WINDOW_DAYS,
+        "REBALANCE_FLOOR_MIN_SAMPLES": FeeController.REBALANCE_FLOOR_MIN_SAMPLES,
+        "REBALANCE_FLOOR_MARGIN": _r(FeeController.REBALANCE_FLOOR_MARGIN),
+        "SATURATED_OUTBOUND_RATIO": _r(FeeController.SATURATED_OUTBOUND_RATIO),
+        "FLOW_BALANCED_WINDOW_SECONDS": FeeController.FLOW_BALANCED_WINDOW_SECONDS,
+        "FLOW_BALANCED_MAX_NET_RATIO": _r(FeeController.FLOW_BALANCED_MAX_NET_RATIO),
+        "FLOW_BALANCED_MIN_WEEKLY_TURNOVER": _r(FeeController.FLOW_BALANCED_MIN_WEEKLY_TURNOVER),
+    })
+
+    # --- dynamic_chain_costs.json ------------------------------------------
+    dcc_cases = []
+
+    def _dcc_case(name, perkb):
+        fc = _controller()
+        fc.data_service = MagicMock()
+        fc.data_service.get_feerates.return_value = {"perkb": perkb}
+        result = fc._get_dynamic_chain_costs_live()
+        dcc_cases.append({
+            "name": name,
+            "perkb": perkb,
+            "expected": None if result is None else {
+                "open_cost_sats": result["open_cost_sats"],
+                "close_cost_sats": result["close_cost_sats"],
+                "sat_per_vbyte": _r(result["sat_per_vbyte"]),
+            },
+        })
+
+    _dcc_case("opening_present", {"opening": 5000})
+    _dcc_case("opening_zero_falls_to_mutual_close", {"opening": 0, "mutual_close": 3000})
+    _dcc_case(
+        "opening_null_mutual_close_zero_falls_to_unilateral",
+        {"opening": None, "mutual_close": 0, "unilateral_close": 2000},
+    )
+    _dcc_case("all_missing_falls_to_floor_key", {"floor": 800})
+    _dcc_case("all_missing_falls_to_1000_default", {})
+    _dcc_case("high_fee_clamped_to_max", {"opening": 1_000_000})
+    _dcc_case("low_fee_clamped_to_min", {"opening": 1})
+    _write(outdir / "dynamic_chain_costs.json", {"now": NOW, "cases": dcc_cases})
+
+    # --- rebalance_cost_floor.json ------------------------------------------
+    rcf_cases = []
+
+    def _rcf_case(name, *, flow_state, cost_history, peer_fallback):
+        fc = _controller()
+        orig_time = time.time
+        time.time = lambda: float(NOW)
+        try:
+            fc.database.get_channel_cost_history.return_value = cost_history
+            if peer_fallback is not None:
+                fc.database.get_historical_inbound_fee_ppm.return_value = peer_fallback
+            else:
+                fc.database.get_historical_inbound_fee_ppm.return_value = None
+            expected = fc._get_rebalance_cost_floor("chan1", "peer1", flow_state)
+        finally:
+            time.time = orig_time
+        rcf_cases.append({
+            "name": name,
+            "flow_state": flow_state,
+            "recent_costs": cost_history,
+            "peer_fallback": peer_fallback,
+            "now": NOW,
+            "expected": expected,
+        })
+
+    _rcf_case("sink_returns_none", flow_state="sink",
+              cost_history=[{"cost_sats": 100, "amount_sats": 10000, "timestamp": NOW - 1000}] * 5,
+              peer_fallback={"confidence": "high", "avg_fee_ppm": 500})
+    _rcf_case("dormant_returns_none", flow_state="dormant",
+              cost_history=[{"cost_sats": 100, "amount_sats": 10000, "timestamp": NOW - 1000}] * 5,
+              peer_fallback={"confidence": "high", "avg_fee_ppm": 500})
+    _rcf_case(
+        "four_samples_integer_division_pin",
+        flow_state="source",
+        cost_history=[
+            {"cost_sats": 100, "amount_sats": 10000, "timestamp": NOW - 1000},
+            {"cost_sats": 150, "amount_sats": 15000, "timestamp": NOW - 2000},
+            {"cost_sats": 130, "amount_sats": 13000, "timestamp": NOW - 3000},
+            {"cost_sats": 120, "amount_sats": 11000, "timestamp": NOW - 4000},
+        ],
+        peer_fallback=None,
+    )
+    _rcf_case(
+        "insufficient_samples_falls_to_peer_fallback_medium",
+        flow_state="router",
+        cost_history=[
+            {"cost_sats": 100, "amount_sats": 10000, "timestamp": NOW - 1000},
+            {"cost_sats": 150, "amount_sats": 15000, "timestamp": NOW - 2000},
+        ],
+        peer_fallback={"confidence": "medium", "avg_fee_ppm": 77},
+    )
+    _rcf_case(
+        "fallback_confidence_low_excluded_returns_none",
+        flow_state="source",
+        cost_history=[],
+        peer_fallback={"confidence": "low", "avg_fee_ppm": 500},
+    )
+    _rcf_case(
+        "fallback_avg_fee_ppm_zero_excluded_returns_none",
+        flow_state="source",
+        cost_history=[],
+        peer_fallback={"confidence": "high", "avg_fee_ppm": 0},
+    )
+    _rcf_case(
+        "samples_outside_window_excluded_falls_to_fallback",
+        flow_state="source",
+        cost_history=[
+            # 2 stale (outside REBALANCE_FLOOR_WINDOW_DAYS=30d), 2 fresh
+            # -> fresh count (2) < MIN_SAMPLES (4) -> falls through.
+            {"cost_sats": 900, "amount_sats": 1000, "timestamp": NOW - 40 * 86400},
+            {"cost_sats": 900, "amount_sats": 1000, "timestamp": NOW - 35 * 86400},
+            {"cost_sats": 100, "amount_sats": 10000, "timestamp": NOW - 1000},
+            {"cost_sats": 150, "amount_sats": 15000, "timestamp": NOW - 2000},
+        ],
+        peer_fallback={"confidence": "high", "avg_fee_ppm": 123},
+    )
+    _rcf_case(
+        "volume_zero_falls_through_to_fallback",
+        flow_state="source",
+        cost_history=[
+            {"cost_sats": 10, "amount_sats": 0, "timestamp": NOW - 1000},
+            {"cost_sats": 10, "amount_sats": 0, "timestamp": NOW - 2000},
+            {"cost_sats": 10, "amount_sats": 0, "timestamp": NOW - 3000},
+            {"cost_sats": 10, "amount_sats": 0, "timestamp": NOW - 4000},
+        ],
+        peer_fallback={"confidence": "high", "avg_fee_ppm": 55},
+    )
+    _rcf_case(
+        "no_data_at_all_returns_none",
+        flow_state="source",
+        cost_history=[],
+        peer_fallback=None,
+    )
+    _write(outdir / "rebalance_cost_floor.json", {"now": NOW, "cases": rcf_cases})
+
+    # --- flow_adjusted_ceiling.json -----------------------------------------
+    fac_cases = []
+
+    def _fac_case(name, *, current_fee, base_ceiling, last_forward_ts):
+        fc = _controller()
+        orig_time = time.time
+        time.time = lambda: float(NOW)
+        try:
+            fc.database.get_last_forward_time.return_value = last_forward_ts
+            expected = fc._get_flow_adjusted_ceiling("chan1", current_fee, base_ceiling)
+        finally:
+            time.time = orig_time
+        fac_cases.append({
+            "name": name,
+            "current_fee": current_fee,
+            "base_ceiling": base_ceiling,
+            "last_forward_ts": last_forward_ts,
+            "now": NOW,
+            "expected": expected,
+        })
+
+    _fac_case("below_fee_threshold_returns_base_unchanged",
+              current_fee=499, base_ceiling=1001, last_forward_ts=NOW - 100 * 86400)
+    _fac_case("no_forwards_recorded_returns_base",
+              current_fee=600, base_ceiling=1001, last_forward_ts=None)
+    _fac_case("zero_timestamp_sentinel_returns_base",
+              current_fee=600, base_ceiling=1001, last_forward_ts=0)
+    _fac_case("just_under_moderate_2_99_days_no_reduction",
+              current_fee=600, base_ceiling=1001, last_forward_ts=NOW - 258336)  # 2.99d
+    _fac_case("exactly_3_days_moderate_reduction",
+              current_fee=600, base_ceiling=1001, last_forward_ts=NOW - 3 * 86400)
+    _fac_case("just_under_severe_6_99_days_moderate_reduction",
+              current_fee=600, base_ceiling=1001, last_forward_ts=NOW - 604224)  # 6.99d
+    _fac_case("exactly_7_days_severe_reduction",
+              current_fee=600, base_ceiling=1001, last_forward_ts=NOW - 7 * 86400)
+    _fac_case("beyond_severe_10_days",
+              current_fee=600, base_ceiling=1001, last_forward_ts=NOW - 10 * 86400)
+    _write(outdir / "flow_adjusted_ceiling.json", {"now": NOW, "cases": fac_cases})
+
+    # --- congestion.json ------------------------------------------------------
+    cong_cases = []
+
+    def _cong_case(name, *, state, channel_info, htlc_congestion_threshold, flow_interval):
+        fc = _controller()
+        orig_time = time.time
+        time.time = lambda: float(NOW)
+        try:
+            cfg = SimpleNamespace(
+                htlc_congestion_threshold=htlc_congestion_threshold,
+                flow_interval=flow_interval,
+            )
+            expected = fc._detect_congestion(state, channel_info, cfg)
+        finally:
+            time.time = orig_time
+        cong_cases.append({
+            "name": name,
+            "state": state,
+            "channel_info": channel_info,
+            "htlc_congestion_threshold": _r(htlc_congestion_threshold),
+            "flow_interval": flow_interval,
+            "now": NOW,
+            "expected": expected,
+        })
+
+    _cong_case("live_data_over_threshold_true",
+               state=None,
+               channel_info={"has_htlc_data": True, "max_accepted_htlcs": 10, "our_htlcs_in_flight": 9},
+               htlc_congestion_threshold=0.8, flow_interval=1800)
+    _cong_case("live_data_at_threshold_boundary_false",
+               state=None,
+               channel_info={"has_htlc_data": True, "max_accepted_htlcs": 10, "our_htlcs_in_flight": 8},
+               htlc_congestion_threshold=0.8, flow_interval=1800)
+    _cong_case("live_data_max_zero_falls_back_to_snapshot_none",
+               state=None,
+               channel_info={"has_htlc_data": True, "max_accepted_htlcs": 0, "our_htlcs_in_flight": 5},
+               htlc_congestion_threshold=0.8, flow_interval=1800)
+    _cong_case("snapshot_fresh_congested_true",
+               state={"state": "congested", "updated_at": NOW - 100},
+               channel_info=None,
+               htlc_congestion_threshold=0.8, flow_interval=1800)
+    _cong_case("snapshot_stale_beyond_2x_flow_interval_false",
+               state={"state": "congested", "updated_at": NOW - 4000},
+               channel_info=None,
+               htlc_congestion_threshold=0.8, flow_interval=1800)
+    _cong_case("snapshot_missing_updated_at_treated_fresh_true",
+               state={"state": "congested"},
+               channel_info=None,
+               htlc_congestion_threshold=0.8, flow_interval=1800)
+    _cong_case("snapshot_updated_at_zero_treated_fresh_true",
+               state={"state": "congested", "updated_at": 0},
+               channel_info=None,
+               htlc_congestion_threshold=0.8, flow_interval=1800)
+    _cong_case("snapshot_not_congested_false",
+               state={"state": "idle", "updated_at": NOW},
+               channel_info=None,
+               htlc_congestion_threshold=0.8, flow_interval=1800)
+    _cong_case("no_state_no_channel_info_false",
+               state=None, channel_info=None,
+               htlc_congestion_threshold=0.8, flow_interval=1800)
+    _cong_case("live_htlc_data_false_falls_back_to_fresh_snapshot_true",
+               state={"state": "congested", "updated_at": NOW - 10},
+               channel_info={"has_htlc_data": False, "max_accepted_htlcs": 10, "our_htlcs_in_flight": 9},
+               htlc_congestion_threshold=0.8, flow_interval=1800)
+    _cong_case("stale_boundary_exactly_2x_flow_interval_still_fresh",
+               state={"state": "congested", "updated_at": NOW - 3600},
+               channel_info=None,
+               htlc_congestion_threshold=0.8, flow_interval=1800)
+    _write(outdir / "congestion.json", {"now": NOW, "cases": cong_cases})
+
+    # --- effective_min_fee.json ------------------------------------------------
+    emf_cases = []
+
+    def _emf_case(name, *, min_fee_ppm, min_fee_ppm_saturated, flow_state, outbound_ratio,
+                  capacity_sats, flow_window):
+        fc = _controller()
+        orig_time = time.time
+        time.time = lambda: float(NOW)
+        try:
+            fc.database.get_all_channel_flow_windows.return_value = (
+                {"chan1": flow_window} if flow_window is not None else {}
+            )
+            cfg = SimpleNamespace(min_fee_ppm=min_fee_ppm, min_fee_ppm_saturated=min_fee_ppm_saturated)
+            expected = fc._effective_min_fee_ppm(
+                cfg, flow_state=flow_state, outbound_ratio=outbound_ratio,
+                channel_id="chan1", capacity_sats=capacity_sats,
+            )
+        finally:
+            time.time = orig_time
+        emf_cases.append({
+            "name": name,
+            "min_fee_ppm": min_fee_ppm,
+            "min_fee_ppm_saturated": min_fee_ppm_saturated,
+            "flow_state": flow_state,
+            "outbound_ratio": None if outbound_ratio is None else _r(outbound_ratio),
+            "capacity_sats": capacity_sats,
+            "flow_window": None if flow_window is None else list(flow_window),
+            "expected": expected,
+        })
+
+    _emf_case("below_saturated_and_not_source_returns_base",
+              min_fee_ppm=100, min_fee_ppm_saturated=20, flow_state=None,
+              outbound_ratio=0.5, capacity_sats=1_000_000, flow_window=None)
+    _emf_case("sat_floor_negative_ignored_returns_base",
+              min_fee_ppm=100, min_fee_ppm_saturated=-5, flow_state="source",
+              outbound_ratio=0.9, capacity_sats=1_000_000, flow_window=None)
+    _emf_case("sat_floor_equal_base_ignored_returns_base",
+              min_fee_ppm=100, min_fee_ppm_saturated=100, flow_state="source",
+              outbound_ratio=0.9, capacity_sats=1_000_000, flow_window=None)
+    _emf_case("source_channel_no_flow_data_takes_sat_floor",
+              min_fee_ppm=100, min_fee_ppm_saturated=20, flow_state="source",
+              outbound_ratio=0.3, capacity_sats=1_000_000, flow_window=None)
+    _emf_case("saturated_outbound_ratio_at_boundary_takes_sat_floor",
+              min_fee_ppm=100, min_fee_ppm_saturated=20, flow_state=None,
+              outbound_ratio=0.85, capacity_sats=1_000_000, flow_window=None)
+    _emf_case("saturated_outbound_ratio_just_below_boundary_returns_base",
+              min_fee_ppm=100, min_fee_ppm_saturated=20, flow_state=None,
+              outbound_ratio=0.849999, capacity_sats=1_000_000, flow_window=None)
+    _emf_case("flow_balanced_router_exemption_returns_base",
+              min_fee_ppm=100, min_fee_ppm_saturated=20, flow_state="source",
+              outbound_ratio=0.9, capacity_sats=1_000_000, flow_window=(200_000, 190_000, 42))
+    _emf_case("flow_not_balanced_low_turnover_takes_sat_floor",
+              min_fee_ppm=100, min_fee_ppm_saturated=20, flow_state="source",
+              outbound_ratio=0.9, capacity_sats=1_000_000, flow_window=(10_000, 9_000, 3))
+    _emf_case("flow_not_balanced_net_ratio_too_high_takes_sat_floor",
+              min_fee_ppm=100, min_fee_ppm_saturated=20, flow_state="source",
+              outbound_ratio=0.9, capacity_sats=1_000_000, flow_window=(300_000, 50_000, 12))
+    _write(outdir / "effective_min_fee.json", {"now": NOW, "cases": emf_cases})
+
+
+# ---------------------------------------------------------------------------
+# vegas: VegasReflexState.update/get_floor_multiplier (Phase 4 Task 6).
+# The real dataclass methods are the oracle. Pins decay-before-check
+# ordering AND the short-circuited RNG-consumption trap: `random.random()`
+# is called ONLY inside the 2x..4x branch when `consecutive_spikes < 2`.
+# ---------------------------------------------------------------------------
+
+def gen_vegas(outdir: Path) -> None:
+    # 12-cycle ratio sequence hitting: decay-only, the 2x boundary exactly,
+    # RNG-gated vs consecutive-confirmed spike triggers, the 4x boundary
+    # exactly (immediate trigger, not the probabilistic branch), and a
+    # decay-only cool-down before another immediate trigger.
+    ratios = [1.0, 2.0, 2.5, 3.9, 4.5, 1.5, 2.1, 1.9, 2.9, 2.9, 0.5, 4.0]
+    ma = 10.0
+    seeds = [0, 1, 42, 12345]
+
+    entries = []
+    for seed in seeds:
+        random.seed(seed)
+        state = VegasReflexState()
+        cycles = []
+        orig_time = time.time
+        try:
+            for i, ratio in enumerate(ratios):
+                cycle_now = NOW + i * 1800
+                time.time = lambda t=cycle_now: float(t)
+                current = ratio * ma
+                state.update(current, ma)
+                cycles.append({
+                    "cycle": i,
+                    "now": cycle_now,
+                    "spike_ratio_input": _r(ratio),
+                    "current_sat_vb": _r(current),
+                    "ma_sat_vb": _r(ma),
+                    "intensity": _r(state.intensity),
+                    "consecutive_spikes": state.consecutive_spikes,
+                    "floor_multiplier": _r(state.get_floor_multiplier()),
+                })
+        finally:
+            time.time = orig_time
+        entries.append({"seed": seed, "cycles": cycles})
+
+    _write(outdir / "sequences.json", {"now": NOW, "entries": entries})
+
+    # ma<=0 guard (py 2363-2364): ma_sat_vb clamped to 1.0 before the ratio
+    # is computed.
+    random.seed(0)
+    guard_state = VegasReflexState()
+    orig_time = time.time
+    time.time = lambda: float(NOW)
+    try:
+        guard_state.update(2.5, 0.0)
+        guard_intensity_after_1 = _r(guard_state.intensity)
+        guard_consecutive_after_1 = guard_state.consecutive_spikes
+        guard_state.update(2.5, -3.0)
+        guard_intensity_after_2 = _r(guard_state.intensity)
+        guard_consecutive_after_2 = guard_state.consecutive_spikes
+    finally:
+        time.time = orig_time
+    _write(outdir / "ma_leq_zero_guard.json", {
+        "now": NOW,
+        "seed": 0,
+        # ma<=0 -> treated as 1.0, so current_sat_vb=2.5 -> ratio=2.5 (2x-4x
+        # branch) both cycles.
+        "cycles": [
+            {
+                "current_sat_vb": _r(2.5), "ma_sat_vb_input": _r(0.0),
+                "intensity": guard_intensity_after_1,
+                "consecutive_spikes": guard_consecutive_after_1,
+            },
+            {
+                "current_sat_vb": _r(2.5), "ma_sat_vb_input": _r(-3.0),
+                "intensity": guard_intensity_after_2,
+                "consecutive_spikes": guard_consecutive_after_2,
+            },
+        ],
+    })
+
+
 SUITES = {
     "pyrand": gen_pyrand,
     "mat3": gen_mat3,
@@ -1298,6 +1782,8 @@ SUITES = {
     "discount": gen_discount,
     "pid": gen_pid,
     "state_dict": gen_state_dict,
+    "floors": gen_floors,
+    "vegas": gen_vegas,
 }
 
 
