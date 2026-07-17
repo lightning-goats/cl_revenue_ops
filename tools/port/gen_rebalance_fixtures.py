@@ -2668,6 +2668,36 @@ def gen_cooldowns() -> dict:
     }
 
 
+def gen_partial_amounts() -> dict:
+    """Dump `RebalanceEngine._native_partial_amounts` over a boundary +
+    seeded-random amount grid (Phase 5 Task 7).
+
+    Feeds `crates/revops-rebalance/src/engine.rs::native_partial_amounts` /
+    `tests/engine.rs::native_partial_amounts_replays_python_fixture` in the
+    Rust port (cl-revenue-ops-r), committed there as `fixtures/rebalance/
+    partial_amounts.json`. The ladder is the ONE new pure function T7
+    introduces (floor `min(orig-1, max(1000, min(5000, orig//2)))`, halving
+    steps, max 7 amounts); everything else in the engine is orchestration
+    proven by scripted-double tests. The static method is driven directly on
+    the class — no engine instance (and hence no plugin/db stub) is needed.
+    """
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    fn = RebalanceEngine._native_partial_amounts
+    amounts = [
+        0, 1, 2, 3, 999, 1_000, 1_001, 1_999, 2_000, 2_001, 3_999, 4_000,
+        4_999, 5_000, 5_001, 9_999, 10_000, 10_001, 20_000, 50_000, 99_999,
+        100_000, 100_001, 640_000, 1_000_000, 2_000_000, 10_000_000,
+    ]
+    rng = random.Random(0x5EBA1A7C)
+    amounts += sorted(rng.randrange(1, 5_000_000) for _ in range(25))
+    return {
+        "cases": [
+            {"amount_sats": a, "amounts": fn(a)} for a in amounts
+        ],
+    }
+
+
 SUITES = {
     "modes": gen_modes,
     "planner": gen_planner,
@@ -2676,6 +2706,7 @@ SUITES = {
     "executor": gen_executor,
     "ev": gen_ev,
     "cooldowns": gen_cooldowns,
+    "partial_amounts": gen_partial_amounts,
 }
 
 
