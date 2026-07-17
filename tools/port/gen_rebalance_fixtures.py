@@ -2432,6 +2432,139 @@ def _gen_fee_escalation_cases():
     return cases
 
 
+def _gen_ev_failure_penalty_fold_cases():
+    """Phase 5 Task 9 (conformance gate, T7-review ledgered obligation):
+    T6/T7 left an open question — the Rust engine (`engine.rs`) folds
+    `failure_penalty_sats` INTO `activity_penalty_sats` before calling
+    `sats_ev_gate` (one combined term), while the real Python
+    `_build_score_decomposition` (`rebalance_engine_v2.py:556-562`)
+    subtracts both as SEPARATE terms in a fixed left-to-right sequence:
+
+        final_score_sats = round(
+            p_success * expected_future_value_sats
+            - expected_fee_sats
+            - source_opportunity_sats
+            - failure_penalty_sats
+            - activity_penalty_sats,
+            6,
+        )
+
+    Floating-point subtraction is not associative, so `(x - a) - b` and
+    `x - (a + b)` can disagree in the last decimal after `round(_, 6)`. This
+    generator drives `_build_score_decomposition` with a NON-EMPTY
+    `_pair_failures` history (unlike `_ev_hand_built_gate_cases`'/
+    `_ev_random_gate_case`'s always-empty history) via
+    `_call_capturing_locals`, to produce real, byte-exact
+    `failure_penalty_sats`-nonzero cases. A 20_000-case randomized sweep
+    (scratch, not committed) found the two orderings disagree in ~0.4% of
+    cases — this is a REAL divergence, not a hypothetical one; the Rust port
+    fixes it by carrying `failure_penalty_sats` as a distinct `EvInputs`
+    field and replicating Python's exact subtraction sequence, pinned here.
+    """
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    rng = random.Random(20260917)
+    cases = []
+
+    def _drive(case_id, *, amount, dest_ppm, source_ppm, src_hist_sourced,
+               dest_hist_direct, validated, src_activity, dst_activity,
+               budget, route_cost, eff_budget, fails, probability_ppm,
+               dest_attempts, dest_success_rate, fail_ages):
+        host_cls = _ev_host_class()
+        cfg = _ev_default_cfg()
+        pair = _ev_default_pair(
+            source_channel_id="111x1x0", dest_channel_id="222x2x0",
+            amount_sats=amount, dest_out_fee_ppm=dest_ppm,
+            source_out_fee_ppm=source_ppm,
+            source_historical_sourced_fee_ppm=src_hist_sourced,
+            dest_historical_direct_fee_ppm=dest_hist_direct,
+            dest_fee_history_validated=validated,
+            source_activity_out_sats=src_activity,
+            dest_activity_in_sats=dst_activity,
+            pair_budget_sats=budget,
+        )
+        database = _EvStubDatabase(total=dest_attempts, success_rate=dest_success_rate)
+        host = host_cls(cfg, database=database)
+        host._pair_failures = (
+            {("111x1x0", "222x2x0"): list(fail_ages)} if fails > 0 else {}
+        )
+
+        decomp, raw_locals = _call_capturing_locals(
+            RebalanceEngine._build_score_decomposition,
+            host, pair,
+            probability_ppm=probability_ppm,
+            route_cost_sats=route_cost,
+            effective_budget_sats=eff_budget,
+        )
+        efv_sats = raw_locals["expected_future_value_sats"]
+        source_opportunity_sats = raw_locals["source_opportunity_sats"]
+        failure_penalty_sats = raw_locals["failure_penalty_sats"]
+        activity_penalty_sats = decomp["activity_penalty_sats"]
+        fee_sats = decomp["expected_fee_sats"]
+        assert raw_locals["failure_count"] == fails
+        return {
+            "case_id": case_id,
+            "inputs": {
+                "probability_ppm": probability_ppm,
+                "dest_attempts": dest_attempts,
+                "dest_success_rate": dest_success_rate,
+                "efv_sats": efv_sats,
+                "fee_sats": fee_sats,
+                "source_opportunity_sats": source_opportunity_sats,
+                "failure_penalty_sats": failure_penalty_sats,
+                "activity_penalty_sats": activity_penalty_sats,
+                "hold_margin_sats": 0.0,
+            },
+            "expected": {
+                "final_score_sats": decomp["final_score_sats"],
+            },
+        }
+
+    import time as _time_mod
+    now = _time_mod.time()
+    # Hand-built adversarial case (found by the 20_000-case scratch sweep
+    # referenced in the docstring): sequential vs. folded subtraction
+    # disagree by 1e-6 after rounding — the exact regression this pin
+    # guards against.
+    cases.append(_drive(
+        "adversarial_sequence_vs_fold_disagreement",
+        amount=4_242_486, dest_ppm=735, source_ppm=1_299,
+        src_hist_sourced=2257.8783806401693,
+        dest_hist_direct=2381.1701665933533,
+        validated=True, src_activity=740_966, dst_activity=10_973,
+        budget=172_670, route_cost=215_427, eff_budget=84_380,
+        fails=2, probability_ppm=0, dest_attempts=2,
+        dest_success_rate=0.51204548306597,
+        fail_ages=[now - 10.0, now - 500.0],
+    ))
+    # Randomized sweep, small (this is a targeted regression pin, not a
+    # broad parity suite — `gate_cases` already covers the failure-free
+    # 4-term formula exhaustively).
+    for i in range(200):
+        amount = rng.randint(1, 5_000_000)
+        fails = rng.randint(1, 8)
+        cases.append(_drive(
+            f"random_fold_{i}",
+            amount=amount,
+            dest_ppm=rng.randint(0, 3000),
+            source_ppm=rng.randint(0, 3000),
+            src_hist_sourced=rng.uniform(0, 3000),
+            dest_hist_direct=rng.uniform(0, 3000),
+            validated=rng.random() < 0.5,
+            src_activity=rng.randint(0, 2_000_000),
+            dst_activity=rng.randint(0, 2_000_000),
+            budget=rng.randint(1, 200_000),
+            route_cost=rng.randint(0, 400_000),
+            eff_budget=rng.randint(1, 400_000),
+            fails=fails,
+            probability_ppm=rng.choice([0, rng.randint(1, 999_999)]),
+            dest_attempts=rng.randint(0, 20),
+            dest_success_rate=rng.uniform(0, 1),
+            fail_ages=[now - rng.uniform(1, 1700) for _ in range(fails)],
+        ))
+    return cases
+
+
 def gen_ev() -> dict:
     """Drive the REAL sats-EV gate math (Phase 5 Task 6) over ~500
     randomized-but-seeded input vectors plus edge cases, plus the
@@ -2478,6 +2611,7 @@ def gen_ev() -> dict:
         "gate_cases": gate_cases,
         "per_attempt_ceiling_cases": _gen_per_attempt_ceiling_cases(),
         "fee_escalation_cases": _gen_fee_escalation_cases(),
+        "failure_penalty_fold_cases": _gen_ev_failure_penalty_fold_cases(),
     }
 
 
