@@ -2698,6 +2698,485 @@ def gen_partial_amounts() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# inbound_fee + defib suites (Phase 5 Task 8) — EVRebalancer facade +
+# defibrillator diagnostic golden parity.
+#
+# The REAL `modules.rebalancer.EVRebalancer` is the oracle: every case
+# instantiates it with duck-typed plugin/config/database/data_service
+# doubles (its __init__ only stores references) and drives the actual
+# method (`_estimate_inbound_fee`, `_is_source_route_failure`,
+# `diagnostic_rebalance`). Nothing here reimplements the logic — the one
+# exception is `_shock_envelope`, which transcribes the inline expression
+# at `modules/rebalancer.py:1782-1787` VERBATIM (including the `or 0` falsy
+# coercion on daily_budget_sats) because the envelope is computed mid-way
+# through `diagnostic_rebalance` and cannot be observed through the full
+# path when capital controls block first (the daily_budget_sats=0 grid row
+# the plan requires). Full-path scenario cases cross-assert the transcription
+# against the candidate the real method builds.
+# ---------------------------------------------------------------------------
+
+
+class _FacadePlugin:
+    """pyln Plugin double: the facade only calls .log(msg, level=...)."""
+
+    def log(self, *args, **kwargs):
+        pass
+
+
+class _FacadeConfig:
+    """Config + ConfigSnapshot double: snapshot() returns self, so the same
+    attribute set serves `self.config.<attr>` reads (inbound_fee_estimate_ppm,
+    diagnostic_rebalance_max_fee_sats, rebalance_max_amount) and
+    `cfg = self.config.snapshot()` reads (budgets, reserve, window)."""
+
+    def __init__(self, **overrides):
+        # modules/config.py dataclass defaults for every field the facade reads.
+        self.daily_budget_sats = 5000
+        self.weekly_budget_sats = 35000
+        self.min_wallet_reserve = 1_000_000
+        self.total_cost_budget_window_hours = 24
+        self.inbound_fee_estimate_ppm = 50
+        self.diagnostic_rebalance_max_fee_sats = 400
+        self.rebalance_max_amount = 5_000_000
+        self.reservation_timeout_hours = 4
+        self.dry_run = False
+        for key, value in overrides.items():
+            setattr(self, key, value)
+
+    def snapshot(self):
+        return self
+
+
+class _FacadeDb:
+    """Database double logging every facade write, with scripted reads."""
+
+    def __init__(self, hist_inbound=None, peer_history=None, total_fees=0):
+        self.hist_inbound = hist_inbound
+        self.peer_history = list(peer_history or [])
+        self.total_fees = total_fees
+        self.calls = []
+        self.next_id = 0
+
+    def get_historical_inbound_fee_ppm(self, peer_id):
+        return dict(self.hist_inbound) if self.hist_inbound else None
+
+    def get_rebalance_history_by_peer(self, peer_id, limit=20):
+        return [dict(r) for r in self.peer_history]
+
+    def get_total_rebalance_fees(self, since_timestamp):
+        return self.total_fees
+
+    def set_channel_probe(self, channel_id, probe_type):
+        self.calls.append(
+            {"call": "set_channel_probe", "channel_id": channel_id,
+             "probe_type": probe_type}
+        )
+
+    def record_rebalance(self, from_channel, to_channel, amount_sats,
+                         max_fee_sats, expected_profit_sats, status="pending",
+                         rebalance_type="normal", reason_code=None,
+                         bleeder_status=None):
+        self.next_id += 1
+        self.calls.append(
+            {"call": "record_rebalance", "id": self.next_id,
+             "from_channel": from_channel, "to_channel": to_channel,
+             "amount_sats": amount_sats, "max_fee_sats": max_fee_sats,
+             "expected_profit_sats": expected_profit_sats,
+             "rebalance_type": rebalance_type, "reason_code": reason_code}
+        )
+        return self.next_id
+
+    def update_rebalance_result(self, rebalance_id, status,
+                                actual_fee_sats=None, actual_fee_msat=None,
+                                error_message=None, **kwargs):
+        self.calls.append(
+            {"call": "update_rebalance_result", "id": rebalance_id,
+             "status": status, "error_message": error_message}
+        )
+
+
+class _FacadeDataService:
+    def __init__(self, funds=None, peer_channels=None, channels_by_source=None,
+                 node_id="03aa" + "0" * 62):
+        self.funds = funds or {"outputs": [], "channels": []}
+        self.peer_channels = peer_channels or {"channels": []}
+        self.channels_by_source = channels_by_source or {}
+        self.node_id = node_id
+
+    def get_funds(self):
+        import copy
+
+        return copy.deepcopy(self.funds)
+
+    def get_peer_channels(self):
+        import copy
+
+        return copy.deepcopy(self.peer_channels)
+
+    def get_channels(self, source=None):
+        return {"channels": [dict(c) for c in self.channels_by_source.get(source, [])]}
+
+    def get_node_id(self):
+        return self.node_id
+
+
+class _FakeEngine:
+    """RebalanceEngineV2 double: scripted per-call ExecutionResults, full
+    candidate capture (the Rust facade test replays the same script)."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def execute_candidate(self, candidate, rebalance_id=None,
+                          reserve_budget=False, account_costs=False):
+        from types import SimpleNamespace
+
+        idx = len(self.calls)
+        spec = self.script[idx] if idx < len(self.script) else {
+            "success": False, "error": "unscripted_engine_call"}
+        self.calls.append({
+            "source": candidate.source_candidates[0],
+            "to_channel": candidate.to_channel,
+            "source_peer_id": candidate.primary_source_peer_id,
+            "to_peer_id": candidate.to_peer_id,
+            "amount_sats": candidate.amount_sats,
+            "amount_msat": candidate.amount_msat,
+            "outbound_fee_ppm": candidate.outbound_fee_ppm,
+            "inbound_fee_ppm": candidate.inbound_fee_ppm,
+            "source_fee_ppm": candidate.source_fee_ppm,
+            "max_budget_sats": candidate.max_budget_sats,
+            "max_budget_msat": candidate.max_budget_msat,
+            "max_fee_ppm": candidate.max_fee_ppm,
+            "expected_profit_sats": candidate.expected_profit_sats,
+            "dest_flow_state": candidate.dest_flow_state,
+            "rebalance_id": rebalance_id,
+            "reserve_budget": bool(reserve_budget),
+            "account_costs": bool(account_costs),
+        })
+        return SimpleNamespace(
+            success=bool(spec.get("success", False)),
+            error=spec.get("error"),
+            payment_pending=bool(spec.get("payment_pending", False)),
+            fee_msat=int(spec.get("fee_msat", 0) or 0),
+        )
+
+
+def _mk_rebalancer(cfg, db, data_service, engine=None):
+    from modules.rebalancer import EVRebalancer
+
+    rb = EVRebalancer(_FacadePlugin(), cfg, db)
+    rb.data_service = data_service
+    rb.rebalance_engine_v2 = engine
+    return rb
+
+
+def gen_inbound_fee() -> dict:
+    """Drive the real `EVRebalancer._estimate_inbound_fee` across every
+    priority tier + fallback chain (Phase 5 Task 8).
+
+    Feeds `crates/revops-rebalance/src/facade.rs::estimate_inbound_fee` /
+    `tests/facade.rs` in the Rust port (cl-revenue-ops-r), committed there
+    as `fixtures/rebalance/inbound_fee.json`. `peer_inbound` scripts the
+    `_peer_inbound_fees` cache directly (the Rust side injects it through a
+    test hook); the cache-building path from listpeerchannels is pinned by
+    the defib full-path scenarios instead.
+    """
+    peer = "02bb" + "1" * 62
+    our_id = "03aa" + "0" * 62
+
+    def case(name, hist=None, peer_inbound=None, gossip=None, history=None,
+             estimate_ppm=50, amount_msat=100_000_000, our=our_id):
+        db = _FacadeDb(hist_inbound=hist, peer_history=history)
+        cfg = _FacadeConfig(inbound_fee_estimate_ppm=estimate_ppm)
+        ds = _FacadeDataService(
+            channels_by_source={peer: gossip or []}, node_id=our)
+        rb = _mk_rebalancer(cfg, db, ds)
+        if peer_inbound is not None:
+            rb._peer_inbound_fees = {peer: dict(peer_inbound)}
+        expected = rb._estimate_inbound_fee(peer, amount_msat=amount_msat)
+        assert isinstance(expected, int)
+        return {
+            "name": name,
+            "peer_id": peer,
+            "amount_msat": amount_msat,
+            "hist": dict(hist) if hist else None,
+            "peer_inbound": dict(peer_inbound) if peer_inbound else None,
+            "our_id": our,
+            "gossip_channels": [dict(g) for g in (gossip or [])],
+            "peer_history": [dict(h) for h in (history or [])],
+            "inbound_fee_estimate_ppm": estimate_ppm,
+            "expected_ppm": expected,
+        }
+
+    def hist(confidence, median, avg, samples):
+        return {"confidence": confidence, "median_fee_ppm": median,
+                "avg_fee_ppm": avg, "sample_count": samples,
+                "total_volume_sats": 1_000_000}
+
+    gossip_hit = [{"destination": our_id, "fee_per_millionth": 75,
+                   "base_fee_millisatoshi": 2000}]
+
+    cases = [
+        # Priority 1-3: historical tiers.
+        case("high_uses_median", hist=hist("high", 350, 380, 12),
+             peer_inbound={"fee_ppm": 999, "base_msat": 0}),
+        case("medium_blends_with_last_hop", hist=hist("medium", 400, 410, 6),
+             peer_inbound={"fee_ppm": 120, "base_msat": 0}),
+        case("medium_blend_truncates", hist=hist("medium", 401, 410, 7),
+             peer_inbound={"fee_ppm": 33, "base_msat": 0}),
+        case("medium_without_last_hop_uses_median",
+             hist=hist("medium", 400, 410, 5)),
+        case("low_avg_with_buffer", hist=hist("low", 300, 333, 3)),
+        case("low_avg_float_edge_110", hist=hist("low", 100, 110, 4)),
+        case("low_avg_float_edge_170", hist=hist("low", 160, 170, 3)),
+        # Priority 5: last-hop + buffer (peer cache first, gossip fallback).
+        case("last_hop_peer_cache_with_base",
+             peer_inbound={"fee_ppm": 100, "base_msat": 1000}),
+        case("last_hop_base_ppm_capped",
+             peer_inbound={"fee_ppm": 7, "base_msat": 200_000_000_000}),
+        case("last_hop_amount_scales_base",
+             peer_inbound={"fee_ppm": 100, "base_msat": 1000},
+             amount_msat=10_000_000),
+        case("gossip_fallback_hit", gossip=gossip_hit),
+        case("gossip_base_ppm_capped",
+             gossip=[{"destination": our_id, "fee_per_millionth": 9,
+                      "base_fee_millisatoshi": 10**12}]),
+        case("gossip_other_destination_ignored",
+             gossip=[{"destination": "02cc" + "2" * 62,
+                      "fee_per_millionth": 75, "base_fee_millisatoshi": 0}]),
+        # Cost-curve failed floor interactions (Priority 5 only).
+        case("failed_floor_bumps_estimate",
+             peer_inbound={"fee_ppm": 100, "base_msat": 0},
+             history=[{"status": "failed", "max_fee_sats": 10,
+                       "amount_sats": 50_000},
+                      {"status": "success", "max_fee_sats": 99,
+                       "amount_sats": 50_000}]),
+        case("failed_floor_equal_bumps",
+             peer_inbound={"fee_ppm": 100, "base_msat": 0},
+             history=[{"status": "failed", "max_fee_sats": 15,
+                       "amount_sats": 100_000}]),
+        case("failed_floor_below_keeps_estimate",
+             peer_inbound={"fee_ppm": 100, "base_msat": 0},
+             history=[{"status": "failed", "max_fee_sats": 5,
+                       "amount_sats": 50_000}]),
+        case("failed_rows_zero_amount_skipped",
+             peer_inbound={"fee_ppm": 100, "base_msat": 0},
+             history=[{"status": "failed", "max_fee_sats": 10,
+                       "amount_sats": 0}]),
+        case("default_fallback", estimate_ppm=77),
+    ]
+    return {"cases": cases}
+
+
+def _shock_envelope(diag_max_fee_sats, daily_budget_sats):
+    """VERBATIM transcription of modules/rebalancer.py:1771-1787 (v2.18.1),
+    constants imported from the real module. See the suite banner for why
+    this one expression is transcribed rather than observed (the daily=0
+    row is unreachable through the full path: capital controls block
+    first). Cross-asserted against full-path captures in gen_defib."""
+    import math as _math
+    from types import SimpleNamespace
+
+    from modules.rebalancer import DIAGNOSTIC_FEE_CAP_CEILING_SATS
+
+    config = SimpleNamespace(
+        diagnostic_rebalance_max_fee_sats=diag_max_fee_sats,
+        daily_budget_sats=daily_budget_sats,
+    )
+    shock_amount = 50_000
+    max_fee_sats = max(1, min(
+        int(getattr(config, 'diagnostic_rebalance_max_fee_sats', 400)),
+        int(getattr(config, 'daily_budget_sats', 0) or 0),
+        DIAGNOSTIC_FEE_CAP_CEILING_SATS,
+    ))
+    max_fee_ppm = _math.ceil(max_fee_sats / shock_amount * 1_000_000)
+    return max_fee_sats, max_fee_ppm
+
+
+def _defib_world(spendables, cfg=None, remote_fee_ppm=100, remote_base_msat=0):
+    """Build listfunds/listpeerchannels for a defib scenario: `spendables`
+    is [(scid, spendable_sats)] in listfunds order; every channel has 10M
+    sats capacity, CHANNELD_NORMAL, a distinct peer, and the TARGET channel
+    is always `chan_target`. On-chain 2M sats keeps the reserve check green
+    under the default min_wallet_reserve."""
+    funds_channels = []
+    peer_channels = []
+    for i, (scid, spendable) in enumerate(spendables):
+        peer_id = "02%02x" % i + "f" * 62
+        funds_channels.append({
+            "state": "CHANNELD_NORMAL",
+            "short_channel_id": scid,
+            "our_amount_msat": spendable * 1000,
+            "amount_msat": 10_000_000_000,
+            "peer_id": peer_id,
+        })
+        peer_channels.append({
+            "short_channel_id": scid,
+            "state": "CHANNELD_NORMAL",
+            "peer_id": peer_id,
+            "fee_proportional_millionths": 50 + i,
+            "fee_base_msat": 0,
+            "htlcs": [],
+            "updates": {"remote": {
+                "fee_proportional_millionths": remote_fee_ppm,
+                "fee_base_msat": remote_base_msat,
+            }},
+        })
+    funds = {
+        "outputs": [{"status": "confirmed", "amount_msat": 2_000_000_000}],
+        "channels": funds_channels,
+    }
+    return funds, {"channels": peer_channels}
+
+
+def gen_defib() -> dict:
+    """Defibrillator diagnostic parity (Phase 5 Task 8): shock-fee envelope
+    grid (MUST include daily_budget_sats=0 — the fixture, not the plan, is
+    the truth for the max(1, 0)=1 clamp), `_is_source_route_failure`
+    marker table, and full `diagnostic_rebalance` scenario captures
+    (ranked-source fallback loop, v2.18.1) with a scripted engine.
+
+    Feeds `crates/revops-rebalance/src/defib.rs` + `src/facade.rs` /
+    `tests/facade.rs` in the Rust port (cl-revenue-ops-r), committed there
+    as `fixtures/rebalance/defib.json`.
+    """
+    from modules.rebalancer import (
+        DIAGNOSTIC_FEE_CAP_CEILING_SATS,
+        DIAGNOSTIC_MAX_SOURCE_ATTEMPTS,
+        EVRebalancer,
+    )
+
+    assert DIAGNOSTIC_FEE_CAP_CEILING_SATS == 10_000
+    assert DIAGNOSTIC_MAX_SOURCE_ATTEMPTS == 3
+
+    # --- shock_fee_envelope grid -----------------------------------------
+    envelope_cases = []
+    for diag in [0, 1, 100, 400, 401, 9_999, 10_000, 20_000, 10**9]:
+        for daily in [0, 1, 50, 399, 400, 5_000, 10_000, 100_000]:
+            sats, ppm = _shock_envelope(diag, daily)
+            envelope_cases.append({
+                "diag_max_fee_sats": diag, "daily_budget_sats": daily,
+                "max_fee_sats": sats, "max_fee_ppm": ppm,
+            })
+
+    # --- _is_source_route_failure marker table ---------------------------
+    route_failure_inputs = [
+        None, "", "route_pricing_failed",
+        "route_pricing_failed: askrene timeout",
+        "route_pricing_failed: no_route (market)",
+        "native_route_invalid: first_hop_mismatch",
+        "no_route", "no_routes", "prefix no_route suffix", "no route",
+        "NO_ROUTE", "native_route_over_budget: 500 > 200",
+        "native_sendpay_error: WIRE_TEMPORARY_CHANNEL_FAILURE (failcode=4103)",
+        "local_budget_block: 0 sats remaining of 5000 unified budget",
+        "payment_pending_timeout: waitsendpay code 200",
+        "unknown_source_node", "engine_busy", "dest_inflight",
+        "Native route invalid",
+    ]
+    route_failure_cases = [
+        {"error": e, "expected": EVRebalancer._is_source_route_failure(e)}
+        for e in route_failure_inputs
+    ]
+
+    # --- full diagnostic_rebalance scenario captures ---------------------
+    target = "700x1x0"
+
+    def scenario(name, spendables, engine_script, cfg_overrides=None,
+                 channel_id=target):
+        cfg = _FacadeConfig(**(cfg_overrides or {}))
+        funds, peer_channels = _defib_world(spendables)
+        db = _FacadeDb()
+        ds = _FacadeDataService(funds=funds, peer_channels=peer_channels)
+        engine = _FakeEngine(engine_script)
+        rb = _mk_rebalancer(cfg, db, ds, engine=engine)
+        result = rb.diagnostic_rebalance(channel_id)
+        env_sats, env_ppm = _shock_envelope(
+            cfg.diagnostic_rebalance_max_fee_sats, cfg.daily_budget_sats)
+        for call in engine.calls:
+            # Cross-assert the transcribed envelope against the candidate
+            # the REAL diagnostic_rebalance built.
+            assert call["max_budget_sats"] == env_sats, (name, call)
+            assert call["max_fee_ppm"] == env_ppm, (name, call)
+            assert call["reserve_budget"] and call["account_costs"], name
+        return {
+            "name": name,
+            "channel_id": channel_id,
+            "config": {
+                "daily_budget_sats": cfg.daily_budget_sats,
+                "weekly_budget_sats": cfg.weekly_budget_sats,
+                "min_wallet_reserve": cfg.min_wallet_reserve,
+                "total_cost_budget_window_hours": cfg.total_cost_budget_window_hours,
+                "inbound_fee_estimate_ppm": cfg.inbound_fee_estimate_ppm,
+                "diagnostic_rebalance_max_fee_sats": cfg.diagnostic_rebalance_max_fee_sats,
+            },
+            "listfunds": funds,
+            "listpeerchannels": peer_channels,
+            "engine_script": list(engine_script),
+            "expected": {
+                "result": result,
+                "engine_calls": engine.calls,
+                "db_calls": db.calls,
+            },
+        }
+
+    # Sources: 4 valid (incl. an exact-tie pair pinning stable sort by
+    # listfunds order), one at exactly 100_000 (excluded: strict >), the
+    # target itself.
+    rich = [(target, 500_000), ("101x1x0", 3_000_000), ("102x1x0", 9_000_000),
+            ("103x1x0", 3_000_000), ("104x1x0", 100_000), ("105x1x0", 2_000_000)]
+    route_fail = {"success": False,
+                  "error": "route_pricing_failed: no_route (market)"}
+    scenarios = [
+        scenario("success_first_source", rich,
+                 [{"success": True, "fee_msat": 12_345}]),
+        scenario("success_first_source_zero_fee", rich,
+                 [{"success": True, "fee_msat": 0}]),
+        scenario("advance_on_route_failure_then_terminal_stop", rich,
+                 [route_fail,
+                  {"success": False,
+                   "error": "native_sendpay_error: WIRE_TEMPORARY_CHANNEL_"
+                            "FAILURE (failcode=4103, erring_channel=102x1x0)"}]),
+        scenario("advance_then_success_second_source", rich,
+                 [{"success": False,
+                   "error": "native_route_invalid: first_hop_mismatch"},
+                  {"success": True, "fee_msat": 7_001}]),
+        scenario("three_route_failures_exhaust_attempts", rich,
+                 [route_fail,
+                  {"success": False,
+                   "error": "native_route_invalid: first_hop_mismatch"},
+                  {"success": False, "error": "no_route"}]),
+        scenario("pending_reports_pending_and_stops", rich,
+                 [{"success": False, "payment_pending": True,
+                   "error": "payment_pending_timeout: waitsendpay code 200"}]),
+        scenario("budget_block_reports_blocked", rich,
+                 [{"success": False,
+                   "error": "local_budget_block: 0 sats remaining of 5000 "
+                            "unified budget"}]),
+        scenario("capital_controls_pre_gate_blocks", rich, [],
+                 cfg_overrides={"daily_budget_sats": 0}),
+        scenario("wallet_reserve_blocks", rich, [],
+                 cfg_overrides={"min_wallet_reserve": 10_000_000_000}),
+        scenario("no_sources_above_floor",
+                 [(target, 500_000), ("104x1x0", 100_000),
+                  ("106x1x0", 40_000)], []),
+        scenario("channel_not_found_locally", rich, [],
+                 channel_id="999x9x9"),
+    ]
+
+    return {
+        "constants": {
+            "DIAGNOSTIC_FEE_CAP_CEILING_SATS": DIAGNOSTIC_FEE_CAP_CEILING_SATS,
+            "DIAGNOSTIC_MAX_SOURCE_ATTEMPTS": DIAGNOSTIC_MAX_SOURCE_ATTEMPTS,
+            "SHOCK_AMOUNT_SATS": 50_000,
+        },
+        "envelope_cases": envelope_cases,
+        "is_source_route_failure_cases": route_failure_cases,
+        "scenarios": scenarios,
+    }
+
+
 SUITES = {
     "modes": gen_modes,
     "planner": gen_planner,
@@ -2707,6 +3186,8 @@ SUITES = {
     "ev": gen_ev,
     "cooldowns": gen_cooldowns,
     "partial_amounts": gen_partial_amounts,
+    "inbound_fee": gen_inbound_fee,
+    "defib": gen_defib,
 }
 
 
