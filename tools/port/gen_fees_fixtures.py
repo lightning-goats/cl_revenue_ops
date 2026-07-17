@@ -2052,6 +2052,22 @@ def gen_cycle(outdir: Path) -> None:  # noqa: C901
             "base_fee_millisatoshi": base,
         }
 
+    def own_gossip_row(sats, fee=300, age_s=600, active=True, base=500):
+        """An own-source row (`source == our_id`): the carry that feeds
+        `_get_competitive_undercut_pct`'s (py 3506-3531) capacity-rank
+        branch. Every other scenario omits this, so the rank always hit
+        its no-data default (0.10) — this helper exists to exercise the
+        rank math for real."""
+        return {
+            "source": our_id,
+            "active": active,
+            "fee_per_millionth": fee,
+            "satoshis": sats,
+            "amount_msat": sats * 1000,
+            "last_update": NOW - age_s,
+            "base_fee_millisatoshi": base,
+        }
+
     def build_fee_state(obs, *, contextual=(), scalars=None, nudges=(),
                         pid_scalars=None):
         """Construct a ChannelFeeState through the REAL update paths."""
@@ -2643,6 +2659,73 @@ def gen_cycle(outdir: Path) -> None:  # noqa: C901
             "state_row": dict(plain_row, state="source"),
             "volume_since": {"default": 0},
             "forward_count_since": {"default": 0},
+        }],
+    })
+
+    # 17. capacity-rank own-source carry: an own-source gossip row makes
+    #     `_get_competitive_undercut_pct`'s capacity rank resolve to real
+    #     data (larger_than_us=3, total_competitors=4 -> rank_weight 0.75,
+    #     high-fee corridor -> undercut_pct 0.175) instead of the ZERO-DATA
+    #     0.10 default every other scenario exercises (Important-1 gap:
+    #     `channel_capacity_rank` was dead-fixture-path before this).
+    #     Otherwise identical to `dts_pid_undercut` (7) so the ONLY delta
+    #     versus that scenario's undercut clamp is the rank input.
+    scenarios.append({
+        "name": "capacity_rank_own_source", "seed": 117, "cfg": _base_cfg(),
+        "gossip": competitors + [own_gossip_row(2_000_000)],
+        "marginal_roi": 42.3567,
+        "cycle_state": cycle_state(last_fee_ppm=600,
+                                   last_broadcast_fee_ppm=600),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(base_fee=700.0, rate=25.0, n=10),
+            scalars=fee_scalars(last_fee_ppm=600,
+                                last_broadcast_fee_ppm=600)),
+        "cycles": [{
+            "now": NOW,
+            "channel_info": _channel_info(cid, peer, fee_ppm=600,
+                                          capacity=2_000_000,
+                                          spendable_msat=1_100_000_000),
+            "state_row": plain_row,
+            "volume_since": {"default": 1_500_000},
+            "forward_count_since": {"default": 8},
+        }],
+    })
+
+    # 18. rebalance-cost SOFT nudge: only 2 in-window cost samples, below
+    #     `REBALANCE_FLOOR_MIN_SAMPLES` (4) so the HARD floor
+    #     (`_get_rebalance_cost_floor`) stays OFF (unlike scenario 11,
+    #     `floor_inversion`, whose 4 samples activate the hard floor and
+    #     gate `_get_channel_rebalance_cost_ppm` off at the source). With
+    #     the hard floor inactive the soft nudge computes cost_ppm=1421
+    #     (int(270 * 1e6 / 190000)) from a low-fee sparse channel, which
+    #     is > post_pid, so the nudge actually raises the target AND its
+    #     `rebal_cost_nudge:1421ppm` tag lands in the pinned reason string
+    #     (Important-1 gap: `_get_channel_rebalance_cost_ppm` was
+    #     dead-fixture-path before this).
+    scenarios.append({
+        "name": "rebal_cost_soft_nudge", "seed": 118, "cfg": _base_cfg(),
+        "cost_history": [
+            {"timestamp": ago(20.0), "cost_sats": 150,
+             "amount_sats": 100_000},
+            {"timestamp": ago(10.0), "cost_sats": 120,
+             "amount_sats": 90_000},
+        ],
+        "cycle_state": cycle_state(last_fee_ppm=200,
+                                   last_broadcast_fee_ppm=200),
+        "fee_state_builder": lambda: build_fee_state(
+            dense_obs(base_fee=200.0, rate=8.0, n=8),
+            scalars=fee_scalars(last_fee_ppm=200,
+                                last_broadcast_fee_ppm=200)),
+        "cycles": [{
+            "now": NOW,
+            "channel_info": _channel_info(cid, peer, fee_ppm=200,
+                                          capacity=2_000_000,
+                                          spendable_msat=1_000_000_000),
+            "state_row": plain_row,
+            "volume_since": {"default": 400_000},
+            "forward_count_since": {"default": 4},
+            "assert_branch": lambda adj, sk: (
+                len(adj) == 1 and ", rebal_cost_nudge:" in adj[0].reason),
         }],
     })
 
