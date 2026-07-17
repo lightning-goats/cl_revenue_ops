@@ -2113,6 +2113,48 @@ def gen_v2_blob(outdir: Path) -> None:
             "dynamic_htlcmin_baseline_msat": 1000,
         }
         cases.append(_blob_case("non_ascii_last_context_key", "chan_non_ascii", v2_10))
+
+        # 11: unrecognized `algorithm_version` (fictitious future writer,
+        # e.g. a schema bump this build predates) with a POPULATED
+        # thompson_state at the FLAT top level (pre-nesting layout, like
+        # cases 2/3) — this is the actual migration-safety-net branch
+        # (`from_v2_dict`, py 2181-2187): unknown version -> discard
+        # persisted thompson_state, use a fresh `GaussianThompsonState()`.
+        #
+        # `missing_pid_state` (case 7) does NOT exercise this branch:
+        # deleting `algorithm_version` from a NESTED `fee_state` dict gets
+        # it re-populated by `_extract_fee_state_payload`'s own
+        # `payload.setdefault("algorithm_version", "dts_pid_v1")` (py 3681)
+        # -- a KNOWN version -- before `from_v2_dict` ever sees the dict, so
+        # the reset branch is unreachable through that path. `setdefault`
+        # only fills a MISSING key, so only an EXPLICIT unrecognized value
+        # survives it; and only the flat/top-level shape lets that explicit
+        # value flow straight into `from_v2_dict` (nested `fee_state` would
+        # ALSO work if the value were explicit rather than deleted, but the
+        # flat layout is the one real un-migrated rows actually have, and
+        # matches cases 2/3's precedent).
+        #
+        # Populating thompson11's observations/contextual posteriors here
+        # (instead of leaving thompson_state at fresh `GaussianThompsonState()`
+        # defaults, as case 7 effectively does) is what makes the reset
+        # OBSERVABLE: resetting an already-fresh state to a fresh state is a
+        # no-op nothing can detect in a round-trip.
+        thompson11 = GaussianThompsonState()
+        thompson11.update_posterior(275, 18.0, 5.0, time_bucket="peak")
+        thompson11.update_contextual("mid:peak:P", 275, 18.0, time_bucket="peak")
+        v2_11 = {
+            "algorithm_version": "future_v9",
+            "thompson_state": thompson11.to_dict(),
+            "last_vegas_multiplier": 1.0,
+            "last_gossip_refresh": NOW - 3600,
+            "last_broadcast_at": NOW - 900,
+            "pid_state": PIDState().to_dict(),
+            "dynamic_htlcmin_baseline_msat": 1000,
+        }
+        cases.append(_blob_case(
+            "unrecognized_algorithm_version_populated_thompson",
+            "chan_unknown_algo_populated", v2_11,
+        ))
     finally:
         time.time = orig_time
 
