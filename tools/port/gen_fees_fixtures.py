@@ -2244,6 +2244,1068 @@ def gen_v2_blob(outdir: Path) -> None:
     })
 
 
+# update / ceiling / sampling: Thompson dynamics + sampling paths (Phase 4
+# Task 7) — update_posterior/update_contextual/record_posterior_nudge/
+# apply_vegas_adjustment sequences with full state snapshots per step,
+# supported_fee_ceiling + maybe_upward_probe_cap gate matrices, and seeded
+# sample_fee/sample_fee_contextual draw scenarios. The REAL
+# GaussianThompsonState methods are the oracle; time.time is monkeypatched
+# per step and the global `random` module is seeded per scenario (the Rust
+# port injects `now: i64` and `&mut PyRandom` instead).
+# ---------------------------------------------------------------------------
+
+H = 3600
+
+
+def _dump_ctx_value(v):
+    """[mean_repr, precision_repr, count, last_update] (current 4-tuple) or
+    [mean_repr, std_repr, count] (legacy 3-tuple, preserved as stored)."""
+    if len(v) == 3:
+        return [_r(v[0]), _r(v[1]), v[2]]
+    return [_r(v[0]), _r(v[1]), v[2], v[3]]
+
+
+def _dump_bias(bias):
+    return [[_r(t), _r(w), ts] for t, w, ts in bias]
+
+
+def _full_snapshot(state):
+    """Every GaussianThompsonState field Task 7's dynamics can touch."""
+    return {
+        "observations": [_dump_obs(o) for o in state.observations],
+        "zero_revenue_streak": state.zero_revenue_streak,
+        "zero_run_start_fee": _r(state.zero_run_start_fee),
+        "zero_run_start_ts": state.zero_run_start_ts,
+        "positive_rate_ref": _r(state.positive_rate_ref),
+        "positive_rate_ref_ts": state.positive_rate_ref_ts,
+        "meaningful_gap_ema_hours": _r(state.meaningful_gap_ema_hours),
+        "last_meaningful_ts": state.last_meaningful_ts,
+        "last_upward_probe_ts": state.last_upward_probe_ts,
+        "posterior_mean": _r(state.posterior_mean),
+        "posterior_std": _r(state.posterior_std),
+        "posterior_coeffs": _rvec(state.posterior_coeffs),
+        "posterior_precision": _rmat(state.posterior_precision),
+        "noise_variance": _r(state.noise_variance),
+        "charged_fee_mean": _r(state.charged_fee_mean),
+        "last_fee_min": _r(state._last_fee_min),
+        "last_fee_max": _r(state._last_fee_max),
+        "posterior_bias": _dump_bias(state.posterior_bias),
+        "contextual_posteriors": [
+            [k, _dump_ctx_value(v)]
+            for k, v in state.contextual_posteriors.items()
+        ],
+    }
+
+
+_INITIAL_INT_FIELDS = (
+    "zero_revenue_streak", "zero_run_start_ts", "positive_rate_ref_ts",
+    "last_meaningful_ts", "last_upward_probe_ts",
+)
+_INITIAL_FLOAT_FIELDS = (
+    "prior_mean_fee", "prior_std_fee", "posterior_mean", "posterior_std",
+    "charged_fee_mean", "noise_variance", "zero_run_start_fee",
+    "positive_rate_ref", "meaningful_gap_ema_hours",
+)
+
+
+def _apply_initial(state, initial):
+    for key in _INITIAL_INT_FIELDS + _INITIAL_FLOAT_FIELDS:
+        if key in initial:
+            setattr(state, key, initial[key])
+    if "observations" in initial:
+        state.observations = [tuple(o) for o in initial["observations"]]
+    if "posterior_bias" in initial:
+        state.posterior_bias = [tuple(b) for b in initial["posterior_bias"]]
+    if "contextual_posteriors" in initial:
+        state.contextual_posteriors = {
+            k: tuple(v) for k, v in initial["contextual_posteriors"].items()
+        }
+    if "posterior_coeffs" in initial:
+        state.posterior_coeffs = list(initial["posterior_coeffs"])
+    if "posterior_precision" in initial:
+        state.posterior_precision = [
+            row[:] for row in initial["posterior_precision"]
+        ]
+    if "last_fee_min" in initial:
+        state._last_fee_min = initial["last_fee_min"]
+    if "last_fee_max" in initial:
+        state._last_fee_max = initial["last_fee_max"]
+
+
+def _dump_initial(initial):
+    out = {}
+    for k, v in initial.items():
+        if k == "observations":
+            out[k] = [_dump_obs(o) for o in v]
+        elif k == "posterior_bias":
+            out[k] = _dump_bias(v)
+        elif k == "contextual_posteriors":
+            out[k] = [[key, _dump_ctx_value(val)] for key, val in v.items()]
+        elif k == "posterior_coeffs":
+            out[k] = _rvec(v)
+        elif k == "posterior_precision":
+            out[k] = _rmat(v)
+        elif k in _INITIAL_INT_FIELDS:
+            out[k] = v
+        else:
+            out[k] = _r(v)
+    return out
+
+
+def _run_update_sequence(name, steps, initial=None):
+    state = GaussianThompsonState()
+    if initial:
+        _apply_initial(state, initial)
+    out_steps = []
+    for step in steps:
+        now = step["now"]
+        orig_time = time.time
+        time.time = lambda t=now: float(t)
+        try:
+            op = step["op"]
+            entry = {"op": op, "now": now}
+            if op == "update_posterior":
+                state.update_posterior(
+                    step["fee"], step["revenue_rate"], step["hours"],
+                    time_bucket=step.get("time_bucket", "normal"),
+                    congested=step.get("congested", False),
+                )
+                entry["args"] = {
+                    "fee": _r(step["fee"]),
+                    "revenue_rate": _r(step["revenue_rate"]),
+                    "hours": _r(step["hours"]),
+                    "time_bucket": step.get("time_bucket", "normal"),
+                    "congested": step.get("congested", False),
+                }
+            elif op == "nudge":
+                state.record_posterior_nudge(step["target_fee"], step["weight"])
+                entry["args"] = {
+                    "target_fee": _r(step["target_fee"]),
+                    "weight": _r(step["weight"]),
+                }
+            elif op == "vegas":
+                state.apply_vegas_adjustment(
+                    step["vegas_multiplier"], step["new_floor"])
+                entry["args"] = {
+                    "vegas_multiplier": _r(step["vegas_multiplier"]),
+                    "new_floor": _r(step["new_floor"]),
+                }
+            elif op == "update_contextual":
+                state.update_contextual(
+                    step["context_key"], step["fee"], step["revenue_rate"],
+                    time_bucket=step.get("time_bucket", "normal"),
+                )
+                entry["args"] = {
+                    "context_key": step["context_key"],
+                    "fee": _r(step["fee"]),
+                    "revenue_rate": _r(step["revenue_rate"]),
+                    "time_bucket": step.get("time_bucket", "normal"),
+                }
+            elif op == "consume_upward_probe":
+                state.consume_upward_probe(now)
+                entry["args"] = {}
+            elif op == "recompute":
+                state._recompute_posterior()
+                entry["args"] = {}
+            else:
+                raise ValueError(op)
+
+            floor_ppm = step.get("ceiling_floor_ppm")
+            ceil_v = state.supported_fee_ceiling(now, floor_ppm)
+            checks = {
+                "real_observation_count": state.real_observation_count(),
+                "ceiling_floor_ppm": (
+                    _r(floor_ppm) if floor_ppm is not None else None),
+                "supported_fee_ceiling": (
+                    _r(ceil_v) if ceil_v is not None else None),
+            }
+            if "meaningful_probe_rates" in step:
+                checks["is_meaningful_rate"] = [
+                    [_r(r), state.is_meaningful_rate(r, now)]
+                    for r in step["meaningful_probe_rates"]
+                ]
+            entry["expected"] = {
+                "checks": checks,
+                "state": _full_snapshot(state),
+            }
+        finally:
+            time.time = orig_time
+        out_steps.append(entry)
+    return {
+        "name": name,
+        "initial": _dump_initial(initial) if initial else None,
+        "steps": out_steps,
+    }
+
+
+def gen_update(outdir: Path) -> None:
+    sequences = []
+
+    def seq(name, steps, initial=None):
+        sequences.append(_run_update_sequence(name, steps, initial=initial))
+
+    # 1: positive_rate_ref seeding, then EMA-on-DECAYED-ref (py 776-779 blends
+    # against the effective/decayed `ref`, NOT the stored positive_rate_ref)
+    # and gap-EMA seeding + update.
+    seq("meaningful_seeds_and_ema_on_decayed_ref", [
+        {"op": "update_posterior", "now": NOW, "fee": 250,
+         "revenue_rate": 100.0, "hours": 6.0},
+        {"op": "update_posterior", "now": NOW + 48 * H, "fee": 250,
+         "revenue_rate": 80.0, "hours": 6.0},
+        {"op": "update_posterior", "now": NOW + 72 * H, "fee": 250,
+         "revenue_rate": 120.0, "hours": 6.0},
+    ])
+
+    # 2: gap-EMA only updates when now > last_meaningful_ts (same-second
+    # meaningful windows leave the gap EMA untouched).
+    seq("gap_ema_requires_forward_time", [
+        {"op": "update_posterior", "now": NOW, "fee": 300,
+         "revenue_rate": 50.0, "hours": 3.0},
+        {"op": "update_posterior", "now": NOW, "fee": 300,
+         "revenue_rate": 60.0, "hours": 3.0},
+        {"op": "update_posterior", "now": NOW + 6 * H, "fee": 300,
+         "revenue_rate": 55.0, "hours": 6.0},
+    ])
+
+    # 3: trickle (rate below TRICKLE_RESET_FRAC of the decayed ref) EXTENDS
+    # the streak and stamps zero_run_start; a later meaningful rate resets.
+    seq("trickle_extends_streak", [
+        {"op": "update_posterior", "now": NOW, "fee": 400,
+         "revenue_rate": 500.0, "hours": 6.0,
+         "meaningful_probe_rates": [0.0, 20.0, 50.0, 500.0]},
+        {"op": "update_posterior", "now": NOW + H, "fee": 400,
+         "revenue_rate": 20.0, "hours": 1.0,
+         "meaningful_probe_rates": [20.0, 49.0, 51.0]},
+        {"op": "update_posterior", "now": NOW + 2 * H, "fee": 400,
+         "revenue_rate": 60.0, "hours": 1.0},
+    ])
+
+    # 4: the >= boundary — a rate exactly at TRICKLE_RESET_FRAC * ref (age 0,
+    # undecayed) is meaningful; just below is a trickle. After step 1 the ref
+    # is 100.0 (seeded, ts=now), so at the same now: 10.0 is meaningful
+    # (resets), 9.99 would be a trickle (probed via is_meaningful_rate).
+    seq("trickle_boundary_exact_fraction", [
+        {"op": "update_posterior", "now": NOW, "fee": 200,
+         "revenue_rate": 100.0, "hours": 6.0,
+         "meaningful_probe_rates": [10.0, 9.99]},
+        {"op": "update_posterior", "now": NOW, "fee": 200,
+         "revenue_rate": 10.0, "hours": 6.0},
+    ])
+
+    # 5: sustained zero run -> probe injection at streak >= 4: probe fee
+    # max(1, int(fee*0.9)) appended as ("zero_probe", rev 0.0) with the SAME
+    # weight/ts/bucket; real_observation_count excludes probes throughout.
+    seq("zero_run_probe_injection_starts", [
+        {"op": "update_posterior", "now": NOW + i * H, "fee": 400,
+         "revenue_rate": 0.0, "hours": 1.0}
+        for i in range(4)
+    ] + [
+        {"op": "update_posterior", "now": NOW + 4 * H, "fee": 360,
+         "revenue_rate": 0.0, "hours": 1.0},
+    ])
+
+    # 6: probe stops once posterior_mean falls below ZERO_PROBE_FLOOR_FRAC of
+    # the zero-run start fee (descending charged fees drag the zero-regime
+    # anchor mean down until the 0.3 * 1000 threshold blocks injection).
+    seq("probe_stops_below_floor_frac", [
+        {"op": "update_posterior", "now": NOW + i * H, "fee": fee,
+         "revenue_rate": 0.0, "hours": 1.0}
+        for i, fee in enumerate(
+            [1000, 1000, 1000, 1000, 260, 250, 240, 230, 220, 210,
+             150, 120, 100, 90, 80, 70])
+    ])
+
+    # 7a/7b: probe descent floor is relative to the EARNING anchor when one
+    # exists, else the zero-run start fee. Identical stale posterior_mean
+    # (250, set directly — the probe gate reads the PREVIOUS cycle's mean,
+    # py 821) and zero run started at 900: with recent earning history at
+    # ~800 the threshold is 0.3*≈800 ≈ 240 -> probe fires; without it the
+    # threshold is 0.3*900 = 270 -> no probe.
+    seq("probe_floor_ref_uses_earning_anchor", [
+        {"op": "update_posterior", "now": NOW, "fee": 900,
+         "revenue_rate": 0.0, "hours": 1.0},
+    ], initial={
+        "zero_revenue_streak": 3,
+        "zero_run_start_fee": 900.0,
+        "zero_run_start_ts": NOW - 3 * H,
+        "posterior_mean": 250.0,
+        "positive_rate_ref": 400.0,
+        "positive_rate_ref_ts": NOW - 4 * H,
+        "observations": [
+            (800, 350.0, 1.0, NOW - 6 * H, "normal"),
+            (900, 0.0, 1.0, NOW - 3 * H, "normal"),
+            (900, 0.0, 1.0, NOW - 2 * H, "normal"),
+            (900, 0.0, 1.0, NOW - H, "normal"),
+        ],
+    })
+    seq("probe_floor_ref_falls_back_to_run_start", [
+        {"op": "update_posterior", "now": NOW, "fee": 900,
+         "revenue_rate": 0.0, "hours": 1.0},
+    ], initial={
+        "zero_revenue_streak": 3,
+        "zero_run_start_fee": 900.0,
+        "zero_run_start_ts": NOW - 3 * H,
+        "posterior_mean": 250.0,
+        "observations": [
+            (900, 0.0, 1.0, NOW - 3 * H, "normal"),
+            (900, 0.0, 1.0, NOW - 2 * H, "normal"),
+            (900, 0.0, 1.0, NOW - H, "normal"),
+        ],
+    })
+
+    # 8: probe requires probe_fee < fee — at fee 1, int(0.9) -> max(1, 0) = 1
+    # is NOT < 1, so no probe despite an eligible streak.
+    seq("probe_requires_strictly_lower_fee", [
+        {"op": "update_posterior", "now": NOW, "fee": 1,
+         "revenue_rate": 0.0, "hours": 1.0},
+    ], initial={
+        "zero_revenue_streak": 5,
+        "zero_run_start_fee": 400.0,
+        "zero_run_start_ts": NOW - 5 * H,
+        "posterior_mean": 300.0,
+    })
+
+    # 9: congestion-flagged windows are REAL market windows: recorded as
+    # 6-tuples, included in real_observation_count, but their revenue is
+    # excluded from supported_fee_ceiling (slot protection, not a market
+    # test) — the ceiling stays anchored on the un-flagged earning region.
+    seq("congestion_counts_but_ceiling_excludes", [
+        {"op": "update_posterior", "now": NOW, "fee": 300,
+         "revenue_rate": 200.0, "hours": 6.0},
+        {"op": "update_posterior", "now": NOW + H, "fee": 2000,
+         "revenue_rate": 900.0, "hours": 6.0, "congested": True},
+        {"op": "update_posterior", "now": NOW + 2 * H, "fee": 310,
+         "revenue_rate": 180.0, "hours": 6.0},
+    ])
+
+    # 10: non-finite/non-positive hours default to 1.0 (weight = 1/6).
+    seq("guard_bad_hours_defaults_to_one", [
+        {"op": "update_posterior", "now": NOW, "fee": 250,
+         "revenue_rate": 50.0, "hours": float("nan")},
+        {"op": "update_posterior", "now": NOW + H, "fee": 250,
+         "revenue_rate": 50.0, "hours": -3.0},
+        {"op": "update_posterior", "now": NOW + 2 * H, "fee": 250,
+         "revenue_rate": 50.0, "hours": 0.0},
+    ])
+
+    # 11: non-finite/negative rate is zeroed (starts a zero run).
+    seq("guard_bad_rate_zeroed", [
+        {"op": "update_posterior", "now": NOW, "fee": 250,
+         "revenue_rate": float("nan"), "hours": 6.0},
+        {"op": "update_posterior", "now": NOW + H, "fee": 250,
+         "revenue_rate": -5.0, "hours": 6.0},
+    ])
+
+    # 12: non-finite or negative fee skips the observation ENTIRELY — no
+    # streak/ref/observation change (steps 2-3 snapshots must equal step 1's).
+    seq("guard_bad_fee_no_state_change", [
+        {"op": "update_posterior", "now": NOW, "fee": 250,
+         "revenue_rate": 50.0, "hours": 6.0},
+        {"op": "update_posterior", "now": NOW + H, "fee": float("nan"),
+         "revenue_rate": 70.0, "hours": 6.0},
+        {"op": "update_posterior", "now": NOW + 2 * H, "fee": -1,
+         "revenue_rate": 70.0, "hours": 6.0},
+    ])
+
+    # 13: exposure weight caps at 6h.
+    seq("weight_caps_at_six_hours", [
+        {"op": "update_posterior", "now": NOW, "fee": 250,
+         "revenue_rate": 40.0, "hours": 12.0},
+        {"op": "update_posterior", "now": NOW + H, "fee": 250,
+         "revenue_rate": 40.0, "hours": 3.0},
+        {"op": "update_posterior", "now": NOW + 2 * H, "fee": 250,
+         "revenue_rate": 40.0, "hours": 6.0},
+    ])
+
+    # 14: prune to the LAST 200: 199 seeded observations + 1 real + 1 probe
+    # appended in the same update -> 201 -> oldest dropped.
+    rnd = random.Random(777)
+    seeded_obs = [
+        (int(rnd.uniform(100, 900)), max(0.0, rnd.gauss(80.0, 40.0)),
+         rnd.uniform(0.3, 1.0), NOW - (199 - i) * H, "normal")
+        for i in range(199)
+    ]
+    seq("prune_at_201_including_probe", [
+        {"op": "update_posterior", "now": NOW, "fee": 500,
+         "revenue_rate": 0.0, "hours": 6.0},
+    ], initial={
+        "zero_revenue_streak": 10,
+        "zero_run_start_fee": 600.0,
+        "zero_run_start_ts": NOW - 10 * H,
+        "posterior_mean": 550.0,
+        "observations": seeded_obs,
+    })
+
+    # 15: THE bias re-apply pin (Task 2 review obligation): a nudge blends
+    # the mean immediately; the next update_posterior recomputes the
+    # posterior from observations (erasing the in-place blend) and
+    # _apply_posterior_bias re-applies the decayed nudge — the bias must
+    # survive with its recorded (undecayed) weight in posterior_bias.
+    seq("nudge_survives_recompute_via_bias_reapply", [
+        {"op": "update_posterior", "now": NOW, "fee": 200,
+         "revenue_rate": 30.0, "hours": 6.0},
+        {"op": "nudge", "now": NOW, "target_fee": 300.0, "weight": 0.4},
+        {"op": "update_posterior", "now": NOW + 2 * H, "fee": 210,
+         "revenue_rate": 35.0, "hours": 6.0},
+        {"op": "update_posterior", "now": NOW + 40 * H, "fee": 220,
+         "revenue_rate": 32.0, "hours": 6.0},
+    ])
+
+    # 16: nudge dedup (M4): a target within 5% of an existing entry
+    # REFRESHES it (max weight, new ts) with NO immediate re-blend; a
+    # distinct target appends and blends.
+    seq("nudge_dedup_refresh_no_reblend", [
+        {"op": "nudge", "now": NOW, "target_fee": 300.0, "weight": 0.4},
+        {"op": "nudge", "now": NOW + H, "target_fee": 310.0, "weight": 0.3},
+        {"op": "nudge", "now": NOW + H, "target_fee": 310.0, "weight": 0.6},
+        {"op": "nudge", "now": NOW + 2 * H, "target_fee": 400.0,
+         "weight": 0.2},
+    ])
+
+    # 17: nudge memory cap: 50 pre-seeded distinct targets + 1 more evicts
+    # the oldest (keep the LAST 50).
+    seq("nudge_cap_evicts_oldest", [
+        {"op": "nudge", "now": NOW, "target_fee": 5.0, "weight": 0.2},
+    ], initial={
+        "posterior_bias": [
+            (10.0 * (1.1 ** k), 0.05, NOW - k) for k in range(50)
+        ],
+    })
+
+    # 18: decayed-below-BIAS_MIN_WEIGHT nudges are pruned by the re-apply
+    # pass that runs inside update_posterior's recompute.
+    seq("nudge_decay_prunes_expired", [
+        {"op": "update_posterior", "now": NOW, "fee": 250,
+         "revenue_rate": 40.0, "hours": 6.0},
+    ], initial={
+        "posterior_bias": [
+            (300.0, 0.5, NOW - 240 * H),   # 10 half-lives: 4.88e-4 < 1e-3
+            (400.0, 0.5, NOW - 48 * H),    # 2 half-lives: 0.125, live
+        ],
+    })
+
+    # 19: Vegas adjustment matrix: <=1.2 no-op; >1.2 boosts std (capped at
+    # 2.0x) and routes the floor through the durable nudge channel only when
+    # the floor exceeds the mean.
+    seq("vegas_adjustment_matrix", [
+        {"op": "vegas", "now": NOW, "vegas_multiplier": 1.2,
+         "new_floor": 500.0},
+        {"op": "vegas", "now": NOW, "vegas_multiplier": 1.19,
+         "new_floor": 500.0},
+        {"op": "vegas", "now": NOW, "vegas_multiplier": 1.5,
+         "new_floor": 500.0},
+        {"op": "vegas", "now": NOW + H, "vegas_multiplier": 3.0,
+         "new_floor": 400.0},
+        {"op": "vegas", "now": NOW + 2 * H, "vegas_multiplier": 1.5,
+         "new_floor": 10.0},
+    ])
+
+    # 20: contextual init (hierarchical prior; role S widens by 1.25),
+    # precision decay on re-update (7-day last_update decay + 0.98
+    # per-update), malformed keys default to role P / time "normal".
+    seq("contextual_init_roles_and_updates", [
+        {"op": "update_contextual", "now": NOW, "context_key": "mid:peak:P",
+         "fee": 300, "revenue_rate": 50.0, "time_bucket": "peak"},
+        {"op": "update_contextual", "now": NOW, "context_key": "mid:peak:S",
+         "fee": 320, "revenue_rate": 50.0, "time_bucket": "peak"},
+        {"op": "update_contextual", "now": NOW + 6 * H,
+         "context_key": "mid:peak:P", "fee": 340, "revenue_rate": 80.0,
+         "time_bucket": "peak"},
+        {"op": "update_contextual", "now": NOW + 6 * H,
+         "context_key": "plain", "fee": 200, "revenue_rate": 10.0,
+         "time_bucket": "peak"},
+        {"op": "update_contextual", "now": NOW + 6 * H,
+         "context_key": "low:peak", "fee": 210, "revenue_rate": 10.0,
+         "time_bucket": "low"},
+    ])
+
+    # 21: cross-pollination: a full-weight (same-bucket) update also nudges
+    # ADJACENT time contexts at 0.1x revenue-weight precision WITHOUT
+    # incrementing their count; a reduced-weight update does not cross-poll.
+    # The legacy 3-tuple context is converted in place when updated.
+    seq("contextual_cross_pollination", [
+        {"op": "update_contextual", "now": NOW,
+         "context_key": "mid:normal:P", "fee": 300, "revenue_rate": 50.0,
+         "time_bucket": "normal"},
+        {"op": "update_contextual", "now": NOW + H,
+         "context_key": "mid:peak:P", "fee": 500, "revenue_rate": 40.0,
+         "time_bucket": "normal"},
+        {"op": "update_contextual", "now": NOW + 2 * H,
+         "context_key": "mid:low:S", "fee": 100, "revenue_rate": 30.0,
+         "time_bucket": "low"},
+    ], initial={
+        "posterior_mean": 250.0,
+        "posterior_std": 60.0,
+        "contextual_posteriors": {
+            "mid:low:P": (150.0, 0.002, 8, NOW - 24 * H),
+            "mid:normal:P": (250.0, 0.001, 12, NOW - 12 * H),
+            "mid:peak:P": (400.0, 0.0015, 6, NOW - 6 * H),
+            "mid:normal:S": (260.0, 45.0, 7),   # legacy 3-tuple
+        },
+    })
+
+    # 22: updating a stored legacy 3-tuple context converts it with the
+    # SAME formula from_dict uses (precision = 1/max(std^2, MIN_STD^2),
+    # last_update = 0 -> no age decay on first touch).
+    seq("contextual_legacy_3tuple_update", [
+        {"op": "update_contextual", "now": NOW, "context_key": "low:peak:P",
+         "fee": 280, "revenue_rate": 25.0, "time_bucket": "peak"},
+    ], initial={
+        "contextual_posteriors": {
+            "low:peak:P": (250.0, 45.0, 12),
+        },
+    })
+
+    # 23: consume_upward_probe stamps the injected now.
+    seq("consume_upward_probe_stamps_now", [
+        {"op": "consume_upward_probe", "now": NOW + 5 * H},
+    ])
+
+    assert len(sequences) == 24, len(sequences)
+    _write(outdir / "sequences.json", {"now": NOW, "sequences": sequences})
+
+    # -----------------------------------------------------------------
+    # contextual_prune.json: the OValue-order trap. All-count-1 overflow:
+    # Python's stable sorted() keeps insertion order on ties, so the 131st
+    # (just-inserted) key is itself pruned away; keys updated twice sort to
+    # the front. dict(sorted_contexts[:104]) REORDERS the surviving map to
+    # count-desc order — a BTreeMap (or unstable sort) changes which keys
+    # survive AND their order.
+    # -----------------------------------------------------------------
+    state = GaussianThompsonState()
+    prune_ops = []
+
+    def ctx_op(key, fee, rate, bucket, now):
+        prune_ops.append(
+            {"context_key": key, "fee": fee, "revenue_rate": _r(rate),
+             "time_bucket": bucket, "now": now})
+        orig_time = time.time
+        time.time = lambda t=now: float(t)
+        try:
+            state.update_contextual(key, fee, rate, time_bucket=bucket)
+        finally:
+            time.time = orig_time
+
+    for i in range(130):
+        ctx_op(f"b{i:03d}:normal:P", 200 + i, 20.0, "normal", NOW + i)
+    # Second updates for three keys -> count 2 (they must survive the prune
+    # and lead the reordered map).
+    for i in (10, 20, 30):
+        ctx_op(f"b{i:03d}:normal:P", 210 + i, 25.0, "normal", NOW + 200 + i)
+    # 131st distinct key overflows: len 131 > 130 -> prune to 104 by count
+    # desc (stable) -> the freshly inserted b130 (count 1, position 131) is
+    # dropped immediately.
+    ctx_op("b130:normal:P", 400, 30.0, "normal", NOW + 300)
+    assert len(state.contextual_posteriors) == 104
+    assert "b130:normal:P" not in state.contextual_posteriors
+    keys = list(state.contextual_posteriors.keys())
+    assert keys[:3] == ["b010:normal:P", "b020:normal:P", "b030:normal:P"]
+    _write(outdir / "contextual_prune.json", {
+        "now": NOW,
+        "ops": prune_ops,
+        "expected_keys_in_order": keys,
+        "expected_contexts": [
+            [k, _dump_ctx_value(v)]
+            for k, v in state.contextual_posteriors.items()
+        ],
+    })
+
+    # -----------------------------------------------------------------
+    # failed_forward.json: the pure math of record_failed_forward
+    # (fee_controller.py:8596-8605) + is_fee_relevant_failure (8504-8525).
+    # The weight/implied-fee arithmetic is transcribed VERBATIM from the
+    # method body (it is inline there, entangled with DB/threading state
+    # that has no pure entry point) — source lines pinned in comments.
+    # -----------------------------------------------------------------
+    weight_cases = []
+    for amount_msat in (0, -5, 1, 999, 123_456, 1_000_000, 100_000_000,
+                        1_000_000_000, 5_000_000_000, 123_456_789):
+        # py 8600-8605 verbatim:
+        base_weight = 0.1
+        amount_sats = amount_msat / 1000
+        if amount_msat > 0:
+            amount_boost = min(3.0, 1.0 + math.log10(max(1, amount_sats)) / 3.0)
+            base_weight *= amount_boost
+        weight_cases.append({
+            "amount_msat": amount_msat,
+            "amount_sats": _r(amount_sats),
+            "expected_weight": _r(base_weight),
+        })
+
+    implied_cases = []
+    for fee in (1, 2, 5, 100, 999, 1000, 2500, 4999):
+        implied_cases.append({
+            "current_fee_ppm": fee,
+            "expected_implied_fee": int(fee * 0.8),  # py 8596 verbatim
+        })
+
+    relevance_cases = []
+    for failcode, failreason in [
+        (0x1000 | 12, None),
+        (0x1000 | 12, "TEMPORARY_CHANNEL_FAILURE"),
+        (0x4000 | 15, "WIRE_FEE_INSUFFICIENT"),  # failcode short-circuits
+        (0, None),
+        (None, "WIRE_FEE_INSUFFICIENT"),
+        (None, "fee_insufficient (retry)"),
+        (None, "TEMPORARY_CHANNEL_FAILURE"),
+        (None, ""),
+        (None, None),
+    ]:
+        relevance_cases.append({
+            "failcode": failcode,
+            "failreason": failreason,
+            "expected": FeeController.is_fee_relevant_failure(
+                failcode, failreason),
+        })
+
+    _write(outdir / "failed_forward.json", {
+        "now": NOW,
+        "weight_cases": weight_cases,
+        "implied_fee_cases": implied_cases,
+        "relevance_cases": relevance_cases,
+    })
+
+
+def gen_ceiling(outdir: Path) -> None:
+    ceiling_cases = []
+
+    def ceiling_case(name, observations, floor_ppm=None, now=NOW):
+        state = GaussianThompsonState()
+        state.observations = [tuple(o) for o in observations]
+        v = state.supported_fee_ceiling(now, floor_ppm)
+        ceiling_cases.append({
+            "name": name,
+            "now": now,
+            "floor_ppm": _r(floor_ppm) if floor_ppm is not None else None,
+            "observations": [_dump_obs(o) for o in observations],
+            "expected": _r(v) if v is not None else None,
+        })
+
+    ceiling_case("no_earning_history_none", [
+        (300, 0.0, 1.0, NOW - H, "normal"),
+        (280, 0.0, 1.0, NOW - 2 * H, "normal"),
+    ])
+    ceiling_case("empty_observations_none", [])
+    ceiling_case("basic_quantile_with_headroom", [
+        (100, 50.0, 1.0, NOW - H, "normal"),
+        (200, 80.0, 1.0, NOW - 2 * H, "normal"),
+        (300, 20.0, 1.0, NOW - 3 * H, "normal"),
+    ])
+    ceiling_case("quantile_reaches_top_fee", [
+        (100, 10.0, 1.0, NOW - H, "normal"),
+        (500, 300.0, 1.0, NOW - 2 * H, "normal"),
+    ])
+    # Winsorization (>= 4 masses): the whale's mass is capped at 3x the
+    # median, which moves the 0.90 quantile fee downward.
+    ceiling_case("winsorized_whale_quantile", [
+        (100, 50.0, 1.0, NOW - H, "normal"),
+        (150, 60.0, 1.0, NOW - H, "normal"),
+        (200, 55.0, 1.0, NOW - H, "normal"),
+        (900, 5000.0, 1.0, NOW - H, "normal"),
+    ])
+    ceiling_case("congestion_revenue_excluded", [
+        (100, 50.0, 1.0, NOW - H, "normal"),
+        (2000, 900.0, 1.0, NOW - H, "normal", "congestion"),
+        (150, 40.0, 1.0, NOW - 2 * H, "normal"),
+    ])
+    ceiling_case("zero_probe_carries_no_mass", [
+        (100, 50.0, 1.0, NOW - H, "normal"),
+        (90, 0.0, 1.0, NOW - H, "normal", "zero_probe"),
+    ])
+    # Floor escape: quantile at/below the floor widens to floor * 2.0.
+    ceiling_case("floor_escape_at_floor", [
+        (100, 50.0, 1.0, NOW - H, "normal"),
+        (100, 45.0, 1.0, NOW - 2 * H, "normal"),
+    ], floor_ppm=100.0)
+    ceiling_case("floor_escape_only_binds_when_larger", [
+        (100, 50.0, 1.0, NOW - H, "normal"),
+    ], floor_ppm=50.0)
+    ceiling_case("no_escape_quantile_above_floor", [
+        (300, 50.0, 1.0, NOW - H, "normal"),
+        (350, 45.0, 1.0, NOW - 2 * H, "normal"),
+    ], floor_ppm=100.0)
+    ceiling_case("floor_zero_never_escapes", [
+        (100, 50.0, 1.0, NOW - H, "normal"),
+    ], floor_ppm=0.0)
+    ceiling_case("stale_mass_decays_out", [
+        (100, 50.0, 1.0, NOW - 400 * 24 * H, "normal"),
+    ])
+    ceiling_case("same_fee_two_windows", [
+        (250, 30.0, 1.0, NOW - H, "normal"),
+        (250, 90.0, 0.5, NOW - 2 * H, "normal"),
+        (400, 5.0, 1.0, NOW - 3 * H, "normal"),
+    ])
+    _write(outdir / "ceiling.json", {"now": NOW, "cases": ceiling_cases})
+
+    # maybe_upward_probe_cap: guard order is cap-parse -> finite/positive ->
+    # streak -> mean -> std -> interval (py 953-974).
+    probe_cases = []
+
+    def probe_case(name, *, streak=0, mean=400.0, std=80.0, last_ts=0,
+                   cap=300.0, now=NOW):
+        state = GaussianThompsonState()
+        state.zero_revenue_streak = streak
+        state.posterior_mean = mean
+        state.posterior_std = std
+        state.last_upward_probe_ts = last_ts
+        v = state.maybe_upward_probe_cap(now, cap)
+        probe_cases.append({
+            "name": name,
+            "now": now,
+            "zero_revenue_streak": streak,
+            "posterior_mean": _r(mean),
+            "posterior_std": _r(std),
+            "last_upward_probe_ts": last_ts,
+            "supported_cap": _r(cap),
+            "expected": _r(v) if v is not None else None,
+        })
+
+    probe_case("grants_stretch")
+    probe_case("cap_nan_none", cap=float("nan"))
+    probe_case("cap_inf_none", cap=float("inf"))
+    probe_case("cap_zero_none", cap=0.0)
+    probe_case("cap_negative_none", cap=-50.0)
+    probe_case("streak_nonzero_none", streak=1)
+    probe_case("streak_negative_none", streak=-1)
+    probe_case("mean_at_cap_none", mean=300.0)
+    probe_case("mean_below_cap_none", mean=299.0)
+    probe_case("std_below_min_none", std=59.999)
+    probe_case("std_exactly_min_grants", std=60.0)
+    probe_case("within_interval_none", last_ts=NOW - 24 * H + 1)
+    probe_case("interval_boundary_grants", last_ts=NOW - 24 * H)
+    probe_case("zero_last_ts_skips_interval_gate", last_ts=0)
+    _write(outdir / "probe_cap.json", {"now": NOW, "cases": probe_cases})
+
+
+def _derive_seed(base_seed: int, component: str) -> int:
+    from modules.cycle_context import CycleContext
+    from modules.econ_types import UnixTime
+    c = CycleContext(cycle_id="c", cycle_time=UnixTime(NOW), seed=base_seed,
+                     snapshot_id="s")
+    return c.derive_seed(component)
+
+
+def _build_sampling_state(spec) -> GaussianThompsonState:
+    state = GaussianThompsonState()
+    _apply_initial(state, spec)
+    return state
+
+
+def gen_sampling(outdir: Path) -> None:
+    cases = []
+
+    def case(name, *, seed, spec, fn="sample_fee", floor=0, ceiling=5000,
+             exploration_multiplier=None, pass_multiplier=True,
+             context_key=None, expect_branch=None, expect_gauss=None,
+             cholesky_expectation=None):
+        state = _build_sampling_state(spec)
+
+        if cholesky_expectation is not None:
+            sigma = GaussianThompsonState._mat3_invert(
+                state.posterior_precision)
+            if cholesky_expectation == "fails":
+                assert sigma is not None, name
+                assert GaussianThompsonState._cholesky3(sigma) is None, name
+            elif cholesky_expectation == "succeeds":
+                assert sigma is not None, name
+                assert GaussianThompsonState._cholesky3(sigma) is not None, name
+            elif cholesky_expectation == "invert_fails":
+                assert sigma is None, name
+
+        random.seed(seed)
+        counts = {"gauss": 0, "random": 0}
+        orig_gauss, orig_random = random.gauss, random.random
+        orig_time = time.time
+
+        def counting_gauss(mu=0.0, sigma=1.0):
+            counts["gauss"] += 1
+            return orig_gauss(mu, sigma)
+
+        def counting_random():
+            counts["random"] += 1
+            return orig_random()
+
+        random.gauss = counting_gauss
+        random.random = counting_random
+        time.time = lambda: float(NOW)
+        try:
+            if fn == "sample_fee":
+                if pass_multiplier:
+                    fee = state.sample_fee(
+                        floor, ceiling,
+                        exploration_multiplier=exploration_multiplier)
+                else:
+                    fee = state.sample_fee(floor, ceiling)
+            else:
+                if pass_multiplier:
+                    fee = state.sample_fee_contextual(
+                        context_key, floor, ceiling,
+                        exploration_multiplier=exploration_multiplier)
+                else:
+                    fee = state.sample_fee_contextual(context_key, floor,
+                                                      ceiling)
+        finally:
+            random.gauss = orig_gauss
+            random.random = orig_random
+            time.time = orig_time
+
+        if expect_gauss is not None:
+            assert counts["gauss"] == expect_gauss, (name, counts)
+
+        # Stream-position + gauss-cache pins: the NEXT gauss and random from
+        # the SAME stream must match on the Rust side — this is the
+        # draw-count parity contract (a missed or extra draw desyncs both).
+        post_gauss = random.gauss(0.0, 1.0)
+        post_random = random.random()
+
+        cases.append({
+            "name": name,
+            "seed": seed,
+            "now": NOW,
+            "state": _dump_initial(spec),
+            "call": {
+                "fn": fn,
+                "floor": floor,
+                "ceiling": ceiling,
+                "exploration_multiplier": (
+                    _r(exploration_multiplier)
+                    if exploration_multiplier is not None else None),
+                "context_key": context_key,
+            },
+            "expected": {
+                "fee": fee,
+                "last_sampled_fee": state.last_sampled_fee,
+                "last_sample_time": state.last_sample_time,
+                "branch": expect_branch,
+                "gauss_draws": counts["gauss"],
+                "random_draws": counts["random"],
+                "post_gauss": _r(post_gauss),
+                "post_random": _r(post_random),
+            },
+        })
+
+    seed_a = _derive_seed(0, "fee-sample")
+    seed_b = _derive_seed(1, "fee-sample")
+    seed_c = _derive_seed(2, "fee-sample")
+    seed_d = _derive_seed(3, "fee-sample")
+
+    # Real observations to pass the MIN_OBSERVATIONS sparse gate (their
+    # values are irrelevant to sampling — only the count matters).
+    five_real = [
+        (200 + 10 * i, 40.0 + i, 1.0, NOW - (i + 1) * H, "normal")
+        for i in range(5)
+    ]
+    # A PD precision matrix whose inverse is PD -> Cholesky succeeds.
+    pd_precision = [[100.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 0.0, 100.0]]
+    # Invertible but INDEFINITE precision: Sigma = diag(1, -1, 1) -> the
+    # Cholesky pivot goes negative -> diagonal-approximation fallback (the
+    # draw count must stay 3).
+    non_pd_precision = [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]
+    concave_coeffs = [-50.0, 20.0, 5.0]
+    poly_spec = {
+        "observations": five_real,
+        "posterior_coeffs": concave_coeffs,
+        "posterior_precision": pd_precision,
+        "last_fee_min": 100.0,
+        "last_fee_max": 400.0,
+        "posterior_mean": 250.0,
+        "posterior_std": 40.0,
+        "charged_fee_mean": 220.0,
+    }
+
+    # --- sparse-prior path (ONE gauss; bias shift applies) ---
+    case("sparse_fresh_prior", seed=seed_a, spec={},
+         expect_branch="sparse_prior", expect_gauss=1)
+    case("sparse_min_std_clamp", seed=seed_a,
+         spec={"prior_mean_fee": 50.0, "prior_std_fee": 5.0},
+         expect_branch="sparse_prior", expect_gauss=1)
+    case("sparse_with_live_nudge", seed=seed_b,
+         spec={"posterior_bias": [(300.0, 0.5, NOW - H)]},
+         expect_branch="sparse_prior", expect_gauss=1)
+    case("sparse_with_expired_nudge", seed=seed_b,
+         spec={"posterior_bias": [(300.0, 0.5, NOW - 240 * H)]},
+         expect_branch="sparse_prior", expect_gauss=1)
+    case("sparse_multiplier_clamped_high", seed=seed_a, spec={},
+         exploration_multiplier=3.5, expect_branch="sparse_prior",
+         expect_gauss=1)
+    case("sparse_multiplier_clamped_low", seed=seed_a, spec={},
+         exploration_multiplier=0.3, expect_branch="sparse_prior",
+         expect_gauss=1)
+    case("sparse_multiplier_nan_fallback", seed=seed_a, spec={},
+         exploration_multiplier=float("nan"), expect_branch="sparse_prior",
+         expect_gauss=1)
+    case("sparse_multiplier_inf_fallback", seed=seed_a, spec={},
+         exploration_multiplier=float("inf"), expect_branch="sparse_prior",
+         expect_gauss=1)
+    case("sparse_multiplier_in_range", seed=seed_c, spec={},
+         exploration_multiplier=1.3, expect_branch="sparse_prior",
+         expect_gauss=1)
+    # Probes don't count toward the sparse gate (4 real + 3 probes -> sparse);
+    # congestion windows do (4 real + 1 congested -> polynomial path).
+    case("sparse_gate_ignores_probes", seed=seed_c, spec={
+        "observations": five_real[:4] + [
+            (180 - i, 0.0, 1.0, NOW - i * H, "normal", "zero_probe")
+            for i in range(3)
+        ],
+    }, expect_branch="sparse_prior", expect_gauss=1)
+    case("sparse_gate_counts_congestion", seed=seed_c, spec={
+        **poly_spec,
+        "observations": five_real[:4] + [
+            (400, 90.0, 1.0, NOW - 6 * H, "peak", "congestion")],
+    }, expect_branch="poly_concave", expect_gauss=3,
+        cholesky_expectation="succeeds")
+
+    # --- polynomial path, Cholesky success (THREE gauss) ---
+    case("poly_concave_cholesky_ok", seed=seed_a, spec=poly_spec,
+         expect_branch="poly_concave", expect_gauss=3,
+         cholesky_expectation="succeeds")
+    case("poly_concave_with_live_nudge", seed=seed_b, spec={
+        **poly_spec, "posterior_bias": [(600.0, 0.4, NOW - 2 * H)],
+    }, expect_branch="poly_concave", expect_gauss=3,
+        cholesky_expectation="succeeds")
+    case("poly_concave_boost_max", seed=seed_c, spec=poly_spec,
+         exploration_multiplier=2.0, expect_branch="poly_concave",
+         expect_gauss=3, cholesky_expectation="succeeds")
+    case("poly_concave_omitted_kwarg", seed=seed_a, spec=poly_spec,
+         pass_multiplier=False, expect_branch="poly_concave",
+         expect_gauss=3, cholesky_expectation="succeeds")
+
+    # --- polynomial path, Cholesky FAILS -> diagonal fallback (still THREE
+    # gauss draws before the concavity check) ---
+    case("poly_cholesky_fallback_diag", seed=seed_a, spec={
+        **poly_spec, "posterior_precision": non_pd_precision,
+    }, expect_branch="poly_cholesky_fallback", expect_gauss=3,
+        cholesky_expectation="fails")
+    case("poly_cholesky_fallback_boosted", seed=seed_d, spec={
+        **poly_spec, "posterior_precision": non_pd_precision,
+    }, exploration_multiplier=1.7, expect_branch="poly_cholesky_fallback",
+        expect_gauss=3, cholesky_expectation="fails")
+
+    # --- polynomial returns None -> Gaussian posterior fallback ---
+    # Non-concave sampled quadratic: 3 draws consumed, then ONE more gauss
+    # (bias shift does NOT apply on this path).
+    case("poly_non_concave_gauss_fallback", seed=seed_a, spec={
+        **poly_spec,
+        "posterior_coeffs": [0.5, 1.0, 2.0],
+        "posterior_precision": [[10000.0, 0.0, 0.0], [0.0, 10000.0, 0.0],
+                                [0.0, 0.0, 10000.0]],
+        "posterior_bias": [(900.0, 0.9, NOW - H)],
+    }, expect_branch="non_concave_gauss_fallback", expect_gauss=4,
+        cholesky_expectation="succeeds")
+    # Degenerate fee range: polynomial declines BEFORE any draw -> ONE gauss.
+    case("poly_range_too_narrow_gauss", seed=seed_b, spec={
+        **poly_spec, "last_fee_min": 200.0, "last_fee_max": 203.0,
+    }, expect_branch="gauss_fallback_no_poly_draws", expect_gauss=1)
+    # Singular precision: inversion fails before any draw -> ONE gauss.
+    case("poly_invert_fails_gauss", seed=seed_c, spec={
+        **poly_spec,
+        "posterior_precision": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+                                [0.0, 0.0, 0.0]],
+    }, expect_branch="gauss_fallback_no_poly_draws", expect_gauss=1,
+        cholesky_expectation="invert_fails")
+    case("gauss_fallback_min_std_boosted", seed=seed_d, spec={
+        **poly_spec, "last_fee_min": 0.0, "last_fee_max": 0.0,
+        "posterior_std": 4.0,
+    }, exploration_multiplier=1.9,
+        expect_branch="gauss_fallback_no_poly_draws", expect_gauss=1)
+
+    # --- clamping (int truncation of max(floor, min(ceiling, sampled))) ---
+    case("clamp_to_floor", seed=seed_a, spec=poly_spec, floor=495,
+         ceiling=5000, expect_branch="poly_concave", expect_gauss=3)
+    case("clamp_to_ceiling", seed=seed_a, spec=poly_spec, floor=0,
+         ceiling=120, expect_branch="poly_concave", expect_gauss=3)
+
+    # --- contextual offset path ---
+    ctx4 = {"mid:peak:P": (400.0, 0.001, 20, NOW - H)}
+    case("ctx_offset_capped", seed=seed_a, spec={
+        **poly_spec, "contextual_posteriors": ctx4,
+    }, fn="sample_fee_contextual", context_key="mid:peak:P",
+        expect_branch="ctx_offset", expect_gauss=3)
+    case("ctx_offset_within_cap", seed=seed_a, spec={
+        **poly_spec,
+        "contextual_posteriors": {"mid:peak:P": (230.0, 0.001, 20, NOW - H)},
+    }, fn="sample_fee_contextual", context_key="mid:peak:P",
+        expect_branch="ctx_offset", expect_gauss=3)
+    case("ctx_legacy_3tuple_offset", seed=seed_b, spec={
+        **poly_spec,
+        "contextual_posteriors": {"low:normal:P": (350.0, 45.0, 12)},
+    }, fn="sample_fee_contextual", context_key="low:normal:P",
+        expect_branch="ctx_offset", expect_gauss=3)
+    case("ctx_count_below_min_passthrough", seed=seed_a, spec={
+        **poly_spec,
+        "contextual_posteriors": {"mid:peak:P": (400.0, 0.001, 4, NOW - H)},
+    }, fn="sample_fee_contextual", context_key="mid:peak:P",
+        expect_branch="ctx_passthrough", expect_gauss=3)
+    case("ctx_missing_key_passthrough", seed=seed_a, spec=poly_spec,
+         fn="sample_fee_contextual", context_key="never:seen:P",
+         expect_branch="ctx_passthrough", expect_gauss=3)
+    case("ctx_nonfinite_mean_passthrough", seed=seed_a, spec={
+        **poly_spec,
+        "contextual_posteriors": {
+            "mid:peak:P": (float("nan"), 0.001, 20, NOW - H)},
+    }, fn="sample_fee_contextual", context_key="mid:peak:P",
+        expect_branch="ctx_passthrough", expect_gauss=3)
+    case("ctx_reference_falls_back_to_posterior_mean", seed=seed_b, spec={
+        **poly_spec, "charged_fee_mean": 0.0,
+        "contextual_posteriors": ctx4,
+    }, fn="sample_fee_contextual", context_key="mid:peak:P",
+        expect_branch="ctx_offset", expect_gauss=3)
+    case("ctx_on_sparse_base", seed=seed_c, spec={
+        "contextual_posteriors": ctx4, "charged_fee_mean": 150.0,
+    }, fn="sample_fee_contextual", context_key="mid:peak:P",
+        expect_branch="ctx_offset", expect_gauss=1)
+    case("ctx_with_boost_forwarded", seed=seed_d, spec={
+        **poly_spec, "contextual_posteriors": ctx4,
+    }, fn="sample_fee_contextual", context_key="mid:peak:P",
+        exploration_multiplier=1.5, expect_branch="ctx_offset",
+        expect_gauss=3)
+
+    assert len(cases) == 32, len(cases)
+    _write(outdir / "draws.json", {
+        "now": NOW,
+        "seeds": {"seed_a": seed_a, "seed_b": seed_b, "seed_c": seed_c,
+                  "seed_d": seed_d},
+        "cases": cases,
+    })
+
+    # -----------------------------------------------------------------
+    # shift.json: _posterior_bias_shift direct pins (sequential decayed
+    # w/(1+w) blends; entries below BIAS_MIN_WEIGHT skipped, NOT pruned).
+    # -----------------------------------------------------------------
+    shift_cases = []
+
+    def shift_case(name, bias, base, now=NOW):
+        state = GaussianThompsonState()
+        state.posterior_bias = [tuple(b) for b in bias]
+        orig_time = time.time
+        time.time = lambda t=now: float(t)
+        try:
+            v = state._posterior_bias_shift(base)
+        finally:
+            time.time = orig_time
+        shift_cases.append({
+            "name": name,
+            "now": now,
+            "posterior_bias": _dump_bias(bias),
+            "base": _r(base),
+            "expected": _r(v),
+        })
+
+    shift_case("empty_bias_zero", [], 150.0)
+    shift_case("single_fresh_nudge", [(300.0, 0.5, NOW - H)], 150.0)
+    shift_case("single_fresh_nudge_base_zero", [(300.0, 0.5, NOW - H)], 0.0)
+    shift_case("negative_base", [(300.0, 0.5, NOW - H)], -50.0)
+    shift_case("sequential_blends_order_matters",
+               [(300.0, 0.5, NOW - H), (100.0, 0.8, NOW - 2 * H),
+                (700.0, 0.2, NOW - 30 * H)], 200.0)
+    shift_case("expired_entry_skipped",
+               [(300.0, 0.5, NOW - 240 * H), (400.0, 0.5, NOW - 48 * H)],
+               200.0)
+    shift_case("future_ts_age_clamped_to_zero",
+               [(300.0, 0.5, NOW + 10 * H)], 200.0)
+    _write(outdir / "shift.json", {"now": NOW, "cases": shift_cases})
+
+
 SUITES = {
     "pyrand": gen_pyrand,
     "mat3": gen_mat3,
@@ -2255,6 +3317,9 @@ SUITES = {
     "floors": gen_floors,
     "vegas": gen_vegas,
     "v2_blob": gen_v2_blob,
+    "update": gen_update,
+    "ceiling": gen_ceiling,
+    "sampling": gen_sampling,
 }
 
 
