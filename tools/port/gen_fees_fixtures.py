@@ -36,6 +36,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from modules.config import Config  # noqa: E402
 from modules.fee_controller import (  # noqa: E402
+    ChannelCycleState,
+    ChannelFeeState,
     FeeController,
     GaussianThompsonState,
     PIDState,
@@ -1774,6 +1776,432 @@ def gen_vegas(outdir: Path) -> None:
     })
 
 
+# ---------------------------------------------------------------------------
+# v2_blob: fee_strategy_state.v2_state_json lossless round-trip (Phase 4
+# Task 9). Exercises `_load_persisted_fee_strategy_row`,
+# `_extract_fee_state_payload`, `_extract_cycle_state_payload`,
+# `_build_merged_fee_strategy_row`, `ChannelFeeState.to_v2_dict`/
+# `from_v2_dict` through the REAL `FeeController`/`ChannelFeeState`/
+# `ChannelCycleState` classes. A scripted `_FakeDb` stands in for
+# `self.database` (only `get_fee_strategy_state` is exercised on the
+# cold-cache, no-cycle-batch path used here).
+# ---------------------------------------------------------------------------
+
+class _FakeDb:
+    """Minimal `self.database` double: returns a fixed db_state row
+    (single-channel generator, channel_id argument is ignored)."""
+
+    def __init__(self, db_state):
+        self._db_state = db_state
+
+    def get_fee_strategy_state(self, channel_id):
+        return dict(self._db_state)
+
+
+_DEFAULT_ROW = {
+    "last_revenue_rate": 12.5,
+    "last_fee_ppm": 250,
+    "trend_direction": 1,
+    "step_ppm": 50,
+    "consecutive_same_direction": 2,
+    "last_update": NOW - 900,
+    "last_broadcast_fee_ppm": 240,
+    "is_sleeping": 0,
+    "sleep_until": 0,
+    "stable_cycles": 1,
+    "forward_count_since_update": 6,
+    "last_volume_sats": 15000,
+    "last_state": "balanced",
+}
+
+
+def _row_for(channel_id: str, **overrides) -> dict:
+    row = dict(_DEFAULT_ROW)
+    row.update(overrides)
+    row["channel_id"] = channel_id
+    return row
+
+
+def _merged_roundtrip(channel_id: str, row: dict, input_blob: str,
+                       *, cycle_state=None, fee_state=None):
+    """One `_build_merged_fee_strategy_row(channel_id, cycle_state=...,
+    fee_state=...)` pass over a persisted `(row, input_blob)` pair through
+    a FRESH `FeeController` (cold in-memory caches -> always re-loads from
+    `_FakeDb`). With both callers `None` this is the exact no-op
+    read-modify-write shape the live controller performs when a cycle
+    touches neither cycle_state nor fee_state for a channel — the target
+    Rust `build_merged_row(channel_id, None, None, persisted)` must
+    reproduce it byte-identically."""
+    db_row = dict(row)
+    db_row["v2_state_json"] = input_blob
+    fc = FeeController(MagicMock(), MagicMock(spec=Config), _FakeDb(db_row))
+    row_fields, merged_v2 = fc._build_merged_fee_strategy_row(
+        channel_id, cycle_state=cycle_state, fee_state=fee_state
+    )
+    python_roundtrip_blob = json.dumps(merged_v2)
+    return row_fields, merged_v2, python_roundtrip_blob
+
+
+def _pinned_fee_state(channel_id: str, row: dict, input_blob: str) -> dict:
+    """`ChannelFeeState.from_v2_dict` truth for `input_blob`'s fee_state
+    payload, floats repr-pinned — mirrors `_get_channel_fee_state_locked`'s
+    load path (extract -> from_v2_dict -> unknown-version migration
+    stamp)."""
+    db_row = dict(row)
+    db_row["v2_state_json"] = input_blob
+    fc = FeeController(MagicMock(), MagicMock(spec=Config), _FakeDb(db_row))
+    db_state, v2_data = fc._load_persisted_fee_strategy_row(channel_id)
+    fee_v2_data = fc._extract_fee_state_payload(db_state, v2_data)
+    known_versions = {"thompson_aimd_v1", "dts_pid_v1"}
+    state = ChannelFeeState.from_v2_dict(fee_v2_data, db_state)
+    if fee_v2_data.get("algorithm_version") not in known_versions:
+        state.algorithm_version = "dts_pid_v1"
+    return {
+        "algorithm_version": state.algorithm_version,
+        "last_revenue_rate": _r(state.last_revenue_rate),
+        "last_fee_ppm": state.last_fee_ppm,
+        "last_broadcast_fee_ppm": state.last_broadcast_fee_ppm,
+        "last_update": state.last_update,
+        "last_broadcast_at": state.last_broadcast_at,
+        "last_state": state.last_state,
+        "is_sleeping": state.is_sleeping,
+        "sleep_until": state.sleep_until,
+        "stable_cycles": state.stable_cycles,
+        "forward_count_since_update": state.forward_count_since_update,
+        "last_volume_sats": state.last_volume_sats,
+        "last_gossip_refresh": state.last_gossip_refresh,
+        "last_vegas_multiplier": _r(state.last_vegas_multiplier),
+        "last_fee_profile": state.last_fee_profile,
+        "last_context_key": state.last_context_key,
+        "last_time_bucket": state.last_time_bucket,
+        "last_corridor_role": state.last_corridor_role,
+        "last_contextual_sample_used": state.last_contextual_sample_used,
+        "dynamic_htlcmin_baseline_msat": state.dynamic_htlcmin_baseline_msat,
+        "pid_kp": _r(state.pid.kp),
+        "thompson_observations_count": len(state.thompson.observations),
+    }
+
+
+def _blob_case(name: str, channel_id: str, v2_data: dict, row_overrides=None) -> dict:
+    row = _row_for(channel_id, **(row_overrides or {}))
+    input_blob = json.dumps(v2_data)
+    row_fields, merged_v2, python_roundtrip_blob = _merged_roundtrip(channel_id, row, input_blob)
+    fee_state_pinned = _pinned_fee_state(channel_id, row, input_blob)
+    return {
+        "name": name,
+        "channel_id": channel_id,
+        "row": row,
+        "input_blob": input_blob,
+        "python_roundtrip_blob": python_roundtrip_blob,
+        "fee_state_pinned": fee_state_pinned,
+    }
+
+
+def _current_fee_state_dict(**overrides) -> dict:
+    d = {
+        "algorithm_version": "dts_pid_v1",
+        "thompson_state": GaussianThompsonState().to_dict(),
+        "last_vegas_multiplier": 1.05,
+        "last_gossip_refresh": NOW - 3600,
+        "last_broadcast_at": NOW - 900,
+        "pid_state": PIDState().to_dict(),
+        "last_fee_profile": "active",
+        "last_context_key": "mid:peak:P",
+        "last_time_bucket": "peak",
+        "last_corridor_role": "P",
+        "last_contextual_sample_used": True,
+        "dynamic_htlcmin_baseline_msat": 1000,
+    }
+    d.update(overrides)
+    return d
+
+
+def _current_cycle_state_dict(**overrides) -> dict:
+    d = {
+        "last_revenue_rate": 12.5,
+        "last_fee_ppm": 250,
+        "trend_direction": 1,
+        "step_ppm": 50,
+        "last_update": NOW - 900,
+        "last_broadcast_at": NOW - 900,
+        "consecutive_same_direction": 2,
+        "is_sleeping": False,
+        "sleep_until": 0,
+        "stable_cycles": 1,
+        "last_broadcast_fee_ppm": 240,
+        "last_state": "balanced",
+        "forward_count_since_update": 6,
+        "last_volume_sats": 15000,
+        "congestion_active": False,
+        "congestion_quiet_cycles": 0,
+        "congestion_entry_fee_ppm": 0,
+        "pending_target_ppm": 0,
+        "last_gossip_refresh": NOW - 3600,
+        "dynamic_htlcmin_baseline_msat": 1000,
+    }
+    d.update(overrides)
+    return d
+
+
+def gen_v2_blob(outdir: Path) -> None:
+    cases = []
+    orig_time = time.time
+    time.time = lambda: float(NOW)
+    try:
+        # 1: current nested-layout blob — both fee_state and cycle_state
+        # nested, canonical shared scalars flat at top level (the shape
+        # every live controller-written row has today).
+        thompson1 = GaussianThompsonState()
+        thompson1.update_posterior(250, 12.5, 6.0, time_bucket="peak")
+        thompson1.update_contextual("mid:peak:P", 250, 12.5, time_bucket="peak")
+        v2_1 = {
+            "algorithm_version": "dts_pid_v1",
+            "fee_state": _current_fee_state_dict(thompson_state=thompson1.to_dict()),
+            "cycle_state": _current_cycle_state_dict(),
+            "last_gossip_refresh": NOW - 3600,
+            "last_broadcast_at": NOW - 900,
+            "dynamic_htlcmin_baseline_msat": 1000,
+        }
+        cases.append(_blob_case("current_nested_layout", "chan_current_nested", v2_1))
+
+        # 2: pre-nesting flat blob — thompson_state/pid_state/shared
+        # scalars at the v2_data TOP level, no "fee_state"/"cycle_state"
+        # keys at all (predates the nesting migration).
+        thompson2 = GaussianThompsonState()
+        thompson2.update_posterior(180, 3.0, 2.0, time_bucket="low")
+        v2_2 = {
+            "algorithm_version": "dts_pid_v1",
+            "thompson_state": thompson2.to_dict(),
+            "last_vegas_multiplier": 1.0,
+            "last_gossip_refresh": NOW - 7200,
+            "last_broadcast_at": NOW - 1800,
+            "pid_state": PIDState().to_dict(),
+            "dynamic_htlcmin_baseline_msat": None,
+        }
+        cases.append(_blob_case(
+            "pre_nesting_flat_layout", "chan_flat_legacy", v2_2,
+            row_overrides={"last_update": NOW - 1800},
+        ))
+
+        # 3: thompson_aimd_v1 legacy blob — flat layout, the pre-rename
+        # algorithm_version marker, and a legacy thompson dict (no
+        # weight_scheme key -> weight rescale on load).
+        v2_3 = {
+            "algorithm_version": "thompson_aimd_v1",
+            "thompson_state": {
+                "prior_mean_fee": 200,
+                "prior_std_fee": 100,
+                "observations": [
+                    [220, 8.0, 0.1, NOW - 5400, "normal"],
+                    [260, 0.0, 0.05, NOW - 9000, "low"],
+                ],
+            },
+            "last_gossip_refresh": 0,
+            "last_broadcast_at": NOW - 3600,
+            "pid_state": PIDState().to_dict(),
+            "dynamic_htlcmin_baseline_msat": None,
+        }
+        cases.append(_blob_case(
+            "thompson_aimd_v1_legacy", "chan_aimd_legacy", v2_3,
+            row_overrides={"last_update": NOW - 3600},
+        ))
+
+        # 4: 5-tuple-only observations (current time_bucket layout, no 6th
+        # congestion/zero_probe flag anywhere).
+        thompson4 = GaussianThompsonState()
+        thompson4.update_posterior(300, 15.0, 4.0, time_bucket="peak")
+        thompson4.update_posterior(310, 14.0, 4.0, time_bucket="normal")
+        v2_4 = {
+            "algorithm_version": "dts_pid_v1",
+            "fee_state": _current_fee_state_dict(thompson_state=thompson4.to_dict()),
+            "cycle_state": _current_cycle_state_dict(),
+            "last_gossip_refresh": NOW - 3600,
+            "last_broadcast_at": NOW - 900,
+            "dynamic_htlcmin_baseline_msat": 1000,
+        }
+        cases.append(_blob_case("five_tuple_observations_only", "chan_five_tuple", v2_4))
+
+        # 5: 6-tuple zero_probe/congestion-flagged observations alongside
+        # plain 5-tuples.
+        thompson5 = GaussianThompsonState()
+        thompson5.update_posterior(250, 12.5, 0.8, time_bucket="normal", congested=True)
+        thompson5.update_posterior(90, 0.0, 0.5, time_bucket="low")
+        v2_5 = {
+            "algorithm_version": "dts_pid_v1",
+            "fee_state": _current_fee_state_dict(thompson_state=thompson5.to_dict()),
+            "cycle_state": _current_cycle_state_dict(),
+            "last_gossip_refresh": NOW - 3600,
+            "last_broadcast_at": NOW - 900,
+            "dynamic_htlcmin_baseline_msat": 1000,
+        }
+        cases.append(_blob_case("six_tuple_congestion_and_zero_probe", "chan_six_tuple", v2_5))
+
+        # 6: 3-tuple (legacy) contextual posteriors alongside the current
+        # 4-tuple layout.
+        thompson6 = GaussianThompsonState()
+        thompson6.contextual_posteriors["low:normal:P"] = (250.0, 45.0, 12)
+        thompson6.contextual_posteriors["mid:peak:S"] = (310.0, 22.5, 8, NOW - 1000)
+        v2_6 = {
+            "algorithm_version": "dts_pid_v1",
+            "fee_state": _current_fee_state_dict(thompson_state=thompson6.to_dict()),
+            "cycle_state": _current_cycle_state_dict(),
+            "last_gossip_refresh": NOW - 3600,
+            "last_broadcast_at": NOW - 900,
+            "dynamic_htlcmin_baseline_msat": 1000,
+        }
+        cases.append(_blob_case("three_tuple_contextual_posteriors", "chan_ctx_legacy", v2_6))
+
+        # 7: missing pid_state AND missing algorithm_version inside
+        # fee_state — from_v2_dict falls back to PIDState() and
+        # `"migrated"`, which the controller then stamps `"dts_pid_v1"`
+        # (unknown-version migration path).
+        fee_state_7 = _current_fee_state_dict()
+        del fee_state_7["pid_state"]
+        del fee_state_7["algorithm_version"]
+        v2_7 = {
+            "algorithm_version": "dts_pid_v1",
+            "fee_state": fee_state_7,
+            "cycle_state": _current_cycle_state_dict(),
+            "last_gossip_refresh": NOW - 3600,
+            "last_broadcast_at": NOW - 900,
+            "dynamic_htlcmin_baseline_msat": 1000,
+        }
+        cases.append(_blob_case("missing_pid_state", "chan_missing_pid", v2_7))
+
+        # 8: missing cycle_state entirely — cycle payload built purely
+        # from the flat db row columns + top-level shared scalars.
+        v2_8 = {
+            "algorithm_version": "dts_pid_v1",
+            "fee_state": _current_fee_state_dict(),
+            "last_gossip_refresh": NOW - 3600,
+            "last_broadcast_at": NOW - 900,
+            "dynamic_htlcmin_baseline_msat": 1000,
+        }
+        cases.append(_blob_case("missing_cycle_state", "chan_missing_cycle", v2_8))
+
+        # 9: unknown keys injected at THREE levels (top of v2_data, inside
+        # fee_state, inside thompson_state). The MERGED write shape drops
+        # unrelated top-level junk by design (only algorithm_version/
+        # fee_state/cycle_state/3 shared scalars are re-emitted) but
+        # preserves fee_state's own unknown key (fee_payload = dict(nested))
+        # and thompson_state's own unknown key (GaussianThompsonState.extra)
+        # — the RAW parse->re-emit test (separate from this merge test)
+        # preserves all three.
+        thompson9 = GaussianThompsonState()
+        thompson9_dict = thompson9.to_dict()
+        thompson9_dict["future_thompson_field"] = {"nested": True}
+        fee_state_9 = _current_fee_state_dict(thompson_state=thompson9_dict)
+        fee_state_9["future_fee_field"] = [1, 2, 3]
+        v2_9 = {
+            "algorithm_version": "dts_pid_v1",
+            "fee_state": fee_state_9,
+            "cycle_state": _current_cycle_state_dict(),
+            "last_gossip_refresh": NOW - 3600,
+            "last_broadcast_at": NOW - 900,
+            "dynamic_htlcmin_baseline_msat": 1000,
+            "future_top_level_field": "dropped-by-merge",
+        }
+        cases.append(_blob_case("unknown_keys_three_levels", "chan_unknown_keys", v2_9))
+
+        # 10: non-ASCII in last_context_key.
+        v2_10 = {
+            "algorithm_version": "dts_pid_v1",
+            "fee_state": _current_fee_state_dict(last_context_key="café:☃:P"),
+            "cycle_state": _current_cycle_state_dict(),
+            "last_gossip_refresh": NOW - 3600,
+            "last_broadcast_at": NOW - 900,
+            "dynamic_htlcmin_baseline_msat": 1000,
+        }
+        cases.append(_blob_case("non_ascii_last_context_key", "chan_non_ascii", v2_10))
+    finally:
+        time.time = orig_time
+
+    _write(outdir / "blobs.json", {"now": NOW, "cases": cases})
+
+    # ------------------------------------------------------------------
+    # merge_matrix: the explicit-shared-field resolution algorithm
+    # (`_resolve_shared_field` + the fee/cycle caller-preference rule,
+    # py 3799-3826). 9 cases = 3 caller combos (cycle-only, fee-only,
+    # both) x 3 shared-field-provenance states on the PRIMARY caller
+    # (explicit-and-different-from-persisted, explicit-but-EQUAL-to-the-
+    # default value 0 [proves tracking is a real "was it assigned" flag,
+    # not a truthiness/!= 0 check], untouched-at-construction-default).
+    # When both callers are given, `cycle_state` is always primary (the
+    # real function's rule) — the "both" cases additionally give
+    # `fee_state` an EXPLICIT, DIFFERENT value (777) to prove it is
+    # correctly ignored.
+    persisted_value = 999
+    persisted_v2 = {
+        "algorithm_version": "dts_pid_v1",
+        "fee_state": _current_fee_state_dict(last_gossip_refresh=persisted_value),
+        "cycle_state": _current_cycle_state_dict(last_gossip_refresh=persisted_value),
+        "last_gossip_refresh": persisted_value,
+        "last_broadcast_at": NOW - 900,
+        "dynamic_htlcmin_baseline_msat": 1000,
+    }
+
+    def _cycle_with(value, *, explicit):
+        cs = ChannelCycleState()
+        if explicit:
+            cs.last_gossip_refresh = value  # tracked via __setattr__
+        else:
+            object.__setattr__(cs, "last_gossip_refresh", value)  # untracked
+        return cs
+
+    def _fee_with(value, *, explicit):
+        fs = ChannelFeeState()
+        if explicit:
+            fs.last_gossip_refresh = value
+        else:
+            object.__setattr__(fs, "last_gossip_refresh", value)
+        return fs
+
+    matrix_cases = []
+    field_states = [
+        ("explicit_diff", 555, True),
+        ("explicit_zero", 0, True),
+        ("untouched_default", 0, False),
+    ]
+    for combo in ("cycle_only", "fee_only", "both"):
+        for state_name, value, explicit in field_states:
+            name = f"{combo}__{state_name}"
+            cycle_state = None
+            fee_state = None
+            if combo in ("cycle_only", "both"):
+                cycle_state = _cycle_with(value, explicit=explicit)
+            if combo in ("fee_only", "both"):
+                fee_state = _fee_with(777 if combo == "both" else value, explicit=True if combo == "both" else explicit)
+            channel_id = f"merge_{name}"
+            row = _row_for(channel_id)
+            input_blob = json.dumps(persisted_v2)
+            _, merged_v2, _ = _merged_roundtrip(
+                channel_id, row, input_blob, cycle_state=cycle_state, fee_state=fee_state
+            )
+            matrix_cases.append({
+                "name": name,
+                "channel_id": channel_id,
+                "row": row,
+                "input_blob": input_blob,
+                "cycle_state_value": (None if cycle_state is None else cycle_state.last_gossip_refresh),
+                "cycle_state_explicit": (
+                    None if cycle_state is None
+                    else "last_gossip_refresh" in cycle_state.explicit_shared_fields()
+                ),
+                "fee_state_value": (None if fee_state is None else fee_state.last_gossip_refresh),
+                "fee_state_explicit": (
+                    None if fee_state is None
+                    else "last_gossip_refresh" in fee_state.explicit_shared_fields()
+                ),
+                "expected_last_gossip_refresh": merged_v2["last_gossip_refresh"],
+            })
+
+    _write(outdir / "merge_matrix.json", {
+        "now": NOW,
+        "persisted_last_gossip_refresh": persisted_value,
+        "cases": matrix_cases,
+    })
+
+
 SUITES = {
     "pyrand": gen_pyrand,
     "mat3": gen_mat3,
@@ -1784,13 +2212,66 @@ SUITES = {
     "state_dict": gen_state_dict,
     "floors": gen_floors,
     "vegas": gen_vegas,
+    "v2_blob": gen_v2_blob,
 }
 
 
+def gen_v2_prod_check(dump_path: Path, outdir: Path) -> None:
+    """Task 9 Step 2 (production blobs — controller-run only): read the
+    operator's `sqlite3 -readonly ... -json` export of `fee_strategy_state`
+    (a JSON array of row dicts with exactly the SELECT's column names — see
+    `p4-task-9-brief.md` / the Phase 4 plan's Task 9 section for the exact
+    command) and, for EVERY row, compute the Python truth for the
+    `_extract_fee_state_payload -> ChannelFeeState.from_v2_dict ->
+    (unknown-version migration stamp) -> to_v2_dict -> json.dumps` path.
+    Writes `<outdir>/expected_to_v2_dict.json`: `{channel_id: expected_json_string}`.
+    `_extract_fee_state_payload` is a `@staticmethod` — no FeeController
+    instance (and therefore no scripted `self.database`/`self.plugin`
+    double) is needed for this path at all."""
+    rows = json.loads(dump_path.read_text())
+    if isinstance(rows, dict):
+        rows = [rows]
+
+    known_versions = {"thompson_aimd_v1", "dts_pid_v1"}
+    expected = {}
+    warnings = []
+    for row in rows:
+        channel_id = row.get("channel_id", "<unknown>")
+        db_state = {k: v for k, v in row.items() if k != "v2_state_json"}
+        raw = row.get("v2_state_json") or "{}"
+        try:
+            v2_data = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as e:
+            warnings.append(f"{channel_id}: v2_state_json JSON parse failed: {e}")
+            continue
+
+        fee_v2_data = FeeController._extract_fee_state_payload(db_state, v2_data)
+        if fee_v2_data.get("algorithm_version") not in known_versions:
+            warnings.append(
+                f"{channel_id}: unrecognized algorithm_version "
+                f"{fee_v2_data.get('algorithm_version')!r} (migration path)"
+            )
+        state = ChannelFeeState.from_v2_dict(fee_v2_data, db_state)
+        if fee_v2_data.get("algorithm_version") not in known_versions:
+            state.algorithm_version = "dts_pid_v1"
+        expected[channel_id] = json.dumps(state.to_v2_dict())
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    _write(outdir / "expected_to_v2_dict.json", {"expected": expected, "warnings": warnings})
+    if warnings:
+        print(f"gen_v2_prod_check: {len(warnings)} warning(s):", file=sys.stderr)
+        for w in warnings:
+            print(f"  {w}", file=sys.stderr)
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "v2_prod_check":
+        gen_v2_prod_check(Path(sys.argv[2]), Path(sys.argv[3]))
+        return
     if len(sys.argv) != 3 or sys.argv[1] not in SUITES:
         names = "|".join(SUITES)
         print(f"usage: {sys.argv[0]} {{{names}}} <outdir>", file=sys.stderr)
+        print(f"       {sys.argv[0]} v2_prod_check <fee_strategy_state.json> <outdir>", file=sys.stderr)
         sys.exit(1)
     SUITES[sys.argv[1]](Path(sys.argv[2]))
 
