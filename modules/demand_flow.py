@@ -65,7 +65,7 @@ class DemandFlowClassifier:
             peer_out[pid] = peer_out.get(pid, 0) + getattr(flow, 'sats_out', 0)
 
         profiles: Dict[str, NodeFlowProfile] = {}
-        for pid in set(peer_in) | set(peer_out):
+        for pid in sorted(set(peer_in) | set(peer_out)):
             total_in = peer_in.get(pid, 0)
             total_out = peer_out.get(pid, 0)
             total = total_in + total_out
