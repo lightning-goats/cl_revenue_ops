@@ -17,6 +17,7 @@ The real module code is the oracle: `modules.rebalance_modes.MODES` /
 """
 import argparse
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -1924,12 +1925,757 @@ def gen_executor() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# ev suite (Phase 5 Task 6) — sats-EV gate, per-attempt ceiling, fee
+# escalation.
+# ---------------------------------------------------------------------------
+
+
+def _ev_host_class():
+    """Build a stub `self` bound to the REAL `RebalanceEngine` instance
+    methods the sats-EV math needs, per the plan's "drive the engine method
+    with a stub self" technique (same as `gen_router`'s `_SweepHost`).
+
+    Only state the real methods actually read is stubbed:
+    `_pair_failures` (empty — see `gen_ev`'s scope-note docstring) and
+    `_dest_success_rate_memo` (per-cycle memo, always empty here since each
+    case is a fresh call).
+    """
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    class _EvHost:
+        def __init__(self, cfg, database=None):
+            self.config = cfg
+            self.database = database
+            self._dest_success_rate_memo = {}
+            self._pair_failures = {}
+            self._futility_window_sec = 1800.0
+
+    _EvHost._pair_key = staticmethod(RebalanceEngine._pair_key)
+    _EvHost._prune_pair_failures = RebalanceEngine._prune_pair_failures
+    _EvHost._failure_count = RebalanceEngine._failure_count
+    _EvHost._failure_penalty = RebalanceEngine._failure_penalty
+    _EvHost._empirical_dest_success_rate = RebalanceEngine._empirical_dest_success_rate
+    _EvHost._query_dest_success_rate = RebalanceEngine._query_dest_success_rate
+    return _EvHost
+
+
+class _EvStubDatabase:
+    """Backs `_query_dest_success_rate`: `total`/`success_rate` mirror
+    exactly the dict shape `get_channel_rebalance_success_rate` returns."""
+
+    def __init__(self, total, success_rate):
+        self._total = total
+        self._success_rate = success_rate
+
+    def get_channel_rebalance_success_rate(self, dest_channel_id):
+        return {"total": self._total, "success_rate": self._success_rate}
+
+
+def _ev_default_cfg(**overrides):
+    from types import SimpleNamespace
+
+    base = dict(
+        high_liquidity_threshold=0.65,
+        low_liquidity_threshold=0.35,
+        max_fee_ppm=500,
+        rebalance_activity_penalty_coeff=0.5,
+        rebalance_activity_penalty_cap_frac=0.5,
+        rebalance_hold_margin=0.0,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _ev_default_pair(**overrides):
+    from types import SimpleNamespace
+    from modules.rebalance_engine_v2 import EXPECTED_UTILIZATION
+
+    base = dict(
+        source_channel_id="111x1x0",
+        dest_channel_id="222x2x0",
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        amount_sats=100_000,
+        source_local_ratio=0.7,
+        dest_local_ratio=0.3,
+        dest_out_fee_ppm=200,
+        source_out_fee_ppm=150,
+        source_historical_direct_fee_ppm=0.0,
+        source_historical_sourced_fee_ppm=0.0,
+        dest_historical_direct_fee_ppm=0.0,
+        dest_historical_sourced_fee_ppm=0.0,
+        dest_fee_history_validated=False,
+        dest_realized_utilization=EXPECTED_UTILIZATION,
+        dest_utilization_is_realized=False,
+        source_realized_utilization=EXPECTED_UTILIZATION,
+        source_utilization_is_realized=False,
+        source_activity_out_sats=0,
+        dest_activity_in_sats=0,
+        score=0.0,
+        pair_budget_sats=5_000,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _call_capturing_locals(func, *args, **kwargs):
+    """Call `func`, returning `(result, locals_at_return)`.
+
+    `_build_score_decomposition`'s OWN `final_score_sats` computation
+    (`rebalance_engine_v2.py:556-563`) uses the RAW (full double-precision,
+    pre-round) `expected_future_value_sats`/`source_opportunity_sats`
+    locals — the dict it returns only exposes `round(x, 6)`'d COPIES of
+    those same names for display. Feeding the Rust port the rounded display
+    copies as its `EvInputs.efv_sats`/`source_opportunity_sats` re-rounds an
+    already-lossy number and occasionally disagrees with the real function
+    in the 6th decimal after `p_success` multiplies through the rounding
+    error. `sys.settrace` on the function's `return` event recovers the
+    exact pre-round locals without reimplementing any of the math — still
+    driving the real function, just reading its stack frame instead of its
+    return value for these two terms.
+    """
+    import sys
+
+    captured = {}
+    target_code = func.__code__
+
+    def local_tracer(frame, event, arg):
+        if event == "return":
+            captured.update(frame.f_locals)
+        return local_tracer
+
+    def global_tracer(frame, event, arg):
+        if event == "call" and frame.f_code is target_code:
+            return local_tracer
+        return global_tracer
+
+    old_trace = sys.gettrace()
+    sys.settrace(global_tracer)
+    try:
+        result = func(*args, **kwargs)
+    finally:
+        sys.settrace(old_trace)
+    return result, captured
+
+
+def _drive_ev_gate_case(
+    case_id,
+    *,
+    probability_ppm,
+    dest_attempts,
+    dest_success_rate,
+    route_cost_sats,
+    effective_budget_sats,
+    hold_margin_sats,
+    cfg_overrides=None,
+    pair_overrides=None,
+):
+    """Drive the REAL `_build_score_decomposition`, then apply the
+    hold-margin gate transcribed verbatim from `find_candidates`
+    (`rebalance_engine_v2.py:1468-1472`) — both operands of that boolean
+    (`final_score_sats`, `expected_fee_sats`) are themselves oracle-derived
+    just above, so this is a direct re-application of the exact inline
+    condition, not a reimplementation of new math.
+
+    `efv_sats`/`source_opportunity_sats` are the RAW pre-round locals
+    (see `_call_capturing_locals`'s docstring), not the rounded dict
+    values — this is what the real `final_score_sats` formula actually
+    consumes.
+    """
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    host_cls = _ev_host_class()
+    cfg = _ev_default_cfg(**(cfg_overrides or {}))
+    pair = _ev_default_pair(**(pair_overrides or {}))
+    database = _EvStubDatabase(dest_attempts, dest_success_rate)
+    host = host_cls(cfg, database=database)
+
+    decomp, raw_locals = _call_capturing_locals(
+        RebalanceEngine._build_score_decomposition,
+        host,
+        pair,
+        probability_ppm=probability_ppm,
+        route_cost_sats=route_cost_sats,
+        effective_budget_sats=effective_budget_sats,
+    )
+    efv_sats = raw_locals["expected_future_value_sats"]
+    fee_sats = decomp["expected_fee_sats"]
+    source_opportunity_sats = raw_locals["source_opportunity_sats"]
+    activity_penalty_sats = decomp["activity_penalty_sats"]
+    final_score_sats = decomp["final_score_sats"]
+    rejected = fee_sats > 0 and final_score_sats < hold_margin_sats
+
+    return {
+        "case_id": case_id,
+        "inputs": {
+            "probability_ppm": probability_ppm,
+            "dest_attempts": dest_attempts,
+            "dest_success_rate": dest_success_rate,
+            "efv_sats": efv_sats,
+            "fee_sats": fee_sats,
+            "source_opportunity_sats": source_opportunity_sats,
+            "activity_penalty_sats": activity_penalty_sats,
+            "hold_margin_sats": hold_margin_sats,
+        },
+        "expected": {
+            "pass": not rejected,
+            "final_score_sats": final_score_sats,
+            "reject_reason": "below_hold_margin" if rejected else None,
+        },
+    }
+
+
+def _ev_hand_built_gate_cases():
+    cases = []
+
+    # Zero-cost routes ALWAYS pass, however negative the sats score (the
+    # zero-budget equalization invariant) — a huge hold_margin would reject
+    # any priced route but must not touch a free one.
+    cases.append(
+        _drive_ev_gate_case(
+            "zero_cost_route_always_passes",
+            probability_ppm=100_000,
+            dest_attempts=0,
+            dest_success_rate=0.0,
+            route_cost_sats=0,
+            effective_budget_sats=5_000,
+            hold_margin_sats=1_000.0,
+            pair_overrides=dict(dest_out_fee_ppm=0, source_out_fee_ppm=2_000),
+        )
+    )
+    cases.append(
+        _drive_ev_gate_case(
+            "zero_cost_route_negative_efv_still_passes",
+            probability_ppm=50_000,
+            dest_attempts=0,
+            dest_success_rate=0.0,
+            route_cost_sats=0,
+            effective_budget_sats=5_000,
+            hold_margin_sats=50.0,
+            pair_overrides=dict(dest_out_fee_ppm=0, source_out_fee_ppm=5_000, amount_sats=500_000),
+        )
+    )
+
+    # Prior-blend boundary: <3 dest attempts keeps the flat 0.5 prior; >=3
+    # blends in the empirical rate (`_query_dest_success_rate`'s own `total
+    # < 3` guard).
+    for attempts, cid in ((2, "prior_blend_boundary_below_3"), (3, "prior_blend_boundary_at_3")):
+        cases.append(
+            _drive_ev_gate_case(
+                cid,
+                probability_ppm=0,
+                dest_attempts=attempts,
+                dest_success_rate=0.8,
+                route_cost_sats=40,
+                effective_budget_sats=5_000,
+                hold_margin_sats=0.0,
+            )
+        )
+
+    # Empirical blend rate range extremes (rate clamped to [0,1] upstream by
+    # `_query_dest_success_rate`, so 0.5*(0.5+rate) never itself breaches the
+    # [0.05, 0.95] clamp — these pin the two range extremes anyway).
+    for rate, cid in ((0.0, "blend_rate_zero"), (1.0, "blend_rate_one")):
+        cases.append(
+            _drive_ev_gate_case(
+                cid,
+                probability_ppm=0,
+                dest_attempts=5,
+                dest_success_rate=rate,
+                route_cost_sats=40,
+                effective_budget_sats=5_000,
+                hold_margin_sats=0.0,
+            )
+        )
+
+    # probability_ppm clamp edges: [0.05, 0.99].
+    for ppm, cid in (
+        (1, "clamp_low_probability"),
+        (50_000, "clamp_low_boundary_exact_0_05"),
+        (990_000, "clamp_high_boundary_exact_0_99"),
+        (999_999, "clamp_high_probability"),
+    ):
+        cases.append(
+            _drive_ev_gate_case(
+                cid,
+                probability_ppm=ppm,
+                dest_attempts=0,
+                dest_success_rate=0.0,
+                route_cost_sats=40,
+                effective_budget_sats=5_000,
+                hold_margin_sats=0.0,
+            )
+        )
+
+    # Hold-margin exact tie: `final_score < hold_margin` is a STRICT
+    # inequality, so an exact tie must still PASS.
+    probe = _drive_ev_gate_case(
+        "hold_margin_tie_probe",
+        probability_ppm=500_000,
+        dest_attempts=0,
+        dest_success_rate=0.0,
+        route_cost_sats=50,
+        effective_budget_sats=5_000,
+        hold_margin_sats=0.0,
+    )
+    tie_margin = probe["expected"]["final_score_sats"]
+    cases.append(
+        _drive_ev_gate_case(
+            "hold_margin_exact_tie_passes",
+            probability_ppm=500_000,
+            dest_attempts=0,
+            dest_success_rate=0.0,
+            route_cost_sats=50,
+            effective_budget_sats=5_000,
+            hold_margin_sats=tie_margin,
+        )
+    )
+    cases.append(
+        _drive_ev_gate_case(
+            "hold_margin_just_above_rejects",
+            probability_ppm=500_000,
+            dest_attempts=0,
+            dest_success_rate=0.0,
+            route_cost_sats=50,
+            effective_budget_sats=5_000,
+            hold_margin_sats=tie_margin + 1e-6,
+        )
+    )
+
+    # Activity-penalty cap binds: a large helpful_flow drives raw penalty
+    # past `activity_cap_frac * expected_future_value_sats`.
+    cases.append(
+        _drive_ev_gate_case(
+            "activity_penalty_cap_binds",
+            probability_ppm=500_000,
+            dest_attempts=0,
+            dest_success_rate=0.0,
+            route_cost_sats=10,
+            effective_budget_sats=5_000,
+            hold_margin_sats=0.0,
+            pair_overrides=dict(source_activity_out_sats=1_000_000, dest_activity_in_sats=1_000_000),
+        )
+    )
+
+    # Validated dest fee history uses the direct realized ppm outright
+    # (no 0.5 discount) instead of the discounted advertised fee.
+    cases.append(
+        _drive_ev_gate_case(
+            "dest_fee_validated_uses_direct_ppm",
+            probability_ppm=500_000,
+            dest_attempts=0,
+            dest_success_rate=0.0,
+            route_cost_sats=10,
+            effective_budget_sats=5_000,
+            hold_margin_sats=0.0,
+            pair_overrides=dict(
+                dest_fee_history_validated=True,
+                dest_historical_direct_fee_ppm=300.0,
+                dest_out_fee_ppm=1_000,
+            ),
+        )
+    )
+
+    # A zero-configured max_fee_ppm zeroes every historical-fee-derived term
+    # (P4-012: no fee headroom means no historical EV benefit either).
+    cases.append(
+        _drive_ev_gate_case(
+            "historical_fee_cap_zero",
+            probability_ppm=500_000,
+            dest_attempts=0,
+            dest_success_rate=0.0,
+            route_cost_sats=10,
+            effective_budget_sats=5_000,
+            hold_margin_sats=0.0,
+            cfg_overrides=dict(max_fee_ppm=0),
+            pair_overrides=dict(
+                dest_historical_direct_fee_ppm=900.0,
+                source_historical_direct_fee_ppm=900.0,
+                source_historical_sourced_fee_ppm=900.0,
+            ),
+        )
+    )
+
+    return cases
+
+
+def _ev_random_gate_case(rng, i):
+    probability_ppm = 0 if rng.random() < 0.3 else rng.randint(1, 1_000_000)
+    dest_attempts = rng.randint(0, 10)
+    dest_success_rate = round(rng.uniform(0.0, 1.0), 6)
+    route_cost_sats = 0 if rng.random() < 0.1 else rng.randint(1, 20_000)
+    effective_budget_sats = route_cost_sats + rng.randint(0, 10_000)
+    max_fee_ppm = rng.choice([0, 100, 500, 2_000])
+
+    pair_overrides = dict(
+        source_capacity_sats=rng.randint(100_000, 5_000_000),
+        dest_capacity_sats=rng.randint(100_000, 5_000_000),
+        amount_sats=rng.randint(1_000, 500_000),
+        source_local_ratio=round(rng.uniform(0.0, 1.0), 6),
+        dest_local_ratio=round(rng.uniform(0.0, 1.0), 6),
+        dest_out_fee_ppm=rng.randint(0, 2_000),
+        source_out_fee_ppm=rng.randint(0, 2_000),
+        source_historical_direct_fee_ppm=float(rng.choice([0, rng.randint(0, 2_000)])),
+        source_historical_sourced_fee_ppm=float(rng.choice([0, rng.randint(0, 2_000)])),
+        dest_historical_direct_fee_ppm=float(rng.choice([0, rng.randint(0, 2_000)])),
+        dest_historical_sourced_fee_ppm=float(rng.choice([0, rng.randint(0, 2_000)])),
+        dest_fee_history_validated=rng.random() < 0.3,
+        dest_utilization_is_realized=rng.random() < 0.3,
+        dest_realized_utilization=round(rng.uniform(0.0, 1.0), 6),
+        source_utilization_is_realized=rng.random() < 0.3,
+        source_realized_utilization=round(rng.uniform(0.0, 1.0), 6),
+        source_activity_out_sats=0 if rng.random() < 0.6 else rng.randint(0, 200_000),
+        dest_activity_in_sats=0 if rng.random() < 0.6 else rng.randint(0, 200_000),
+        pair_budget_sats=rng.randint(0, 20_000),
+    )
+
+    # hold_margin_sats is picked AFTER driving the case (below) so it can
+    # straddle final_score_sats for good pass/fail/tie coverage; the probe
+    # call uses hold_margin_sats=0.0 as a placeholder (the gate math never
+    # feeds back into the decomposition).
+    probe = _drive_ev_gate_case(
+        f"random-{i:04d}",
+        probability_ppm=probability_ppm,
+        dest_attempts=dest_attempts,
+        dest_success_rate=dest_success_rate,
+        route_cost_sats=route_cost_sats,
+        effective_budget_sats=effective_budget_sats,
+        hold_margin_sats=0.0,
+        cfg_overrides=dict(max_fee_ppm=max_fee_ppm),
+        pair_overrides=pair_overrides,
+    )
+    final_score_sats = probe["expected"]["final_score_sats"]
+    roll = rng.random()
+    if roll < 0.15:
+        hold_margin_sats = final_score_sats
+    elif roll < 0.55:
+        hold_margin_sats = round(final_score_sats + rng.uniform(0.000001, 500.0), 6)
+    else:
+        hold_margin_sats = round(final_score_sats - rng.uniform(0.000001, 500.0), 6)
+
+    return _drive_ev_gate_case(
+        f"random-{i:04d}",
+        probability_ppm=probability_ppm,
+        dest_attempts=dest_attempts,
+        dest_success_rate=dest_success_rate,
+        route_cost_sats=route_cost_sats,
+        effective_budget_sats=effective_budget_sats,
+        hold_margin_sats=hold_margin_sats,
+        cfg_overrides=dict(max_fee_ppm=max_fee_ppm),
+        pair_overrides=pair_overrides,
+    )
+
+
+def _gen_per_attempt_ceiling_cases():
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from types import SimpleNamespace
+
+    cases = []
+    grid = [
+        # (prob_adjusted_budget_sats, amount_sats, pair_fee_cap_ppm, name)
+        (5_000, 100_000, 1_000, "ceiling_binds"),
+        (100, 100_000, 1_000, "budget_binds"),
+        (5_000, 100_000, 0, "ppm_disabled_budget_only"),
+        (5_000, 0, 1_000, "amount_zero_disabled"),
+        (5_000, -10, 1_000, "amount_negative_disabled"),
+        (0, 100_000, 1_000, "zero_budget_stays_zero"),
+        (5_000, 1_000_000, 5, "ceil_exact_divisible"),  # 1_000_000*5/1e6=5 exact
+        (5_000, 1_000_001, 5, "ceil_rounds_up_by_one"),
+        (5_000, 1, 1_000_000, "ceil_tiny_amount"),
+        (10_000_000, 2_000_000, 2_500, "large_values"),
+    ]
+    for budget, amount, ppm, name in grid:
+        cfg = SimpleNamespace(pair_fee_cap_ppm=ppm)
+        expected = RebalanceEngine._per_attempt_fee_ceiling(None, amount, budget, cfg)
+        cases.append(
+            {
+                "case_id": name,
+                "prob_adjusted_budget_sats": budget,
+                "amount_sats": amount,
+                "pair_fee_cap_ppm": ppm,
+                "expected": expected,
+            }
+        )
+    return cases
+
+
+def _gen_fee_escalation_cases():
+    from modules.rebalancer import EVRebalancer
+
+    cases = []
+    grid = [
+        # (last_attempted_sats, ev_max_sats, name) — driven with fail_count=1
+        # and last_attempted>0 (the reduced 2-arg Rust interface's implicit
+        # precondition; the fail_count==0/last<=0 short-circuit branches are
+        # the CALLER's responsibility per the frozen 2-arg signature — see
+        # ev.rs's module doc comment).
+        (100, 1_000, "escalates_below_max"),
+        (100, 120, "escalates_capped_at_max"),
+        (200, 100, "last_already_at_or_above_max"),
+        (80, 120, "exact_boundary_last_times_1_5_eq_max"),  # 80*1.5=120
+        (81, 120, "truncation_last_times_1_5_not_integer"),  # 81*1.5=121.5->121
+        (1, 1_000_000, "tiny_last_attempted"),
+        (1_000_000, 1_000_000, "last_equals_max"),
+        (0, 1_000, "last_zero_still_driven_with_failcount_1"),
+    ]
+    for last, ev_max, name in grid:
+        expected = EVRebalancer._apply_fee_escalation(ev_max, 1, last)
+        cases.append(
+            {
+                "case_id": name,
+                "last_attempted_sats": last,
+                "ev_max_sats": ev_max,
+                "expected": expected,
+            }
+        )
+    return cases
+
+
+def gen_ev() -> dict:
+    """Drive the REAL sats-EV gate math (Phase 5 Task 6) over ~500
+    randomized-but-seeded input vectors plus edge cases, plus the
+    per-attempt-ceiling and fee-escalation tables.
+
+    Feeds `crates/revops-rebalance/src/ev.rs` /
+    `crates/revops-rebalance/tests/ev.rs` in the Rust port
+    (cl-revenue-ops-r), committed there as `fixtures/rebalance/ev.json`.
+
+    Scope note (documented, not an oversight): the Rust `EvInputs` interface
+    takes ALREADY-COMPUTED sats terms (`efv_sats`/`source_opportunity_sats`/
+    `activity_penalty_sats`) rather than the raw ppm/utilization/activity
+    inputs the real `_build_score_decomposition` reduces them from — that
+    raw-to-sats reduction (`EXPECTED_UTILIZATION`/
+    `SOURCE_UTILIZATION_DISCOUNT`/`UNVALIDATED_ADVERTISED_FEE_DISCOUNT`) is
+    exercised HERE, in the generator, by driving the real function with
+    synthetic pair/cfg stubs; only the resulting sats terms cross the Rust
+    interface boundary. `EvInputs` also carries no `failure_count`: every
+    driven case uses a stub host with an EMPTY in-cycle failure history
+    (`_pair_failures = {}`), so `failure_penalty_sats` is always exactly 0.0
+    and drops out of the real 5-term formula, leaving the reduced 4-term
+    formula `ev.rs` implements (`p*efv - fee - source_opp -
+    activity_penalty`) byte-identical to the real one for every fixture case
+    (failure-count-driven futility breaking is `cooldowns.rs`'s
+    `PairFutility`/`DestFutility`, a separate concern with its own
+    constants, not fixture-driven — see `cooldowns.rs`'s doc comment).
+    """
+    rng = random.Random(20260717)
+    gate_cases = _ev_hand_built_gate_cases()
+    seen_ids = {c["case_id"] for c in gate_cases}
+    for i in range(500):
+        case = _ev_random_gate_case(rng, i)
+        assert case["case_id"] not in seen_ids
+        seen_ids.add(case["case_id"])
+        gate_cases.append(case)
+
+    return {
+        "constants": {
+            "expected_utilization": 0.5,
+            "source_utilization_discount": 0.5,
+            "failure_cost_rate": 0.25,
+            "unvalidated_advertised_fee_discount": 0.5,
+        },
+        "gate_cases": gate_cases,
+        "per_attempt_ceiling_cases": _gen_per_attempt_ceiling_cases(),
+        "fee_escalation_cases": _gen_fee_escalation_cases(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# cooldowns suite (Phase 5 Task 6) — persisted per-kind cooldown backoff,
+# fill-fraction dest cooldown (audit F7), drift override.
+# ---------------------------------------------------------------------------
+
+
+def _gen_persisted_cooldown_cases():
+    """Drive the REAL `Database.record_pair_rebalance_failure` (SQL-embedded
+    backoff math, `database.py:2657-2733`) repeatedly to build up
+    `failure_count`, reading `cooldown_until - last_failure_at` back as the
+    oracle for `persisted_cooldown_secs(kind, failure_count)`. Base seconds
+    per kind transcribed from `rebalance_engine_v2.py:178-186`
+    (`_pair_failure_cooldowns`, frozen already at `errors.rs::
+    cooldown_base_secs` — Task 1).
+    """
+    import tempfile
+
+    from modules.database import Database
+
+    class _FakePlugin:
+        def log(self, *a, **kw):
+            pass
+
+    base_by_kind = {
+        "temporary_channel_failure": 300,
+        "fee_insufficient": 1800,
+        "incorrect_cltv_expiry": 3600,
+        "permanent_failure": 21_600,
+        "payment_pending_timeout": 3600,
+        "local_execution_failed": 600,
+        "other_retriable": 600,
+    }
+
+    cases = []
+    with tempfile.TemporaryDirectory() as td:
+        for kind, base in base_by_kind.items():
+            db = Database(os.path.join(td, f"cooldown_{kind}.db"), _FakePlugin())
+            db.initialize()
+            src, dst = "111x1x0", "222x2x0"
+            last = None
+            for count in range(1, 9):
+                last = db.record_pair_rebalance_failure(
+                    src, dst, kind, base, now=1_700_000_000
+                )
+                assert last["failure_count"] == count
+                secs = last["cooldown_until"] - last["last_failure_at"]
+                cases.append(
+                    {
+                        "kind": kind,
+                        "base_secs": base,
+                        "failure_count": count,
+                        "expected_secs": secs,
+                    }
+                )
+    return cases
+
+
+def _gen_dest_cooldown_cases():
+    """Drive the REAL `RebalanceEngine._effective_dest_cooldown_secs` (audit
+    F7 fill-fraction scaling, `rebalance_engine_v2.py:876-927`) with an
+    explicit `anchor` dict, bypassing the DB lookup — the reduced
+    `dest_cooldown_secs(base_secs, amount_sats, remaining_band_gap_sats)`
+    Rust signature takes the remaining gap directly rather than deriving it
+    from `capacity_sats`/`local_sats`/`target_band_low`, so `capacity_sats`/
+    `target_band_low` are chosen here purely as an algebraic vehicle:
+    `target_band_low=1.0, local_sats=0, capacity_sats=<desired gap>` makes
+    `remaining_gap == capacity_sats` exactly (int(1.0 * gap) - 0 == gap).
+    """
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    def _drive(base_secs, amount_sats, remaining_gap_sats):
+        if remaining_gap_sats <= 0:
+            # Zero/negative gap: capacity_sats must still be > 0 to reach the
+            # gap<=0 branch (rather than the capacity_sats<=0 short-circuit).
+            capacity_sats = 1_000
+            target_band_low = 0.0
+        else:
+            capacity_sats = remaining_gap_sats
+            target_band_low = 1.0
+        return RebalanceEngine._effective_dest_cooldown_secs(
+            None,
+            "111x1x0",
+            capacity_sats=capacity_sats,
+            local_sats=0,
+            base_cooldown_secs=base_secs,
+            target_band_low=target_band_low,
+            anchor={"amount_sats": amount_sats} if amount_sats > 0 else None,
+        )
+
+    cases = []
+    grid = [
+        # (base_secs, amount_sats, remaining_gap_sats, name)
+        (86_400, 500, 0, "zero_gap_full_cooldown"),
+        (86_400, 0, 1_000, "zero_amount_no_anchor_amount_full_cooldown"),
+        (86_400, 500, 1_000, "partial_fill_scaled"),
+        (86_400, 1_000, 1_000, "exact_half_fill_boundary"),  # fraction=0.5 *2=1.0 -> full
+        (86_400, 5_000, 1_000, "over_half_fill_full_cooldown"),
+        (86_400, 1, 1_000_000, "tiny_fill_short_cooldown"),
+        (3_600, 250, 250, "small_base_half_fill"),
+        (300, 100, 400, "fill_fraction_one_fifth"),
+    ]
+    for base_secs, amount_sats, remaining_gap, name in grid:
+        expected = _drive(base_secs, amount_sats, remaining_gap)
+        cases.append(
+            {
+                "case_id": name,
+                "base_secs": base_secs,
+                "amount_sats": amount_sats,
+                "remaining_band_gap_sats": remaining_gap,
+                "expected_secs": expected,
+            }
+        )
+    # No-anchor case: base_secs unmodified regardless of remaining_gap.
+    for base_secs, remaining_gap, name in (
+        (86_400, 1_000, "no_anchor_full_cooldown_gap_positive"),
+        (86_400, 0, "no_anchor_full_cooldown_gap_zero"),
+    ):
+        expected = _drive(base_secs, 0, remaining_gap)
+        cases.append(
+            {
+                "case_id": name,
+                "base_secs": base_secs,
+                "amount_sats": 0,
+                "remaining_band_gap_sats": remaining_gap,
+                "expected_secs": expected,
+            }
+        )
+    return cases
+
+
+def _gen_drift_override_cases():
+    """`drift_override(anchor_ratio, current_ratio) -> anchor - current >=
+    0.30`, transcribed verbatim from the single inline boolean at
+    `rebalance_engine_v2.py:1166` (`anchor_ratio - current_ratio >=
+    drift_threshold`, `drift_threshold` defaulting to the module's
+    `rebalance_drift_override_ratio` config default of 0.30) — there is no
+    standalone function to drive; this IS the whole function body.
+    """
+    cases = []
+    grid = [
+        # 0.7 - 0.4 == 0.29999999999999993 in float64 (NOT exactly 0.30) —
+        # a genuine binary-fp-precision edge, not a mislabeled boundary: it
+        # pins that the Rust port must reproduce Python's float subtraction
+        # bit-for-bit rather than "helpfully" rounding first.
+        (0.70, 0.40, "near_threshold_fp_precision_no_trigger"),
+        (0.70, 0.41, "just_below_threshold_no_trigger"),  # 0.29
+        (0.70, 0.39, "just_above_threshold_triggers"),  # 0.31 (approx, fp)
+        (0.50, 0.50, "no_drift_no_trigger"),
+        (0.40, 0.70, "negative_drift_no_trigger"),
+        (1.0, 0.70, "large_drift_triggers"),
+        (0.30, 0.0, "exact_threshold_from_zero"),  # 0.3 - 0.0 == 0.3 exactly
+    ]
+    for anchor_ratio, current_ratio, name in grid:
+        expected = (anchor_ratio - current_ratio) >= 0.30
+        cases.append(
+            {
+                "case_id": name,
+                "anchor_ratio": anchor_ratio,
+                "current_ratio": current_ratio,
+                "expected": expected,
+            }
+        )
+    return cases
+
+
+def gen_cooldowns() -> dict:
+    """Dump persisted per-kind cooldown backoff, fill-fraction dest
+    cooldown (audit F7), and drift-override parity data (Phase 5 Task 6).
+
+    Feeds `crates/revops-rebalance/src/cooldowns.rs` /
+    `crates/revops-rebalance/tests/cooldowns.rs` in the Rust port
+    (cl-revenue-ops-r), committed there as `fixtures/rebalance/
+    cooldowns.json`. `PairFutility` (3 failures / 1800s window) and
+    `DestFutility` (4/10 thresholds, keyed on `to_peer_id` — DEF-063) are
+    NOT fixture-driven here: both are documented, fully-specified-by-the-
+    plan in-memory state machines (constants already frozen in the brief),
+    proven instead by targeted Rust unit tests in `cooldowns.rs` — there is
+    no batch input/output table to golden-pin for a stateful breaker in the
+    way there is for the pure functions below.
+    """
+    return {
+        "persisted_cooldown_cases": _gen_persisted_cooldown_cases(),
+        "dest_cooldown_cases": _gen_dest_cooldown_cases(),
+        "drift_override_cases": _gen_drift_override_cases(),
+    }
+
+
 SUITES = {
     "modes": gen_modes,
     "planner": gen_planner,
     "segstore": gen_segstore,
     "router": gen_router,
     "executor": gen_executor,
+    "ev": gen_ev,
+    "cooldowns": gen_cooldowns,
 }
 
 
