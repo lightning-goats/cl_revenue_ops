@@ -1290,6 +1290,353 @@ def gen_state_dict(outdir: Path) -> None:
     _write(outdir / "cases.json", {"now": NOW, "cases": cases})
 
 
+# ---------------------------------------------------------------------------
+# market: neighbor-gossip market intelligence (Phase 4 Task 8) —
+# _get_neighbor_fee_median_live, _get_neighbor_fee_percentile_live,
+# _is_cln_default_fee, _get_competitive_undercut_pct,
+# _get_market_boundary_fee (always-None stub), _get_network_fee_prior_live /
+# _select_best_fee_prior, _gossip_cache_ttl_seconds. The real FeeController
+# methods are the oracle: each case monkeypatches only the instance's
+# gossip-fetch seam (`_get_peer_inbound_channels`, `_get_our_id`, or
+# `data_service.get_channels`) so the *live* method body runs unmodified —
+# nothing here reimplements the median/percentile/undercut/prior math.
+# ---------------------------------------------------------------------------
+
+def _market_controller() -> FeeController:
+    fc = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock())
+    fc.data_service = MagicMock()
+    return fc
+
+
+def _gossip_ch(source, fee_ppm, base_fee_msat=0, satoshis=1_000_000,
+               last_update=None, active=True):
+    """A single `_GOSSIP_CHANNEL_FIELDS`-shaped dict, as
+    `_get_peer_inbound_channels_live` would return it."""
+    return {
+        "source": source,
+        "active": active,
+        "fee_per_millionth": fee_ppm,
+        "satoshis": satoshis,
+        "last_update": NOW - 3600 if last_update is None else last_update,
+        "base_fee_millisatoshi": base_fee_msat,
+    }
+
+
+def _to_rust_channel(ch):
+    """The Rust `GossipChannel` shape this port's pure functions consume —
+    the same dict, trimmed/renamed to what `market.rs` actually reads."""
+    return {
+        "source": ch["source"],
+        "destination": "peer",
+        "fee_ppm": ch["fee_per_millionth"],
+        "base_fee_msat": ch["base_fee_millisatoshi"],
+        "capacity_sats": ch["satoshis"],
+        "last_update_ts": ch["last_update"],
+    }
+
+
+def _median_case(name, channels, our_id="us", now=NOW, cfg=None):
+    fc = _market_controller()
+    fc._get_our_id = lambda: our_id
+    fc._get_peer_inbound_channels = lambda *a, **k: list(channels)
+    cfg = cfg if cfg is not None else SimpleNamespace(fee_interval=0)
+    orig_time = time.time
+    time.time = lambda: float(now)
+    try:
+        expected = fc._get_neighbor_fee_median_live("peer", cfg)
+    finally:
+        time.time = orig_time
+    return {
+        "name": name,
+        "now": now,
+        "our_id": our_id,
+        "peer_channels": [_to_rust_channel(c) for c in channels],
+        "expected": expected,
+    }
+
+
+def _percentile_case(name, channels, pct, our_id="us", now=NOW, cfg=None):
+    fc = _market_controller()
+    fc._get_our_id = lambda: our_id
+    fc._get_peer_inbound_channels = lambda *a, **k: list(channels)
+    cfg = cfg if cfg is not None else SimpleNamespace(fee_interval=0)
+    orig_time = time.time
+    time.time = lambda: float(now)
+    try:
+        expected = fc._get_neighbor_fee_percentile_live("peer", pct, cfg)
+    finally:
+        time.time = orig_time
+    return {
+        "name": name,
+        "now": now,
+        "our_id": our_id,
+        "pct": _r(pct),
+        "peer_channels": [_to_rust_channel(c) for c in channels],
+        "expected": expected,
+    }
+
+
+def gen_market_median_percentile():
+    median_cases = []
+    percentile_cases = []
+
+    # 1. Exactly-3-competitor boundary: 2 -> None, 3 -> Some.
+    two = [_gossip_ch("a", 100), _gossip_ch("b", 200)]
+    three = two + [_gossip_ch("c", 300)]
+    median_cases.append(_median_case("two_competitors_below_boundary_none", two))
+    median_cases.append(_median_case("three_competitors_at_boundary_some", three))
+    percentile_cases.append(_percentile_case(
+        "two_competitors_below_boundary_none", two, 0.5))
+    percentile_cases.append(_percentile_case(
+        "three_competitors_at_boundary_some", three, 0.5))
+
+    # 2. CLN-default exclusion: a default-tuple (10ppm/1000msat) channel
+    # does not count toward the competitor pool even though its fee is in
+    # range.
+    cln_default_mixed = [
+        _gossip_ch("a", 10, base_fee_msat=1000),
+        _gossip_ch("b", 100),
+        _gossip_ch("c", 200),
+    ]
+    median_cases.append(_median_case(
+        "cln_default_excluded_leaves_two_none", cln_default_mixed))
+    cln_default_mixed_with_third = cln_default_mixed + [_gossip_ch("d", 300)]
+    median_cases.append(_median_case(
+        "cln_default_excluded_third_real_competitor_some",
+        cln_default_mixed_with_third))
+    percentile_cases.append(_percentile_case(
+        "cln_default_excluded_leaves_two_none", cln_default_mixed, 0.5))
+
+    # 3. Range filter: 0 and 10001 excluded (out of [1, 10000]).
+    range_mixed = [
+        _gossip_ch("a", 0), _gossip_ch("b", 10001),
+        _gossip_ch("c", 100), _gossip_ch("d", 200), _gossip_ch("e", 300),
+    ]
+    median_cases.append(_median_case("range_filter_excludes_zero_and_over_max", range_mixed))
+    percentile_cases.append(_percentile_case(
+        "range_filter_excludes_zero_and_over_max", range_mixed, 0.5))
+
+    # 4. Age weighting: fresh (1h old) vs 30-day-old channels of otherwise
+    # identical fee/capacity shape produce a DIFFERENT weighted median,
+    # proving recency_weight actually participates (not just capacity).
+    fresh = [
+        _gossip_ch("a", 100, satoshis=1_000_000, last_update=NOW - 3600),
+        _gossip_ch("b", 100, satoshis=1_000_000, last_update=NOW - 3600),
+        _gossip_ch("c", 900, satoshis=5_000_000, last_update=NOW - 3600),
+    ]
+    stale = [
+        _gossip_ch("a", 100, satoshis=1_000_000, last_update=NOW - 30 * 86400),
+        _gossip_ch("b", 100, satoshis=1_000_000, last_update=NOW - 30 * 86400),
+        _gossip_ch("c", 900, satoshis=5_000_000, last_update=NOW - 3600),
+    ]
+    median_cases.append(_median_case("age_weighting_fresh_competitors", fresh))
+    median_cases.append(_median_case("age_weighting_stale_competitors_same_shape", stale))
+
+    # 5. Last-update <= 0 (unknown age) falls back to a flat 30-day age.
+    unknown_age = [
+        _gossip_ch("a", 100, last_update=0),
+        _gossip_ch("b", 200, last_update=0),
+        _gossip_ch("c", 300, last_update=0),
+    ]
+    median_cases.append(_median_case("unknown_last_update_flat_30day_age", unknown_age))
+
+    # 6. Weighted-median tie: two competitors share the SAME fee (equal
+    # weight each), pinning the exact index/cumulative-weight selection at
+    # the tie. Both have capacity 1_000_000 -> equal weight; the third is
+    # a much larger channel so the tie pair's combined weight still loses
+    # the >=50% crossing to the big channel's own bucket boundary.
+    tie = [
+        _gossip_ch("a", 150, satoshis=1_000_000, last_update=NOW - 3600),
+        _gossip_ch("b", 150, satoshis=1_000_000, last_update=NOW - 3600),
+        _gossip_ch("c", 500, satoshis=1_000_000, last_update=NOW - 3600),
+    ]
+    median_cases.append(_median_case("weighted_median_tie_equal_fee_pair", tie))
+
+    # 7. Excludes our own channel (source == our_id) even when otherwise a
+    # perfectly valid competitor entry.
+    with_self = [
+        _gossip_ch("us", 5000), _gossip_ch("a", 100), _gossip_ch("b", 200),
+        _gossip_ch("c", 300),
+    ]
+    median_cases.append(_median_case("excludes_our_own_channel", with_self, our_id="us"))
+
+    # 8. Larger realistic pool (7 competitors, varied capacity/age) for the
+    # weighted-median walk to cross mid-pool.
+    varied = [
+        _gossip_ch("a", 80, satoshis=500_000, last_update=NOW - 3600),
+        _gossip_ch("b", 120, satoshis=2_000_000, last_update=NOW - 7200),
+        _gossip_ch("c", 150, satoshis=1_000_000, last_update=NOW - 86400),
+        _gossip_ch("d", 200, satoshis=3_000_000, last_update=NOW - 3600),
+        _gossip_ch("e", 250, satoshis=1_500_000, last_update=NOW - 2 * 86400),
+        _gossip_ch("f", 300, satoshis=800_000, last_update=NOW - 5 * 86400),
+        _gossip_ch("g", 400, satoshis=4_000_000, last_update=NOW - 3600),
+    ]
+    median_cases.append(_median_case("seven_competitor_varied_pool", varied))
+    for pct in (0.0, 0.25, 0.5, 0.75, 0.9, 1.0):
+        percentile_cases.append(_percentile_case(
+            f"seven_competitor_varied_pool_p{int(pct * 100)}", varied, pct))
+
+    return median_cases, percentile_cases
+
+
+def _undercut_case(label, capacity_rank, rank_count, neighbor_median, invert_rank):
+    """Engineer a peer-channel pool with EXACTLY `capacity_rank` competitors
+    strictly larger than our own capacity out of `rank_count` total, then
+    call the REAL `_get_competitive_undercut_pct` — pinning both the
+    engineered (capacity_rank, rank_count) inputs and Python's own output,
+    so the Rust pure function's abstracted (rank, count) signature is
+    proven equivalent to the live rank computation for this case."""
+    fc = _market_controller()
+    fc._get_our_id = lambda: "us"
+
+    # rank_count competitor capacities, strictly decreasing so
+    # capacity_rank has an unambiguous "strictly greater than ours" count.
+    caps = [1_000_000 - i * 50_000 for i in range(rank_count)]
+    if capacity_rank == 0:
+        our_capacity = caps[0] + 100_000 if caps else 100_000
+    elif capacity_rank == rank_count:
+        our_capacity = caps[-1] - 100_000
+    else:
+        # Sits strictly between caps[capacity_rank - 1] and
+        # caps[capacity_rank]: exactly `capacity_rank` competitors above.
+        our_capacity = (caps[capacity_rank - 1] + caps[capacity_rank]) // 2
+
+    channels = [_gossip_ch("us", 999, satoshis=our_capacity)]
+    for i, cap in enumerate(caps):
+        channels.append(_gossip_ch(f"c{i}", 100 + i, satoshis=cap))
+
+    fc._get_peer_inbound_channels = lambda *a, **k: list(channels)
+    cfg = SimpleNamespace(fee_interval=0)
+    expected = fc._get_competitive_undercut_pct(
+        "peer", "chan", neighbor_median=neighbor_median, cfg=cfg,
+        invert_rank=invert_rank)
+
+    return {
+        "label": label,
+        "capacity_rank": capacity_rank,
+        "rank_count": rank_count,
+        "neighbor_median": neighbor_median,
+        "invert_rank": invert_rank,
+        "peer_channels": [_to_rust_channel(c) for c in channels],
+        "our_capacity_sats": our_capacity,
+        "expected": _r(expected),
+    }
+
+
+def gen_market_undercut():
+    cases = []
+    rank_count = 5
+    ranks = {"rank_first_largest": 0, "rank_mid": rank_count // 2,
+             "rank_last_smallest": rank_count}
+    medians = {"low_50": 50, "mid_200": 200, "high_500": 500}
+    for rank_label, rank in ranks.items():
+        for median_label, median in medians.items():
+            for invert in (False, True):
+                label = f"{rank_label}__{median_label}__invert_{invert}"
+                cases.append(_undercut_case(label, rank, rank_count, median, invert))
+
+    # No-competitor-data early-out (rank_count == 0 -> flat 0.10 default,
+    # regardless of median/invert_rank).
+    for invert in (False, True):
+        cases.append(_undercut_case(
+            f"no_competitor_data__invert_{invert}", 0, 0, 200, invert))
+
+    return cases
+
+
+def _network_prior_case(name, channels_response, allow_rpc=True):
+    fc = _market_controller()
+    fc.data_service.get_channels.return_value = channels_response
+    network_prior = fc._get_network_fee_prior_live("peer", "123x1x0")
+    selected = fc._select_best_fee_prior("peer", "123x1x0", allow_rpc=allow_rpc)
+    return {
+        "name": name,
+        "allow_rpc": allow_rpc,
+        "channels_response": channels_response,
+        "expected_network_prior": (
+            {"mean": network_prior["mean"], "std": network_prior["std"]}
+            if network_prior is not None else None
+        ),
+        "expected_selected": selected,
+    }
+
+
+def gen_market_prior():
+    cases = []
+
+    cases.append(_network_prior_case("no_channels_none", {"channels": []}))
+
+    weighted = {"channels": [
+        {"fee_per_millionth": 100, "satoshis": 1_000_000},
+        {"fee_per_millionth": 200, "satoshis": 2_000_000},
+        {"fee_per_millionth": 300, "satoshis": 500_000},
+    ]}
+    cases.append(_network_prior_case("weighted_median_with_spread", weighted))
+
+    single = {"channels": [{"fee_per_millionth": 150, "satoshis": 1_000_000}]}
+    cases.append(_network_prior_case("single_channel_std_floor", single))
+
+    out_of_range = {"channels": [
+        {"fee_per_millionth": 0, "satoshis": 1_000_000},
+        {"fee_per_millionth": 10001, "satoshis": 1_000_000},
+    ]}
+    cases.append(_network_prior_case("all_out_of_range_none", out_of_range))
+
+    # allow_rpc=False short-circuits _select_best_fee_prior to None even
+    # though the network prior itself would resolve (out-of-cycle vs
+    # per-cycle caller distinction, py 7930-7938).
+    cases.append(_network_prior_case(
+        "allow_rpc_false_short_circuits_selection", weighted, allow_rpc=False))
+
+    return cases
+
+
+def gen_market(outdir: Path) -> None:
+    median_cases, percentile_cases = gen_market_median_percentile()
+    _write(outdir / "median.json", {"now": NOW, "cases": median_cases})
+    _write(outdir / "percentile.json", {"now": NOW, "cases": percentile_cases})
+
+    # is_cln_default_fee: direct static-method pins across both field-name
+    # spellings and the missing-field "assume not default" fallback.
+    cln_cases = []
+    for label, ch in [
+        ("exact_default_tuple", {"fee_per_millionth": 10, "base_fee_millisatoshi": 1000}),
+        ("non_default_ppm", {"fee_per_millionth": 11, "base_fee_millisatoshi": 1000}),
+        ("non_default_base", {"fee_per_millionth": 10, "base_fee_millisatoshi": 999}),
+        ("post24x_field_name", {"fee_per_millionth": 10, "fee_base_msat": 1000}),
+        ("missing_base_assumed_not_default", {"fee_per_millionth": 10}),
+    ]:
+        cln_cases.append({
+            "label": label, "channel": ch,
+            "expected": FeeController._is_cln_default_fee(ch),
+        })
+    _write(outdir / "cln_default.json", {"now": NOW, "cases": cln_cases})
+
+    _write(outdir / "undercut.json", {"now": NOW, "cases": gen_market_undercut()})
+    _write(outdir / "prior.json", {"now": NOW, "cases": gen_market_prior()})
+
+    # market_boundary_fee: ALWAYS None, even with the persisted config flag
+    # enabled (behavioral contract 1) — direct call through the real stub.
+    fc = _market_controller()
+    boundary_cases = []
+    for enabled in (False, True):
+        cfg = SimpleNamespace(fee_market_boundary_enabled=enabled)
+        result = fc._get_market_boundary_fee("peer", cfg=cfg)
+        boundary_cases.append({"cfg_enabled": enabled, "expected": result})
+    _write(outdir / "boundary.json", {"now": NOW, "cases": boundary_cases})
+
+    # gossip_cache_ttl_seconds: interval scaling + the 3900s floor/fallback.
+    fc2 = _market_controller()
+    ttl_cases = []
+    for interval in (0, -5, 60, 1950, 3000, 10_000):
+        cfg = SimpleNamespace(fee_interval=interval)
+        ttl_cases.append({
+            "fee_interval": interval,
+            "expected": fc2._gossip_cache_ttl_seconds(cfg),
+        })
+    _write(outdir / "ttl.json", {"now": NOW, "cases": ttl_cases})
+
+
 SUITES = {
     "pyrand": gen_pyrand,
     "mat3": gen_mat3,
@@ -1298,6 +1645,7 @@ SUITES = {
     "discount": gen_discount,
     "pid": gen_pid,
     "state_dict": gen_state_dict,
+    "market": gen_market,
 }
 
 
