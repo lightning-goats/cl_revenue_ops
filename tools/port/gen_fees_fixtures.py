@@ -35,7 +35,11 @@ from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from modules.config import Config  # noqa: E402
-from modules.fee_controller import FeeController, GaussianThompsonState  # noqa: E402
+from modules.fee_controller import (  # noqa: E402
+    FeeController,
+    GaussianThompsonState,
+    PIDState,
+)
 
 NOW = 1_752_400_000
 
@@ -992,12 +996,308 @@ def gen_discount(outdir: Path) -> None:
     _write(outdir / "sequences.json", {"now": NOW, "sequences": sequences})
 
 
+# ---------------------------------------------------------------------------
+# pid: PIDState.calculate_multiplier (fee_controller.py:1977-2020), 12
+# sequences of calls pinning (multiplier, ewma_error, integral_error) per
+# step as repr strings. Phase 4 Task 3.
+# ---------------------------------------------------------------------------
+
+def _run_pid_sequence(steps):
+    """steps: list of dicts with now/ratio/capacity/flow_state. Returns the
+    per-step results list, running the REAL PIDState.calculate_multiplier
+    under a monkeypatched time.time() (the method reads time.time()
+    internally rather than taking `now` as an argument — clock injection is
+    the Rust port's job, per Phase 4 Global Constraints, but the Python
+    oracle itself is unchanged)."""
+    state = PIDState()
+    orig_time = time.time
+    results = []
+    try:
+        for step in steps:
+            time.time = lambda t=step["now"]: float(t)
+            mult = state.calculate_multiplier(
+                step["ratio"], step["capacity"], step["flow_state"]
+            )
+            results.append({
+                "now": step["now"],
+                "ratio": _r(step["ratio"]),
+                "capacity_sats": step["capacity"],
+                "flow_state": step["flow_state"],
+                "multiplier": _r(mult),
+                "ewma_error": _r(state.ewma_error),
+                "integral_error": _r(state.integral_error),
+            })
+    finally:
+        time.time = orig_time
+    return results
+
+
+def gen_pid(outdir: Path) -> None:
+    sequences = []
+
+    def seq(name, steps):
+        sequences.append({"name": name, "steps": _run_pid_sequence(steps)})
+
+    # 1: flow_state="source" (target 0.7), capacity floor-clamped to 1,
+    # varying dt across steps including the first-call dt=0.
+    seq("source_capacity_floor", [
+        {"now": NOW, "ratio": 0.95, "capacity": 1, "flow_state": "source"},
+        {"now": NOW + 3600, "ratio": 0.85, "capacity": 1, "flow_state": "source"},
+        {"now": NOW + 3600 * 6, "ratio": 0.6, "capacity": 1, "flow_state": "source"},
+    ])
+
+    # 2: flow_state="sink" (target 0.3), capacity 1e6, includes a long dt
+    # (48h) that should saturate the integral clamp.
+    seq("sink_capacity_1e6_integral_saturation", [
+        {"now": NOW, "ratio": 0.9, "capacity": 1_000_000, "flow_state": "sink"},
+        {"now": NOW + 3600 * 48, "ratio": 0.95, "capacity": 1_000_000, "flow_state": "sink"},
+        {"now": NOW + 3600 * 96, "ratio": 0.97, "capacity": 1_000_000, "flow_state": "sink"},
+    ])
+
+    # 3: flow_state="balanced_active", capacity 5e6.
+    seq("balanced_active_capacity_5e6", [
+        {"now": NOW, "ratio": 0.55, "capacity": 5_000_000, "flow_state": "balanced_active"},
+        {"now": NOW + 1800, "ratio": 0.45, "capacity": 5_000_000, "flow_state": "balanced_active"},
+    ])
+
+    # 4: flow_state="dormant" (target 0.5, F6), capacity 5e8.
+    seq("dormant_capacity_5e8", [
+        {"now": NOW, "ratio": 0.5, "capacity": 500_000_000, "flow_state": "dormant"},
+        {"now": NOW + 3600 * 12, "ratio": 0.5, "capacity": 500_000_000, "flow_state": "dormant"},
+    ])
+
+    # 5: flow_state="congested", capacity floor-clamped, ratio edges 0/1.
+    seq("congested_ratio_edges", [
+        {"now": NOW, "ratio": 0.0, "capacity": 1, "flow_state": "congested"},
+        {"now": NOW + 3600, "ratio": 1.0, "capacity": 1, "flow_state": "congested"},
+    ])
+
+    # 6: flow_state="unknown" (explicitly listed key, still 0.5), capacity 1e6.
+    seq("flow_state_unknown_key", [
+        {"now": NOW, "ratio": 0.3, "capacity": 1_000_000, "flow_state": "unknown"},
+        {"now": NOW + 3600 * 3, "ratio": 0.4, "capacity": 1_000_000, "flow_state": "unknown"},
+    ])
+
+    # 7: flow_state NOT in the dict at all ("router" — reserved vocabulary
+    # the classifier does not emit yet) — exercises the `.get(x, 0.5)`
+    # fallback, capacity 5e6.
+    seq("flow_state_not_in_dict_router", [
+        {"now": NOW, "ratio": 0.6, "capacity": 5_000_000, "flow_state": "router"},
+        {"now": NOW + 3600 * 2, "ratio": 0.6, "capacity": 5_000_000, "flow_state": "totally_unknown_state"},
+    ])
+
+    # 8: NaN ratio — non-finite input replaced by the target ratio before
+    # the raw-error computation, both on the fresh (dt=0) call and a
+    # subsequent dt>0 call.
+    seq("nan_ratio_guard", [
+        {"now": NOW, "ratio": float("nan"), "capacity": 500_000_000, "flow_state": "balanced"},
+        {"now": NOW + 3600, "ratio": float("nan"), "capacity": 500_000_000, "flow_state": "balanced"},
+        {"now": NOW + 3600 * 2, "ratio": 0.5, "capacity": 500_000_000, "flow_state": "balanced"},
+    ])
+
+    # 9: very large dt (1000h) — integral term should still clamp to
+    # ±integral_clamp (3.0) rather than overflow.
+    seq("very_large_dt_integral_clamp", [
+        {"now": NOW, "ratio": 0.99, "capacity": 1, "flow_state": "sink"},
+        {"now": NOW + 3600 * 1000, "ratio": 0.99, "capacity": 1, "flow_state": "sink"},
+    ])
+
+    # 10: overshoot ratios (negative and >1) drive the multiplier to its
+    # hard 0.5/2.0 clamp bounds.
+    seq("overshoot_ratio_hits_multiplier_clamp", [
+        {"now": NOW, "ratio": -0.5, "capacity": 1_000_000, "flow_state": "balanced"},
+        {"now": NOW + 3600, "ratio": 1.5, "capacity": 1_000_000, "flow_state": "balanced"},
+    ])
+
+    # 11: flow_state AND capacity both change across steps of the SAME
+    # persistent PidState (a channel migrating between flow-classifier
+    # regimes over successive cycles).
+    seq("flow_state_and_capacity_change_across_steps", [
+        {"now": NOW, "ratio": 0.8, "capacity": 1_000_000, "flow_state": "source"},
+        {"now": NOW + 3600 * 4, "ratio": 0.4, "capacity": 5_000_000, "flow_state": "sink"},
+        {"now": NOW + 3600 * 8, "ratio": 0.5, "capacity": 500_000_000, "flow_state": "balanced"},
+    ])
+
+    # 12: the exact conformance scenario 12 case
+    # (tests/conformance/scenarios/12-dts-pid-components/case.json) — a
+    # single fresh-state (dt=0) call. `round(pid_multiplier, 12) ==
+    # 1.026338203439` and `round(pid_ewma_error, 12) == 0.09` per that
+    # scenario's `expected` block (generate_scenarios.py rounds to 12
+    # digits; the fixture here pins the FULL, unrounded repr, and this
+    # assertion is a sanity cross-check that this is the same code path).
+    seq("conformance_scenario_12_fresh_state", [
+        {"now": NOW, "ratio": 0.2, "capacity": 5_000_000, "flow_state": "balanced"},
+    ])
+
+    assert len(sequences) == 12, len(sequences)
+    last_step = sequences[-1]["steps"][-1]
+    last_mult = float(last_step["multiplier"])
+    last_ewma = float(last_step["ewma_error"])
+    assert round(last_mult, 12) == 1.026338203439, last_mult
+    assert round(last_ewma, 12) == 0.09, last_ewma
+
+    _write(outdir / "sequences.json", {"now": NOW, "sequences": sequences})
+
+
+# ---------------------------------------------------------------------------
+# state_dict: GaussianThompsonState.to_dict/from_dict
+# (fee_controller.py:1721-1940), byte-identical round trips through the
+# REAL Python json.dumps (default separators (", ", ": "), ensure_ascii).
+# Phase 4 Task 3.
+# ---------------------------------------------------------------------------
+
+def _state_dict_case_with_unknown(name, base_d, extra_keys):
+    """Like `_state_dict_case`, but `extra_keys` are top-level keys Python's
+    own `to_dict()` doesn't know about and therefore silently drops. This
+    port's contract (Task 3 brief) is to survive them instead, re-emitted
+    after all known keys in first-seen order — so `expected` is Python's
+    real `from_dict(d).to_dict()` output (the known-fields truth) with
+    `extra_keys` manually re-appended in that position, i.e. the CONTRACT
+    truth, not the as-is (lossy) Python behavior."""
+    d = dict(base_d)
+    d.update(extra_keys)
+    state = GaussianThompsonState.from_dict(d)
+    to_dict = state.to_dict()
+    for k, v in extra_keys.items():
+        to_dict[k] = v
+    return {
+        "name": name,
+        "blob": json.dumps(d),
+        "expected": json.dumps(to_dict),
+    }
+
+
+def _state_dict_case(name, d):
+    """`d`: a plain dict fed to GaussianThompsonState.from_dict. Records the
+    raw input bytes (`blob`, via json.dumps(d) — NOT the generator's own
+    indent=1 wrapper format) and the Python truth for a from_dict/to_dict
+    round trip (`expected`, via json.dumps(state.to_dict())) — both using
+    Python's DEFAULT json.dumps separators (", ", ": "), the format real
+    v2_state_json blobs are written with."""
+    state = GaussianThompsonState.from_dict(d)
+    return {
+        "name": name,
+        "blob": json.dumps(d),
+        "expected": json.dumps(state.to_dict()),
+    }
+
+
+def gen_state_dict(outdir: Path) -> None:
+    cases = []
+
+    # 1: CURRENT-format round trip — a state built via the REAL running
+    # code paths (update_posterior, update_contextual, record_posterior_nudge),
+    # so `d` is exactly what a live channel's to_dict() would produce
+    # (observations with a congestion-flagged 6-tuple, a populated
+    # contextual_posteriors 4-tuple entry, a posterior_bias nudge).
+    orig_time = time.time
+    time.time = lambda: float(NOW)
+    try:
+        base = GaussianThompsonState()
+        base.update_posterior(250, 12.5, 6.0, time_bucket="peak")
+        base.update_posterior(400, 4.0, 3.0, time_bucket="low", congested=True)
+        base.update_contextual("mid:peak:P", 250, 12.5, time_bucket="peak")
+        base.record_posterior_nudge(275.0, 0.4)
+        d0 = base.to_dict()
+    finally:
+        time.time = orig_time
+    cases.append(_state_dict_case("current_format_roundtrip", d0))
+
+    # 2: legacy blob — NO "weight_scheme" key at all (predates the marker),
+    # so from_dict rescales BOTH a positive-rate window (a) and a
+    # zero-rate window (b) to the exposure-only scheme. Weights are
+    # repr-pinned separately below (test contract (b)).
+    d1 = {
+        "prior_mean_fee": 200,
+        "prior_std_fee": 100,
+        "observations": [
+            # Small original weights so the rescale lands well below the
+            # min(1.0, ...) clamp — a non-trivial repr-pinned value, not
+            # just "both saturate to 1.0".
+            [250, 12.5, 0.1, NOW - 3600, "normal"],
+            [300, 0.0, 0.05, NOW - 7200, "low"],
+        ],
+    }
+    legacy_case = _state_dict_case("legacy_weight_rescale_absent_marker", d1)
+    legacy_state = GaussianThompsonState.from_dict(d1)
+    legacy_case["rescaled_weights"] = [_r(o[2]) for o in legacy_state.observations]
+    cases.append(legacy_case)
+
+    # 2b: legacy blob with an explicit STALE weight_scheme value (not
+    # merely absent) — same rescale path, different trigger.
+    d1b = dict(d1)
+    d1b["weight_scheme"] = "thompson_aimd_v1"
+    cases.append(_state_dict_case("legacy_weight_rescale_stale_marker", d1b))
+
+    # 3: 3-tuple contextual posteriors (legacy layout) alongside a current
+    # 4-tuple one, converted on load.
+    d2 = {
+        "contextual_posteriors": {
+            "low:normal:P": [250.0, 45.0, 12],
+            "mid:peak:S": [310.0, 22.5, 8, NOW - 1000],
+        },
+    }
+    ctx_case = _state_dict_case("legacy_ctx_3tuple_alongside_current_4tuple", d2)
+    ctx_state = GaussianThompsonState.from_dict(d2)
+    ctx_case["converted_ctx"] = {
+        k: [_r(v[0]), _r(v[1]), v[2], v[3]] for k, v in ctx_state.contextual_posteriors.items()
+    }
+    cases.append(ctx_case)
+
+    # 4: unknown injected top-level key on an otherwise-current-format
+    # blob. Python's own from_dict/to_dict DROPS unknown keys; this port's
+    # contract (see `_state_dict_case_with_unknown`) is to survive them,
+    # re-emitted after all known keys in first-seen order.
+    cases.append(_state_dict_case_with_unknown(
+        "unknown_top_level_key_survives_roundtrip",
+        d0, {"future_field": {"x": 1}},
+    ))
+
+    # 5: a 6-tuple zero_probe-flagged observation alongside a 6-tuple
+    # congestion-flagged one, current weight_scheme, round-tripped.
+    d4 = {
+        "weight_scheme": "exposure_v2",
+        "observations": [
+            [250, 12.5, 0.8, NOW - 3600, "normal", "congestion"],
+            [90, 0.0, 0.5, NOW - 1800, "low", "zero_probe"],
+        ],
+    }
+    cases.append(_state_dict_case("six_tuple_congestion_and_zero_probe", d4))
+
+    # 6: non-ASCII string in a preserved (unknown-key) leaf, to pin
+    # dumps_python's ensure_ascii=True escaping end-to-end.
+    cases.append(_state_dict_case_with_unknown(
+        "non_ascii_unknown_value",
+        d0, {"future_alias_note": "café ☃ router-étiquette"},
+    ))
+
+    # 7: a legacy float-typed observation fee (thompson_aimd_v1-era blobs
+    # may carry `fee_ppm` as a JSON float) alongside a current int-typed fee
+    # in the SAME observations list. `from_dict`/`to_dict` never cast
+    # observation[0] (just like prior_mean_fee/prior_std_fee — see that
+    # struct doc comment), so the JSON int/float typing of each observation
+    # fee must survive the round trip independently, byte-identical to
+    # Python's own `json.dumps`.
+    d5 = {
+        "weight_scheme": "exposure_v2",
+        "observations": [
+            [250.0, 12.5, 1.0, NOW - 3600, "peak"],
+            [250, 12.5, 1.0, NOW - 3600, "peak"],
+        ],
+    }
+    cases.append(_state_dict_case("float_and_int_observation_fee_roundtrip", d5))
+
+    _write(outdir / "cases.json", {"now": NOW, "cases": cases})
+
+
 SUITES = {
     "pyrand": gen_pyrand,
     "mat3": gen_mat3,
     "rails": gen_rails,
     "posterior": gen_posterior,
     "discount": gen_discount,
+    "pid": gen_pid,
+    "state_dict": gen_state_dict,
 }
 
 
