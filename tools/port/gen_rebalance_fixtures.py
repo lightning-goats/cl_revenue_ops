@@ -1391,11 +1391,545 @@ def gen_router() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# executor suite (Phase 5 Task 5) — NativeRouteExecutor golden parity.
+#
+# Drives the REAL modules.rebalance_native_executor_v2.NativeRouteExecutor
+# with a scripted payment-RPC double over every contract point: each strict
+# route-validation failure expressible through the Rust typed SendpayHop seam
+# (hop dicts always carry id/channel/amount_msat/delay as an int/str, so the
+# Python-only hop_N_not_object / hop_N_missing_<field> branches are
+# unreachable in the port and deliberately not fixtured), success each
+# amount_sent shape, payment-pending each way (waitsendpay code 200, proxy
+# timeout, waitsendpay_status=pending), terminal failures with/without
+# erring_channel attribution, malformed invoice responses (NX-4), and the
+# confidence-weighted segment observations (0.85 attributed, /2 when the
+# direction is unknown, 0.85/n with a 0.2 floor when inferred).
+#
+# Determinism: time.time is patched per-case to an integer number of seconds
+# (case_now_s), so the invoice label is exactly
+# `rebal-native-{case_now_s*1000}-{dest_scid}` and segment observations get
+# observed_at == case_now_s. The Rust ExecuteRequest carries now_ms =
+# case_now_s*1000 and derives observed_at = now_ms / 1000.
+#
+# RPC error encoding (the seam convention the Rust PaymentRpc doubles and
+# the future live impl must follow): a structured CLN RPC error (pyln
+# RpcError.error dict) is carried to Rust as RpcFailure{ message:
+# json.dumps(error_dict) } — the executor parses the message as JSON to
+# recover code/message/data exactly like Python's _error_details reads
+# exc.error. A plain-text failure stays plain text. Proxy timeouts are
+# plain-text messages containing "rpc timeout" (Python detects the
+# RPCTimeoutError CLASS first, then falls back to the same substring; the
+# generator asserts every scripted timeout_error message contains the
+# substring so both detectors agree).
+# ---------------------------------------------------------------------------
+
+_NX_OUR_ID = "020000000000000000000000000000000000000000000000000000000000000001"
+_NX_PEER_SRC = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02"
+_NX_PEER_M1 = "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb03"
+_NX_PEER_M2 = "03cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc04"
+_NX_PEER_M3 = "03dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd05"
+_NX_PEER_DST = "02eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee06"
+_NX_SRC_SCID = "800000x1000x0"
+_NX_DST_SCID = "800000x2000x1"
+_NX_M1 = "810000x10x0"
+_NX_M2 = "810000x20x1"
+_NX_M3 = "810000x30x0"
+_NX_NOW_BASE_S = 1750000000
+
+
+class _NxRpcError(Exception):
+    """Scripted stand-in for pyln RpcError: carries .error like the real one."""
+
+    def __init__(self, error):
+        super().__init__(str(error.get("message") or error))
+        self.error = error
+
+
+class RPCTimeoutError(Exception):
+    """Name matters: NativeRouteExecutor._is_proxy_timeout matches the MRO
+    class name (the main plugin's RPCTimeoutError without importing it)."""
+
+
+class _NxPaymentRpc:
+    """Scripted payment-RPC double with a normalized call log.
+
+    Script specs per method:
+      {"result": v}        -> return v (a dict)
+      {"raw": v}           -> return v verbatim (non-dict, NX-4 shapes)
+      {"error": obj}       -> raise _NxRpcError(obj)   (structured CLN error)
+      {"error_text": s}    -> raise RuntimeError(s)    (plain-text failure)
+      {"timeout_error": s} -> raise RPCTimeoutError(s) (proxy deadline)
+    """
+
+    def __init__(self, script):
+        self.script = dict(script or {})
+        self.calls = []
+
+    def call(self, method, params, timeout=None):
+        rec = {"method": method, "params": params, "timeout_kwarg": timeout}
+        self.calls.append(rec)
+        spec = self.script.get(method)
+        if spec is None:
+            raise AssertionError(f"unscripted RPC method: {method}")
+        if "result" in spec:
+            return spec["result"]
+        if "raw" in spec:
+            return spec["raw"]
+        if "error" in spec:
+            err = spec["error"]
+            assert err.get("message"), (
+                "seam convention: structured errors always carry a non-empty "
+                f"'message' (got {err!r})"
+            )
+            raise _NxRpcError(err)
+        if "error_text" in spec:
+            raise RuntimeError(spec["error_text"])
+        if "timeout_error" in spec:
+            msg = spec["timeout_error"]
+            assert "rpc timeout" in msg.lower(), (
+                "seam convention: proxy-timeout messages must contain "
+                f"'rpc timeout' so the Rust substring detector agrees ({msg!r})"
+            )
+            raise RPCTimeoutError(msg)
+        raise AssertionError(f"bad script spec for {method}: {spec}")
+
+
+def _nx_hop(node_id, channel, direction, delay, amount_msat):
+    return {
+        "id": node_id,
+        "channel": channel,
+        "direction": direction,
+        "delay": delay,
+        "amount_msat": amount_msat,
+        "style": "tlv",
+    }
+
+
+def _nx_route_4hop(amount_sats=100_000):
+    """us -> SRC peer -> M1 -> M2 -> us; planned fee 1500 msat."""
+    amt = amount_sats * 1000
+    return [
+        _nx_hop(_NX_PEER_SRC, _NX_SRC_SCID, 0, 120, amt + 1500),
+        _nx_hop(_NX_PEER_M1, _NX_M1, 1, 100, amt + 900),
+        _nx_hop(_NX_PEER_M2, _NX_M2, 0, 80, amt + 300),
+        _nx_hop(_NX_OUR_ID, _NX_DST_SCID, 1, 18, amt),
+    ]
+
+
+def _nx_invoice_result(case_i, with_bolt11=True, with_secret=True):
+    out = {"payment_hash": f"ph{case_i:02d}" + "00" * 30}
+    if with_bolt11:
+        out["bolt11"] = f"lnbc1case{case_i:02d}"
+    if with_secret:
+        out["payment_secret"] = f"sec{case_i:02d}" + "11" * 30
+    return out
+
+
+def _nx_normalize_calls(calls, src, dst, amount_sats):
+    """Reduce raw plugin.rpc.call records to the seam-visible argument set
+    (the shape the Rust ScriptedPaymentRpc logs and the test compares)."""
+    out = []
+    for rec in calls:
+        method, params = rec["method"], rec["params"]
+        if method == "invoice":
+            assert params["description"] == (
+                f"cl_revenue_ops rebalance {src}->{dst}"
+            ), params
+            out.append(
+                {
+                    "method": "invoice",
+                    "amount_msat": params["amount_msat"],
+                    "label": params["label"],
+                    "expiry": params["expiry"],
+                }
+            )
+        elif method == "sendpay":
+            # The frozen Rust seam has no amount_msat parameter: the live
+            # impl derives it from the final hop, which validation pinned
+            # to amount_sats*1000. Assert that derivation is sound.
+            assert params["amount_msat"] == amount_sats * 1000
+            assert params["route"][-1]["amount_msat"] == params["amount_msat"]
+            out.append(
+                {
+                    "method": "sendpay",
+                    "route": params["route"],
+                    "payment_hash": params["payment_hash"],
+                    "bolt11": params.get("bolt11", ""),
+                    "payment_secret": params.get("payment_secret", ""),
+                }
+            )
+        elif method == "waitsendpay":
+            assert rec["timeout_kwarg"] == params["timeout"] == 60
+            out.append(
+                {
+                    "method": "waitsendpay",
+                    "payment_hash": params["payment_hash"],
+                    "timeout": params["timeout"],
+                }
+            )
+        elif method == "delpay":
+            out.append(
+                {
+                    "method": "delpay",
+                    "payment_hash": params["payment_hash"],
+                    "status": params["status"],
+                }
+            )
+        elif method == "delinvoice":
+            out.append(
+                {
+                    "method": "delinvoice",
+                    "label": params["label"],
+                    "status": params["status"],
+                }
+            )
+        else:
+            raise AssertionError(f"unexpected RPC method {method}")
+    return out
+
+
+def _nx_case_inputs():
+    """Input-only case table; expected outputs come from the real Python."""
+    r4 = _nx_route_4hop
+    wire_temp = "WIRE_TEMPORARY_CHANNEL_FAILURE: temporary_channel_failure"
+    cases = []
+
+    def add(name, route, script=None, amount_sats=100_000, max_fee_sats=10,
+            source=_NX_SRC_SCID, dest=_NX_DST_SCID, invoice_i=None,
+            expect_no_rpc=False):
+        cases.append(
+            {
+                "name": name,
+                "route": route,
+                "script": script or {},
+                "amount_sats": amount_sats,
+                "max_fee_sats": max_fee_sats,
+                "source_channel_id": source,
+                "dest_channel_id": dest,
+                "expect_no_rpc": expect_no_rpc,
+            }
+        )
+
+    # --- strict validation failures (fail before ANY RPC) ---
+    add("validation_invalid_amount_zero", r4(), amount_sats=0,
+        expect_no_rpc=True)
+    add("validation_invalid_amount_negative", r4(), amount_sats=-5,
+        expect_no_rpc=True)
+    add("validation_missing_route", [], expect_no_rpc=True)
+    add("validation_first_hop_not_source_channel", r4(),
+        source="999999x1x0", expect_no_rpc=True)
+    add("validation_final_hop_not_dest_channel", r4(),
+        dest="999999x2x1", expect_no_rpc=True)
+    bad_final_node = r4()
+    bad_final_node[-1]["id"] = _NX_PEER_M2
+    add("validation_final_hop_not_our_node", bad_final_node,
+        expect_no_rpc=True)
+    bad_final_amt = r4()
+    bad_final_amt[-1]["amount_msat"] = 100_000_000 - 1
+    add("validation_final_amount_mismatch", bad_final_amt,
+        expect_no_rpc=True)
+    zero_first = r4()
+    zero_first[0]["amount_msat"] = 0
+    zero_first[-1]["amount_msat"] = 100_000_000
+    add("validation_hop_0_invalid_amount", zero_first, expect_no_rpc=True)
+    increasing = r4()
+    increasing[2]["amount_msat"] = increasing[1]["amount_msat"] + 1
+    add("validation_increasing_route_amount", increasing, expect_no_rpc=True)
+    add("validation_over_budget", r4(), max_fee_sats=1, expect_no_rpc=True)
+
+    # --- success shapes ---
+    add("success_amount_sent_int", r4(), {
+        "invoice": {"result": _nx_invoice_result(10)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"result": {
+            "status": "complete", "amount_sent_msat": 100_001_500,
+        }},
+    })
+    add("success_amount_sent_msat_string", r4(), {
+        "invoice": {"result": _nx_invoice_result(11, with_secret=False)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"result": {
+            "status": "complete", "amount_sent_msat": "100001500msat",
+        }},
+    })
+    add("success_missing_amount_sent_falls_back_to_first_hop", r4(), {
+        "invoice": {"result": _nx_invoice_result(12, with_bolt11=False,
+                                                 with_secret=False)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"result": {"status": "complete"}},
+    })
+    add("success_status_missing_treated_complete", r4(), {
+        "invoice": {"result": _nx_invoice_result(13)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"result": {"amount_sent_msat": 100_000_600}},
+    })
+
+    # --- malformed invoice responses (NX-4): terminal + best-effort delinvoice ---
+    add("invoice_response_not_dict", r4(), {
+        "invoice": {"raw": "garbage"},
+        "delinvoice": {"result": {}},
+    })
+    add("invoice_response_missing_payment_hash", r4(), {
+        "invoice": {"result": {"bolt11": "lnbc1nohash"}},
+        "delinvoice": {"result": {}},
+    })
+
+    # --- payment_pending: abandon, never cancel ---
+    add("pending_waitsendpay_code_200", r4(), {
+        "invoice": {"result": _nx_invoice_result(16)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"error": {
+            "code": 200,
+            "message": "Timed out while waiting for payment",
+        }},
+    })
+    add("pending_proxy_timeout_on_sendpay", r4(), {
+        "invoice": {"result": _nx_invoice_result(17)},
+        "sendpay": {"timeout_error": "RPC timeout after 60.0s (sendpay)"},
+    })
+    add("pending_proxy_timeout_on_waitsendpay", r4(), {
+        "invoice": {"result": _nx_invoice_result(18)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"timeout_error":
+                        "RPC timeout after 60.0s (waitsendpay)"},
+    })
+    add("pending_waitsendpay_status_pending", r4(), {
+        "invoice": {"result": _nx_invoice_result(19)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"result": {"status": "pending"}},
+    })
+
+    # --- terminal sendpay failures ---
+    add("terminal_erring_channel_and_direction", r4(), {
+        "invoice": {"result": _nx_invoice_result(20)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"error": {
+            "code": 204,
+            "message": f"failed: {wire_temp} (reply from remote)",
+            "data": {
+                "erring_channel": _NX_M2,
+                "erring_direction": 0,
+                "erring_node": _NX_PEER_M1,
+                "erring_index": 2,
+                "failcode": 4103,
+                "failcodename": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+            },
+        }},
+        "delpay": {"result": {}},
+        "delinvoice": {"result": {}},
+    })
+    add("terminal_erring_direction_string", r4(), {
+        "invoice": {"result": _nx_invoice_result(21)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"error": {
+            "code": 204,
+            "message": f"failed: {wire_temp}",
+            "data": {"erring_channel": _NX_M1, "erring_direction": "1"},
+        }},
+        "delpay": {"result": {}},
+        "delinvoice": {"result": {}},
+    })
+    add("terminal_erring_channel_unknown_direction", r4(), {
+        "invoice": {"result": _nx_invoice_result(22)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"error": {
+            "code": 204,
+            "message": f"failed: {wire_temp}",
+            "data": {"erring_channel": _NX_M1, "failcode": 4103},
+        }},
+        "delpay": {"result": {}},
+        "delinvoice": {"result": {}},
+    })
+    add("terminal_liquidity_no_attribution_middle_hops", r4(), {
+        "invoice": {"result": _nx_invoice_result(23)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"error_text": wire_temp},
+        "delpay": {"result": {}},
+        "delinvoice": {"result": {}},
+    })
+    # 5-hop route with a duplicated middle (scid, dir): dedup -> n=2.
+    amt = 100_000 * 1000
+    dup_middle = [
+        _nx_hop(_NX_PEER_SRC, _NX_SRC_SCID, 0, 140, amt + 2000),
+        _nx_hop(_NX_PEER_M1, _NX_M1, 1, 120, amt + 1200),
+        _nx_hop(_NX_PEER_M1, _NX_M1, 1, 100, amt + 700),
+        _nx_hop(_NX_PEER_M2, _NX_M2, 0, 80, amt + 300),
+        _nx_hop(_NX_OUR_ID, _NX_DST_SCID, 1, 18, amt),
+    ]
+    add("terminal_fee_no_attribution_dedups_middle_hops", dup_middle, {
+        "invoice": {"result": _nx_invoice_result(24)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"error": {
+            "code": 204,
+            "message": "failed: WIRE_FEE_INSUFFICIENT: fee_insufficient",
+        }},
+        "delpay": {"result": {}},
+        "delinvoice": {"result": {}},
+    })
+    # 8-hop route, 6 distinct middles: 0.85/6 ~ 0.1417 -> floor 0.2.
+    floor_route = [_nx_hop(_NX_PEER_SRC, _NX_SRC_SCID, 0, 220, amt + 6000)]
+    middles = [
+        (_NX_PEER_M1, _NX_M1, 1), (_NX_PEER_M2, _NX_M2, 0),
+        (_NX_PEER_M3, _NX_M3, 0), (_NX_PEER_M1, "820000x40x1", 1),
+        (_NX_PEER_M2, "820000x50x0", 0), (_NX_PEER_M3, "820000x60x1", 1),
+    ]
+    for i, (pid, scid, d) in enumerate(middles):
+        floor_route.append(
+            _nx_hop(pid, scid, d, 200 - i * 20, amt + 5000 - i * 800)
+        )
+    floor_route.append(_nx_hop(_NX_OUR_ID, _NX_DST_SCID, 1, 18, amt))
+    add("terminal_inferred_confidence_floor", floor_route, {
+        "invoice": {"result": _nx_invoice_result(25)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"error_text": wire_temp},
+        "delpay": {"result": {}},
+        "delinvoice": {"result": {}},
+    })
+    add("terminal_waitsendpay_status_failed_unknown_class", r4(), {
+        "invoice": {"result": _nx_invoice_result(26)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"result": {"status": "failed"}},
+        "delpay": {"result": {}},
+        "delinvoice": {"result": {}},
+    })
+    add("terminal_timeout_class_not_proxy_timeout", r4(), {
+        "invoice": {"result": _nx_invoice_result(27)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"error_text":
+                        "deadline exceeded waiting for htlc resolution"},
+        "delpay": {"result": {}},
+        "delinvoice": {"result": {}},
+    })
+    add("terminal_invoice_rpc_error", r4(), {
+        "invoice": {"error": {"code": -32602, "message": "Invalid label"}},
+        "delinvoice": {"result": {}},
+    })
+    add("terminal_invoice_code_200_not_pending", r4(), {
+        "invoice": {"error": {
+            "code": 200, "message": "Timed out creating invoice",
+        }},
+        "delinvoice": {"result": {}},
+    })
+    add("terminal_sendpay_structured_error", r4(), {
+        "invoice": {"result": _nx_invoice_result(30)},
+        "sendpay": {"error": {
+            "code": 204,
+            "message": f"failed: {wire_temp}",
+            "data": {"erring_channel": _NX_M1, "erring_direction": 1},
+        }},
+        "delpay": {"result": {}},
+        "delinvoice": {"result": {}},
+    })
+    add("terminal_cleanup_failures_swallowed", r4(), {
+        "invoice": {"result": _nx_invoice_result(31)},
+        "sendpay": {"result": {"status": "pending"}},
+        "waitsendpay": {"error": {
+            "code": 204,
+            "message": f"failed: {wire_temp}",
+            "data": {"erring_channel": _NX_M2, "erring_direction": 0},
+        }},
+        "delpay": {"error": {"message": "Payment with hash not found"}},
+        "delinvoice": {"error": {"message": "Invoice not found"}},
+    })
+    return cases
+
+
+def gen_executor() -> dict:
+    """Drive the REAL NativeRouteExecutor over a scripted payment-RPC double.
+
+    Feeds `crates/revops-rebalance/src/executor.rs` /
+    `crates/revops-rebalance/tests/executor.rs` (Phase 5 Task 5), committed
+    in the Rust repo as `fixtures/rebalance/executor.json`.
+    """
+    import copy
+    import dataclasses
+    import time as _time
+
+    from modules.rebalance_native_executor_v2 import NativeRouteExecutor
+
+    assert NativeRouteExecutor.ATTRIBUTED_CONFIDENCE == 0.85
+    assert NativeRouteExecutor.INFERRED_CONFIDENCE_FLOOR == 0.2
+    assert NativeRouteExecutor.INVOICE_EXPIRY_SEC == 300
+    assert NativeRouteExecutor.SENDPAY_TIMEOUT_SEC == 60
+
+    real_time = _time.time
+    out_cases = []
+    try:
+        for i, case in enumerate(_nx_case_inputs()):
+            now_s = _NX_NOW_BASE_S + i
+            _time.time = lambda now_s=now_s: float(now_s)
+
+            rpc = _NxPaymentRpc(case["script"])
+            store = SegmentObservationStore()
+            executor = NativeRouteExecutor(
+                _StubPlugin(rpc),
+                observation_store=store,
+                our_id=_NX_OUR_ID,
+            )
+            route = copy.deepcopy(case["route"])
+            result = executor.execute(
+                route,
+                case["amount_sats"],
+                case["source_channel_id"],
+                case["dest_channel_id"],
+                case["max_fee_sats"],
+            )
+            if case["expect_no_rpc"]:
+                assert rpc.calls == [], (case["name"], rpc.calls)
+
+            expected = dataclasses.asdict(result)
+            if expected["error"] == "":
+                expected["error"] = None
+            pending_hash = None
+            if result.payment_pending:
+                pending_hash = result.failure_data.get("payment_hash")
+            snap = store.export_snapshot(
+                observer_member_id="gen", now=now_s
+            )
+            out_cases.append(
+                {
+                    "name": case["name"],
+                    "now_ms": now_s * 1000,
+                    "request": {
+                        "route": case["route"],
+                        "amount_sats": case["amount_sats"],
+                        "source_channel_id": case["source_channel_id"],
+                        "dest_channel_id": case["dest_channel_id"],
+                        "max_fee_sats": case["max_fee_sats"],
+                        "our_id": _NX_OUR_ID,
+                    },
+                    "rpc_script": case["script"],
+                    "expected": expected,
+                    "expected_payment_hash": pending_hash,
+                    "expected_calls": _nx_normalize_calls(
+                        rpc.calls,
+                        case["source_channel_id"],
+                        case["dest_channel_id"],
+                        case["amount_sats"],
+                    ),
+                    "expected_observations": snap["segment_observations"],
+                }
+            )
+    finally:
+        _time.time = real_time
+
+    return {
+        "invoice_expiry_sec": NativeRouteExecutor.INVOICE_EXPIRY_SEC,
+        "sendpay_timeout_sec": NativeRouteExecutor.SENDPAY_TIMEOUT_SEC,
+        "attributed_confidence": NativeRouteExecutor.ATTRIBUTED_CONFIDENCE,
+        "inferred_confidence_floor":
+            NativeRouteExecutor.INFERRED_CONFIDENCE_FLOOR,
+        "cases": out_cases,
+    }
+
+
 SUITES = {
     "modes": gen_modes,
     "planner": gen_planner,
     "segstore": gen_segstore,
     "router": gen_router,
+    "executor": gen_executor,
 }
 
 
