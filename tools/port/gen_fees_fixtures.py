@@ -3351,6 +3351,16 @@ def _to_rust_channel(ch):
     }
 
 
+def _resolve_min_competitors(cfg):
+    """Mirrors the live method's own inline resolution exactly
+    (`min_competitors = int(getattr(cfg, 'neighbor_median_min_competitors',
+    3) or 3)`, fee_controller.py:3385/3469) so the recorded fixture field
+    always matches what the oracle call actually used — not the Config
+    dataclass default (2), which only applies when a *real* `Config`
+    instance reaches the live method un-monkeypatched."""
+    return int(getattr(cfg, "neighbor_median_min_competitors", 3) or 3)
+
+
 def _median_case(name, channels, our_id="us", now=NOW, cfg=None):
     fc = _market_controller()
     fc._get_our_id = lambda: our_id
@@ -3366,6 +3376,7 @@ def _median_case(name, channels, our_id="us", now=NOW, cfg=None):
         "name": name,
         "now": now,
         "our_id": our_id,
+        "min_competitors": _resolve_min_competitors(cfg),
         "peer_channels": [_to_rust_channel(c) for c in channels],
         "expected": expected,
     }
@@ -3387,6 +3398,7 @@ def _percentile_case(name, channels, pct, our_id="us", now=NOW, cfg=None):
         "now": now,
         "our_id": our_id,
         "pct": _r(pct),
+        "min_competitors": _resolve_min_competitors(cfg),
         "peer_channels": [_to_rust_channel(c) for c in channels],
         "expected": expected,
     }
@@ -3491,6 +3503,50 @@ def gen_market_median_percentile():
     for pct in (0.0, 0.25, 0.5, 0.75, 0.9, 1.0):
         percentile_cases.append(_percentile_case(
             f"seven_competitor_varied_pool_p{int(pct * 100)}", varied, pct))
+
+    # 9. Config-driven `neighbor_median_min_competitors` (Phase 4b Task 8a):
+    # production runs with the DB-override-resolved value 2, not the
+    # inline getattr fallback of 3 Task 8's pure functions originally
+    # baked in. Pin the n-1/n/n+1 boundary at BOTH thresholds, using the
+    # exact SAME 2-channel and 3-channel pools at each threshold so the
+    # "same data, different config, different verdict" contrast is
+    # explicit: `two` resolves at threshold 2 but refuses at threshold 3;
+    # `three` resolves at threshold 3 but is already covered as the
+    # baseline three-competitor case above (case 1) for threshold 3's
+    # default. Reuses `two`/`three` from case 1 for the min_competitors=2
+    # side; builds a fresh `four` for threshold 3's n+1 pin.
+    one = [_gossip_ch("a", 100)]
+    four = three + [_gossip_ch("d", 400)]
+    cfg_min2 = SimpleNamespace(fee_interval=0, neighbor_median_min_competitors=2)
+    cfg_min3 = SimpleNamespace(fee_interval=0, neighbor_median_min_competitors=3)
+
+    median_cases.append(_median_case(
+        "min_competitors_2_below_boundary_one_none", one, cfg=cfg_min2))
+    median_cases.append(_median_case(
+        "min_competitors_2_at_boundary_two_some", two, cfg=cfg_min2))
+    median_cases.append(_median_case(
+        "min_competitors_2_above_boundary_three_some", three, cfg=cfg_min2))
+    median_cases.append(_median_case(
+        "min_competitors_3_below_boundary_two_none_same_pool_as_min2_some",
+        two, cfg=cfg_min3))
+    median_cases.append(_median_case(
+        "min_competitors_3_at_boundary_three_some", three, cfg=cfg_min3))
+    median_cases.append(_median_case(
+        "min_competitors_3_above_boundary_four_some", four, cfg=cfg_min3))
+
+    percentile_cases.append(_percentile_case(
+        "min_competitors_2_below_boundary_one_none", one, 0.5, cfg=cfg_min2))
+    percentile_cases.append(_percentile_case(
+        "min_competitors_2_at_boundary_two_some", two, 0.5, cfg=cfg_min2))
+    percentile_cases.append(_percentile_case(
+        "min_competitors_2_above_boundary_three_some", three, 0.5, cfg=cfg_min2))
+    percentile_cases.append(_percentile_case(
+        "min_competitors_3_below_boundary_two_none_same_pool_as_min2_some",
+        two, 0.5, cfg=cfg_min3))
+    percentile_cases.append(_percentile_case(
+        "min_competitors_3_at_boundary_three_some", three, 0.5, cfg=cfg_min3))
+    percentile_cases.append(_percentile_case(
+        "min_competitors_3_above_boundary_four_some", four, 0.5, cfg=cfg_min3))
 
     return median_cases, percentile_cases
 
