@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from modules.rebalance_modes import MODES, engine_kwargs  # noqa: E402
 from modules.rebalance_planner_v2 import RebalancePlanner  # noqa: E402
 from modules.rebalance_state_v2 import ChannelState, StateSnapshot  # noqa: E402
+from modules.segment_observations import SegmentObservationStore  # noqa: E402
 
 MODE_NAMES = ["normal", "hot_protection", "structural_drain", "manual", "diagnostic"]
 
@@ -425,11 +426,160 @@ def gen_planner() -> dict:
         case["expected"] = _run_planner_case(case)
 
     return {"cases": cases}
+def gen_segstore() -> dict:
+    """Dump `SegmentObservationStore` bucket-boundary + scripted
+    record/prune/export parity data (Phase 5 Task 3).
+
+    Feeds `crates/revops-rebalance/src/segstore.rs` /
+    inline unit tests in the Rust port (cl-revenue-ops-r), committed there
+    as `fixtures/rebalance/segstore.json`. The real class is the oracle:
+    `SegmentObservationStore.bucket_amount_sats` /
+    `.record_failure` / `.export_snapshot` are called directly; nothing here
+    reimplements bucket, validation, TTL-prune, or sort semantics.
+    """
+    edges = [
+        50_000,
+        100_000,
+        250_000,
+        500_000,
+        1_000_000,
+        2_000_000,
+        5_000_000,
+        10_000_000,
+    ]
+    amounts = {0, 1, 49_999, 50_000, 50_001, 10_000_000 + 1, 15_000_000, -5, -1}
+    for e in edges:
+        amounts.update({e - 1, e, e + 1})
+    bucket_cases = [
+        {"amount_sats": a, "bucket": SegmentObservationStore.bucket_amount_sats(a)}
+        for a in sorted(amounts)
+    ]
+
+    # Scripted record/prune/export sequence: exercises bucket rejection
+    # (amount_sats <= 0, sequence number NOT consumed), invalid-direction
+    # exclusion, empty-short_channel_id exclusion, unknown-failure_class
+    # normalization, confidence clamping to [0, 1], FIFO eviction beyond
+    # max_observations, TTL-boundary pruning across two export calls, and
+    # stable descending sort by observed_at (with observed_at ties).
+    store = SegmentObservationStore(ttl_seconds=500, max_observations=4)
+    record_calls = [
+        dict(
+            short_channel_id="111x1x0",
+            direction=0,
+            amount_sats=10_000,
+            failure_class="liquidity",
+            confidence=0.9,
+            observed_at=1000,
+        ),
+        dict(
+            short_channel_id="zero-amount",
+            direction=0,
+            amount_sats=0,
+            failure_class="liquidity",
+            confidence=0.5,
+            observed_at=1005,
+        ),
+        dict(
+            short_channel_id="neg-amount",
+            direction=0,
+            amount_sats=-5,
+            failure_class="liquidity",
+            confidence=0.5,
+            observed_at=1006,
+        ),
+        dict(
+            short_channel_id="222x2x1",
+            direction=1,
+            amount_sats=60_000,
+            failure_class="fee",
+            confidence=1.5,
+            observed_at=1010,
+        ),
+        dict(
+            short_channel_id="333x3x0",
+            direction=2,
+            amount_sats=200_000,
+            failure_class="timeout",
+            confidence=-0.3,
+            observed_at=1020,
+        ),
+        dict(
+            short_channel_id="444x4x1",
+            direction=1,
+            amount_sats=5_000_000,
+            failure_class="not_a_real_class",
+            confidence=2.0,
+            observed_at=1030,
+        ),
+        dict(
+            short_channel_id="",
+            direction=0,
+            amount_sats=80_000,
+            failure_class="liquidity",
+            confidence=0.4,
+            observed_at=1040,
+        ),
+        dict(
+            short_channel_id="555x5x0",
+            direction=0,
+            amount_sats=80_000,
+            failure_class="liquidity",
+            confidence=0.4,
+            observed_at=1040,
+        ),
+    ]
+
+    # `steps` is a SINGLE chronologically-ordered list (not separate
+    # records/exports arrays) precisely because interleaving matters:
+    # export_snapshot mutates the internal ring (prunes it permanently), so
+    # a replaying test MUST perform record/export calls in exactly this
+    # order, not all records followed by all exports.
+    steps = []
+    for call in record_calls:
+        result = store.record_failure(**call)
+        steps.append({"op": "record", "args": call, "result": result})
+
+    steps.append(
+        {
+            "op": "export",
+            "now": 1050,
+            "snapshot": store.export_snapshot(observer_member_id="test-node", now=1050),
+        }
+    )
+
+    late_call = dict(
+        short_channel_id="666x6x0",
+        direction=0,
+        amount_sats=300_000,
+        failure_class="liquidity",
+        confidence=0.7,
+        observed_at=1600,
+    )
+    steps.append(
+        {"op": "record", "args": late_call, "result": store.record_failure(**late_call)}
+    )
+
+    steps.append(
+        {
+            "op": "export",
+            "now": 1600,
+            "snapshot": store.export_snapshot(observer_member_id="test-node", now=1600),
+        }
+    )
+
+    return {
+        "bucket_boundaries": bucket_cases,
+        "sequence": {
+            "init": {"ttl_seconds": 500, "max_observations": 4},
+            "steps": steps,
+        },
+    }
 
 
 SUITES = {
     "modes": gen_modes,
     "planner": gen_planner,
+    "segstore": gen_segstore,
 }
 
 
