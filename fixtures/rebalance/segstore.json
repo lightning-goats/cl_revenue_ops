@@ -122,8 +122,9 @@
    "ttl_seconds": 500,
    "max_observations": 4
   },
-  "records": [
+  "steps": [
    {
+    "op": "record",
     "args": {
      "short_channel_id": "111x1x0",
      "direction": 0,
@@ -149,6 +150,7 @@
     }
    },
    {
+    "op": "record",
     "args": {
      "short_channel_id": "zero-amount",
      "direction": 0,
@@ -160,6 +162,7 @@
     "result": null
    },
    {
+    "op": "record",
     "args": {
      "short_channel_id": "neg-amount",
      "direction": 0,
@@ -171,6 +174,7 @@
     "result": null
    },
    {
+    "op": "record",
     "args": {
      "short_channel_id": "222x2x1",
      "direction": 1,
@@ -196,6 +200,7 @@
     }
    },
    {
+    "op": "record",
     "args": {
      "short_channel_id": "333x3x0",
      "direction": 2,
@@ -221,6 +226,7 @@
     }
    },
    {
+    "op": "record",
     "args": {
      "short_channel_id": "444x4x1",
      "direction": 1,
@@ -246,6 +252,7 @@
     }
    },
    {
+    "op": "record",
     "args": {
      "short_channel_id": "",
      "direction": 0,
@@ -271,6 +278,7 @@
     }
    },
    {
+    "op": "record",
     "args": {
      "short_channel_id": "555x5x0",
      "direction": 0,
@@ -296,33 +304,7 @@
     }
    },
    {
-    "args": {
-     "short_channel_id": "666x6x0",
-     "direction": 0,
-     "amount_sats": 300000,
-     "failure_class": "liquidity",
-     "confidence": 0.7,
-     "observed_at": 1600
-    },
-    "result": {
-     "observation_id": "obs-1600-7",
-     "short_channel_id": "666x6x0",
-     "direction": 0,
-     "amount_bucket_sats": 250000,
-     "outcome": "failure",
-     "failure_class": "liquidity",
-     "confidence": 0.7,
-     "observed_at": 1600,
-     "source_channel_id": "",
-     "dest_channel_id": "",
-     "route_policy": "",
-     "router_kind": "",
-     "correlation_id": ""
-    }
-   }
-  ],
-  "exports": [
-   {
+    "op": "export",
     "now": 1050,
     "snapshot": {
      "generated_at": 1050,
@@ -364,6 +346,33 @@
     }
    },
    {
+    "op": "record",
+    "args": {
+     "short_channel_id": "666x6x0",
+     "direction": 0,
+     "amount_sats": 300000,
+     "failure_class": "liquidity",
+     "confidence": 0.7,
+     "observed_at": 1600
+    },
+    "result": {
+     "observation_id": "obs-1600-7",
+     "short_channel_id": "666x6x0",
+     "direction": 0,
+     "amount_bucket_sats": 250000,
+     "outcome": "failure",
+     "failure_class": "liquidity",
+     "confidence": 0.7,
+     "observed_at": 1600,
+     "source_channel_id": "",
+     "dest_channel_id": "",
+     "route_policy": "",
+     "router_kind": "",
+     "correlation_id": ""
+    }
+   },
+   {
+    "op": "export",
     "now": 1600,
     "snapshot": {
      "generated_at": 1600,

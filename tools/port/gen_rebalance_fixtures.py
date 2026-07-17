@@ -158,12 +158,23 @@ def gen_segstore() -> dict:
         ),
     ]
 
-    record_results = []
+    # `steps` is a SINGLE chronologically-ordered list (not separate
+    # records/exports arrays) precisely because interleaving matters:
+    # export_snapshot mutates the internal ring (prunes it permanently), so
+    # a replaying test MUST perform record/export calls in exactly this
+    # order, not all records followed by all exports.
+    steps = []
     for call in record_calls:
         result = store.record_failure(**call)
-        record_results.append({"args": call, "result": result})
+        steps.append({"op": "record", "args": call, "result": result})
 
-    export1 = store.export_snapshot(observer_member_id="test-node", now=1050)
+    steps.append(
+        {
+            "op": "export",
+            "now": 1050,
+            "snapshot": store.export_snapshot(observer_member_id="test-node", now=1050),
+        }
+    )
 
     late_call = dict(
         short_channel_id="666x6x0",
@@ -173,21 +184,23 @@ def gen_segstore() -> dict:
         confidence=0.7,
         observed_at=1600,
     )
-    record_results.append(
-        {"args": late_call, "result": store.record_failure(**late_call)}
+    steps.append(
+        {"op": "record", "args": late_call, "result": store.record_failure(**late_call)}
     )
 
-    export2 = store.export_snapshot(observer_member_id="test-node", now=1600)
+    steps.append(
+        {
+            "op": "export",
+            "now": 1600,
+            "snapshot": store.export_snapshot(observer_member_id="test-node", now=1600),
+        }
+    )
 
     return {
         "bucket_boundaries": bucket_cases,
         "sequence": {
             "init": {"ttl_seconds": 500, "max_observations": 4},
-            "records": record_results,
-            "exports": [
-                {"now": 1050, "snapshot": export1},
-                {"now": 1600, "snapshot": export2},
-            ],
+            "steps": steps,
         },
     }
 
