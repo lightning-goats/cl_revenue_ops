@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.cl-revenue-ops.invalid/fee_cycle_replay.v0.schema.json",
+  "title": "Fee Cycle Replay v0",
+  "type": "object",
+  "required": [
+    "schema_name",
+    "schema_version",
+    "capture_run_id",
+    "capture_seq",
+    "cycle_id",
+    "producer",
+    "configuration",
+    "pre_state",
+    "observations",
+    "expected",
+    "completeness",
+    "payload_sha256"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_name": {
+      "const": "fee_cycle_replay"
+    },
+    "schema_version": {
+      "const": 0
+    },
+    "capture_run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "capture_seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "cycle_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "producer": {
+      "$ref": "#/$defs/wire_object"
+    },
+    "configuration": {
+      "$ref": "#/$defs/wire_object"
+    },
+    "pre_state": {
+      "$ref": "#/$defs/wire_object"
+    },
+    "observations": {
+      "$ref": "#/$defs/wire_object"
+    },
+    "expected": {
+      "$ref": "#/$defs/wire_object"
+    },
+    "completeness": {
+      "type": "object",
+      "required": [
+        "complete"
+      ],
+      "properties": {
+        "complete": {
+          "const": true
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/wire_value"
+      }
+    },
+    "payload_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "tagged_float": {
+      "type": "object",
+      "required": [
+        "__f__"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "__f__": {
+          "type": "string"
+        }
+      }
+    },
+    "wire_object": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/wire_value"
+      }
+    },
+    "wire_value": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/wire_value"
+          }
+        },
+        {
+          "type": "object",
+          "if": {
+            "required": [
+              "__f__"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/tagged_float"
+          },
+          "else": {
+            "additionalProperties": {
+              "$ref": "#/$defs/wire_value"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "examples": [
+    {
+      "capture_run_id": "run-a",
+      "capture_seq": 1,
+      "completeness": {"complete": true},
+      "configuration": {"depletion_threshold": {"__f__": "0.9500000000000001"}},
+      "cycle_id": "cycle-a",
+      "expected": {},
+      "observations": {},
+      "payload_sha256": "bf993e25c58a5aa6ca1aafc10fa89b6538444fcdd0a1b3dfe9061f4317f9156e",
+      "pre_state": {},
+      "producer": {
+        "algorithm_version": "dts_pid_v1",
+        "python_commit": "92348bf9c072b2dbc543b8b0a92c34c7e46d3035"
+      },
+      "schema_name": "fee_cycle_replay",
+      "schema_version": 0
+    }
+  ]
+}
