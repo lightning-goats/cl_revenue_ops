@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -530,6 +531,43 @@ def test_rotation_keeps_newest_32_successful_cycles(tmp_path):
     assert [attempt["capture_seq"] for attempt in manifest["attempts"]] == list(
         range(2, 34)
     )
+
+
+def test_retention_ignores_json_outside_manager_envelope_identity(
+    tmp_path, monkeypatch
+):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    manager.set_enabled(True)
+    session = _complete_session(manager)
+    manager.finish_cycle(session)
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+
+    output_dir = tmp_path / "revenue_ops_fee_replay"
+    valid_capture = _capture_files(output_dir)[0]
+    manifest = (
+        output_dir
+        / f"manifest-{session.capture_run_id}.v{capture.SCHEMA_VERSION}.json"
+    )
+    ordinary_json = output_dir / "operator-notes.json"
+    invalid_contract_shape = output_dir / "notes-00000001-backup.json"
+    ordinary_json.write_text("{}", encoding="utf-8")
+    invalid_contract_shape.write_text("{}", encoding="utf-8")
+    os.utime(invalid_contract_shape, ns=(1, 1))
+    os.utime(valid_capture, ns=(2, 2))
+    monkeypatch.setattr(capture, "RETENTION_MAX_FILES", 1)
+
+    assert manager._capture_identity(valid_capture) == (
+        session.capture_run_id,
+        session.capture_seq,
+    )
+    manager._rotate_capture_files()
+
+    assert valid_capture.exists()
+    assert manifest.exists()
+    assert ordinary_json.exists()
+    assert invalid_contract_shape.exists()
 
 
 def test_close_does_not_rotate_or_evict_retained_envelope_at_limit(

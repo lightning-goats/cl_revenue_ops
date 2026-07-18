@@ -561,10 +561,12 @@ class FeeCycleCaptureManager:
         except ValueError:
             return None
         if (
-            not run_id
+            len(run_id) != 32
+            or any(character not in "0123456789abcdef" for character in run_id)
             or len(sequence_text) != 8
-            or not sequence_text.isdigit()
-            or not cycle_id
+            or any(character not in "0123456789" for character in sequence_text)
+            or int(sequence_text) < 1
+            or cycle_id != f"{run_id}:{sequence_text}"
         ):
             return None
         return run_id, int(sequence_text)
