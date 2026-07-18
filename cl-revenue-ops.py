@@ -1095,10 +1095,25 @@ def _on_fee_replay_capture_change(
     enabled = _parse_dynamic_bool(option_name, new_value)
     cfg = globals().get("config")
     controller = globals().get("fee_controller")
+    manager = (
+        getattr(controller, "_fee_capture", None)
+        if controller is not None
+        else None
+    )
+    if manager is not None:
+        manager_ready = manager.set_enabled(enabled, timeout_seconds=5.0)
+        if enabled and manager_ready is not True:
+            raise ValueError(f"{option_name} could not be enabled")
+        if not enabled and manager_ready is not True:
+            if cfg is not None:
+                cfg.fee_replay_capture_enabled = False
+            plugin_.log(
+                "FEE REPLAY CAPTURE: disabled; writer is still draining",
+                level="warn",
+            )
+            return
     if cfg is not None:
         cfg.fee_replay_capture_enabled = enabled
-    if controller is not None and hasattr(controller, "_fee_capture"):
-        controller._fee_capture.set_enabled(enabled, timeout_seconds=5.0)
     plugin_.log(
         f"FEE REPLAY CAPTURE: {'enabled' if enabled else 'disabled'}",
         level="info",
