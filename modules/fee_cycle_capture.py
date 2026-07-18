@@ -111,9 +111,10 @@ class FeeCycleCaptureManager:
     def __init__(self, database_path: Any, logger: Any):
         expanded = os.path.expandvars(os.path.expanduser(os.fspath(database_path)))
         database = Path(expanded)
-        self.output_dir = database.with_name(f"{database.stem}_fee_replay")
+        self.output_dir = database.parent / "revenue_ops_fee_replay"
         self._logger = logger
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._queue: queue.Queue = queue.Queue(maxsize=2)
         self._writer_thread: Optional[threading.Thread] = None
         self._enabled = False
@@ -121,26 +122,33 @@ class FeeCycleCaptureManager:
         self._next_seq = 0
         self._manifest: Optional[Dict[str, Any]] = None
         self._manifest_path: Optional[Path] = None
-        self._submitted = set()
+        self._active_sessions: Dict[int, str] = {}
+        self._queued_count = 0
+        self._inflight_seq: Optional[int] = None
+        self._retained_sequences = set()
+        self._revision = 0
+        self._published_revision = 0
+        self._publish_blocked_revision = -1
+        self._close_retry_revision = -1
+        self._durable_closed = False
 
     def set_enabled(self, enabled: bool, timeout_seconds: float = 5.0) -> bool:
         try:
             if enabled:
                 return self._enable()
             return self._disable(timeout_seconds)
-        except Exception as exc:
-            self._log_failure("capture enable state change failed", exc)
+        except Exception:
             return False
 
     def begin_cycle(
         self, configuration: dict, producer: dict
     ) -> Optional[FeeCycleCaptureSession]:
         try:
-            with self._lock:
+            with self._condition:
                 if (
                     not self._enabled
                     or self._manifest is None
-                    or self._manifest["state"] != "open"
+                    or self._manifest["state"] != "active"
                     or self._capture_run_id is None
                 ):
                     return None
@@ -161,42 +169,49 @@ class FeeCycleCaptureManager:
                     configuration=configuration_copy,
                 )
                 self._next_seq = capture_seq
+                self._active_sessions[capture_seq] = cycle_id
+                self._manifest["attempted"] += 1
+                self._manifest["last_attempted_seq"] = capture_seq
+                self._manifest["attempts"].append(
+                    {
+                        "capture_seq": capture_seq,
+                        "cycle_id": cycle_id,
+                        "status": "active",
+                        "eligible": False,
+                    }
+                )
+                self._prune_attempts_locked()
+                self._mark_dirty_locked()
                 return session
-        except Exception as exc:
-            self._log_failure("capture session creation failed", exc)
+        except Exception:
             return None
 
     def finish_cycle(self, session: FeeCycleCaptureSession) -> None:
         try:
             self._finish_cycle(session)
-        except Exception as exc:
-            self._log_failure("capture submission failed", exc)
+        except Exception:
+            return
 
     def read_manifest(self) -> dict:
-        with self._lock:
-            path = self._manifest_path
-            fallback = copy.deepcopy(self._manifest) if self._manifest else {}
-        if path is None:
-            return fallback
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                value = json.load(handle)
-            return value if isinstance(value, dict) else fallback
-        except Exception:
-            return fallback
+        with self._condition:
+            return copy.deepcopy(self._manifest) if self._manifest else {}
 
     def _enable(self) -> bool:
-        with self._lock:
+        with self._condition:
             if self._enabled:
                 return True
             if self._manifest is not None and self._manifest["state"] == "draining":
                 return False
-            self._ensure_output_dir()
             run_id = uuid.uuid4().hex
             now = _utc_now()
+            work_queue: queue.Queue = queue.Queue(maxsize=2)
+            self._queue = work_queue
             self._capture_run_id = run_id
             self._next_seq = 0
-            self._submitted = set()
+            self._active_sessions = {}
+            self._queued_count = 0
+            self._inflight_seq = None
+            self._retained_sequences = set()
             self._manifest_path = (
                 self.output_dir / f"manifest-{run_id}.v{SCHEMA_VERSION}.json"
             )
@@ -204,18 +219,31 @@ class FeeCycleCaptureManager:
                 "schema_name": "fee_cycle_capture_manifest",
                 "schema_version": SCHEMA_VERSION,
                 "capture_run_id": run_id,
-                "state": "open",
+                "state": "active",
                 "queue_drained": False,
                 "started_at": now,
                 "updated_at": now,
+                "attempted": 0,
                 "completed": 0,
                 "failed": 0,
                 "dropped": 0,
+                "last_attempted_seq": None,
+                "last_completed_seq": None,
+                "retained_sequence_range": {"first": None, "last": None},
+                "writer_health": "healthy",
+                "last_error_category": None,
                 "attempts": [],
             }
             self._enabled = True
-            self._ensure_writer_locked()
-            if not self._publish_manifest_locked():
+            self._revision = 0
+            self._published_revision = 0
+            self._publish_blocked_revision = -1
+            self._close_retry_revision = -1
+            self._durable_closed = False
+            self._mark_dirty_locked()
+            try:
+                self._ensure_writer_locked(run_id, work_queue)
+            except Exception:
                 self._enabled = False
                 self._manifest = None
                 self._manifest_path = None
@@ -225,116 +253,242 @@ class FeeCycleCaptureManager:
 
     def _disable(self, timeout_seconds: float) -> bool:
         timeout = max(0.0, float(timeout_seconds))
-        with self._lock:
+        deadline = time.monotonic() + timeout
+        with self._condition:
             self._enabled = False
             if self._manifest is None:
                 return True
-            if self._manifest["state"] == "closed":
+            if self._manifest["state"] == "closed" and self._durable_closed:
                 return True
             if self._manifest["state"] != "draining":
                 self._manifest["state"] = "draining"
                 self._manifest["queue_drained"] = False
-                self._touch_manifest_locked()
-                self._publish_manifest_locked()
-            if self._queue.unfinished_tasks == 0:
-                self._close_run_locked()
-                return True
-
-        if not self._wait_for_queue(timeout):
-            return False
-
-        with self._lock:
-            self._close_run_locked()
-            return self._manifest is not None and self._manifest["state"] == "closed"
+            self._mark_dirty_locked()
+            while not self._durable_closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
 
     def _finish_cycle(self, session: FeeCycleCaptureSession) -> None:
-        with self._lock:
+        if not isinstance(session, FeeCycleCaptureSession):
+            return
+        with self._condition:
             if (
-                not isinstance(session, FeeCycleCaptureSession)
-                or self._manifest is None
-                or not self._enabled
-                or self._manifest["state"] != "open"
+                self._manifest is None
+                or self._manifest["state"] not in {"active", "draining"}
                 or session.capture_run_id != self._capture_run_id
-                or session.capture_seq in self._submitted
+                or self._active_sessions.get(session.capture_seq) != session.cycle_id
             ):
                 return
-            self._submitted.add(session.capture_seq)
-            attempt = {
-                "capture_seq": session.capture_seq,
-                "cycle_id": session.cycle_id,
-                "status": "queued",
-                "eligible": True,
-            }
-            self._manifest["attempts"].append(attempt)
-            self._touch_manifest_locked()
-            self._publish_manifest_locked()
+            attempt = self._attempt_for_seq_locked(session.capture_seq)
+            if attempt is None:
+                return
             try:
                 queued_session = copy.deepcopy(session)
+            except Exception as exc:
+                self._active_sessions.pop(session.capture_seq, None)
+                attempt["status"] = "failed"
+                attempt["eligible"] = False
+                attempt["error_category"] = _error_category(exc)
+                attempt["error"] = _error_text(exc)
+                self._manifest["failed"] += 1
+                self._record_health_error_locked(exc)
+                self._prune_attempts_locked()
+                self._mark_dirty_locked()
+                return
+
+            self._active_sessions.pop(session.capture_seq, None)
+            attempt["status"] = "queued"
+            attempt["eligible"] = False
+            try:
                 self._queue.put_nowait((queued_session, attempt))
+                self._queued_count += 1
             except queue.Full:
                 attempt["status"] = "dropped"
                 attempt["eligible"] = False
+                attempt["error_category"] = "queue_full"
                 attempt["error"] = "capture queue full"
                 self._manifest["dropped"] += 1
-                self._touch_manifest_locked()
-                self._publish_manifest_locked()
             except Exception as exc:
                 attempt["status"] = "failed"
                 attempt["eligible"] = False
+                attempt["error_category"] = _error_category(exc)
                 attempt["error"] = _error_text(exc)
                 self._manifest["failed"] += 1
-                self._touch_manifest_locked()
-                self._publish_manifest_locked()
+                self._record_health_error_locked(exc)
+            self._prune_attempts_locked()
+            self._mark_dirty_locked()
 
-    def _writer_main(self) -> None:
+    def _writer_main(self, run_id: str, work_queue: queue.Queue) -> None:
         while True:
-            session, attempt = self._queue.get()
-            try:
-                with self._lock:
-                    attempt["status"] = "writing"
-                    self._touch_manifest_locked()
-                    self._publish_manifest_locked()
+            with self._condition:
+                if self._capture_run_id != run_id or self._manifest is None:
+                    return
                 try:
-                    publication = self._publish_envelope(session)
-                except Exception as exc:
-                    with self._lock:
-                        attempt["status"] = "failed"
-                        attempt["eligible"] = False
-                        attempt["error"] = _error_text(exc)
-                        if self._manifest is not None:
-                            self._manifest["failed"] += 1
-                            self._touch_manifest_locked()
-                            self._publish_manifest_locked()
-                    self._log_failure("capture writer failed", exc)
+                    session, attempt = work_queue.get_nowait()
+                except queue.Empty:
+                    session = None
+                    attempt = None
+
+                if session is not None and attempt is not None:
+                    self._queued_count -= 1
+                    self._inflight_seq = session.capture_seq
+                    attempt["status"] = "writing"
+                    attempt["eligible"] = False
+                    self._mark_dirty_locked()
+                    snapshot = copy.deepcopy(self._manifest)
+                    revision = self._revision
+                    action = "write"
+                elif self._can_close_locked() and (
+                    self._revision > self._close_retry_revision
+                ):
+                    snapshot = None
+                    revision = self._revision
+                    action = "close"
+                elif self._revision > max(
+                    self._published_revision, self._publish_blocked_revision
+                ):
+                    snapshot = copy.deepcopy(self._manifest)
+                    revision = self._revision
+                    action = "publish"
                 else:
-                    rotation_error = None
-                    try:
-                        self._rotate_capture_files()
-                    except Exception as exc:
-                        rotation_error = _error_text(exc)
-                        self._log_failure("capture retention failed", exc)
-                    with self._lock:
-                        attempt["status"] = "completed"
-                        attempt["eligible"] = publication["eligible"]
-                        attempt["filename"] = publication["filename"]
-                        attempt["bytes"] = publication["bytes"]
-                        if rotation_error is not None:
-                            attempt["rotation_error"] = rotation_error
-                        if self._manifest is not None:
-                            self._manifest["completed"] += 1
-                            self._touch_manifest_locked()
-                            self._publish_manifest_locked()
-            except Exception as exc:
-                self._log_failure("capture writer bookkeeping failed", exc)
-            finally:
-                self._queue.task_done()
-                with self._lock:
-                    if (
-                        self._manifest is not None
-                        and self._manifest["state"] == "draining"
-                        and self._queue.unfinished_tasks == 0
-                    ):
-                        self._close_run_locked()
+                    self._condition.wait()
+                    continue
+
+            if action == "write":
+                self._publish_manifest_snapshot(run_id, snapshot, revision)
+                self._write_queued_session(run_id, work_queue, session, attempt)
+            elif action == "publish":
+                self._publish_manifest_snapshot(run_id, snapshot, revision)
+            elif self._close_run_durably(run_id):
+                return
+
+    def _publish_manifest_snapshot(
+        self, run_id: str, snapshot: dict, revision: int
+    ) -> bool:
+        with self._condition:
+            path = self._manifest_path
+        if path is None:
+            return False
+        try:
+            self._ensure_output_dir()
+            self._atomic_write(path, _json_bytes(snapshot))
+        except Exception as exc:
+            with self._condition:
+                if self._capture_run_id == run_id and self._manifest is not None:
+                    self._record_health_error_locked(exc)
+                    self._mark_dirty_locked()
+                    self._publish_blocked_revision = self._revision
+            self._log_failure("capture manifest publication failed", exc)
+            return False
+        with self._condition:
+            if self._capture_run_id == run_id:
+                self._published_revision = max(self._published_revision, revision)
+                self._publish_blocked_revision = -1
+                self._condition.notify_all()
+        return True
+
+    def _write_queued_session(
+        self,
+        run_id: str,
+        work_queue: queue.Queue,
+        session: FeeCycleCaptureSession,
+        attempt: dict,
+    ) -> None:
+        try:
+            publication = self._publish_envelope(session)
+        except Exception as exc:
+            with self._condition:
+                if self._capture_run_id == run_id and self._manifest is not None:
+                    attempt["status"] = "failed"
+                    attempt["eligible"] = False
+                    attempt["error_category"] = _error_category(exc)
+                    attempt["error"] = _error_text(exc)
+                    self._manifest["failed"] += 1
+                    self._record_health_error_locked(exc)
+                    self._inflight_seq = None
+                    work_queue.task_done()
+                    self._prune_attempts_locked()
+                    self._mark_dirty_locked()
+            self._log_failure("capture writer failed", exc)
+            return
+
+        retained_index = None
+        rotation_error = None
+        try:
+            retained_index = self._rotate_capture_files()
+            self._reconcile_closed_manifests(retained_index, run_id)
+        except Exception as exc:
+            rotation_error = exc
+            self._log_failure("capture retention failed", exc)
+
+        with self._condition:
+            if self._capture_run_id != run_id or self._manifest is None:
+                work_queue.task_done()
+                return
+            attempt["status"] = "completed"
+            attempt["eligible"] = publication["eligible"]
+            attempt["filename"] = publication["filename"]
+            attempt["bytes"] = publication["bytes"]
+            self._manifest["completed"] += 1
+            self._manifest["last_completed_seq"] = session.capture_seq
+            if retained_index is None:
+                self._retained_sequences.add(session.capture_seq)
+            else:
+                self._set_retained_sequences_locked(
+                    retained_index.get(run_id, set())
+                )
+            if rotation_error is not None:
+                attempt["rotation_error"] = _error_text(rotation_error)
+                self._record_health_error_locked(rotation_error)
+            self._inflight_seq = None
+            work_queue.task_done()
+            self._prune_attempts_locked()
+            self._mark_dirty_locked()
+
+    def _close_run_durably(self, run_id: str) -> bool:
+        try:
+            self._ensure_output_dir()
+            retained_index = self._rotate_capture_files()
+            self._reconcile_closed_manifests(retained_index, run_id)
+            with self._condition:
+                if not self._can_close_locked() or self._capture_run_id != run_id:
+                    return False
+                self._set_retained_sequences_locked(
+                    retained_index.get(run_id, set())
+                )
+                closed_snapshot = copy.deepcopy(self._manifest)
+                closed_snapshot["state"] = "closed"
+                closed_snapshot["queue_drained"] = True
+                closed_snapshot["updated_at"] = _utc_now()
+                path = self._manifest_path
+                revision = self._revision
+            if path is None:
+                return False
+            self._atomic_write(path, _json_bytes(closed_snapshot))
+        except Exception as exc:
+            with self._condition:
+                if self._capture_run_id == run_id and self._manifest is not None:
+                    self._record_health_error_locked(exc)
+                    self._mark_dirty_locked()
+                    self._close_retry_revision = self._revision
+            self._log_failure("capture close publication failed", exc)
+            return False
+
+        with self._condition:
+            if self._capture_run_id != run_id or not self._can_close_locked():
+                return False
+            self._manifest["state"] = "closed"
+            self._manifest["queue_drained"] = True
+            self._manifest["updated_at"] = closed_snapshot["updated_at"]
+            self._durable_closed = True
+            self._published_revision = max(self._published_revision, revision)
+            if self._writer_thread is threading.current_thread():
+                self._writer_thread = None
+            self._condition.notify_all()
+        return True
 
     def _publish_envelope(self, session: FeeCycleCaptureSession) -> dict:
         body = session.to_body()
@@ -356,7 +510,7 @@ class FeeCycleCaptureManager:
             "eligible": bool(body["completeness"]["complete"]),
         }
 
-    def _rotate_capture_files(self) -> None:
+    def _rotate_capture_files(self) -> Dict[str, set]:
         candidates = []
         for path in self.output_dir.glob(
             f"capture-*.v{SCHEMA_VERSION}.json"
@@ -379,6 +533,62 @@ class FeeCycleCaptureManager:
             retained_bytes += size
         if removed:
             self._fsync_directory()
+        return self._capture_index(
+            path for _mtime, _name, _size, path in candidates if path.exists()
+        )
+
+    def _capture_index(self, paths: Iterator[Path]) -> Dict[str, set]:
+        retained: Dict[str, set] = {}
+        prefix = "capture-"
+        suffix = f".v{SCHEMA_VERSION}.json"
+        for path in paths:
+            name = path.name
+            if not name.startswith(prefix) or not name.endswith(suffix):
+                continue
+            identity = name[len(prefix) : -len(suffix)]
+            try:
+                run_id, sequence_text = identity.rsplit("-", 1)
+                sequence = int(sequence_text)
+            except (TypeError, ValueError):
+                continue
+            retained.setdefault(run_id, set()).add(sequence)
+        return retained
+
+    def _reconcile_closed_manifests(
+        self, retained_index: Dict[str, set], current_run_id: str
+    ) -> None:
+        current_path = self._manifest_path
+        removed = False
+        for path in self.output_dir.glob(
+            f"manifest-*.v{SCHEMA_VERSION}.json"
+        ):
+            if path == current_path:
+                continue
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    manifest = json.load(handle)
+            except Exception:
+                continue
+            if not isinstance(manifest, dict) or manifest.get("state") != "closed":
+                continue
+            run_id = manifest.get("capture_run_id")
+            retained_sequences = retained_index.get(str(run_id), set())
+            if not retained_sequences:
+                path.unlink()
+                removed = True
+                continue
+            updated = copy.deepcopy(manifest)
+            updated["attempts"] = self._bounded_attempt_records(
+                updated.get("attempts", []), retained_sequences
+            )
+            updated["retained_sequence_range"] = self._sequence_range(
+                retained_sequences
+            )
+            if updated != manifest:
+                updated["updated_at"] = _utc_now()
+                self._atomic_write(path, _json_bytes(updated))
+        if removed:
+            self._fsync_directory()
 
     def _ensure_output_dir(self) -> None:
         if self.output_dir.is_symlink():
@@ -388,49 +598,92 @@ class FeeCycleCaptureManager:
             raise OSError(f"capture output path is not a directory: {self.output_dir}")
         os.chmod(self.output_dir, 0o700)
 
-    def _ensure_writer_locked(self) -> None:
-        if self._writer_thread is not None and self._writer_thread.is_alive():
-            return
+    def _ensure_writer_locked(self, run_id: str, work_queue: queue.Queue) -> None:
+        if self._writer_thread is not None:
+            raise RuntimeError("capture writer already active")
         self._writer_thread = threading.Thread(
             target=self._writer_main,
+            args=(run_id, work_queue),
             name="fee-cycle-capture-writer",
             daemon=True,
         )
         self._writer_thread.start()
 
-    def _publish_manifest_locked(self) -> bool:
-        if self._manifest is None or self._manifest_path is None:
-            return False
-        try:
-            self._atomic_write(self._manifest_path, _json_bytes(self._manifest))
-            return True
-        except Exception as exc:
-            self._log_failure("capture manifest publication failed", exc)
-            return False
-
-    def _touch_manifest_locked(self) -> None:
+    def _mark_dirty_locked(self) -> None:
         if self._manifest is not None:
             self._manifest["updated_at"] = _utc_now()
+        self._revision += 1
+        self._condition.notify_all()
 
-    def _close_run_locked(self) -> None:
-        if self._manifest is None or self._manifest["state"] == "closed":
-            return
-        if self._queue.unfinished_tasks != 0:
-            return
-        self._manifest["state"] = "closed"
-        self._manifest["queue_drained"] = True
-        self._touch_manifest_locked()
-        self._publish_manifest_locked()
+    def _can_close_locked(self) -> bool:
+        return bool(
+            self._manifest is not None
+            and self._manifest["state"] == "draining"
+            and not self._active_sessions
+            and self._queued_count == 0
+            and self._inflight_seq is None
+        )
 
-    def _wait_for_queue(self, timeout_seconds: float) -> bool:
-        deadline = time.monotonic() + timeout_seconds
-        with self._queue.all_tasks_done:
-            while self._queue.unfinished_tasks:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._queue.all_tasks_done.wait(remaining)
-            return True
+    def _attempt_for_seq_locked(self, capture_seq: int) -> Optional[dict]:
+        if self._manifest is None:
+            return None
+        for attempt in self._manifest["attempts"]:
+            if attempt.get("capture_seq") == capture_seq:
+                return attempt
+        return None
+
+    def _record_health_error_locked(self, exc: Exception) -> None:
+        if self._manifest is None:
+            return
+        self._manifest["writer_health"] = "degraded"
+        self._manifest["last_error_category"] = _error_category(exc)
+
+    def _set_retained_sequences_locked(self, sequences: set) -> None:
+        self._retained_sequences = set(sequences)
+        if self._manifest is not None:
+            self._manifest["retained_sequence_range"] = self._sequence_range(
+                self._retained_sequences
+            )
+        self._prune_attempts_locked()
+
+    def _prune_attempts_locked(self) -> None:
+        if self._manifest is None:
+            return
+        self._manifest["attempts"] = self._bounded_attempt_records(
+            self._manifest["attempts"], self._retained_sequences
+        )
+
+    @staticmethod
+    def _bounded_attempt_records(attempts: Any, retained_sequences: set) -> list:
+        if not isinstance(attempts, list):
+            return []
+        live = []
+        retained = []
+        failures = []
+        for attempt in attempts:
+            if not isinstance(attempt, dict):
+                continue
+            status = attempt.get("status")
+            sequence = attempt.get("capture_seq")
+            if status in {"active", "queued", "writing"}:
+                live.append(attempt)
+            elif status == "completed" and sequence in retained_sequences:
+                retained.append(attempt)
+            elif status in {"failed", "dropped"}:
+                failures.append(attempt)
+        failures = sorted(
+            failures, key=lambda item: int(item.get("capture_seq", -1))
+        )[-RETENTION_MAX_FILES:]
+        return sorted(
+            retained + failures + live,
+            key=lambda item: int(item.get("capture_seq", -1)),
+        )
+
+    @staticmethod
+    def _sequence_range(sequences: set) -> dict:
+        if not sequences:
+            return {"first": None, "last": None}
+        return {"first": min(sequences), "last": max(sequences)}
 
     def _atomic_write(self, destination: Path, payload: bytes) -> None:
         temporary = destination.with_name(
@@ -492,3 +745,7 @@ def _utc_now() -> str:
 
 def _error_text(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
+
+
+def _error_category(exc: Exception) -> str:
+    return type(exc).__name__

@@ -56,6 +56,21 @@ def test_disabled_manager_opens_no_session(tmp_path):
     assert not (tmp_path / "revenue_ops_fee_replay").exists()
 
 
+def test_authority_side_input_errors_do_not_call_logger(tmp_path):
+    logged = []
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *args, **kwargs: logged.append(
+            (args, kwargs)
+        )
+    )
+    manager.set_enabled(True)
+
+    assert manager.set_enabled(False, timeout_seconds="not-a-timeout") is False
+    assert logged == []
+
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+
+
 def test_session_records_copies_and_context_binding():
     session = FeeCycleCaptureSession(
         capture_run_id="run-a",
@@ -137,6 +152,94 @@ def test_enabled_manager_publishes_private_atomic_cycle(tmp_path):
     assert not list(output_dir.glob(".*.tmp"))
 
 
+def test_manifest_exposes_complete_active_run_state(tmp_path):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    manager.set_enabled(True)
+    output_dir = tmp_path / "revenue_ops_fee_replay"
+    _wait_until(lambda: bool(list(output_dir.glob("manifest-*.json"))))
+
+    manifest = manager.read_manifest()
+    assert manifest["state"] == "active"
+    assert manifest["attempted"] == 0
+    assert manifest["completed"] == 0
+    assert manifest["failed"] == 0
+    assert manifest["dropped"] == 0
+    assert manifest["last_attempted_seq"] is None
+    assert manifest["last_completed_seq"] is None
+    assert manifest["retained_sequence_range"] == {"first": None, "last": None}
+    assert manifest["writer_health"] == "healthy"
+    assert manifest["last_error_category"] is None
+    assert manifest["queue_drained"] is False
+
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+
+
+def test_finish_cycle_never_waits_for_manifest_storage(tmp_path, monkeypatch):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    manager.set_enabled(True)
+    output_dir = tmp_path / "revenue_ops_fee_replay"
+    _wait_until(lambda: bool(list(output_dir.glob("manifest-*.json"))))
+    session = _complete_session(manager)
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_atomic_write = manager._atomic_write
+
+    def blocked_manifest_write(destination, payload):
+        if destination.name.startswith("manifest-"):
+            entered.set()
+            assert release.wait(5.0)
+        return original_atomic_write(destination, payload)
+
+    monkeypatch.setattr(manager, "_atomic_write", blocked_manifest_write)
+    authority = threading.Thread(
+        target=lambda: (manager.finish_cycle(session), finished.set())
+    )
+    authority.start()
+    try:
+        assert entered.wait(5.0)
+        assert finished.wait(0.1), "finish_cycle blocked on durable manifest I/O"
+    finally:
+        release.set()
+        authority.join(5.0)
+        manager.set_enabled(False, timeout_seconds=5.0)
+
+
+def test_enable_only_notifies_writer_when_manifest_storage_is_blocked(
+    tmp_path, monkeypatch
+):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_atomic_write = manager._atomic_write
+
+    def blocked_manifest_write(destination, payload):
+        if destination.name.startswith("manifest-"):
+            entered.set()
+            assert release.wait(5.0)
+        return original_atomic_write(destination, payload)
+
+    monkeypatch.setattr(manager, "_atomic_write", blocked_manifest_write)
+    authority = threading.Thread(
+        target=lambda: (manager.set_enabled(True), finished.set())
+    )
+    authority.start()
+    try:
+        assert finished.wait(0.1), "enable blocked on durable manifest I/O"
+        assert entered.wait(5.0)
+    finally:
+        release.set()
+        authority.join(5.0)
+        manager.set_enabled(False, timeout_seconds=5.0)
+
+
 def test_queue_capacity_drops_third_pending_submission(tmp_path, monkeypatch):
     manager = FeeCycleCaptureManager(
         tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
@@ -169,6 +272,51 @@ def test_queue_capacity_drops_third_pending_submission(tmp_path, monkeypatch):
     assert manager.read_manifest()["completed"] == 3
 
 
+def test_queue_drop_never_waits_for_manifest_storage(tmp_path, monkeypatch):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    envelope_entered = threading.Event()
+    envelope_release = threading.Event()
+    manifest_release = threading.Event()
+    finished = threading.Event()
+    original_publish = manager._publish_envelope
+    original_atomic_write = manager._atomic_write
+
+    def blocked_envelope(session):
+        envelope_entered.set()
+        assert envelope_release.wait(5.0)
+        return original_publish(session)
+
+    def blocked_manifest_write(destination, payload):
+        if destination.name.startswith("manifest-"):
+            assert manifest_release.wait(5.0)
+        return original_atomic_write(destination, payload)
+
+    monkeypatch.setattr(manager, "_publish_envelope", blocked_envelope)
+    manager.set_enabled(True)
+    manager.finish_cycle(_complete_session(manager, padding="active"))
+    assert envelope_entered.wait(5.0)
+    manager.finish_cycle(_complete_session(manager, padding="pending-1"))
+    manager.finish_cycle(_complete_session(manager, padding="pending-2"))
+    monkeypatch.setattr(manager, "_atomic_write", blocked_manifest_write)
+
+    authority = threading.Thread(
+        target=lambda: (
+            manager.finish_cycle(_complete_session(manager, padding="dropped")),
+            finished.set(),
+        )
+    )
+    authority.start()
+    try:
+        assert finished.wait(0.1), "queue drop blocked on durable manifest I/O"
+    finally:
+        manifest_release.set()
+        authority.join(5.0)
+        envelope_release.set()
+        manager.set_enabled(False, timeout_seconds=5.0)
+
+
 def test_writer_exception_fails_open_and_records_failed_attempt(tmp_path, monkeypatch):
     manager = FeeCycleCaptureManager(
         tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
@@ -192,6 +340,118 @@ def test_writer_exception_fails_open_and_records_failed_attempt(tmp_path, monkey
     assert _capture_files(tmp_path / "revenue_ops_fee_replay") == []
 
 
+def test_pending_attempt_is_ineligible_until_envelope_is_durable(
+    tmp_path, monkeypatch
+):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original_publish = manager._publish_envelope
+
+    def blocked_publish(session):
+        entered.set()
+        assert release.wait(5.0)
+        return original_publish(session)
+
+    monkeypatch.setattr(manager, "_publish_envelope", blocked_publish)
+    manager.set_enabled(True)
+    manager.finish_cycle(_complete_session(manager))
+    assert entered.wait(5.0)
+
+    try:
+        attempt = manager.read_manifest()["attempts"][0]
+        assert attempt["status"] in {"queued", "writing"}
+        assert attempt["eligible"] is False
+    finally:
+        release.set()
+        manager.set_enabled(False, timeout_seconds=5.0)
+
+
+def test_disable_waits_for_begun_session_and_accepts_its_late_finish(tmp_path):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    manager.set_enabled(True)
+    session = _complete_session(manager)
+
+    assert manager.set_enabled(False, timeout_seconds=0.01) is False
+    manifest = manager.read_manifest()
+    assert manifest["state"] == "draining"
+    assert manifest["queue_drained"] is False
+
+    manager.finish_cycle(session)
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+    manifest = manager.read_manifest()
+    assert manifest["state"] == "closed"
+    assert manifest["queue_drained"] is True
+    assert manifest["completed"] == 1
+
+
+def test_disable_acknowledges_close_only_after_closed_manifest_is_durable(
+    tmp_path, monkeypatch
+):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    manager.set_enabled(True)
+    output_dir = tmp_path / "revenue_ops_fee_replay"
+    _wait_until(lambda: bool(list(output_dir.glob("manifest-*.json"))))
+    original_atomic_write = manager._atomic_write
+
+    def reject_closed_manifest(destination, payload):
+        if destination.name.startswith("manifest-"):
+            manifest = json.loads(payload)
+            if manifest["state"] == "closed":
+                raise OSError("closed manifest unavailable")
+        return original_atomic_write(destination, payload)
+
+    monkeypatch.setattr(manager, "_atomic_write", reject_closed_manifest)
+    assert manager.set_enabled(False, timeout_seconds=0.05) is False
+    assert manager.read_manifest()["state"] != "closed"
+
+    monkeypatch.setattr(manager, "_atomic_write", original_atomic_write)
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+    assert manager.read_manifest()["state"] == "closed"
+
+
+def test_output_directory_is_fixed_sibling_of_database_parent(tmp_path):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "custom-name.sqlite3", lambda *_args, **_kw: None
+    )
+
+    assert manager.output_dir == tmp_path / "revenue_ops_fee_replay"
+    manager.set_enabled(True)
+    manager.finish_cycle(_complete_session(manager))
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+    assert (tmp_path / "revenue_ops_fee_replay").is_dir()
+    assert not (tmp_path / "custom-name_fee_replay").exists()
+
+
+def test_closed_worker_terminates_and_reenable_starts_fresh_worker(tmp_path):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    manager.set_enabled(True)
+    first_worker = manager._writer_thread
+    assert first_worker is not None
+
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+    first_worker.join(1.0)
+    assert not first_worker.is_alive()
+
+    assert manager.set_enabled(True)
+    second_worker = manager._writer_thread
+    assert second_worker is not None
+    assert second_worker is not first_worker
+    assert second_worker.is_alive()
+
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+    second_worker.join(1.0)
+    assert not second_worker.is_alive()
+
+
 def test_rotation_keeps_newest_32_successful_cycles(tmp_path):
     manager = FeeCycleCaptureManager(
         tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
@@ -206,6 +466,117 @@ def test_rotation_keeps_newest_32_successful_cycles(tmp_path):
     assert len(files) == 32
     assert not any("-00000001." in path.name for path in files)
     assert any("-00000033." in path.name for path in files)
+    manifest = manager.read_manifest()
+    assert manifest["completed"] == 33
+    assert len(manifest["attempts"]) == 32
+    assert [attempt["capture_seq"] for attempt in manifest["attempts"]] == list(
+        range(2, 34)
+    )
+
+
+def test_attempt_rotation_preserves_aggregate_failure_truth(tmp_path, monkeypatch):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    original_publish = manager._publish_envelope
+
+    def fail_first(session):
+        if session.capture_seq == 1:
+            raise OSError("first capture failed")
+        return original_publish(session)
+
+    monkeypatch.setattr(manager, "_publish_envelope", fail_first)
+    manager.set_enabled(True)
+    manager.finish_cycle(_complete_session(manager, padding="failed"))
+    _wait_until(lambda: manager.read_manifest()["failed"] == 1)
+
+    for seq in range(2, 34):
+        manager.finish_cycle(_complete_session(manager, padding=str(seq)))
+        _wait_until(lambda: manager.read_manifest()["completed"] == seq - 1)
+    assert manager.set_enabled(False, timeout_seconds=10.0)
+
+    manifest = manager.read_manifest()
+    assert manifest["attempted"] == 33
+    assert manifest["completed"] == 32
+    assert manifest["failed"] == 1
+    assert manifest["dropped"] == 0
+    assert manifest["last_attempted_seq"] == 33
+    assert manifest["last_completed_seq"] == 33
+    assert manifest["retained_sequence_range"] == {"first": 2, "last": 33}
+    assert [attempt["capture_seq"] for attempt in manifest["attempts"]] == list(
+        range(1, 34)
+    )
+
+
+def test_failed_attempt_after_32_successes_keeps_all_retained_metadata(
+    tmp_path, monkeypatch
+):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    original_publish = manager._publish_envelope
+    manager.set_enabled(True)
+    for seq in range(1, 33):
+        manager.finish_cycle(_complete_session(manager, padding=str(seq)))
+        _wait_until(lambda: manager.read_manifest()["completed"] == seq)
+
+    def fail_last(_session):
+        raise OSError("last capture failed")
+
+    monkeypatch.setattr(manager, "_publish_envelope", fail_last)
+    manager.finish_cycle(_complete_session(manager, padding="failed"))
+    _wait_until(lambda: manager.read_manifest()["failed"] == 1)
+    assert manager.set_enabled(False, timeout_seconds=10.0)
+
+    manifest = manager.read_manifest()
+    assert manifest["attempted"] == 33
+    assert manifest["completed"] == 32
+    assert manifest["failed"] == 1
+    assert manifest["retained_sequence_range"] == {"first": 1, "last": 32}
+    assert [attempt["capture_seq"] for attempt in manifest["attempts"]] == list(
+        range(1, 34)
+    )
+    assert manifest["attempts"][-1]["status"] == "failed"
+    assert manifest["attempts"][-1]["eligible"] is False
+
+    monkeypatch.setattr(manager, "_publish_envelope", original_publish)
+
+
+def test_terminal_failure_detail_is_bounded_beside_retained_completions(
+    tmp_path, monkeypatch
+):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    manager.set_enabled(True)
+    for seq in range(1, 33):
+        manager.finish_cycle(_complete_session(manager, padding=str(seq)))
+        _wait_until(lambda: manager.read_manifest()["completed"] == seq)
+
+    def explode(_session):
+        raise OSError("persistent writer failure")
+
+    monkeypatch.setattr(manager, "_publish_envelope", explode)
+    for failed_count in range(1, 34):
+        manager.finish_cycle(_complete_session(manager, padding="failed"))
+        _wait_until(lambda: manager.read_manifest()["failed"] == failed_count)
+    assert manager.set_enabled(False, timeout_seconds=10.0)
+
+    manifest = manager.read_manifest()
+    assert manifest["attempted"] == 65
+    assert manifest["completed"] == 32
+    assert manifest["failed"] == 33
+    assert len(manifest["attempts"]) == 64
+    assert [
+        attempt["capture_seq"]
+        for attempt in manifest["attempts"]
+        if attempt["status"] == "completed"
+    ] == list(range(1, 33))
+    assert [
+        attempt["capture_seq"]
+        for attempt in manifest["attempts"]
+        if attempt["status"] == "failed"
+    ] == list(range(34, 66))
 
 
 def test_rotation_enforces_total_byte_cap_after_successful_publication(
@@ -315,3 +686,72 @@ def test_restart_uses_unique_run_ids_manifests_and_capture_names(tmp_path):
     assert len(manifests) == 2
     assert len(captures) == 2
     assert len({path.name for path in manifests + captures}) == 4
+
+
+def test_retention_prunes_orphaned_empty_and_failed_run_manifests(
+    tmp_path, monkeypatch
+):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+
+    manager.set_enabled(True)
+    empty_run_id = manager._capture_run_id
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+
+    original_publish = manager._publish_envelope
+
+    def explode(_session):
+        raise OSError("failed-only run")
+
+    monkeypatch.setattr(manager, "_publish_envelope", explode)
+    manager.set_enabled(True)
+    failed_run_id = manager._capture_run_id
+    manager.finish_cycle(_complete_session(manager))
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+
+    monkeypatch.setattr(manager, "_publish_envelope", original_publish)
+    manager.set_enabled(True)
+    retained_run_id = manager._capture_run_id
+    manager.finish_cycle(_complete_session(manager))
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+
+    manifests = list(
+        (tmp_path / "revenue_ops_fee_replay").glob("manifest-*.v0.json")
+    )
+    manifest_run_ids = {
+        json.loads(path.read_text(encoding="utf-8"))["capture_run_id"]
+        for path in manifests
+    }
+    assert manifest_run_ids == {retained_run_id}
+    assert empty_run_id not in manifest_run_ids
+    assert failed_run_id not in manifest_run_ids
+
+
+def test_retention_keeps_manifest_for_each_globally_retained_envelope(tmp_path):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    first_run_id = None
+    for _ in range(33):
+        manager.set_enabled(True)
+        if first_run_id is None:
+            first_run_id = manager._capture_run_id
+        manager.finish_cycle(_complete_session(manager))
+        assert manager.set_enabled(False, timeout_seconds=5.0)
+
+    output_dir = tmp_path / "revenue_ops_fee_replay"
+    captures = _capture_files(output_dir)
+    manifests = list(output_dir.glob("manifest-*.v0.json"))
+    capture_run_ids = {
+        json.loads(path.read_text(encoding="utf-8"))["capture_run_id"]
+        for path in captures
+    }
+    manifest_run_ids = {
+        json.loads(path.read_text(encoding="utf-8"))["capture_run_id"]
+        for path in manifests
+    }
+    assert len(captures) == 32
+    assert len(manifests) == 32
+    assert manifest_run_ids == capture_run_ids
+    assert first_run_id not in manifest_run_ids
