@@ -166,6 +166,7 @@ The envelope contains:
 ```text
 schema_name
 schema_version
+capture_run_id
 capture_seq
 cycle_id
 producer
@@ -211,11 +212,20 @@ the canonical envelope body excluding `payload_sha256`.
 
 ## Manifest and completeness
 
-The writer maintains an atomically replaced `manifest.v0.json` containing:
+Each transition from disabled to enabled creates a unique `capture_run_id`.
+Sequence numbers start at one within that run. Capture filenames are
+`<capture_run_id>-<capture_seq>-<cycle_id>.json`.
 
+The writer maintains an atomically replaced
+`manifest-<capture_run_id>.v0.json` containing:
+
+- the current `capture_run_id` and lifecycle state (`active`, `draining`, or
+  `closed`);
 - attempted, completed, failed, and dropped totals;
 - last attempted and completed sequence numbers;
 - the retained sequence range;
+- one bounded attempt record per retained sequence, containing sequence,
+  cycle ID, status, and stable error category when applicable;
 - writer health and last error category;
 - queue-drained status.
 
@@ -227,8 +237,10 @@ A validation window is eligible only when:
 
 - every selected file has a recognized schema and valid digest;
 - every file is marked complete and its declared counts agree with contents;
+- all selected files belong to one manifest run in `closed` state;
 - capture sequence numbers are consecutive within the selected range;
-- the manifest reports no failed or dropped attempt in that range;
+- the manifest contains one completed attempt record for every sequence in the
+  selected range and no failed or dropped attempt in that range;
 - the writer reports the queue drained after capture is disabled.
 
 Invalid or unmatched captures are gate failures. The parity tool does not
@@ -270,8 +282,12 @@ Add one dynamic boolean option:
 `revenue-ops-fee-replay-capture-enabled`
 
 The default is `false`. Enabling it does not start a fee cycle; the next
-naturally scheduled Python cycle opens a capture session. Disabling it prevents
-new sessions and requests a bounded writer drain. The live collection workflow
+naturally scheduled Python cycle opens a capture session. Disabling it
+immediately prevents new sessions and waits up to five seconds for the writer.
+If the queue has not drained, the option still reads back as disabled while the
+manifest remains `draining`; the writer changes it to `closed` only after all
+queued work and the final manifest update complete. Validation cannot begin
+until the manifest is `closed` and queue-drained. The live collection workflow
 may mutate only this option and must verify readback.
 
 No new action RPC is introduced. Existing scheduled Python actions continue
