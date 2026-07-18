@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import queue
+import random
 import threading
 import time
 import uuid
@@ -105,6 +106,119 @@ def bind_capture(
 
 def current_capture() -> Optional[FeeCycleCaptureSession]:
     return _CURRENT_CAPTURE.get()
+
+
+def _observation_ordinal(session: Any, family: str) -> int:
+    try:
+        entries = session.observations[family]
+        return len(entries) if isinstance(entries, list) else 0
+    except Exception:
+        return 0
+
+
+def _record_observation_no_throw(session: Any, family: str, entry: dict) -> None:
+    if session is None:
+        return
+    try:
+        session.record_observation(family, entry)
+    except Exception as exc:
+        try:
+            session.mark_invalid(
+                f"capture recorder failure: {type(exc).__name__}"
+            )
+        except Exception:
+            pass
+
+
+def decision_now(label: str) -> int:
+    value = int(time.time())
+    session = current_capture()
+    _record_observation_no_throw(
+        session,
+        "clock",
+        {
+            "ordinal": _observation_ordinal(session, "clock"),
+            "label": label,
+            "value": value,
+        },
+    )
+    return value
+
+
+def decision_random(label: str) -> float:
+    value = random.random()
+    session = current_capture()
+    _record_observation_no_throw(
+        session,
+        "entropy",
+        {
+            "ordinal": _observation_ordinal(session, "entropy"),
+            "op": "random",
+            "label": label,
+            "args": [],
+            "result": value,
+        },
+    )
+    return value
+
+
+def decision_gauss(label: str, mu: float, sigma: float) -> float:
+    value = random.gauss(mu, sigma)
+    session = current_capture()
+    _record_observation_no_throw(
+        session,
+        "entropy",
+        {
+            "ordinal": _observation_ordinal(session, "entropy"),
+            "op": "gauss",
+            "label": label,
+            "args": [mu, sigma],
+            "result": value,
+        },
+    )
+    return value
+
+
+def _stable_error_message(exc: Exception) -> str:
+    try:
+        return str(exc)
+    except Exception:
+        return "unprintable exception"
+
+
+def record_effective_evidence(op: Any, args: Any, fn: Any) -> Any:
+    session = current_capture()
+    if session is None:
+        return fn()
+    ordinal = _observation_ordinal(session, "evidence")
+    try:
+        result = fn()
+    except Exception as exc:
+        _record_observation_no_throw(
+            session,
+            "evidence",
+            {
+                "ordinal": ordinal,
+                "op": op,
+                "args": args,
+                "error": {
+                    "category": type(exc).__name__,
+                    "message": _stable_error_message(exc),
+                },
+            },
+        )
+        raise
+    _record_observation_no_throw(
+        session,
+        "evidence",
+        {
+            "ordinal": ordinal,
+            "op": op,
+            "args": args,
+            "result": result,
+        },
+    )
+    return result
 
 
 class FeeCycleCaptureManager:

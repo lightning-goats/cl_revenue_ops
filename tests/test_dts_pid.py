@@ -1,11 +1,15 @@
 """Tests for DTS + PID fee controller components."""
+import copy
+from contextlib import nullcontext
 import json
 import math
+import random
 import time
 from typing import Dict, List, Tuple, get_type_hints
 from unittest.mock import MagicMock
 
 import pytest
+from modules.fee_cycle_capture import FeeCycleCaptureSession, bind_capture
 from modules.fee_controller import (
     GaussianThompsonState,
     FeeAdjustment,
@@ -181,6 +185,7 @@ class TestDTSDiscountFactor:
         import random as _random
 
         import modules.fee_controller as fc_mod
+        import modules.fee_cycle_capture as capture_mod
 
         class FakeTime:
             t = 1_750_000_000.0
@@ -194,6 +199,7 @@ class TestDTSDiscountFactor:
                 return "12"
 
         monkeypatch.setattr(fc_mod, "time", FakeTime)
+        monkeypatch.setattr(capture_mod, "time", FakeTime)
 
         # Established history around 300 ppm with real revenue
         ts = GaussianThompsonState()
@@ -1039,6 +1045,81 @@ def _make_fc_for_dts_pid(mock_plugin, mock_database):
     mock_plugin.rpc.feerates.return_value = {"perkw": {"opening": 1000}}
 
     return fc, cfg
+
+
+def test_capture_entropy_preserves_seeded_controller_adjustment_and_state(
+    mock_plugin, mock_database, monkeypatch
+):
+    fixed_now = 1_750_000_000
+    monkeypatch.setattr("modules.fee_cycle_capture.time.time", lambda: fixed_now)
+    channel_id = "123x456x0"
+    peer_id = "02" + "a" * 64
+    channel_info = {
+        "short_channel_id": channel_id,
+        "peer_id": peer_id,
+        "fee_proportional_millionths": 500,
+        "capacity": 2_000_000,
+        "spendable_msat": "1000000000msat",
+        "opener": "local",
+    }
+    flow_state = {
+        "state": "balanced",
+        "forward_count": 50,
+        "sats_out": 10_000,
+    }
+    mock_database.get_fee_strategy_state.return_value["last_update"] = (
+        fixed_now - 7200
+    )
+    mock_database.get_last_forward_time.return_value = fixed_now - 1800
+
+    def run(session=None):
+        controller, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        controller.config.dry_run = True
+        random.seed(20260718)
+        context = bind_capture(session) if session is not None else nullcontext()
+        with context:
+            adjustment = controller._adjust_channel_fee(
+                channel_id,
+                peer_id,
+                flow_state,
+                channel_info,
+                cfg=cfg,
+            )
+        assert adjustment is not None
+        return (
+            adjustment.to_dict(),
+            copy.deepcopy(controller._cycle_states[channel_id].__dict__),
+            controller._channel_fee_states[channel_id].to_v2_dict(),
+        )
+
+    baseline = run()
+    session = FeeCycleCaptureSession(
+        capture_run_id="b" * 32,
+        capture_seq=1,
+        cycle_id=f"{'b' * 32}:00000001",
+        producer={"started_at": "2026-07-18T00:00:00+00:00"},
+        configuration={"version": 1},
+    )
+    captured = run(session)
+
+    assert captured == baseline
+    assert [entry["label"] for entry in session.observations["clock"]] == [
+        "channel.adjust",
+        "rebalance_cost_floor.cutoff",
+        "rebalance_cost_history.cutoff",
+        "flow_ceiling.last_forward_age",
+        "thompson.posterior.update",
+        "thompson.posterior.recompute",
+        "thompson.contextual.update",
+        "thompson.last_sample_time",
+        "pid.calculate",
+        "thompson.supported_fee_ceiling",
+        "thompson.earning_region",
+        "thompson.meaningful_rate",
+    ]
+    assert [entry["label"] for entry in session.observations["entropy"]] == [
+        "thompson.prior"
+    ]
 
 
 class TestZeroFlowRatchetGuard:

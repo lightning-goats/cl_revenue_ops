@@ -54,7 +54,6 @@ Revenue Calculation:
 from __future__ import annotations
 
 import time
-import random
 import math
 import json
 import threading
@@ -67,6 +66,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from . import admission_policy as _admission_policy
 from .database import Database
+from .fee_cycle_capture import decision_gauss, decision_now, decision_random
 from .policy_manager import PolicyManager, FeeStrategy, PeerPolicy
 from .utils import normalize_scid, parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
@@ -570,7 +570,9 @@ class GaussianThompsonState:
         if self.real_observation_count() < self.MIN_OBSERVATIONS:
             # Use prior with extra exploration (clamped to MIN_STD like normal path)
             explore_std = max(self.MIN_STD, self.prior_std_fee * 1.1) * boost
-            sampled = random.gauss(self.prior_mean_fee, explore_std)
+            sampled = decision_gauss(
+                "thompson.prior", self.prior_mean_fee, explore_std
+            )
             # The prior ignores posterior_mean, so advisory nudges (e.g.
             # neighbor-median seeding on young channels) must be applied here
             sampled += self._posterior_bias_shift(sampled)
@@ -586,18 +588,20 @@ class GaussianThompsonState:
                 sampled += self._posterior_bias_shift(sampled)
                 sampled_fee = int(max(floor, min(ceiling, sampled)))
                 self.last_sampled_fee = sampled_fee
-                self.last_sample_time = int(time.time())
+                self.last_sample_time = decision_now("thompson.last_sample_time")
                 return sampled_fee
             # Fallback: sample from Gaussian posterior. No extra bias shift:
             # posterior_mean already carries the nudges via
             # _apply_posterior_bias after every recompute.
             modulated_std = max(self.MIN_STD, self.posterior_std) * boost
-            sampled = random.gauss(self.posterior_mean, modulated_std)
+            sampled = decision_gauss(
+                "thompson.posterior", self.posterior_mean, modulated_std
+            )
 
         # Clamp to bounds
         sampled_fee = int(max(floor, min(ceiling, sampled)))
         self.last_sampled_fee = sampled_fee
-        self.last_sample_time = int(time.time())
+        self.last_sample_time = decision_now("thompson.last_sample_time")
 
         return sampled_fee
 
@@ -665,7 +669,7 @@ class GaussianThompsonState:
 
         sampled_fee = int(max(floor, min(ceiling, base + offset)))
         self.last_sampled_fee = sampled_fee
-        self.last_sample_time = int(time.time())
+        self.last_sample_time = decision_now("thompson.last_sample_time")
         return sampled_fee
 
     def _sample_from_polynomial_posterior(
@@ -700,13 +704,21 @@ class GaussianThompsonState:
         if L is None:
             # Fallback: diagonal approximation
             diag = [max(1e-6, Sigma[i][i]) for i in range(3)]
-            z = [random.gauss(0, 1) * noise_scale for _ in range(3)]
+            z = [
+                decision_gauss(f"thompson.polynomial.coefficient.{i}", 0, 1)
+                * noise_scale
+                for i in range(3)
+            ]
             beta_sampled = [
                 self.posterior_coeffs[i] + z[i] * math.sqrt(diag[i])
                 for i in range(3)
             ]
         else:
-            z = [random.gauss(0, 1) * noise_scale for _ in range(3)]
+            z = [
+                decision_gauss(f"thompson.polynomial.coefficient.{i}", 0, 1)
+                * noise_scale
+                for i in range(3)
+            ]
             Lz = self._mat3_vec_mul(L, z)
             beta_sampled = [self.posterior_coeffs[i] + Lz[i] for i in range(3)]
 
@@ -748,7 +760,7 @@ class GaussianThompsonState:
                 flagged so the supported-fee ceiling ignores it: congestion
                 pricing is slot protection, not a market test.
         """
-        now = int(time.time())
+        now = decision_now("thompson.posterior.update")
 
         # Guard against NaN/Inf inputs that would corrupt the posterior
         if not math.isfinite(hours) or hours <= 0:
@@ -844,7 +856,7 @@ class GaussianThompsonState:
         except (TypeError, ValueError):
             return False
         if now is None:
-            now = int(time.time())
+            now = decision_now("thompson.meaningful_rate")
         ref = self._effective_positive_rate_ref(now)
         return rate > 0 and rate >= self.TRICKLE_RESET_FRAC * ref
 
@@ -920,7 +932,7 @@ class GaussianThompsonState:
         room to escape the floor absorbing state while staying bounded.
         """
         if now is None:
-            now = int(time.time())
+            now = decision_now("thompson.supported_fee_ceiling")
         masses = self._positive_revenue_mass(now)
         total = sum(m for _, m in masses)
         if total <= 0:
@@ -1026,7 +1038,7 @@ class GaussianThompsonState:
             revenue_rate: Observed revenue rate (demand-adjusted)
             time_bucket: Current time bucket ("low", "normal", "peak")
         """
-        now = int(time.time())
+        now = decision_now("thompson.contextual.update")
 
         if context_key not in self.contextual_posteriors:
             # Initialize from global posterior as hierarchical prior
@@ -1134,7 +1146,6 @@ class GaussianThompsonState:
             return
 
         balance, _, role = parts
-        now = int(time.time())
 
         # Determine adjacent time buckets
         adjacent = {
@@ -1193,7 +1204,7 @@ class GaussianThompsonState:
         if weight <= 0 or target_fee < 0:
             return
 
-        now = int(time.time())
+        now = decision_now("thompson.posterior_nudge")
         # Dedupe (M4): a nudge toward (approximately) the same target is the
         # same advisory signal — refresh its timestamp/weight so it stays
         # live, instead of accumulating entries that compound on every
@@ -1256,7 +1267,7 @@ class GaussianThompsonState:
         """
         if not self.posterior_bias:
             return 0.0
-        now = int(time.time())
+        now = decision_now("thompson.posterior_bias.shift")
         shifted = float(base)
         for entry in self.posterior_bias:
             try:
@@ -1276,7 +1287,7 @@ class GaussianThompsonState:
         """Re-apply recorded nudges after a posterior rebuild, with decay."""
         if not self.posterior_bias:
             return
-        now = int(time.time())
+        now = decision_now("thompson.posterior_bias.apply")
         kept: List[Tuple[float, float, int]] = []
         for entry in self.posterior_bias:
             try:
@@ -1325,7 +1336,7 @@ class GaussianThompsonState:
         # asserted "no demand" at untested fees and inflated
         # charged_fee_mean); their one coherent role is the zero-regime
         # anchor's downward gradient, so they stay in the anchor pool.
-        now = int(time.time())
+        now = decision_now("thompson.posterior.recompute")
         weighted_obs: List[Tuple[float, float, float]] = []  # (fee, revenue, weight)
         weighted_ts: List[int] = []  # Parallel timestamps (zero-regime filtering)
         anchor_pool: List[Tuple[float, float, int]] = []  # (fee, weight, ts) incl. probes
@@ -1590,7 +1601,7 @@ class GaussianThompsonState:
                 self.posterior_mean = float(self.prior_mean_fee)
                 self.posterior_std = float(self.prior_std_fee)
                 return
-            now = int(time.time())
+            now = decision_now("thompson.posterior.recompute_legacy")
             weighted_obs = []
             for obs in self.observations:
                 if len(obs) >= 4:
@@ -1980,7 +1991,7 @@ class PIDState:
         capacity_sats: int,
         flow_state: str = "balanced",
     ) -> float:
-        now = int(time.time())
+        now = decision_now("pid.calculate")
         if self.last_update_time <= 0:
             dt = 0.0
         else:
@@ -2358,8 +2369,6 @@ class VegasReflexState:
             current_sat_vb: Current mempool fee rate in sat/vB
             ma_sat_vb: Moving average fee rate (24h)
         """
-        import random
-        
         if ma_sat_vb <= 0:
             ma_sat_vb = 1.0  # Prevent division by zero
         
@@ -2383,10 +2392,13 @@ class VegasReflexState:
             # Either 2 consecutive spikes OR random chance proportional to spike
             boost = (spike_ratio - 2.0) / 2.0  # 0.0 to 1.0
 
-            if self.consecutive_spikes >= 2 or random.random() < boost * 0.5:
+            if (
+                self.consecutive_spikes >= 2
+                or decision_random("vegas.boost") < boost * 0.5
+            ):
                 self.intensity = min(1.0, self.intensity + boost * 0.3)
         self.last_sat_vb = current_sat_vb
-        self.last_update = int(time.time())
+        self.last_update = decision_now("vegas.update")
     
     def get_floor_multiplier(self) -> float:
         """
@@ -3571,7 +3583,7 @@ class FeeController:
         if not self.database:
             return 0
         try:
-            cutoff = int(time.time()) - (
+            cutoff = decision_now("rebalance_cost_history.cutoff") - (
                 self.REBALANCE_FLOOR_WINDOW_DAYS * 86400
             )
             try:
@@ -4105,7 +4117,9 @@ class FeeController:
         # Strategy 1: Per-channel cost history.
         # Push the window filter into SQL when the DB layer supports it;
         # fall back to the legacy full-history signature otherwise.
-        cutoff = int(time.time()) - (self.REBALANCE_FLOOR_WINDOW_DAYS * 86400)
+        cutoff = decision_now("rebalance_cost_floor.cutoff") - (
+            self.REBALANCE_FLOOR_WINDOW_DAYS * 86400
+        )
         try:
             cost_history = self.database.get_channel_cost_history(
                 channel_id, since_timestamp=cutoff
@@ -4191,7 +4205,7 @@ class FeeController:
                 # Be conservative: don't penalize new channels
                 return base_ceiling
 
-            now = int(time.time())
+            now = decision_now("flow_ceiling.last_forward_age")
             days_since_forward = (now - last_forward_ts) / 86400
 
             if days_since_forward >= self.ZERO_FLOW_DAYS_SEVERE:
@@ -4307,7 +4321,7 @@ class FeeController:
             Number of channels woken up
         """
         woken = 0
-        now = int(time.time())
+        now = decision_now("state.wake_all")
         _, profile = self._resolve_fee_profile()
         # Backdate far enough to satisfy the observation window check
         backdated = now - int(profile.min_observation_hours * 3600) - 1
@@ -4829,7 +4843,7 @@ class FeeController:
                 # Issue #32: pass actual fee for desync detection
                 actual_fee = channel_info.get("fee_proportional_millionths", 0)
                 cycle = self._get_cycle_state(channel_id, actual_fee_ppm=actual_fee)
-                now = int(time.time())
+                now = decision_now("cycle.channel.evaluate")
                 pre_is_sleeping = cycle.is_sleeping
                 pre_last_update = cycle.last_update
                 pre_last_broadcast_fee = cycle.last_broadcast_fee_ppm
@@ -5495,7 +5509,9 @@ class FeeController:
             updated_at = int(state.get("updated_at") or 0)
             if updated_at > 0:
                 max_age = 2 * int(cfg.flow_interval)
-                if (int(time.time()) - updated_at) > max_age:
+                if (
+                    decision_now("congestion.snapshot_age") - updated_at
+                ) > max_age:
                     return False  # stale label — flow analysis stopped updating
         except (TypeError, ValueError, AttributeError):
             pass  # no usable timestamp — treat as fresh
@@ -5586,7 +5602,7 @@ class FeeController:
         exploration_flag = self.database.get_channel_probe(channel_id)
         is_under_exploration = (exploration_flag is not None)
         
-        now = int(time.time())
+        now = decision_now("channel.adjust")
 
         # Get current fee
         raw_chain_fee = channel_info.get("fee_proportional_millionths", 0)
@@ -6730,7 +6746,7 @@ class FeeController:
                 # extra headroom step so the belief can be market-tested.
                 try:
                     probe_cap = ts_state.thompson.maybe_upward_probe_cap(
-                        int(time.time()), supported_cap
+                        decision_now("thompson.upward_probe_cap"), supported_cap
                     )
                 except Exception:
                     probe_cap = None
@@ -6815,7 +6831,7 @@ class FeeController:
             zero_revenue_streak = ts_state.thompson.zero_revenue_streak
             try:
                 earning_anchor_ppm = ts_state.thompson._earning_region_fee(
-                    int(time.time())
+                    decision_now("thompson.earning_region")
                 )
             except Exception:
                 earning_anchor_ppm = None
@@ -7535,13 +7551,11 @@ class FeeController:
         without reserving; the gates are paused/stale plus the ledger
         trail. Returns (authorized, reason_code_str); FAILS CLOSED."""
         try:
-            import time as _time
-
             from .econ_intents import Explanation, make_intent
             from .econ_types import Micro, Msat, SignedMsat, UnixTime
             from .governor_facade import GovernorFacade
 
-            now = int(_time.time())
+            now = decision_now("governor.authorize")
             cfg = self.config.snapshot() \
                 if hasattr(self.config, "snapshot") else self.config
 
@@ -7821,7 +7835,9 @@ class FeeController:
             result["old_fee_ppm"] = old_fee_ppm
             result["message"] = f"Fee set to {fee_ppm} PPM"
             # Failure-nudge gossip-settle anchor (audit SL-2).
-            self._last_fee_apply_ts[resolved_channel_id] = int(time.time())
+            self._last_fee_apply_ts[resolved_channel_id] = decision_now(
+                "fee.apply"
+            )
 
             # M-13: Removed per-channel sleep+verify+retry loop from hot path.
             # Fee verification is handled by the existing gossip refresh mechanism
@@ -7860,7 +7876,7 @@ class FeeController:
                 FeeReasonCode.CHANNEL_OPEN.value,
             )
             if should_sync_state:
-                now = int(time.time())
+                now = decision_now("fee.state_sync")
                 # TS-1: Protect state mutations with _state_lock
                 with self._state_lock:
                     try:
@@ -8551,7 +8567,7 @@ class FeeController:
             return
         if not self.is_fee_relevant_failure(failcode, failreason):
             return
-        now = int(time.time())
+        now = decision_now("failed_forward.record")
         # Gossip-settle cooldown + per-window rate limit (audit SL-2, see
         # FAILURE_NUDGE_GOSSIP_SETTLE_SECONDS).
         applied_ts = self._last_fee_apply_ts.get(channel_id, 0)
