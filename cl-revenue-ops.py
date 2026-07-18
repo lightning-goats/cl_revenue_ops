@@ -1073,6 +1073,38 @@ _scid_cache_fetch_lock = threading.Lock()  # M-2: Serializes cache-miss RPC call
 # PLUGIN OPTIONS
 # =============================================================================
 
+
+def _parse_dynamic_bool(option_name: str, value: Any) -> bool:
+    """Parse a dynamic boolean option without accepting ambiguous values."""
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"{option_name} must be a boolean")
+
+
+def _on_fee_replay_capture_change(
+    plugin_: Plugin,
+    option_name: str,
+    new_value: Any,
+) -> None:
+    """Apply fee replay capture lifecycle changes from setconfig."""
+    enabled = _parse_dynamic_bool(option_name, new_value)
+    cfg = globals().get("config")
+    controller = globals().get("fee_controller")
+    if cfg is not None:
+        cfg.fee_replay_capture_enabled = enabled
+    if controller is not None and hasattr(controller, "_fee_capture"):
+        controller._fee_capture.set_enabled(enabled, timeout_seconds=5.0)
+    plugin_.log(
+        f"FEE REPLAY CAPTURE: {'enabled' if enabled else 'disabled'}",
+        level="info",
+    )
+
+
 plugin.add_option(
     name='revenue-ops-db-path',
     default='~/.lightning/revenue_ops.db',
@@ -1089,6 +1121,18 @@ plugin.add_option(
     name='revenue-ops-fee-interval',
     default='1800',
     description='Interval in seconds for fee adjustments (default: 30 min)'
+)
+
+plugin.add_option(
+    name='revenue-ops-fee-replay-capture-enabled',
+    default='false',
+    description=(
+        'Internal observational fee-cycle replay capture. Disabled by '
+        'default; enabling observes the next naturally scheduled cycle '
+        'without starting a cycle.'
+    ),
+    dynamic=True,
+    on_change=_on_fee_replay_capture_change,
 )
 
 plugin.add_option(
@@ -2415,6 +2459,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_interval=_safe_int('revenue-ops-flow-interval'),
         fee_interval=_safe_int('revenue-ops-fee-interval'),
         rebalance_interval=_safe_int('revenue-ops-rebalance-interval'),
+        fee_replay_capture_enabled=(
+            str(options.get(
+                'revenue-ops-fee-replay-capture-enabled',
+                'false',
+            )).strip().lower() == 'true'
+        ),
         hot_channel_protection_enabled=options.get('revenue-ops-hot-channel-protection-enabled', 'true').lower() == 'true',
         hot_channel_protection_override_peers=str(options.get('revenue-ops-hot-channel-protection-override-peers', '') or ''),
         hot_channel_protection_min_velocity=_safe_float_opt('revenue-ops-hot-channel-protection-min-velocity', '0.20'),
