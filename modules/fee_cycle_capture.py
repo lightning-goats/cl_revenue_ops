@@ -150,6 +150,7 @@ class FeeCycleCaptureManager:
                     or self._manifest is None
                     or self._manifest["state"] != "active"
                     or self._capture_run_id is None
+                    or self._active_sessions
                 ):
                     return None
                 configuration_copy = copy.deepcopy(configuration)
@@ -451,7 +452,7 @@ class FeeCycleCaptureManager:
     def _close_run_durably(self, run_id: str) -> bool:
         try:
             self._ensure_output_dir()
-            retained_index = self._rotate_capture_files()
+            retained_index = self._current_capture_index()
             self._reconcile_closed_manifests(retained_index, run_id)
             with self._condition:
                 if not self._can_close_locked() or self._capture_run_id != run_id:
@@ -500,8 +501,8 @@ class FeeCycleCaptureManager:
                 f"{MAX_ENVELOPE_BYTES} byte capture limit"
             )
         filename = (
-            f"capture-{session.capture_run_id}-{session.capture_seq:08d}."
-            f"v{SCHEMA_VERSION}.json"
+            f"{session.capture_run_id}-{session.capture_seq:08d}-"
+            f"{session.cycle_id}.json"
         )
         self._atomic_write(self.output_dir / filename, serialized)
         return {
@@ -512,9 +513,9 @@ class FeeCycleCaptureManager:
 
     def _rotate_capture_files(self) -> Dict[str, set]:
         candidates = []
-        for path in self.output_dir.glob(
-            f"capture-*.v{SCHEMA_VERSION}.json"
-        ):
+        for path in self.output_dir.glob("*.json"):
+            if self._capture_identity(path) is None:
+                continue
             stat = path.stat()
             candidates.append((stat.st_mtime_ns, path.name, stat.st_size, path))
         candidates.sort(reverse=True)
@@ -537,22 +538,36 @@ class FeeCycleCaptureManager:
             path for _mtime, _name, _size, path in candidates if path.exists()
         )
 
+    def _current_capture_index(self) -> Dict[str, set]:
+        return self._capture_index(self.output_dir.glob("*.json"))
+
     def _capture_index(self, paths: Iterator[Path]) -> Dict[str, set]:
         retained: Dict[str, set] = {}
-        prefix = "capture-"
-        suffix = f".v{SCHEMA_VERSION}.json"
         for path in paths:
-            name = path.name
-            if not name.startswith(prefix) or not name.endswith(suffix):
+            identity = self._capture_identity(path)
+            if identity is None:
                 continue
-            identity = name[len(prefix) : -len(suffix)]
-            try:
-                run_id, sequence_text = identity.rsplit("-", 1)
-                sequence = int(sequence_text)
-            except (TypeError, ValueError):
-                continue
+            run_id, sequence = identity
             retained.setdefault(run_id, set()).add(sequence)
         return retained
+
+    @staticmethod
+    def _capture_identity(path: Path) -> Optional[tuple]:
+        name = path.name
+        if name.startswith("manifest-") or not name.endswith(".json"):
+            return None
+        try:
+            run_id, sequence_text, cycle_id = name[:-5].split("-", 2)
+        except ValueError:
+            return None
+        if (
+            not run_id
+            or len(sequence_text) != 8
+            or not sequence_text.isdigit()
+            or not cycle_id
+        ):
+            return None
+        return run_id, int(sequence_text)
 
     def _reconcile_closed_manifests(
         self, retained_index: Dict[str, set], current_run_id: str
@@ -593,10 +608,15 @@ class FeeCycleCaptureManager:
     def _ensure_output_dir(self) -> None:
         if self.output_dir.is_symlink():
             raise OSError(f"capture output directory is a symlink: {self.output_dir}")
+        created = not self.output_dir.exists()
         self.output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.output_dir.is_symlink():
+            raise OSError(f"capture output directory is a symlink: {self.output_dir}")
         if not self.output_dir.is_dir():
             raise OSError(f"capture output path is not a directory: {self.output_dir}")
         os.chmod(self.output_dir, 0o700)
+        if created:
+            self._fsync_directory(self.output_dir.parent)
 
     def _ensure_writer_locked(self, run_id: str, work_queue: queue.Queue) -> None:
         if self._writer_thread is not None:
@@ -714,9 +734,10 @@ class FeeCycleCaptureManager:
                 pass
             raise
 
-    def _fsync_directory(self) -> None:
+    def _fsync_directory(self, directory: Optional[Path] = None) -> None:
+        target = self.output_dir if directory is None else Path(directory)
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        descriptor = os.open(self.output_dir, flags)
+        descriptor = os.open(target, flags)
         try:
             os.fsync(descriptor)
         finally:

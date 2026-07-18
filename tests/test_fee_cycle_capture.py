@@ -145,11 +145,44 @@ def test_enabled_manager_publishes_private_atomic_cycle(tmp_path):
     manifests = [path for path in files if path.name.startswith("manifest-")]
     assert len(captures) == 1
     assert len(manifests) == 1
+    assert captures[0].name == (
+        f"{session.capture_run_id}-{session.capture_seq:08d}-{session.cycle_id}.json"
+    )
+    assert manifests[0].name == (
+        f"manifest-{session.capture_run_id}.v{capture.SCHEMA_VERSION}.json"
+    )
     assert output_dir.stat().st_mode & 0o777 == 0o700
     assert captures[0].stat().st_mode & 0o777 == 0o600
     assert manifests[0].stat().st_mode & 0o777 == 0o600
     assert not list(output_dir.glob("*.tmp"))
     assert not list(output_dir.glob(".*.tmp"))
+
+
+def test_first_output_creation_fsyncs_parent_and_atomic_publication_fsyncs_output(
+    tmp_path, monkeypatch
+):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    fsynced_directories = []
+    original_fsync_directory = manager._fsync_directory
+
+    def observe_fsync_directory(directory=None):
+        target = manager.output_dir if directory is None else Path(directory)
+        fsynced_directories.append(target)
+        if directory is None:
+            return original_fsync_directory()
+        return original_fsync_directory(directory)
+
+    monkeypatch.setattr(manager, "_fsync_directory", observe_fsync_directory)
+    manager.set_enabled(True)
+    output_dir = tmp_path / "revenue_ops_fee_replay"
+    try:
+        _wait_until(lambda: bool(list(output_dir.glob("manifest-*.json"))))
+        assert tmp_path in fsynced_directories
+        assert output_dir in fsynced_directories
+    finally:
+        manager.set_enabled(False, timeout_seconds=5.0)
 
 
 def test_manifest_exposes_complete_active_run_state(tmp_path):
@@ -389,6 +422,31 @@ def test_disable_waits_for_begun_session_and_accepts_its_late_finish(tmp_path):
     assert manifest["completed"] == 1
 
 
+def test_begin_cycle_allows_only_one_unfinished_session_and_late_finish(tmp_path):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    manager.set_enabled(True)
+    first = _complete_session(manager)
+    manifest_before_second = manager.read_manifest()
+
+    second = manager.begin_cycle(
+        {"version": 1, "padding": "duplicate-active"},
+        {"python_commit": "abc"},
+    )
+
+    assert second is None
+    manifest_after_second = manager.read_manifest()
+    assert manifest_after_second["attempted"] == manifest_before_second["attempted"] == 1
+    assert manifest_after_second["last_attempted_seq"] == 1
+    assert len(manifest_after_second["attempts"]) == 1
+
+    assert manager.set_enabled(False, timeout_seconds=0.01) is False
+    manager.finish_cycle(first)
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+    assert manager.read_manifest()["completed"] == 1
+
+
 def test_disable_acknowledges_close_only_after_closed_manifest_is_durable(
     tmp_path, monkeypatch
 ):
@@ -464,14 +522,38 @@ def test_rotation_keeps_newest_32_successful_cycles(tmp_path):
 
     files = _capture_files(tmp_path / "revenue_ops_fee_replay")
     assert len(files) == 32
-    assert not any("-00000001." in path.name for path in files)
-    assert any("-00000033." in path.name for path in files)
+    assert not any("-00000001-" in path.name for path in files)
+    assert any("-00000033-" in path.name for path in files)
     manifest = manager.read_manifest()
     assert manifest["completed"] == 33
     assert len(manifest["attempts"]) == 32
     assert [attempt["capture_seq"] for attempt in manifest["attempts"]] == list(
         range(2, 34)
     )
+
+
+def test_close_does_not_rotate_or_evict_retained_envelope_at_limit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(capture, "RETENTION_MAX_FILES", 1)
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    manager.set_enabled(True)
+    manager.finish_cycle(_complete_session(manager))
+    _wait_until(lambda: manager.read_manifest()["completed"] == 1)
+
+    retained = _capture_files(tmp_path / "revenue_ops_fee_replay")
+    assert len(retained) == capture.RETENTION_MAX_FILES
+    retained_path = retained[0]
+
+    def destructive_close_rotation():
+        retained_path.unlink()
+        return {}
+
+    monkeypatch.setattr(manager, "_rotate_capture_files", destructive_close_rotation)
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+    assert retained_path.exists()
 
 
 def test_attempt_rotation_preserves_aggregate_failure_truth(tmp_path, monkeypatch):
@@ -600,7 +682,7 @@ def test_rotation_enforces_total_byte_cap_after_successful_publication(
     files = _capture_files(output_dir)
     assert len(files) == 2
     assert sum(path.stat().st_size for path in files) <= capture.RETENTION_MAX_BYTES
-    assert any("-00000003." in path.name for path in files)
+    assert any("-00000003-" in path.name for path in files)
 
 
 def test_complete_serialized_envelope_over_cap_is_failed_and_ineligible(
