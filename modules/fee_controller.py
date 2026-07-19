@@ -4781,28 +4781,21 @@ class FeeController:
         channels = prefetched_channels or record_effective_evidence(
             "channels_info", [], self._get_channels_info
         )
-        # Hydrate valid channel inputs before Vegas or a decision mutates state.
-        # The later decision path reuses these cached states, so capture does not
-        # add evidence I/O or change hydration behavior when it is disabled.
-        for state in channel_states:
-            if not isinstance(state, dict):
-                continue
-            channel_id = state.get("channel_id")
-            peer_id = state.get("peer_id")
-            if not channel_id or not peer_id:
-                continue
-            channel_info = channels.get(channel_id)
-            cycle_state = None
-            fee_state = None
-            if channel_info:
-                actual_fee = channel_info.get("fee_proportional_millionths", 0)
-                cycle_state = self._get_cycle_state(
-                    channel_id, actual_fee_ppm=actual_fee
-                )
-                fee_state = self._get_channel_fee_state(
-                    channel_id, peer_id, actual_fee_ppm=actual_fee
-                )
-            if capture_session is not None:
+        # Snapshot state that is already warm before Vegas can mutate it.
+        # Cold state stays behind its original overlay/policy/dynamic gates.
+        if capture_session is not None:
+            for state in channel_states:
+                if not isinstance(state, dict):
+                    continue
+                channel_id = state.get("channel_id")
+                peer_id = state.get("peer_id")
+                if not channel_id or not peer_id:
+                    continue
+                channel_info = channels.get(channel_id)
+                cycle_state = self._cycle_states.get(channel_id)
+                fee_state = self._channel_fee_states.get(channel_id)
+                if channel_info and cycle_state is None and fee_state is None:
+                    continue
                 self._capture_channel_pre_state(
                     capture_session,
                     channel_id=channel_id,

@@ -902,7 +902,49 @@ def test_capture_records_channel_pre_state_before_vegas_wake(
     ] is False
 
 
-def test_cold_channel_pre_state_is_hydrated_before_vegas_without_extra_io(
+@pytest.mark.parametrize(
+    ("strategy", "overlay"),
+    [
+        (FeeStrategy.DYNAMIC, True),
+        (FeeStrategy.PASSIVE, False),
+        (FeeStrategy.STATIC, False),
+    ],
+)
+def test_default_off_cold_skip_does_not_hydrate_state(
+    tmp_path, monkeypatch, strategy, overlay
+):
+    controller, manager = _capture_controller(
+        tmp_path,
+        enabled=False,
+        strategy=strategy,
+        overlay=overlay,
+    )
+    controller._cycle_states.clear()
+    controller._channel_fee_states.clear()
+    if strategy == FeeStrategy.STATIC:
+        controller.policy_manager.get_policy.return_value = PeerPolicy(
+            peer_id=PEER_ID,
+            strategy=FeeStrategy.STATIC,
+            fee_ppm_target=100,
+        )
+    controller.database.get_fee_strategy_state.side_effect = AssertionError(
+        "cold skip hydrated state"
+    )
+    adjust = MagicMock()
+    monkeypatch.setattr(controller, "_adjust_channel_fee", adjust)
+
+    assert controller.adjust_all_fees() == []
+
+    controller.database.get_fee_strategy_state.assert_not_called()
+    adjust.assert_not_called()
+    controller.data_service.set_channel.assert_not_called()
+    assert controller._cycle_states == {}
+    assert controller._channel_fee_states == {}
+    assert manager.sessions == []
+    assert manager.finished == []
+
+
+def test_cold_dynamic_capture_hydrates_before_decision_without_extra_io(
     tmp_path, monkeypatch
 ):
     controllers = [
@@ -930,16 +972,17 @@ def test_cold_channel_pre_state_is_hydrated_before_vegas_without_extra_io(
             "v2_state_json": "{}",
         }
 
-        def vegas_wake(current=controller):
+        def vegas_probe(current=controller):
+            assert CHANNEL_ID not in current._cycle_states
+            assert CHANNEL_ID not in current._channel_fee_states
+            return False
+
+        def adjust(current=controller, **_kwargs):
+            current._get_channel_fee_state(CHANNEL_ID, PEER_ID)
             assert current._cycle_states[CHANNEL_ID].is_sleeping is True
             assert current._channel_fee_states[CHANNEL_ID].is_sleeping is True
             current._cycle_states[CHANNEL_ID].is_sleeping = False
             current._channel_fee_states[CHANNEL_ID].is_sleeping = False
-            return True
-
-        def adjust(current=controller, **_kwargs):
-            current._get_cycle_state(CHANNEL_ID)
-            current._get_channel_fee_state(CHANNEL_ID, PEER_ID)
             return FeeAdjustment(
                 CHANNEL_ID,
                 PEER_ID,
@@ -949,7 +992,7 @@ def test_cold_channel_pre_state_is_hydrated_before_vegas_without_extra_io(
                 {"target": 125},
             )
 
-        monkeypatch.setattr(controller, "_maybe_wake_for_vegas_spike", vegas_wake)
+        monkeypatch.setattr(controller, "_maybe_wake_for_vegas_spike", vegas_probe)
         monkeypatch.setattr(controller, "_adjust_channel_fee", adjust)
         results.append(controller.adjust_all_fees())
         io_counts.append({
