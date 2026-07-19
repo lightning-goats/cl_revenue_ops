@@ -695,6 +695,112 @@ def test_recursive_execution_transcript_never_changes_successful_result(
 
     assert capture_session.invalid_reason == "capture recorder failure: RecursionError"
 
+
+class _MalformedCurrentCapture:
+    @property
+    def observations(self):
+        raise RuntimeError("malformed observations")
+
+    def record_observation(self, _family, _entry):
+        raise RuntimeError("malformed recorder")
+
+    def mark_invalid(self, _reason):
+        return None
+
+
+class _MetadataBoolFailure:
+    def __bool__(self):
+        raise RuntimeError("metadata bool failed")
+
+
+class _MetadataStrFailure:
+    def __str__(self):
+        raise RuntimeError("metadata str failed")
+
+
+class _UnstringableAuthorityError(RuntimeError):
+    def __str__(self):
+        raise RuntimeError("metadata str failed")
+
+
+@pytest.mark.parametrize(
+    "surface, metadata_failure",
+    [
+        ("governor", "malformed_capture"),
+        ("governor", "bool"),
+        ("governor", "str"),
+        ("execution", "malformed_capture"),
+    ],
+)
+def test_transcript_metadata_preparation_never_replaces_success(
+    tmp_path, monkeypatch, capture_session, surface, metadata_failure
+):
+    controller, _manager = _capture_controller(tmp_path)
+    session = (
+        _MalformedCurrentCapture()
+        if metadata_failure == "malformed_capture"
+        else capture_session
+    )
+
+    if surface == "governor":
+        delegated_result = (
+            _MetadataBoolFailure() if metadata_failure == "bool" else True,
+            _MetadataStrFailure() if metadata_failure == "str" else "allowed",
+        )
+        monkeypatch.setattr(
+            controller,
+            "_governed_authorize_fee_broadcast_inner",
+            MagicMock(return_value=delegated_result),
+        )
+        with bind_capture(session):
+            actual = controller._governed_authorize_fee_broadcast(
+                channel_id=CHANNEL_ID,
+                fee_ppm=125,
+                old_fee_ppm=100,
+                reason="test",
+                reason_code="test",
+            )
+    else:
+        delegated_result = {"success": True}
+        monkeypatch.setattr(
+            controller,
+            "_set_channel_fee_inner",
+            MagicMock(return_value=delegated_result),
+        )
+        with bind_capture(session):
+            actual = controller.set_channel_fee(CHANNEL_ID, 125)
+
+    assert actual is delegated_result
+
+
+@pytest.mark.parametrize("metadata_failure", ["malformed_capture", "str"])
+def test_execution_metadata_preparation_never_replaces_original_error(
+    tmp_path, monkeypatch, capture_session, metadata_failure
+):
+    controller, _manager = _capture_controller(tmp_path)
+    session = (
+        _MalformedCurrentCapture()
+        if metadata_failure == "malformed_capture"
+        else capture_session
+    )
+    delegated_error = (
+        _UnstringableAuthorityError("authority failed")
+        if metadata_failure == "str"
+        else RuntimeError("authority failed")
+    )
+    monkeypatch.setattr(
+        controller,
+        "_set_channel_fee_inner",
+        MagicMock(side_effect=delegated_error),
+    )
+
+    with bind_capture(session):
+        with pytest.raises(type(delegated_error)) as raised:
+            controller.set_channel_fee(CHANNEL_ID, 125)
+
+    assert raised.value is delegated_error
+
+
 def test_full_cycle_capture_records_pre_state_outcome_and_post_state(
     tmp_path, monkeypatch
 ):
@@ -794,6 +900,78 @@ def test_capture_records_channel_pre_state_before_vegas_wake(
     assert body["expected"]["post_channel_state"][0]["cycle_state"][
         "is_sleeping"
     ] is False
+
+
+def test_cold_channel_pre_state_is_hydrated_before_vegas_without_extra_io(
+    tmp_path, monkeypatch
+):
+    controllers = [
+        _capture_controller(tmp_path / "enabled", enabled=True),
+        _capture_controller(tmp_path / "disabled", enabled=False),
+    ]
+    results = []
+    io_counts = []
+
+    for controller, manager in controllers:
+        controller._cycle_states.clear()
+        controller._channel_fee_states.clear()
+        controller.config.enable_vegas_reflex = True
+        controller._get_dynamic_chain_costs.return_value = {"sat_per_vbyte": 100.0}
+        controller.database.get_mempool_ma.return_value = 1.0
+        controller.database.get_fee_strategy_state.return_value = {
+            "channel_id": CHANNEL_ID,
+            "last_fee_ppm": 100,
+            "last_broadcast_fee_ppm": 100,
+            "last_update": 0,
+            "last_state": "balanced",
+            "is_sleeping": 1,
+            "sleep_until": 999,
+            "stable_cycles": 2,
+            "v2_state_json": "{}",
+        }
+
+        def vegas_wake(current=controller):
+            assert current._cycle_states[CHANNEL_ID].is_sleeping is True
+            assert current._channel_fee_states[CHANNEL_ID].is_sleeping is True
+            current._cycle_states[CHANNEL_ID].is_sleeping = False
+            current._channel_fee_states[CHANNEL_ID].is_sleeping = False
+            return True
+
+        def adjust(current=controller, **_kwargs):
+            current._get_cycle_state(CHANNEL_ID)
+            current._get_channel_fee_state(CHANNEL_ID, PEER_ID)
+            return FeeAdjustment(
+                CHANNEL_ID,
+                PEER_ID,
+                100,
+                125,
+                "cold hydrated",
+                {"target": 125},
+            )
+
+        monkeypatch.setattr(controller, "_maybe_wake_for_vegas_spike", vegas_wake)
+        monkeypatch.setattr(controller, "_adjust_channel_fee", adjust)
+        results.append(controller.adjust_all_fees())
+        io_counts.append({
+            "channel_states": controller.database.get_all_channel_states.call_count,
+            "strategy_state": controller.database.get_fee_strategy_state.call_count,
+            "mempool_ma": controller.database.get_mempool_ma.call_count,
+            "peer_channels": controller.data_service.get_peer_channels.call_count,
+        })
+
+        if manager.enabled:
+            pre_state = _only_body(manager)["pre_state"]["ordered_channels"][0]
+            assert pre_state["cycle_state"]["is_sleeping"] is True
+            assert pre_state["fee_state"]["is_sleeping"] is True
+
+    assert results[0] == results[1]
+    assert io_counts[0] == io_counts[1] == {
+        "channel_states": 1,
+        "strategy_state": 2,
+        "mempool_ma": 1,
+        "peer_channels": 1,
+    }
+
 
 def test_database_flow_window_error_records_neutral_fallback(tmp_path, monkeypatch):
     controller, manager = _capture_controller(tmp_path)

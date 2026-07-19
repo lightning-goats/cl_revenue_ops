@@ -4781,23 +4781,36 @@ class FeeController:
         channels = prefetched_channels or record_effective_evidence(
             "channels_info", [], self._get_channels_info
         )
-        # Snapshot every valid channel input before Vegas or a decision mutates state.
-        if capture_session is not None:
-            for state in channel_states:
-                if not isinstance(state, dict):
-                    continue
-                channel_id = state.get("channel_id")
-                peer_id = state.get("peer_id")
-                if not channel_id or not peer_id:
-                    continue
+        # Hydrate valid channel inputs before Vegas or a decision mutates state.
+        # The later decision path reuses these cached states, so capture does not
+        # add evidence I/O or change hydration behavior when it is disabled.
+        for state in channel_states:
+            if not isinstance(state, dict):
+                continue
+            channel_id = state.get("channel_id")
+            peer_id = state.get("peer_id")
+            if not channel_id or not peer_id:
+                continue
+            channel_info = channels.get(channel_id)
+            cycle_state = None
+            fee_state = None
+            if channel_info:
+                actual_fee = channel_info.get("fee_proportional_millionths", 0)
+                cycle_state = self._get_cycle_state(
+                    channel_id, actual_fee_ppm=actual_fee
+                )
+                fee_state = self._get_channel_fee_state(
+                    channel_id, peer_id, actual_fee_ppm=actual_fee
+                )
+            if capture_session is not None:
                 self._capture_channel_pre_state(
                     capture_session,
                     channel_id=channel_id,
                     peer_id=peer_id,
                     state=state,
-                    channel_info=channels.get(channel_id),
-                    cycle_state=self._cycle_states.get(channel_id),
-                    fee_state=self._channel_fee_states.get(channel_id),
+                    channel_info=channel_info,
+                    cycle_state=cycle_state,
+                    fee_state=fee_state,
                 )
 
         # OPTIMIZATION: Hoist feerates RPC call outside the loop
@@ -7921,15 +7934,17 @@ class FeeController:
             "reason_code": reason_code,
         }
         result = self._governed_authorize_fee_broadcast_inner(**request)
-        record_capture_observation("governor", {
-            "ordinal": len(current_capture().observations["governor"])
-            if current_capture() is not None else 0,
-            "request": request,
-            "result": {
-                "authorized": bool(result[0]),
-                "reason": str(result[1]),
+        record_capture_observation(
+            "governor",
+            lambda ordinal: {
+                "ordinal": ordinal,
+                "request": request,
+                "result": {
+                    "authorized": bool(result[0]),
+                    "reason": str(result[1]),
+                },
             },
-        })
+        )
         return result
 
     def _governed_authorize_fee_broadcast_inner(self, *, channel_id, fee_ppm,
@@ -8051,22 +8066,26 @@ class FeeController:
         try:
             result = self._set_channel_fee_inner(**request)
         except Exception as exc:
-            record_capture_observation("execution", {
-                "ordinal": len(current_capture().observations["execution"])
-                if current_capture() is not None else 0,
-                "request": request,
-                "error": {
-                    "category": type(exc).__name__,
-                    "message": str(exc),
+            record_capture_observation(
+                "execution",
+                lambda ordinal: {
+                    "ordinal": ordinal,
+                    "request": request,
+                    "error": {
+                        "category": type(exc).__name__,
+                        "message": str(exc),
+                    },
                 },
-            })
+            )
             raise
-        record_capture_observation("execution", {
-            "ordinal": len(current_capture().observations["execution"])
-            if current_capture() is not None else 0,
-            "request": request,
-            "result": result,
-        })
+        record_capture_observation(
+            "execution",
+            lambda ordinal: {
+                "ordinal": ordinal,
+                "request": request,
+                "result": result,
+            },
+        )
         return result
 
     def _set_channel_fee_inner(self, channel_id: str, fee_ppm: int,

@@ -118,11 +118,16 @@ def _observation_ordinal(session: Any, family: str) -> int:
         return 0
 
 
-def _record_observation_no_throw(session: Any, family: str, entry: dict) -> None:
+def _record_observation_no_throw(session: Any, family: str, entry: Any) -> None:
     if session is None:
         return
     try:
-        session.record_observation(family, capture_value(entry))
+        resolved_entry = (
+            entry(_observation_ordinal(session, family))
+            if callable(entry)
+            else entry
+        )
+        session.record_observation(family, capture_value(resolved_entry))
     except Exception as exc:
         try:
             session.mark_invalid(
@@ -192,7 +197,7 @@ def mark_capture_invalid(session: Any, reason: str) -> None:
         pass
 
 
-def record_capture_observation(family: str, entry: dict) -> None:
+def record_capture_observation(family: str, entry: Any) -> None:
     session = current_capture()
     if session is None:
         return
