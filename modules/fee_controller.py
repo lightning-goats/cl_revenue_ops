@@ -3091,6 +3091,18 @@ class FeeController:
             }
             for existing in channels:
                 if existing.get("channel_id") == channel_id:
+                    changed = False
+                    if (
+                        existing.get("cycle_state") is None
+                        and cycle_state is not None
+                    ):
+                        existing["cycle_state"] = capture_value(cycle_state)
+                        changed = True
+                    if existing.get("fee_state") is None and fee_state is not None:
+                        existing["fee_state"] = capture_value(fee_state)
+                        changed = True
+                    if changed:
+                        record_capture_pre_state(session, pre_state)
                     return
             channels.append(capture_value(entry))
             record_capture_pre_state(session, pre_state)

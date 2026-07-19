@@ -902,6 +902,101 @@ def test_capture_records_channel_pre_state_before_vegas_wake(
     ] is False
 
 
+@pytest.mark.parametrize("warm_component", ["cycle", "fee"])
+def test_partial_warm_dynamic_capture_merges_only_later_hydrated_state(
+    tmp_path, monkeypatch, warm_component
+):
+    controllers = [
+        _capture_controller(tmp_path / "enabled", enabled=True),
+        _capture_controller(tmp_path / "disabled", enabled=False),
+    ]
+    results = []
+    io_counts = []
+
+    for controller, manager in controllers:
+        controller._cycle_states.clear()
+        controller._channel_fee_states.clear()
+        if warm_component == "cycle":
+            controller._cycle_states[CHANNEL_ID] = ChannelCycleState(
+                last_fee_ppm=111,
+                last_broadcast_fee_ppm=100,
+                is_sleeping=True,
+            )
+        else:
+            controller._channel_fee_states[CHANNEL_ID] = ChannelFeeState(
+                last_fee_ppm=112,
+                last_broadcast_fee_ppm=100,
+                is_sleeping=True,
+            )
+        controller.config.enable_vegas_reflex = True
+        controller._get_dynamic_chain_costs.return_value = {"sat_per_vbyte": 100.0}
+        controller.database.get_mempool_ma.return_value = 1.0
+        controller.database.get_fee_strategy_state.return_value = {
+            "channel_id": CHANNEL_ID,
+            "last_fee_ppm": 220,
+            "last_broadcast_fee_ppm": 100,
+            "last_update": 0,
+            "last_state": "balanced",
+            "is_sleeping": 1,
+            "sleep_until": 999,
+            "stable_cycles": 2,
+            "v2_state_json": "{}",
+        }
+
+        def vegas_mutation(current=controller, component=warm_component):
+            if component == "cycle":
+                assert CHANNEL_ID not in current._channel_fee_states
+                current._cycle_states[CHANNEL_ID].last_fee_ppm = 999
+                current._cycle_states[CHANNEL_ID].is_sleeping = False
+            else:
+                assert CHANNEL_ID not in current._cycle_states
+                current._channel_fee_states[CHANNEL_ID].last_fee_ppm = 999
+                current._channel_fee_states[CHANNEL_ID].is_sleeping = False
+            return True
+
+        def adjust(current=controller, **_kwargs):
+            current._get_channel_fee_state(CHANNEL_ID, PEER_ID)
+            current._cycle_states[CHANNEL_ID].last_fee_ppm = 999
+            current._channel_fee_states[CHANNEL_ID].last_fee_ppm = 999
+            return FeeAdjustment(
+                CHANNEL_ID,
+                PEER_ID,
+                100,
+                125,
+                "partial warm",
+                {"target": 125},
+            )
+
+        monkeypatch.setattr(
+            controller, "_maybe_wake_for_vegas_spike", vegas_mutation
+        )
+        monkeypatch.setattr(controller, "_adjust_channel_fee", adjust)
+        results.append(controller.adjust_all_fees())
+        io_counts.append({
+            "channel_states": controller.database.get_all_channel_states.call_count,
+            "strategy_state": controller.database.get_fee_strategy_state.call_count,
+            "mempool_ma": controller.database.get_mempool_ma.call_count,
+            "peer_channels": controller.data_service.get_peer_channels.call_count,
+        })
+
+        if manager.enabled:
+            pre_state = _only_body(manager)["pre_state"]["ordered_channels"][0]
+            assert pre_state["cycle_state"]["last_fee_ppm"] == (
+                111 if warm_component == "cycle" else 220
+            )
+            assert pre_state["fee_state"]["last_fee_ppm"] == (
+                112 if warm_component == "fee" else 220
+            )
+
+    assert results[0] == results[1]
+    assert io_counts[0] == io_counts[1] == {
+        "channel_states": 1,
+        "strategy_state": 1,
+        "mempool_ma": 1,
+        "peer_channels": 1,
+    }
+
+
 @pytest.mark.parametrize(
     ("strategy", "overlay"),
     [
