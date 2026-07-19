@@ -56,6 +56,7 @@ from __future__ import annotations
 import time
 import math
 import json
+import random
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, ClassVar, Dict, List, Optional, Any, Set, Tuple, Union, TYPE_CHECKING
@@ -66,7 +67,21 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from . import admission_policy as _admission_policy
 from .database import Database
-from .fee_cycle_capture import decision_gauss, decision_now, decision_random
+from .fee_cycle_capture import (
+    FeeCycleCaptureManager,
+    bind_capture,
+    capture_value,
+    current_capture,
+    decision_gauss,
+    decision_now,
+    decision_random,
+    mark_capture_invalid,
+    record_capture_expected,
+    record_capture_observation,
+    record_capture_pre_state,
+    record_effective_evidence,
+    record_effective_evidence_result,
+)
 from .policy_manager import PolicyManager, FeeStrategy, PeerPolicy
 from .utils import normalize_scid, parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
@@ -2809,9 +2824,11 @@ class FeeController:
         if not channel_id or capacity_sats <= 0:
             return False
         window_map = self._get_flow_window_map()
+        flow_window = window_map.get(channel_id) if window_map else None
+        record_effective_evidence_result("flow_window", [channel_id], flow_window)
         if not window_map:
             return False
-        out_sats, in_sats, _count = window_map.get(channel_id, (0, 0, 0))
+        out_sats, in_sats, _count = flow_window or (0, 0, 0)
         gross = out_sats + in_sats
         if gross <= 0:
             return False
@@ -3039,6 +3056,98 @@ class FeeController:
             "dominant_input": "startup",
             "safety_block": False,
         }
+        try:
+            self._fee_capture = FeeCycleCaptureManager(config.db_path, plugin.log)
+        except Exception:
+            # Capture is observational. A malformed/mocked path must never
+            # prevent controller construction or enable recording.
+            self._fee_capture = FeeCycleCaptureManager(Config().db_path, plugin.log)
+        if getattr(config, "fee_replay_capture_enabled", False) is True:
+            self._fee_capture.set_enabled(True)
+
+    def _capture_channel_pre_state(
+        self,
+        session: Any,
+        *,
+        channel_id: str,
+        peer_id: str,
+        state: Dict[str, Any],
+        channel_info: Dict[str, Any],
+        cycle_state: Any = None,
+        fee_state: Any = None,
+    ) -> None:
+        if session is None:
+            return
+        try:
+            pre_state = capture_value(session.pre_state)
+            channels = pre_state.setdefault("ordered_channels", [])
+            entry = {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "channel_state": state,
+                "channel_info": channel_info,
+                "cycle_state": cycle_state,
+                "fee_state": fee_state,
+            }
+            for index, existing in enumerate(channels):
+                if existing.get("channel_id") == channel_id:
+                    channels[index] = capture_value(entry)
+                    break
+            else:
+                channels.append(capture_value(entry))
+            record_capture_pre_state(session, pre_state)
+        except Exception as exc:
+            mark_capture_invalid(
+                session, f"capture recorder failure: {type(exc).__name__}"
+            )
+
+    @staticmethod
+    def _capture_terminal_outcome(session: Any, outcome: dict) -> None:
+        if session is None:
+            return
+        try:
+            expected = capture_value(session.expected)
+            outcomes = expected.setdefault("ordered_outcomes", [])
+            outcomes.append(capture_value(outcome))
+            record_capture_expected(session, expected)
+        except Exception as exc:
+            mark_capture_invalid(
+                session, f"capture recorder failure: {type(exc).__name__}"
+            )
+
+    def _capture_finalize_cycle(
+        self,
+        session: Any,
+        *,
+        drain_values: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if session is None:
+            return
+        try:
+            expected = capture_value(session.expected)
+            expected.setdefault("ordered_outcomes", [])
+            post_channels = []
+            for channel in session.pre_state.get("ordered_channels", []):
+                channel_id = channel.get("channel_id")
+                post_channels.append({
+                    "channel_id": channel_id,
+                    "peer_id": channel.get("peer_id"),
+                    "cycle_state": self._cycle_states.get(channel_id),
+                    "fee_state": self._channel_fee_states.get(channel_id),
+                })
+            expected["post_channel_state"] = post_channels
+            expected["post_global"] = {
+                "vegas_state": self._vegas_state,
+                "vegas_wake_armed": self._vegas_wake_armed,
+                "decision_summary": self._last_decision_summary,
+                "random_state": random.getstate(),
+                "drain_values": drain_values or {},
+            }
+            record_capture_expected(session, expected)
+        except Exception as exc:
+            mark_capture_invalid(
+                session, f"capture recorder failure: {type(exc).__name__}"
+            )
 
     def _set_last_decision_summary(
         self,
@@ -3161,9 +3270,12 @@ class FeeController:
                                    force_refresh: bool = False) -> list:
         return self._frozen_observation(
             ("inbound_channels", str(peer_id)),
-            lambda: self._get_peer_inbound_channels_live(
-                peer_id, ttl_seconds=ttl_seconds,
-                force_refresh=force_refresh))
+            lambda: record_effective_evidence(
+                "gossip_channels", [peer_id],
+                lambda: self._get_peer_inbound_channels_live(
+                    peer_id, ttl_seconds=ttl_seconds,
+                    force_refresh=force_refresh),
+            ))
 
     def _get_neighbor_fee_median(self, peer_id: str,
                                  cfg: Optional[Any] = None) -> int | None:
@@ -3590,8 +3702,14 @@ class FeeController:
                 history = self.database.get_channel_cost_history(
                     channel_id, since_timestamp=cutoff
                 )
-            except TypeError:
+                record_effective_evidence_result(
+                    "channel_cost_history", [channel_id, cutoff], history
+                )
+            except TypeError as exc:
                 history = self.database.get_channel_cost_history(channel_id)
+                record_effective_evidence_result(
+                    "channel_cost_history", [channel_id, cutoff], history, exc
+                )
             recent = [
                 c for c in history if int(c.get("timestamp", 0) or 0) >= cutoff
             ]
@@ -3651,6 +3769,8 @@ class FeeController:
     def _load_persisted_fee_strategy_row(self, channel_id: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Load the current fee_strategy_state row plus parsed v2 payload."""
         db_state = self.database.get_fee_strategy_state(channel_id) if self.database else {"channel_id": channel_id}
+        if not isinstance(db_state, dict):
+            db_state = {"channel_id": channel_id}
         v2_json_str = db_state.get("v2_state_json", "{}") if db_state else "{}"
         try:
             v2_data = json.loads(v2_json_str) if v2_json_str else {}
@@ -4124,9 +4244,15 @@ class FeeController:
             cost_history = self.database.get_channel_cost_history(
                 channel_id, since_timestamp=cutoff
             )
-        except TypeError:
+            record_effective_evidence_result(
+                "channel_cost_history", [channel_id, cutoff], cost_history
+            )
+        except TypeError as exc:
             # Older database module without since_timestamp support
             cost_history = self.database.get_channel_cost_history(channel_id)
+            record_effective_evidence_result(
+                "channel_cost_history", [channel_id, cutoff], cost_history, exc
+            )
         recent_costs = [c for c in cost_history if c.get('timestamp', 0) >= cutoff]
 
         if len(recent_costs) >= self.REBALANCE_FLOOR_MIN_SAMPLES:
@@ -4153,10 +4279,13 @@ class FeeController:
                 return floor_ppm
 
         # Strategy 2: Fallback to per-peer history (for cold-start)
-        peer_history = self.database.get_historical_inbound_fee_ppm(
-            peer_id,
-            window_days=self.REBALANCE_FLOOR_WINDOW_DAYS,
-            min_samples=self.REBALANCE_FLOOR_MIN_SAMPLES
+        peer_history = record_effective_evidence(
+            "peer_fee_history", [peer_id],
+            lambda: self.database.get_historical_inbound_fee_ppm(
+                peer_id,
+                window_days=self.REBALANCE_FLOOR_WINDOW_DAYS,
+                min_samples=self.REBALANCE_FLOOR_MIN_SAMPLES,
+            ),
         )
 
         if peer_history and peer_history.get('confidence') in ('medium', 'high'):
@@ -4199,7 +4328,16 @@ class FeeController:
 
         # Get days since last forward
         try:
-            last_forward_ts = self.database.get_last_forward_time(channel_id)
+            try:
+                last_forward_ts = self.database.get_last_forward_time(channel_id)
+                record_effective_evidence_result(
+                    "last_forward_time", [channel_id], last_forward_ts
+                )
+            except Exception as exc:
+                record_effective_evidence_result(
+                    "last_forward_time", [channel_id], None, exc
+                )
+                raise
             if last_forward_ts is None or last_forward_ts == 0:
                 # No forwards recorded - check channel age
                 # Be conservative: don't penalize new channels
@@ -4425,6 +4563,42 @@ class FeeController:
         return False
 
     def adjust_all_fees(self) -> List[FeeAdjustment]:
+        """Open one observational capture around the existing authority path."""
+        try:
+            cfg = self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
+        except Exception:
+            cfg = self.config
+        session = None
+        try:
+            session = self._fee_capture.begin_cycle(
+                capture_value(cfg),
+                {"algorithm_version": "dts_pid_v1"},
+            )
+        except Exception:
+            session = None
+
+        try:
+            with bind_capture(session):
+                cycle_started_at = decision_now("cycle.started_at")
+                return self._adjust_all_fees_bound(cfg, cycle_started_at)
+        except Exception as exc:
+            mark_capture_invalid(session, f"cycle exception: {type(exc).__name__}")
+            raise
+        finally:
+            if session is not None:
+                try:
+                    body = session.to_body()
+                    if not body["completeness"]["complete"]:
+                        mark_capture_invalid(session, "incomplete fee cycle")
+                except Exception as exc:
+                    mark_capture_invalid(
+                        session, f"capture recorder failure: {type(exc).__name__}"
+                    )
+                self._fee_capture.finish_cycle(session)
+
+    def _adjust_all_fees_bound(
+        self, cfg: Any, cycle_started_at: int
+    ) -> List[FeeAdjustment]:
         """
         Adjust fees for all channels using DTS+PID optimization.
 
@@ -4437,10 +4611,6 @@ class FeeController:
         # paused re-check, inner-loop snapshot). The paused flag is therefore
         # read once at cycle start; a pause toggled mid-warm-up takes effect
         # on the next timer tick.
-        try:
-            cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
-        except Exception:
-            cfg = self.config
         pre_paused = bool(getattr(cfg, "paused", False))
 
         # PERF: warm the profitability cache BEFORE acquiring _state_lock.
@@ -4466,8 +4636,12 @@ class FeeController:
         prefetched_channels: Optional[Dict[str, Dict[str, Any]]] = None
         if not pre_paused:
             try:
-                prefetched_channels = self._get_channels_info()
-                self._prefetch_neighbor_gossip(prefetched_channels, cfg=cfg)
+                prefetched_channels = record_effective_evidence(
+                    "channels_info", [], self._get_channels_info
+                )
+                self._prefetch_neighbor_gossip(
+                    prefetched_channels, cfg=cfg, now=cycle_started_at
+                )
             except Exception as e:
                 self.plugin.log(f"Gossip prefetch failed: {e}", level='debug')
 
@@ -4495,7 +4669,9 @@ class FeeController:
             self._cycle_observations = {}
             try:
                 return self._adjust_all_fees_inner(
-                    prefetched_channels=prefetched_channels, cfg=cfg
+                    prefetched_channels=prefetched_channels,
+                    cfg=cfg,
+                    capture_session=current_capture(),
                 )
             finally:
                 self._cycle_observations = None
@@ -4505,6 +4681,7 @@ class FeeController:
     def _prefetch_neighbor_gossip(
         self,
         channels: Dict[str, Dict[str, Any]],
+        now: int,
         cfg: Optional[Any] = None,
     ) -> None:
         """Warm gossip_channels_{peer} cache entries that are absent/expired.
@@ -4522,7 +4699,6 @@ class FeeController:
         if self.data_service is None or not channels:
             return
         ttl_seconds = self._gossip_cache_ttl_seconds(cfg)
-        now = time.time()
         seen_peers: set = set()
         for info in channels.values():
             peer_id = info.get("peer_id")
@@ -4547,9 +4723,26 @@ class FeeController:
         self,
         prefetched_channels: Optional[Dict[str, Dict[str, Any]]] = None,
         cfg: Optional[Any] = None,
+        capture_session: Any = None,
     ) -> List[FeeAdjustment]:
         """Inner implementation of adjust_all_fees, called under _state_lock."""
         adjustments = []
+        if capture_session is not None:
+            record_capture_pre_state(capture_session, {
+                "global": {
+                    "vegas_state": self._vegas_state,
+                    "vegas_wake_armed": self._vegas_wake_armed,
+                    "decision_summary": self._last_decision_summary,
+                    "random_state": random.getstate(),
+                },
+                "ordered_channels": [],
+            })
+            record_capture_expected(capture_session, {
+                "ordered_outcomes": [],
+                "post_global": {},
+                "post_channel_state": [],
+            })
+        record_effective_evidence_result("our_node_id", [], self._our_node_id)
 
         # Skip reason tracking for diagnostics
         skip_reasons = {
@@ -4567,7 +4760,9 @@ class FeeController:
         }
 
         # Get all channel states from flow analysis
-        channel_states = self.database.get_all_channel_states()
+        channel_states = record_effective_evidence(
+            "channel_states", [], lambda: self.database.get_all_channel_states()
+        )
         
         if not channel_states:
             self._set_last_decision_summary(
@@ -4577,17 +4772,22 @@ class FeeController:
                 safety_block=False,
             )
             self.plugin.log("No channel state data for fee adjustment", level='debug')
+            self._capture_finalize_cycle(capture_session)
             return adjustments
         
         # Get current channel info for capacity and balance.
         # PERF: normally fetched (and gossip-prefetched against) BEFORE the
         # lock by adjust_all_fees; the in-lock fetch is a fallback for direct
         # callers and for a failed/empty pre-lock fetch.
-        channels = prefetched_channels or self._get_channels_info()
+        channels = prefetched_channels or record_effective_evidence(
+            "channels_info", [], self._get_channels_info
+        )
 
         # OPTIMIZATION: Hoist feerates RPC call outside the loop
         # This reduces N RPC calls to 1 per adjust_all_fees cycle
-        chain_costs = self._get_dynamic_chain_costs()
+        chain_costs = record_effective_evidence(
+            "chain_costs", [], self._get_dynamic_chain_costs
+        )
         
         # ConfigSnapshot for thread-safe reads — normally taken ONCE by
         # adjust_all_fees and passed in; fallback for direct callers.
@@ -4598,7 +4798,10 @@ class FeeController:
         if cfg.enable_vegas_reflex and chain_costs:
             current_sat_vb = chain_costs.get("sat_per_vbyte", 1.0)
             self.database.record_mempool_fee(current_sat_vb)
-            ma_sat_vb = self.database.get_mempool_ma(86400)  # 24h moving average
+            ma_sat_vb = record_effective_evidence(
+                "mempool_ma_24h", [],
+                lambda: self.database.get_mempool_ma(86400),
+            )  # 24h moving average
             self._vegas_state.update(current_sat_vb, ma_sat_vb)
             if self._vegas_state.intensity > 0.1:
                 self.plugin.log(
@@ -4631,8 +4834,14 @@ class FeeController:
                         if self.data_service is not None
                         else self.plugin.rpc.listpeerchannels()
                     ).get("channels", [])
-                except Exception:
+                    record_effective_evidence_result(
+                        "node_channels", [], raw_channels
+                    )
+                except Exception as exc:
                     raw_channels = []
+                    record_effective_evidence_result(
+                        "node_channels", [], raw_channels, exc
+                    )
                 node_receivable_ratio_value = compute_node_receivable_ratio(raw_channels)
                 pressure = node_drain_pressure(
                     node_receivable_ratio_value,
@@ -4735,6 +4944,15 @@ class FeeController:
                 safety_block=False,
             )
 
+        self._capture_finalize_cycle(
+            capture_session,
+            drain_values={
+                "node_receivable_ratio": node_receivable_ratio_value,
+                "node_drain_pressure": node_drain_pressure_value,
+                "effective_drain_discount_max": node_drain_bias_effective_cap,
+            },
+        )
+
         return adjustments
 
     def _adjust_all_fees_channel_loop(
@@ -4758,18 +4976,44 @@ class FeeController:
         cfg.drain_fee_discount_max, i.e. pre-Task-3 behavior unchanged).
         """
         for state in channel_states:
+            if not isinstance(state, dict):
+                continue
             channel_id = state.get("channel_id")
             peer_id = state.get("peer_id")
 
             if not channel_id or not peer_id:
                 continue
 
+            channel_info = channels.get(channel_id)
+            if not channel_info:
+                continue
+
             if self.temporary_fee_overlay_active is not None:
                 try:
-                    if self.temporary_fee_overlay_active(channel_id):
+                    overlay_active = self.temporary_fee_overlay_active(channel_id)
+                    record_effective_evidence_result(
+                        "temporary_overlay_active", [channel_id], overlay_active
+                    )
+                    if overlay_active:
+                        self._capture_channel_pre_state(
+                            current_capture(),
+                            channel_id=channel_id,
+                            peer_id=peer_id,
+                            state=state,
+                            channel_info=channel_info,
+                            cycle_state=self._cycle_states.get(channel_id),
+                            fee_state=self._channel_fee_states.get(channel_id),
+                        )
                         skip_reasons["temporary_overlay"] += 1
+                        self._capture_terminal_outcome(
+                            current_capture(),
+                            {"skip": {"reason": "temporary_overlay"}},
+                        )
                         continue
                 except Exception as e:
+                    record_effective_evidence_result(
+                        "temporary_overlay_active", [channel_id], False, e
+                    )
                     self.plugin.log(
                         f"TEMP_OVERLAY: Failed to query overlay state for {channel_id}: {e}",
                         level='debug'
@@ -4777,16 +5021,39 @@ class FeeController:
 
             # Check policy for this peer (v1.4: Policy-Driven Architecture)
             if self.policy_manager:
-                policy = self.policy_manager.get_policy(peer_id)
+                policy = record_effective_evidence(
+                    "policy", [peer_id],
+                    lambda: self.policy_manager.get_policy(peer_id),
+                )
 
                 # Skip PASSIVE strategy (equivalent to old is_peer_ignored)
                 if policy.strategy == FeeStrategy.PASSIVE:
+                    self._capture_channel_pre_state(
+                        current_capture(),
+                        channel_id=channel_id,
+                        peer_id=peer_id,
+                        state=state,
+                        channel_info=channel_info,
+                        cycle_state=self._cycle_states.get(channel_id),
+                        fee_state=self._channel_fee_states.get(channel_id),
+                    )
                     skip_reasons["policy_passive"] += 1
+                    self._capture_terminal_outcome(
+                        current_capture(), {"skip": {"reason": "policy_passive"}}
+                    )
                     continue
 
                 # Handle STATIC strategy: apply fixed fee
                 if policy.strategy == FeeStrategy.STATIC and policy.fee_ppm_target is not None:
-                    channel_info = channels.get(channel_id)
+                    self._capture_channel_pre_state(
+                        current_capture(),
+                        channel_id=channel_id,
+                        peer_id=peer_id,
+                        state=state,
+                        channel_info=channel_info,
+                        cycle_state=self._cycle_states.get(channel_id),
+                        fee_state=self._channel_fee_states.get(channel_id),
+                    )
                     if channel_info:
                         current_fee = channel_info.get("fee_proportional_millionths", 0)
                         requested_static_fee = int(policy.fee_ppm_target)
@@ -4809,9 +5076,13 @@ class FeeController:
                                         level='error'
                                     )
                                     skip_reasons["error"] += 1
+                                    self._capture_terminal_outcome(
+                                        current_capture(),
+                                        {"skip": {"reason": "execution_failure"}},
+                                    )
                                     continue
                                 applied_fee_ppm = int(result.get("fee_ppm", effective_static_fee))
-                                adjustments.append(FeeAdjustment(
+                                adjustment = FeeAdjustment(
                                     channel_id=channel_id,
                                     peer_id=peer_id,
                                     old_fee_ppm=current_fee,
@@ -4823,26 +5094,51 @@ class FeeController:
                                         "effective_fee_ppm": applied_fee_ppm,
                                     },
                                     reason_code=FeeReasonCode.POLICY_STATIC.value,
-                                ))
+                                )
+                                adjustments.append(adjustment)
+                                self._capture_terminal_outcome(
+                                    current_capture(),
+                                    {"adjustment": adjustment.to_dict()},
+                                )
                             except Exception as e:
                                 self.plugin.log(f"Error setting static fee for {channel_id}: {e}", level='error')
                                 skip_reasons["error"] += 1
+                                self._capture_terminal_outcome(
+                                    current_capture(),
+                                    {"skip": {
+                                        "reason": "execution_failure",
+                                        "error_category": type(e).__name__,
+                                    }},
+                                )
                         else:
                             skip_reasons["policy_static"] += 1
+                            self._capture_terminal_outcome(
+                                current_capture(),
+                                {"skip": {"reason": "policy_static"}},
+                            )
                     continue
 
                 # DYNAMIC strategy continues to normal fee optimization below
-
-            # Get channel info
-            channel_info = channels.get(channel_id)
-            if not channel_info:
-                continue
 
             try:
                 # Check cycle state before adjustment to track skip reasons
                 # Issue #32: pass actual fee for desync detection
                 actual_fee = channel_info.get("fee_proportional_millionths", 0)
                 cycle = self._get_cycle_state(channel_id, actual_fee_ppm=actual_fee)
+                capture_session = current_capture()
+                if capture_session is not None:
+                    fee_state = self._get_channel_fee_state(
+                        channel_id, peer_id, actual_fee_ppm=actual_fee
+                    )
+                    self._capture_channel_pre_state(
+                        capture_session,
+                        channel_id=channel_id,
+                        peer_id=peer_id,
+                        state=state,
+                        channel_info=channel_info,
+                        cycle_state=cycle,
+                        fee_state=fee_state,
+                    )
                 now = decision_now("cycle.channel.evaluate")
                 pre_is_sleeping = cycle.is_sleeping
                 pre_last_update = cycle.last_update
@@ -4852,8 +5148,11 @@ class FeeController:
                 forward_count_hint = None
                 if pre_last_update > 0:
                     pre_hours_elapsed = (now - pre_last_update) / 3600.0
-                    pre_forward_count = self.database.get_forward_count_since(
-                        channel_id, pre_last_update
+                    pre_forward_count = record_effective_evidence(
+                        "forward_count_since", [channel_id, pre_last_update],
+                        lambda: self.database.get_forward_count_since(
+                            channel_id, pre_last_update
+                        ),
                     )
                     # PERF: reuse this count inside _adjust_channel_fee instead
                     # of issuing the identical query a second time.
@@ -4878,6 +5177,10 @@ class FeeController:
 
                 if adjustment:
                     adjustments.append(adjustment)
+                    self._capture_terminal_outcome(
+                        current_capture(),
+                        {"adjustment": adjustment.to_dict()},
+                    )
                 else:
                     skip_reason = self._classify_no_adjustment_skip_reason(
                         cycle=cycle,
@@ -4891,10 +5194,20 @@ class FeeController:
                         cfg=cfg,
                     )
                     skip_reasons[skip_reason] += 1
+                    self._capture_terminal_outcome(
+                        current_capture(), {"skip": {"reason": skip_reason}}
+                    )
 
             except Exception as e:
                 self.plugin.log(f"Error adjusting fee for {channel_id}: {e}", level='error')
                 skip_reasons["error"] += 1
+                self._capture_terminal_outcome(
+                    current_capture(),
+                    {"skip": {
+                        "reason": "error",
+                        "error_category": type(e).__name__,
+                    }},
+                )
 
     def _classify_no_adjustment_skip_reason(
         self,
@@ -4971,7 +5284,10 @@ class FeeController:
             return False
         
         # Check 2: Time since last forward (channel activity)
-        last_forward_ts = self.database.get_last_forward_time(channel_id)
+        last_forward_ts = record_effective_evidence(
+            "last_forward_time", [channel_id],
+            lambda: self.database.get_last_forward_time(channel_id),
+        )
         if last_forward_ts and last_forward_ts > 0:
             hours_since_forward = (current_time - last_forward_ts) / 3600
             if hours_since_forward < self.GOSSIP_REFRESH_MIN_IDLE_HOURS:
@@ -5031,7 +5347,10 @@ class FeeController:
         last_broadcast_at = getattr(state, "last_broadcast_at", 0) or 0
         hours_since_broadcast = (current_time - last_broadcast_at) / 3600 if last_broadcast_at > 0 else 999
         
-        last_forward_ts = self.database.get_last_forward_time(channel_id)
+        last_forward_ts = record_effective_evidence(
+            "last_forward_time", [channel_id],
+            lambda: self.database.get_last_forward_time(channel_id),
+        )
         if last_forward_ts and last_forward_ts > 0:
             hours_since_forward = (current_time - last_forward_ts) / 3600
         else:
@@ -5600,6 +5919,9 @@ class FeeController:
         # no longer implies literal 0-ppm behavior.
         # =====================================================================
         exploration_flag = self.database.get_channel_probe(channel_id)
+        record_effective_evidence_result(
+            "exploration_flag", [channel_id], exploration_flag is not None
+        )
         is_under_exploration = (exploration_flag is not None)
         
         now = decision_now("channel.adjust")
@@ -5675,7 +5997,12 @@ class FeeController:
             else:
                 # Still within sleep period - check for revenue spike that should wake us
                 # Calculate current revenue rate to detect significant changes
-                volume_since_sats = self.database.get_volume_since(channel_id, _sleep_last_update)
+                volume_since_sats = record_effective_evidence(
+                    "volume_since", [channel_id, _sleep_last_update],
+                    lambda: self.database.get_volume_since(
+                        channel_id, _sleep_last_update
+                    ),
+                )
 
                 hours_elapsed = (now - _sleep_last_update) / 3600.0 if _sleep_last_update > 0 else 1.0
                 hours_elapsed = max(hours_elapsed, 0.1)  # Prevent division by zero
@@ -5737,7 +6064,10 @@ class FeeController:
         observation_cursor = cycle.last_update
         if observation_cursor <= 0:
             observation_cursor = now - int(getattr(cfg, "fee_interval", 1800) or 1800)
-        volume_since_sats = self.database.get_volume_since(channel_id, observation_cursor)
+        volume_since_sats = record_effective_evidence(
+            "volume_since", [channel_id, observation_cursor],
+            lambda: self.database.get_volume_since(channel_id, observation_cursor),
+        )
 
         # Calculate time elapsed since last update
         if cycle.last_update > 0:
@@ -5765,8 +6095,11 @@ class FeeController:
             forward_count = forward_count_hint
         else:
             # Same bounded bootstrap cursor as the volume query (L2).
-            forward_count = self.database.get_forward_count_since(
-                channel_id, observation_cursor
+            forward_count = record_effective_evidence(
+                "forward_count_since", [channel_id, observation_cursor],
+                lambda: self.database.get_forward_count_since(
+                    channel_id, observation_cursor
+                ),
             )
         cycle.forward_count_since_update = forward_count
 
@@ -5854,6 +6187,11 @@ class FeeController:
         marginal_roi_info = "unknown"
         if self.profitability:
             prof_data = self.profitability.get_profitability(channel_id)
+            record_effective_evidence_result(
+                "marginal_roi_percent",
+                [channel_id],
+                getattr(prof_data, "marginal_roi_percent", None),
+            )
             if prof_data:
                 marginal_roi_info = f"marginal_roi={prof_data.marginal_roi_percent:.1f}%"
         
@@ -6145,7 +6483,13 @@ class FeeController:
                 # near the floor instead of bouncing between special regimes.
                 try:
                     self.database.clear_channel_probe(channel_id)
+                    record_effective_evidence_result(
+                        "clear_exploration_flag", [channel_id], None
+                    )
                 except Exception as e:
+                    record_effective_evidence_result(
+                        "clear_exploration_flag", [channel_id], None, e
+                    )
                     self.plugin.log(f"Failed to clear exploration flag for {channel_id[:12]}...: {e}", level='debug')
 
                 sparse_data_conservative = self._is_sparse_data_channel(
@@ -7546,6 +7890,27 @@ class FeeController:
 
     def _governed_authorize_fee_broadcast(self, *, channel_id, fee_ppm,
                                           old_fee_ppm, reason, reason_code):
+        request = {
+            "channel_id": channel_id,
+            "fee_ppm": fee_ppm,
+            "old_fee_ppm": old_fee_ppm,
+            "reason": reason,
+            "reason_code": reason_code,
+        }
+        result = self._governed_authorize_fee_broadcast_inner(**request)
+        record_capture_observation("governor", {
+            "ordinal": len(current_capture().observations["governor"])
+            if current_capture() is not None else 0,
+            "request": request,
+            "result": {
+                "authorized": bool(result[0]),
+                "reason": str(result[1]),
+            },
+        })
+        return result
+
+    def _governed_authorize_fee_broadcast_inner(self, *, channel_id, fee_ppm,
+                                                old_fee_ppm, reason, reason_code):
         """Phase 2H: authorize one automated fee broadcast. Zero worst-
         case cost (reversible policy change) — the facade authorizes
         without reserving; the gates are paused/stale plus the ledger
@@ -7639,6 +8004,49 @@ class FeeController:
             return False, f"internal_error ({e})"
 
     def set_channel_fee(self, channel_id: str, fee_ppm: int,
+                       reason: str = "manual", manual: bool = False,
+                       reason_code: Optional[str] = None,
+                       enforce_limits: bool = True,
+                       channel_info: Optional[Dict[str, Any]] = None,
+                       htlcmin_msat: Optional[int] = None,
+                       htlcmax_msat: Optional[int] = None,
+                       base_fee_msat_override: Optional[int] = None,
+                       effective_min_fee_ppm: Optional[int] = None) -> Dict[str, Any]:
+        request = {
+            "channel_id": channel_id,
+            "fee_ppm": fee_ppm,
+            "reason": reason,
+            "manual": manual,
+            "reason_code": reason_code,
+            "enforce_limits": enforce_limits,
+            "channel_info": channel_info,
+            "htlcmin_msat": htlcmin_msat,
+            "htlcmax_msat": htlcmax_msat,
+            "base_fee_msat_override": base_fee_msat_override,
+            "effective_min_fee_ppm": effective_min_fee_ppm,
+        }
+        try:
+            result = self._set_channel_fee_inner(**request)
+        except Exception as exc:
+            record_capture_observation("execution", {
+                "ordinal": len(current_capture().observations["execution"])
+                if current_capture() is not None else 0,
+                "request": request,
+                "error": {
+                    "category": type(exc).__name__,
+                    "message": str(exc),
+                },
+            })
+            raise
+        record_capture_observation("execution", {
+            "ordinal": len(current_capture().observations["execution"])
+            if current_capture() is not None else 0,
+            "request": request,
+            "result": result,
+        })
+        return result
+
+    def _set_channel_fee_inner(self, channel_id: str, fee_ppm: int,
                        reason: str = "manual", manual: bool = False,
                        reason_code: Optional[str] = None,
                        enforce_limits: bool = True,
@@ -8215,12 +8623,20 @@ class FeeController:
             if self._cycle_batch_active:
                 latency = self._cycle_peer_latency_memo.get(peer_id)
                 if latency is None:
-                    latency = self.database.get_peer_latency_stats(
-                        peer_id, window_seconds=86400
+                    latency = record_effective_evidence(
+                        "peer_latency", [peer_id],
+                        lambda: self.database.get_peer_latency_stats(
+                            peer_id, window_seconds=86400
+                        ),
                     )
                     self._cycle_peer_latency_memo[peer_id] = latency
             else:
-                latency = self.database.get_peer_latency_stats(peer_id, window_seconds=86400)
+                latency = record_effective_evidence(
+                    "peer_latency", [peer_id],
+                    lambda: self.database.get_peer_latency_stats(
+                        peer_id, window_seconds=86400
+                    ),
+                )
             avg_res = latency.get('avg', 0)
             std_res = latency.get('std', 0)
             

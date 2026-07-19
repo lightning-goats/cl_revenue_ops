@@ -1,7 +1,11 @@
 from copy import deepcopy
+import json
+from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
+from modules.fee_cycle_capture import FeeCycleCaptureSession
 import modules.fee_cycle_replay_wire as replay_wire
 from modules.fee_cycle_replay_wire import (
     MAX_ENVELOPE_BYTES,
@@ -9,6 +13,12 @@ from modules.fee_cycle_replay_wire import (
     seal_envelope,
     tag_floats,
     verify_envelope,
+)
+
+SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "schemas"
+    / "fee_cycle_replay.v0.schema.json"
 )
 
 
@@ -94,3 +104,31 @@ def test_seal_rejects_body_over_configured_body_limit(monkeypatch):
 
     with pytest.raises(ValueError, match="32 MiB"):
         seal_envelope(body)
+
+
+def test_real_session_envelope_matches_closed_schema():
+    session = FeeCycleCaptureSession(
+        capture_run_id="run-a",
+        capture_seq=1,
+        cycle_id="cycle-a",
+        producer={
+            "python_commit": "deadbeef",
+            "algorithm_version": "dts_pid_v1",
+            "started_at": "2026-07-19T00:00:00+00:00",
+        },
+        configuration={"fee_replay_capture_enabled": True},
+    )
+    session.record_pre_state({"global": {}, "ordered_channels": []})
+    session.record_expected(
+        {
+            "ordered_outcomes": [],
+            "post_global": {},
+            "post_channel_state": [],
+        }
+    )
+    sealed = seal_envelope(session.to_body())
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+    Draft202012Validator(schema).validate(sealed)
+    assert "started_at" in schema["required"]
+    assert isinstance(sealed["started_at"], str)

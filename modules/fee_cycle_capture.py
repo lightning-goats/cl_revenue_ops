@@ -3,13 +3,15 @@ import json
 import os
 import queue
 import random
+import subprocess
 import threading
 import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
@@ -130,6 +132,98 @@ def _record_observation_no_throw(session: Any, family: str, entry: dict) -> None
             pass
 
 
+def capture_value(value: Any) -> Any:
+    """Return a detached, replay-wire-safe representation of a live value."""
+    if value is None or isinstance(value, (bool, str, int, float)):
+        return value
+    if isinstance(value, Enum):
+        return capture_value(value.value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: capture_value(getattr(value, item.name))
+            for item in fields(value)
+            if not item.name.startswith("_")
+        }
+    if isinstance(value, dict):
+        return {str(key): capture_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [capture_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((capture_value(item) for item in value), key=repr)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return capture_value(to_dict())
+        except Exception:
+            pass
+    return {"unsupported_type": type(value).__name__}
+
+
+def record_capture_pre_state(session: Any, value: dict) -> None:
+    if session is None:
+        return
+    try:
+        session.record_pre_state(capture_value(value))
+    except Exception as exc:
+        try:
+            session.mark_invalid(f"capture recorder failure: {type(exc).__name__}")
+        except Exception:
+            pass
+
+
+def record_capture_expected(session: Any, value: dict) -> None:
+    if session is None:
+        return
+    try:
+        session.record_expected(capture_value(value))
+    except Exception as exc:
+        try:
+            session.mark_invalid(f"capture recorder failure: {type(exc).__name__}")
+        except Exception:
+            pass
+
+
+def mark_capture_invalid(session: Any, reason: str) -> None:
+    if session is None:
+        return
+    try:
+        session.mark_invalid(reason)
+    except Exception:
+        pass
+
+
+def record_capture_observation(family: str, entry: dict) -> None:
+    session = current_capture()
+    if session is None:
+        return
+    _record_observation_no_throw(session, family, capture_value(entry))
+
+
+def record_effective_evidence_result(
+    op: Any,
+    args: Any,
+    result: Any,
+    fallback_error: Optional[Exception] = None,
+) -> Any:
+    """Record one already-computed effective fallback result without rerunning I/O."""
+    session = current_capture()
+    if session is None:
+        return result
+    entry = {
+        "ordinal": _observation_ordinal(session, "evidence"),
+        "op": op,
+        "args": capture_value(args),
+        "result": capture_value(result),
+    }
+    if fallback_error is not None:
+        entry["fallback_error"] = {
+            "category": type(fallback_error).__name__,
+            "message": _stable_error_message(fallback_error),
+        }
+    _record_observation_no_throw(session, "evidence", entry)
+    return result
+
+
 def decision_now(label: str) -> int:
     value = int(time.time())
     session = current_capture()
@@ -200,7 +294,7 @@ def record_effective_evidence(op: Any, args: Any, fn: Any) -> Any:
             {
                 "ordinal": ordinal,
                 "op": op,
-                "args": args,
+                "args": capture_value(args),
                 "error": {
                     "category": type(exc).__name__,
                     "message": _stable_error_message(exc),
@@ -214,8 +308,8 @@ def record_effective_evidence(op: Any, args: Any, fn: Any) -> Any:
         {
             "ordinal": ordinal,
             "op": op,
-            "args": args,
-            "result": result,
+            "args": capture_value(args),
+            "result": capture_value(result),
         },
     )
     return result
@@ -245,6 +339,23 @@ class FeeCycleCaptureManager:
         self._publish_blocked_revision = -1
         self._close_retry_revision = -1
         self._durable_closed = False
+        self.python_commit = self._discover_python_commit()
+
+    @staticmethod
+    def _discover_python_commit() -> str:
+        root = Path(__file__).resolve().parents[1]
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=True,
+            )
+            revision = completed.stdout.strip()
+            return revision or "unknown"
+        except Exception:
+            return "unknown"
 
     def set_enabled(self, enabled: bool, timeout_seconds: float = 5.0) -> bool:
         try:
@@ -274,6 +385,7 @@ class FeeCycleCaptureManager:
                 if not isinstance(producer_copy, dict):
                     raise TypeError("capture producer must be a dict")
                 producer_copy.setdefault("started_at", _utc_now())
+                producer_copy.setdefault("python_commit", self.python_commit)
                 capture_seq = self._next_seq + 1
                 cycle_id = f"{self._capture_run_id}:{capture_seq:08d}"
                 session = FeeCycleCaptureSession(

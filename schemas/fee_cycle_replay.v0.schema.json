@@ -10,6 +10,7 @@
     "capture_seq",
     "cycle_id",
     "producer",
+    "started_at",
     "configuration",
     "pre_state",
     "observations",
@@ -39,6 +40,10 @@
     },
     "producer": {
       "$ref": "#/$defs/wire_object"
+    },
+    "started_at": {
+      "type": "string",
+      "minLength": 1
     },
     "configuration": {
       "$ref": "#/$defs/wire_object"
@@ -145,7 +150,8 @@
         "python_commit": "92348bf9c072b2dbc543b8b0a92c34c7e46d3035"
       },
       "schema_name": "fee_cycle_replay",
-      "schema_version": 0
+      "schema_version": 0,
+      "started_at": "2026-07-19T00:00:00+00:00"
     }
   ]
 }
