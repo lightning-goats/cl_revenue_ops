@@ -315,6 +315,32 @@ def test_recording_failure_never_changes_delegated_result(capture_session, monke
     assert capture_session.invalid_reason == "capture recorder failure: TypeError"
 
 
+def test_recursive_evidence_serialization_preserves_result_and_original_error(
+    capture_session,
+):
+    recursive = {}
+    recursive["self"] = recursive
+    delegated_error = RuntimeError("authority failed")
+
+    def fail():
+        raise delegated_error
+
+    with bind_capture(capture_session):
+        assert capture.record_effective_evidence_result(
+            "chosen", recursive, recursive
+        ) is recursive
+        assert record_effective_evidence(
+            "queried", recursive, lambda: recursive
+        ) is recursive
+        with pytest.raises(RuntimeError) as raised:
+            record_effective_evidence("failed", recursive, fail)
+
+    assert raised.value is delegated_error
+    assert capture_session.invalid_reason == (
+        "capture recorder failure: RecursionError"
+    )
+
+
 def test_malformed_bound_session_does_not_change_authority_behavior(monkeypatch):
     monkeypatch.setattr(capture.time, "time", lambda: 999.8)
     monkeypatch.setattr(capture.random, "random", lambda: 0.75)
@@ -538,6 +564,8 @@ class _MemoryCaptureManager:
     def begin_cycle(self, configuration, producer):
         if not self.enabled:
             return None
+        if callable(configuration):
+            configuration = configuration()
         producer = copy.deepcopy(producer)
         producer.setdefault("started_at", "2026-07-19T00:00:00+00:00")
         session = FeeCycleCaptureSession(
@@ -649,6 +677,24 @@ def _only_body(manager):
     return manager.finished[0].to_body()
 
 
+
+def test_recursive_execution_transcript_never_changes_successful_result(
+    tmp_path, monkeypatch, capture_session
+):
+    controller, _manager = _capture_controller(tmp_path)
+    successful_result = {}
+    successful_result["self"] = successful_result
+    monkeypatch.setattr(
+        controller,
+        "_set_channel_fee_inner",
+        MagicMock(return_value=successful_result),
+    )
+
+    with bind_capture(capture_session):
+        assert controller.set_channel_fee(CHANNEL_ID, 125) is successful_result
+
+    assert capture_session.invalid_reason == "capture recorder failure: RecursionError"
+
 def test_full_cycle_capture_records_pre_state_outcome_and_post_state(
     tmp_path, monkeypatch
 ):
@@ -721,6 +767,34 @@ def test_capture_records_pre_state_before_sleep_mutation(tmp_path, monkeypatch):
     ] is False
 
 
+
+def test_capture_records_channel_pre_state_before_vegas_wake(
+    tmp_path, monkeypatch
+):
+    controller, manager = _capture_controller(tmp_path)
+    controller.config.enable_vegas_reflex = True
+    controller._get_dynamic_chain_costs.return_value = {"sat_per_vbyte": 100.0}
+    controller.database.get_mempool_ma.return_value = 1.0
+    controller._cycle_states[CHANNEL_ID].is_sleeping = True
+    controller._channel_fee_states[CHANNEL_ID].is_sleeping = True
+
+    def vegas_wake():
+        controller._cycle_states[CHANNEL_ID].is_sleeping = False
+        controller._channel_fee_states[CHANNEL_ID].is_sleeping = False
+        return True
+
+    monkeypatch.setattr(controller, "_maybe_wake_for_vegas_spike", vegas_wake)
+    monkeypatch.setattr(controller, "_adjust_channel_fee", lambda **_kwargs: None)
+
+    controller.adjust_all_fees()
+    body = _only_body(manager)
+    assert body["pre_state"]["ordered_channels"][0]["cycle_state"][
+        "is_sleeping"
+    ] is True
+    assert body["expected"]["post_channel_state"][0]["cycle_state"][
+        "is_sleeping"
+    ] is False
+
 def test_database_flow_window_error_records_neutral_fallback(tmp_path, monkeypatch):
     controller, manager = _capture_controller(tmp_path)
     controller.database.get_all_channel_flow_windows.side_effect = RuntimeError(
@@ -750,6 +824,24 @@ def test_malformed_channel_state_is_ignored_without_action(tmp_path):
     controller.data_service.set_channel.assert_not_called()
     assert _only_body(manager)["completeness"]["complete"] is True
 
+
+
+def test_missing_channel_info_is_recorded_with_terminal_skip(tmp_path):
+    controller, manager = _capture_controller(tmp_path)
+    controller.data_service.get_peer_channels.return_value = {"channels": []}
+
+    assert controller.adjust_all_fees() == []
+    body = _only_body(manager)
+    assert [
+        entry["channel_id"] for entry in body["pre_state"]["ordered_channels"]
+    ] == [CHANNEL_ID]
+    assert body["expected"]["ordered_outcomes"] == [
+        {"skip": {"reason": "missing_channel_info"}}
+    ]
+    assert body["completeness"]["evaluated_channels"] == 1
+    assert body["completeness"]["terminal_outcomes"] == 1
+    assert body["completeness"]["complete"] is True
+    controller.data_service.set_channel.assert_not_called()
 
 @pytest.mark.parametrize(
     ("strategy", "overlay", "reason"),
@@ -921,6 +1013,20 @@ def test_disabled_capture_preserves_seeded_result_and_state(tmp_path, monkeypatc
     assert enabled_state == disabled._cycle_states[CHANNEL_ID]
     assert len(enabled_manager.finished) == 1
     assert disabled_manager.finished == []
+
+
+def test_disabled_capture_never_serializes_configuration(tmp_path, monkeypatch):
+    controller, manager = _capture_controller(tmp_path, enabled=False)
+    serializer = MagicMock(side_effect=AssertionError("configuration serialized"))
+    monkeypatch.setattr("modules.fee_controller.capture_value", serializer)
+    monkeypatch.setattr(controller, "_adjust_channel_fee", lambda **_kwargs: None)
+
+    assert controller.adjust_all_fees() == []
+
+    serializer.assert_not_called()
+    assert manager.sessions == []
+    assert manager.finished == []
+
 
 
 def test_prefetch_failure_preserves_inner_retry_and_delegated_result(

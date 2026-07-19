@@ -143,7 +143,7 @@
       "cycle_id": "cycle-a",
       "expected": {},
       "observations": {},
-      "payload_sha256": "bf993e25c58a5aa6ca1aafc10fa89b6538444fcdd0a1b3dfe9061f4317f9156e",
+      "payload_sha256": "1aa1c19fd92958f9e7163d811aa5ac9bcd54610a31c16ff4c07bd271af8bc54f",
       "pre_state": {},
       "producer": {
         "algorithm_version": "dts_pid_v1",

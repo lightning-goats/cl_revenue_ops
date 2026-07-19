@@ -122,7 +122,7 @@ def _record_observation_no_throw(session: Any, family: str, entry: dict) -> None
     if session is None:
         return
     try:
-        session.record_observation(family, entry)
+        session.record_observation(family, capture_value(entry))
     except Exception as exc:
         try:
             session.mark_invalid(
@@ -196,7 +196,7 @@ def record_capture_observation(family: str, entry: dict) -> None:
     session = current_capture()
     if session is None:
         return
-    _record_observation_no_throw(session, family, capture_value(entry))
+    _record_observation_no_throw(session, family, entry)
 
 
 def record_effective_evidence_result(
@@ -212,8 +212,8 @@ def record_effective_evidence_result(
     entry = {
         "ordinal": _observation_ordinal(session, "evidence"),
         "op": op,
-        "args": capture_value(args),
-        "result": capture_value(result),
+        "args": args,
+        "result": result,
     }
     if fallback_error is not None:
         entry["fallback_error"] = {
@@ -294,7 +294,7 @@ def record_effective_evidence(op: Any, args: Any, fn: Any) -> Any:
             {
                 "ordinal": ordinal,
                 "op": op,
-                "args": capture_value(args),
+                "args": args,
                 "error": {
                     "category": type(exc).__name__,
                     "message": _stable_error_message(exc),
@@ -308,8 +308,8 @@ def record_effective_evidence(op: Any, args: Any, fn: Any) -> Any:
         {
             "ordinal": ordinal,
             "op": op,
-            "args": capture_value(args),
-            "result": capture_value(result),
+            "args": args,
+            "result": result,
         },
     )
     return result
@@ -366,7 +366,7 @@ class FeeCycleCaptureManager:
             return False
 
     def begin_cycle(
-        self, configuration: dict, producer: dict
+        self, configuration: Any, producer: dict
     ) -> Optional[FeeCycleCaptureSession]:
         try:
             with self._condition:
@@ -378,7 +378,8 @@ class FeeCycleCaptureManager:
                     or self._active_sessions
                 ):
                     return None
-                configuration_copy = copy.deepcopy(configuration)
+                configuration_value = configuration() if callable(configuration) else configuration
+                configuration_copy = copy.deepcopy(configuration_value)
                 producer_copy = copy.deepcopy(producer)
                 if not isinstance(configuration_copy, dict):
                     raise TypeError("capture configuration must be a dict")

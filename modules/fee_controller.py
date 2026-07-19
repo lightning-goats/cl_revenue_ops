@@ -3072,7 +3072,7 @@ class FeeController:
         channel_id: str,
         peer_id: str,
         state: Dict[str, Any],
-        channel_info: Dict[str, Any],
+        channel_info: Optional[Dict[str, Any]],
         cycle_state: Any = None,
         fee_state: Any = None,
     ) -> None:
@@ -3089,12 +3089,10 @@ class FeeController:
                 "cycle_state": cycle_state,
                 "fee_state": fee_state,
             }
-            for index, existing in enumerate(channels):
+            for existing in channels:
                 if existing.get("channel_id") == channel_id:
-                    channels[index] = capture_value(entry)
-                    break
-            else:
-                channels.append(capture_value(entry))
+                    return
+            channels.append(capture_value(entry))
             record_capture_pre_state(session, pre_state)
         except Exception as exc:
             mark_capture_invalid(
@@ -4571,7 +4569,7 @@ class FeeController:
         session = None
         try:
             session = self._fee_capture.begin_cycle(
-                capture_value(cfg),
+                lambda: capture_value(cfg),
                 {"algorithm_version": "dts_pid_v1"},
             )
         except Exception:
@@ -4756,6 +4754,7 @@ class FeeController:
             "fee_unchanged": 0,
             "gossip_hysteresis": 0,
             "idempotent": 0,
+            "missing_channel_info": 0,
             "error": 0
         }
 
@@ -4782,6 +4781,24 @@ class FeeController:
         channels = prefetched_channels or record_effective_evidence(
             "channels_info", [], self._get_channels_info
         )
+        # Snapshot every valid channel input before Vegas or a decision mutates state.
+        if capture_session is not None:
+            for state in channel_states:
+                if not isinstance(state, dict):
+                    continue
+                channel_id = state.get("channel_id")
+                peer_id = state.get("peer_id")
+                if not channel_id or not peer_id:
+                    continue
+                self._capture_channel_pre_state(
+                    capture_session,
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    state=state,
+                    channel_info=channels.get(channel_id),
+                    cycle_state=self._cycle_states.get(channel_id),
+                    fee_state=self._channel_fee_states.get(channel_id),
+                )
 
         # OPTIMIZATION: Hoist feerates RPC call outside the loop
         # This reduces N RPC calls to 1 per adjust_all_fees cycle
@@ -4905,6 +4922,7 @@ class FeeController:
                     "waiting_forwards",
                     "gossip_hysteresis",
                     "idempotent",
+                    "missing_channel_info",
                     "error",
                 }
                 self._set_last_decision_summary(
@@ -4986,6 +5004,11 @@ class FeeController:
 
             channel_info = channels.get(channel_id)
             if not channel_info:
+                skip_reasons["missing_channel_info"] += 1
+                self._capture_terminal_outcome(
+                    current_capture(),
+                    {"skip": {"reason": "missing_channel_info"}},
+                )
                 continue
 
             if self.temporary_fee_overlay_active is not None:

@@ -132,3 +132,12 @@ def test_real_session_envelope_matches_closed_schema():
     Draft202012Validator(schema).validate(sealed)
     assert "started_at" in schema["required"]
     assert isinstance(sealed["started_at"], str)
+
+
+def test_schema_example_has_valid_payload_digest():
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    example = deepcopy(schema["examples"][0])
+
+    verify_envelope(example)
+    supplied = example.pop("payload_sha256")
+    assert seal_envelope(example)["payload_sha256"] == supplied
