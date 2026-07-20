@@ -3065,6 +3065,14 @@ class FeeController:
         if getattr(config, "fee_replay_capture_enabled", False) is True:
             self._fee_capture.set_enabled(True)
 
+    @staticmethod
+    def _capture_fee_state(fee_state: Any) -> Any:
+        captured = capture_value(fee_state)
+        thompson = getattr(fee_state, "thompson", None)
+        if isinstance(captured, dict) and thompson is not None:
+            captured["thompson"] = capture_value(thompson.to_dict())
+        return captured
+
     def _capture_channel_pre_state(
         self,
         session: Any,
@@ -3087,7 +3095,7 @@ class FeeController:
                 "channel_state": state,
                 "channel_info": channel_info,
                 "cycle_state": cycle_state,
-                "fee_state": fee_state,
+                "fee_state": self._capture_fee_state(fee_state),
             }
             for existing in channels:
                 if existing.get("channel_id") == channel_id:
@@ -3099,7 +3107,7 @@ class FeeController:
                         existing["cycle_state"] = capture_value(cycle_state)
                         changed = True
                     if existing.get("fee_state") is None and fee_state is not None:
-                        existing["fee_state"] = capture_value(fee_state)
+                        existing["fee_state"] = self._capture_fee_state(fee_state)
                         changed = True
                     if changed:
                         record_capture_pre_state(session, pre_state)
@@ -3205,7 +3213,9 @@ class FeeController:
                     "channel_id": channel_id,
                     "peer_id": channel.get("peer_id"),
                     "cycle_state": self._cycle_states.get(channel_id),
-                    "fee_state": self._channel_fee_states.get(channel_id),
+                    "fee_state": self._capture_fee_state(
+                        self._channel_fee_states.get(channel_id)
+                    ),
                 })
             expected["post_channel_state"] = post_channels
             expected["post_global"] = {
@@ -3353,14 +3363,20 @@ class FeeController:
                                  cfg: Optional[Any] = None) -> int | None:
         return self._frozen_observation(
             ("neighbor_median", str(peer_id)),
-            lambda: self._get_neighbor_fee_median_live(peer_id, cfg))
+            lambda: record_effective_evidence(
+                "neighbor_fee_median", [peer_id],
+                lambda: self._get_neighbor_fee_median_live(peer_id, cfg),
+            ))
 
     def _get_neighbor_fee_percentile(self, peer_id: str, pct: float,
                                      cfg: Optional[Any] = None) -> int | None:
         return self._frozen_observation(
             ("neighbor_pct", str(peer_id), float(pct)),
-            lambda: self._get_neighbor_fee_percentile_live(
-                peer_id, pct, cfg))
+            lambda: record_effective_evidence(
+                "neighbor_fee_percentile", [peer_id, pct],
+                lambda: self._get_neighbor_fee_percentile_live(
+                    peer_id, pct, cfg),
+            ))
 
     def _get_dynamic_chain_costs(self) -> Optional[Dict[str, int]]:
         return self._frozen_observation(

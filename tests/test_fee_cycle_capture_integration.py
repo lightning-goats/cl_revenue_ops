@@ -42,6 +42,8 @@ EVIDENCE_OPERATION_CONTRACT = {
     "exploration_flag",
     "clear_exploration_flag",
     "gossip_channels",
+    "neighbor_fee_median",
+    "neighbor_fee_percentile",
     "peer_latency",
     "channel_cost_history",
     "peer_fee_history",
@@ -698,6 +700,41 @@ def test_capture_producer_declares_optional_overlay_capability(
     assert ("temporary_overlay_active" in operations) is overlay_available
 
 
+def test_neighbor_cache_effective_values_are_recorded_once_at_first_use(
+    tmp_path, monkeypatch, capture_session
+):
+    controller, _manager = _capture_controller(tmp_path)
+    controller._cycle_observations = {}
+    median_live = MagicMock(return_value=360)
+    percentile_live = MagicMock(return_value=None)
+    monkeypatch.setattr(controller, "_get_neighbor_fee_median_live", median_live)
+    monkeypatch.setattr(
+        controller, "_get_neighbor_fee_percentile_live", percentile_live
+    )
+
+    with bind_capture(capture_session):
+        assert controller._get_neighbor_fee_median(PEER_ID) == 360
+        assert controller._get_neighbor_fee_median(PEER_ID) == 360
+        assert controller._get_neighbor_fee_percentile(PEER_ID, 0.25) is None
+        assert controller._get_neighbor_fee_percentile(PEER_ID, 0.25) is None
+
+    median_live.assert_called_once_with(PEER_ID, None)
+    percentile_live.assert_called_once_with(PEER_ID, 0.25, None)
+    assert capture_session.observations["evidence"] == [
+        {
+            "ordinal": 0,
+            "op": "neighbor_fee_median",
+            "args": [PEER_ID],
+            "result": 360,
+        },
+        {
+            "ordinal": 1,
+            "op": "neighbor_fee_percentile",
+            "args": [PEER_ID, 0.25],
+            "result": None,
+        },
+    ]
+
 
 def test_recursive_execution_transcript_never_changes_successful_result(
     tmp_path, monkeypatch, capture_session
@@ -826,6 +863,8 @@ def test_full_cycle_capture_records_pre_state_outcome_and_post_state(
     tmp_path, monkeypatch
 ):
     controller, manager = _capture_controller(tmp_path)
+    controller._channel_fee_states[CHANNEL_ID].thompson._last_fee_min = 75.0
+    controller._channel_fee_states[CHANNEL_ID].thompson._last_fee_max = 225.0
     expected = FeeAdjustment(
         channel_id=CHANNEL_ID,
         peer_id=PEER_ID,
@@ -851,6 +890,9 @@ def test_full_cycle_capture_records_pre_state_outcome_and_post_state(
     assert body["completeness"]["evaluated_channels"] == 1
     assert body["pre_state"]["ordered_channels"][0]["channel_id"] == CHANNEL_ID
     assert body["pre_state"]["ordered_channels"][0]["cycle_state"]["last_fee_ppm"] == 100
+    pre_thompson = body["pre_state"]["ordered_channels"][0]["fee_state"]["thompson"]
+    assert pre_thompson["_last_fee_min"] == 75.0
+    assert pre_thompson["_last_fee_max"] == 225.0
     assert body["expected"]["ordered_outcomes"] == [
         {
             "channel_id": CHANNEL_ID,
@@ -859,6 +901,9 @@ def test_full_cycle_capture_records_pre_state_outcome_and_post_state(
         }
     ]
     assert body["expected"]["post_channel_state"][0]["cycle_state"]["last_fee_ppm"] == 125
+    post_thompson = body["expected"]["post_channel_state"][0]["fee_state"]["thompson"]
+    assert post_thompson["_last_fee_min"] == 75.0
+    assert post_thompson["_last_fee_max"] == 225.0
     assert body["pre_state"]["global"]["random_state"] != []
     assert body["expected"]["post_global"]["random_state"] != []
     assert manager.finish_lock_available == [True]
