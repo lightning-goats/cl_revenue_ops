@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, ValidationError
 
 from modules.fee_cycle_capture import FeeCycleCaptureSession
 import modules.fee_cycle_replay_wire as replay_wire
@@ -132,6 +132,38 @@ def test_real_session_envelope_matches_closed_schema():
     Draft202012Validator(schema).validate(sealed)
     assert "started_at" in schema["required"]
     assert isinstance(sealed["started_at"], str)
+
+
+def test_schema_requires_closed_decision_trace_and_explicit_completeness_counts():
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    validator = Draft202012Validator(schema)
+    example = deepcopy(schema["examples"][0])
+    example["expected"]["ordered_decision_traces"] = [
+        {
+            "channel_id": "1x1x1",
+            "peer_id": "peer-a",
+            "terminal_kind": "skip",
+            "terminal_reason": "policy_passive",
+            "decision_source": "policy_passive",
+            "current_fee_ppm": 100,
+            "target_fee_ppm": None,
+            "applied_fee_ppm": 100,
+            "algorithm_values": None,
+            "governor": [],
+            "execution": [],
+        }
+    ]
+    validator.validate(example)
+
+    unknown = deepcopy(example)
+    unknown["expected"]["ordered_decision_traces"][0]["rust_only"] = True
+    with pytest.raises(ValidationError):
+        validator.validate(unknown)
+
+    missing_count = deepcopy(example)
+    del missing_count["completeness"]["decision_trace_entries"]
+    with pytest.raises(ValidationError):
+        validator.validate(missing_count)
 
 
 def test_schema_example_has_valid_payload_digest():

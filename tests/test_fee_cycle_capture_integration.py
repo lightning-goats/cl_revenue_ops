@@ -831,12 +831,68 @@ def test_full_cycle_capture_records_pre_state_outcome_and_post_state(
     assert body["pre_state"]["ordered_channels"][0]["channel_id"] == CHANNEL_ID
     assert body["pre_state"]["ordered_channels"][0]["cycle_state"]["last_fee_ppm"] == 100
     assert body["expected"]["ordered_outcomes"] == [
-        {"adjustment": expected.to_dict()}
+        {
+            "channel_id": CHANNEL_ID,
+            "peer_id": PEER_ID,
+            "adjustment": expected.to_dict(),
+        }
     ]
     assert body["expected"]["post_channel_state"][0]["cycle_state"]["last_fee_ppm"] == 125
     assert body["pre_state"]["global"]["random_state"] != []
     assert body["expected"]["post_global"]["random_state"] != []
     assert manager.finish_lock_available == [True]
+
+
+def test_python_authority_emits_closed_ordered_decision_trace_oracle(
+    tmp_path, monkeypatch
+):
+    controller, manager = _capture_controller(tmp_path)
+    expected = FeeAdjustment(
+        channel_id=CHANNEL_ID,
+        peer_id=PEER_ID,
+        old_fee_ppm=100,
+        new_fee_ppm=125,
+        reason="test adjustment",
+        algorithm_values={"target": 125, "source": "python"},
+        reason_code="dts_pid_sample",
+    )
+
+    def adjust(**_kwargs):
+        controller.set_channel_fee(
+            CHANNEL_ID,
+            125,
+            reason="test adjustment",
+            reason_code="dts_pid_sample",
+            channel_info={
+                "channel_id": CHANNEL_ID,
+                "short_channel_id": CHANNEL_ID,
+                "peer_id": PEER_ID,
+                "fee_proportional_millionths": 100,
+            },
+        )
+        return expected
+
+    monkeypatch.setattr(controller, "_adjust_channel_fee", adjust)
+
+    assert controller.adjust_all_fees() == [expected]
+    body = _only_body(manager)
+    trace = body["expected"]["ordered_decision_traces"]
+    assert trace == [
+        {
+            "channel_id": CHANNEL_ID,
+            "peer_id": PEER_ID,
+            "terminal_kind": "adjustment",
+            "terminal_reason": "test adjustment",
+            "decision_source": "dts_pid_sample",
+            "current_fee_ppm": 100,
+            "target_fee_ppm": 125,
+            "applied_fee_ppm": 125,
+            "algorithm_values": {"target": 125, "source": "python"},
+            "governor": [],
+            "execution": body["observations"]["execution"],
+        }
+    ]
+    assert body["completeness"]["decision_trace_entries"] == 1
 
 
 def test_cycle_exception_is_ineligible_and_submitted_outside_state_lock(tmp_path):
@@ -1111,6 +1167,83 @@ def test_cold_dynamic_capture_hydrates_before_decision_without_extra_io(
     }
 
 
+def test_cold_a_then_warm_b_preserves_authority_channel_order_everywhere(
+    tmp_path, monkeypatch
+):
+    controller, manager = _capture_controller(tmp_path)
+    channel_a = CHANNEL_ID
+    peer_a = PEER_ID
+    channel_b = "123x457x0"
+    peer_b = "03" + "c" * 64
+    controller.database.get_all_channel_states.return_value = [
+        {
+            "channel_id": channel_a,
+            "peer_id": peer_a,
+            "state": "balanced",
+            "forward_count": 3,
+        },
+        {
+            "channel_id": channel_b,
+            "peer_id": peer_b,
+            "state": "balanced",
+            "forward_count": 4,
+        },
+    ]
+    raw_b = _raw_channel()
+    raw_b.update(
+        {
+            "short_channel_id": channel_b,
+            "channel_id": "2" * 64,
+            "peer_id": peer_b,
+        }
+    )
+    controller.data_service.get_peer_channels.return_value = {
+        "channels": [_raw_channel(), raw_b]
+    }
+    controller._cycle_states.clear()
+    controller._channel_fee_states.clear()
+    controller._cycle_states[channel_b] = ChannelCycleState(
+        last_fee_ppm=100,
+        last_broadcast_fee_ppm=100,
+    )
+    controller._channel_fee_states[channel_b] = ChannelFeeState(
+        last_fee_ppm=100,
+        last_broadcast_fee_ppm=100,
+    )
+
+    def adjust(channel_id, peer_id, **_kwargs):
+        controller._get_cycle_state(channel_id, actual_fee_ppm=100)
+        controller._get_channel_fee_state(
+            channel_id, peer_id, actual_fee_ppm=100
+        )
+        return None
+
+    monkeypatch.setattr(controller, "_adjust_channel_fee", adjust)
+    monkeypatch.setattr(
+        controller,
+        "_classify_no_adjustment_skip_reason",
+        lambda **_kwargs: "fee_unchanged",
+    )
+
+    assert controller.adjust_all_fees() == []
+    body = _only_body(manager)
+    expected_order = [channel_a, channel_b]
+    assert [
+        item["channel_id"] for item in body["pre_state"]["ordered_channels"]
+    ] == expected_order
+    assert [
+        item["channel_id"] for item in body["expected"]["ordered_outcomes"]
+    ] == expected_order
+    assert [
+        item["channel_id"]
+        for item in body["expected"]["ordered_decision_traces"]
+    ] == expected_order
+    assert [
+        item["channel_id"] for item in body["expected"]["post_channel_state"]
+    ] == expected_order
+    assert body["completeness"]["complete"] is True
+
+
 def test_database_flow_window_error_records_neutral_fallback(tmp_path, monkeypatch):
     controller, manager = _capture_controller(tmp_path)
     controller.database.get_all_channel_flow_windows.side_effect = RuntimeError(
@@ -1152,7 +1285,11 @@ def test_missing_channel_info_is_recorded_with_terminal_skip(tmp_path):
         entry["channel_id"] for entry in body["pre_state"]["ordered_channels"]
     ] == [CHANNEL_ID]
     assert body["expected"]["ordered_outcomes"] == [
-        {"skip": {"reason": "missing_channel_info"}}
+        {
+            "channel_id": CHANNEL_ID,
+            "peer_id": PEER_ID,
+            "skip": {"reason": "missing_channel_info"},
+        }
     ]
     assert body["completeness"]["evaluated_channels"] == 1
     assert body["completeness"]["terminal_outcomes"] == 1
@@ -1183,7 +1320,11 @@ def test_policy_and_overlay_skips_are_explicit_terminal_outcomes(
     assert controller.adjust_all_fees() == []
     body = _only_body(manager)
     assert body["expected"]["ordered_outcomes"] == [
-        {"skip": {"reason": reason}}
+        {
+            "channel_id": CHANNEL_ID,
+            "peer_id": PEER_ID,
+            "skip": {"reason": reason},
+        }
     ]
     assert body["completeness"]["complete"] is True
 
@@ -1212,7 +1353,11 @@ def test_each_major_dynamic_skip_has_one_terminal_outcome(
     assert controller.adjust_all_fees() == []
     body = _only_body(manager)
     assert body["expected"]["ordered_outcomes"] == [
-        {"skip": {"reason": reason}}
+        {
+            "channel_id": CHANNEL_ID,
+            "peer_id": PEER_ID,
+            "skip": {"reason": reason},
+        }
     ]
     assert body["completeness"]["terminal_outcomes"] == 1
 

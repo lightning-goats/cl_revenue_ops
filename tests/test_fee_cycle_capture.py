@@ -80,12 +80,27 @@ def test_session_records_copies_and_context_binding():
         producer={"started_at": "2026-07-18T00:00:00+00:00"},
         configuration={"version": 1},
     )
-    pre_state = {"global": {}, "ordered_channels": [{"channel_id": "1x1x1"}]}
+    identity = {"channel_id": "1x1x1", "peer_id": "peer-a"}
+    pre_state = {"global": {}, "ordered_channels": [dict(identity)]}
     observation = {"channel_id": "1x1x1", "value": 1.5}
     expected = {
-        "ordered_outcomes": [{"channel_id": "1x1x1"}],
-        "post_global_state": {},
-        "post_channel_state": [],
+        "ordered_outcomes": [{**identity, "skip": {"reason": "test"}}],
+        "ordered_decision_traces": [
+            {
+                **identity,
+                "terminal_kind": "skip",
+                "terminal_reason": "test",
+                "decision_source": "test",
+                "current_fee_ppm": 100,
+                "target_fee_ppm": None,
+                "applied_fee_ppm": 100,
+                "algorithm_values": None,
+                "governor": [],
+                "execution": [],
+            }
+        ],
+        "post_global": {},
+        "post_channel_state": [dict(identity)],
     }
 
     session.record_pre_state(pre_state)
@@ -101,12 +116,15 @@ def test_session_records_copies_and_context_binding():
     assert current_capture() is None
 
     body = session.to_body()
-    assert body["pre_state"]["ordered_channels"] == [{"channel_id": "1x1x1"}]
+    assert body["pre_state"]["ordered_channels"] == [identity]
     assert body["observations"]["evidence"][0]["value"] == 1.5
-    assert body["expected"]["ordered_outcomes"] == [{"channel_id": "1x1x1"}]
+    assert body["expected"]["ordered_outcomes"] == [
+        {**identity, "skip": {"reason": "test"}}
+    ]
     assert body["completeness"] == {
         "evaluated_channels": 1,
         "terminal_outcomes": 1,
+        "decision_trace_entries": 1,
         "evidence_entries": 1,
         "clock_entries": 0,
         "entropy_entries": 0,
@@ -371,6 +389,79 @@ def test_writer_exception_fails_open_and_records_failed_attempt(tmp_path, monkey
     assert manifest["attempts"][0]["status"] == "failed"
     assert manifest["attempts"][0]["eligible"] is False
     assert "disk unavailable" in manifest["attempts"][0]["error"]
+    assert _capture_files(tmp_path / "revenue_ops_fee_replay") == []
+
+
+def test_writer_rejects_invalid_session_without_publishing_capture(tmp_path):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    manager.set_enabled(True)
+    session = _complete_session(manager)
+    session.mark_invalid("capture recorder failure: TypeError")
+
+    manager.finish_cycle(session)
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+
+    manifest = manager.read_manifest()
+    assert manifest["attempted"] == 1
+    assert manifest["completed"] == 0
+    assert manifest["failed"] == 1
+    assert manifest["last_completed_seq"] is None
+    assert manifest["attempts"] == [
+        {
+            "capture_seq": 1,
+            "cycle_id": session.cycle_id,
+            "status": "failed",
+            "eligible": False,
+            "error_category": "invalid_session",
+            "error": "capture session is invalid",
+        }
+    ]
+    assert _capture_files(tmp_path / "revenue_ops_fee_replay") == []
+
+
+def test_writer_rejects_outcome_count_mismatch_without_publishing_capture(
+    tmp_path,
+):
+    manager = FeeCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_args, **_kw: None
+    )
+    manager.set_enabled(True)
+    session = manager.begin_cycle({"version": 1}, {"python_commit": "abc"})
+    assert session is not None
+    session.record_pre_state(
+        {
+            "global": {},
+            "ordered_channels": [
+                {"channel_id": "1x1x1", "peer_id": "02" + "a" * 64}
+            ],
+        }
+    )
+    session.record_expected(
+        {
+            "ordered_outcomes": [],
+            "ordered_decision_traces": [],
+            "post_global_state": {},
+            "post_channel_state": [],
+        }
+    )
+
+    manager.finish_cycle(session)
+    assert manager.set_enabled(False, timeout_seconds=5.0)
+
+    manifest = manager.read_manifest()
+    assert manifest["attempted"] == 1
+    assert manifest["completed"] == 0
+    assert manifest["failed"] == 1
+    assert manifest["last_completed_seq"] is None
+    assert manifest["attempts"][0]["status"] == "failed"
+    assert manifest["attempts"][0]["eligible"] is False
+    assert manifest["attempts"][0]["error_category"] == "count_mismatch"
+    assert manifest["attempts"][0]["error"] == (
+        "evaluated channel, terminal outcome, decision trace, and "
+        "post-state counts differ"
+    )
     assert _capture_files(tmp_path / "revenue_ops_fee_replay") == []
 
 

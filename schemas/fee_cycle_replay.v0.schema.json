@@ -55,21 +55,10 @@
       "$ref": "#/$defs/wire_object"
     },
     "expected": {
-      "$ref": "#/$defs/wire_object"
+      "$ref": "#/$defs/expected"
     },
     "completeness": {
-      "type": "object",
-      "required": [
-        "complete"
-      ],
-      "properties": {
-        "complete": {
-          "const": true
-        }
-      },
-      "additionalProperties": {
-        "$ref": "#/$defs/wire_value"
-      }
+      "$ref": "#/$defs/completeness"
     },
     "payload_sha256": {
       "type": "string",
@@ -132,26 +121,281 @@
           }
         }
       ]
+    },
+    "channel_identity_properties": {
+      "channel_id": {
+        "type": "string",
+        "minLength": 1
+      },
+      "peer_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "terminal_outcome": {
+      "type": "object",
+      "required": [
+        "channel_id",
+        "peer_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "peer_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adjustment": {
+          "$ref": "#/$defs/wire_object"
+        },
+        "skip": {
+          "type": "object",
+          "required": [
+            "reason"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "adjustment"
+          ],
+          "not": {
+            "required": [
+              "skip"
+            ]
+          }
+        },
+        {
+          "required": [
+            "skip"
+          ],
+          "not": {
+            "required": [
+              "adjustment"
+            ]
+          }
+        }
+      ]
+    },
+    "decision_trace": {
+      "type": "object",
+      "required": [
+        "channel_id",
+        "peer_id",
+        "terminal_kind",
+        "terminal_reason",
+        "decision_source",
+        "current_fee_ppm",
+        "target_fee_ppm",
+        "applied_fee_ppm",
+        "algorithm_values",
+        "governor",
+        "execution"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "peer_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "terminal_kind": {
+          "enum": [
+            "adjustment",
+            "skip"
+          ]
+        },
+        "terminal_reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "decision_source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "current_fee_ppm": {
+          "type": "integer"
+        },
+        "target_fee_ppm": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "applied_fee_ppm": {
+          "type": "integer"
+        },
+        "algorithm_values": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "governor": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/wire_value"
+          }
+        },
+        "execution": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/wire_value"
+          }
+        }
+      }
+    },
+    "channel_state_row": {
+      "type": "object",
+      "required": [
+        "channel_id",
+        "peer_id"
+      ],
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "peer_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/wire_value"
+      }
+    },
+    "expected": {
+      "type": "object",
+      "required": [
+        "ordered_outcomes",
+        "ordered_decision_traces",
+        "post_global",
+        "post_channel_state"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "ordered_outcomes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/terminal_outcome"
+          }
+        },
+        "ordered_decision_traces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/decision_trace"
+          }
+        },
+        "post_global": {
+          "$ref": "#/$defs/wire_object"
+        },
+        "post_channel_state": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/channel_state_row"
+          }
+        }
+      }
+    },
+    "completeness": {
+      "type": "object",
+      "required": [
+        "evaluated_channels",
+        "terminal_outcomes",
+        "decision_trace_entries",
+        "evidence_entries",
+        "clock_entries",
+        "entropy_entries",
+        "complete"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "evaluated_channels": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "terminal_outcomes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "decision_trace_entries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidence_entries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "clock_entries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "entropy_entries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "complete": {
+          "const": true
+        }
+      }
     }
   },
   "examples": [
     {
       "capture_run_id": "run-a",
       "capture_seq": 1,
-      "completeness": {"complete": true},
-      "configuration": {"depletion_threshold": {"__f__": "0.9500000000000001"}},
+      "completeness": {
+        "evaluated_channels": 0,
+        "terminal_outcomes": 0,
+        "decision_trace_entries": 0,
+        "evidence_entries": 0,
+        "clock_entries": 0,
+        "entropy_entries": 0,
+        "complete": true
+      },
+      "configuration": {
+        "depletion_threshold": {
+          "__f__": "0.9500000000000001"
+        }
+      },
       "cycle_id": "cycle-a",
-      "expected": {},
-      "observations": {},
-      "payload_sha256": "1aa1c19fd92958f9e7163d811aa5ac9bcd54610a31c16ff4c07bd271af8bc54f",
-      "pre_state": {},
+      "expected": {
+        "ordered_outcomes": [],
+        "ordered_decision_traces": [],
+        "post_global": {},
+        "post_channel_state": []
+      },
+      "observations": {
+        "evidence": [],
+        "clock": [],
+        "entropy": [],
+        "governor": [],
+        "execution": []
+      },
+      "pre_state": {
+        "global": {},
+        "ordered_channels": []
+      },
       "producer": {
         "algorithm_version": "dts_pid_v1",
         "python_commit": "92348bf9c072b2dbc543b8b0a92c34c7e46d3035"
       },
       "schema_name": "fee_cycle_replay",
       "schema_version": 0,
-      "started_at": "2026-07-19T00:00:00+00:00"
+      "started_at": "2026-07-19T00:00:00+00:00",
+      "payload_sha256": "a1325e39531afc534b7e34acb28cdd449352d0acbc86a0d70c758066d1d27202"
     }
   ]
 }

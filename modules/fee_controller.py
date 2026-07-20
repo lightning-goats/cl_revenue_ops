@@ -3118,7 +3118,69 @@ class FeeController:
         try:
             expected = capture_value(session.expected)
             outcomes = expected.setdefault("ordered_outcomes", [])
-            outcomes.append(capture_value(outcome))
+            traces = expected.setdefault("ordered_decision_traces", [])
+            channels = session.pre_state.get("ordered_channels", [])
+            if len(outcomes) >= len(channels):
+                raise ValueError("terminal outcome has no ordered channel")
+            channel = channels[len(outcomes)]
+            channel_id = channel.get("channel_id")
+            peer_id = channel.get("peer_id")
+            captured_outcome = capture_value(outcome)
+            captured_outcome["channel_id"] = channel_id
+            captured_outcome["peer_id"] = peer_id
+
+            adjustment = captured_outcome.get("adjustment")
+            if isinstance(adjustment, dict):
+                terminal_kind = "adjustment"
+                terminal_reason = adjustment.get("reason")
+                decision_source = adjustment.get("reason_code")
+                current_fee_ppm = adjustment.get("old_fee_ppm")
+                applied_fee_ppm = adjustment.get("new_fee_ppm")
+                algorithm_values = adjustment.get("algorithm_values")
+            else:
+                skip = captured_outcome.get("skip", {})
+                terminal_kind = "skip"
+                terminal_reason = skip.get("reason")
+                decision_source = terminal_reason
+                channel_info = channel.get("channel_info") or {}
+                cycle_state = channel.get("cycle_state") or {}
+                current_fee_ppm = channel_info.get(
+                    "fee_proportional_millionths",
+                    cycle_state.get("last_fee_ppm"),
+                )
+                applied_fee_ppm = current_fee_ppm
+                algorithm_values = None
+
+            governor = [
+                entry
+                for entry in session.observations.get("governor", [])
+                if entry.get("request", {}).get("channel_id") == channel_id
+            ]
+            execution = [
+                entry
+                for entry in session.observations.get("execution", [])
+                if entry.get("request", {}).get("channel_id") == channel_id
+            ]
+            target_fee_ppm = (
+                execution[-1].get("request", {}).get("fee_ppm")
+                if execution
+                else (applied_fee_ppm if terminal_kind == "adjustment" else None)
+            )
+            trace = {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "terminal_kind": terminal_kind,
+                "terminal_reason": terminal_reason,
+                "decision_source": decision_source,
+                "current_fee_ppm": current_fee_ppm,
+                "target_fee_ppm": target_fee_ppm,
+                "applied_fee_ppm": applied_fee_ppm,
+                "algorithm_values": algorithm_values,
+                "governor": governor,
+                "execution": execution,
+            }
+            outcomes.append(captured_outcome)
+            traces.append(capture_value(trace))
             record_capture_expected(session, expected)
         except Exception as exc:
             mark_capture_invalid(
@@ -4749,6 +4811,7 @@ class FeeController:
             })
             record_capture_expected(capture_session, {
                 "ordered_outcomes": [],
+                "ordered_decision_traces": [],
                 "post_global": {},
                 "post_channel_state": [],
             })
@@ -4806,8 +4869,6 @@ class FeeController:
                 channel_info = channels.get(channel_id)
                 cycle_state = self._cycle_states.get(channel_id)
                 fee_state = self._channel_fee_states.get(channel_id)
-                if channel_info and cycle_state is None and fee_state is None:
-                    continue
                 self._capture_channel_pre_state(
                     capture_session,
                     channel_id=channel_id,

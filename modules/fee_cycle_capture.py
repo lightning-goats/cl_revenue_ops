@@ -27,6 +27,56 @@ RETENTION_MAX_FILES = 32
 RETENTION_MAX_BYTES = 256 * 1024 * 1024
 
 
+class CaptureValidationError(ValueError):
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
+
+
+def _validate_complete_session(session: "FeeCycleCaptureSession") -> dict:
+    if session.invalid_reason is not None:
+        raise CaptureValidationError(
+            "invalid_session", "capture session is invalid"
+        )
+    body = session.to_body()
+    completeness = body["completeness"]
+    counts = (
+        completeness["evaluated_channels"],
+        completeness["terminal_outcomes"],
+        completeness["decision_trace_entries"],
+        len(body["expected"].get("post_channel_state", [])),
+    )
+    if len(set(counts)) != 1:
+        raise CaptureValidationError(
+            "count_mismatch",
+            "evaluated channel, terminal outcome, decision trace, and "
+            "post-state counts differ",
+        )
+    if not completeness["complete"]:
+        raise CaptureValidationError(
+            "channel_order_mismatch",
+            "channel identity or order differs across replay sections",
+        )
+    return body
+
+
+def _ordered_channel_identities(entries: Any) -> Optional[list]:
+    if not isinstance(entries, list):
+        return None
+    identities = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return None
+        channel_id = entry.get("channel_id")
+        peer_id = entry.get("peer_id")
+        if not isinstance(channel_id, str) or not channel_id:
+            return None
+        if not isinstance(peer_id, str) or not peer_id:
+            return None
+        identities.append((channel_id, peer_id))
+    return identities
+
+
 @dataclass
 class FeeCycleCaptureSession:
     capture_run_id: str
@@ -64,9 +114,24 @@ class FeeCycleCaptureSession:
             self.invalid_reason = str(reason)
 
     def to_body(self) -> dict:
-        outcomes = self.expected.get("ordered_outcomes", [])
+        expected = copy.deepcopy(self.expected)
+        expected.setdefault("ordered_decision_traces", [])
+        outcomes = expected.get("ordered_outcomes", [])
+        traces = expected.get("ordered_decision_traces", [])
+        post_channels = expected.get("post_channel_state", [])
         channels = self.pre_state.get("ordered_channels", [])
-        complete = self.invalid_reason is None and len(outcomes) == len(channels)
+        channel_count = len(channels)
+        channel_identities = _ordered_channel_identities(channels)
+        complete = (
+            self.invalid_reason is None
+            and len(outcomes) == channel_count
+            and len(traces) == channel_count
+            and len(post_channels) == channel_count
+            and channel_identities is not None
+            and channel_identities == _ordered_channel_identities(outcomes)
+            and channel_identities == _ordered_channel_identities(traces)
+            and channel_identities == _ordered_channel_identities(post_channels)
+        )
         return {
             "schema_name": SCHEMA_NAME,
             "schema_version": SCHEMA_VERSION,
@@ -78,10 +143,11 @@ class FeeCycleCaptureSession:
             "configuration": copy.deepcopy(self.configuration),
             "pre_state": copy.deepcopy(self.pre_state),
             "observations": copy.deepcopy(self.observations),
-            "expected": copy.deepcopy(self.expected),
+            "expected": expected,
             "completeness": {
-                "evaluated_channels": len(channels),
+                "evaluated_channels": channel_count,
                 "terminal_outcomes": len(outcomes),
+                "decision_trace_entries": len(traces),
                 "evidence_entries": len(self.observations["evidence"]),
                 "clock_entries": len(self.observations["clock"]),
                 "entropy_entries": len(self.observations["entropy"]),
@@ -724,7 +790,7 @@ class FeeCycleCaptureManager:
         return True
 
     def _publish_envelope(self, session: FeeCycleCaptureSession) -> dict:
-        body = session.to_body()
+        body = _validate_complete_session(session)
         sealed = seal_envelope(body)
         serialized = _json_bytes(sealed)
         if len(serialized) > MAX_ENVELOPE_BYTES:
@@ -999,8 +1065,12 @@ def _utc_now() -> str:
 
 
 def _error_text(exc: Exception) -> str:
+    if isinstance(exc, CaptureValidationError):
+        return str(exc)
     return f"{type(exc).__name__}: {exc}"
 
 
 def _error_category(exc: Exception) -> str:
+    if isinstance(exc, CaptureValidationError):
+        return exc.category
     return type(exc).__name__
