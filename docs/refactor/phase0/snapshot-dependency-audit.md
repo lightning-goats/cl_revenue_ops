@@ -14,7 +14,7 @@ verified by hand. Categories:
 - `analyzer_cache` — reads of the flow/profitability analyzers
 - `live_rpc` — `data_service.get_*` / `plugin.rpc.*` / `self.rpc.*`
 - `database` — direct DB reads
-- `wall_clock` — `time.time()` (cycle-time injection status)
+- `wall_clock` — `time.time()` or `decision_now()` (cycle-time injection status)
 
 Classification vocabulary (spec Phase B): **construction** (input to
 snapshot/observation building), **projection** (immutable derived
@@ -32,7 +32,7 @@ read during decision generation — must migrate).
 | treasury (capex_budget) | 0 | 0 | 4 | 1 | none (budget-state reads = historical/state) |
 | boltz_manager | 0 | 7 | 0 | 5 | none in decision path (all execution-side) |
 | rebalance_engine_v2 | 0 | 14 | 18 | 10 | none in decision path (planner input is pre-collected; RPC/db reads are execution/reconciliation) |
-| fee_controller | 1 | 9 | 27 | 38 | **market/gossip + chain-cost reads mid-decision** |
+| fee_controller | 1 | 9 | 27 | 37 | **market/gossip + chain-cost reads mid-decision** |
 | capacity_planner | 6 | 24 | 11 | 11 | **analyzer cache + live peer-state reads mid-decision** |
 | lnplus_swaps | 0 | 12 | 0 | 12 | **live gate-check reads mid-decision** |
 | profitability_analyzer | 0 | 5 | 28 | 24 | n/a — it IS a construction source |
@@ -94,7 +94,7 @@ Decision-generation reads of mutable sources:
 | `_adjust_channel_fee`:5773 | `profitability.get_profitability` | **telemetry only** (marginal-ROI log string — verified; not a decision input) |
 | DB reads (`_get_rebalance_cost_floor`:4048, `_get_channel_rebalance_cost_ppm`:3516, fee-strategy rows :3579/:3966) | rebalance-cost history, DTS/PID controller state | historical + controller_state — allowed by the Phase C contract (`fee_controller(snapshot, controller_state, config)`) |
 | `set_initial_fee`:7893 | live channel lookup | event-driven (new-channel hook), outside the cycle — document as event-path exception, evaluate against latest snapshot + freshness gate |
-| 38 wall-clock sites (DTS sampling :589, posterior updates :751) | `time.time()` | cycle-time injection pending — CycleContext carries the cycle clock; migration threads it in (recorded portability hazard) |
+| 37 effective wall-clock sites (DTS sampling, posterior updates, cache TTLs) | `decision_now()` for 27 decision/state reads; `time.time()` for 10 cache/observation reads | replay clock seam complete for effective decision and mutating-state reads; cache TTL clocks remain construction mechanics whose materialized evidence is captured. One dead contextual cross-pollination read was removed (38→37). |
 
 ### capacity_planner.py — IMPROPER sites (PR 3b)
 

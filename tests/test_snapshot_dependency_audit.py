@@ -39,7 +39,7 @@ PATTERNS = {
         r"|self\.rpc\.\w+\("
     ),
     "database": r"database\.\w*get\w*\(|self\.database\.\w+\(",
-    "wall_clock": r"time\.time\(\)",
+    "wall_clock": r"time\.time\(\)|\bdecision_now\(",
 }
 
 # Pinned 2026-07-13 (audit baseline). Keys: (module, category) -> count.
@@ -47,7 +47,9 @@ PINNED_COUNTS = {
     ("fee", "analyzer_cache"): 1,
     ("fee", "live_rpc"): 9,
     ("fee", "database"): 27,
-    ("fee", "wall_clock"): 38,
+    # Fee replay clock seam: 27 effective reads now use decision_now(),
+    # 10 cache-TTL reads remain raw, and one dead contextual read was removed.
+    ("fee", "wall_clock"): 37,
     ("rebalance", "analyzer_cache"): 0,
     ("rebalance", "live_rpc"): 14,
     ("rebalance", "database"): 18,

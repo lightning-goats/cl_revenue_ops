@@ -19,6 +19,7 @@ import statistics
 import pytest
 
 import modules.fee_controller as fc
+import modules.fee_cycle_capture as capture
 from modules.fee_controller import GaussianThompsonState
 
 FLOOR, CEIL = 10, 2500
@@ -48,6 +49,7 @@ class FakeTime:
 def fake_time(monkeypatch):
     FakeTime.t = 1_750_000_000.0
     monkeypatch.setattr(fc, "time", FakeTime)
+    monkeypatch.setattr(capture, "time", FakeTime)
     return FakeTime
 
 

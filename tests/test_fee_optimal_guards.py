@@ -39,6 +39,7 @@ sys.modules.setdefault('pyln.client', mock_pyln)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import modules.fee_controller as fc_mod
+import modules.fee_cycle_capture as capture_mod
 from modules.fee_controller import (
     GaussianThompsonState,
     ChannelCycleState,
@@ -68,6 +69,7 @@ class FakeTime:
 def fake_time(monkeypatch):
     FakeTime.t = 1_780_000_000.0
     monkeypatch.setattr(fc_mod, "time", FakeTime)
+    monkeypatch.setattr(capture_mod, "time", FakeTime)
     return FakeTime
 
 
