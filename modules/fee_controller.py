@@ -4644,7 +4644,12 @@ class FeeController:
         try:
             session = self._fee_capture.begin_cycle(
                 lambda: capture_value(cfg),
-                {"algorithm_version": "dts_pid_v1"},
+                {
+                    "algorithm_version": "dts_pid_v1",
+                    "temporary_overlay_active_available": (
+                        self.temporary_fee_overlay_active is not None
+                    ),
+                },
             )
         except Exception:
             session = None

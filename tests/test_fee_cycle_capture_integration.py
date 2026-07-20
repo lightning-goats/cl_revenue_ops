@@ -616,7 +616,8 @@ def _raw_channel():
 
 
 def _capture_controller(tmp_path, *, enabled=True, dry_run=True,
-                        strategy=FeeStrategy.DYNAMIC, overlay=False):
+                        strategy=FeeStrategy.DYNAMIC, overlay=False,
+                        overlay_available=True):
     plugin = MagicMock()
     plugin.rpc.getinfo.return_value = {"id": NODE_ID}
     config = Config(
@@ -647,7 +648,9 @@ def _capture_controller(tmp_path, *, enabled=True, dry_run=True,
         config,
         database,
         policy_manager=policy_manager,
-        temporary_fee_overlay_active=(lambda _channel_id: overlay),
+        temporary_fee_overlay_active=(
+            (lambda _channel_id: overlay) if overlay_available else None
+        ),
     )
     data_service = MagicMock()
     data_service.get_node_id.return_value = NODE_ID
@@ -675,6 +678,24 @@ def _capture_controller(tmp_path, *, enabled=True, dry_run=True,
 def _only_body(manager):
     assert len(manager.finished) == 1
     return manager.finished[0].to_body()
+
+
+@pytest.mark.parametrize("overlay_available", [False, True])
+def test_capture_producer_declares_optional_overlay_capability(
+    tmp_path, monkeypatch, overlay_available
+):
+    controller, manager = _capture_controller(
+        tmp_path,
+        overlay=False,
+        overlay_available=overlay_available,
+    )
+    monkeypatch.setattr(controller, "_adjust_channel_fee", lambda **_kwargs: None)
+
+    assert controller.adjust_all_fees() == []
+    body = _only_body(manager)
+    assert body["producer"]["temporary_overlay_active_available"] is overlay_available
+    operations = [entry["op"] for entry in body["observations"]["evidence"]]
+    assert ("temporary_overlay_active" in operations) is overlay_available
 
 
 
