@@ -355,14 +355,13 @@ def record_effective_evidence(op: Any, args: Any, fn: Any) -> Any:
     session = current_capture()
     if session is None:
         return fn()
-    ordinal = _observation_ordinal(session, "evidence")
     try:
         result = fn()
     except Exception as exc:
         _record_observation_no_throw(
             session,
             "evidence",
-            {
+            lambda ordinal: {
                 "ordinal": ordinal,
                 "op": op,
                 "args": args,
@@ -376,7 +375,7 @@ def record_effective_evidence(op: Any, args: Any, fn: Any) -> Any:
     _record_observation_no_throw(
         session,
         "evidence",
-        {
+        lambda ordinal: {
             "ordinal": ordinal,
             "op": op,
             "args": args,

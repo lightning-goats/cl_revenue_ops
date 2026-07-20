@@ -736,6 +736,38 @@ def test_neighbor_cache_effective_values_are_recorded_once_at_first_use(
     ]
 
 
+def test_neighbor_cache_miss_records_nested_gossip_before_effective_median(
+    tmp_path, monkeypatch, capture_session
+):
+    controller, _manager = _capture_controller(tmp_path)
+    controller._cycle_observations = {}
+    monkeypatch.setattr(controller, "_get_peer_inbound_channels_live", lambda *_a, **_k: [])
+
+    def median_live(peer_id, _cfg):
+        assert controller._get_peer_inbound_channels(peer_id) == []
+        return 360
+
+    monkeypatch.setattr(controller, "_get_neighbor_fee_median_live", median_live)
+
+    with bind_capture(capture_session):
+        assert controller._get_neighbor_fee_median(PEER_ID) == 360
+
+    assert capture_session.observations["evidence"] == [
+        {
+            "ordinal": 0,
+            "op": "gossip_channels",
+            "args": [PEER_ID],
+            "result": [],
+        },
+        {
+            "ordinal": 1,
+            "op": "neighbor_fee_median",
+            "args": [PEER_ID],
+            "result": 360,
+        },
+    ]
+
+
 def test_recursive_execution_transcript_never_changes_successful_result(
     tmp_path, monkeypatch, capture_session
 ):
