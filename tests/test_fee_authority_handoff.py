@@ -6,6 +6,8 @@ import pytest
 
 from modules.config import Config
 from modules.fee_authority import FeeAuthorityGate
+from modules.fee_controller import ChannelCycleState, ChannelFeeState, FeeController
+from modules.policy_manager import PeerPolicy
 from tests.plugin_test_utils import load_plugin_module
 
 
@@ -374,3 +376,126 @@ def test_reenabling_authority_restores_existing_fee_adjustment_path():
     assert blocked["reason"] == "fee_authority_disabled"
     assert enabled == []
     mod.fee_controller.adjust_all_fees.assert_called_once_with()
+
+
+def test_record_failed_forward_defense_leaves_fee_state_unchanged_when_disabled():
+    channel_id = "123x456x0"
+    database = MagicMock()
+    controller = FeeController(
+        MagicMock(),
+        Config(),
+        database,
+        fee_authority_gate=_disabled_gate(),
+    )
+    fee_state = ChannelFeeState(last_fee_ppm=500)
+    controller._channel_fee_states[channel_id] = fee_state
+
+    controller.record_failed_forward(
+        channel_id,
+        current_fee_ppm=500,
+        amount_msat=5_000_000_000,
+        failcode=0x1000 | 12,
+        failreason="WIRE_FEE_INSUFFICIENT",
+    )
+
+    assert fee_state.thompson.posterior_bias == []
+    assert channel_id not in controller._last_failure_nudge_ts
+    database.get_fee_strategy_state.assert_not_called()
+
+
+def test_policy_change_defense_leaves_sleeping_fee_state_unchanged_when_disabled():
+    peer_id = "02" + "a" * 64
+    channel_id = "123x456x0"
+    database = MagicMock()
+    database.get_all_channel_states.return_value = [
+        {"peer_id": peer_id, "channel_id": channel_id},
+    ]
+    controller = FeeController(
+        MagicMock(),
+        Config(),
+        database,
+        fee_authority_gate=_disabled_gate(),
+    )
+    cycle = ChannelCycleState(
+        is_sleeping=True,
+        sleep_until=99_999,
+        stable_cycles=4,
+    )
+    fee_state = ChannelFeeState(
+        is_sleeping=True,
+        sleep_until=99_999,
+        stable_cycles=4,
+    )
+    controller._cycle_states[channel_id] = cycle
+    controller._channel_fee_states[channel_id] = fee_state
+
+    controller._handle_policy_change(peer_id, PeerPolicy(peer_id=peer_id))
+
+    assert (cycle.is_sleeping, cycle.sleep_until, cycle.stable_cycles) == (
+        True,
+        99_999,
+        4,
+    )
+    assert (
+        fee_state.is_sleeping,
+        fee_state.sleep_until,
+        fee_state.stable_cycles,
+    ) == (True, 99_999, 4)
+    database.get_all_channel_states.assert_not_called()
+    database.update_fee_strategy_state.assert_not_called()
+
+
+def test_disabled_authority_keeps_capture_control_and_status_reads_live(
+    monkeypatch,
+):
+    mod = load_plugin_module()
+    mod.fee_authority_gate = _disabled_gate()
+    mod.config = Config(
+        fee_authority_enabled=False,
+        fee_replay_capture_enabled=False,
+    )
+    mod.fee_controller = MagicMock()
+    mod.fee_controller._fee_capture.set_enabled.return_value = True
+    monkeypatch.setattr(mod.time, "time", lambda: 10_010)
+
+    result = mod._on_fee_replay_capture_change(
+        mod.plugin,
+        "revenue-ops-fee-replay-capture-enabled",
+        True,
+    )
+    status = mod.revenue_fee_authority_status(mod.plugin)
+
+    assert result is None
+    assert mod.config.fee_replay_capture_enabled is True
+    mod.fee_controller._fee_capture.set_enabled.assert_called_once_with(
+        True,
+        timeout_seconds=5.0,
+    )
+    assert status == {
+        "schema": "revenue_ops_fee_authority/v1",
+        "enabled": False,
+        "generation": 1,
+        "transitioned_at": 10_000,
+        "observed_at": 10_010,
+        "reason": "setconfig",
+    }
+
+
+def test_disabled_authority_keeps_policy_reads_live():
+    mod = load_plugin_module()
+    mod.fee_authority_gate = _disabled_gate()
+    policy = MagicMock()
+    policy.to_dict.return_value = {
+        "peer_id": "02" + "b" * 64,
+        "strategy": "dynamic",
+    }
+    mod.policy_manager = MagicMock()
+    mod.policy_manager.get_all_policies.return_value = [policy]
+
+    result = mod.revenue_policy(mod.plugin, action="list")
+
+    assert result == {
+        "policies": [policy.to_dict.return_value],
+        "count": 1,
+    }
+    mod.policy_manager.get_all_policies.assert_called_once_with()

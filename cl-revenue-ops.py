@@ -6876,7 +6876,11 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
     #     failure reason exists, and most such failures are liquidity
     #     failures that say nothing about our fee, so the nudge is DROPPED
     #     entirely — a misdirected systematic signal is worse than none.
-    if status in ("failed", "local_failed") and fee_controller is not None:
+    if (
+        status in ("failed", "local_failed")
+        and fee_controller is not None
+        and _fee_authority_denial("failed_forward_trigger") is None
+    ):
         out_scid = forward_event.get("out_channel")
         out_scid = normalize_scid(out_scid) if out_scid else None
         failcode = forward_event.get("failcode")

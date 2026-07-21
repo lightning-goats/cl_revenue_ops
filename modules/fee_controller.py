@@ -7846,6 +7846,8 @@ class FeeController:
         Registered with PolicyManager at init; fires on revenue-policy
         set and delete (delete notifies with the default policy).
         """
+        if self.fee_authority_gate.deny_reason("policy_change_trigger") is not None:
+            return
         try:
             states = self.database.get_all_channel_states()
         except Exception as e:
@@ -9120,6 +9122,8 @@ class FeeController:
         Base weight: 10% of a settled forward.
         Amount boost: up to 3x for large forwards (>1M sats).
         """
+        if self.fee_authority_gate.deny_reason("failed_forward_trigger") is not None:
+            return
         if not channel_id or current_fee_ppm <= 0:
             return
         if not self.is_fee_relevant_failure(failcode, failreason):

@@ -11,6 +11,9 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
+from modules.fee_authority import FeeAuthorityGate
 from tests.plugin_test_utils import load_plugin_module
 
 
@@ -36,6 +39,11 @@ def _module():
     mod.plugin.log = MagicMock()
     mod.fee_controller = None
     return mod
+
+
+def _disable_fee_authority(mod):
+    mod.fee_authority_gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 10_000)
+    mod.fee_authority_gate.set_enabled(False, reason="setconfig")
 
 
 class TestForwardWriteCoalescing:
@@ -108,6 +116,55 @@ class TestForwardWriteCoalescing:
         db.update_peer_reputation.assert_called_once_with(PEER, is_success=False)
         db.record_forward_and_reputation.assert_not_called()
         db.record_forward.assert_not_called()
+
+    @pytest.mark.parametrize("status", ["failed", "local_failed"])
+    def test_disabled_authority_blocks_failed_forward_fee_trigger(self, status):
+        mod = _module()
+        _disable_fee_authority(mod)
+        db = MagicMock(spec=[
+            "record_forward_and_reputation", "record_forward", "update_peer_reputation",
+        ])
+        mod.database = db
+        mod._resolve_scid_to_peer = MagicMock(return_value=PEER)
+        mod.fee_controller = MagicMock()
+        mod.fee_controller.is_fee_relevant_failure.return_value = True
+        mod.fee_controller._state_lock.acquire.return_value = True
+        mod.fee_controller._channel_fee_states = {
+            "200x2x0": MagicMock(last_fee_ppm=250),
+        }
+
+        event = _settled_event()
+        event.update({
+            "status": status,
+            "failcode": 0x1000 | 12,
+            "failreason": "WIRE_FEE_INSUFFICIENT",
+        })
+        mod._on_forward_event_impl(event, mod.plugin)
+
+        mod.fee_controller.is_fee_relevant_failure.assert_not_called()
+        mod.fee_controller._state_lock.acquire.assert_not_called()
+        mod.fee_controller.record_failed_forward.assert_not_called()
+        if status == "failed":
+            db.update_peer_reputation.assert_called_once_with(
+                PEER, is_success=False
+            )
+
+    def test_disabled_authority_keeps_settled_forward_accounting_live(self):
+        mod = _module()
+        _disable_fee_authority(mod)
+        db = MagicMock(spec=[
+            "record_forward_and_reputation", "record_forward", "update_peer_reputation",
+        ])
+        mod.database = db
+        mod._resolve_scid_to_peer = MagicMock(return_value=PEER)
+
+        mod._on_forward_event_impl(_settled_event(), mod.plugin)
+
+        db.record_forward_and_reputation.assert_called_once()
+        forward, peer_id, success = db.record_forward_and_reputation.call_args.args
+        assert (forward["out_channel"], peer_id, success) == (
+            "200x2x0", PEER, True
+        )
 
 
 class TestScidNegativeCache:
