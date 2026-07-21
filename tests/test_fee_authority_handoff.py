@@ -3,7 +3,19 @@ import threading
 
 import pytest
 
+from modules.config import Config
 from modules.fee_authority import FeeAuthorityGate
+from tests.plugin_test_utils import load_plugin_module
+
+
+FEE_AUTHORITY_OPTION = "revenue-ops-fee-authority-enabled"
+
+
+def test_authority_config_defaults_on_and_is_snapshotted():
+    cfg = Config()
+
+    assert cfg.fee_authority_enabled is True
+    assert cfg.snapshot().fee_authority_enabled is True
 
 
 def test_gate_defaults_enabled_and_transitions_once():
@@ -116,3 +128,124 @@ def test_concurrent_snapshot_waits_for_complete_transition():
     assert len(statuses) == 2
     assert statuses[0] == statuses[1]
     assert (statuses[0].enabled, statuses[0].generation) == (False, 1)
+
+
+@pytest.mark.parametrize(
+    ("new_value", "expected"),
+    [
+        (True, True),
+        (False, False),
+        ("true", True),
+        ("TRUE", True),
+        ("1", True),
+        ("yes", True),
+        ("on", True),
+        ("false", False),
+        ("FALSE", False),
+        ("0", False),
+        ("no", False),
+        ("off", False),
+    ],
+)
+def test_authority_callback_accepts_cln_boolean_spellings(new_value, expected):
+    mod = load_plugin_module()
+    initial = not expected
+    mod.config = Config(fee_authority_enabled=initial)
+    mod.fee_authority_gate = FeeAuthorityGate(
+        enabled=initial,
+        now_fn=lambda: 6000,
+    )
+
+    readback = mod._on_fee_authority_change(
+        mod.plugin,
+        FEE_AUTHORITY_OPTION,
+        new_value,
+    )
+
+    status = mod.fee_authority_gate.snapshot()
+    assert mod.config.fee_authority_enabled is expected
+    assert (status.enabled, status.generation, status.reason) == (
+        expected,
+        1,
+        "setconfig",
+    )
+    assert readback == (
+        f"{FEE_AUTHORITY_OPTION}={str(expected).lower()} generation=1"
+    )
+
+
+@pytest.mark.parametrize("invalid", ["", "maybe", 2, None])
+def test_authority_callback_rejects_invalid_input_without_mutation(invalid):
+    mod = load_plugin_module()
+    mod.config = Config(fee_authority_enabled=False)
+    mod.fee_authority_gate = FeeAuthorityGate(
+        enabled=False,
+        now_fn=lambda: 7000,
+    )
+    before = mod.fee_authority_gate.snapshot()
+
+    with pytest.raises(ValueError, match=f"{FEE_AUTHORITY_OPTION} must be a boolean"):
+        mod._on_fee_authority_change(
+            mod.plugin,
+            FEE_AUTHORITY_OPTION,
+            invalid,
+        )
+
+    assert mod.config.fee_authority_enabled is False
+    assert mod.fee_authority_gate.snapshot() is before
+
+
+def test_authority_callback_updates_config_and_gate_under_config_lock():
+    mod = load_plugin_module()
+    mod.config = Config(fee_authority_enabled=True)
+    mod.fee_authority_gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 8000)
+    callback_started = threading.Event()
+    callback_finished = threading.Event()
+    callback_errors = []
+
+    def disable():
+        callback_started.set()
+        try:
+            mod._on_fee_authority_change(
+                mod.plugin,
+                FEE_AUTHORITY_OPTION,
+                False,
+            )
+        except Exception as exc:
+            callback_errors.append(exc)
+        finally:
+            callback_finished.set()
+
+    mod.config._lock.acquire()
+    worker = threading.Thread(target=disable)
+    try:
+        worker.start()
+        assert callback_started.wait(timeout=1)
+        assert not callback_finished.wait(timeout=0.05)
+        assert mod.config.fee_authority_enabled is True
+        assert mod.fee_authority_gate.snapshot().enabled is True
+    finally:
+        mod.config._lock.release()
+
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert callback_errors == []
+    assert mod.config.fee_authority_enabled is False
+    assert mod.fee_authority_gate.snapshot().enabled is False
+
+
+def test_fee_authority_status_rpc_returns_positive_in_process_state(monkeypatch):
+    mod = load_plugin_module()
+    mod.fee_authority_gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 9000)
+    monkeypatch.setattr(mod.time, "time", lambda: 9010)
+
+    result = mod.revenue_fee_authority_status(mod.plugin)
+
+    assert result == {
+        "schema": "revenue_ops_fee_authority/v1",
+        "enabled": True,
+        "generation": 0,
+        "transitioned_at": 9000,
+        "observed_at": 9010,
+        "reason": "initial",
+    }

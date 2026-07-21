@@ -6,6 +6,19 @@ from modules.config import Config
 from tests.plugin_test_utils import load_plugin_module
 
 
+FEE_AUTHORITY_OPTION = "revenue-ops-fee-authority-enabled"
+
+
+def test_fee_authority_plugin_option_is_dynamic_boolean_and_default_on():
+    mod = load_plugin_module()
+
+    option = mod.plugin.options[FEE_AUTHORITY_OPTION]
+    assert option["default"] is True
+    assert option["opt_type"] == "bool"
+    assert option["dynamic"] is True
+    assert option["on_change"] is mod._on_fee_authority_change
+
+
 def test_public_runtime_keys_are_safety_only():
     cfg = Config()
 
@@ -82,6 +95,7 @@ def test_public_runtime_keys_are_safety_only():
 def test_internal_knobs_are_not_public():
     cfg = Config()
 
+    assert "fee_authority_enabled" not in cfg.public_runtime_keys()
     assert "enable_vegas_reflex" not in cfg.public_runtime_keys()
     assert "thompson_prior_std_fee" not in cfg.public_runtime_keys()
     assert "askrene_layers" not in cfg.public_runtime_keys()
@@ -264,6 +278,22 @@ def _run_init_with_stubbed_dependencies(
 
     mod.init(options, {}, mod.plugin)
     return mod.config
+
+
+def test_fee_authority_option_is_parsed_during_init_and_initializes_gate(monkeypatch):
+    mod = load_plugin_module()
+
+    cfg = _run_init_with_stubbed_dependencies(
+        mod,
+        monkeypatch,
+        {FEE_AUTHORITY_OPTION: "false"},
+    )
+
+    assert cfg.fee_authority_enabled is False
+    status = mod.fee_authority_gate.snapshot()
+    assert status.enabled is False
+    assert status.generation == 1
+    assert status.reason == "init"
 
 
 def test_planner_execute_closes_plugin_option_defaults_false():

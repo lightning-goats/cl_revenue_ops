@@ -35,6 +35,7 @@ from pyln.client import Plugin, RpcError
 from modules.flow_analysis import FlowAnalyzer, ChannelState
 from modules import flow_analysis as flow_analysis_mod
 from modules.fee_controller import FeeController
+from modules.fee_authority import FeeAuthorityGate
 from modules.rebalancer import EVRebalancer
 from modules.config import Config
 from modules.growth_budget import compute_growth_budget_status
@@ -1005,6 +1006,7 @@ class ThreadSafePluginProxy:
 # Global instances (initialized in init)
 flow_analyzer: Optional[FlowAnalyzer] = None
 fee_controller: Optional[FeeController] = None
+fee_authority_gate = FeeAuthorityGate()
 rebalancer: Optional[EVRebalancer] = None
 database: Optional[Database] = None
 config: Optional[Config] = None
@@ -1086,6 +1088,25 @@ def _parse_dynamic_bool(option_name: str, value: Any) -> bool:
     raise ValueError(f"{option_name} must be a boolean")
 
 
+def _on_fee_authority_change(
+    plugin_: Plugin,
+    option_name: str,
+    new_value: Any,
+) -> str:
+    """Atomically apply the dynamic Python fee-authority setting."""
+    enabled = _parse_dynamic_bool(option_name, new_value)
+    cfg = globals().get("config")
+    if cfg is None:
+        raise ValueError("fee authority configuration is not initialized")
+    with cfg._lock:
+        cfg.fee_authority_enabled = enabled
+        status = fee_authority_gate.set_enabled(enabled, reason="setconfig")
+    return (
+        f"{option_name}={str(status.enabled).lower()} "
+        f"generation={status.generation}"
+    )
+
+
 def _on_fee_replay_capture_change(
     plugin_: Plugin,
     option_name: str,
@@ -1136,6 +1157,15 @@ plugin.add_option(
     name='revenue-ops-fee-interval',
     default='1800',
     description='Interval in seconds for fee adjustments (default: 30 min)'
+)
+
+plugin.add_option(
+    name="revenue-ops-fee-authority-enabled",
+    default=True,
+    description="Permit Python fee evaluation and setchannel authority",
+    opt_type="bool",
+    dynamic=True,
+    on_change=_on_fee_authority_change,
 )
 
 plugin.add_option(
@@ -2474,6 +2504,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_interval=_safe_int('revenue-ops-flow-interval'),
         fee_interval=_safe_int('revenue-ops-fee-interval'),
         rebalance_interval=_safe_int('revenue-ops-rebalance-interval'),
+        fee_authority_enabled=_parse_dynamic_bool(
+            "revenue-ops-fee-authority-enabled",
+            options.get("revenue-ops-fee-authority-enabled", True),
+        ),
         fee_replay_capture_enabled=(
             str(options.get(
                 'revenue-ops-fee-replay-capture-enabled',
@@ -2668,6 +2702,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             level='warn'
         )
     config = Config(**{k: v for k, v in config_kwargs.items() if k in config_fields})
+    with config._lock:
+        fee_authority_gate.set_enabled(
+            config.fee_authority_enabled,
+            reason="init",
+        )
     
     plugin.log(f"Configuration loaded: "
                f"fee_range=[{config.min_fee_ppm}, {config.max_fee_ppm}], "
@@ -3754,6 +3793,20 @@ def revenue_rebalance_cycle(plugin: Plugin, max_candidates: int = 20) -> Dict[st
 # =============================================================================
 # RPC METHODS - Exposed to lightning-cli
 # =============================================================================
+
+
+@plugin.method("revenue-fee-authority-status")
+def revenue_fee_authority_status(plugin: Plugin) -> Dict[str, Any]:
+    """Return the current in-process Python fee-authority state."""
+    status = fee_authority_gate.snapshot()
+    return {
+        "schema": "revenue_ops_fee_authority/v1",
+        "enabled": status.enabled,
+        "generation": status.generation,
+        "transitioned_at": status.transitioned_at,
+        "observed_at": int(time.time()),
+        "reason": status.reason,
+    }
 
 
 @plugin.method("revenue-status")
