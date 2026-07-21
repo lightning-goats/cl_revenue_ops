@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules.policy_manager import FeeStrategy, RebalanceMode, PeerPolicy
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 class MockConfigSnapshot:
     """Mock ConfigSnapshot for testing."""
 
@@ -81,7 +83,7 @@ class TestPauseControl:
         cfg = Config(paused=True)
         mock_database.get_all_channel_states = MagicMock()
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         adjustments = fc.adjust_all_fees()
         summary = fc.get_last_decision_summary()
@@ -131,7 +133,7 @@ class TestAdjustAllFeesSkipClassification:
         from modules.fee_controller import FeeController
 
         config = MagicMock(spec=Config)
-        fc = FeeController(mock_plugin, config, mock_database)
+        fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         cfg = MockConfigSnapshot(
             min_fee_ppm=1,
@@ -369,7 +371,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        fc = FeeController(mock_plugin, config, mock_database)
+        fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -400,7 +402,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        fc = FeeController(mock_plugin, config, mock_database)
+        fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -429,7 +431,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        fc = FeeController(mock_plugin, config, mock_database)
+        fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -452,7 +454,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        fc = FeeController(mock_plugin, config, mock_database)
+        fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -479,7 +481,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        fc = FeeController(mock_plugin, config, mock_database)
+        fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -503,7 +505,7 @@ class TestRebalanceCostFloor:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        fc = FeeController(mock_plugin, config, mock_database)
+        fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -540,7 +542,7 @@ class TestRealizedCostFloorNoSuccessRateDivision:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        return FeeController(mock_plugin, config, mock_database)
+        return FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
     def _cost_history(self, cost_ppm=100, n=5):
         """Return n cost records that average to cost_ppm per 1M sats."""
@@ -614,7 +616,7 @@ class TestAuditRound8Regressions:
         from modules.config import Config
 
         config = MagicMock(spec=Config)
-        return FeeController(mock_plugin, config, mock_database)
+        return FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
     # --- P1-1: Flow-adjusted ceiling cannot return 0 ---
 
@@ -735,7 +737,7 @@ class TestCalculateFloorOpener:
     def test_remote_opener_lower_floor(self, mock_plugin, mock_database):
         from modules.fee_controller import FeeController
         config = MagicMock()
-        fc = FeeController(mock_plugin, config, mock_database)
+        fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         chain_costs = {"open_cost_sats": 5000, "close_cost_sats": 3000, "sat_per_vbyte": 5.0}
         floor_local = fc._calculate_floor(5_000_000, chain_costs=chain_costs, opener="local")
@@ -751,7 +753,7 @@ class TestCalculateFloorOpener:
     def test_default_opener_is_local(self, mock_plugin, mock_database):
         from modules.fee_controller import FeeController
         config = MagicMock()
-        fc = FeeController(mock_plugin, config, mock_database)
+        fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         chain_costs = {"open_cost_sats": 5000, "close_cost_sats": 3000, "sat_per_vbyte": 5.0}
         floor_default = fc._calculate_floor(5_000_000, chain_costs=chain_costs)
@@ -767,7 +769,7 @@ class TestLastDecisionSummary:
         cfg = Config()
         mock_database.get_all_channel_states.return_value = []
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         adjustments = fc.adjust_all_fees()
         summary = fc.get_last_decision_summary()
@@ -794,6 +796,7 @@ class TestLastDecisionSummary:
             cfg,
             mock_database,
             temporary_fee_overlay_active=lambda cid: cid == channel_id,
+            fee_authority_gate=FeeAuthorityGate(),
         )
         fc._get_channels_info = MagicMock(return_value={
             channel_id: {"fee_proportional_millionths": 100}
@@ -840,7 +843,7 @@ class TestStaticStrategyExecution:
             {"channel_id": channel_id, "peer_id": peer_id, "state": "balanced"}
         ]
 
-        fc = FeeController(mock_plugin, cfg, mock_database, policy_manager=policy_manager)
+        fc = FeeController(mock_plugin, cfg, mock_database, policy_manager=policy_manager, fee_authority_gate=FeeAuthorityGate())
         fc._get_channels_info = MagicMock(return_value={
             channel_id: {
                 "channel_id": channel_id,

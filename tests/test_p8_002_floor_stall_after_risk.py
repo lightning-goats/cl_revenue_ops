@@ -14,11 +14,13 @@ so it multiplies whichever term wins.
 from unittest.mock import MagicMock
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _fee_controller(mock_plugin, mock_database):
     from modules.fee_controller import FeeController
 
     config = MagicMock()
-    return FeeController(mock_plugin, config, mock_database)
+    return FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
 
 def test_stall_multiplier_applies_after_risk_premium(mock_plugin, mock_database):

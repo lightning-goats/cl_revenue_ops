@@ -15,6 +15,8 @@ import pytest
 from unittest.mock import MagicMock
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _make_analyzer(source_threshold=0.05, sink_threshold=-0.05):
     from modules.flow_analysis import FlowAnalyzer
 
@@ -464,7 +466,7 @@ class TestF6DormantVocabulary:
         plugin = MagicMock()
         config = MagicMock(spec=Config)
         db = MagicMock()
-        fc = FeeController(plugin, config, db)
+        fc = FeeController(plugin, config, db, fee_authority_gate=FeeAuthorityGate())
 
         assert fc._get_rebalance_cost_floor("100x1x0", "peer", "dormant") is None
         db.get_channel_cost_history.assert_not_called()

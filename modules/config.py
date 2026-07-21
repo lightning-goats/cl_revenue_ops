@@ -505,6 +505,8 @@ class Config:
     flow_interval: int = 3600      # 1 hour
     fee_interval: int = 1800       # 30 minutes (matches option default)
     rebalance_interval: int = 900  # 15 minutes
+    # Python remains the fee authority unless an explicit handoff disables it.
+    fee_authority_enabled: bool = True
     # Internal fee-cycle replay instrumentation. Disabled by default and
     # observational only; enabling affects the next naturally scheduled cycle.
     fee_replay_capture_enabled: bool = False
@@ -1311,6 +1313,9 @@ class ConfigSnapshot:
 
     # M-27: xpay/askrene parameters (were missing from snapshot)
     askrene_layer: str = 'xpay'
+
+    # Python fee-authority handoff state. Default-on preserves current behavior.
+    fee_authority_enabled: bool = True
 
     # Internal, default-off fee-cycle replay instrumentation.
     fee_replay_capture_enabled: bool = False

@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from modules import admission_policy
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _cfg(**over):
     base = dict(
         enable_dynamic_htlcmax=True,
@@ -38,7 +40,7 @@ def test_direct_matches_shim():
     from unittest.mock import MagicMock
     from modules.config import Config
     from modules.fee_controller import FeeController
-    fc = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock())
+    fc = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock(), fee_authority_gate=FeeAuthorityGate())
     chan = {"capacity": 2_000_000, "spendable_msat": 1_900_000_000}
     for state in ("source", "sink", "balanced"):
         assert fc._compute_dynamic_htlcmax_msat(_cfg(), chan, state) == \
@@ -51,7 +53,7 @@ def test_constants_alias_intact():
     from unittest.mock import MagicMock
     from modules.config import Config
     from modules.fee_controller import FeeController
-    fc = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock())
+    fc = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock(), fee_authority_gate=FeeAuthorityGate())
     assert fc.HTLCMAX_FLOOR_MSAT == admission_policy.FLOOR_MSAT
     assert fc.HTLCMAX_DEPLETION_SPENDABLE_FRACTION == \
         admission_policy.DEPLETION_SPENDABLE_FRACTION

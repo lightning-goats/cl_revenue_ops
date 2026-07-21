@@ -45,9 +45,11 @@ CHANNEL_ID = "100x1x0"
 PEER_ID = "02" + "a" * 64
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _make_fc(mock_plugin, mock_database):
     config = MagicMock(spec=Config)
-    fc = FeeController(mock_plugin, config, mock_database)
+    fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
     # Real Database returns a defaults dict for unknown channels, never None
     mock_database.get_fee_strategy_state.return_value = {
         "channel_id": CHANNEL_ID, "v2_state_json": "{}", "last_update": 0,

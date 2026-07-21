@@ -12,7 +12,8 @@ PLUGIN_PY = pathlib.Path(__file__).resolve().parent.parent / "cl-revenue-ops.py"
 
 EXPECTED_RPC_METHODS = frozenset({
     "revenue-rebalance-cycle", "revenue-status", "revenue-rebalance-debug",
-    "revenue-fee-debug", "revenue-fee-cycle", "revenue-analyze",
+    "revenue-fee-debug", "revenue-fee-cycle", "revenue-fee-authority-status",
+    "revenue-analyze",
     "revenue-wake-all", "revenue-capacity-report", "revenue-planner-status",
     "revenue-lnplus-status", "revenue-lnplus-breaker-clear",
     "revenue-lnplus-abandon", "revenue-lnplus-backfill",
@@ -62,5 +63,6 @@ def test_expected_count():
     # 64 at baseline 5e8f747; + econ-shadow diagnostics (no compat
     # promise yet): revenue-econ-snapshot (Phase 1), revenue-econ-
     # reconcile (Phase 2B), revenue-econ-cycle (Workstream H shadow),
-    # revenue-profile-preview (PR 8, read-only risk-profile diff).
-    assert len(EXPECTED_RPC_METHODS) == 68
+    # revenue-profile-preview (PR 8, read-only risk-profile diff), and
+    # revenue-fee-authority-status (Python fee-authority handoff status).
+    assert len(EXPECTED_RPC_METHODS) == 69

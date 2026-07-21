@@ -67,6 +67,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from . import admission_policy as _admission_policy
 from .database import Database
+from .fee_authority import FeeAuthorityGate
 from .fee_cycle_capture import (
     FeeCycleCaptureManager,
     bind_capture,
@@ -2949,7 +2950,9 @@ class FeeController:
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  policy_manager: Optional[PolicyManager] = None,
                  profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None,
-                 temporary_fee_overlay_active: Optional[Callable[[str], bool]] = None):
+                 temporary_fee_overlay_active: Optional[Callable[[str], bool]] = None,
+                 *,
+                 fee_authority_gate: FeeAuthorityGate):
         """
         Initialize the fee controller.
 
@@ -2959,6 +2962,7 @@ class FeeController:
             database: Database instance
             policy_manager: Optional PolicyManager for peer-level fee policies
             profitability_analyzer: Optional profitability analyzer for ROI-based adjustments
+            fee_authority_gate: Shared, explicit Python fee-authority gate
         """
         self.plugin = plugin
         self.config = config
@@ -2966,6 +2970,18 @@ class FeeController:
         self.policy_manager = policy_manager
         self.profitability = profitability_analyzer
         self.temporary_fee_overlay_active = temporary_fee_overlay_active
+        if not isinstance(fee_authority_gate, FeeAuthorityGate):
+            raise TypeError("fee_authority_gate must be an explicit FeeAuthorityGate")
+        configured_authority = getattr(config, "fee_authority_enabled", None)
+        gate_authority = fee_authority_gate.snapshot().enabled
+        if (
+            isinstance(configured_authority, bool)
+            and configured_authority != gate_authority
+        ):
+            raise ValueError(
+                "fee authority configuration and shared gate must initially match"
+            )
+        self.fee_authority_gate = fee_authority_gate
         self.data_service = None  # Unified data service (injected by main plugin)
         if self.policy_manager and hasattr(self.policy_manager, "register_on_change"):
             try:
@@ -4533,6 +4549,14 @@ class FeeController:
         return pruned
 
     def wake_all_sleeping_channels(self) -> int:
+        with self.fee_authority_gate.execution_lease(
+            "wake_all_sleeping_channels"
+        ) as denial:
+            if denial is not None:
+                return 0
+            return self._wake_all_sleeping_channels_authorized()
+
+    def _wake_all_sleeping_channels_authorized(self) -> int:
         """
         Wake all channels immediately — clears both sleep mode AND observation windows.
 
@@ -4651,6 +4675,14 @@ class FeeController:
         return False
 
     def adjust_all_fees(self) -> List[FeeAdjustment]:
+        with self.fee_authority_gate.execution_lease(
+            "adjust_all_fees"
+        ) as denial:
+            if denial is not None:
+                return []
+            return self._adjust_all_fees_authorized()
+
+    def _adjust_all_fees_authorized(self) -> List[FeeAdjustment]:
         """Open one observational capture around the existing authority path."""
         try:
             cfg = self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
@@ -7837,6 +7869,16 @@ class FeeController:
         return None
 
     def _handle_policy_change(self, peer_id: str, policy: PeerPolicy) -> None:
+        with self.fee_authority_gate.execution_lease(
+            "policy_change_trigger"
+        ) as denial:
+            if denial is not None:
+                return
+            self._handle_policy_change_authorized(peer_id, policy)
+
+    def _handle_policy_change_authorized(
+        self, peer_id: str, policy: PeerPolicy
+    ) -> None:
         """Wake the peer's sleeping channels so the next fee cycle applies
         the new policy.
 
@@ -8137,6 +8179,45 @@ class FeeController:
                        htlcmax_msat: Optional[int] = None,
                        base_fee_msat_override: Optional[int] = None,
                        effective_min_fee_ppm: Optional[int] = None) -> Dict[str, Any]:
+        with self.fee_authority_gate.execution_lease(
+            "set_channel_fee"
+        ) as denial:
+            if denial is not None:
+                return {
+                    "success": False,
+                    "channel_id": channel_id,
+                    "fee_ppm": fee_ppm,
+                    "message": "Fee authority disabled",
+                    **denial,
+                }
+            return self._set_channel_fee_authorized(
+                channel_id=channel_id,
+                fee_ppm=fee_ppm,
+                reason=reason,
+                manual=manual,
+                reason_code=reason_code,
+                enforce_limits=enforce_limits,
+                channel_info=channel_info,
+                htlcmin_msat=htlcmin_msat,
+                htlcmax_msat=htlcmax_msat,
+                base_fee_msat_override=base_fee_msat_override,
+                effective_min_fee_ppm=effective_min_fee_ppm,
+            )
+
+    def _set_channel_fee_authorized(
+        self,
+        channel_id: str,
+        fee_ppm: int,
+        reason: str = "manual",
+        manual: bool = False,
+        reason_code: Optional[str] = None,
+        enforce_limits: bool = True,
+        channel_info: Optional[Dict[str, Any]] = None,
+        htlcmin_msat: Optional[int] = None,
+        htlcmax_msat: Optional[int] = None,
+        base_fee_msat_override: Optional[int] = None,
+        effective_min_fee_ppm: Optional[int] = None,
+    ) -> Dict[str, Any]:
         request = {
             "channel_id": channel_id,
             "fee_ppm": fee_ppm,
@@ -8501,6 +8582,16 @@ class FeeController:
         return None
 
     def set_initial_fee(self, channel_id: str, peer_id: str) -> Optional[Dict[str, Any]]:
+        with self.fee_authority_gate.execution_lease(
+            "set_initial_fee"
+        ) as denial:
+            if denial is not None:
+                return None
+            return self._set_initial_fee_authorized(channel_id, peer_id)
+
+    def _set_initial_fee_authorized(
+        self, channel_id: str, peer_id: str
+    ) -> Optional[Dict[str, Any]]:
         """
         Set an initial fee for a newly opened channel.
 
@@ -9089,6 +9180,25 @@ class FeeController:
                               amount_msat: int = 0,
                               failcode: Optional[int] = None,
                               failreason: Optional[str] = None) -> None:
+        with self.fee_authority_gate.execution_lease(
+            "failed_forward_trigger"
+        ) as denial:
+            if denial is not None:
+                return
+            self._record_failed_forward_authorized(
+                channel_id,
+                current_fee_ppm,
+                amount_msat=amount_msat,
+                failcode=failcode,
+                failreason=failreason,
+            )
+
+    def _record_failed_forward_authorized(
+        self, channel_id: str, current_fee_ppm: int,
+        amount_msat: int = 0,
+        failcode: Optional[int] = None,
+        failreason: Optional[str] = None,
+    ) -> None:
         """Record a fee-relevant failed forward as a weak negative signal.
 
         Audit DTS-4 — two corrections to the original design:

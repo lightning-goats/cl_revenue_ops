@@ -1,13 +1,14 @@
 # Public compatibility catalog (baseline 5e8f747)
 
 What the refactor MUST keep working (refactor invariants 2 and 3).
-Pin test: `tests/test_rpc_surface_inventory.py` (68 methods; 64 at baseline + econ-shadow diagnostics `revenue-econ-snapshot`, `revenue-econ-reconcile`, `revenue-econ-cycle` + risk-profile diagnostic `revenue-profile-preview` (PR 8, read-only), NO compatibility promise yet).
+Pin test: `tests/test_rpc_surface_inventory.py` (69 methods; 64 at baseline + econ-shadow diagnostics `revenue-econ-snapshot`, `revenue-econ-reconcile`, `revenue-econ-cycle` + risk-profile diagnostic `revenue-profile-preview` (PR 8, read-only) + Python fee-authority diagnostic `revenue-fee-authority-status`).
 
 ## RPC surface
 
 Primary operator surfaces (must remain schema-compatible; per
 refactor.md Workstream I these become facades over projections):
-`revenue-status`, `revenue-fee-debug`, `revenue-rebalance-debug`,
+`revenue-status`, `revenue-fee-authority-status`, `revenue-fee-debug`,
+`revenue-rebalance-debug`,
 `revenue-config get|set`, `revenue-profitability`, `revenue-analyze`,
 `revenue-wake-all`, `revenue-dashboard`, `revenue-health`,
 planner/Boltz/LN+ diagnostics.
@@ -18,15 +19,15 @@ Classification per method: `docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md`
 (header refreshed 2026-07-09; body dated 2026-05-20 — refresh during
 Workstream I).
 
-Full 67-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
+Full 69-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
 
 ## Config surface
 
-Owner: `modules/config.py` — a single `Config` dataclass (142 fields)
+Owner: `modules/config.py` — a single `Config` dataclass (147 fields)
 plus the `config_overrides` table (`revenue-config set` persists
 overrides; precedence documented in README.md §revenue-config).
 
-- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (59, listed below).
+- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (62, listed below).
 - Immutable at runtime: `db_path`, `dry_run` (`IMMUTABLE_CONFIG_KEYS` —
   dry_run is immutable so enabling it cannot HIDE actions).
 - The refactor's Workstream I risk-profile work must preserve every
@@ -58,7 +59,7 @@ dataclass is normative).
 
 ---
 
-### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 59)
+### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 62)
 
 - `paused`
 - `daily_budget_sats`
@@ -106,7 +107,10 @@ dataclass is normative).
 - `econ_cycle_rebalance_enabled` (added 2026-07-13, Workstream H cutover)
 - `econ_cycle_planner_enabled` (added 2026-07-13, Workstream H cutover)
 - `econ_cycle_boltz_enabled` (added 2026-07-13, Workstream H cutover)
+- `econ_ev_populated` (added 2026-07-13, Phase E PR 6)
+- `econ_conflict_rules_extended` (added 2026-07-13, Phase G PR 10)
 - `authority_level` (added 2026-07-13, Phase 4 Workstream I; observe/fees/liquidity/capital, default `capital`)
+- `risk_profile` (added 2026-07-13, Phase D PR 7; default `custom`)
 - `lnplus_swaps_enabled`
 - `lnplus_execute_applications`
 - `lnplus_swap_preference_margin`
@@ -120,7 +124,7 @@ dataclass is normative).
 - `lnplus_inbound_credit_factor`
 - `lnplus_watcher_interval`
 
-### Full Config dataclass surface (142 fields with defaults)
+### Full Config dataclass surface (147 fields with defaults)
 
 | Field | Default | Runtime-settable |
 |---|---|---|
@@ -128,6 +132,8 @@ dataclass is normative).
 | `flow_interval` | `3600` |  |
 | `fee_interval` | `1800` |  |
 | `rebalance_interval` | `900` |  |
+| `fee_authority_enabled` | `True` |  |
+| `fee_replay_capture_enabled` | `False` |  |
 | `hot_channel_protection_enabled` | `True` |  |
 | `hot_channel_protection_override_peers` | `''` |  |
 | `hot_channel_protection_min_velocity` | `0.2` |  |
@@ -159,7 +165,10 @@ dataclass is normative).
 | `econ_cycle_rebalance_enabled` | `False` | yes |
 | `econ_cycle_planner_enabled` | `False` | yes |
 | `econ_cycle_boltz_enabled` | `False` | yes |
+| `econ_ev_populated` | `False` | yes |
+| `econ_conflict_rules_extended` | `False` | yes |
 | `authority_level` | `'capital'` | yes |
+| `risk_profile` | `'custom'` | yes |
 | `expansion_treasury_enabled` | `False` |  |
 | `expansion_treasury_onchain_target_sats` | `5000000` |  |
 | `expansion_treasury_min_deficit_sats` | `250000` |  |

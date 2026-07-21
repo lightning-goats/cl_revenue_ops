@@ -37,12 +37,15 @@ from modules.fee_controller import (
 from modules.config import Config
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _make_fc(mock_plugin, mock_database, policy_manager=None):
     """Create a fee controller with mocked dependencies."""
     config = MagicMock(spec=Config)
     return FeeController(
         mock_plugin, config, mock_database,
         policy_manager=policy_manager,
+        fee_authority_gate=FeeAuthorityGate(),
     )
 
 

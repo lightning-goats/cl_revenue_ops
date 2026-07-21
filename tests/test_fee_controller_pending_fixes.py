@@ -49,9 +49,11 @@ from modules.config import Config
 from tests.plugin_test_utils import load_plugin_module
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _make_fc(mock_plugin, mock_database):
     config = MagicMock(spec=Config)
-    return FeeController(mock_plugin, config, mock_database)
+    return FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
 
 def _make_config_snapshot(**overrides):

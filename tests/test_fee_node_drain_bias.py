@@ -200,6 +200,7 @@ import random as _random
 from unittest.mock import MagicMock as _MagicMock
 
 from modules.fee_controller import FeeController as _Controller
+from modules.fee_authority import FeeAuthorityGate
 from modules.config import Config as _Config
 
 _PEER_ID = "02" + "b" * 64
@@ -293,7 +294,7 @@ def _make_node_bias_fc(mock_plugin, mock_database, *, node_drain_bias_enabled,
     reshaped channel dict, mirroring how compute_node_receivable_ratio
     consumes raw to_us_msat/total_msat/state fields."""
     config = _MagicMock(spec=_Config)
-    fc = _Controller(mock_plugin, config, mock_database)
+    fc = _Controller(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
     cfg = _node_bias_config_snapshot(node_drain_bias_enabled=node_drain_bias_enabled)
     fc.config.snapshot.return_value = cfg
 

@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, call
 from modules.fee_controller import FeeController
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _make_data_service(mock_plugin):
     """Build a data_service MagicMock that delegates to mock_plugin.rpc."""
     ds = MagicMock()
@@ -48,7 +50,7 @@ def mock_database():
 @pytest.fixture
 def fc(mock_plugin, mock_config, mock_database):
     mock_plugin.rpc.getinfo.return_value = {"id": "02our_node_id"}
-    controller = FeeController(mock_plugin, mock_config, mock_database)
+    controller = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
     controller.data_service = _make_data_service(mock_plugin)
     return controller
 
@@ -71,7 +73,7 @@ class TestGetOurId:
 
     def test_handles_empty_id(self, mock_plugin, mock_config, mock_database):
         mock_plugin.rpc.getinfo.return_value = {}
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         assert fc._get_our_id() == ""
 

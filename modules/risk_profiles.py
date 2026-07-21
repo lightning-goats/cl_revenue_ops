@@ -67,6 +67,7 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "paused": "authority_control",
     "dry_run": "authority_control",
     "authority_level": "authority_control",
+    "fee_authority_enabled": "authority_control",
     "risk_profile": "authority_control",
     "econ_shadow_enabled": "authority_control",
     "econ_governor_rebalance_enabled": "authority_control",

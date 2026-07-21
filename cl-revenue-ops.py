@@ -35,6 +35,7 @@ from pyln.client import Plugin, RpcError
 from modules.flow_analysis import FlowAnalyzer, ChannelState
 from modules import flow_analysis as flow_analysis_mod
 from modules.fee_controller import FeeController
+from modules.fee_authority import FeeAuthorityGate
 from modules.rebalancer import EVRebalancer
 from modules.config import Config
 from modules.growth_budget import compute_growth_budget_status
@@ -1005,6 +1006,8 @@ class ThreadSafePluginProxy:
 # Global instances (initialized in init)
 flow_analyzer: Optional[FlowAnalyzer] = None
 fee_controller: Optional[FeeController] = None
+fee_authority_gate = FeeAuthorityGate()
+_fee_authority_transition_lock = threading.Lock()
 rebalancer: Optional[EVRebalancer] = None
 database: Optional[Database] = None
 config: Optional[Config] = None
@@ -1086,6 +1089,32 @@ def _parse_dynamic_bool(option_name: str, value: Any) -> bool:
     raise ValueError(f"{option_name} must be a boolean")
 
 
+def _on_fee_authority_change(
+    plugin_: Plugin,
+    option_name: str,
+    new_value: Any,
+) -> str:
+    """Atomically apply the dynamic Python fee-authority setting."""
+    enabled = _parse_dynamic_bool(option_name, new_value)
+    cfg = globals().get("config")
+    if cfg is None:
+        raise ValueError("fee authority configuration is not initialized")
+    # Do not hold Config._lock while draining fee work: an accepted cycle
+    # may need Config.snapshot() before releasing its authority lease.
+    with _fee_authority_transition_lock:
+        status = fee_authority_gate.set_enabled(enabled, reason="setconfig")
+        with cfg._lock:
+            cfg.fee_authority_enabled = status.enabled
+    return (
+        f"{option_name}={str(status.enabled).lower()} "
+        f"generation={status.generation}"
+    )
+
+
+def _fee_authority_denial(operation: str) -> dict[str, object] | None:
+    return fee_authority_gate.deny_reason(operation)
+
+
 def _on_fee_replay_capture_change(
     plugin_: Plugin,
     option_name: str,
@@ -1136,6 +1165,15 @@ plugin.add_option(
     name='revenue-ops-fee-interval',
     default='1800',
     description='Interval in seconds for fee adjustments (default: 30 min)'
+)
+
+plugin.add_option(
+    name="revenue-ops-fee-authority-enabled",
+    default=True,
+    description="Permit Python fee evaluation and setchannel authority",
+    opt_type="bool",
+    dynamic=True,
+    on_change=_on_fee_authority_change,
 )
 
 plugin.add_option(
@@ -2474,6 +2512,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_interval=_safe_int('revenue-ops-flow-interval'),
         fee_interval=_safe_int('revenue-ops-fee-interval'),
         rebalance_interval=_safe_int('revenue-ops-rebalance-interval'),
+        fee_authority_enabled=_parse_dynamic_bool(
+            "revenue-ops-fee-authority-enabled",
+            options.get("revenue-ops-fee-authority-enabled", True),
+        ),
         fee_replay_capture_enabled=(
             str(options.get(
                 'revenue-ops-fee-replay-capture-enabled',
@@ -2668,6 +2710,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             level='warn'
         )
     config = Config(**{k: v for k, v in config_kwargs.items() if k in config_fields})
+    with config._lock:
+        fee_authority_gate.set_enabled(
+            config.fee_authority_enabled,
+            reason="init",
+        )
     
     plugin.log(f"Configuration loaded: "
                f"fee_range=[{config.min_fee_ppm}, {config.max_fee_ppm}], "
@@ -2961,6 +3008,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database,
         policy_manager,
         profitability_analyzer,
+        fee_authority_gate=fee_authority_gate,
     )
     # Phase 1 shadow (docs/planning/2026-07-12-refactor-phase1-wiring.md):
     # observe-mode intent recording + snapshot preview. Fail-open by
@@ -3176,7 +3224,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
                     break
     
-    def fee_adjustment_loop():
+    def fee_adjustment_loop(scheduled_work=None):
         """Background loop for fee adjustment."""
         # Staggered startup: fees at 90s (was 60s) to avoid thundering herd
         if shutdown_event.wait(90):
@@ -3191,7 +3239,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
                 try:
                     plugin.log("Running scheduled fee adjustment...")
-                    run_fee_adjustment()
+                    (scheduled_work or run_fee_adjustment)()
                 except (RPCTimeoutError, RPCBreakerOpen) as e:
                     plugin.log(f"RPC degraded in fee adjustment: {e}. Skipping this cycle.", level='warn')
                 except Exception as e:
@@ -3538,7 +3586,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Start background threads (daemon=True so they don't block shutdown)
     threading.Thread(target=flow_analysis_loop, daemon=True, name="flow-analysis").start()
-    threading.Thread(target=fee_adjustment_loop, daemon=True, name="fee-adjustment").start()
+    threading.Thread(
+        target=fee_adjustment_loop,
+        args=(_run_scheduled_fee_adjustment,),
+        daemon=True,
+        name="fee-adjustment",
+    ).start()
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
@@ -3590,7 +3643,24 @@ def run_flow_analysis():
 
 
 
+def _run_scheduled_fee_adjustment():
+    denial = _fee_authority_denial("scheduled_fee_cycle")
+    if denial is not None:
+        return denial
+    return run_fee_adjustment()
+
+
 def run_fee_adjustment():
+    """Run one complete Python fee cycle under the shared authority lease."""
+    with fee_authority_gate.execution_lease(
+        "fee_adjustment"
+    ) as denial:
+        if denial is not None:
+            return denial
+        return _run_fee_adjustment_authorized()
+
+
+def _run_fee_adjustment_authorized():
     """
     Module 2: DTS+PID Fee Controller (Dynamic Pricing)
 
@@ -3754,6 +3824,20 @@ def revenue_rebalance_cycle(plugin: Plugin, max_candidates: int = 20) -> Dict[st
 # =============================================================================
 # RPC METHODS - Exposed to lightning-cli
 # =============================================================================
+
+
+@plugin.method("revenue-fee-authority-status")
+def revenue_fee_authority_status(plugin: Plugin) -> Dict[str, Any]:
+    """Return the current in-process Python fee-authority state."""
+    status = fee_authority_gate.snapshot()
+    return {
+        "schema": "revenue_ops_fee_authority/v1",
+        "enabled": status.enabled,
+        "generation": status.generation,
+        "transitioned_at": status.transitioned_at,
+        "observed_at": int(time.time()),
+        "reason": status.reason,
+    }
 
 
 @plugin.method("revenue-status")
@@ -4412,12 +4496,22 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
 @plugin.method("revenue-fee-cycle")
 def revenue_fee_cycle(plugin: Plugin) -> Dict[str, Any]:
     """Run one fee adjustment cycle immediately."""
-    adjustments = run_fee_adjustment() or []
-    return {
-        "ok": True,
-        "adjusted_channels": len(adjustments),
-        "fee_debug": revenue_fee_debug(plugin),
-    }
+    with fee_authority_gate.execution_lease(
+        "revenue-fee-cycle"
+    ) as denial:
+        if denial is not None:
+            return {
+                "ok": False,
+                "adjusted_channels": 0,
+                "fee_debug": {},
+                **denial,
+            }
+        adjustments = run_fee_adjustment() or []
+        return {
+            "ok": True,
+            "adjusted_channels": len(adjustments),
+            "fee_debug": revenue_fee_debug(plugin),
+        }
 
 
 @plugin.method("revenue-analyze")
@@ -4461,15 +4555,24 @@ def revenue_wake_all(plugin: Plugin) -> Dict[str, Any]:
 
     Usage: lightning-cli revenue-wake-all
     """
-    if fee_controller is None:
-        return {"error": "Plugin not fully initialized"}
+    with fee_authority_gate.execution_lease(
+        "revenue-wake-all"
+    ) as denial:
+        if denial is not None:
+            return {
+                "channels_woken": 0,
+                "message": "Fee authority disabled",
+                **denial,
+            }
+        if fee_controller is None:
+            return {"error": "Plugin not fully initialized"}
 
-    woken = fee_controller.wake_all_sleeping_channels()
-    return {
-        "status": "ok",
-        "channels_woken": woken,
-        "message": f"Woke {woken} sleeping channel(s). They will be evaluated on the next fee cycle."
-    }
+        woken = fee_controller.wake_all_sleeping_channels()
+        return {
+            "status": "ok",
+            "channels_woken": woken,
+            "message": f"Woke {woken} sleeping channel(s). They will be evaluated on the next fee cycle."
+        }
 
 
 @plugin.method("revenue-capacity-report")
@@ -4618,6 +4721,29 @@ def revenue_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
 
 @plugin.method("revenue-set-fee")
 def revenue_set_fee(plugin: Plugin, channel_id: str = None, fee_ppm: int = None, force: bool = False) -> Dict[str, Any]:
+    """Manually set a fee while holding the shared authority lease."""
+    with fee_authority_gate.execution_lease(
+        "revenue-set-fee"
+    ) as denial:
+        if denial is not None:
+            return {
+                "error": "Fee authority disabled",
+                **denial,
+            }
+        return _revenue_set_fee_authorized(
+            plugin,
+            channel_id=channel_id,
+            fee_ppm=fee_ppm,
+            force=force,
+        )
+
+
+def _revenue_set_fee_authorized(
+    plugin: Plugin,
+    channel_id: str = None,
+    fee_ppm: int = None,
+    force: bool = False,
+) -> Dict[str, Any]:
     """
     Manually set fee for a channel.
 
@@ -6782,7 +6908,11 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
     #     failure reason exists, and most such failures are liquidity
     #     failures that say nothing about our fee, so the nudge is DROPPED
     #     entirely — a misdirected systematic signal is worse than none.
-    if status in ("failed", "local_failed") and fee_controller is not None:
+    if (
+        status in ("failed", "local_failed")
+        and fee_controller is not None
+        and _fee_authority_denial("failed_forward_trigger") is None
+    ):
         out_scid = forward_event.get("out_channel")
         out_scid = normalize_scid(out_scid) if out_scid else None
         failcode = forward_event.get("failcode")

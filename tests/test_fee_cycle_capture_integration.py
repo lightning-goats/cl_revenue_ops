@@ -97,6 +97,8 @@ DECISION_CALL_CONTRACT = {
 }
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _decision_call_inventory(source):
     tree = ast.parse(source)
     inventory = {name: Counter() for name in DECISION_CALL_CONTRACT}
@@ -653,6 +655,7 @@ def _capture_controller(tmp_path, *, enabled=True, dry_run=True,
         temporary_fee_overlay_active=(
             (lambda _channel_id: overlay) if overlay_available else None
         ),
+        fee_authority_gate=FeeAuthorityGate(),
     )
     data_service = MagicMock()
     data_service.get_node_id.return_value = NODE_ID
@@ -1666,6 +1669,6 @@ def test_controller_manager_stays_default_off_with_malformed_config_path():
     config.db_path = object()
     config.fee_replay_capture_enabled = False
 
-    controller = FeeController(plugin, config, MagicMock())
+    controller = FeeController(plugin, config, MagicMock(), fee_authority_gate=FeeAuthorityGate())
 
     assert controller._fee_capture.read_manifest() == {}

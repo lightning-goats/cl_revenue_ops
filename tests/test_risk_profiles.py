@@ -12,6 +12,8 @@ Safety architecture under test:
   field cannot ship unclassified).
 """
 import dataclasses
+import re
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -29,6 +31,18 @@ from modules.risk_profiles import (
     PROFILE_NAMES,
     resolve_profile,
 )
+
+
+COMPATIBILITY_CATALOG = (
+    Path(__file__).resolve().parents[1]
+    / "docs/refactor/phase0/compatibility-catalog.md"
+)
+
+
+def _catalog_default(field):
+    if field.default is not dataclasses.MISSING:
+        return repr(field.default)
+    return f"factory:{field.default_factory.__name__}"
 
 
 def _load(overrides):
@@ -56,6 +70,31 @@ class TestClassificationCoverage:
     def test_deprecated_key_classified(self):
         assert FIELD_CLASSIFICATION["rebalance_min_profit"] == \
             "deprecated_transition"
+
+    def test_compatibility_catalog_matches_config_surface(self):
+        text = COMPATIBILITY_CATALOG.read_text()
+        heading = re.search(
+            r"^### Full Config dataclass surface \((\d+) fields with defaults\)$",
+            text,
+            re.MULTILINE,
+        )
+        assert heading is not None
+        rows = re.findall(
+            r"^\| `([^`]+)` \| `([^`]*)` \| *(yes)? *\|$",
+            text[heading.end():],
+            re.MULTILINE,
+        )
+        expected = [
+            (
+                field.name,
+                _catalog_default(field),
+                "yes" if field.name in PUBLIC_RUNTIME_KEYS else "",
+            )
+            for field in dataclasses.fields(Config)
+        ]
+
+        assert int(heading.group(1)) == len(expected)
+        assert rows == expected
 
 
 class TestBundleSafety:

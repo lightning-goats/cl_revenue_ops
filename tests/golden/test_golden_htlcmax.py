@@ -10,9 +10,11 @@ from modules.fee_controller import FeeController
 from tests.golden.util import golden_check
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 @pytest.fixture
 def fc():
-    return FeeController(MagicMock(), MagicMock(spec=Config), MagicMock())
+    return FeeController(MagicMock(), MagicMock(spec=Config), MagicMock(), fee_authority_gate=FeeAuthorityGate())
 
 
 def _cfg(**over):

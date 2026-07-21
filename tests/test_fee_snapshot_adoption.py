@@ -30,8 +30,10 @@ PEER_B = "03" + "b" * 64
 NOW = 1_752_400_000
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _fc():
-    fc = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock())
+    fc = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock(), fee_authority_gate=FeeAuthorityGate())
     cfg = MagicMock()
     cfg.snapshot.return_value = SimpleNamespace(
         econ_governor_fees_enabled=True, paused=False,

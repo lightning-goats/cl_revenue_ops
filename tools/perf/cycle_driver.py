@@ -20,6 +20,8 @@ N_CHANNELS = 36
 DAY = 86_400
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _scids(n: int) -> List[str]:
     return [f"{800000 + i}x{i}x0" for i in range(n)]
 
@@ -146,7 +148,7 @@ def build_stack(database) -> Dict[str, Any]:
     stack["profitability"] = profitability
 
     try:
-        fc = FeeController(plugin, config, database, policy_manager, profitability)
+        fc = FeeController(plugin, config, database, policy_manager, profitability, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = data_service
         stack["fee_controller"] = fc
     except Exception:

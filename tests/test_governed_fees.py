@@ -15,8 +15,10 @@ from modules.fee_controller import FeeController
 SCID = "111x222x0"
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _fc(governed=True, paused=False):
-    fc = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock())
+    fc = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock(), fee_authority_gate=FeeAuthorityGate())
     cfg = MagicMock()
     cfg.snapshot.return_value = SimpleNamespace(
         econ_governor_fees_enabled=governed, paused=paused)
@@ -25,7 +27,7 @@ def _fc(governed=True, paused=False):
 
 
 def test_flag_check_is_strict():
-    fc = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock())
+    fc = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock(), fee_authority_gate=FeeAuthorityGate())
     fc.config = MagicMock()  # truthy attrs
     assert fc._fee_governor_enabled() is False
     assert _fc(governed=True)._fee_governor_enabled() is True

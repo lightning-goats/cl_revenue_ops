@@ -23,7 +23,7 @@ change.
 | `planner_max_fee_rate_sat_vb` | `50.0` |
 | `receivable_ratio_floor` | `0.2` |
 
-## authority_control (22) — What the node MAY do — pause, dry-run, authority level, capability gates
+## authority_control (23) — What the node MAY do — pause, dry-run, authority level, capability gates
 
 | Field | Default |
 |---|---|
@@ -42,6 +42,7 @@ change.
 | `econ_governor_rebalance_enabled` | `False` |
 | `econ_shadow_enabled` | `False` |
 | `expansion_treasury_enabled` | `False` |
+| `fee_authority_enabled` | `True` |
 | `lnplus_execute_applications` | `True` |
 | `lnplus_swaps_enabled` | `True` |
 | `paused` | `False` |

@@ -38,6 +38,8 @@ from modules.fee_controller import (
 )
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 @pytest.fixture
 def mock_plugin():
     p = MagicMock()
@@ -55,7 +57,7 @@ def _make_fc(mock_plugin, mock_database):
     config = MagicMock()
     config.min_fee_ppm = 10
     config.max_fee_ppm = 5000
-    return FeeController(mock_plugin, config, mock_database)
+    return FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
 
 def _make_cfg_snapshot(**overrides):
