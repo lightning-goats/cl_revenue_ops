@@ -36,6 +36,7 @@ The wire contracts are versioned and language-neutral: see [`schemas/`](schemas/
 - Live rebalances execute through `RebalanceEngineV2` using native explicit-route execution; route discovery is pinned to the `v3`/askrene router path.
 - There is no Sling dependency.
 - The normal runtime controls are `paused`, `daily_budget_sats`, fee rails, `authority_level` (what the node MAY do: `observe` < `fees` < `liquidity` < `capital`), `risk_profile` (coherent economic-risk defaults: `preserve`/`conservative`/`balanced`/`growth`/`custom`; preview any change with `revenue-profile-preview` before activating), and planner execution caps. (`fee_market_boundary_*` and `rebalance_min_profit` are deprecated no-ops scheduled for removal after the announced 2026-08-12 compatibility window — see `docs/refactor/phase0/contract-compatibility-policy.md`.)
+- Python fee authority is default-on and is controlled through Core Lightning's dynamic `revenue-ops-fee-authority-enabled` option, not `revenue-config`. Inspect it with `revenue-fee-authority-status`; follow the [Python fee-authority handoff runbook](docs/runbooks/python-fee-authority-handoff.md) for transient checks, a separately approved manual cutover, and rollback.
 - The primary operator surfaces are `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug`.
 - The normal workflow is decision explainability first, knob tuning second.
 - Auto fee bands are enabled by default. Manual policy bands are fallback only when an auto band is not yet available.

@@ -1,13 +1,14 @@
 # Public compatibility catalog (baseline 5e8f747)
 
 What the refactor MUST keep working (refactor invariants 2 and 3).
-Pin test: `tests/test_rpc_surface_inventory.py` (68 methods; 64 at baseline + econ-shadow diagnostics `revenue-econ-snapshot`, `revenue-econ-reconcile`, `revenue-econ-cycle` + risk-profile diagnostic `revenue-profile-preview` (PR 8, read-only), NO compatibility promise yet).
+Pin test: `tests/test_rpc_surface_inventory.py` (69 methods; 64 at baseline + econ-shadow diagnostics `revenue-econ-snapshot`, `revenue-econ-reconcile`, `revenue-econ-cycle` + risk-profile diagnostic `revenue-profile-preview` (PR 8, read-only) + Python fee-authority diagnostic `revenue-fee-authority-status`).
 
 ## RPC surface
 
 Primary operator surfaces (must remain schema-compatible; per
 refactor.md Workstream I these become facades over projections):
-`revenue-status`, `revenue-fee-debug`, `revenue-rebalance-debug`,
+`revenue-status`, `revenue-fee-authority-status`, `revenue-fee-debug`,
+`revenue-rebalance-debug`,
 `revenue-config get|set`, `revenue-profitability`, `revenue-analyze`,
 `revenue-wake-all`, `revenue-dashboard`, `revenue-health`,
 planner/Boltz/LN+ diagnostics.
@@ -18,7 +19,7 @@ Classification per method: `docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md`
 (header refreshed 2026-07-09; body dated 2026-05-20 — refresh during
 Workstream I).
 
-Full 67-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
+Full 69-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
 
 ## Config surface
 
