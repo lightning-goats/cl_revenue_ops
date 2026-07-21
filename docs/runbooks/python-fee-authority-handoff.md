@@ -14,10 +14,12 @@ approval after the reviewed source has been deployed and verified default-on.
   or grant broadcast permission anywhere else. The replacement must remain in
   observer/dry-run/no-broadcast mode unless a separate change authorizes more.
 - A disabled gate blocks scheduled and manual fee evaluation, manual fee
-  setting, wake requests, the final `setchannel` execution boundary,
-  failed-forward fee nudges, and policy-change wakeups. It does not stop
-  read-only status or policy inspection, settled-forward accounting, or the
-  observational replay-capture control.
+  setting, channel-open initial-fee handling, direct controller fee-evaluation
+  and direct controller wake boundaries, dynamic `htlcmax` updates, wake
+  requests, the final `setchannel` execution boundary, failed-forward fee
+  nudges, and policy-change wakeups. It does not stop read-only status or
+  policy inspection, settled-forward accounting, or the observational
+  replay-capture control.
 - Authority transitions are manual. Initialization adopts the configured value,
   and the dynamic `setconfig` callback applies operator changes. Timers never
   change authority; scheduled fee work only checks and obeys the gate.

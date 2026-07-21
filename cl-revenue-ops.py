@@ -4496,20 +4496,22 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
 @plugin.method("revenue-fee-cycle")
 def revenue_fee_cycle(plugin: Plugin) -> Dict[str, Any]:
     """Run one fee adjustment cycle immediately."""
-    denial = _fee_authority_denial("revenue-fee-cycle")
-    if denial is not None:
+    with fee_authority_gate.execution_lease(
+        "revenue-fee-cycle"
+    ) as denial:
+        if denial is not None:
+            return {
+                "ok": False,
+                "adjusted_channels": 0,
+                "fee_debug": {},
+                **denial,
+            }
+        adjustments = run_fee_adjustment() or []
         return {
-            "ok": False,
-            "adjusted_channels": 0,
-            "fee_debug": {},
-            **denial,
+            "ok": True,
+            "adjusted_channels": len(adjustments),
+            "fee_debug": revenue_fee_debug(plugin),
         }
-    adjustments = run_fee_adjustment() or []
-    return {
-        "ok": True,
-        "adjusted_channels": len(adjustments),
-        "fee_debug": revenue_fee_debug(plugin),
-    }
 
 
 @plugin.method("revenue-analyze")
@@ -4553,22 +4555,24 @@ def revenue_wake_all(plugin: Plugin) -> Dict[str, Any]:
 
     Usage: lightning-cli revenue-wake-all
     """
-    denial = _fee_authority_denial("revenue-wake-all")
-    if denial is not None:
-        return {
-            "channels_woken": 0,
-            "message": "Fee authority disabled",
-            **denial,
-        }
-    if fee_controller is None:
-        return {"error": "Plugin not fully initialized"}
+    with fee_authority_gate.execution_lease(
+        "revenue-wake-all"
+    ) as denial:
+        if denial is not None:
+            return {
+                "channels_woken": 0,
+                "message": "Fee authority disabled",
+                **denial,
+            }
+        if fee_controller is None:
+            return {"error": "Plugin not fully initialized"}
 
-    woken = fee_controller.wake_all_sleeping_channels()
-    return {
-        "status": "ok",
-        "channels_woken": woken,
-        "message": f"Woke {woken} sleeping channel(s). They will be evaluated on the next fee cycle."
-    }
+        woken = fee_controller.wake_all_sleeping_channels()
+        return {
+            "status": "ok",
+            "channels_woken": woken,
+            "message": f"Woke {woken} sleeping channel(s). They will be evaluated on the next fee cycle."
+        }
 
 
 @plugin.method("revenue-capacity-report")

@@ -801,6 +801,194 @@ def test_wake_all_rpc_preserves_outer_shape_without_mutating_controller_state():
     mod.fee_controller.wake_all_sleeping_channels.assert_not_called()
 
 
+def test_fee_cycle_rpc_holds_outer_lease_across_delegation_during_drain():
+    mod = load_plugin_module()
+    mod.config = Config(fee_authority_enabled=True)
+    mod.fee_authority_gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 10_100)
+    mod.revenue_fee_debug = MagicMock(return_value={"summary": {"total": 1}})
+    delegation_entered = threading.Event()
+    nested_checked = threading.Event()
+    release_delegation = threading.Event()
+    disable_finished = threading.Event()
+    mutations = []
+    nested_denials = []
+    enabled_during_delegation = []
+    transition_finished_during_delegation = []
+    rpc_results = []
+    transition_results = []
+
+    def delegated_cycle():
+        delegation_entered.set()
+        assert _wait_until(
+            lambda: mod.fee_authority_gate.deny_reason("drain_probe") is not None
+        )
+        with mod.fee_authority_gate.execution_lease("fee_adjustment") as denial:
+            nested_denials.append(denial)
+            enabled_during_delegation.append(
+                mod.revenue_fee_authority_status(mod.plugin)["enabled"]
+            )
+            transition_finished_during_delegation.append(disable_finished.is_set())
+            nested_checked.set()
+            assert release_delegation.wait(timeout=1)
+            if denial is not None:
+                return denial
+            mutations.append("fee-cycle")
+            return [{"channel_id": "123x456x0"}]
+
+    mod.run_fee_adjustment = delegated_cycle
+
+    def run_rpc():
+        rpc_results.append(mod.revenue_fee_cycle(mod.plugin))
+
+    def disable():
+        transition_results.append(
+            mod._on_fee_authority_change(
+                mod.plugin,
+                FEE_AUTHORITY_OPTION,
+                False,
+            )
+        )
+        disable_finished.set()
+
+    rpc = threading.Thread(target=run_rpc)
+    rpc.start()
+    assert delegation_entered.wait(timeout=1)
+
+    transition = threading.Thread(target=disable)
+    transition.start()
+    assert nested_checked.wait(timeout=1)
+    try:
+        assert not disable_finished.wait(timeout=0.05)
+    finally:
+        release_delegation.set()
+        rpc.join(timeout=1)
+        transition.join(timeout=1)
+
+    assert not rpc.is_alive()
+    assert not transition.is_alive()
+    assert rpc_results == [{
+        "ok": True,
+        "adjusted_channels": 1,
+        "fee_debug": {"summary": {"total": 1}},
+    }]
+    assert mutations == ["fee-cycle"]
+    assert nested_denials == [None]
+    assert enabled_during_delegation == [True]
+    assert transition_finished_during_delegation == [False]
+    assert transition_results == [
+        f"{FEE_AUTHORITY_OPTION}=false generation=1"
+    ]
+
+    blocked = mod.revenue_fee_cycle(mod.plugin)
+    assert blocked == {
+        "ok": False,
+        "adjusted_channels": 0,
+        "fee_debug": {},
+        "status": "blocked",
+        "reason": "fee_authority_disabled",
+        "operation": "revenue-fee-cycle",
+        "generation": 1,
+        "transitioned_at": 10_100,
+    }
+    assert mutations == ["fee-cycle"]
+    mod.revenue_fee_debug.assert_called_once_with(mod.plugin)
+
+
+def test_wake_all_rpc_holds_outer_lease_across_delegation_during_drain():
+    mod = load_plugin_module()
+    mod.config = Config(fee_authority_enabled=True)
+    mod.fee_authority_gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 10_200)
+    mod.fee_controller = MagicMock()
+    delegation_entered = threading.Event()
+    nested_checked = threading.Event()
+    release_delegation = threading.Event()
+    disable_finished = threading.Event()
+    mutations = []
+    nested_denials = []
+    enabled_during_delegation = []
+    transition_finished_during_delegation = []
+    rpc_results = []
+    transition_results = []
+
+    def delegated_wake():
+        delegation_entered.set()
+        assert _wait_until(
+            lambda: mod.fee_authority_gate.deny_reason("drain_probe") is not None
+        )
+        with mod.fee_authority_gate.execution_lease("controller_wake") as denial:
+            nested_denials.append(denial)
+            enabled_during_delegation.append(
+                mod.revenue_fee_authority_status(mod.plugin)["enabled"]
+            )
+            transition_finished_during_delegation.append(disable_finished.is_set())
+            nested_checked.set()
+            assert release_delegation.wait(timeout=1)
+            if denial is not None:
+                return 0
+            mutations.append("wake-all")
+            return 1
+
+    mod.fee_controller.wake_all_sleeping_channels.side_effect = delegated_wake
+
+    def run_rpc():
+        rpc_results.append(mod.revenue_wake_all(mod.plugin))
+
+    def disable():
+        transition_results.append(
+            mod._on_fee_authority_change(
+                mod.plugin,
+                FEE_AUTHORITY_OPTION,
+                False,
+            )
+        )
+        disable_finished.set()
+
+    rpc = threading.Thread(target=run_rpc)
+    rpc.start()
+    assert delegation_entered.wait(timeout=1)
+
+    transition = threading.Thread(target=disable)
+    transition.start()
+    assert nested_checked.wait(timeout=1)
+    try:
+        assert not disable_finished.wait(timeout=0.05)
+    finally:
+        release_delegation.set()
+        rpc.join(timeout=1)
+        transition.join(timeout=1)
+
+    assert not rpc.is_alive()
+    assert not transition.is_alive()
+    assert rpc_results == [{
+        "status": "ok",
+        "channels_woken": 1,
+        "message": (
+            "Woke 1 sleeping channel(s). They will be evaluated on the next "
+            "fee cycle."
+        ),
+    }]
+    assert mutations == ["wake-all"]
+    assert nested_denials == [None]
+    assert enabled_during_delegation == [True]
+    assert transition_finished_during_delegation == [False]
+    assert transition_results == [
+        f"{FEE_AUTHORITY_OPTION}=false generation=1"
+    ]
+
+    blocked = mod.revenue_wake_all(mod.plugin)
+    assert blocked == {
+        "status": "blocked",
+        "channels_woken": 0,
+        "message": "Fee authority disabled",
+        "reason": "fee_authority_disabled",
+        "operation": "revenue-wake-all",
+        "generation": 1,
+        "transitioned_at": 10_200,
+    }
+    assert mutations == ["wake-all"]
+    mod.fee_controller.wake_all_sleeping_channels.assert_called_once_with()
+
+
 def test_set_fee_rpc_blocks_before_rate_limit_or_controller_work():
     mod = load_plugin_module()
     mod.fee_authority_gate = _disabled_gate()
@@ -1017,3 +1205,16 @@ def test_runbook_requires_persistent_option_cleanup_before_old_source_revert():
 
     assert positions == sorted(positions)
     assert "must not be automated" in section
+
+
+def test_runbook_contract_inventory_names_all_fee_authority_boundaries():
+    runbook = RUNBOOK_PATH.read_text()
+    contract = runbook.split("## Contract", 1)[1].split(
+        "## Inspect authority",
+        1,
+    )[0]
+
+    assert "channel-open initial-fee handling" in contract
+    assert "direct controller fee-evaluation" in contract
+    assert "direct controller wake" in contract
+    assert "dynamic `htlcmax`" in contract
