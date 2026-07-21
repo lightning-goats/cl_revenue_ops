@@ -1,5 +1,6 @@
 import dataclasses
 import threading
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -9,6 +10,12 @@ from tests.plugin_test_utils import load_plugin_module
 
 
 FEE_AUTHORITY_OPTION = "revenue-ops-fee-authority-enabled"
+
+
+def _disabled_gate(now: int = 10_000) -> FeeAuthorityGate:
+    gate = FeeAuthorityGate(enabled=True, now_fn=lambda: now)
+    gate.set_enabled(False, reason="setconfig")
+    return gate
 
 
 def test_authority_config_defaults_on_and_is_snapshotted():
@@ -249,3 +256,121 @@ def test_fee_authority_status_rpc_returns_positive_in_process_state(monkeypatch)
         "observed_at": 9010,
         "reason": "initial",
     }
+
+
+def test_scheduled_fee_cycle_does_not_enter_run_fee_adjustment_when_disabled():
+    mod = load_plugin_module()
+    mod.fee_authority_gate = _disabled_gate()
+    mod.run_fee_adjustment = MagicMock(return_value=[])
+
+    result = mod._run_scheduled_fee_adjustment()
+
+    assert result == {
+        "status": "blocked",
+        "reason": "fee_authority_disabled",
+        "operation": "scheduled_fee_cycle",
+        "generation": 1,
+        "transitioned_at": 10_000,
+    }
+    mod.run_fee_adjustment.assert_not_called()
+
+
+def test_run_fee_adjustment_does_not_enter_controller_when_disabled():
+    mod = load_plugin_module()
+    mod.fee_authority_gate = _disabled_gate()
+    mod.fee_controller = MagicMock()
+    mod.fee_controller.adjust_all_fees.return_value = []
+
+    result = mod.run_fee_adjustment()
+
+    assert result == {
+        "status": "blocked",
+        "reason": "fee_authority_disabled",
+        "operation": "fee_adjustment",
+        "generation": 1,
+        "transitioned_at": 10_000,
+    }
+    mod.fee_controller.adjust_all_fees.assert_not_called()
+
+
+def test_fee_cycle_rpc_preserves_outer_shape_when_authority_is_disabled():
+    mod = load_plugin_module()
+    mod.fee_authority_gate = _disabled_gate()
+    mod.run_fee_adjustment = MagicMock(return_value=[])
+    mod.revenue_fee_debug = MagicMock(return_value={"summary": {"total": 1}})
+
+    result = mod.revenue_fee_cycle(mod.plugin)
+
+    assert result == {
+        "ok": False,
+        "adjusted_channels": 0,
+        "fee_debug": {},
+        "status": "blocked",
+        "reason": "fee_authority_disabled",
+        "operation": "revenue-fee-cycle",
+        "generation": 1,
+        "transitioned_at": 10_000,
+    }
+    mod.run_fee_adjustment.assert_not_called()
+    mod.revenue_fee_debug.assert_not_called()
+
+
+def test_wake_all_rpc_preserves_outer_shape_without_mutating_controller_state():
+    mod = load_plugin_module()
+    mod.fee_authority_gate = _disabled_gate()
+    mod.fee_controller = MagicMock()
+
+    result = mod.revenue_wake_all(mod.plugin)
+
+    assert result == {
+        "status": "blocked",
+        "channels_woken": 0,
+        "message": "Fee authority disabled",
+        "reason": "fee_authority_disabled",
+        "operation": "revenue-wake-all",
+        "generation": 1,
+        "transitioned_at": 10_000,
+    }
+    mod.fee_controller.wake_all_sleeping_channels.assert_not_called()
+
+
+def test_set_fee_rpc_blocks_before_rate_limit_or_controller_work():
+    mod = load_plugin_module()
+    mod.fee_authority_gate = _disabled_gate()
+    mod.config = Config(min_fee_ppm=10, max_fee_ppm=5000)
+    mod.fee_controller = MagicMock()
+    mod.force_rate_limiter = MagicMock()
+    mod.force_rate_limiter.check_rate_limit.return_value = (True, "ok")
+
+    result = mod.revenue_set_fee(
+        mod.plugin,
+        channel_id="123x456x0",
+        fee_ppm=125,
+        force=True,
+    )
+
+    assert result == {
+        "status": "blocked",
+        "error": "Fee authority disabled",
+        "reason": "fee_authority_disabled",
+        "operation": "revenue-set-fee",
+        "generation": 1,
+        "transitioned_at": 10_000,
+    }
+    mod.force_rate_limiter.check_rate_limit.assert_not_called()
+    mod.fee_controller.set_channel_fee.assert_not_called()
+
+
+def test_reenabling_authority_restores_existing_fee_adjustment_path():
+    mod = load_plugin_module()
+    mod.fee_authority_gate = _disabled_gate()
+    mod.fee_controller = MagicMock()
+    mod.fee_controller.adjust_all_fees.return_value = []
+
+    blocked = mod.run_fee_adjustment()
+    mod.fee_authority_gate.set_enabled(True, reason="rollback")
+    enabled = mod.run_fee_adjustment()
+
+    assert blocked["reason"] == "fee_authority_disabled"
+    assert enabled == []
+    mod.fee_controller.adjust_all_fees.assert_called_once_with()

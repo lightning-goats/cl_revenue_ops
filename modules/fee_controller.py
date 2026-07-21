@@ -67,6 +67,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from . import admission_policy as _admission_policy
 from .database import Database
+from .fee_authority import FeeAuthorityGate
 from .fee_cycle_capture import (
     FeeCycleCaptureManager,
     bind_capture,
@@ -2949,7 +2950,8 @@ class FeeController:
     def __init__(self, plugin: Plugin, config: Config, database: Database,
                  policy_manager: Optional[PolicyManager] = None,
                  profitability_analyzer: Optional["ChannelProfitabilityAnalyzer"] = None,
-                 temporary_fee_overlay_active: Optional[Callable[[str], bool]] = None):
+                 temporary_fee_overlay_active: Optional[Callable[[str], bool]] = None,
+                 fee_authority_gate: Optional[FeeAuthorityGate] = None):
         """
         Initialize the fee controller.
 
@@ -2966,6 +2968,7 @@ class FeeController:
         self.policy_manager = policy_manager
         self.profitability = profitability_analyzer
         self.temporary_fee_overlay_active = temporary_fee_overlay_active
+        self.fee_authority_gate = fee_authority_gate or FeeAuthorityGate()
         self.data_service = None  # Unified data service (injected by main plugin)
         if self.policy_manager and hasattr(self.policy_manager, "register_on_change"):
             try:
@@ -8137,6 +8140,15 @@ class FeeController:
                        htlcmax_msat: Optional[int] = None,
                        base_fee_msat_override: Optional[int] = None,
                        effective_min_fee_ppm: Optional[int] = None) -> Dict[str, Any]:
+        denial = self.fee_authority_gate.deny_reason("set_channel_fee")
+        if denial is not None:
+            return {
+                "success": False,
+                "channel_id": channel_id,
+                "fee_ppm": fee_ppm,
+                "message": "Fee authority disabled",
+                **denial,
+            }
         request = {
             "channel_id": channel_id,
             "fee_ppm": fee_ppm,

@@ -1107,6 +1107,10 @@ def _on_fee_authority_change(
     )
 
 
+def _fee_authority_denial(operation: str) -> dict[str, object] | None:
+    return fee_authority_gate.deny_reason(operation)
+
+
 def _on_fee_replay_capture_change(
     plugin_: Plugin,
     option_name: str,
@@ -3000,6 +3004,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database,
         policy_manager,
         profitability_analyzer,
+        fee_authority_gate=fee_authority_gate,
     )
     # Phase 1 shadow (docs/planning/2026-07-12-refactor-phase1-wiring.md):
     # observe-mode intent recording + snapshot preview. Fail-open by
@@ -3215,7 +3220,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
                     break
     
-    def fee_adjustment_loop():
+    def fee_adjustment_loop(scheduled_work=None):
         """Background loop for fee adjustment."""
         # Staggered startup: fees at 90s (was 60s) to avoid thundering herd
         if shutdown_event.wait(90):
@@ -3230,7 +3235,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
                 try:
                     plugin.log("Running scheduled fee adjustment...")
-                    run_fee_adjustment()
+                    (scheduled_work or run_fee_adjustment)()
                 except (RPCTimeoutError, RPCBreakerOpen) as e:
                     plugin.log(f"RPC degraded in fee adjustment: {e}. Skipping this cycle.", level='warn')
                 except Exception as e:
@@ -3577,7 +3582,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Start background threads (daemon=True so they don't block shutdown)
     threading.Thread(target=flow_analysis_loop, daemon=True, name="flow-analysis").start()
-    threading.Thread(target=fee_adjustment_loop, daemon=True, name="fee-adjustment").start()
+    threading.Thread(
+        target=fee_adjustment_loop,
+        args=(_run_scheduled_fee_adjustment,),
+        daemon=True,
+        name="fee-adjustment",
+    ).start()
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
@@ -3629,12 +3639,22 @@ def run_flow_analysis():
 
 
 
+def _run_scheduled_fee_adjustment():
+    denial = _fee_authority_denial("scheduled_fee_cycle")
+    if denial is not None:
+        return denial
+    return run_fee_adjustment()
+
+
 def run_fee_adjustment():
     """
     Module 2: DTS+PID Fee Controller (Dynamic Pricing)
 
     Adjust channel fees using DTS+PID optimization.
     """
+    denial = _fee_authority_denial("fee_adjustment")
+    if denial is not None:
+        return denial
     if fee_controller is None:
         plugin.log("Fee controller not initialized", level='error')
         return []
@@ -4465,6 +4485,14 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
 @plugin.method("revenue-fee-cycle")
 def revenue_fee_cycle(plugin: Plugin) -> Dict[str, Any]:
     """Run one fee adjustment cycle immediately."""
+    denial = _fee_authority_denial("revenue-fee-cycle")
+    if denial is not None:
+        return {
+            "ok": False,
+            "adjusted_channels": 0,
+            "fee_debug": {},
+            **denial,
+        }
     adjustments = run_fee_adjustment() or []
     return {
         "ok": True,
@@ -4514,6 +4542,13 @@ def revenue_wake_all(plugin: Plugin) -> Dict[str, Any]:
 
     Usage: lightning-cli revenue-wake-all
     """
+    denial = _fee_authority_denial("revenue-wake-all")
+    if denial is not None:
+        return {
+            "channels_woken": 0,
+            "message": "Fee authority disabled",
+            **denial,
+        }
     if fee_controller is None:
         return {"error": "Plugin not fully initialized"}
 
@@ -4676,6 +4711,12 @@ def revenue_set_fee(plugin: Plugin, channel_id: str = None, fee_ppm: int = None,
 
     Usage: lightning-cli revenue-set-fee channel_id fee_ppm [force=false]
     """
+    denial = _fee_authority_denial("revenue-set-fee")
+    if denial is not None:
+        return {
+            "error": "Fee authority disabled",
+            **denial,
+        }
     if channel_id is None or fee_ppm is None:
         return {"error": "usage: revenue-set-fee channel_id fee_ppm [force=false]"}
     if fee_controller is None or config is None:
