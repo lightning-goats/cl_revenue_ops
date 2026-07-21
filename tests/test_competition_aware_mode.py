@@ -14,6 +14,8 @@ from modules.fee_controller import FeeController
 from modules.config import STRING_ENUM_VALID_VALUES
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 @pytest.fixture
 def mock_plugin():
     p = MagicMock()
@@ -88,7 +90,7 @@ class TestNeighborFeePercentile:
         ]
 
     def _setup_fc(self, mock_plugin, mock_config, mock_database, channels: list):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc._our_node_id = "02ourid"
         fc.data_service = MagicMock()
         fc.data_service.get_channels = MagicMock(return_value={"channels": channels})

@@ -31,11 +31,13 @@ CHAN_A2 = "111x2x0"
 CHAN_B1 = "222x1x0"
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _make_fc(database=None):
     plugin = MagicMock()
     config = MagicMock(spec=Config)
     db = database or MagicMock()
-    return FeeController(plugin, config, db)
+    return FeeController(plugin, config, db, fee_authority_gate=FeeAuthorityGate())
 
 
 def _sleeping_cycle():

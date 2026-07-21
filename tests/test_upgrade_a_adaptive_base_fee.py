@@ -14,6 +14,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _make_data_service(mock_plugin):
     ds = MagicMock()
     ds.get_peer_channels.side_effect = lambda peer_id=None, **kw: (
@@ -82,7 +84,7 @@ def test_policy_off_uses_legacy_base_fee_msat(mock_plugin, mock_database):
     mock_database.get_fee_strategy_state.return_value = _strategy_state()
     mock_database.record_fee_change = MagicMock()
 
-    fc = FeeController(mock_plugin, cfg, mock_database)
+    fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
     fc.data_service = _make_data_service(mock_plugin)
 
     fc.set_channel_fee(scid, 200, manual=True)
@@ -109,7 +111,7 @@ def test_policy_adaptive_uses_legacy_base_fee(mock_plugin, mock_database):
     mock_database.get_fee_strategy_state.return_value = _strategy_state()
     mock_database.record_fee_change = MagicMock()
 
-    fc = FeeController(mock_plugin, cfg, mock_database)
+    fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
     fc.data_service = _make_data_service(mock_plugin)
 
     fc.set_channel_fee(scid, 200, manual=True)
@@ -137,7 +139,7 @@ def test_explicit_override_beats_policy(mock_plugin, mock_database):
     mock_database.get_fee_strategy_state.return_value = _strategy_state()
     mock_database.record_fee_change = MagicMock()
 
-    fc = FeeController(mock_plugin, cfg, mock_database)
+    fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
     fc.data_service = _make_data_service(mock_plugin)
 
     fc.set_channel_fee(scid, 200, manual=True, base_fee_msat_override=5555)

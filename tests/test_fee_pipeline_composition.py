@@ -40,6 +40,8 @@ CHANNEL_ID = "123x456x0"
 PEER_ID = "02" + "a" * 64
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _make_config_snapshot(**overrides):
     defaults = {
         'min_fee_ppm': 10,
@@ -64,7 +66,7 @@ def _make_config_snapshot(**overrides):
 def _make_fc(mock_plugin, mock_database, **cfg_overrides):
     """Fee controller with the full DTS-path database mocks."""
     config = MagicMock(spec=Config)
-    fc = FeeController(mock_plugin, config, mock_database)
+    fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
 
     cfg = _make_config_snapshot(**cfg_overrides)
     fc.config.snapshot.return_value = cfg

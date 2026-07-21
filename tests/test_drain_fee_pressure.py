@@ -18,6 +18,7 @@ sys.modules['pyln.client'] = mock_pyln
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.fee_controller import FeeController as Controller
+from modules.fee_authority import FeeAuthorityGate
 from modules.config import Config
 
 
@@ -150,7 +151,7 @@ def _setup_db(mock_database, now):
 def _make_drain_fc(mock_plugin, mock_database, *, discount_max):
     """FeeController with ONE channel at ~97% local and zero forwards."""
     config = MagicMock(spec=Config)
-    fc = Controller(mock_plugin, config, mock_database)
+    fc = Controller(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
     cfg = _make_config_snapshot(drain_fee_discount_max=discount_max)
     fc.config.snapshot.return_value = cfg
     fc.config.dry_run = True  # set_channel_fee succeeds without RPC

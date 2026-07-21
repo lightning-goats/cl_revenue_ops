@@ -22,6 +22,8 @@ CHANNEL = "123x456x0"
 PEER = "02" + "a" * 64
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 @pytest.fixture
 def mock_plugin():
     p = MagicMock()
@@ -46,7 +48,7 @@ def mock_database():
 
 
 def _make_fc(mock_plugin, mock_config, mock_database, gossip_channels=None):
-    fc = FeeController(mock_plugin, mock_config, mock_database)
+    fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
     fc.data_service = MagicMock()
     fc.data_service.get_channels.return_value = {
         "channels": gossip_channels or []

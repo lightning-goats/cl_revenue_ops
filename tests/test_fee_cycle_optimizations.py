@@ -45,6 +45,8 @@ PEER_IDS = ["02" + c * 64 for c in "abc"]
 CHANNEL_IDS = ["100x1x0", "100x2x0", "100x3x0"]
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _make_config_snapshot(**overrides):
     defaults = {
         "paused": False,
@@ -124,7 +126,7 @@ def _setup_db(mock_database, now=None):
 def _make_cycle_fc(mock_plugin, mock_database):
     """Build a FeeController wired up for an end-to-end adjust_all_fees run."""
     config = MagicMock(spec=Config)
-    fc = FeeController(mock_plugin, config, mock_database)
+    fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
     cfg = _make_config_snapshot()
     fc.config.snapshot.return_value = cfg
     fc.config.dry_run = True  # set_channel_fee succeeds without RPC
@@ -423,7 +425,7 @@ class TestNeighborHelpers:
     def _make_fc_with_gossip(self, mock_plugin, mock_database, channels):
         mock_plugin.rpc.getinfo.return_value = {"id": "02our_node_id"}
         config = MagicMock(spec=Config)
-        fc = FeeController(mock_plugin, config, mock_database)
+        fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = MagicMock()
         fc.data_service.get_channels.return_value = {"channels": channels}
         fc.data_service.get_node_id.return_value = "02our_node_id"

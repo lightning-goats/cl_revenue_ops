@@ -1,11 +1,13 @@
 import dataclasses
 import threading
+import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from modules.config import Config
-from modules.fee_authority import FeeAuthorityGate
+from modules.fee_authority import FeeAuthorityGate, FeeAuthorityTransitionError
 from modules.fee_controller import ChannelCycleState, ChannelFeeState, FeeController
 from modules.policy_manager import PeerPolicy
 from tests.plugin_test_utils import load_plugin_module
@@ -75,6 +77,466 @@ def test_generation_and_timestamps_advance_only_on_transitions():
         enabled.transitioned_at,
     ] == [3000, 3010, 3020]
     assert [disabled.reason, enabled.reason] == ["cutover", "rollback"]
+
+
+def _wait_until(predicate, timeout: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        threading.Event().wait(0.001)
+    return predicate()
+
+
+def test_transition_timestamps_do_not_decrease_when_wall_clock_moves_backward():
+    clock = iter([3000, 2990, 2980]).__next__
+    gate = FeeAuthorityGate(enabled=True, now_fn=clock)
+
+    disabled = gate.set_enabled(False, reason="cutover")
+    enabled = gate.set_enabled(True, reason="rollback")
+
+    assert disabled.transitioned_at == 3000
+    assert enabled.transitioned_at == 3000
+
+
+def test_disable_drains_outer_lease_and_denies_new_work_before_false_readback():
+    gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 5000)
+    mutation_entered = threading.Event()
+    finish_mutation = threading.Event()
+    nested_checked = threading.Event()
+    disable_finished = threading.Event()
+    statuses = []
+
+    def mutate():
+        with gate.execution_lease("manual_fee_mutation") as denial:
+            assert denial is None
+            mutation_entered.set()
+            assert _wait_until(
+                lambda: gate.deny_reason("new_fee_mutation") is not None
+            )
+            with gate.execution_lease("nested_set_channel_fee") as nested_denial:
+                assert nested_denial is None
+                nested_checked.set()
+            assert finish_mutation.wait(timeout=1)
+
+    def disable():
+        statuses.append(
+            gate.set_enabled(False, reason="setconfig", timeout_seconds=1)
+        )
+        disable_finished.set()
+
+    mutation = threading.Thread(target=mutate)
+    mutation.start()
+    assert mutation_entered.wait(timeout=1)
+
+    transition = threading.Thread(target=disable)
+    transition.start()
+    assert _wait_until(lambda: gate.deny_reason("new_fee_mutation") is not None)
+
+    assert gate.snapshot().enabled is True
+    assert not disable_finished.wait(timeout=0.05)
+    with gate.execution_lease("new_fee_mutation") as denial:
+        assert denial == {
+            "status": "blocked",
+            "reason": "fee_authority_disabled",
+            "operation": "new_fee_mutation",
+            "generation": 0,
+            "transitioned_at": 5000,
+        }
+    assert nested_checked.wait(timeout=1)
+
+    finish_mutation.set()
+    mutation.join(timeout=1)
+    transition.join(timeout=1)
+
+    assert not mutation.is_alive()
+    assert not transition.is_alive()
+    assert statuses[0].enabled is False
+    assert gate.snapshot() == statuses[0]
+
+
+def test_disable_timeout_restores_accepting_state_without_false_readback():
+    gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 6000)
+    mutation_entered = threading.Event()
+    finish_mutation = threading.Event()
+
+    def mutate():
+        with gate.execution_lease("scheduled_fee_cycle") as denial:
+            assert denial is None
+            mutation_entered.set()
+            assert finish_mutation.wait(timeout=1)
+
+    mutation = threading.Thread(target=mutate)
+    mutation.start()
+    assert mutation_entered.wait(timeout=1)
+
+    with pytest.raises(FeeAuthorityTransitionError, match="timed out"):
+        gate.set_enabled(False, reason="setconfig", timeout_seconds=0.01)
+
+    assert gate.snapshot().enabled is True
+    assert gate.deny_reason("new_fee_mutation") is None
+    with gate.execution_lease("new_fee_mutation") as denial:
+        assert denial is None
+
+    finish_mutation.set()
+    mutation.join(timeout=1)
+    assert not mutation.is_alive()
+
+
+def test_disable_from_inside_execution_lease_fails_without_changing_state():
+    gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 7000)
+
+    with gate.execution_lease("manual_fee_mutation") as denial:
+        assert denial is None
+        with pytest.raises(FeeAuthorityTransitionError, match="active execution lease"):
+            gate.set_enabled(False, reason="setconfig", timeout_seconds=0.01)
+
+    assert gate.snapshot().enabled is True
+    assert gate.deny_reason("new_fee_mutation") is None
+
+
+def test_controller_requires_explicit_shared_authority_gate():
+    with pytest.raises(TypeError, match="fee_authority_gate"):
+        FeeController(MagicMock(), Config(), MagicMock())
+
+
+def test_controller_rejects_config_and_gate_initial_authority_mismatch():
+    with pytest.raises(ValueError, match="fee authority"):
+        FeeController(
+            MagicMock(),
+            Config(fee_authority_enabled=False),
+            MagicMock(),
+            fee_authority_gate=FeeAuthorityGate(enabled=True),
+        )
+
+
+def test_direct_adjust_all_fees_is_denied_before_capture_or_cycle_state():
+    controller = FeeController(
+        MagicMock(),
+        Config(fee_authority_enabled=False),
+        MagicMock(),
+        fee_authority_gate=_disabled_gate(),
+    )
+    controller._fee_capture.begin_cycle = MagicMock()
+    controller._adjust_all_fees_bound = MagicMock(return_value=[])
+
+    result = controller.adjust_all_fees()
+
+    assert result == []
+    controller._fee_capture.begin_cycle.assert_not_called()
+    controller._adjust_all_fees_bound.assert_not_called()
+
+
+def test_direct_wake_all_is_denied_before_state_or_database_mutation():
+    channel_id = "123x456x0"
+    database = MagicMock()
+    controller = FeeController(
+        MagicMock(),
+        Config(fee_authority_enabled=False),
+        database,
+        fee_authority_gate=_disabled_gate(),
+    )
+    cycle = ChannelCycleState(
+        is_sleeping=True,
+        sleep_until=99_999,
+        stable_cycles=4,
+        last_update=99_999,
+    )
+    controller._cycle_states[channel_id] = cycle
+
+    result = controller.wake_all_sleeping_channels()
+
+    assert result == 0
+    assert (cycle.is_sleeping, cycle.sleep_until, cycle.stable_cycles) == (
+        True,
+        99_999,
+        4,
+    )
+    database.get_all_fee_strategy_states.assert_not_called()
+    database.update_fee_strategy_state.assert_not_called()
+
+
+def test_channel_open_initial_fee_is_denied_before_reads_or_prior_persistence():
+    database = MagicMock()
+    controller = FeeController(
+        MagicMock(),
+        Config(fee_authority_enabled=False),
+        database,
+        fee_authority_gate=_disabled_gate(),
+    )
+    controller.data_service = MagicMock()
+
+    result = controller.set_initial_fee(
+        "123x456x0",
+        "02" + "a" * 64,
+    )
+
+    assert result is None
+    controller.data_service.get_peer_channels.assert_not_called()
+    database.get_fee_strategy_state.assert_not_called()
+    database.update_fee_strategy_state.assert_not_called()
+
+
+def test_setconfig_disable_timeout_keeps_config_and_positive_readback_true():
+    mod = load_plugin_module()
+    mod.config = Config(fee_authority_enabled=True)
+    mod.fee_authority_gate = FeeAuthorityGate(
+        enabled=True,
+        now_fn=lambda: 8000,
+        drain_timeout_seconds=0.01,
+    )
+    lease_entered = threading.Event()
+    release_lease = threading.Event()
+
+    def hold_lease():
+        with mod.fee_authority_gate.execution_lease("scheduled_fee_cycle") as denial:
+            assert denial is None
+            lease_entered.set()
+            assert release_lease.wait(timeout=1)
+
+    worker = threading.Thread(target=hold_lease)
+    worker.start()
+    assert lease_entered.wait(timeout=1)
+
+    with pytest.raises(FeeAuthorityTransitionError, match="timed out"):
+        mod._on_fee_authority_change(
+            mod.plugin,
+            FEE_AUTHORITY_OPTION,
+            False,
+        )
+
+    assert mod.config.fee_authority_enabled is True
+    assert mod.revenue_fee_authority_status(mod.plugin)["enabled"] is True
+    assert mod.fee_authority_gate.deny_reason("new_fee_mutation") is None
+
+    release_lease.set()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+
+
+def test_inflight_manual_mutation_blocks_disabled_readback_and_new_mutation():
+    channel_id = "123x456x0"
+    peer_id = "02" + "b" * 64
+    gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 9000)
+    controller = FeeController(
+        MagicMock(),
+        Config(),
+        MagicMock(),
+        fee_authority_gate=gate,
+    )
+    controller.data_service = MagicMock()
+    rpc_entered = threading.Event()
+    release_rpc = threading.Event()
+    disable_finished = threading.Event()
+    mutation_results = []
+    disable_results = []
+
+    def set_channel(**_kwargs):
+        rpc_entered.set()
+        assert release_rpc.wait(timeout=1)
+        return {}
+
+    controller.data_service.set_channel.side_effect = set_channel
+
+    def mutate():
+        mutation_results.append(
+            controller.set_channel_fee(
+                channel_id,
+                125,
+                manual=True,
+                channel_info={
+                    "short_channel_id": channel_id,
+                    "peer_id": peer_id,
+                    "fee_proportional_millionths": 100,
+                },
+            )
+        )
+
+    def disable():
+        disable_results.append(
+            gate.set_enabled(False, reason="setconfig", timeout_seconds=1)
+        )
+        disable_finished.set()
+
+    mutation = threading.Thread(target=mutate)
+    mutation.start()
+    assert rpc_entered.wait(timeout=1)
+
+    transition = threading.Thread(target=disable)
+    transition.start()
+    assert _wait_until(lambda: gate.deny_reason("new_fee_mutation") is not None)
+
+    assert gate.snapshot().enabled is True
+    assert not disable_finished.wait(timeout=0.05)
+    blocked = controller.set_channel_fee(
+        channel_id,
+        130,
+        manual=True,
+        channel_info={
+            "short_channel_id": channel_id,
+            "peer_id": peer_id,
+            "fee_proportional_millionths": 100,
+        },
+    )
+    assert blocked["reason"] == "fee_authority_disabled"
+    assert controller.data_service.set_channel.call_count == 1
+
+    release_rpc.set()
+    mutation.join(timeout=1)
+    transition.join(timeout=1)
+
+    assert not mutation.is_alive()
+    assert not transition.is_alive()
+    assert mutation_results[0]["success"] is True
+    assert disable_results[0].enabled is False
+
+
+def test_inflight_scheduled_cycle_blocks_setconfig_readback_and_new_cycle():
+    mod = load_plugin_module()
+    mod.config = Config(fee_authority_enabled=True)
+    mod.fee_authority_gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 9500)
+    cycle_entered = threading.Event()
+    release_cycle = threading.Event()
+    disable_finished = threading.Event()
+    cycle_results = []
+    disable_results = []
+
+    def adjust_all_fees():
+        cycle_entered.set()
+        assert release_cycle.wait(timeout=1)
+        return []
+
+    mod.fee_controller = MagicMock()
+    mod.fee_controller.adjust_all_fees.side_effect = adjust_all_fees
+
+    def run_cycle():
+        cycle_results.append(mod.run_fee_adjustment())
+
+    def disable():
+        disable_results.append(
+            mod._on_fee_authority_change(
+                mod.plugin,
+                FEE_AUTHORITY_OPTION,
+                False,
+            )
+        )
+        disable_finished.set()
+
+    cycle = threading.Thread(target=run_cycle)
+    cycle.start()
+    assert cycle_entered.wait(timeout=1)
+
+    transition = threading.Thread(target=disable)
+    transition.start()
+    try:
+        assert _wait_until(
+            lambda: mod.fee_authority_gate.deny_reason("new_fee_cycle") is not None
+        )
+        assert mod.config.fee_authority_enabled is True
+        assert mod.revenue_fee_authority_status(mod.plugin)["enabled"] is True
+        assert not disable_finished.wait(timeout=0.05)
+
+        blocked = mod.run_fee_adjustment()
+        assert blocked["reason"] == "fee_authority_disabled"
+        assert mod.fee_controller.adjust_all_fees.call_count == 1
+    finally:
+        release_cycle.set()
+        cycle.join(timeout=1)
+        transition.join(timeout=1)
+
+    assert not cycle.is_alive()
+    assert not transition.is_alive()
+    assert cycle_results == [[]]
+    assert disable_results == [
+        f"{FEE_AUTHORITY_OPTION}=false generation=1"
+    ]
+    assert mod.config.fee_authority_enabled is False
+    assert mod.revenue_fee_authority_status(mod.plugin)["enabled"] is False
+
+
+def test_inflight_manual_rpc_blocks_disabled_readback_before_rate_limit_finishes():
+    mod = load_plugin_module()
+    mod.config = Config(
+        fee_authority_enabled=True,
+        min_fee_ppm=10,
+        max_fee_ppm=5000,
+    )
+    mod.fee_authority_gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 9750)
+    mod.fee_controller = MagicMock()
+    mod.fee_controller.set_channel_fee.return_value = {"success": True}
+    rate_limit_entered = threading.Event()
+    release_rate_limit = threading.Event()
+    disable_finished = threading.Event()
+    rpc_results = []
+
+    mod.force_rate_limiter = MagicMock()
+
+    def check_rate_limit(_operation):
+        rate_limit_entered.set()
+        assert release_rate_limit.wait(timeout=1)
+        return True, "ok"
+
+    mod.force_rate_limiter.check_rate_limit.side_effect = check_rate_limit
+
+    def set_fee():
+        rpc_results.append(
+            mod.revenue_set_fee(
+                mod.plugin,
+                channel_id="123x456x0",
+                fee_ppm=125,
+                force=True,
+            )
+        )
+
+    transition_results = []
+
+    def disable():
+        transition_results.append(
+            mod._on_fee_authority_change(
+                mod.plugin,
+                FEE_AUTHORITY_OPTION,
+                False,
+            )
+        )
+        disable_finished.set()
+
+    rpc = threading.Thread(target=set_fee)
+    rpc.start()
+    assert rate_limit_entered.wait(timeout=1)
+
+    transition = threading.Thread(target=disable)
+    transition.start()
+    try:
+        assert _wait_until(
+            lambda: mod.fee_authority_gate.deny_reason("new_manual_rpc") is not None
+        )
+        assert mod.revenue_fee_authority_status(mod.plugin)["enabled"] is True
+        assert not disable_finished.wait(timeout=0.05)
+
+        blocked = mod.revenue_set_fee(
+            mod.plugin,
+            channel_id="123x456x0",
+            fee_ppm=130,
+            force=True,
+        )
+        assert blocked["reason"] == "fee_authority_disabled"
+        assert mod.force_rate_limiter.check_rate_limit.call_count == 1
+    finally:
+        release_rate_limit.set()
+        rpc.join(timeout=1)
+        transition.join(timeout=1)
+
+    assert not rpc.is_alive()
+    assert not transition.is_alive()
+    assert rpc_results == [{
+        "status": "success",
+        "channel": "123x456x0",
+        "new_fee_ppm": 125,
+        "success": True,
+    }]
+    assert transition_results == [
+        f"{FEE_AUTHORITY_OPTION}=false generation=1"
+    ]
 
 
 def test_deny_reason_is_stable_and_machine_readable():
@@ -204,7 +666,7 @@ def test_authority_callback_rejects_invalid_input_without_mutation(invalid):
     assert mod.fee_authority_gate.snapshot() is before
 
 
-def test_authority_callback_updates_config_and_gate_under_config_lock():
+def test_authority_callback_does_not_return_before_config_matches_gate():
     mod = load_plugin_module()
     mod.config = Config(fee_authority_enabled=True)
     mod.fee_authority_gate = FeeAuthorityGate(enabled=True, now_fn=lambda: 8000)
@@ -231,8 +693,11 @@ def test_authority_callback_updates_config_and_gate_under_config_lock():
         worker.start()
         assert callback_started.wait(timeout=1)
         assert not callback_finished.wait(timeout=0.05)
+        # The gate is the sole authority source and may safely publish the
+        # drained disabled state before the diagnostic Config field catches up.
+        # The callback itself must not return until both agree.
         assert mod.config.fee_authority_enabled is True
-        assert mod.fee_authority_gate.snapshot().enabled is True
+        assert mod.fee_authority_gate.snapshot().enabled is False
     finally:
         mod.config._lock.release()
 
@@ -383,7 +848,7 @@ def test_record_failed_forward_defense_leaves_fee_state_unchanged_when_disabled(
     database = MagicMock()
     controller = FeeController(
         MagicMock(),
-        Config(),
+        Config(fee_authority_enabled=False),
         database,
         fee_authority_gate=_disabled_gate(),
     )
@@ -412,7 +877,7 @@ def test_policy_change_defense_leaves_sleeping_fee_state_unchanged_when_disabled
     ]
     controller = FeeController(
         MagicMock(),
-        Config(),
+        Config(fee_authority_enabled=False),
         database,
         fee_authority_gate=_disabled_gate(),
     )
@@ -499,3 +964,56 @@ def test_disabled_authority_keeps_policy_reads_live():
         "count": 1,
     }
     mod.policy_manager.get_all_policies.assert_called_once_with()
+
+
+RUNBOOK_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "docs"
+    / "runbooks"
+    / "python-fee-authority-handoff.md"
+)
+
+
+def test_runbook_pins_nested_setconfig_value_and_source_contract():
+    runbook = RUNBOOK_PATH.read_text()
+
+    assert ".config.value_bool == false" in runbook
+    assert ".config.value_bool == true" in runbook
+    assert 'test("(^|/)config[.]setconfig:[1-9][0-9]*$")' in runbook
+    assert "/data/lightningd/bitcoin/config.setconfig:1" in runbook
+
+
+def test_runbook_orders_post_activation_rollback_before_python_reenable():
+    runbook = RUNBOOK_PATH.read_text()
+    section = runbook.split("### Post-activation rollback", 1)[1]
+
+    ordered_steps = [
+        "Disable Rust fee broadcasts",
+        "no Rust fee batch is active",
+        "Remove the cutover arm",
+        "Reconcile or quarantine every ambiguous Rust action",
+        "Re-enable Python fee authority",
+    ]
+    positions = [section.index(step) for step in ordered_steps]
+
+    assert positions == sorted(positions)
+    assert "pre-arm and pre-Rust-activation only" in runbook
+
+
+def test_runbook_requires_persistent_option_cleanup_before_old_source_revert():
+    runbook = RUNBOOK_PATH.read_text()
+    section = runbook.split(
+        "## Reverting to source that does not register the option",
+        1,
+    )[1]
+
+    ordered_steps = [
+        "re-enable Python fee authority persistently",
+        "resolved `config.setconfig` path",
+        "remove exactly the active",
+        "revert to source that does not register",
+    ]
+    positions = [section.index(step) for step in ordered_steps]
+
+    assert positions == sorted(positions)
+    assert "must not be automated" in section

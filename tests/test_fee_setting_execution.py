@@ -10,6 +10,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _make_data_service(mock_plugin):
     """Build a data_service MagicMock that delegates to mock_plugin.rpc.
 
@@ -148,7 +150,7 @@ class TestFeeAuthorityExecutionBoundary:
         gate = _disabled_fee_authority_gate()
         controller = FeeController(
             mock_plugin,
-            Config(),
+            Config(fee_authority_enabled=False),
             mock_database,
             fee_authority_gate=gate,
         )
@@ -163,9 +165,19 @@ class TestFeeAuthorityExecutionBoundary:
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
-        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, dry_run=False)
-        controller = FeeController(mock_plugin, cfg, mock_database)
-        controller.fee_authority_gate = _disabled_fee_authority_gate()
+        cfg = Config(
+            min_fee_ppm=10,
+            max_fee_ppm=5000,
+            dry_run=False,
+            fee_authority_enabled=False,
+        )
+        gate = _disabled_fee_authority_gate()
+        controller = FeeController(
+            mock_plugin,
+            cfg,
+            mock_database,
+            fee_authority_gate=gate,
+        )
         controller.data_service = _make_data_service(mock_plugin)
         controller._cycle_states[channel_id] = ChannelCycleState(
             is_sleeping=True,
@@ -208,9 +220,19 @@ class TestFeeAuthorityExecutionBoundary:
 
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
-        cfg = Config(min_fee_ppm=10, max_fee_ppm=5000, dry_run=False)
-        controller = FeeController(mock_plugin, cfg, mock_database)
-        controller.fee_authority_gate = _disabled_fee_authority_gate()
+        cfg = Config(
+            min_fee_ppm=10,
+            max_fee_ppm=5000,
+            dry_run=False,
+            fee_authority_enabled=False,
+        )
+        gate = _disabled_fee_authority_gate()
+        controller = FeeController(
+            mock_plugin,
+            cfg,
+            mock_database,
+            fee_authority_gate=gate,
+        )
         controller.data_service = _make_data_service(mock_plugin)
         controller._fee_governor_enabled = MagicMock(return_value=True)
         controller._governed_authorize_fee_broadcast = MagicMock(
@@ -255,7 +277,7 @@ class TestChannelInfoShaping:
             htlc_maximum_msat=advertised_htlc_maximum_msat,
         )
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         channel_info = fc._get_channels_info()[channel_id]
 
@@ -280,7 +302,7 @@ class TestChannelInfoShaping:
             maximum_htlc_out_msat="21000000msat",
         )
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         channel_info = fc._get_channels_info()[channel_id]
 
@@ -307,7 +329,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
 
         fc.set_channel_fee(channel_id, 1, manual=True, enforce_limits=True)
@@ -333,7 +355,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
 
         fc.set_channel_fee(channel_id, 1, manual=True, enforce_limits=False)
@@ -360,7 +382,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
 
         # Mirror the revenue-set-fee force=true call path: manual operator set,
@@ -389,7 +411,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
 
         result = fc.set_channel_fee("123:456:0", 125, manual=True)
@@ -417,7 +439,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
 
         result = fc.set_channel_fee(full_channel_id, 125, manual=True)
@@ -445,7 +467,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         fc._cycle_states[channel_id] = ChannelCycleState(
             last_fee_ppm=100,
@@ -494,7 +516,7 @@ class TestSetChannelFeeLimits:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
 
         result = fc.set_channel_fee(peer_id, 125, manual=True)
@@ -518,7 +540,7 @@ class TestSetChannelFeeHtlcMin:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         return fc
 
@@ -595,7 +617,7 @@ class TestGossipRefreshExecution:
         mock_database.record_fee_change = MagicMock()
         mock_database.get_last_forward_time.return_value = int(time.time()) - 86400 * 2
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
 
         # Provide a real-ish state and ensure the fee change will be applied.
@@ -626,7 +648,7 @@ class TestBoundedExplorationEndToEnd:
         from modules.fee_controller import FeeController
 
         cfg = Config(min_fee_ppm=40, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         target = fc._get_exploration_fee_target(
             current_fee_ppm=42,
@@ -642,7 +664,7 @@ class TestBoundedExplorationEndToEnd:
         from modules.fee_controller import FeeController
 
         cfg = Config(min_fee_ppm=40, max_fee_ppm=5000, base_fee_msat=0, dry_run=False)
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
 
         target = fc._get_exploration_fee_target(
             current_fee_ppm=400,
@@ -690,7 +712,7 @@ class TestBoundedExplorationEndToEnd:
         mock_database.get_channel_cost_history.return_value = []
         mock_database.get_historical_inbound_fee_ppm.return_value = None
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
 
         channel_info = {
@@ -748,7 +770,7 @@ class TestBoundedExplorationEndToEnd:
         mock_database.get_channel_cost_history.return_value = []
         mock_database.get_historical_inbound_fee_ppm.return_value = None
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
 
         channel_info = {
@@ -792,7 +814,7 @@ class TestBoundedExplorationEndToEnd:
         mock_database.get_fee_strategy_state.return_value = _fee_strategy_state_dict()
         mock_database.record_fee_change = MagicMock()
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         fc._cycle_states[channel_id] = ChannelCycleState(
             last_fee_ppm=200,
@@ -841,7 +863,8 @@ class TestSetInitialFee:
         mock_database.record_fee_change = MagicMock()
 
         fc = FeeController(
-            mock_plugin, cfg, mock_database, policy_manager
+            mock_plugin, cfg, mock_database, policy_manager,
+            fee_authority_gate=FeeAuthorityGate(),
         )
         fc.data_service = _make_data_service(mock_plugin)
         return fc
@@ -1064,7 +1087,7 @@ class TestSetInitialFeePersistentPriorSeeding:
 
         mock_plugin.rpc.listpeerchannels.side_effect = fake_listpeerchannels
 
-        fc = FeeController(mock_plugin, cfg, mock_database)
+        fc = FeeController(mock_plugin, cfg, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
 
         fc._get_network_fee_prior = MagicMock(return_value=network_prior)

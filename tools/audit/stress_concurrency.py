@@ -92,6 +92,8 @@ from tests.plugin_test_utils import load_plugin_module  # noqa: E402
 # ---------------------------------------------------------------------------
 # Mock substrate
 # ---------------------------------------------------------------------------
+from modules.fee_authority import FeeAuthorityGate
+
 class _SafePluginMock:
     """Minimal ThreadSafePluginProxy stand-in: .log + .rpc, both thread-safe."""
 
@@ -266,7 +268,7 @@ class StressHarness:
             pm = mod.PolicyManager(db, safe_plugin)
             mod.profitability_analyzer = pa
             mod.policy_manager = pm
-            mod.fee_controller = mod.FeeController(safe_plugin, cfg, db, pm, pa)
+            mod.fee_controller = mod.FeeController(safe_plugin, cfg, db, pm, pa, fee_authority_gate=FeeAuthorityGate())
             self._probe_loop("fee", mod.run_fee_adjustment)
         except Exception as exc:
             mod.fee_controller = None

@@ -84,36 +84,107 @@ Before cutover, require all of the following:
 3. The replacement remains verified observer/dry-run/no-broadcast.
 4. A fresh status read reports `enabled=true`.
 
-Only after separate operator approval, run the persistent change manually:
+Only after separate operator approval, run the persistent change manually and
+validate Core Lightning's nested response in the same command:
 
 ```bash
 lightning-cli setconfig \
-  config=revenue-ops-fee-authority-enabled val=false transient=false
+  config=revenue-ops-fee-authority-enabled val=false transient=false \
+  | jq -e '
+      .config.value_bool == false
+      and (.config.source | type == "string")
+      and (.config.source
+           | test("(^|/)config[.]setconfig:[1-9][0-9]*$"))
+    '
 ```
 
-Inspect the direct `setconfig` response before proceeding. Its returned source
-must be exactly `config.setconfig`, and its effective value must be `false`.
-Stop and roll back if either check fails. Then read
-`revenue-fee-authority-status` and require `enabled=false`, `reason=setconfig`,
-and the expected generation advance. Re-read status after the next scheduled fee
-interval to prove the timer obeyed the disabled gate and did not perform a
-transition.
+The response contract is nested under `.config`. The source is not the literal
+string `config.setconfig`; it is a basename or absolute path plus a positive
+line number. Live read-only evidence for another dynamic option was
+`/data/lightningd/bitcoin/config.setconfig:1`. The regular expression above
+accepts that path and `config.setconfig:1`, but rejects another basename,
+missing line suffix, line zero, or a non-boolean value.
+
+Then read `revenue-fee-authority-status` and require `enabled=false`,
+`reason=setconfig`, and the expected generation advance. Re-read status after
+the next scheduled fee interval to prove the timer obeyed the disabled gate and
+did not perform a transition.
 
 This cutover disables Python fee mutation authority only. It does not authorize
 broadcasts by the replacement.
 
-## Persistent rollback
+## Rollback boundaries
 
-If the cutover is aborted or verification fails, restore the durable default
-manually:
+### Pre-arm abort (pre-arm and pre-Rust-activation only)
+
+A short Python-only restore is allowed **pre-arm and pre-Rust-activation only**:
+no cutover arm has ever been installed for the candidate, Rust fee activation
+has never been attempted, Rust remains observer/dry-run/no-broadcast, and its
+mutation count is unchanged. Under those conditions only, restore and verify
+the persistent Python value:
 
 ```bash
 lightning-cli setconfig \
-  config=revenue-ops-fee-authority-enabled val=true transient=false
+  config=revenue-ops-fee-authority-enabled val=true transient=false \
+  | jq -e '
+      .config.value_bool == true
+      and (.config.source | type == "string")
+      and (.config.source
+           | test("(^|/)config[.]setconfig:[1-9][0-9]*$"))
+    '
 ```
 
-Inspect the direct response and require source `config.setconfig` with effective
-value `true`. Then require `revenue-fee-authority-status` to report
-`enabled=true`, `reason=setconfig`, and the expected generation advance. A
-temporary `transient=true` restore is not a substitute for persistent rollback
-after a persistent cutover.
+Then require `revenue-fee-authority-status` to report `enabled=true`,
+`reason=setconfig`, and the expected generation advance. A transient restore
+is not a substitute for this persistent rollback.
+
+### Post-activation rollback
+
+Once an arm has been installed or Rust fee activation has been attempted,
+never re-enable Python first. Use this order to prevent overlapping authority:
+
+1. Disable Rust fee broadcasts and positively verify the live executor cannot
+   begin another broadcast.
+2. Verify that no Rust fee batch is active; wait for or abort the batch through
+   the reviewed Rust operational interface.
+3. Remove the cutover arm and verify it is absent.
+4. Reconcile or quarantine every ambiguous Rust action before another
+   authority can act.
+5. Restore the checksummed prior Rust shadow artifact if required.
+6. Re-enable Python fee authority persistently and validate the nested
+   `.config.value_bool == true` and source-path contract with the exact
+   `jq -e` check from the pre-arm section.
+7. Require positive Python status `enabled=true`, then confirm Rust is
+   observer/dry-run/no-broadcast and its mutation count remains stable.
+8. Preserve the incident evidence and reset promotion status.
+
+Do not compress this sequence into the pre-arm shortcut merely because the
+rollback is urgent.
+
+## Reverting to source that does not register the option
+
+A persistent `config.setconfig` entry can prevent older source from loading if
+that source does not register `revenue-ops-fee-authority-enabled`. Prefer a
+rollback artifact that retains the dynamic option. If older source is required,
+the following is a manual pre-revert safety sequence and must not be automated:
+
+1. Complete the applicable rollback boundary above: Rust broadcasts disabled,
+   no batch active, arm absent, and every ambiguity reconciled or quarantined.
+2. While the current Python release is still loaded and still registers the
+   option, re-enable Python fee authority persistently and pass both the nested
+   `jq -e` response check and positive status readback.
+3. Use the returned source field to identify the resolved `config.setconfig` path.
+   Back it up with ownership, mode, and checksum recorded.
+4. Re-read that file immediately before editing, identify by option name rather
+   than trusting a possibly shifted line number, and remove exactly the active
+   `revenue-ops-fee-authority-enabled` entry with an operator-reviewed atomic
+   edit. Abort if the match is absent or ambiguous; preserve all unrelated
+   entries and original ownership/mode.
+5. Verify the persistent file no longer contains an active entry for the
+   option while the still-running plugin continues to report authority enabled.
+6. Only then revert to source that does not register the option and follow the
+   established checksummed plugin-only rollback procedure.
+
+Do not unload or replace the current plugin before step 5: it is the component
+that can positively prove Python authority is enabled while persistent cleanup
+is performed.

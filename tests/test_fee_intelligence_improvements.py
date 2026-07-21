@@ -6,6 +6,8 @@ from unittest.mock import MagicMock
 from modules.fee_controller import FeeController, GaussianThompsonState, ChannelFeeState
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 def _make_data_service(mock_plugin):
     """Build a data_service MagicMock that delegates to mock_plugin.rpc."""
     ds = MagicMock()
@@ -56,7 +58,7 @@ class TestNetworkInformedPriors:
                 {"fee_per_millionth": 800},
             ]
         }
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         result = fc._get_network_fee_prior("02peer", "123x1x0")
         assert result is not None
@@ -65,14 +67,14 @@ class TestNetworkInformedPriors:
 
     def test_prior_none_when_no_channels(self, mock_plugin, mock_config, mock_database):
         mock_plugin.rpc.listchannels.return_value = {"channels": []}
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         result = fc._get_network_fee_prior("02peer", "123x1x0")
         assert result is None
 
     def test_prior_none_on_rpc_failure(self, mock_plugin, mock_config, mock_database):
         mock_plugin.rpc.listchannels.side_effect = Exception("RPC error")
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         result = fc._get_network_fee_prior("02peer", "123x1x0")
         assert result is None
@@ -85,7 +87,7 @@ class TestNetworkInformedPriors:
                 {"fee_per_millionth": 50000},   # Too high
             ]
         }
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         result = fc._get_network_fee_prior("02peer", "123x1x0")
         assert result is not None
@@ -110,7 +112,7 @@ class TestRebalanceCostFloor:
 
     def test_cost_ppm_from_dest_ledger(self, mock_plugin, mock_config, mock_database):
         mock_database.get_channel_cost_history.return_value = self._history()
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 500  # 500 sats / 1M sats * 1M = 500 PPM
         mock_database.get_last_rebalance_cost.assert_not_called()
@@ -124,7 +126,7 @@ class TestRebalanceCostFloor:
             # Ancient entry outside the window must not count
             {"cost_sats": 5_000, "amount_sats": 1_000, "timestamp": now - 90 * 86400},
         ]
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 200  # (100+300) / 2M * 1M
 
@@ -132,36 +134,36 @@ class TestRebalanceCostFloor:
         """Sinks fill from inbound and dormant channels have no flow to
         recover against — nudging their price up opposes the drain logic."""
         mock_database.get_channel_cost_history.return_value = self._history()
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         assert fc._get_channel_rebalance_cost_ppm("123x1x0", flow_state="sink") == 0
         assert fc._get_channel_rebalance_cost_ppm("123x1x0", flow_state="dormant") == 0
 
     def test_cost_ppm_zero_when_no_history(self, mock_plugin, mock_config, mock_database):
         mock_database.get_channel_cost_history.return_value = []
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 0
 
     def test_cost_ppm_zero_on_error(self, mock_plugin, mock_config, mock_database):
         mock_database.get_channel_cost_history.side_effect = Exception("DB error")
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 0
 
     def test_cost_ppm_handles_zero_amount(self, mock_plugin, mock_config, mock_database):
         mock_database.get_channel_cost_history.return_value = self._history(amount=0)
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 0
 
     def test_cost_ppm_handles_none_cost(self, mock_plugin, mock_config, mock_database):
         mock_database.get_channel_cost_history.return_value = self._history(cost=None)
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 0
 
     def test_cost_ppm_no_database(self, mock_plugin, mock_config):
-        fc = FeeController(mock_plugin, mock_config, None)
+        fc = FeeController(mock_plugin, mock_config, None, fee_authority_gate=FeeAuthorityGate())
         cost = fc._get_channel_rebalance_cost_ppm("123x1x0")
         assert cost == 0
 
@@ -186,7 +188,7 @@ class TestFailedForwardObservation:
         return state
 
     def test_fee_failcode_adjusts_posterior(self, mock_plugin, mock_config, mock_database):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         state = self._seed_channel(fc)
 
         original_mean = state.posterior_mean
@@ -204,7 +206,7 @@ class TestFailedForwardObservation:
         self, mock_plugin, mock_config, mock_database
     ):
         """Some payloads carry only the symbolic failreason."""
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         state = self._seed_channel(fc)
 
         original_mean = state.posterior_mean
@@ -220,7 +222,7 @@ class TestFailedForwardObservation:
         change, not demand evidence. A raise on a busy channel used to emit
         ~50 nudges that moved the next sample ~99% of the way to 0.8x,
         systematically undoing every raise on the busiest channels."""
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         state = self._seed_channel(fc)
 
         fc._last_fee_apply_ts["123x1x0"] = int(time.time()) - 60
@@ -234,7 +236,7 @@ class TestFailedForwardObservation:
     def test_nudge_allowed_after_gossip_settle_window(
         self, mock_plugin, mock_config, mock_database
     ):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         state = self._seed_channel(fc)
 
         fc._last_fee_apply_ts["123x1x0"] = (
@@ -253,7 +255,7 @@ class TestFailedForwardObservation:
     ):
         """One nudge per channel per observation window — a burst of
         failures within one window is one datapoint, not fifty."""
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         state = self._seed_channel(fc)
 
         for _ in range(5):
@@ -269,7 +271,7 @@ class TestFailedForwardObservation:
     ):
         """A liquidity failure says nothing about our fee — the sender
         already chose our edge."""
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         state = self._seed_channel(fc)
 
         original_mean = state.posterior_mean
@@ -287,7 +289,7 @@ class TestFailedForwardObservation:
     ):
         """No usable failure reason at all (CLN's plain 'failed' status):
         drop the nudge entirely."""
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         state = self._seed_channel(fc)
 
         original_mean = state.posterior_mean
@@ -297,29 +299,29 @@ class TestFailedForwardObservation:
         assert state.posterior_bias == []
 
     def test_failed_forward_no_crash_missing_state(self, mock_plugin, mock_config, mock_database):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         # No state for this channel — should not crash
         fc.record_failed_forward("999x1x0", 500, failcode=self.WIRE_FEE_INSUFFICIENT)
 
     def test_failed_forward_no_crash_zero_fee(self, mock_plugin, mock_config, mock_database):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         # Should not crash
         fc.record_failed_forward("123x1x0", 0, failcode=self.WIRE_FEE_INSUFFICIENT)
 
     def test_failed_forward_no_crash_empty_channel_id(self, mock_plugin, mock_config, mock_database):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         # Should not crash
         fc.record_failed_forward("", 500, failcode=self.WIRE_FEE_INSUFFICIENT)
 
     def test_failed_forward_no_crash_garbage_failcode(self, mock_plugin, mock_config, mock_database):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         state = self._seed_channel(fc)
         original_mean = state.posterior_mean
         fc.record_failed_forward("123x1x0", 500, failcode="not-a-number")
         assert state.posterior_mean == original_mean
 
     def test_failed_forward_preserves_min_std(self, mock_plugin, mock_config, mock_database):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         state = GaussianThompsonState()
         state.posterior_mean = 500.0
         state.posterior_std = float(GaussianThompsonState.MIN_STD)
@@ -341,20 +343,20 @@ class TestConfidenceScaledBlend:
     confidence boost."""
 
     def test_high_confidence_increases_blend(self, mock_plugin, mock_config, mock_database):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         high_var_ratio = fc._get_target_blend_ratio(False, True, posterior_std=250.0)
         confident_ratio = fc._get_target_blend_ratio(False, False, posterior_std=20.0)
         assert confident_ratio > high_var_ratio
 
     def test_blend_capped_at_sixty_percent(self, mock_plugin, mock_config, mock_database):
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         ratio = fc._get_target_blend_ratio(False, False, posterior_std=1.0)
         assert ratio <= 0.60
 
     def test_tight_posterior_under_sparse_flag_gets_boost(self, mock_plugin, mock_config, mock_database):
         """Prior design stuck sparse channels at 0.20 even with tight posterior.
         Phase A.2: posterior_std drives the ratio; sparse flag no longer caps."""
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         ratio = fc._get_target_blend_ratio(False, True, posterior_std=10.0)
         assert ratio == 0.60  # Tight posterior -> fast convergence regardless of flag
 
@@ -371,7 +373,7 @@ class TestNeighborFeeAwareness:
                 {"source": "02node5", "fee_per_millionth": 500, "active": True},
             ]
         }
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         median = fc._get_neighbor_fee_median("02peer123")
         assert median == 200
@@ -383,7 +385,7 @@ class TestNeighborFeeAwareness:
                 {"source": "02node1", "fee_per_millionth": 100, "active": True},
             ]
         }
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         assert fc._get_neighbor_fee_median("02peer") is None
 
@@ -397,7 +399,7 @@ class TestNeighborFeeAwareness:
                 {"source": "02node3", "fee_per_millionth": 300, "active": True},
             ]
         }
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         median = fc._get_neighbor_fee_median("02peer")
         assert median == 200  # Our 999 excluded
@@ -408,7 +410,7 @@ class TestNeighborFeeAwareness:
             {"source": f"02node{i}", "fee_per_millionth": 100 + i * 50, "active": True}
             for i in range(5)
         ]}
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         fc._get_neighbor_fee_median("02peer")
         fc._get_neighbor_fee_median("02peer")
@@ -425,7 +427,7 @@ class TestNeighborFeeAwareness:
                 {"source": "02node4", "fee_per_millionth": 400, "active": True},
             ]
         }
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         median = fc._get_neighbor_fee_median("02peer")
         assert median == 300  # Inactive node2 excluded; [100, 300, 400] -> 300
@@ -441,14 +443,14 @@ class TestNeighborFeeAwareness:
                 {"source": "02node5", "fee_per_millionth": 50000, "active": True},
             ]
         }
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         median = fc._get_neighbor_fee_median("02peer")
         assert median == 200  # 0 and 50000 filtered out; [100, 200, 300] -> 200
 
     def test_neighbor_none_on_rpc_error(self, mock_plugin, mock_config, mock_database):
         mock_plugin.rpc.getinfo.side_effect = Exception("RPC error")
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         assert fc._get_neighbor_fee_median("02peer") is None
 
@@ -459,7 +461,7 @@ class TestNeighborFeeAwareness:
             {"source": f"02node{i}", "fee_per_millionth": 100 + i * 50, "active": True}
             for i in range(5)
         ]}
-        fc = FeeController(mock_plugin, mock_config, mock_database)
+        fc = FeeController(mock_plugin, mock_config, mock_database, fee_authority_gate=FeeAuthorityGate())
         fc.data_service = _make_data_service(mock_plugin)
         # Fill cache with 501 stale entries
         old_ts = time.time() - 7200  # 2 hours old

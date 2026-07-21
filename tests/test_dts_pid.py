@@ -20,6 +20,8 @@ from modules.fee_controller import (
 )
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 class TestPIDState:
     """Unit tests for PIDState balance controller."""
 
@@ -1005,7 +1007,7 @@ def _make_config_snapshot(**overrides):
 def _make_fc_for_dts_pid(mock_plugin, mock_database):
     from modules.config import Config
     config = MagicMock(spec=Config)
-    fc = FeeController(mock_plugin, config, mock_database)
+    fc = FeeController(mock_plugin, config, mock_database, fee_authority_gate=FeeAuthorityGate())
     cfg = _make_config_snapshot()
     fc.config.snapshot.return_value = cfg
 

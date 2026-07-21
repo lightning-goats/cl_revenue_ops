@@ -1007,6 +1007,7 @@ class ThreadSafePluginProxy:
 flow_analyzer: Optional[FlowAnalyzer] = None
 fee_controller: Optional[FeeController] = None
 fee_authority_gate = FeeAuthorityGate()
+_fee_authority_transition_lock = threading.Lock()
 rebalancer: Optional[EVRebalancer] = None
 database: Optional[Database] = None
 config: Optional[Config] = None
@@ -1098,9 +1099,12 @@ def _on_fee_authority_change(
     cfg = globals().get("config")
     if cfg is None:
         raise ValueError("fee authority configuration is not initialized")
-    with cfg._lock:
-        cfg.fee_authority_enabled = enabled
+    # Do not hold Config._lock while draining fee work: an accepted cycle
+    # may need Config.snapshot() before releasing its authority lease.
+    with _fee_authority_transition_lock:
         status = fee_authority_gate.set_enabled(enabled, reason="setconfig")
+        with cfg._lock:
+            cfg.fee_authority_enabled = status.enabled
     return (
         f"{option_name}={str(status.enabled).lower()} "
         f"generation={status.generation}"
@@ -3647,14 +3651,21 @@ def _run_scheduled_fee_adjustment():
 
 
 def run_fee_adjustment():
+    """Run one complete Python fee cycle under the shared authority lease."""
+    with fee_authority_gate.execution_lease(
+        "fee_adjustment"
+    ) as denial:
+        if denial is not None:
+            return denial
+        return _run_fee_adjustment_authorized()
+
+
+def _run_fee_adjustment_authorized():
     """
     Module 2: DTS+PID Fee Controller (Dynamic Pricing)
 
     Adjust channel fees using DTS+PID optimization.
     """
-    denial = _fee_authority_denial("fee_adjustment")
-    if denial is not None:
-        return denial
     if fee_controller is None:
         plugin.log("Fee controller not initialized", level='error')
         return []
@@ -4706,17 +4717,34 @@ def revenue_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
 
 @plugin.method("revenue-set-fee")
 def revenue_set_fee(plugin: Plugin, channel_id: str = None, fee_ppm: int = None, force: bool = False) -> Dict[str, Any]:
+    """Manually set a fee while holding the shared authority lease."""
+    with fee_authority_gate.execution_lease(
+        "revenue-set-fee"
+    ) as denial:
+        if denial is not None:
+            return {
+                "error": "Fee authority disabled",
+                **denial,
+            }
+        return _revenue_set_fee_authorized(
+            plugin,
+            channel_id=channel_id,
+            fee_ppm=fee_ppm,
+            force=force,
+        )
+
+
+def _revenue_set_fee_authorized(
+    plugin: Plugin,
+    channel_id: str = None,
+    fee_ppm: int = None,
+    force: bool = False,
+) -> Dict[str, Any]:
     """
     Manually set fee for a channel.
 
     Usage: lightning-cli revenue-set-fee channel_id fee_ppm [force=false]
     """
-    denial = _fee_authority_denial("revenue-set-fee")
-    if denial is not None:
-        return {
-            "error": "Fee authority disabled",
-            **denial,
-        }
     if channel_id is None or fee_ppm is None:
         return {"error": "usage: revenue-set-fee channel_id fee_ppm [force=false]"}
     if fee_controller is None or config is None:

@@ -18,9 +18,11 @@ PROFILE = SimpleNamespace(
 )
 
 
+from modules.fee_authority import FeeAuthorityGate
+
 @pytest.fixture
 def fc():
-    controller = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock())
+    controller = FeeController(MagicMock(), MagicMock(spec=Config), MagicMock(), fee_authority_gate=FeeAuthorityGate())
     # Pin the fee profile so damping math is exercised with fixed inputs.
     controller._resolve_fee_profile = lambda cfg=None: ("golden", PROFILE)
     return controller
