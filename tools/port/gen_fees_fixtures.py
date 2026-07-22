@@ -866,7 +866,113 @@ def gen_posterior(outdir: Path) -> None:
             (520.0, 95.0, 1.0, NOW - 30 * 24 * 3600 - 60, "all"),
         ]))
 
+    # 21. pow-parity canaries (2026-07-22 Rust deep-audit H1): CPython
+    # `x ** 2` calls libm pow(x, 2.0), which differs from `x * x` in the
+    # last bit for ~0.086% of doubles. These seeded 40-obs buffers are
+    # chosen so the residual sum-of-squares (py 1500 -> noise_variance)
+    # hits a divergent square AND the 1-ULP delta survives the 0.7/0.3
+    # EMA blend into the serialized repr. A Rust port computing any of
+    # the `** 2` sites as a multiply (or `.powi(2)`) fails these cases.
+    for canary_seed in (2320, 2579, 3199):
+        rnd = random.Random(canary_seed)
+        canary_obs = []
+        for _ in range(40):
+            fee = rnd.uniform(50.0, 900.0)
+            rev = max(0.0, rnd.gauss(200.0, 90.0))
+            w = rnd.uniform(0.3, 1.5)
+            ts = NOW - rnd.randint(0, 160) * 3600
+            canary_obs.append((fee, rev, w, ts, "all"))
+        scenarios.append(gen_posterior_scenario(
+            f"pow_parity_canary_core_seed{canary_seed}",
+            observations=canary_obs))
+
     _write(outdir / "recompute.json", {"now": NOW, "cases": scenarios})
+
+    # -----------------------------------------------------------------
+    # pow_canary.json: direct pow-parity pins for the two `** 2` sites
+    # not reachable divergently through the core fixture — the legacy
+    # Normal-Normal posterior (py 1612 obs_mean ** 2, py 1615
+    # prior_std_fee ** 2) and apply_dts_discount (py 1689
+    # posterior_std ** 2). Inputs are searched so the pow-vs-multiply
+    # 1-ULP delta survives into the output reprs.
+    # -----------------------------------------------------------------
+    legacy_direct_cases = []
+    for name, prior_std, obs in [
+        ("legacy_pow_canary_prior_std", 89.71402414108367, [
+            (258.2580003549024, 170.82854665416173,
+             1.2456427376794346, NOW - 8 * 3600, "all"),
+            (419.28694718806213, 98.12398185318645,
+             0.5915550987997603, NOW - 42 * 3600, "all"),
+            (281.55858092217824, 31.772660250248876,
+             0.769319362722909, NOW - 38 * 3600, "all"),
+            (397.9899710520945, 164.98797398522805,
+             0.5724698628446799, NOW - 25 * 3600, "all"),
+            (398.8956423576264, 172.99646831857441,
+             1.250222715651719, NOW - 25 * 3600, "all"),
+            (487.64639024148033, 193.92976075289212,
+             0.932252248777342, NOW - 24 * 3600, "all"),
+        ]),
+        ("legacy_pow_canary_prior_std_2", 369.6062694839487, [
+            (411.97214183191073, 197.8189037653636,
+             0.8372383464805285, NOW - 38 * 3600, "all"),
+            (354.2422275317218, 151.78823670927932,
+             1.2516496871850902, NOW - 3 * 3600, "all"),
+            (397.1037180747184, 171.3536849955253,
+             1.211550169260079, NOW - 36 * 3600, "all"),
+            (416.56940145001465, 87.92198229553883,
+             0.7321752388255056, NOW - 15 * 3600, "all"),
+            (120.19676590941671, 182.81311964464854,
+             1.2986236364265447, NOW - 43 * 3600, "all"),
+            (252.44538385044825, 108.49289492727043,
+             0.6384791848084063, NOW - 8 * 3600, "all"),
+        ]),
+    ]:
+        state = GaussianThompsonState()
+        state.prior_mean_fee = 200
+        state.prior_std_fee = prior_std
+        state.observations = list(obs)
+        orig_time = time.time
+        time.time = lambda: float(NOW)
+        try:
+            state._recompute_posterior_legacy()
+        finally:
+            time.time = orig_time
+        legacy_direct_cases.append({
+            "name": name,
+            "input": {
+                "prior_mean_fee": _r(200.0),
+                "prior_std_fee": _r(prior_std),
+                "observations": [_dump_obs(o) for o in obs],
+            },
+            "expected": {
+                "posterior_mean": _r(state.posterior_mean),
+                "posterior_std": _r(state.posterior_std),
+            },
+        })
+
+    dts_direct_cases = []
+    for posterior_std, gamma in [
+        (22.786647742612658, 0.98),
+        (134.81360334610886, 0.95),
+        (184.5845872103575, 0.95),
+    ]:
+        state = GaussianThompsonState()
+        state.posterior_std = posterior_std
+        state.apply_dts_discount(gamma)
+        dts_direct_cases.append({
+            "name": f"dts_pow_canary_std_{posterior_std!r}",
+            "input": {
+                "posterior_std": _r(posterior_std),
+                "gamma": _r(gamma),
+            },
+            "expected": {"posterior_std": _r(state.posterior_std)},
+        })
+
+    _write(outdir / "pow_canary.json", {
+        "now": NOW,
+        "legacy_direct_cases": legacy_direct_cases,
+        "dts_direct_cases": dts_direct_cases,
+    })
 
     # -----------------------------------------------------------------
     # helpers.json: direct pins for _positive_revenue_mass /
@@ -995,6 +1101,23 @@ def gen_discount(outdir: Path) -> None:
         # gamma outside (0,1): apply_dts_discount is a documented no-op.
         run_sequence("gamma_noop_guard", base_obs, [1.0, 0.0, -0.5]),
     ]
+
+    # pow-parity canaries (2026-07-22 Rust deep-audit H1): seeded buffers
+    # where a `** 2` squaring inside recompute/discount hits a double whose
+    # pow(x, 2.0) differs from x*x in the last bit AND the delta survives
+    # into a serialized repr. See gen_posterior's canary comment.
+    for canary_seed in (1009, 3519, 3745):
+        rnd = random.Random(canary_seed)
+        canary_obs = []
+        for _ in range(12):
+            fee = rnd.uniform(50.0, 900.0)
+            rev = max(0.0, rnd.gauss(200.0, 90.0))
+            w = rnd.uniform(0.3, 1.5)
+            ts = NOW - rnd.randint(0, 100) * 3600
+            canary_obs.append((fee, rev, w, ts, "all"))
+        sequences.append(run_sequence(
+            f"pow_parity_canary_seed{canary_seed}",
+            canary_obs, [0.98, 0.992, 0.95]))
 
     _write(outdir / "sequences.json", {"now": NOW, "sequences": sequences})
 
@@ -2761,7 +2884,26 @@ def gen_update(outdir: Path) -> None:
         {"op": "consume_upward_probe", "now": NOW + 5 * H},
     ])
 
-    assert len(sequences) == 24, len(sequences)
+    # 25: pow-parity canary (2026-07-22 Rust deep-audit H1): posterior_std
+    # is chosen so `posterior_std ** 2` (pow) differs from a multiply in
+    # the last bit. Step 1 pins the contextual-init (py 1040) and
+    # obs_variance (py 1085) squarings; step 2 (peak bucket, time_weight
+    # 1.0) additionally cross-pollinates the adjacent normal context, so
+    # the related-contexts squaring (py 1162) is pinned per-entry: fixing
+    # only 1040/1085 in a port still fails the low:normal:P entry.
+    seq("pow_parity_canary_contextual", [
+        {"op": "update_contextual", "now": NOW,
+         "context_key": "low:normal:P", "fee": 167.41525471658025,
+         "revenue_rate": 159.32235856043812, "time_bucket": "normal"},
+        {"op": "update_contextual", "now": NOW,
+         "context_key": "low:peak:P", "fee": 300.0,
+         "revenue_rate": 120.0, "time_bucket": "peak"},
+    ], initial={
+        "posterior_mean": 250.0,
+        "posterior_std": 138.55702359529351,
+    })
+
+    assert len(sequences) == 25, len(sequences)
     _write(outdir / "sequences.json", {"now": NOW, "sequences": sequences})
 
     # -----------------------------------------------------------------
