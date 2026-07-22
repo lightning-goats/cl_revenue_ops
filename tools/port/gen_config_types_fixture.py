@@ -71,6 +71,74 @@ for node in ast.walk(tree):
             raw_enums = literal_or_call_arg(node.value)
             enums = {k: list(v) for k, v in raw_enums.items()}
 
+# ---------------------------------------------------------------------------
+# Per-field bool STARTUP casts (2026-07-22 Rust audit M2): the
+# `Config(**config_kwargs)` construction in cl-revenue-ops.py converts each
+# bool option with one of two inconsistent expressions —
+# `.lower() == 'true'` (strict) or `.lower() in ('true', '1', 'yes')`
+# (tolerant, note: NO 'on') — and `_apply_override`'s generic
+# `('true','1','yes','on')` parser applies ONLY to DB override rows. The
+# Rust layer-(b) (listconfigs) conversion must mirror the per-field startup
+# cast, so AST-extract it here rather than hand-transcribe 23 fields.
+# fee_replay_capture_enabled wraps its cast in str(...).strip(); the strip
+# only matters for whitespace-padded values of that one field and is folded
+# into "eq_true" (documented divergence: Rust does not strip).
+# ---------------------------------------------------------------------------
+
+
+def classify_bool_cast(node):
+    """Return "eq_true" / "in_true_1_yes" for a recognized startup bool
+    cast expression, else None."""
+    if not isinstance(node, ast.Compare) or len(node.ops) != 1:
+        return None
+    op, comp = node.ops[0], node.comparators[0]
+    if isinstance(op, ast.Eq):
+        if isinstance(comp, ast.Constant) and comp.value == "true":
+            return "eq_true"
+        return None
+    if isinstance(op, ast.In):
+        try:
+            values = tuple(ast.literal_eval(comp))
+        except (ValueError, SyntaxError):
+            return None
+        if values == ("true", "1", "yes"):
+            return "in_true_1_yes"
+        return None
+    return None
+
+
+plugin_tree = ast.parse(open("cl-revenue-ops.py").read())
+bool_casts = {}
+for node in ast.walk(plugin_tree):
+    # The construction is `config_kwargs = dict(<field>=<cast expr>, ...)`
+    # (cl-revenue-ops.py:2413), then `Config(**{k: v ...})` at 2605.
+    if not (isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "config_kwargs"
+                    for t in node.targets)
+            and isinstance(node.value, ast.Call)
+            and len(node.value.keywords) > 20):
+        continue
+    for kw in node.value.keywords:
+        if kw.arg is None or fields.get(kw.arg) != "bool":
+            continue
+        cast = classify_bool_cast(kw.value)
+        if cast is None:
+            # Unwrap one parenthesized/str(...)-wrapped level (the
+            # fee_replay_capture_enabled shape) before giving up.
+            for inner in ast.walk(kw.value):
+                cast = classify_bool_cast(inner)
+                if cast is not None:
+                    break
+        if cast is None:
+            sys.exit(
+                f"bool field {kw.arg!r} in the Config(...) construction has "
+                "an unrecognized startup cast expression — extend "
+                "classify_bool_cast (do NOT let it silently default)"
+            )
+        bool_casts[kw.arg] = cast
+if not bool_casts:
+    sys.exit("no Config(...) bool casts extracted from cl-revenue-ops.py")
+
 if public_keys is None:
     sys.exit("PUBLIC_RUNTIME_KEYS not found in modules/config.py")
 if deprecated_keys is None:
@@ -89,10 +157,11 @@ out = {
     "deprecated_keys": deprecated_keys,
     "ranges": ranges,
     "enums": enums,
+    "bool_casts": bool_casts,
 }
 json.dump(out, open(sys.argv[1], "w"), indent=1)
 print(
     f"{len(fields)} fields, {len(public_keys)} public keys, "
     f"{len(deprecated_keys)} deprecated keys, {len(ranges)} ranges, "
-    f"{len(enums)} enums -> {sys.argv[1]}"
+    f"{len(enums)} enums, {len(bool_casts)} bool casts -> {sys.argv[1]}"
 )
