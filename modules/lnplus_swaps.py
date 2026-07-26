@@ -1415,9 +1415,12 @@ class SwapLifecycle:
                         "in force", level="warn")
                 self._db.lnplus_update_swap(sid, **fields)
                 row = self._db.lnplus_get_swap(sid)
-                self._execute_swap_open(row, entry)
+                opened_now = self._execute_swap_open(row, entry)
+                # Touched this pass either way, so 3b does not redo it — but
+                # only a row that actually reached 'opened' counts as opened.
                 processed_opening_ids.add(sid)
-                summary["opened"].append(sid)
+                if opened_now:
+                    summary["opened"].append(sid)
             except Exception as e:
                 self._plugin.log(f"LNPLUS: error opening swap {sid}: {e}", level="error")
                 summary["errors"].append(sid)
@@ -1519,14 +1522,17 @@ class SwapLifecycle:
                     "— not funding a channel for a dead swap", level="warn")
                 continue
             try:
-                self._execute_swap_open(row)
-                summary["opened"].append(sid)
+                if self._execute_swap_open(row):
+                    summary["opened"].append(sid)
             except Exception as e:
                 self._plugin.log(f"LNPLUS: error retrying open for swap {sid}: {e}", level="error")
                 summary["errors"].append(sid)
 
     # -- gate 10-11: channel-open execution -------------------------------
-    def _execute_swap_open(self, row: Dict, entry: Optional[Dict] = None) -> None:
+    def _execute_swap_open(self, row: Dict, entry: Optional[Dict] = None) -> bool:
+        """Return True only when the row actually reached 'opened'. Callers use
+        this to decide whether the pass may report the swap as opened — a
+        completion step that failed must never be summarised as progress."""
         sid = row["swap_id"]
         peer = row.get("outbound_peer")
         deadline = row.get("deadline_at")
@@ -1534,8 +1540,7 @@ class SwapLifecycle:
 
         if row.get("channel_funding_txid"):
             # Already funded on a prior pass — only complete_application is left.
-            self._complete_and_mark_opened(sid)
-            return
+            return self._complete_and_mark_opened(sid)
 
         try:
             channels = self.rpc.listpeerchannels().get("channels", []) or []
@@ -1600,7 +1605,7 @@ class SwapLifecycle:
             except Exception as e:
                 self._plugin.log(f"LNPLUS: connect to {peer} failed for swap {sid}: {e}", level="warn")
                 self._maybe_trip_deadline_miss(row, sid, deadline, now)
-                return
+                return False
 
             # Write intent before the irreversible external call.
             self._db.lnplus_update_swap(sid, status="opening", outcome="fundchannel attempt")
@@ -1646,13 +1651,13 @@ class SwapLifecycle:
                         f"LNPLUS: budget reservation failed for swap {sid} — "
                         f"retrying next pass ({e})", level="warn")
                     self._maybe_trip_deadline_miss(row, sid, deadline, now)
-                    return
+                    return False
             if not reservation_active:
                 self._plugin.log(
                     f"LNPLUS: budget reservation failed for swap {sid} — "
                     "retrying next pass", level="warn")
                 self._maybe_trip_deadline_miss(row, sid, deadline, now)
-                return
+                return False
 
             try:
                 # Phase 3E: prefer the CLN adapter (invalidates funds/
@@ -1670,13 +1675,13 @@ class SwapLifecycle:
                 self._plugin.log(f"LNPLUS: fundchannel to {peer} failed for swap {sid}: {e}", level="error")
                 self._release_swap_open_reservation(reservation_id, sid)
                 self._maybe_trip_deadline_miss(row, sid, deadline, now)
-                return
+                return False
             txid = result.get("txid") if isinstance(result, dict) else None
             if not txid:
                 self._plugin.log(f"LNPLUS: fundchannel for swap {sid} returned no txid", level="error")
                 self._release_swap_open_reservation(reservation_id, sid)
                 self._maybe_trip_deadline_miss(row, sid, deadline, now)
-                return
+                return False
             # Outcome, after the call.
             self._db.lnplus_update_swap(sid, channel_funding_txid=txid, opened_at=now)
             first_fund = True
@@ -1686,20 +1691,47 @@ class SwapLifecycle:
             # reservation and drop the spend off the rail.
             self._settle_swap_open_reservation(reservation_id, estimated_cost, sid)
 
-        self._complete_and_mark_opened(sid)
+        marked_opened = self._complete_and_mark_opened(sid)
         if first_fund:
             self._record_swap_open_planner_action(
                 row, status="completed",
                 reason=f"LN+ swap {sid}: channel opened to {peer}")
+        return marked_opened
 
-    def _complete_and_mark_opened(self, sid: str) -> None:
+    @staticmethod
+    def _already_past_opening(e: LNPlusError) -> bool:
+        """True when LN+ rejects complete_application because the application
+        has ALREADY left the opening state.
+
+        That is a success signal wearing a 422: the transition we are asking
+        for has happened. It is the normal shape whenever a swap is completed
+        outside this plugin (an operator finishing it on the LN+ site), and
+        retrying can never succeed — so treating it as retryable pins the row
+        at 'opening' forever, which starves phase 4 activation, skips the
+        no_close protection, and jams the in-flight serialization gate.
+        """
+        if e.http_status != 422 or not isinstance(e.errors, dict):
+            return False
+        return any("not in opening state" in str(message).lower()
+                   for value in e.errors.values()
+                   for message in (value if isinstance(value, list) else [value]))
+
+    def _complete_and_mark_opened(self, sid: str) -> bool:
+        """Return True once the row is marked opened; False while it is still
+        stuck at 'opening' so callers never report progress that didn't happen."""
         try:
             self._client.complete_application(sid)
         except LNPlusError as e:
-            self._plugin.log(f"LNPLUS: complete_application failed for {sid} (will retry): {e}",
-                              level="warn")
-            return
+            if not self._already_past_opening(e):
+                self._plugin.log(f"LNPLUS: complete_application failed for {sid} (will retry): {e}",
+                                  level="warn")
+                return False
+            self._plugin.log(
+                f"LNPLUS: complete_application for {sid} reports it already left "
+                "'opening' — treating as already complete and marking opened",
+                level="info")
         self._db.lnplus_update_swap(sid, status="opened")
+        return True
 
     def _release_swap_open_reservation(self, reservation_id: str, sid: str) -> None:
         """Best-effort release on a failed/aborted fundchannel attempt. Never a

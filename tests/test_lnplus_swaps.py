@@ -2315,3 +2315,108 @@ class TestOperatorBanGate:
         result = ev.run_cycle(cfg, 0.0)
         assert not any("operator-banned" in r.get("reason", "")
                        for r in result["rejections"])
+
+
+class TestCompleteApplicationIdempotency:
+    """Swap 24333 (diagnosed 2026-07-26): LN+ completed the swap and issued a
+    positive rating, but complete_application kept returning HTTP 422
+    "application is not in opening state". That was treated as retryable, so
+    the row never left 'opening' — activation never ran, no_close was never
+    tagged, and the in-flight gate blocked every later swap for 6 days."""
+
+    NOT_OPENING = {"swap": ["application is not in opening state"]}
+
+    def _err(self, status, errors):
+        from modules.lnplus_swaps import LNPlusError
+        return LNPlusError(f"LN+ HTTP {status} on complete_application: {errors!r}",
+                           http_status=status, errors=errors)
+
+    def _stuck(self, my_swaps=None):
+        """A funded 'opening' row that LN+ already reports completed — the
+        exact 24333 shape. LN+ must list it, or phase 3b skips it as dead and
+        complete_application is never reached at all."""
+        peer = PK_A
+        my = my_swaps if my_swaps is not None else {
+            "pending": [], "opening": [],
+            "completed": [{"id": "s1", "outgoing_peer_pubkey": peer,
+                           "capacity_sats": 10_000_000}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(
+            my_swaps=my,
+            local_rows=[dict(swap_id="s1", status="opening", capacity_sats=10_000_000,
+                             duration_months=12, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", channel_funding_txid="ab" * 32,
+                              opened_at=int(time.time()) - 86_400,
+                              deadline_at=int(time.time()) - 3_600)
+        rpc.listpeerchannels.return_value = {"channels": []}
+        return lc, db, rpc, client, policy, peer
+
+    # -- the unit under test, in isolation --------------------------------
+
+    def test_422_not_in_opening_state_marks_opened(self):
+        # LN+ is reporting that the call it rejects has already happened.
+        lc, db, _, client, _, _ = self._stuck()
+        client.complete_application.side_effect = self._err(422, self.NOT_OPENING)
+
+        lc._complete_and_mark_opened("s1")
+
+        assert db.lnplus_get_swap("s1")["status"] == "opened"
+
+    def test_transient_error_leaves_row_opening(self):
+        # Guard against over-broadening: a real outage stays retryable.
+        from modules.lnplus_swaps import LNPlusError
+        lc, db, _, client, _, _ = self._stuck()
+        client.complete_application.side_effect = LNPlusError("LN+ unreachable")
+
+        lc._complete_and_mark_opened("s1")
+
+        assert db.lnplus_get_swap("s1")["status"] == "opening"
+
+    def test_unrelated_422_leaves_row_opening(self):
+        # A 422 that is not the already-past-opening signal is a genuine
+        # validation failure and must not be swallowed as success.
+        lc, db, _, client, _, _ = self._stuck()
+        client.complete_application.side_effect = self._err(
+            422, {"swap": ["channel capacity below the agreed amount"]})
+
+        lc._complete_and_mark_opened("s1")
+
+        assert db.lnplus_get_swap("s1")["status"] == "opening"
+
+    # -- end-to-end through the watcher -----------------------------------
+
+    def test_stuck_swap_reaches_active_and_protects_peer(self):
+        # One pass must carry the 24333 shape all the way to active with the
+        # contract peer tagged no_close (phase 4 runs after 3b in the same pass).
+        lc, db, _, client, policy, _ = self._stuck()
+        client.complete_application.side_effect = self._err(422, self.NOT_OPENING)
+
+        lc.run_watcher_once()
+
+        assert db.lnplus_get_swap("s1")["status"] == "active"
+        assert [c for c in policy.add_tag.call_args_list if "no_close" in str(c)], \
+            "contract peer must be protected with no_close"
+
+    def test_stuck_swap_releases_the_inflight_gate(self):
+        # The operational consequence: until the row leaves 'opening', the
+        # serialization gate blocks every future application.
+        lc, db, _, client, _, _ = self._stuck()
+        client.complete_application.side_effect = self._err(422, self.NOT_OPENING)
+        assert lc.has_inflight() is True
+
+        lc.run_watcher_once()
+
+        assert lc.has_inflight() is False
+
+    def test_summary_does_not_report_opened_when_completion_fails(self):
+        # The masking defect: _phase_3b counted the row as opened because
+        # _execute_swap_open swallowed the error and returned normally, so the
+        # watcher logged {opened: 1, errors: 0} hourly over a dead row.
+        from modules.lnplus_swaps import LNPlusError
+        lc, db, _, client, _, _ = self._stuck()
+        client.complete_application.side_effect = LNPlusError("LN+ unreachable")
+
+        summary = lc.run_watcher_once()
+
+        assert db.lnplus_get_swap("s1")["status"] == "opening"
+        assert "s1" not in summary["opened"], \
+            "a row that never left 'opening' must not be reported as opened"
