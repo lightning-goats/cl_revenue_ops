@@ -56,10 +56,22 @@ def test_startup_numeric_ranges_are_the_authoritative_config_ranges(mod):
     assert mod._INIT_NUMERIC_RANGES == CONFIG_FIELD_RANGES
 
 
-def test_startup_fee_bounds_finish_ordered_and_inside_both_ranges(mod):
+@pytest.mark.parametrize(
+    ("minimum", "maximum", "expected"),
+    [
+        (10, 1, (10, 10)),
+        (3, 2, (5, 5)),
+        (0, 0, (5, 5)),
+        (5, 4, (5, 5)),
+        (200_000, 50, (100_000, 100_000)),
+    ],
+)
+def test_startup_fee_bounds_finish_ordered_and_inside_both_ranges(
+    mod, minimum, maximum, expected
+):
     out = mod._validate_startup_config_options(
-        {"min_fee_ppm": 10, "max_fee_ppm": 1},
+        {"min_fee_ppm": minimum, "max_fee_ppm": maximum},
         log=None,
     )
 
-    assert out == {"min_fee_ppm": 5, "max_fee_ppm": 10}
+    assert (out["min_fee_ppm"], out["max_fee_ppm"]) == expected

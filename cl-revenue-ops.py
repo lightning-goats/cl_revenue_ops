@@ -499,10 +499,11 @@ def _validate_numeric_config_options(kwargs, log=None):
 
 
 def _enforce_fee_bound_invariant(kwargs, log=None):
-    """P1-009: enforce min_fee_ppm <= max_fee_ppm (swap with warning).
+    """P1-009: enforce min_fee_ppm <= max_fee_ppm without lowering the floor.
 
     Inverted bounds would otherwise silently pin fees to a low ceiling and
-    suppress revenue with no crash or warning.
+    suppress revenue. Raise the ceiling because lowering min_fee_ppm can
+    violate the CRITICAL-02 economic floor.
     """
     if 'min_fee_ppm' not in kwargs or 'max_fee_ppm' not in kwargs:
         return kwargs
@@ -512,8 +513,8 @@ def _enforce_fee_bound_invariant(kwargs, log=None):
     except (ValueError, TypeError):
         return kwargs
     if mn > mx:
-        _init_warn(log, f"Config min_fee_ppm ({mn}) > max_fee_ppm ({mx}); swapping to keep min <= max")
-        kwargs['min_fee_ppm'], kwargs['max_fee_ppm'] = mx, mn
+        _init_warn(log, f"Config min_fee_ppm ({mn}) > max_fee_ppm ({mx}); raising max_fee_ppm to {mn}")
+        kwargs["max_fee_ppm"] = mn
     return kwargs
 
 
@@ -559,8 +560,8 @@ def _validate_enum_config_options(kwargs, log=None):
 
 def _validate_startup_config_options(kwargs, log=None):
     """Apply startup repairs in an order that leaves every invariant true."""
-    _enforce_fee_bound_invariant(kwargs, log=log)
     _validate_numeric_config_options(kwargs, log=log)
+    _enforce_fee_bound_invariant(kwargs, log=log)
     _validate_enum_config_options(kwargs, log=log)
     return kwargs
 
@@ -2681,9 +2682,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalance_router='v3',
         askrene_layers=str(options.get('revenue-ops-askrene-layers', '') or '').strip() or 'standalone',
     )
-    # P1-008/P1-009/P1-026: repair crossed bounds before applying the
-    # authoritative numeric ranges, then validate enums. The order matters:
-    # a late swap can otherwise reintroduce an out-of-range minimum.
+    # P1-008/P1-009/P1-026: apply the authoritative numeric ranges, then
+    # raise any crossed ceiling to the validated floor. Swapping can lower
+    # min_fee_ppm below its CRITICAL-02 range when the bounds have different
+    # lower limits.
     _validate_startup_config_options(config_kwargs, log=plugin.log)
 
     configured_router = str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower()

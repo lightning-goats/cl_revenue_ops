@@ -1,7 +1,7 @@
 """P1-009: enforce min_fee_ppm <= max_fee_ppm at init.
 
-An inverted config is corrected (swapped) with a warning, not silently
-pinned to a low ceiling.
+An inverted config is corrected by raising the ceiling to the floor with a
+warning, never by lowering the economic floor.
 """
 
 import pytest
@@ -18,10 +18,10 @@ def _val(mod, **kw):
     return mod._enforce_fee_bound_invariant(dict(kw), log=None)
 
 
-def test_inverted_fee_bounds_swapped(mod):
+def test_inverted_fee_bounds_raise_ceiling_to_floor(mod):
     out = _val(mod, min_fee_ppm=500, max_fee_ppm=100)
-    assert out["min_fee_ppm"] <= out["max_fee_ppm"]
-    assert {out["min_fee_ppm"], out["max_fee_ppm"]} == {100, 500}
+    assert out["min_fee_ppm"] == 500
+    assert out["max_fee_ppm"] == 500
 
 
 def test_ordered_fee_bounds_unchanged(mod):
