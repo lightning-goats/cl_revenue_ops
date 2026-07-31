@@ -946,12 +946,19 @@ class Config:
         # (e.g., min_fee_ppm > max_fee_ppm from TOCTOU race or manual DB edits).
         # Workstream I: each repair now also WARNS — silent repair left the
         # operator unaware their persisted settings contradict each other.
+        # The crossed fee pair is repaired UPWARD. Lowering min_fee_ppm to a
+        # persisted max_fee_ppm of 1-4 is individually in range but drags the
+        # floor under its own CONFIG_FIELD_RANGES minimum (CRITICAL-02), and
+        # the two bounds have different lower limits so no downward repair can
+        # hold both invariants. Raising the ceiling honors the operator's
+        # stated floor and only widens a cap. Matches the init-time repair in
+        # cl-revenue-ops.py::_enforce_fee_bound_invariant.
         if self.min_fee_ppm > self.max_fee_ppm:
             self._override_warnings.append(
                 f"Contradictory settings: min_fee_ppm ({self.min_fee_ppm}) > "
-                f"max_fee_ppm ({self.max_fee_ppm}); repaired min_fee_ppm to "
-                f"{self.max_fee_ppm}")
-            self.min_fee_ppm = self.max_fee_ppm
+                f"max_fee_ppm ({self.max_fee_ppm}); repaired max_fee_ppm to "
+                f"{self.min_fee_ppm}")
+            self.max_fee_ppm = self.min_fee_ppm
         if hasattr(self, 'low_liquidity_threshold') and hasattr(self, 'high_liquidity_threshold'):
             if self.low_liquidity_threshold >= self.high_liquidity_threshold:
                 # M-R6-1 FIX: Clamp to 0.0 to prevent negative values when

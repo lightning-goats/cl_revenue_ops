@@ -3,7 +3,9 @@ deprecated settings. Detection WARNS (via load_overrides' warning list,
 logged at startup); the pre-existing cross-field repairs still repair."""
 from unittest.mock import MagicMock
 
-from modules.config import Config
+import pytest
+
+from modules.config import CONFIG_FIELD_RANGES, Config
 
 
 def _load(overrides):
@@ -25,7 +27,55 @@ class TestContradictoryPairs:
         cfg, warnings = _load({"min_fee_ppm": "900", "max_fee_ppm": "100"})
         assert _matching(warnings, "Contradictory", "min_fee_ppm",
                          "max_fee_ppm")
-        assert cfg.min_fee_ppm == 100  # existing repair preserved
+        # Repaired upward: the operator's stated floor is honored and the
+        # ceiling widens to meet it. Repairing downward would silently
+        # discard the 900 floor, and for a ceiling of 1-4 it would breach
+        # the min_fee_ppm range minimum outright.
+        assert cfg.min_fee_ppm == 900
+        assert cfg.max_fee_ppm == 900
+
+    def test_persisted_low_ceiling_never_lowers_min_fee_below_its_floor(self):
+        # A persisted max_fee_ppm of 1-4 is individually in range, but
+        # repairing the crossed pair DOWNWARD drags min_fee_ppm under the
+        # CRITICAL-02 economic floor.
+        floor = CONFIG_FIELD_RANGES["min_fee_ppm"][0]
+        cfg, _ = _load({"max_fee_ppm": "4"})
+        assert cfg.min_fee_ppm >= floor
+
+    def test_persisted_crossed_bounds_finish_ordered(self):
+        cfg, _ = _load({"max_fee_ppm": "4"})
+        assert cfg.min_fee_ppm <= cfg.max_fee_ppm
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            # Persisted ceilings below the min_fee_ppm floor of 5: the case
+            # the downward repair breached outright.
+            ({"max_fee_ppm": "1"}, (10, 10)),
+            ({"max_fee_ppm": "4"}, (10, 10)),
+            # Crossed but both individually in band.
+            ({"max_fee_ppm": "9"}, (10, 10)),
+            ({"min_fee_ppm": "5", "max_fee_ppm": "1"}, (5, 5)),
+            ({"min_fee_ppm": "900", "max_fee_ppm": "100"}, (900, 900)),
+            ({"min_fee_ppm": "100000", "max_fee_ppm": "1"}, (100000, 100000)),
+            # Range ends and already-ordered pairs must be left alone.
+            ({"max_fee_ppm": "10"}, (10, 10)),
+            ({"min_fee_ppm": "100", "max_fee_ppm": "2000"}, (100, 2000)),
+            # Out of range persists nothing: _apply_override skips it, so
+            # the defaults stand and the invariant still holds.
+            ({"max_fee_ppm": "0"}, (10, 2000)),
+        ],
+    )
+    def test_persisted_fee_bounds_end_ordered_and_in_band(self, overrides,
+                                                          expected):
+        lo_min, hi_min = CONFIG_FIELD_RANGES["min_fee_ppm"]
+        lo_max, hi_max = CONFIG_FIELD_RANGES["max_fee_ppm"]
+        cfg, _ = _load(overrides)
+
+        assert (cfg.min_fee_ppm, cfg.max_fee_ppm) == expected
+        assert cfg.min_fee_ppm <= cfg.max_fee_ppm
+        assert lo_min <= cfg.min_fee_ppm <= hi_min
+        assert lo_max <= cfg.max_fee_ppm <= hi_max
 
     def test_crossed_liquidity_thresholds_warn(self):
         cfg, warnings = _load({"low_liquidity_threshold": "0.8",
