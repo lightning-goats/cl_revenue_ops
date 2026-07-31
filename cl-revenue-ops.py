@@ -37,7 +37,7 @@ from modules import flow_analysis as flow_analysis_mod
 from modules.fee_controller import FeeController
 from modules.fee_authority import FeeAuthorityGate
 from modules.rebalancer import EVRebalancer
-from modules.config import Config
+from modules.config import CONFIG_FIELD_RANGES, Config
 from modules.growth_budget import compute_growth_budget_status
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -467,20 +467,9 @@ def _snapshot_peers_once():
 # clamp/correct such values with a loud warning, matching the warn+repair
 # style used by Config._apply_override / load_overrides for the runtime path.
 
-# Numeric options range-checked at init. Ranges mirror CONFIG_FIELD_RANGES so
-# init and the runtime-override path agree on what is in-band.
-_INIT_NUMERIC_RANGES = {
-    'rpc_timeout_seconds': (1, 300),
-    'daily_budget_sats': (0, 10_000_000),
-    'growth_budget_earned_fraction': (0.0, 1.0),
-    'growth_budget_experiment_fraction': (0.0, 1.0),
-    'growth_budget_max_extra_sats': (0, 1_000_000),
-    'growth_budget_hard_ceiling_sats': (0, 10_000_000),
-    'weekly_budget_sats': (0, 70_000_000),
-    'min_fee_ppm_saturated': (0, 1000),
-    'reputation_decay': (0.0, 1.0),
-    'htlc_congestion_threshold': (0.0, 1.0),
-}
+# Numeric options range-checked at init. Use the same authoritative table as
+# runtime overrides so startup cannot silently omit a newly governed field.
+_INIT_NUMERIC_RANGES = dict(CONFIG_FIELD_RANGES)
 
 
 def _init_warn(log, msg):
@@ -565,6 +554,14 @@ def _validate_enum_config_options(kwargs, log=None):
         if val not in valid:
             _init_warn(log, f"Config option {key}={val!r} not one of {tuple(valid)}; using default {default!r}")
             kwargs[key] = default
+    return kwargs
+
+
+def _validate_startup_config_options(kwargs, log=None):
+    """Apply startup repairs in an order that leaves every invariant true."""
+    _enforce_fee_bound_invariant(kwargs, log=log)
+    _validate_numeric_config_options(kwargs, log=log)
+    _validate_enum_config_options(kwargs, log=log)
     return kwargs
 
 
@@ -2684,13 +2681,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalance_router='v3',
         askrene_layers=str(options.get('revenue-ops-askrene-layers', '') or '').strip() or 'standalone',
     )
-    # P1-008: range-validate numeric options before Config construction so a
-    # 0/negative/out-of-band value can never fail open.
-    _validate_numeric_config_options(config_kwargs, log=plugin.log)
-    # P1-009: enforce min_fee_ppm <= max_fee_ppm before construction.
-    _enforce_fee_bound_invariant(config_kwargs, log=plugin.log)
-    # P1-026: validate enum-style options before construction.
-    _validate_enum_config_options(config_kwargs, log=plugin.log)
+    # P1-008/P1-009/P1-026: repair crossed bounds before applying the
+    # authoritative numeric ranges, then validate enums. The order matters:
+    # a late swap can otherwise reintroduce an out-of-range minimum.
+    _validate_startup_config_options(config_kwargs, log=plugin.log)
 
     configured_router = str(options.get('revenue-ops-rebalance-router', 'v3') or 'v3').lower()
     if configured_router != 'v3':
