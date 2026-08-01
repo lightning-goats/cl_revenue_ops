@@ -96,6 +96,76 @@ def test_check_pins_cli_exit_nonzero_on_loose(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Audit 2026-08-01 wave2 FIX 6: requirements.txt <-> requirements.lock
+# shared-pin agreement (the lock used to drift silently)
+# --------------------------------------------------------------------------
+
+def test_repo_lock_agrees_with_requirements_txt():
+    req = ROOT / "requirements.txt"
+    lock = ROOT / "requirements.lock"
+    _, problems = check_pins.check(str(req), check_installed=False,
+                                   lock_path=str(lock))
+    assert problems == [], problems
+
+
+def test_lock_drift_is_flagged(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("numpy==1.26.4\n")
+    lock = tmp_path / "requirements.lock"
+    lock.write_text("numpy==2.4.2 --hash=sha256:" + "0" * 64 + "\n")
+    _, problems = check_pins.check(str(req), check_installed=False,
+                                   lock_path=str(lock))
+    assert len(problems) == 1
+    assert "lock drift" in problems[0]
+
+
+def test_pin_absent_from_lock_is_flagged(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("numpy==1.26.4\nPyYAML==6.0.1\n")
+    lock = tmp_path / "requirements.lock"
+    lock.write_text("numpy==1.26.4 --hash=sha256:" + "0" * 64 + "\n")
+    _, problems = check_pins.check(str(req), check_installed=False,
+                                   lock_path=str(lock))
+    assert len(problems) == 1
+    assert "ABSENT" in problems[0]
+    assert "PyYAML" in problems[0]
+
+
+def test_lock_names_match_case_insensitively(tmp_path):
+    """PEP 503 canonicalization: pyyaml vs PyYAML must not false-positive."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("PyYAML==6.0.1\n")
+    lock = tmp_path / "requirements.lock"
+    lock.write_text("pyyaml==6.0.1 --hash=sha256:" + "0" * 64 + "\n")
+    _, problems = check_pins.check(str(req), check_installed=False,
+                                   lock_path=str(lock))
+    assert problems == [], problems
+
+
+def test_check_pins_cli_uses_repo_lock_by_default():
+    proc = subprocess.run(
+        [sys.executable, str(TOOLS / "check_pins.py"), "--no-installed-check"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "lock-agreement" in proc.stdout
+
+
+def test_check_pins_cli_exit_nonzero_on_lock_drift(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("numpy==1.26.4\n")
+    lock = tmp_path / "requirements.lock"
+    lock.write_text("numpy==2.4.2 --hash=sha256:" + "0" * 64 + "\n")
+    proc = subprocess.run(
+        [sys.executable, str(TOOLS / "check_pins.py"),
+         "--requirements", str(req), "--no-installed-check"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "lock drift" in proc.stdout
+
+
+# --------------------------------------------------------------------------
 # no undeclared / forbidden runtime imports
 # --------------------------------------------------------------------------
 
