@@ -110,6 +110,12 @@ class TestExplorationBudgetGate:
         # Stub listpeerchannels
         planner.plugin.rpc.listpeerchannels.return_value = {"channels": []}
 
+        # Positive EV so candidates reach the exploration gate under test
+        # (wave2 F5's conservative bootstrap prior otherwise rejects these
+        # history-less mock candidates on EV before the budget check).
+        planner._size_channel = MagicMock(return_value=1_000_000)
+        planner._calculate_open_ev = MagicMock(return_value=100)
+
         summary = planner.execute_cycle(planner.config)
 
         # Total budget 1000 < open cost 5000 → all opens blocked

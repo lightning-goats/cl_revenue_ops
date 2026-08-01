@@ -2775,16 +2775,27 @@ class TestOpenEV:
         assert abs(ev - expected_ev) < 1.0  # Allow float tolerance
 
     def test_ev_fallback_estimate(self):
-        """New peers use capacity-based revenue estimate."""
+        """New peers use the conservative bootstrap prior (wave2 F5).
+
+        The legacy 45 ppm/day fallback (225 sats/day on 5M) approved nearly
+        every open; the bootstrap prior must NOT clear the default 1%
+        capital hurdle on speculation alone, but still yields positive raw
+        operating EV (hurdle disabled) so genuine bootstrap opens remain
+        possible for operators who opt out of the hurdle.
+        """
         planner = self._make_planner(
             feerates_return={"perkb": {"opening": 1000}},
             closed_summary=None,  # No history
         )
         cfg = self._make_cfg()
         ev = planner._calculate_open_ev("new_peer", 5000000, cfg)
-        # Fallback: 5000000 * 0.3 * 150 / 1e6 = 225 sats/day
-        # Should produce positive EV with low fees
-        assert ev > 0
+        assert ev < 0  # speculation must not clear the capital hurdle
+
+        cfg.planner_min_annual_roi_pct = 0.0
+        ev_no_hurdle = planner._calculate_open_ev("new_peer", 5000000, cfg)
+        # Bootstrap: 5M * 2 ppm/day = 10 sats/day
+        # EV = 1800 revenue - 180 rebal - 340 on-chain = +1280
+        assert ev_no_hurdle > 0
 
     def test_ev_survives_rpc_errors(self):
         """EV calculation works with fallback costs when RPC fails."""
@@ -2826,9 +2837,10 @@ class TestOpenEV:
             closed_summary={"daily_net_est_sats": -10},  # Historically unprofitable
         )
         cfg = self._make_cfg()
+        cfg.planner_min_annual_roi_pct = 0.0  # isolate the revenue model
         ev = planner._calculate_open_ev("peer1", 5000000, cfg)
-        # Should use fallback estimate, not the negative value
-        # Fallback: 5000000 * 0.3 * 150 / 1e6 = 225 sats/day
+        # Should use fallback estimate, not the negative value.
+        # Wave2 F5 bootstrap: 5M * 2 ppm/day = 10 sats/day => +1280 raw EV
         assert ev > 0
 
     def test_ev_zero_closed_summary_uses_fallback(self):
@@ -2838,8 +2850,9 @@ class TestOpenEV:
             closed_summary={"daily_net_est_sats": 0},
         )
         cfg = self._make_cfg()
+        cfg.planner_min_annual_roi_pct = 0.0  # isolate the revenue model
         ev = planner._calculate_open_ev("peer1", 5000000, cfg)
-        # Fallback: 5000000 * 0.3 * 150 / 1e6 = 225 sats/day
+        # Wave2 F5 bootstrap: 5M * 2 ppm/day = 10 sats/day => +1280 raw EV
         assert ev > 0
 
     def test_ev_database_exception_handled(self):
@@ -2851,9 +2864,10 @@ class TestOpenEV:
         prof_analyzer.database.get_peer_closed_channel_profit_summary.side_effect = Exception("DB error")
         planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
         cfg = self._make_cfg()
+        cfg.planner_min_annual_roi_pct = 0.0  # isolate the revenue model
         ev = planner._calculate_open_ev("peer1", 5000000, cfg)
         assert isinstance(ev, float)
-        assert ev > 0  # Should use fallback
+        assert ev > 0  # Should use fallback (wave2 F5 bootstrap prior)
 
 
 # ---------------------------------------------------------------------------
@@ -4834,15 +4848,17 @@ class TestOpenEVAnchoredForecast:
         expected = (daily_revenue * 180) - (daily_revenue * 0.1 * 180) - 340 - hurdle
         assert ev == pytest.approx(expected, abs=2.0)
 
-    def test_no_observed_data_falls_back_to_legacy_ceiling(self):
-        """Bootstrap: a node with no routing history uses the legacy rate."""
+    def test_no_observed_data_falls_back_to_conservative_bootstrap(self):
+        """Bootstrap: no routing history uses the conservative prior (wave2
+        F5), NOT the legacy 45 ppm/day ceiling the code itself calls 10-50x
+        reality."""
+        from modules.capacity_planner import BOOTSTRAP_FORECAST_DAILY_PPM
         planner = self._make_planner([], feerate_perkb=1000)
         cfg = self._make_cfg()
 
         ev = planner._calculate_open_ev("02" + "ee" * 32, 5_000_000, cfg)
 
-        # Legacy fallback: 5M * 45e-6 = 225 sats/day (back-compat bootstrap)
-        daily_revenue = 225.0
+        daily_revenue = 5_000_000 * BOOTSTRAP_FORECAST_DAILY_PPM / 1_000_000
         hurdle = 5_000_000 * 0.01 * (180 / 365)
         expected = (daily_revenue * 180) - (daily_revenue * 0.1 * 180) - 340 - hurdle
         assert ev == pytest.approx(expected, abs=2.0)

@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
-from .utils import MSAT_PER_SAT, base_to_sats_ceil
+from .utils import MSAT_PER_SAT, base_to_sats_ceil, base_to_sats_floor, parse_msat
 
 _log = logging.getLogger("cl-revenue-ops.capex_budget")
 
@@ -92,6 +92,11 @@ class CapexAllocations:
     # database this cycle, so all budgets were zeroed (spend denied) rather
     # than re-granted as if nothing had been spent.
     db_degraded: bool = False
+    # Wave2 F2 fail-closed: True when the profitability analyzer had no real
+    # snapshot this cycle (RPC outage), so exploration budgeting was zeroed
+    # instead of falling into the zero-revenue bootstrap path that grants
+    # the entire wallet excess.
+    profitability_unavailable: bool = False
 
     @property
     def global_envelope_sats(self) -> int:
@@ -147,12 +152,24 @@ class CapexBudgetEngine:
         """
         cfg = self._config.snapshot() if hasattr(self._config, 'snapshot') else self._config
 
-        # Get profitability data for all channels
+        # Get profitability data for all channels.
+        # Wave2 F2: distinguish "RPC failed" from "node genuinely has no
+        # channels/revenue". An outage must never route budgeting into the
+        # zero-revenue bootstrap path (which grants the whole wallet excess).
         all_prof = {}
+        prof_unavailable = False
         try:
             all_prof = self._profitability.analyze_all_channels()
         except Exception:
-            pass
+            all_prof = {}
+            prof_unavailable = True
+        if not prof_unavailable:
+            avail_fn = getattr(self._profitability, 'data_available', None)
+            if callable(avail_fn):
+                try:
+                    prof_unavailable = not bool(avail_fn())
+                except Exception:
+                    prof_unavailable = True
 
         # Get total capex per channel (rebalance_costs + spend_events) — in sats.
         # CB-4 fail-closed: None means the DB read failed; treat spend history
@@ -243,7 +260,19 @@ class CapexBudgetEngine:
         if spend_summary is None:
             db_degraded = True
             spend_summary = {"spent_by_category": {}, "reserved_by_category": {}}
-        if total_fleet_contribution_msat > 0:
+        if prof_unavailable:
+            # Wave2 F2 fail-closed: bootstrap mode requires AFFIRMATIVE
+            # evidence of a zero-revenue node (a real, non-error snapshot).
+            # With no snapshot at all, a mature revenue node would otherwise
+            # flip into bootstrap and get the entire wallet excess as
+            # exploration budget. Grant nothing this cycle.
+            _log.warning(
+                "capex_budget: profitability data unavailable this cycle — "
+                "granting NO exploration budget (bootstrap requires a real "
+                "zero-revenue snapshot, not a data outage)"
+            )
+            exploration_msat = 0
+        elif total_fleet_contribution_msat > 0:
             revenue_exploration_msat = int(total_fleet_contribution_msat * cfg.capex_exploration_rate)
             wallet_floor_msat = self._get_wallet_exploration_floor_msat(cfg)
             exploration_msat = max(revenue_exploration_msat, wallet_floor_msat)
@@ -319,6 +348,7 @@ class CapexBudgetEngine:
             tactical_budget_msat=tactical_msat,
             total_fleet_contribution_msat=total_fleet_contribution_msat,
             db_degraded=db_degraded,
+            profitability_unavailable=prof_unavailable,
             allocated_by_priority_msat={
                 "defensive": defensive_total_msat,
                 "preservation": preservation_total_msat,
@@ -696,17 +726,60 @@ class CapexBudgetEngine:
         return "growth"
 
     def _get_reserve_deficit(self, cfg) -> int:
-        """Get on-chain reserve deficit in sats."""
+        """Get on-chain reserve deficit in sats.
+
+        Wave2 F3 fail-closed: an UNREADABLE wallet must not read as an EMPTY
+        wallet. `deficit = min_wallet_reserve - 0` flipped the priority class
+        to "operational" and granted a tactical Boltz budget to refill a
+        possibly-full wallet. When the wallet cannot be read, report NO
+        deficit (grant nothing) this cycle.
+        """
         onchain = self._get_confirmed_onchain_sats()
+        if onchain is None:
+            _log.warning(
+                "capex_budget: wallet unreadable (listfunds failed) — "
+                "assuming NO reserve deficit this cycle (no tactical refill "
+                "budget granted on unknown balance)"
+            )
+            return 0
         deficit = max(0, cfg.min_wallet_reserve - onchain)
         return deficit
 
-    def _get_confirmed_onchain_sats(self) -> int:
-        """Get confirmed on-chain balance in sats."""
+    def _get_confirmed_onchain_sats(self) -> Optional[int]:
+        """Get confirmed on-chain balance in sats; None when unreadable.
+
+        Wave2 F3: Database.get_confirmed_onchain_sats swallows listfunds
+        failures to 0, which is indistinguishable from a genuinely empty
+        wallet. Read listfunds through the database's RPC handle here so an
+        RPC failure surfaces as None (callers treat unknown conservatively).
+        When no usable RPC surface exists (e.g. fully-mocked database in
+        tests), fall back to the DB helper's value.
+        """
+        rpc = getattr(getattr(self._database, 'plugin', None), 'rpc', None)
+        if rpc is not None:
+            try:
+                lf = rpc.listfunds()
+            except Exception as exc:
+                _log.warning(
+                    "capex_budget: listfunds failed (%s) — confirmed on-chain "
+                    "balance unknown", exc
+                )
+                return None
+            if isinstance(lf, dict):
+                total_sats = 0
+                for output in lf.get("outputs", []) or []:
+                    if not isinstance(output, dict):
+                        continue
+                    if str(output.get("status") or "") != "confirmed":
+                        continue
+                    total_sats += base_to_sats_floor(
+                        parse_msat(output.get("amount_msat", 0))
+                    )
+                return int(total_sats)
         try:
             return int(self._database.get_confirmed_onchain_sats() or 0)
         except Exception:
-            return 0
+            return None
 
     def _get_bootstrap_wallet_exploration_budget_msat(self, cfg, summary) -> int:
         """Use wallet excess for bootstrap opens when the fleet has no fee revenue yet.
@@ -716,6 +789,9 @@ class CapexBudgetEngine:
         historical spend again would double-count. We only remove active reservations.
         """
         onchain_sats = self._get_confirmed_onchain_sats()
+        if onchain_sats is None:
+            # Wave2 F3: unknown wallet -> no bootstrap exploration budget.
+            return 0
         wallet_excess_sats = max(0, onchain_sats - cfg.min_wallet_reserve)
         reserved_by_category = summary.get("reserved_by_category", {}) or {}
         reserved_open_sats = int(reserved_by_category.get("channel_open", 0) or 0)
@@ -730,6 +806,9 @@ class CapexBudgetEngine:
         bootstrap.
         """
         onchain_sats = self._get_confirmed_onchain_sats()
+        if onchain_sats is None:
+            # Wave2 F3: unknown wallet -> no wallet-backed exploration floor.
+            return 0
         wallet_excess_sats = max(0, onchain_sats - cfg.min_wallet_reserve)
         if wallet_excess_sats <= 0:
             return 0

@@ -78,9 +78,13 @@ def close_protection_reason(scid_display: str, prof: Any, flow_metrics: Any,
     # HIGH-confidence evidence of inactivity (F3).
     if flow_metrics:
         confidence = getattr(flow_metrics, 'confidence', 1.0)
+        if confidence is None:
+            confidence = 1.0
         if not isinstance(confidence, (int, float)):
             confidence = 1.0
-        confidence = confidence or 1.0
+        # Wave2 F7: a legitimate confidence of 0.0 is the LOWEST possible
+        # confidence — the old `confidence or 1.0` mapped it to FULL
+        # confidence and disabled this gate in the permissive direction.
         if confidence < KALMAN_CONFIDENCE_FLOOR and not inactivity_is_signal(
                 getattr(flow_metrics, "forward_count", None),
                 getattr(prof, "days_open", None), flow_window_days):
@@ -171,9 +175,17 @@ def policy_close_block(policy: Any) -> Optional[str]:
 
 
 def lnplus_contract_protection(opened_at: Any, duration_months: Any,
-                               swap_id: Any) -> Optional[Protection]:
+                               swap_id: Any,
+                               now: Any = None) -> Optional[Protection]:
     """An accepted LN+ swap obligates the channel to stay open for the
-    swap's duration: an owned, expiring Protection (invariant 6)."""
+    swap's duration: an owned, expiring Protection (invariant 6).
+
+    Wave2 F7: the computed expires_at is compared against the injected
+    evaluation time `now` — an expired contract yields NO protection. This
+    module is pure (no clock), so callers must pass `now`; with now=None the
+    expiry cannot be evaluated and the protection is kept, which errs on the
+    side of blocking closes (the conservative direction for a close gate).
+    """
     try:
         start = int(opened_at)
         months = int(duration_months)
@@ -182,6 +194,12 @@ def lnplus_contract_protection(opened_at: Any, duration_months: Any,
     if start <= 0 or months <= 0:
         return None
     expires = start + months * 30 * 86400
+    if now is not None:
+        try:
+            if int(now) >= expires:
+                return None  # contract window elapsed: no protection
+        except (TypeError, ValueError):
+            pass  # unusable clock: keep the protection (blocks closes)
     return Protection(reason="lnplus_contract", owner="lnplus",
                       expires_at=UnixTime(expires))
 
@@ -194,7 +212,8 @@ def lnplus_contract_protection(opened_at: Any, duration_months: Any,
 def close_protections(*, scid_display: str, prof: Any, flow_metrics: Any,
                       route_pair_channels, policy: Any = None,
                       lnplus_obligation: Optional[dict] = None,
-                      flow_window_days: int = 7) -> Tuple[Protection, ...]:
+                      flow_window_days: int = 7,
+                      now: Any = None) -> Tuple[Protection, ...]:
     """Every protection currently blocking closure, as owned typed data."""
     protections = []
     economic = close_protection_reason(
@@ -212,7 +231,8 @@ def close_protections(*, scid_display: str, prof: Any, flow_metrics: Any,
         contract = lnplus_contract_protection(
             lnplus_obligation.get("opened_at"),
             lnplus_obligation.get("duration_months"),
-            lnplus_obligation.get("swap_id"))
+            lnplus_obligation.get("swap_id"),
+            now=now)
         if contract is not None:
             protections.append(contract)
     return tuple(protections)

@@ -28,7 +28,7 @@ def test_disabled_loop_keeps_baseline_capex_checks():
     assert {item.name for item in results} == {
         "low_yield_large_open_rejected",
         "legacy_zero_hurdle_accepts_absolute_profit",
-        "new_peer_fallback_clears_default_hurdle",
+        "new_peer_bootstrap_respects_default_hurdle",
         "high_onchain_fee_rejected",
         "cycle_skips_low_yield_candidate",
         "cycle_opens_hurdle_clearing_candidate",

@@ -1418,7 +1418,13 @@ class FlowAnalyzer:
 
         # Analyze each channel
         for channel in channels:
-            channel_id = channel.get("short_channel_id") or channel.get("channel_id")
+            # Wave2 F8: normalize like the rest of the file (analyze_channel
+            # does at ~2148) — a ':'-form scid otherwise keys the flow result
+            # differently from the normalized profitability keys, silently
+            # dropping the channel from winner/fire-sale/stagnant evaluation.
+            channel_id = normalize_scid(
+                channel.get("short_channel_id") or channel.get("channel_id")
+            )
             if not channel_id:
                 continue
 

@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
+import uuid
 from statistics import median
 from typing import Dict, List, Any, Optional
 from pyln.client import Plugin
@@ -102,8 +104,17 @@ PEER_EXPOSURE_CAP_MULTIPLIER = 2
 # open at max size and channel sizing was effectively decided by this
 # constant. The forecast is now anchored to the node's realized
 # revenue-per-capacity; the old constant is retained ONLY as a hard ceiling
-# on that anchor and as a bootstrap when the node has no routing history.
+# on that anchor.
 LEGACY_FORECAST_DAILY_PPM_CEILING = 45.0
+
+# Wave2 F5: bootstrap prior when the node has NO observed routing history.
+# Falling back to the 45 ppm/day ceiling above (10-50x reality per its own
+# comment) meant that whenever the anchor was unavailable, EV approved
+# nearly any open. Reality per that same comment is ~1-4.5 ppm of capacity
+# per day (330-1,600 ppm/year); bootstrap at the LOW end of that observed
+# band so a young node must earn its way up via the observed-ppm anchor,
+# not inherit a fantasy forecast.
+BOOTSTRAP_FORECAST_DAILY_PPM = 2.0
 
 # Discount applied to the node's observed median per-day revenue ppm when
 # forecasting a brand-new peer with no track record of its own.
@@ -197,6 +208,12 @@ class CapacityPlanner:
         # PR 3b: per-cycle frozen bleeder projection + snapshot ref
         self._cycle_bleeders: dict | None = None
         self._cycle_snapshot_ref: dict | None = None
+        # Wave2 F6: single-flight guard for execute_cycle. The scheduled
+        # planner loop (daemon thread) and the revenue-planner-execute RPC
+        # (dispatch thread) could interleave: _init_cycle_cache reset shared
+        # per-cycle state mid-cycle and both could fundchannel the same peer.
+        # Non-blocking (mirrors rebalance_engine_v2._cycle_lock).
+        self._cycle_lock = threading.Lock()
 
     def set_capex_engine(self, engine: 'CapexBudgetEngine'):
         """Inject the unified capex budget engine."""
@@ -398,7 +415,26 @@ class CapacityPlanner:
             return "healthy"
 
     def execute_cycle(self, cfg=None) -> Dict[str, Any]:
-        """Main timer-driven cycle. Evaluates and executes open/close decisions."""
+        """Main timer-driven cycle. Evaluates and executes open/close decisions.
+
+        Wave2 F6 single-flight: contenders never block — the loser returns a
+        'cycle_already_running' result instead of resetting shared per-cycle
+        state mid-cycle or double-opening to the same peer.
+        """
+        if not self._cycle_lock.acquire(blocking=False):
+            self.plugin.log(
+                "PLANNER: cycle_already_running — another planner cycle "
+                "holds the lock; skipping this invocation",
+                level='info',
+            )
+            return {"skipped": True, "reason": "cycle_already_running"}
+        try:
+            return self._execute_cycle_locked(cfg)
+        finally:
+            self._cycle_lock.release()
+
+    def _execute_cycle_locked(self, cfg=None) -> Dict[str, Any]:
+        """execute_cycle body. Caller holds _cycle_lock (Wave2 F6)."""
         if cfg is None:
             cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
 
@@ -549,7 +585,11 @@ class CapacityPlanner:
             closes_this_cycle += 1
 
         # 6. Check portfolio balance before opening
-        portfolio_state = "healthy"
+        # Wave2 F4: the governor previously failed OPEN — a listpeerchannels
+        # hiccup left portfolio_state "healthy" and skipped both the
+        # constrained/blocked open restriction and the F8 peer-exposure cap
+        # for the whole cycle. Unknown state now blocks opens (fail closed).
+        portfolio_state = "unknown"
         try:
             peer_channels = (self.data_service.get_peer_channels() if self.data_service else self.plugin.rpc.listpeerchannels()).get("channels", [])
             self._cycle_peer_channels = peer_channels  # reused by exposure cap (F8)
@@ -559,7 +599,17 @@ class CapacityPlanner:
             elif portfolio_state in ("constrained", "blocked"):
                 self.plugin.log(f"Portfolio balance governor: {portfolio_state} — restricting opens", level='info')
         except Exception as e:
-            self.plugin.log(f"Portfolio balance check failed: {e}", level='debug')
+            portfolio_state = "unknown"
+            self._cycle_peer_channels = None
+            self.plugin.log(
+                f"Portfolio balance check failed: {e} — portfolio state "
+                f"unknown; blocking opens this cycle",
+                level='warn',
+            )
+            summary["skipped_reasons"].append(
+                "Portfolio state unknown (listpeerchannels failed) — "
+                "blocking all opens this cycle"
+            )
 
         # 7. Discover and open channels (up to max_opens_per_cycle)
         candidates = []
@@ -683,7 +733,10 @@ class CapacityPlanner:
             )
 
             # 7a. LN+ swap evaluation — swaps are preferred within the margin
-            if self.lnplus_evaluator is not None and opens_this_cycle < max_opens:
+            # Wave2 F4: an applied LN+ swap is an irreversible open
+            # commitment, so it is blocked on unknown portfolio state too.
+            if self.lnplus_evaluator is not None and opens_this_cycle < max_opens \
+                    and portfolio_state != "unknown":
                 try:
                     _best_regular_ev = (ranked_candidates[0].get("_planned_ev", 0.0)
                                         if ranked_candidates else 0.0)
@@ -710,6 +763,11 @@ class CapacityPlanner:
 
             for candidate in ranked_candidates:
                 if opens_this_cycle >= max_opens:
+                    break
+
+                # Wave2 F4 fail-closed: unknown aggregate balance — no opens
+                # (reason already appended when the state was computed).
+                if portfolio_state == "unknown":
                     break
 
                 peer_id = candidate["peer_id"]
@@ -985,6 +1043,10 @@ class CapacityPlanner:
         if bleeders is None:
             bleeders = {}
             try:
+                # Wave2 F1: identify_bleeders_v2 returns None when the pass
+                # could not run. Treating that as [] here is the conservative
+                # direction for a CLOSE decision: no channel gets escalated
+                # to hard-bleeder closure on missing data.
                 bleeder_list = self.profitability.identify_bleeders_v2() or []
                 # Convert list to dict keyed by channel_id for O(1) lookup
                 for b in bleeder_list:
@@ -2520,7 +2582,14 @@ class CapacityPlanner:
                 )
                 channels = result.get("channels", []) if isinstance(result, dict) else []
             except Exception:
-                return None
+                # Wave2 F4 fail-closed: with listpeerchannels unavailable the
+                # existing exposure is unknown — block this open rather than
+                # silently skipping the concentration cap.
+                return (
+                    f"Peer exposure cap for {peer_id[:16]}...: existing "
+                    f"capacity unknown (listpeerchannels unavailable) — "
+                    f"blocking open"
+                )
 
         total_capacity_sats = 0
         for channel in channels:
@@ -2903,6 +2972,23 @@ class CapacityPlanner:
         median revenue-per-capacity (discounted for new peers and clamped to
         the legacy constant as a ceiling), not a fixed utilization guess.
         """
+        # Wave2 F5: no EV-based opens on an unavailable profitability
+        # snapshot (an RPC outage is not a young node). Without real data
+        # neither the observed anchor nor a defensible bootstrap applies —
+        # EV 0 makes every `ev <= 0` caller skip the open/recycle.
+        avail_fn = getattr(self.profitability, "data_available", None)
+        if callable(avail_fn):
+            try:
+                if not bool(avail_fn()):
+                    self.plugin.log(
+                        "PLANNER: profitability data unavailable — "
+                        "skipping EV-based open evaluation",
+                        level='debug',
+                    )
+                    return 0.0
+            except Exception:
+                return 0.0
+
         # Estimate daily revenue
         daily_revenue = 0.0
 
@@ -2923,8 +3009,11 @@ class CapacityPlanner:
                     LEGACY_FORECAST_DAILY_PPM_CEILING,
                 )
             else:
-                # Bootstrap: no routing history at all — use the legacy rate.
-                forecast_daily_ppm = LEGACY_FORECAST_DAILY_PPM_CEILING
+                # Bootstrap: no routing history at all. Wave2 F5: use the
+                # conservative low-end-of-reality prior, NOT the legacy
+                # 45 ppm/day ceiling (10-50x reality — it approved nearly
+                # every open whenever the anchor was unavailable).
+                forecast_daily_ppm = BOOTSTRAP_FORECAST_DAILY_PPM
             daily_revenue = channel_size_sats * forecast_daily_ppm / 1_000_000.0
 
         # Estimate on-chain costs (dynamic via feerates RPC, legacy fallback)
@@ -3261,7 +3350,12 @@ class CapacityPlanner:
         # rejection inside reserve_spend's BEGIN IMMEDIATE runs — a concurrent
         # rebalance/boltz reserve and this open cannot jointly overshoot.
         eff_budget, budget_since = self._unified_reserve_budget_params()
-        reservation_id = f"planner-open-{peer_id[:16]}-{int(time.time())}"
+        # Wave2 F6: uuid suffix makes the id unique even when two opens to
+        # the same peer land in the same second (mirrors the lnplus-open fix).
+        reservation_id = (
+            f"planner-open-{peer_id[:16]}-{int(time.time())}-"
+            f"{uuid.uuid4().hex[:8]}"
+        )
         reservation_active = False
         if db:
             if self._planner_governor_enabled():

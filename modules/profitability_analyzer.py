@@ -580,6 +580,12 @@ class ChannelProfitabilityAnalyzer:
         self._cache_timestamp: int = 0
         self._cache_ttl: int = 900  # >= the slowest steady-state caller cadence (rebalance cycle 900s); a 300s TTL made every fee/rebalance wake re-run the full pass (~6x/hour instead of 2)
         self._analysis_lock = threading.Lock()  # Prevent concurrent analysis stampede
+        # Wave2 F1: True once a REAL (non-error) analysis pass has completed.
+        # Distinguishes "RPC failed" (snapshot unavailable, consumers must
+        # fail conservative) from "node genuinely has no channels" (a real,
+        # confidently-empty snapshot). Never reset to False by later failed
+        # passes — those keep serving the stale-but-real cache instead.
+        self._snapshot_available: bool = False
 
         # Bleeder classification cache (avoids re-running full analysis per channel)
         # TS-7: Same GIL-safety note: dict/None reads are atomic under CPython.
@@ -660,6 +666,9 @@ class ChannelProfitabilityAnalyzer:
 
             # Update cache with new results
             self._profitability_cache = results
+            # Wave2 F1: this was a real pass (even if 0 channels) — mark the
+            # snapshot available for conservative-consumer checks.
+            self._snapshot_available = True
 
             # Log summary
             classifications = {}
@@ -678,15 +687,45 @@ class ChannelProfitabilityAnalyzer:
             self._push_profitability_summary(results)
 
         except Exception as e:
-            self.plugin.log(f"Error in profitability analysis: {e}", level='error')
             # On error, restore old timestamp so next call retries
             self._cache_timestamp = old_timestamp
-            # Return cached data instead of empty results
+            # Wave2 F1: a failed pass must never masquerade as a successful
+            # "no channels" snapshot. With a prior good cache, keep serving
+            # it (stale-but-real). Without one, return an empty result that
+            # data_available() reports as UNAVAILABLE so downstream
+            # consumers (should_rebalance, bleeder gating, capex bootstrap,
+            # planner EV) fail conservative instead of permissive.
+            if self._snapshot_available:
+                # (No extra wall-clock read here — snapshot-dependency pin.)
+                self.plugin.log(
+                    f"Error in profitability analysis: {e} — serving stale "
+                    f"snapshot ({len(self._profitability_cache)} channels, "
+                    f"taken_at={old_timestamp})",
+                    level='error'
+                )
+            else:
+                self.plugin.log(
+                    f"Error in profitability analysis: {e} — no prior "
+                    f"snapshot; profitability data UNAVAILABLE this cycle",
+                    level='error'
+                )
             results = self._profitability_cache
         finally:
             self._analysis_lock.release()
 
         return results
+
+    def data_available(self) -> bool:
+        """Whether profitability data reflects a real analysis pass.
+
+        Wave2 F1: False means no successful pass has EVER completed (e.g.
+        listpeerchannels has failed since startup) — consumers must treat
+        profitability as unknown and do LESS (no rebalance green-light, no
+        bootstrap budgets, no EV-based opens). True may still mean the cache
+        is stale-but-real (a later pass failed and the previous snapshot is
+        being served); staleness is the accepted conservative degradation.
+        """
+        return self._snapshot_available
 
     def _push_profitability_summary(self, results: Dict[str, 'ChannelProfitability']) -> None:
         """Push compressed profitability summary to CLN datastore.
@@ -1120,8 +1159,13 @@ class ChannelProfitabilityAnalyzer:
             Tuple of (should_rebalance, reason)
         """
         profitability = self.get_profitability(channel_id)
-        
+
         if not profitability:
+            # Wave2 F1: "the analyzer has no real snapshot" is not "this
+            # channel has no data". Green-lighting rebalance spend exactly
+            # when we know least is the permissive direction — fail closed.
+            if not self._snapshot_available:
+                return False, "profitability_data_unavailable"
             return True, "no_profitability_data"
         
         if profitability.classification == ProfitabilityClass.ZOMBIE:
@@ -1207,7 +1251,16 @@ class ChannelProfitabilityAnalyzer:
 
         if validate_exists:
             # Get current active channel IDs
-            active_channel_ids = set(self._get_all_channels().keys())
+            try:
+                active_channel_ids = set(self._get_all_channels().keys())
+            except Exception as e:
+                # Wave2 F1: cannot verify which channels still exist — report
+                # NO zombies (closure candidates) rather than unverified ones.
+                self.plugin.log(
+                    f"Zombie validation skipped — cannot list channels: {e}",
+                    level='warn'
+                )
+                return []
             # Filter to only include channels that still exist
             zombies = [z for z in zombies if z.channel_id in active_channel_ids]
 
@@ -1224,7 +1277,16 @@ class ChannelProfitabilityAnalyzer:
             Number of entries removed from cache
         """
         # Get current active channel IDs
-        active_channel_ids = set(self._get_all_channels().keys())
+        try:
+            active_channel_ids = set(self._get_all_channels().keys())
+        except Exception as e:
+            # Wave2 F1: with the channel list unavailable, the old {} result
+            # made EVERY cached channel look closed and wiped the whole
+            # profitability cache. Prune nothing this cycle instead.
+            self.plugin.log(
+                f"Prune skipped — cannot list channels: {e}", level='warn'
+            )
+            return 0
 
         # Find closed channels in cache
         cached_ids = set(self._profitability_cache.keys())
@@ -1593,7 +1655,7 @@ class ChannelProfitabilityAnalyzer:
 
         return bleeders
 
-    def identify_bleeders_v2(self, window_days: int = 30) -> List[BleederClassification]:
+    def identify_bleeders_v2(self, window_days: int = 30) -> Optional[List[BleederClassification]]:
         """
         Enhanced bleeder detection with hard/soft classification.
 
@@ -1615,7 +1677,8 @@ class ChannelProfitabilityAnalyzer:
             window_days: Time window for 30-day analysis (default 30, minimum 7)
 
         Returns:
-            List of BleederClassification objects for all channels
+            List of BleederClassification objects for all channels, or None
+            when the pass could not run (Wave2 F1: unavailable != no bleeders)
         """
         # Validate window_days (need at least 7 days for 7d comparison)
         if window_days < 7:
@@ -1789,6 +1852,10 @@ class ChannelProfitabilityAnalyzer:
 
         except Exception as e:
             self.plugin.log(f"Error in identify_bleeders_v2: {e}", level='error')
+            # Wave2 F1: None = "bleeder data unavailable this pass", which is
+            # NOT the same as [] = "no channels are bleeding". Callers must
+            # not cache or act on an unavailable pass as if it were clean.
+            return None
 
         return classifications
 
@@ -1807,11 +1874,22 @@ class ChannelProfitabilityAnalyzer:
         """
         now = time.time()
         if self._bleeder_cache is None or now - self._bleeder_cache_time > 300:
-            # M10 FIX: Set cache before timestamp to prevent a window where
-            # another thread sees a fresh timestamp with stale/None data.
-            new_cache = {c.channel_id: c for c in self.identify_bleeders_v2()}
-            self._bleeder_cache = new_cache
-            self._bleeder_cache_time = now
+            classifications = self.identify_bleeders_v2()
+            if classifications is None:
+                # Wave2 F1: the pass could not run — unavailable is NOT "no
+                # bleeders". Never cache an empty map for 300s (that made
+                # hard-bleeder blocks vanish after one RPC hiccup). Serve the
+                # previous stale-but-real map if one exists; otherwise report
+                # unknown without caching so the next call retries.
+                if self._bleeder_cache is None:
+                    return None
+            else:
+                # M10 FIX: Set cache before timestamp to prevent a window
+                # where another thread sees a fresh timestamp with stale/None
+                # data.
+                new_cache = {c.channel_id: c for c in classifications}
+                self._bleeder_cache = new_cache
+                self._bleeder_cache_time = now
         return self._bleeder_cache.get(normalize_scid(channel_id))
 
     def calculate_roc(self, window_days: int = 30) -> Dict[str, Any]:
@@ -1960,8 +2038,13 @@ class ChannelProfitabilityAnalyzer:
                 }
                 
         except Exception as e:
+            # Wave2 F1: do NOT swallow to {} — an RPC outage is not "the node
+            # has no channels". Callers that can tolerate a missing snapshot
+            # catch this and degrade conservatively (serve stale data, skip
+            # pruning, report bleeder status as unavailable).
             self.plugin.log(f"Error getting channels: {e}", level='error')
-        
+            raise
+
         return channels
     
     def _get_channel_open_timestamp(self, channel_id: str, funding_txid: str) -> int:

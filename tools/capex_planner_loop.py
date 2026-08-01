@@ -214,13 +214,17 @@ def _baseline_results(*, min_annual_roi_pct: float) -> list[ScenarioResult]:
             feerate_perkb=1000,
             expect_positive=True,
         ),
+        # Wave2 F5: the history-less fallback is now the conservative
+        # bootstrap prior (2 ppm/day, low end of observed reality), not the
+        # legacy 45 ppm/day fantasy — pure speculation must NOT clear the
+        # default capital hurdle.
         _ev_scenario(
-            name="new_peer_fallback_clears_default_hurdle",
+            name="new_peer_bootstrap_respects_default_hurdle",
             closed_daily_net_sats=None,
             channel_size_sats=5_000_000,
             min_annual_roi_pct=min_annual_roi_pct,
             feerate_perkb=1000,
-            expect_positive=True,
+            expect_positive=False,
         ),
         _ev_scenario(
             name="high_onchain_fee_rejected",
