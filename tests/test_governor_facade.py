@@ -105,6 +105,74 @@ def test_ledger_records_authorization(tmp_path):
     assert state.reserved_msat == {}  # released
 
 
+class _FailingLedger:
+    """Ledger stub whose append always raises (lock timeout / disk full).
+
+    Only `append` is exercised by the facade paths under test."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    def append(self, **kwargs):
+        self.attempts += 1
+        import sqlite3
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_ledger_append_failure_does_not_block_authorization():
+    """A ledger journaling failure AFTER the reservation committed must
+    neither refuse the intent nor strand the reservation: the
+    spend_reservations DB is the authority, the ledger a shadow journal
+    (the hourly reconciler heals ledger-missing-reservation divergence)."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        db = Database(path, MagicMock())
+        db.initialize()
+        ledger = _FailingLedger()
+
+        def reserve(**kwargs):
+            return db.reserve_spend(
+                reservation_id=kwargs["reservation_id"],
+                amount_sats=kwargs["amount_sats"],
+                category=kwargs["category"],
+                effective_budget_sats=100,
+            )
+
+        facade = GovernorFacade(
+            reserve_spend=reserve,
+            release_spend=lambda reservation_id: db.release_spend_reservation(
+                reservation_id),
+            is_paused=lambda: False,
+        )
+        facade._ledger = ledger
+
+        decision = facade.authorize(_intent(), NOW)
+        assert decision.authorized
+        assert decision.token is not None
+        assert decision.reason_code == ""
+        assert ledger.attempts >= 1  # append was attempted, and raised
+
+        # The reservation is live and owned by the caller via the token —
+        # release must succeed even though its ledger append also raises.
+        assert facade.release(decision.token, NOW + 10)
+        row = db._get_connection().execute(
+            "SELECT status FROM spend_reservations WHERE reservation_id = ?",
+            (decision.token.reservation_id,)).fetchone()
+        assert row is not None and row["status"] != "active"
+    finally:
+        os.unlink(path)
+
+
+def test_ledger_append_failure_does_not_block_release():
+    release = MagicMock(return_value=True)
+    facade = _facade(release=release, ledger=None)
+    decision = facade.authorize(_intent(), NOW)
+    facade._ledger = _FailingLedger()
+    assert facade.release(decision.token, NOW + 10)
+    release.assert_called_once_with(decision.token.reservation_id)
+
+
 def test_release_delegates():
     release = MagicMock(return_value=True)
     facade = _facade(release=release)

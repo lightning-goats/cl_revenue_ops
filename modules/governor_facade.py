@@ -21,6 +21,7 @@ authorizations and reservations are recorded as events.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -33,6 +34,8 @@ from .econ_types import UnixTime
 # AUTHORITY_LEVEL_BLOCKED. Unknown configured values fail CLOSED to
 # 'observe' (a typo must never grant authority).
 AUTHORITY_LEVELS = {"observe": 0, "fees": 1, "liquidity": 2, "capital": 3}
+
+_log = logging.getLogger("cl-revenue-ops.governor_facade")
 
 
 def authority_allows(configured_level, required_level: str) -> bool:
@@ -143,26 +146,41 @@ class GovernorFacade:
             arbitration_key=env.idempotency_key,
         )
         if self._ledger is not None:
-            self._ledger.append(
-                event_type="intent_authorized",
-                intent_id=env.intent_id.value,
-                idempotency_key=env.idempotency_key,
-                cycle_id=env.snapshot_id,
-                at=now,
-                amounts={"max_cost_msat": env.max_cost_msat.value},
-            )
-            if token.reserved_msat > 0:
-                # Zero-cost intents (reversible fee/HTLC changes) are
-                # authorized without a reservation — recording one would
-                # misstate the ledger.
+            # Best-effort, like the rejection-path append above: the
+            # reservation is already COMMITTED in spend_reservations (the
+            # authority — the ledger is a shadow journal, and the hourly
+            # reconciler heals ledger-missing-reservation divergence). If
+            # the append raised here, the caller's fail-closed handler
+            # would report "not authorized" and never execute OR release,
+            # stranding the active reservation and pinning the unified
+            # budget until the stale sweep.
+            try:
                 self._ledger.append(
-                    event_type="budget_reserved",
+                    event_type="intent_authorized",
                     intent_id=env.intent_id.value,
-                    idempotency_key=effective_reservation_id,
+                    idempotency_key=env.idempotency_key,
                     cycle_id=env.snapshot_id,
                     at=now,
-                    amounts={"reserved_msat": token.reserved_msat},
+                    amounts={"max_cost_msat": env.max_cost_msat.value},
                 )
+                if token.reserved_msat > 0:
+                    # Zero-cost intents (reversible fee/HTLC changes) are
+                    # authorized without a reservation — recording one would
+                    # misstate the ledger.
+                    self._ledger.append(
+                        event_type="budget_reserved",
+                        intent_id=env.intent_id.value,
+                        idempotency_key=effective_reservation_id,
+                        cycle_id=env.snapshot_id,
+                        at=now,
+                        amounts={"reserved_msat": token.reserved_msat},
+                    )
+            except Exception as e:
+                _log.error(
+                    "ledger append failed after reservation %s committed "
+                    "(intent %s): %s — proceeding; the hourly reconciler "
+                    "will heal the journal",
+                    effective_reservation_id, env.intent_id.value, e)
         return GovernorDecision(True, token, "")
 
     def release(self, token: AuthorizationToken, now: int) -> bool:
@@ -174,12 +192,21 @@ class GovernorFacade:
                 pass
         released = bool(self._release_spend(token.reservation_id))
         if self._ledger is not None:
-            self._ledger.append(
-                event_type="reservation_released",
-                intent_id=token.intent_id,
-                idempotency_key=token.reservation_id,
-                cycle_id="release",
-                at=now,
-                amounts={"released_msat": token.reserved_msat},
-            )
+            # Best-effort for the same reason as in authorize(): the
+            # release already committed; raising here would make the
+            # caller believe the release failed.
+            try:
+                self._ledger.append(
+                    event_type="reservation_released",
+                    intent_id=token.intent_id,
+                    idempotency_key=token.reservation_id,
+                    cycle_id="release",
+                    at=now,
+                    amounts={"released_msat": token.reserved_msat},
+                )
+            except Exception as e:
+                _log.error(
+                    "ledger append failed after reservation %s released: "
+                    "%s — proceeding; the hourly reconciler will heal "
+                    "the journal", token.reservation_id, e)
         return released
