@@ -262,6 +262,32 @@ class RebalanceEngine:
         with self._inflight_lock:
             return set(self._inflight_dests)
 
+    def _pending_settlement_dest_snapshot(self) -> set:
+        """Destinations with a parked 'pending_settlement' rebalance row.
+
+        Extends P4-008 across worker lifetimes: _inflight_dests protects a
+        destination only while its worker thread is alive, but a payment
+        parked as pending_settlement (waitsendpay timeout) can still settle
+        hours later. Until reconcile_pending_settlements resolves the row,
+        the destination must not be paid again — same "never pay again on
+        top" invariant as P8-001. Resolution (success/failed) removes the
+        row from this query, so eligibility returns naturally.
+        """
+        if self.database is None:
+            return set()
+        getter = getattr(
+            self.database, "get_pending_settlement_dest_channels", None
+        )
+        if getter is None:
+            return set()
+        try:
+            return {str(dest) for dest in (getter() or []) if dest}
+        except Exception as exc:
+            self._log(
+                f"pending settlement dest query failed: {exc}", level="warn"
+            )
+            return set()
+
     def _probe_askrene(self) -> bool:
         """One-shot probe: does this CLN instance have askrene loaded?"""
         try:
@@ -1271,8 +1297,15 @@ class RebalanceEngine:
         # destination a second time once the cycle lock is released. The orphan
         # clears its own entry when it finally completes, so the dest becomes
         # selectable again on a later cycle — no permanent suppression, no wait.
+        # Same invariant across worker lifetimes: a dest whose payment is
+        # parked as pending_settlement (worker gone, HTLC possibly still in
+        # flight for hours) must not be paid again until the reconcile sweep
+        # resolves the row. One DB query per cycle.
         inflight_dests = self._inflight_dest_snapshot()
-        if inflight_dests and plan.selected:
+        pending_dests = (
+            self._pending_settlement_dest_snapshot() if plan.selected else set()
+        )
+        if (inflight_dests or pending_dests) and plan.selected:
             kept_selected: List[PairCandidate] = []
             for pair in plan.selected:
                 dest_id = str(getattr(pair, "dest_channel_id", "") or "")
@@ -1287,6 +1320,20 @@ class RebalanceEngine:
                         detail=(
                             f"src={pair.source_channel_id} dest has an "
                             "in-flight/unresolved payment from a prior cycle"
+                        ),
+                    ))
+                    continue
+                if dest_id in pending_dests:
+                    plan.skipped.append(SkipRecord(
+                        channel_id=pair.dest_channel_id,
+                        reason="dest_pending_settlement",
+                        value_class="valuable",
+                        remaining_budget_sats=int(
+                            getattr(pair, "pair_budget_sats", 0) or 0
+                        ),
+                        detail=(
+                            f"src={pair.source_channel_id} dest has a parked "
+                            "pending_settlement payment awaiting reconciliation"
                         ),
                     ))
                     continue
@@ -3319,6 +3366,16 @@ class RebalanceEngine:
             return ExecutionResult(
                 success=False,
                 error="dest_inflight",
+                amount_sats=amount_sats,
+                route_type=self._executor_mode(),
+            )
+        # Pending-settlement extension of P4-008: the worker (and its
+        # _inflight_dests entry) is gone, but the parked payment's HTLC can
+        # still settle. Paying again would double-fill the destination.
+        if dest_channel_id in self._pending_settlement_dest_snapshot():
+            return ExecutionResult(
+                success=False,
+                error="dest_pending_settlement",
                 amount_sats=amount_sats,
                 route_type=self._executor_mode(),
             )

@@ -2541,6 +2541,28 @@ class Database:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_pending_settlement_dest_channels(self) -> List[str]:
+        """Destination channels with a live sweepable 'pending_settlement' row.
+
+        The engine excludes these from rebalance destination selection: the
+        parked payment's HTLC can still settle hours later, and paying a
+        second invoice into the same destination meanwhile would double-fill
+        it and pay both fees. Mirrors the reconcile sweep's payment_hash
+        filter so an un-sweepable row (which the sweep can never resolve)
+        cannot block its destination forever. The idx_rh_pending_settlement
+        partial index keeps this a scan of the (tiny) pending partition.
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            """
+            SELECT DISTINCT to_channel
+            FROM rebalance_history
+            WHERE status = 'pending_settlement'
+                  AND payment_hash IS NOT NULL AND payment_hash != ''
+            """
+        ).fetchall()
+        return [str(row[0]) for row in rows if row[0]]
+
     def get_last_post_rebalance_state(
         self, channel_id: str
     ) -> Optional[Dict[str, Any]]:

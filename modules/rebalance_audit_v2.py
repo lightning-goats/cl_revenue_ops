@@ -54,6 +54,10 @@ VALID_SKIP_REASONS: frozenset[str] = frozenset({
     # P4-008 in-flight-destination guard: a prior cycle's still-running
     # (possibly orphaned) worker holds an unresolved payment to this dest.
     "dest_inflight",
+    # Pending-settlement extension of P4-008: a prior payment to this dest
+    # is parked as 'pending_settlement' (worker gone, HTLC may still settle)
+    # until reconcile_pending_settlements resolves it.
+    "dest_pending_settlement",
     # Produced by the engine's lazy policy gate (rebalance_mode/tags)
     "policy_blocked",
     # Produced by the v3 askrene router specifically
