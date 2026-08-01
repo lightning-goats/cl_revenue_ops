@@ -149,6 +149,8 @@ RPC_HANDLER_FUNCS = {
     "revenue_boltz_expansion_treasury_status",
     "revenue_boltz_expansion_treasury_recommendations",
     "revenue_boltz_expansion_treasury_cycle",
+    # Phase C dispatchers (operator-surface reduction 2026-08-01).
+    "revenue_boltz", "revenue_cycle", "revenue_planner", "revenue_budget",
 }
 
 
@@ -174,8 +176,9 @@ def test_handler_discovery_covers_full_surface(mod):
     found = {s[0] for s in specs}
     missing = RPC_HANDLER_FUNCS - found
     assert not missing, f"handlers not discovered: {sorted(missing)}"
-    # 57 handlers is the current full surface.
-    assert len(found) == len(RPC_HANDLER_FUNCS) == 57
+    # 61 handlers is the current full surface (57 + the 4 Phase C
+    # dispatchers added 2026-08-01).
+    assert len(found) == len(RPC_HANDLER_FUNCS) == 61
 
 
 def test_param_matrix_no_leaks(mod):

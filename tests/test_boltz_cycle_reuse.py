@@ -120,7 +120,11 @@ class TestBalanceCyclePendingShortCircuit:
 
         result = mod.revenue_boltz_balance_cycle(mod.plugin, dry_run=True, max_actions=2)
 
-        assert result == {"status": "dry_run"}
+        assert result == {
+            "status": "dry_run",
+            # Phase C 2026-08-01: old name is a deprecated alias.
+            "deprecation": mod._alias_deprecation_notice("revenue-boltz balance-cycle"),
+        }
         kwargs = mod._execute_boltz_balance_cycle.call_args.kwargs
         assert kwargs["dry_run"] is True
         assert kwargs["max_actions"] == 2
@@ -309,7 +313,11 @@ class TestTreasuryCyclePlanReuse:
             mod.plugin, dry_run=True, max_actions=2
         )
 
-        assert result == {"status": "dry_run"}
+        assert result == {
+            "status": "dry_run",
+            # Phase C 2026-08-01: old name is a deprecated alias.
+            "deprecation": mod._alias_deprecation_notice("revenue-boltz treasury-cycle"),
+        }
         kwargs = mod._execute_boltz_expansion_treasury_cycle.call_args.kwargs
         assert kwargs["dry_run"] is True
         assert kwargs["max_actions"] == 2

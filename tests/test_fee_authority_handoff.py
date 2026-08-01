@@ -777,6 +777,8 @@ def test_fee_cycle_rpc_preserves_outer_shape_when_authority_is_disabled():
         "operation": "revenue-fee-cycle",
         "generation": 1,
         "transitioned_at": 10_000,
+        # Phase C 2026-08-01: old name is a deprecated alias.
+        "deprecation": mod._alias_deprecation_notice("revenue-cycle fees"),
     }
     mod.run_fee_adjustment.assert_not_called()
     mod.revenue_fee_debug.assert_not_called()
@@ -797,6 +799,8 @@ def test_wake_all_rpc_preserves_outer_shape_without_mutating_controller_state():
         "operation": "revenue-wake-all",
         "generation": 1,
         "transitioned_at": 10_000,
+        # Phase C 2026-08-01: old name is a deprecated alias.
+        "deprecation": mod._alias_deprecation_notice("revenue-cycle all"),
     }
     mod.fee_controller.wake_all_sleeping_channels.assert_not_called()
 
@@ -870,6 +874,8 @@ def test_fee_cycle_rpc_holds_outer_lease_across_delegation_during_drain():
         "ok": True,
         "adjusted_channels": 1,
         "fee_debug": {"summary": {"total": 1}},
+        # Phase C 2026-08-01: old name is a deprecated alias.
+        "deprecation": mod._alias_deprecation_notice("revenue-cycle fees"),
     }]
     assert mutations == ["fee-cycle"]
     assert nested_denials == [None]
@@ -889,6 +895,7 @@ def test_fee_cycle_rpc_holds_outer_lease_across_delegation_during_drain():
         "operation": "revenue-fee-cycle",
         "generation": 1,
         "transitioned_at": 10_100,
+        "deprecation": mod._alias_deprecation_notice("revenue-cycle fees"),
     }
     assert mutations == ["fee-cycle"]
     mod.revenue_fee_debug.assert_called_once_with(mod.plugin)
@@ -966,6 +973,8 @@ def test_wake_all_rpc_holds_outer_lease_across_delegation_during_drain():
             "Woke 1 sleeping channel(s). They will be evaluated on the next "
             "fee cycle."
         ),
+        # Phase C 2026-08-01: old name is a deprecated alias.
+        "deprecation": mod._alias_deprecation_notice("revenue-cycle all"),
     }]
     assert mutations == ["wake-all"]
     assert nested_denials == [None]
@@ -984,6 +993,7 @@ def test_wake_all_rpc_holds_outer_lease_across_delegation_during_drain():
         "operation": "revenue-wake-all",
         "generation": 1,
         "transitioned_at": 10_200,
+        "deprecation": mod._alias_deprecation_notice("revenue-cycle all"),
     }
     assert mutations == ["wake-all"]
     mod.fee_controller.wake_all_sleeping_channels.assert_called_once_with()

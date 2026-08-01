@@ -276,15 +276,35 @@ lightning-cli revenue-config set daily_budget_sats 10000
 | `revenue-config get` | Inspect current runtime controls |
 | `revenue-config set <key> <value>` | Change one of the supported runtime controls |
 | `revenue-profitability [channel_id]` | Per-channel profitability with sourced metrics and flow profiles |
-| `revenue-analyze` | Trigger immediate analysis |
-| `revenue-wake-all` | Wake the background loops immediately |
-| `revenue-planner-candidate-sources` | Diagnostic: candidate pipeline strategy breakdown |
+| `revenue-cycle <subsystem>` | Run one manual cycle: `fees`, `rebalance`, `flow`, `planner`, `boltz`, or `all` (wake everything) |
+| `revenue-planner <view>` | Planner reads: `status` (default), `candidates`, `sources`, `history`, `report` |
+| `revenue-budget [section]` | Unified budget view (total_cost + capex + boltz sections); `revenue-budget ledger` for the spend ledger |
+| `revenue-boltz <verb>` | All Boltz swap operations (`quote`, `loop-out`, `wallet`, `treasury-status`, ... — 22 verbs, 1:1 with the old `revenue-boltz-*` names) |
+| `revenue-policy ban\|unban\|list-banned <peer_id>` | Operator peer bans (was `revenue-ban`/`revenue-unban`/`revenue-list-banned`) |
 | `revenue-profile-preview [name]` | Diagnostic: risk-profile diff/comparison before activation |
 | `revenue-econ-snapshot` | Diagnostic: the canonical economic snapshot (governance core) |
 | `revenue-econ-reconcile` | Diagnostic: ledger-vs-reservations reconciliation state |
 | `revenue-econ-cycle` | Diagnostic: deterministic shadow economic cycle |
 
 See [docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md) for the full action/mutation RPC inventory across all subsystems (fees, rebalancing, planner, Boltz, LN+).
+
+### Deprecated RPC aliases (window ends 2026-09-05)
+
+The dispatcher commands above (`revenue-cycle`, `revenue-planner`,
+`revenue-budget`, `revenue-boltz`, and the `revenue-policy
+ban|unban|list-banned` actions) are the primary names as of 2026-08-01
+([operator-surface reduction](docs/audits/OPERATOR_SURFACE_REDUCTION_2026-08-01.md)).
+The old standalone names — every `revenue-boltz-*` method,
+`revenue-fee-cycle`, `revenue-rebalance-cycle`, `revenue-analyze`,
+`revenue-wake-all`, `revenue-planner-execute`, `revenue-planner-status`,
+`revenue-planner-candidates`, `revenue-planner-candidate-sources`,
+`revenue-planner-history`, `revenue-capacity-report`,
+`revenue-total-cost-budget`, `revenue-capex-status`, `revenue-spend-ledger`,
+`revenue-ban`, `revenue-unban`, `revenue-list-banned` — keep working as
+deprecated aliases until **2026-09-05**; each alias response carries a
+`deprecation` field naming its replacement. Migrate scripts to the
+dispatcher forms before that date (announcement:
+[contract-compatibility-policy.md](docs/refactor/phase0/contract-compatibility-policy.md)).
 
 ### revenue-config: actions and override precedence
 

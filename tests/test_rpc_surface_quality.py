@@ -37,7 +37,11 @@ class TestBoltzStatusUsageError:
         manager = MagicMock()
         manager.swap_status.return_value = {"status": "ok"}
         monkeypatch.setattr(mod, "_require_boltz_manager", lambda: manager)
-        assert mod.revenue_boltz_status(MagicMock(), "abc123") == {"status": "ok"}
+        assert mod.revenue_boltz_status(MagicMock(), "abc123") == {
+            "status": "ok",
+            # Phase C 2026-08-01: old name is a deprecated alias.
+            "deprecation": mod._alias_deprecation_notice("revenue-boltz status"),
+        }
         manager.swap_status.assert_called_once_with("abc123")
 
 

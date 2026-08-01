@@ -1195,8 +1195,8 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-min-fee-ppm',
-    default='10',
-    description='Minimum fee floor in PPM (default: 10)'
+    default='50',
+    description='Minimum fee floor in PPM (default: 50)'
 )
 
 plugin.add_option(
@@ -1745,8 +1745,8 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-enable-dynamic-htlcmax',
-    default='false',
-    description='Enable the dynamic htlc_max flow valve: scale each channel max HTLC by flow state (sinks tightest). Default: false'
+    default='true',
+    description='Enable the dynamic htlc_max flow valve: scale each channel max HTLC by flow state (sinks tightest). Default: true'
 )
 
 plugin.add_option(
@@ -1851,8 +1851,8 @@ plugin.add_option(
 )
 plugin.add_option(
     name='revenue-ops-planner-min-channel-sats',
-    default='500000',
-    description='Minimum channel size in sats for automated opens (default: 500000)'
+    default='1000000',
+    description='Minimum channel size in sats for automated opens (default: 1000000)'
 )
 plugin.add_option(
     name='revenue-ops-planner-max-channel-sats',
@@ -2553,7 +2553,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         drain_fee_discount_max=_safe_float_opt('revenue-ops-drain-fee-discount-max', '0.0'),
         node_drain_bias_enabled=options.get('revenue-ops-node-drain-bias-enabled', 'false').lower() == 'true',
         node_drain_bias_max=_safe_float_opt('revenue-ops-node-drain-bias-max', '0.3'),
-        enable_dynamic_htlcmax=options.get('revenue-ops-enable-dynamic-htlcmax', 'false').lower() == 'true',
+        enable_dynamic_htlcmax=options.get('revenue-ops-enable-dynamic-htlcmax', 'true').lower() == 'true',
         htlcmax_source_pct=_safe_float_opt('revenue-ops-htlcmax-source-pct', '0.50'),
         htlcmax_sink_pct=_safe_float_opt('revenue-ops-htlcmax-sink-pct', '0.25'),
         htlcmax_balanced_pct=_safe_float_opt('revenue-ops-htlcmax-balanced-pct', '0.45'),
@@ -3817,8 +3817,90 @@ def run_rebalance_check():
         raise
 
 
-@plugin.method("revenue-rebalance-cycle")
-def revenue_rebalance_cycle(plugin: Plugin, max_candidates: int = 20) -> Dict[str, Any]:
+# =============================================================================
+# Phase C (operator-surface reduction 2026-08-01): deprecated-alias plumbing.
+#
+# The dispatcher RPCs (revenue-boltz / revenue-cycle / revenue-planner /
+# revenue-budget, plus the ban actions on revenue-policy) are the primary
+# operator names. Every pre-existing name keeps working as a thin forwarding
+# alias whose dict response gains ONLY an additive `deprecation` field; the
+# alias window ends 2026-09-05. See
+# docs/audits/OPERATOR_SURFACE_REDUCTION_2026-08-01.md (§1, §4) and the
+# 2026-08-01 announcement in
+# docs/refactor/phase0/contract-compatibility-policy.md.
+# =============================================================================
+
+_SURFACE_REDUCTION_DOC = "docs/audits/OPERATOR_SURFACE_REDUCTION_2026-08-01.md"
+_RPC_ALIAS_REMOVAL_DATE = "2026-09-05"
+
+
+def _alias_deprecation_notice(new_name: str) -> str:
+    """Deprecation text for an old RPC name renamed to a dispatcher form."""
+    return (
+        f"renamed to '{new_name}' — this name is scheduled for removal "
+        f"{_RPC_ALIAS_REMOVAL_DATE}; see {_SURFACE_REDUCTION_DOC}"
+    )
+
+
+def _removal_deprecation_notice() -> str:
+    """Deprecation text for the ignore trio (removed without a rename)."""
+    return (
+        f"scheduled for removal {_RPC_ALIAS_REMOVAL_DATE} with no replacement "
+        f"— revenue-policy actions cover it; see {_SURFACE_REDUCTION_DOC}"
+    )
+
+
+def _deprecated_alias(result: Any, new_name: str) -> Any:
+    """ADD the `deprecation` field to an old-name RPC response.
+
+    Additive only: never changes the response shape otherwise, and never
+    mutates the helper's dict in place (helpers may return shared state).
+    Dispatcher responses never pass through here, so the new names stay
+    deprecation-free.
+    """
+    if isinstance(result, dict) and "deprecation" not in result:
+        out = dict(result)
+        out["deprecation"] = _alias_deprecation_notice(new_name)
+        return out
+    return result
+
+
+def _deprecated_removal(result: Any) -> Any:
+    """ADD the `deprecation` field to a response of an RPC slated for
+    removal with no replacement (the ignore trio)."""
+    if isinstance(result, dict) and "deprecation" not in result:
+        out = dict(result)
+        out["deprecation"] = _removal_deprecation_notice()
+        return out
+    return result
+
+
+def _dispatch_subcommand(plugin: Plugin, rpc_name: str, arg_label: str,
+                         table: Dict[str, Any], subcommand: Any,
+                         kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Shared dispatcher core: route `<rpc_name> <subcommand>` onto the same
+    helper the old standalone method calls. Unknown subcommands return the
+    list of valid ones instead of raising."""
+    key = str(subcommand or "").strip().lower()
+    handler = table.get(key)
+    if handler is None:
+        valid = sorted(table)
+        return {
+            "error": (
+                f"Unknown {arg_label} '{subcommand}' for {rpc_name}. "
+                f"Valid {arg_label}s: {', '.join(valid)}"
+            ),
+            f"valid_{arg_label}s": valid,
+        }
+    try:
+        return handler(plugin, **kwargs)
+    except TypeError as e:
+        # Bad passthrough kwargs bind-fail here; the helpers themselves
+        # catch their own runtime errors and return error dicts.
+        return {"error": f"Invalid arguments for '{rpc_name} {key}': {e}"}
+
+
+def _rpc_rebalance_cycle(plugin: Plugin, max_candidates: int = 20) -> Dict[str, Any]:
     """Run one automatic rebalance cycle immediately and return debug state."""
     if rebalancer is None:
         return {"error": "Rebalancer not initialized"}
@@ -3837,6 +3919,15 @@ def revenue_rebalance_cycle(plugin: Plugin, max_candidates: int = 20) -> Dict[st
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+@plugin.method("revenue-rebalance-cycle")
+def revenue_rebalance_cycle(plugin: Plugin, max_candidates: int = 20) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-cycle rebalance' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_rebalance_cycle(plugin, max_candidates=max_candidates),
+        "revenue-cycle rebalance",
+    )
 
 
 # =============================================================================
@@ -4511,8 +4602,7 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     return result
 
 
-@plugin.method("revenue-fee-cycle")
-def revenue_fee_cycle(plugin: Plugin) -> Dict[str, Any]:
+def _rpc_fee_cycle(plugin: Plugin) -> Dict[str, Any]:
     """Run one fee adjustment cycle immediately."""
     with fee_authority_gate.execution_lease(
         "revenue-fee-cycle"
@@ -4532,8 +4622,13 @@ def revenue_fee_cycle(plugin: Plugin) -> Dict[str, Any]:
         }
 
 
-@plugin.method("revenue-analyze")
-def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[str, Any]:
+@plugin.method("revenue-fee-cycle")
+def revenue_fee_cycle(plugin: Plugin) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-cycle fees' (removal 2026-09-05)."""
+    return _deprecated_alias(_rpc_fee_cycle(plugin), "revenue-cycle fees")
+
+
+def _rpc_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Run flow analysis on demand (optionally for a specific channel).
 
@@ -4563,8 +4658,15 @@ def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[st
         return {"status": "Flow analysis triggered"}
 
 
-@plugin.method("revenue-wake-all")
-def revenue_wake_all(plugin: Plugin) -> Dict[str, Any]:
+@plugin.method("revenue-analyze")
+def revenue_analyze(plugin: Plugin, channel_id: Optional[str] = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-cycle flow' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_analyze(plugin, channel_id=channel_id), "revenue-cycle flow"
+    )
+
+
+def _rpc_wake_all(plugin: Plugin) -> Dict[str, Any]:
     """
     Wake all sleeping channels immediately.
 
@@ -4593,8 +4695,13 @@ def revenue_wake_all(plugin: Plugin) -> Dict[str, Any]:
         }
 
 
-@plugin.method("revenue-capacity-report")
-def revenue_capacity_report(plugin: Plugin, **kwargs):
+@plugin.method("revenue-wake-all")
+def revenue_wake_all(plugin: Plugin) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-cycle all' (removal 2026-09-05)."""
+    return _deprecated_alias(_rpc_wake_all(plugin), "revenue-cycle all")
+
+
+def _rpc_capacity_report(plugin: Plugin, **kwargs):
     """
     Generate a strategic capital redeployment report.
 
@@ -4611,12 +4718,25 @@ def revenue_capacity_report(plugin: Plugin, **kwargs):
         return {"error": f"Report generation failed: {e}"}
 
 
-@plugin.method("revenue-planner-status")
-def revenue_planner_status(plugin: Plugin) -> Dict[str, Any]:
+@plugin.method("revenue-capacity-report")
+def revenue_capacity_report(plugin: Plugin, **kwargs):
+    """Deprecated alias for 'revenue-planner report' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_capacity_report(plugin, **kwargs), "revenue-planner report"
+    )
+
+
+def _rpc_planner_status(plugin: Plugin) -> Dict[str, Any]:
     """Get capacity planner status — pending actions, last cycle result, config."""
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
     return capacity_planner.get_status()
+
+
+@plugin.method("revenue-planner-status")
+def revenue_planner_status(plugin: Plugin) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-planner status' (removal 2026-09-05)."""
+    return _deprecated_alias(_rpc_planner_status(plugin), "revenue-planner status")
 
 
 @plugin.method("revenue-lnplus-status")
@@ -4692,16 +4812,22 @@ def revenue_lnplus_backfill(plugin: Plugin, **_unused: Any) -> Dict[str, Any]:
     return lnplus_lifecycle.backfill_from_lnplus()
 
 
-@plugin.method("revenue-planner-candidate-sources")
-def planner_candidate_sources(plugin: Plugin):
+def _rpc_planner_candidate_sources(plugin: Plugin):
     """Show strategy distribution of the current candidate pool."""
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
     return capacity_planner.get_candidate_sources()
 
 
-@plugin.method("revenue-planner-candidates")
-def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
+@plugin.method("revenue-planner-candidate-sources")
+def planner_candidate_sources(plugin: Plugin):
+    """Deprecated alias for 'revenue-planner sources' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_planner_candidate_sources(plugin), "revenue-planner sources"
+    )
+
+
+def _rpc_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
     """List scored peer candidates for channel opens."""
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
@@ -4716,16 +4842,28 @@ def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any
     }
 
 
-@plugin.method("revenue-planner-execute")
-def revenue_planner_execute(plugin: Plugin) -> Dict[str, Any]:
+@plugin.method("revenue-planner-candidates")
+def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-planner candidates' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_planner_candidates(plugin, limit=limit), "revenue-planner candidates"
+    )
+
+
+def _rpc_planner_execute(plugin: Plugin) -> Dict[str, Any]:
     """Manually trigger a capacity planner cycle."""
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
     return capacity_planner.execute_cycle()
 
 
-@plugin.method("revenue-planner-history")
-def revenue_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
+@plugin.method("revenue-planner-execute")
+def revenue_planner_execute(plugin: Plugin) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-cycle planner' (removal 2026-09-05)."""
+    return _deprecated_alias(_rpc_planner_execute(plugin), "revenue-cycle planner")
+
+
+def _rpc_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
     """Get audit log of past planner actions."""
     if capacity_planner is None:
         return {"error": "Capacity planner not initialized"}
@@ -4735,6 +4873,14 @@ def revenue_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
         return {"error": str(e)}
     actions = database.get_planner_actions(limit=limit)
     return {"actions": actions, "count": len(actions)}
+
+
+@plugin.method("revenue-planner-history")
+def revenue_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-planner history' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_planner_history(plugin, limit=limit), "revenue-planner history"
+    )
 
 
 @plugin.method("revenue-set-fee")
@@ -5145,8 +5291,7 @@ def _policy_write_override(kwargs: Dict[str, Any]) -> bool:
     return _truthy(kwargs.get("internal")) or _truthy(kwargs.get("admin"))
 
 
-@plugin.method("revenue-ignore")
-def revenue_ignore(plugin: Plugin, peer_id: str, reason: str = "manual", **kwargs) -> Dict[str, Any]:
+def _rpc_ignore(plugin: Plugin, peer_id: str, reason: str = "manual", **kwargs) -> Dict[str, Any]:
     """
     DEPRECATED: Use 'revenue-policy set <peer_id> strategy=passive rebalance=disabled' instead.
 
@@ -5193,8 +5338,13 @@ def revenue_ignore(plugin: Plugin, peer_id: str, reason: str = "manual", **kwarg
         return {"status": "error", "error": str(e)}
 
 
-@plugin.method("revenue-unignore")
-def revenue_unignore(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
+@plugin.method("revenue-ignore")
+def revenue_ignore(plugin: Plugin, peer_id: str, reason: str = "manual", **kwargs) -> Dict[str, Any]:
+    """DEPRECATED (removal 2026-09-05, no replacement — revenue-policy covers it)."""
+    return _deprecated_removal(_rpc_ignore(plugin, peer_id, reason=reason, **kwargs))
+
+
+def _rpc_unignore(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
     """
     DEPRECATED: Use 'revenue-policy delete <peer_id>' instead.
 
@@ -5231,8 +5381,13 @@ def revenue_unignore(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
     }
 
 
-@plugin.method("revenue-list-ignored")
-def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
+@plugin.method("revenue-unignore")
+def revenue_unignore(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
+    """DEPRECATED (removal 2026-09-05, no replacement — revenue-policy covers it)."""
+    return _deprecated_removal(_rpc_unignore(plugin, peer_id, **kwargs))
+
+
+def _rpc_list_ignored(plugin: Plugin) -> Dict[str, Any]:
     """
     DEPRECATED: Use 'revenue-policy list' or 'revenue-report policies' instead.
     
@@ -5264,8 +5419,13 @@ def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
     }
 
 
-@plugin.method("revenue-ban")
-def revenue_ban(plugin: Plugin, peer_id: str, reason: str = "operator", **kwargs) -> Dict[str, Any]:
+@plugin.method("revenue-list-ignored")
+def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
+    """DEPRECATED (removal 2026-09-05, no replacement — revenue-policy covers it)."""
+    return _deprecated_removal(_rpc_list_ignored(plugin))
+
+
+def _rpc_ban(plugin: Plugin, peer_id: str, reason: str = "operator", **kwargs) -> Dict[str, Any]:
     """
     Ban a peer: the planner will never open channels to it, the LN+
     evaluator rejects any swap that includes it, and fee/rebalance
@@ -5298,8 +5458,15 @@ def revenue_ban(plugin: Plugin, peer_id: str, reason: str = "operator", **kwargs
     }
 
 
-@plugin.method("revenue-unban")
-def revenue_unban(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
+@plugin.method("revenue-ban")
+def revenue_ban(plugin: Plugin, peer_id: str, reason: str = "operator", **kwargs) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-policy ban' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_ban(plugin, peer_id, reason=reason, **kwargs), "revenue-policy ban"
+    )
+
+
+def _rpc_unban(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
     """
     Lift an operator ban set by revenue-ban. The peer returns to dynamic
     fee management with rebalancing enabled; other tags are preserved.
@@ -5323,9 +5490,16 @@ def revenue_unban(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
     }
 
 
-@plugin.method("revenue-list-banned")
-def revenue_list_banned(plugin: Plugin) -> Dict[str, Any]:
-    """List all operator-banned peers (revenue-ban)."""
+@plugin.method("revenue-unban")
+def revenue_unban(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-policy unban' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_unban(plugin, peer_id, **kwargs), "revenue-policy unban"
+    )
+
+
+def _rpc_list_banned(plugin: Plugin) -> Dict[str, Any]:
+    """List all operator-banned peers."""
     if policy_manager is None:
         return {"error": "Plugin not initialized"}
     banned = [
@@ -5333,6 +5507,12 @@ def revenue_list_banned(plugin: Plugin) -> Dict[str, Any]:
         for p in policy_manager.get_peers_by_tag(BANNED_TAG)
     ]
     return {"banned_peers": banned, "count": len(banned)}
+
+
+@plugin.method("revenue-list-banned")
+def revenue_list_banned(plugin: Plugin) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-policy list-banned' (removal 2026-09-05)."""
+    return _deprecated_alias(_rpc_list_banned(plugin), "revenue-policy list-banned")
 
 
 
@@ -5359,6 +5539,9 @@ def revenue_policy(plugin: Plugin, action: str = "list", peer_id: str = None,
       lightning-cli revenue-policy get <peer_id>                  # Get policy for peer
       lightning-cli revenue-policy find <tag>                     # Find peers by tag
       lightning-cli revenue-policy changes [since=<timestamp>]    # Get policy changes
+      lightning-cli revenue-policy ban <peer_id> [reason=X]       # Ban peer (was revenue-ban)
+      lightning-cli revenue-policy unban <peer_id>                # Lift ban (was revenue-unban)
+      lightning-cli revenue-policy list-banned                    # List bans (was revenue-list-banned)
       lightning-cli revenue-policy set <peer_id> [options]        # Deprecated for normal operator use
       lightning-cli revenue-policy delete <peer_id>               # Deprecated for normal operator use
       lightning-cli revenue-policy tag <peer_id> <tag>            # Deprecated for normal operator use
@@ -5527,6 +5710,24 @@ def revenue_policy(plugin: Plugin, action: str = "list", peer_id: str = None,
                 "tags": policy.tags
             }
         
+        elif action == "ban":
+            # Phase C (2026-08-01): primary home of the former revenue-ban.
+            if not peer_id:
+                return {"error": "Usage: revenue-policy ban <peer_id> [reason=X]"}
+            return _rpc_ban(
+                plugin, peer_id, reason=str(kwargs.get("reason", "operator"))
+            )
+
+        elif action == "unban":
+            # Phase C (2026-08-01): primary home of the former revenue-unban.
+            if not peer_id:
+                return {"error": "Usage: revenue-policy unban <peer_id>"}
+            return _rpc_unban(plugin, peer_id)
+
+        elif action == "list-banned":
+            # Phase C (2026-08-01): primary home of revenue-list-banned.
+            return _rpc_list_banned(plugin)
+
         elif action == "find":
             if not tag:
                 return {"error": "Usage: revenue-policy find <tag>"}
@@ -5586,7 +5787,10 @@ def revenue_policy(plugin: Plugin, action: str = "list", peer_id: str = None,
                 return {"status": "error", "error": str(e)}
 
         else:
-            allowed = sorted(READ_ONLY_POLICY_ACTIONS | TACTICAL_POLICY_ACTIONS)
+            allowed = sorted(
+                READ_ONLY_POLICY_ACTIONS | TACTICAL_POLICY_ACTIONS
+                | {"ban", "unban", "list-banned"}
+            )
             allowed_text = ", ".join(f"'{name}'" for name in allowed)
             return {"error": f"Unknown action: {action}. Use {allowed_text}"}
     
@@ -7720,8 +7924,7 @@ def _structural_envelope_sats_provider() -> int:
     return int(getattr(config, "boltz_structural_budget_sats_per_day", 0) or 0)
 
 
-@plugin.method("revenue-total-cost-budget")
-def revenue_total_cost_budget(plugin: Plugin, window_hours: int = None) -> Dict[str, Any]:
+def _rpc_total_cost_budget(plugin: Plugin, window_hours: int = None) -> Dict[str, Any]:
     """Unified budget status across rebalances, Boltz, and on-chain liquidity costs."""
     try:
         return _total_cost_budget_status(window_hours=window_hours)
@@ -7729,8 +7932,15 @@ def revenue_total_cost_budget(plugin: Plugin, window_hours: int = None) -> Dict[
         return {"error": str(e)}
 
 
-@plugin.method("revenue-capex-status")
-def revenue_capex_status(plugin, **kwargs):
+@plugin.method("revenue-total-cost-budget")
+def revenue_total_cost_budget(plugin: Plugin, window_hours: int = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-budget' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_total_cost_budget(plugin, window_hours=window_hours), "revenue-budget"
+    )
+
+
+def _rpc_capex_status(plugin, **kwargs):
     """Return unified capex budget allocations.
 
     Shows per-channel budgets, fleet exploration budget, tactical budget,
@@ -7795,8 +8005,13 @@ def revenue_capex_status(plugin, **kwargs):
     return result
 
 
-@plugin.method("revenue-spend-ledger")
-def revenue_spend_ledger(
+@plugin.method("revenue-capex-status")
+def revenue_capex_status(plugin, **kwargs):
+    """Deprecated alias for 'revenue-budget' (removal 2026-09-05)."""
+    return _deprecated_alias(_rpc_capex_status(plugin, **kwargs), "revenue-budget")
+
+
+def _rpc_spend_ledger(
     plugin: Plugin,
     window_hours: int = 24,
     include_reservations: bool = False,
@@ -7813,6 +8028,25 @@ def revenue_spend_ledger(
         )
     except Exception as e:
         return {"error": str(e)}
+
+
+@plugin.method("revenue-spend-ledger")
+def revenue_spend_ledger(
+    plugin: Plugin,
+    window_hours: int = 24,
+    include_reservations: bool = False,
+    reservation_limit: int = 50,
+) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-budget ledger' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_spend_ledger(
+            plugin,
+            window_hours=window_hours,
+            include_reservations=include_reservations,
+            reservation_limit=reservation_limit,
+        ),
+        "revenue-budget ledger",
+    )
 
 
 # Serializes the unified-budget check with the reservation insert below.
@@ -7963,16 +8197,23 @@ def revenue_spend_settle(
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-quote")
-def revenue_boltz_quote(plugin: Plugin, amount_sats: int, swap_type: str = "reverse", currency: str = None) -> Dict[str, Any]:
+def _rpc_boltz_quote(plugin: Plugin, amount_sats: int, swap_type: str = "reverse", currency: str = None) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().quote(amount_sats=amount_sats, swap_type=swap_type, currency=currency)
     except Exception as e:
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-loop-out")
-def revenue_boltz_loop_out(plugin: Plugin, amount_sats: int, address: str = None, channel_id: str = None,
+@plugin.method("revenue-boltz-quote")
+def revenue_boltz_quote(plugin: Plugin, amount_sats: int, swap_type: str = "reverse", currency: str = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz quote' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_quote(plugin, amount_sats=amount_sats, swap_type=swap_type, currency=currency),
+        "revenue-boltz quote",
+    )
+
+
+def _rpc_boltz_loop_out(plugin: Plugin, amount_sats: int, address: str = None, channel_id: str = None,
                            peer_id: str = None, currency: str = None, routing_fee_limit_ppm: int = None) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().loop_out(
@@ -7983,8 +8224,17 @@ def revenue_boltz_loop_out(plugin: Plugin, amount_sats: int, address: str = None
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-loop-in")
-def revenue_boltz_loop_in(plugin: Plugin, amount_sats: int, channel_id: str = None,
+@plugin.method("revenue-boltz-loop-out")
+def revenue_boltz_loop_out(plugin: Plugin, amount_sats: int, address: str = None, channel_id: str = None,
+                           peer_id: str = None, currency: str = None, routing_fee_limit_ppm: int = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz loop-out' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_loop_out(plugin, amount_sats=amount_sats, address=address, channel_id=channel_id, peer_id=peer_id, currency=currency, routing_fee_limit_ppm=routing_fee_limit_ppm),
+        "revenue-boltz loop-out",
+    )
+
+
+def _rpc_boltz_loop_in(plugin: Plugin, amount_sats: int, channel_id: str = None,
                           peer_id: str = None, currency: str = None) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().loop_in(
@@ -7994,8 +8244,17 @@ def revenue_boltz_loop_in(plugin: Plugin, amount_sats: int, channel_id: str = No
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-status")
-def revenue_boltz_status(plugin: Plugin, swap_id: str = None) -> Dict[str, Any]:
+@plugin.method("revenue-boltz-loop-in")
+def revenue_boltz_loop_in(plugin: Plugin, amount_sats: int, channel_id: str = None,
+                          peer_id: str = None, currency: str = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz loop-in' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_loop_in(plugin, amount_sats=amount_sats, channel_id=channel_id, peer_id=peer_id, currency=currency),
+        "revenue-boltz loop-in",
+    )
+
+
+def _rpc_boltz_status(plugin: Plugin, swap_id: str = None) -> Dict[str, Any]:
     if not swap_id:
         return {"error": "usage: revenue-boltz-status swap_id (per-swap status; "
                          "see revenue-boltz-wallet/-budget/-history for global state)"}
@@ -8005,40 +8264,80 @@ def revenue_boltz_status(plugin: Plugin, swap_id: str = None) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-history")
-def revenue_boltz_history(plugin: Plugin, limit: int = None) -> Dict[str, Any]:
+@plugin.method("revenue-boltz-status")
+def revenue_boltz_status(plugin: Plugin, swap_id: str = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz status' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_status(plugin, swap_id=swap_id),
+        "revenue-boltz status",
+    )
+
+
+def _rpc_boltz_history(plugin: Plugin, limit: int = None) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().swap_history(limit=limit)
     except Exception as e:
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-external-pay-ignores")
-def revenue_boltz_external_pay_ignores(plugin: Plugin, action: str = "list", swap_id: str = None, note: str = None) -> Dict[str, Any]:
+@plugin.method("revenue-boltz-history")
+def revenue_boltz_history(plugin: Plugin, limit: int = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz history' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_history(plugin, limit=limit),
+        "revenue-boltz history",
+    )
+
+
+def _rpc_boltz_external_pay_ignores(plugin: Plugin, action: str = "list", swap_id: str = None, note: str = None) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().manage_external_pay_ignores(action=action, swap_id=swap_id, note=note)
     except Exception as e:
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-budget")
-def revenue_boltz_budget(plugin: Plugin) -> Dict[str, Any]:
+@plugin.method("revenue-boltz-external-pay-ignores")
+def revenue_boltz_external_pay_ignores(plugin: Plugin, action: str = "list", swap_id: str = None, note: str = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz external-pay-ignores' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_external_pay_ignores(plugin, action=action, swap_id=swap_id, note=note),
+        "revenue-boltz external-pay-ignores",
+    )
+
+
+def _rpc_boltz_budget(plugin: Plugin) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().budget()
     except Exception as e:
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-wallet")
-def revenue_boltz_wallet(plugin: Plugin) -> Dict[str, Any]:
+@plugin.method("revenue-boltz-budget")
+def revenue_boltz_budget(plugin: Plugin) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz budget' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_budget(plugin),
+        "revenue-boltz budget",
+    )
+
+
+def _rpc_boltz_wallet(plugin: Plugin) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().wallet_balances()
     except Exception as e:
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-refund")
-def revenue_boltz_refund(plugin: Plugin, swap_id: str = None, destination: str = None) -> Dict[str, Any]:
+@plugin.method("revenue-boltz-wallet")
+def revenue_boltz_wallet(plugin: Plugin) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz wallet' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_wallet(plugin),
+        "revenue-boltz wallet",
+    )
+
+
+def _rpc_boltz_refund(plugin: Plugin, swap_id: str = None, destination: str = None) -> Dict[str, Any]:
     if not swap_id:
         return {"error": "usage: revenue-boltz-refund swap_id [destination]"}
     try:
@@ -8047,8 +8346,16 @@ def revenue_boltz_refund(plugin: Plugin, swap_id: str = None, destination: str =
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-claim")
-def revenue_boltz_claim(plugin: Plugin, swap_ids: List[str] = None, destination: str = None) -> Dict[str, Any]:
+@plugin.method("revenue-boltz-refund")
+def revenue_boltz_refund(plugin: Plugin, swap_id: str = None, destination: str = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz refund' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_refund(plugin, swap_id=swap_id, destination=destination),
+        "revenue-boltz refund",
+    )
+
+
+def _rpc_boltz_claim(plugin: Plugin, swap_ids: List[str] = None, destination: str = None) -> Dict[str, Any]:
     if not swap_ids:
         return {"error": "usage: revenue-boltz-claim swap_ids [destination]"}
     try:
@@ -8057,8 +8364,16 @@ def revenue_boltz_claim(plugin: Plugin, swap_ids: List[str] = None, destination:
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-chainswap")
-def revenue_boltz_chainswap(plugin: Plugin, amount_sats: int, from_currency: str = None,
+@plugin.method("revenue-boltz-claim")
+def revenue_boltz_claim(plugin: Plugin, swap_ids: List[str] = None, destination: str = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz claim' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_claim(plugin, swap_ids=swap_ids, destination=destination),
+        "revenue-boltz claim",
+    )
+
+
+def _rpc_boltz_chainswap(plugin: Plugin, amount_sats: int, from_currency: str = None,
                             to_currency: str = None, to_address: str = None) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().chainswap(
@@ -8068,8 +8383,17 @@ def revenue_boltz_chainswap(plugin: Plugin, amount_sats: int, from_currency: str
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-withdraw")
-def revenue_boltz_withdraw(plugin: Plugin, amount_sats: int = None, destination: str = None, currency: str = None,
+@plugin.method("revenue-boltz-chainswap")
+def revenue_boltz_chainswap(plugin: Plugin, amount_sats: int, from_currency: str = None,
+                            to_currency: str = None, to_address: str = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz chainswap' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_chainswap(plugin, amount_sats=amount_sats, from_currency=from_currency, to_currency=to_currency, to_address=to_address),
+        "revenue-boltz chainswap",
+    )
+
+
+def _rpc_boltz_withdraw(plugin: Plugin, amount_sats: int = None, destination: str = None, currency: str = None,
                            sat_per_vbyte: int = None, sweep: bool = False,
                            confirm_sweep: bool = False) -> Dict[str, Any]:
     try:
@@ -8081,29 +8405,63 @@ def revenue_boltz_withdraw(plugin: Plugin, amount_sats: int = None, destination:
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-deposit")
-def revenue_boltz_deposit(plugin: Plugin, currency: str = None) -> Dict[str, Any]:
+@plugin.method("revenue-boltz-withdraw")
+def revenue_boltz_withdraw(plugin: Plugin, amount_sats: int = None, destination: str = None, currency: str = None,
+                           sat_per_vbyte: int = None, sweep: bool = False,
+                           confirm_sweep: bool = False) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz withdraw' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_withdraw(plugin, amount_sats=amount_sats, destination=destination, currency=currency, sat_per_vbyte=sat_per_vbyte, sweep=sweep, confirm_sweep=confirm_sweep),
+        "revenue-boltz withdraw",
+    )
+
+
+def _rpc_boltz_deposit(plugin: Plugin, currency: str = None) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().deposit_address(currency=currency)
     except Exception as e:
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-backup")
-def revenue_boltz_backup(plugin: Plugin, include_mnemonic: bool = False) -> Dict[str, Any]:
+@plugin.method("revenue-boltz-deposit")
+def revenue_boltz_deposit(plugin: Plugin, currency: str = None) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz deposit' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_deposit(plugin, currency=currency),
+        "revenue-boltz deposit",
+    )
+
+
+def _rpc_boltz_backup(plugin: Plugin, include_mnemonic: bool = False) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().backup(include_mnemonic=bool(include_mnemonic))
     except Exception as e:
         return {"error": str(e)}
 
 
-@plugin.method("revenue-boltz-backup-verify")
-def revenue_boltz_backup_verify(plugin: Plugin, swap_mnemonic: str) -> Dict[str, Any]:
+@plugin.method("revenue-boltz-backup")
+def revenue_boltz_backup(plugin: Plugin, include_mnemonic: bool = False) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz backup' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_backup(plugin, include_mnemonic=include_mnemonic),
+        "revenue-boltz backup",
+    )
+
+
+def _rpc_boltz_backup_verify(plugin: Plugin, swap_mnemonic: str) -> Dict[str, Any]:
     try:
         return _require_boltz_manager().backup_verify(swap_mnemonic=swap_mnemonic)
     except Exception as e:
         return {"error": str(e)}
 
+
+@plugin.method("revenue-boltz-backup-verify")
+def revenue_boltz_backup_verify(plugin: Plugin, swap_mnemonic: str) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz backup-verify' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_backup_verify(plugin, swap_mnemonic=swap_mnemonic),
+        "revenue-boltz backup-verify",
+    )
 
 
 def _boltz_balance_pct_from_channel_info(channel_info: Dict[str, Any]) -> float:
@@ -9766,8 +10124,7 @@ def _build_boltz_balance_plan(
     }
 
 
-@plugin.method("revenue-boltz-balance-recommendations")
-def revenue_boltz_balance_recommendations(
+def _rpc_boltz_balance_recommendations(
     plugin: Plugin,
     low_trigger_pct: float = 40.0,
     low_target_pct: float = 55.0,
@@ -9808,6 +10165,32 @@ def revenue_boltz_balance_recommendations(
         return {"error": str(e)}
 
 
+@plugin.method("revenue-boltz-balance-recommendations")
+def revenue_boltz_balance_recommendations(
+    plugin: Plugin,
+    low_trigger_pct: float = 40.0,
+    low_target_pct: float = 55.0,
+    high_trigger_pct: float = 80.0,
+    high_target_pct: float = 60.0,
+    min_amount_sats: int = 100_000,
+    max_amount_sats: int = 1_000_000,
+    max_candidates: int = 20,
+    only_peer_id: str = None,
+    only_channel_id: str = None,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    loop_in_currency: str = "LBTC",
+    loop_out_currency: str = "LBTC",
+) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz balance-recommendations' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_balance_recommendations(plugin, low_trigger_pct=low_trigger_pct, low_target_pct=low_target_pct, high_trigger_pct=high_trigger_pct, high_target_pct=high_target_pct, min_amount_sats=min_amount_sats, max_amount_sats=max_amount_sats, max_candidates=max_candidates, only_peer_id=only_peer_id, only_channel_id=only_channel_id, require_profitable=require_profitable, min_marginal_roi=min_marginal_roi, profit_margin_factor=profit_margin_factor, expected_horizon_days=expected_horizon_days, loop_in_currency=loop_in_currency, loop_out_currency=loop_out_currency),
+        "revenue-boltz balance-recommendations",
+    )
+
+
 def _compact_boltz_recommendation(rec: Any) -> Dict[str, Any]:
     """Compact summary of a balance/treasury recommendation for status
     payloads. Skip/plan entries in revenue-boltz-auto-cycle-status embed
@@ -9834,8 +10217,7 @@ def _compact_boltz_recommendation(rec: Any) -> Dict[str, Any]:
     return compact
 
 
-@plugin.method("revenue-boltz-auto-cycle-status")
-def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
+def _rpc_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
     """Return scheduler status for the in-plugin Boltz auto-cycle."""
     with _boltz_auto_cycle_state_lock:
         state = dict(_boltz_auto_cycle_state)
@@ -9854,8 +10236,16 @@ def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
     return state
 
 
-@plugin.method("revenue-boltz-auto-cycle-run-now")
-def revenue_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False,
+@plugin.method("revenue-boltz-auto-cycle-status")
+def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz auto-cycle-status' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_auto_cycle_status(plugin),
+        "revenue-boltz auto-cycle-status",
+    )
+
+
+def _rpc_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False,
                                      dry_run: bool = False) -> Dict[str, Any]:
     """Trigger one immediate Boltz auto-cycle run using scheduler settings.
 
@@ -9874,6 +10264,16 @@ def revenue_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False,
         return result
     except Exception as e:
         return {"error": str(e)}
+
+
+@plugin.method("revenue-boltz-auto-cycle-run-now")
+def revenue_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False,
+                                     dry_run: bool = False) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz auto-cycle-run-now' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_auto_cycle_run_now(plugin, force=force, dry_run=dry_run),
+        "revenue-boltz auto-cycle-run-now",
+    )
 
 
 def _arbitrate_boltz_recommendations(recommendations):
@@ -10324,8 +10724,7 @@ def _execute_boltz_balance_cycle(
     }
 
 
-@plugin.method("revenue-boltz-balance-cycle")
-def revenue_boltz_balance_cycle(
+def _rpc_boltz_balance_cycle(
     plugin: Plugin,
     dry_run: bool = True,
     max_actions: int = 1,
@@ -10369,8 +10768,36 @@ def revenue_boltz_balance_cycle(
     )
 
 
-@plugin.method("revenue-boltz-expansion-treasury-status")
-def revenue_boltz_expansion_treasury_status(plugin: Plugin) -> Dict[str, Any]:
+@plugin.method("revenue-boltz-balance-cycle")
+def revenue_boltz_balance_cycle(
+    plugin: Plugin,
+    dry_run: bool = True,
+    max_actions: int = 1,
+    low_trigger_pct: float = 40.0,
+    low_target_pct: float = 55.0,
+    high_trigger_pct: float = 80.0,
+    high_target_pct: float = 60.0,
+    min_amount_sats: int = 100_000,
+    max_amount_sats: int = 1_000_000,
+    only_peer_id: str = None,
+    only_channel_id: str = None,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    cooldown_hours: float = 4.0,
+    allow_concurrent_swaps: bool = False,
+    loop_in_currency: str = "LBTC",
+    loop_out_currency: str = "LBTC",
+) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz balance-cycle' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_balance_cycle(plugin, dry_run=dry_run, max_actions=max_actions, low_trigger_pct=low_trigger_pct, low_target_pct=low_target_pct, high_trigger_pct=high_trigger_pct, high_target_pct=high_target_pct, min_amount_sats=min_amount_sats, max_amount_sats=max_amount_sats, only_peer_id=only_peer_id, only_channel_id=only_channel_id, require_profitable=require_profitable, min_marginal_roi=min_marginal_roi, profit_margin_factor=profit_margin_factor, expected_horizon_days=expected_horizon_days, cooldown_hours=cooldown_hours, allow_concurrent_swaps=allow_concurrent_swaps, loop_in_currency=loop_in_currency, loop_out_currency=loop_out_currency),
+        "revenue-boltz balance-cycle",
+    )
+
+
+def _rpc_boltz_expansion_treasury_status(plugin: Plugin) -> Dict[str, Any]:
     """Show expansion treasury reserve target status and current on-chain reserve."""
     try:
         bm = _require_boltz_manager()
@@ -10398,8 +10825,16 @@ def revenue_boltz_expansion_treasury_status(plugin: Plugin) -> Dict[str, Any]:
         return {'error': str(e)}
 
 
-@plugin.method("revenue-boltz-expansion-treasury-recommendations")
-def revenue_boltz_expansion_treasury_recommendations(
+@plugin.method("revenue-boltz-expansion-treasury-status")
+def revenue_boltz_expansion_treasury_status(plugin: Plugin) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz treasury-status' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_expansion_treasury_status(plugin),
+        "revenue-boltz treasury-status",
+    )
+
+
+def _rpc_boltz_expansion_treasury_recommendations(
     plugin: Plugin,
     onchain_target_sats: int = None,
     min_deficit_sats: int = None,
@@ -10433,6 +10868,29 @@ def revenue_boltz_expansion_treasury_recommendations(
         )
     except Exception as e:
         return {'error': str(e)}
+
+
+@plugin.method("revenue-boltz-expansion-treasury-recommendations")
+def revenue_boltz_expansion_treasury_recommendations(
+    plugin: Plugin,
+    onchain_target_sats: int = None,
+    min_deficit_sats: int = None,
+    preferred_currency: str = None,
+    max_actions: int = None,
+    min_source_local_pct: float = None,
+    exclude_protected: bool = None,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    min_amount_sats: int = 100_000,
+    max_amount_sats: int = 1_500_000,
+) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz treasury-recommendations' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_expansion_treasury_recommendations(plugin, onchain_target_sats=onchain_target_sats, min_deficit_sats=min_deficit_sats, preferred_currency=preferred_currency, max_actions=max_actions, min_source_local_pct=min_source_local_pct, exclude_protected=exclude_protected, require_profitable=require_profitable, min_marginal_roi=min_marginal_roi, profit_margin_factor=profit_margin_factor, expected_horizon_days=expected_horizon_days, min_amount_sats=min_amount_sats, max_amount_sats=max_amount_sats),
+        "revenue-boltz treasury-recommendations",
+    )
 
 
 def _execute_boltz_expansion_treasury_cycle(
@@ -10633,8 +11091,7 @@ def _execute_boltz_expansion_treasury_cycle(
     }
 
 
-@plugin.method("revenue-boltz-expansion-treasury-cycle")
-def revenue_boltz_expansion_treasury_cycle(
+def _rpc_boltz_expansion_treasury_cycle(
     plugin: Plugin,
     dry_run: bool = True,
     max_actions: int = None,
@@ -10669,6 +11126,157 @@ def revenue_boltz_expansion_treasury_cycle(
         max_amount_sats=max_amount_sats,
         cooldown_hours=cooldown_hours,
         allow_concurrent_swaps=allow_concurrent_swaps,
+    )
+
+
+@plugin.method("revenue-boltz-expansion-treasury-cycle")
+def revenue_boltz_expansion_treasury_cycle(
+    plugin: Plugin,
+    dry_run: bool = True,
+    max_actions: int = None,
+    onchain_target_sats: int = None,
+    min_deficit_sats: int = None,
+    preferred_currency: str = None,
+    min_source_local_pct: float = None,
+    exclude_protected: bool = None,
+    require_profitable: bool = True,
+    min_marginal_roi: float = 0.0,
+    profit_margin_factor: float = 1.2,
+    expected_horizon_days: float = 3.0,
+    min_amount_sats: int = 100_000,
+    max_amount_sats: int = 1_500_000,
+    cooldown_hours: float = 4.0,
+    allow_concurrent_swaps: bool = False,
+) -> Dict[str, Any]:
+    """Deprecated alias for 'revenue-boltz treasury-cycle' (removal 2026-09-05)."""
+    return _deprecated_alias(
+        _rpc_boltz_expansion_treasury_cycle(plugin, dry_run=dry_run, max_actions=max_actions, onchain_target_sats=onchain_target_sats, min_deficit_sats=min_deficit_sats, preferred_currency=preferred_currency, min_source_local_pct=min_source_local_pct, exclude_protected=exclude_protected, require_profitable=require_profitable, min_marginal_roi=min_marginal_roi, profit_margin_factor=profit_margin_factor, expected_horizon_days=expected_horizon_days, min_amount_sats=min_amount_sats, max_amount_sats=max_amount_sats, cooldown_hours=cooldown_hours, allow_concurrent_swaps=allow_concurrent_swaps),
+        "revenue-boltz treasury-cycle",
+    )
+
+
+# =============================================================================
+# PHASE C DISPATCHER RPCS (operator-surface reduction 2026-08-01)
+#
+# Primary operator names. Each verb/subsystem/view routes onto the SAME
+# shared helper the corresponding old standalone method calls; the old
+# names stay as deprecated aliases until 2026-09-05.
+# =============================================================================
+
+
+@plugin.method("revenue-boltz")
+def revenue_boltz(plugin: Plugin, verb: str = None, **kwargs) -> Dict[str, Any]:
+    """Unified Boltz swap surface (primary name since 2026-08-01).
+
+    Usage: lightning-cli -k revenue-boltz verb=<verb> [key=value ...]
+
+    Verbs map 1:1 onto the former revenue-boltz-* methods (same argument
+    names, same behavior). An unknown verb returns the list of valid verbs.
+    """
+    table = {
+        "quote": _rpc_boltz_quote,
+        "loop-out": _rpc_boltz_loop_out,
+        "loop-in": _rpc_boltz_loop_in,
+        "status": _rpc_boltz_status,
+        "history": _rpc_boltz_history,
+        "budget": _rpc_boltz_budget,
+        "wallet": _rpc_boltz_wallet,
+        "refund": _rpc_boltz_refund,
+        "claim": _rpc_boltz_claim,
+        "chainswap": _rpc_boltz_chainswap,
+        "withdraw": _rpc_boltz_withdraw,
+        "deposit": _rpc_boltz_deposit,
+        "backup": _rpc_boltz_backup,
+        "backup-verify": _rpc_boltz_backup_verify,
+        "external-pay-ignores": _rpc_boltz_external_pay_ignores,
+        "balance-recommendations": _rpc_boltz_balance_recommendations,
+        "balance-cycle": _rpc_boltz_balance_cycle,
+        "auto-cycle-status": _rpc_boltz_auto_cycle_status,
+        "auto-cycle-run-now": _rpc_boltz_auto_cycle_run_now,
+        "treasury-status": _rpc_boltz_expansion_treasury_status,
+        "treasury-recommendations": _rpc_boltz_expansion_treasury_recommendations,
+        "treasury-cycle": _rpc_boltz_expansion_treasury_cycle,
+    }
+    return _dispatch_subcommand(plugin, "revenue-boltz", "verb", table, verb, kwargs)
+
+
+@plugin.method("revenue-cycle")
+def revenue_cycle(plugin: Plugin, subsystem: str = None, **kwargs) -> Dict[str, Any]:
+    """Run one manual cycle of a subsystem (primary name since 2026-08-01).
+
+    Usage: lightning-cli -k revenue-cycle subsystem=<subsystem> [key=value ...]
+
+    Subsystems: fees (was revenue-fee-cycle), rebalance
+    (revenue-rebalance-cycle), flow (revenue-analyze), planner
+    (revenue-planner-execute), boltz (revenue-boltz-auto-cycle-run-now),
+    all (revenue-wake-all). An unknown subsystem returns the valid list.
+    """
+    table = {
+        "fees": _rpc_fee_cycle,
+        "rebalance": _rpc_rebalance_cycle,
+        "flow": _rpc_analyze,
+        "planner": _rpc_planner_execute,
+        "boltz": _rpc_boltz_auto_cycle_run_now,
+        "all": _rpc_wake_all,
+    }
+    return _dispatch_subcommand(
+        plugin, "revenue-cycle", "subsystem", table, subsystem, kwargs
+    )
+
+
+@plugin.method("revenue-planner")
+def revenue_planner(plugin: Plugin, view: str = "status", **kwargs) -> Dict[str, Any]:
+    """Capacity-planner read surface (primary name since 2026-08-01).
+
+    Usage: lightning-cli -k revenue-planner view=<view> [key=value ...]
+
+    Views: status (default; was revenue-planner-status), candidates
+    (revenue-planner-candidates), sources (revenue-planner-candidate-sources),
+    history (revenue-planner-history), report (revenue-capacity-report).
+    An unknown view returns the valid list.
+    """
+    table = {
+        "status": _rpc_planner_status,
+        "candidates": _rpc_planner_candidates,
+        "sources": _rpc_planner_candidate_sources,
+        "history": _rpc_planner_history,
+        "report": _rpc_capacity_report,
+    }
+    return _dispatch_subcommand(plugin, "revenue-planner", "view", table, view, kwargs)
+
+
+@plugin.method("revenue-budget")
+def revenue_budget(plugin: Plugin, section: str = None, **kwargs) -> Dict[str, Any]:
+    """Unified budget view (primary name since 2026-08-01).
+
+    Usage:
+      lightning-cli revenue-budget
+          One response with sections: total_cost (was
+          revenue-total-cost-budget), capex (revenue-capex-status), and
+          boltz (revenue-boltz-budget).
+      lightning-cli -k revenue-budget section=ledger [window_hours=N]
+          [include_reservations=true] [reservation_limit=N]
+          Forwards to the spend ledger (was revenue-spend-ledger).
+    """
+    key = str(section or "").strip().lower()
+    if key in ("", "all"):
+        def _section(fn, **kw):
+            try:
+                return fn(plugin, **kw)
+            except Exception as e:
+                return {"error": str(e)}
+
+        total_cost_kwargs = {}
+        if kwargs.get("window_hours") is not None:
+            total_cost_kwargs["window_hours"] = kwargs["window_hours"]
+        return {
+            "total_cost": _section(_rpc_total_cost_budget, **total_cost_kwargs),
+            "capex": _section(_rpc_capex_status),
+            "boltz": _section(_rpc_boltz_budget),
+        }
+    table = {"ledger": _rpc_spend_ledger}
+    return _dispatch_subcommand(
+        plugin, "revenue-budget", "section", table, section, kwargs
     )
 
 

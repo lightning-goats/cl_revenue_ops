@@ -41,6 +41,10 @@ EXPECTED_RPC_METHODS = frozenset({
     "revenue-boltz-balance-cycle", "revenue-boltz-expansion-treasury-status",
     "revenue-boltz-expansion-treasury-recommendations",
     "revenue-boltz-expansion-treasury-cycle",
+    # Phase C dispatchers (operator-surface reduction 2026-08-01): the new
+    # primary names; every merged old name above keeps working as a
+    # deprecated alias until 2026-09-05.
+    "revenue-boltz", "revenue-cycle", "revenue-planner", "revenue-budget",
 })
 
 
@@ -64,5 +68,9 @@ def test_expected_count():
     # promise yet): revenue-econ-snapshot (Phase 1), revenue-econ-
     # reconcile (Phase 2B), revenue-econ-cycle (Workstream H shadow),
     # revenue-profile-preview (PR 8, read-only risk-profile diff), and
-    # revenue-fee-authority-status (Python fee-authority handoff status).
-    assert len(EXPECTED_RPC_METHODS) == 69
+    # revenue-fee-authority-status (Python fee-authority handoff status);
+    # + the 4 Phase C dispatchers (2026-08-01 operator-surface reduction:
+    # revenue-boltz, revenue-cycle, revenue-planner, revenue-budget). The
+    # merged old names remain registered as deprecated aliases until
+    # 2026-09-05.
+    assert len(EXPECTED_RPC_METHODS) == 73
