@@ -132,6 +132,8 @@ def test_plugin_listing_rpc_and_safe_default_contract():
     assert options["revenue-ops-boltz-enabled"]["default"] == "false"
     assert options["revenue-ops-planner-enabled"]["default"] == "false"
     assert options["revenue-ops-planner-execute-closes"]["default"] == "false"
-    assert options["revenue-ops-fee-market-boundary-enabled"]["default"] == "false"
+    # 2026-08-12 removal: the deprecated fee-market-boundary options are gone.
+    assert "revenue-ops-fee-market-boundary-enabled" not in options
+    assert "revenue-ops-rebalance-min-profit" not in options
     assert "revenue-ops-dry-run" in options
     assert mod.plugin.init_functions

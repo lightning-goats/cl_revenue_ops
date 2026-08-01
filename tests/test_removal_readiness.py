@@ -3,17 +3,15 @@
 Two halves:
 1. The migration scanner works — it detects each blocker class and
    reports READY on a clean system (tested against synthetic DBs).
-2. STAGED post-removal tests (xfail until the 2026-08-12 checklist
-   executes): after removal, `rebalance_min_profit` behaves like any
-   unknown key. Un-xfail these in the removal PR — they are its
-   acceptance tests.
+2. Post-removal acceptance tests (un-xfailed in the 2026-08-12 removal
+   commit): `rebalance_min_profit` behaves like any unknown key —
+   `revenue-config set` rejects it, a stale persisted override is
+   skipped with a warning at startup, never applied.
 """
 import pathlib
 import sqlite3
 import subprocess
 import sys
-
-import pytest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SCANNER = REPO / "tools" / "deprecation_scan.py"
@@ -98,26 +96,24 @@ class TestScanner:
 def test_no_other_deprecated_no_ops_undisclosed():
     """Phase H item 6: the announced window covers EVERYTHING deprecated.
     A new member of DEPRECATED_RUNTIME_KEYS must be added to the
-    compatibility policy and this pin in the same commit."""
+    compatibility policy and this pin in the same commit.
+
+    2026-08-12: `rebalance_min_profit` was removed at the announced
+    window — the set is empty; the machinery stays for FUTURE
+    deprecations (the checklist's by-symbol instruction)."""
     from modules.config import DEPRECATED_RUNTIME_KEYS
-    assert set(DEPRECATED_RUNTIME_KEYS) == {"rebalance_min_profit"}
+    assert set(DEPRECATED_RUNTIME_KEYS) == set()
 
 
 class TestStagedPostRemoval:
-    """Acceptance tests for the ≥2026-08-12 removal PR. xfail(strict)
-    until then: they FAIL today (the shim exists), and the xfail marker
-    comes off in the removal commit."""
+    """Acceptance tests for the 2026-08-12 removal (un-xfailed in the
+    removal commit, per the staged plan)."""
 
-    @pytest.mark.xfail(strict=True,
-                       reason="staged for the 2026-08-12 removal: the "
-                              "no-op shim still exists by design")
     def test_key_is_unknown_after_removal(self):
         from modules.config import CONFIG_FIELD_TYPES, Config
         assert "rebalance_min_profit" not in CONFIG_FIELD_TYPES
         assert not hasattr(Config(), "rebalance_min_profit")
 
-    @pytest.mark.xfail(strict=True,
-                       reason="staged for the 2026-08-12 removal")
     def test_stale_override_skipped_with_warning(self):
         from unittest.mock import MagicMock
 
@@ -128,6 +124,24 @@ class TestStagedPostRemoval:
             "rebalance_min_profit": "42"}
         database.get_config_version.return_value = 1
         warnings = cfg.load_overrides(database)
-        # Post-removal: unknown key -> not applied, not fatal.
+        # Post-removal: unknown key -> not applied, not fatal, and the
+        # Phase B unknown-override warning path surfaces the stale row.
         assert not hasattr(cfg, "rebalance_min_profit")
-        assert warnings  # startup surfaces the stale override
+        assert any("rebalance_min_profit" in w
+                   and "does not match any known key" in w
+                   for w in warnings)
+
+    def test_revenue_config_set_returns_clean_unknown_key_error(self):
+        """`revenue-config set rebalance_min_profit` must fail exactly
+        like any unknown key — not the internal-key wording."""
+        from tests.plugin_test_utils import load_plugin_module
+        from unittest.mock import MagicMock
+
+        from modules.config import Config
+        mod = load_plugin_module()
+        mod.config = Config()
+        mod.database = MagicMock()
+        result = mod.revenue_config(mod.plugin, "set",
+                                    "rebalance_min_profit", "42")
+        assert result == {
+            "error": "Unknown config key: rebalance_min_profit"}

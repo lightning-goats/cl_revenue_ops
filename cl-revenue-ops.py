@@ -1227,42 +1227,6 @@ plugin.add_option(
 )
 
 plugin.add_option(
-    name='revenue-ops-fee-market-boundary-enabled',
-    default='false',
-    description='Deprecated no-op compatibility flag; fee market boundary logic is ignored (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-fee-market-boundary-min-competitors',
-    default='3',
-    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 3)'
-)
-
-plugin.add_option(
-    name='revenue-ops-fee-market-boundary-margin-ppm',
-    default='5',
-    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 5)'
-)
-
-plugin.add_option(
-    name='revenue-ops-fee-market-boundary-margin-ratio',
-    default='0.05',
-    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 0.05)'
-)
-
-plugin.add_option(
-    name='revenue-ops-fee-market-boundary-max-downshift-ratio',
-    default='0.35',
-    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 0.35)'
-)
-
-plugin.add_option(
-    name='revenue-ops-fee-market-boundary-cache-seconds',
-    default='60',
-    description='Deprecated no-op compatibility setting for fee market boundary logic (default: 60)'
-)
-
-plugin.add_option(
     name='revenue-ops-market-fee-mode',
     default='undercut',
     description=(
@@ -1300,16 +1264,6 @@ plugin.add_option(
         '(undercut/match/premium/competition_aware); below this threshold '
         'the helper returns None and the market-fee-mode branch is '
         'skipped. Prod nodes with dense gossip may prefer 3.'
-    )
-)
-
-plugin.add_option(
-    name='revenue-ops-rebalance-min-profit',
-    default='10',
-    description=(
-        'Deprecated no-op compatibility setting; minimum-profit gating is '
-        'enforced by the sats-EV gate and revenue-ops-rebalance-hold-margin '
-        '(default: 10)'
     )
 )
 
@@ -2571,25 +2525,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         base_fee_policy=options.get('revenue-ops-base-fee-policy', 'off').lower(),
         neighbor_median_min_competitors=_safe_int_opt('revenue-ops-neighbor-median-min-competitors', '2'),
         fee_profile=str(options.get('revenue-ops-fee-profile', 'active') or 'active').lower(),
-        fee_market_boundary_enabled=options.get(
-            'revenue-ops-fee-market-boundary-enabled', 'false'
-        ).lower() == 'true',
-        fee_market_boundary_min_competitors=_safe_int_opt(
-            'revenue-ops-fee-market-boundary-min-competitors', '3'
-        ),
-        fee_market_boundary_margin_ppm=_safe_int_opt(
-            'revenue-ops-fee-market-boundary-margin-ppm', '5'
-        ),
-        fee_market_boundary_margin_ratio=_safe_float_opt(
-            'revenue-ops-fee-market-boundary-margin-ratio', '0.05'
-        ),
-        fee_market_boundary_max_downshift_ratio=_safe_float_opt(
-            'revenue-ops-fee-market-boundary-max-downshift-ratio', '0.35'
-        ),
-        fee_market_boundary_cache_seconds=_safe_int_opt(
-            'revenue-ops-fee-market-boundary-cache-seconds', '60'
-        ),
-        rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
         rebalance_emergency_local_ratio=_safe_float_opt(
             'revenue-ops-rebalance-emergency-local-ratio', '0.10'
         ),
@@ -4457,7 +4392,6 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
     profile = fee_controller.get_fee_profile_settings(cfg_snap)
     min_obs_hours = profile["min_observation_hours"]
     min_forwards = profile["min_forwards_for_signal"]
-    market_boundary_configured = bool(getattr(cfg_snap, "fee_market_boundary_enabled", False))
 
     now = int(time.time())
     # ADR-001 (PR 4): the debug surface names the REAL controller and
@@ -4477,15 +4411,9 @@ def revenue_fee_debug(plugin: Plugin) -> Dict[str, Any]:
         "config": {
             "fee_interval_seconds": config.fee_interval if config else 1800,
             "fee_profile": profile["name"],
-            "market_boundary_enabled": False,
-            "market_boundary_configured": market_boundary_configured,
-            "market_boundary_effective": False,
-            "market_boundary_deprecated": True,
-            "market_boundary_min_competitors": getattr(cfg_snap, "fee_market_boundary_min_competitors", 3),
-            "market_boundary_margin_ppm": getattr(cfg_snap, "fee_market_boundary_margin_ppm", 5),
-            "market_boundary_margin_ratio": getattr(cfg_snap, "fee_market_boundary_margin_ratio", 0.05),
-            "market_boundary_max_downshift_ratio": getattr(cfg_snap, "fee_market_boundary_max_downshift_ratio", 0.35),
-            "market_boundary_cache_seconds": getattr(cfg_snap, "fee_market_boundary_cache_seconds", 60),
+            # market_boundary_* echoes removed 2026-08-12 with the
+            # deprecated fee_market_boundary_* settings (announced
+            # compatibility window).
             "min_observation_hours": min_obs_hours,
             "min_forwards_for_signal": min_forwards,
             "profile_settings": profile,
@@ -6100,6 +6028,11 @@ def revenue_config(
         if not key or value is None:
             return {"error": "Usage: revenue-config set <key> <value>"}
 
+        # 2026-08-12 removal contract: a key that no longer exists on
+        # Config (e.g. the removed rebalance_min_profit shim) fails with
+        # a clean unknown-key error, not the internal-key wording.
+        if not hasattr(config, key) or key.startswith('_'):
+            return {"error": f"Unknown config key: {key}"}
         if not config.is_public_runtime_key(key):
             return _not_public_error(key)
         
@@ -6118,6 +6051,8 @@ def revenue_config(
         if not key:
             return {"error": "Usage: revenue-config reset <key>"}
 
+        if not hasattr(config, key) or key.startswith('_'):
+            return {"error": f"Unknown config key: {key}"}
         if not config.is_public_runtime_key(key):
             return _not_public_error(key)
         

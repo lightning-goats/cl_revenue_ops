@@ -29,7 +29,7 @@ from modules.econ_types import (
 )
 
 SCHEMA_PATH = (pathlib.Path(__file__).resolve().parent.parent
-               / "schemas" / "economic_snapshot.v0.schema.json")
+               / "schemas" / "economic_snapshot.v1.schema.json")
 
 PEER = "02" + "a" * 64
 
@@ -111,7 +111,8 @@ def test_to_wire_validates_against_schema():
     wire = to_wire(_snap([_chan()]))
     jsonschema.validate(wire, schema)
     assert wire["schema_name"] == "economic_snapshot"
-    assert wire["schema_version"] == 0
+    # v0 -> v1 emission cutover (2026-08-12 compatibility window)
+    assert wire["schema_version"] == 1
     assert wire["channels"][0]["role"] == "ROUTER"
     assert wire["channels"][0]["capacity_msat"] == 2_000_000_000_000
 

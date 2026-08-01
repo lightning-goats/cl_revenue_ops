@@ -132,11 +132,6 @@ class TestShadowedSettings:
         _, warnings = _load({"growth_budget_enabled": "false"})
         assert not _matching(warnings, "Shadowed")
 
-    def test_market_boundary_param_with_gate_off_warns(self):
-        _, warnings = _load({"fee_market_boundary_margin_ppm": "25"})
-        assert _matching(warnings, "Shadowed",
-                         "fee_market_boundary_margin_ppm")
-
     def test_lnplus_param_with_gate_off_warns(self):
         # lnplus_swaps_enabled defaults TRUE — must be turned off
         # explicitly for its params to be shadowed.
@@ -154,11 +149,16 @@ class TestShadowedSettings:
 
 
 class TestDeprecatedOptions:
-    def test_deprecated_key_warns_with_replacement(self):
-        _, warnings = _load({"rebalance_min_profit": "42"})
-        found = _matching(warnings, "Deprecated", "rebalance_min_profit",
-                          "rebalance_hold_margin")
-        assert found and "no-op" in found[0]
+    def test_removed_key_hits_unknown_override_warning_path(self):
+        """2026-08-12 removal: rebalance_min_profit is no longer a known
+        key — a stale persisted override is skipped with the Phase B
+        unknown-override warning, never applied (checklist item 1
+        post-removal semantics)."""
+        cfg, warnings = _load({"rebalance_min_profit": "42"})
+        found = _matching(warnings, "rebalance_min_profit",
+                          "does not match any known key")
+        assert found
+        assert not hasattr(cfg, "rebalance_min_profit")
 
 
 def test_clean_overrides_produce_no_warnings():

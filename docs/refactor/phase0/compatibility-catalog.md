@@ -31,11 +31,11 @@ field; the alias window ends 2026-09-05 (announcement:
 
 ## Config surface
 
-Owner: `modules/config.py` — a single `Config` dataclass (147 fields)
+Owner: `modules/config.py` — a single `Config` dataclass (140 fields)
 plus the `config_overrides` table (`revenue-config set` persists
 overrides; precedence documented in README.md §revenue-config).
 
-- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (62, listed below).
+- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (56, listed below).
 - Immutable at runtime: `db_path`, `dry_run` (`IMMUTABLE_CONFIG_KEYS` —
   dry_run is immutable so enabling it cannot HIDE actions).
 - The refactor's Workstream I risk-profile work must preserve every
@@ -67,7 +67,7 @@ dataclass is normative).
 
 ---
 
-### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 62)
+### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 56)
 
 - `paused`
 - `daily_budget_sats`
@@ -81,12 +81,6 @@ dataclass is normative).
 - `min_fee_ppm_saturated`
 - `max_fee_ppm`
 - `fee_profile`
-- `fee_market_boundary_enabled`
-- `fee_market_boundary_min_competitors`
-- `fee_market_boundary_margin_ppm`
-- `fee_market_boundary_margin_ratio`
-- `fee_market_boundary_max_downshift_ratio`
-- `fee_market_boundary_cache_seconds`
 - `planner_enabled`
 - `planner_dry_run`
 - `planner_execute_closes`
@@ -105,20 +99,20 @@ dataclass is normative).
 - `htlcmax_source_pct`
 - `htlcmax_sink_pct`
 - `htlcmax_balanced_pct`
-- `econ_shadow_enabled` (added 2026-07-12, Phase 1 wiring)
-- `econ_governor_rebalance_enabled` (added 2026-07-12, Phase 2D)
-- `econ_governor_planner_enabled` (added 2026-07-12, Phase 2E)
-- `econ_governor_lnplus_enabled` (added 2026-07-12, Phase 2F)
-- `econ_governor_boltz_enabled` (added 2026-07-12, Phase 2G)
-- `econ_governor_fees_enabled` (added 2026-07-12, Phase 2H)
-- `econ_arbiter_enabled` (added 2026-07-13, Phase 3F)
-- `econ_cycle_rebalance_enabled` (added 2026-07-13, Workstream H cutover)
-- `econ_cycle_planner_enabled` (added 2026-07-13, Workstream H cutover)
-- `econ_cycle_boltz_enabled` (added 2026-07-13, Workstream H cutover)
-- `econ_ev_populated` (added 2026-07-13, Phase E PR 6)
-- `econ_conflict_rules_extended` (added 2026-07-13, Phase G PR 10)
-- `authority_level` (added 2026-07-13, Phase 4 Workstream I; observe/fees/liquidity/capital, default `capital`)
-- `risk_profile` (added 2026-07-13, Phase D PR 7; default `custom`)
+- `econ_shadow_enabled`
+- `econ_governor_rebalance_enabled`
+- `econ_governor_planner_enabled`
+- `econ_governor_lnplus_enabled`
+- `econ_governor_boltz_enabled`
+- `econ_governor_fees_enabled`
+- `econ_arbiter_enabled`
+- `econ_cycle_rebalance_enabled`
+- `econ_cycle_planner_enabled`
+- `econ_cycle_boltz_enabled`
+- `econ_ev_populated`
+- `econ_conflict_rules_extended`
+- `authority_level`
+- `risk_profile`
 - `lnplus_swaps_enabled`
 - `lnplus_execute_applications`
 - `lnplus_swap_preference_margin`
@@ -132,7 +126,7 @@ dataclass is normative).
 - `lnplus_inbound_credit_factor`
 - `lnplus_watcher_interval`
 
-### Full Config dataclass surface (147 fields with defaults)
+### Full Config dataclass surface (140 fields with defaults)
 
 | Field | Default | Runtime-settable |
 |---|---|---|
@@ -195,13 +189,6 @@ dataclass is normative).
 | `neighbor_median_min_competitors` | `2` |  |
 | `market_fee_mode` | `'undercut'` |  |
 | `fee_profile` | `'active'` | yes |
-| `fee_market_boundary_enabled` | `False` | yes |
-| `fee_market_boundary_min_competitors` | `3` | yes |
-| `fee_market_boundary_margin_ppm` | `5` | yes |
-| `fee_market_boundary_margin_ratio` | `0.05` | yes |
-| `fee_market_boundary_max_downshift_ratio` | `0.35` | yes |
-| `fee_market_boundary_cache_seconds` | `60` | yes |
-| `rebalance_min_profit` | `10` |  |
 | `rebalance_max_amount` | `5000000` |  |
 | `low_liquidity_threshold` | `0.3` |  |
 | `high_liquidity_threshold` | `0.7` |  |

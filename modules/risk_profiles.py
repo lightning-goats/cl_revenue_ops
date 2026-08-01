@@ -130,7 +130,8 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "expansion_treasury_onchain_target_sats": "economic_risk",
     "expansion_treasury_min_deficit_sats": "economic_risk",
     # --- deprecated / transition ---------------------------------------
-    "rebalance_min_profit": "deprecated_transition",
+    # (empty since the 2026-08-12 removal of rebalance_min_profit; the
+    # category is kept as the pattern for future deprecations)
     # --- advanced expert overrides --------------------------------------
     "hot_channel_protection_enabled": "advanced_expert",
     "hot_channel_protection_override_peers": "advanced_expert",
@@ -153,12 +154,6 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "base_fee_policy": "advanced_expert",
     "neighbor_median_min_competitors": "advanced_expert",
     "market_fee_mode": "advanced_expert",
-    "fee_market_boundary_enabled": "advanced_expert",
-    "fee_market_boundary_min_competitors": "advanced_expert",
-    "fee_market_boundary_margin_ppm": "advanced_expert",
-    "fee_market_boundary_margin_ratio": "advanced_expert",
-    "fee_market_boundary_max_downshift_ratio": "advanced_expert",
-    "fee_market_boundary_cache_seconds": "advanced_expert",
     "fee_replay_capture_enabled": "advanced_expert",
     "planner_close_feerange_enabled": "advanced_expert",
     "low_liquidity_threshold": "advanced_expert",

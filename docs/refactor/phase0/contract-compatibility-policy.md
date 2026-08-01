@@ -22,13 +22,32 @@ after a 30-day window (2026-08-12), each with a migration check:
 
 1. `rebalance_min_profit` config key — deprecated no-op shim; migrate to
    `rebalance_hold_margin`.
+   **EXECUTED 2026-08-12** (with the Phase A `fee_market_boundary_*`
+   removals from the operator-surface reduction §4): option, Config
+   field, ranges/types, `DEPRECATED_RUNTIME_KEYS` entry removed — the
+   machinery stays for future deprecations. Post-removal semantics:
+   `revenue-config set/get` return a clean unknown-key error; a stale
+   override row hits the Phase B unknown-override startup warning.
 2. v0 schema emission — plugin output moves to v1; consumers reading
    `schema_version` are unaffected if they tolerate the closed-object
    tightening.
+   **EXECUTED 2026-08-12**: `economic_snapshot` and `intent` emission is
+   `schema_version` 1 (the two v1 families; the other wire families
+   remain v0-only). Conformance corpus regenerated; the standalone
+   validator continues to accept v0 payloads read-side for one further
+   window.
 3. `budget_reservations` legacy table + dual-path release/settle
    fallbacks — transition-only since Phase 2J; removal requires zero
    active legacy rows at cutover (migration check) and follows the
    Phase 5 projection verification.
+   **NOT EXECUTED at the 2026-08-12 window** — deferred: the
+   zero-active-rows migration check is a cutover-time production-DB
+   precondition (`tools/deprecation_scan.py` on lnnode), and the Phase 5
+   projection-verification prerequisite (refactor.md Phase 5: legacy
+   tables go only "after projection verification and backup/migration
+   tooling exist") has no completed artifact yet. The dual-path stays
+   transition-read-only until a follow-up removal PR clears both
+   preconditions (one PR per item, removal-checklist-2026-08-12.md).
 
 ## Compatibility window (announced 2026-08-01, Phase C of the operator-surface reduction)
 

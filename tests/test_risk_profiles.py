@@ -67,9 +67,13 @@ class TestClassificationCoverage:
     def test_categories_are_valid(self):
         assert set(FIELD_CLASSIFICATION.values()) <= CATEGORIES
 
-    def test_deprecated_key_classified(self):
-        assert FIELD_CLASSIFICATION["rebalance_min_profit"] == \
-            "deprecated_transition"
+    def test_deprecated_transition_category_kept_but_empty(self):
+        # 2026-08-12: rebalance_min_profit was removed at the announced
+        # window; the category stays as the pattern for FUTURE
+        # deprecations (removal-checklist-2026-08-12.md item 1).
+        assert "deprecated_transition" in CATEGORIES
+        assert "rebalance_min_profit" not in FIELD_CLASSIFICATION
+        assert "deprecated_transition" not in FIELD_CLASSIFICATION.values()
 
     def test_compatibility_catalog_matches_config_surface(self):
         text = COMPATIBILITY_CATALOG.read_text()

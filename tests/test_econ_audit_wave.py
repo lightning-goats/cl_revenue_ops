@@ -742,21 +742,19 @@ class TestCloseCostFeerate:
 
 # =============================================================================
 # E-4.5: dead rebalance_min_profit config + dead caller-side execute loop
+# (the deprecated no-op shim was REMOVED at the announced 2026-08-12
+# window; post-removal rejection semantics are pinned by
+# tests/test_removal_readiness.py::TestStagedPostRemoval)
 # =============================================================================
 
-class TestRebalanceMinProfitDeprecation:
+class TestRebalanceMinProfitRemoved:
 
-    def test_key_classified_deprecated(self):
-        from modules.config import Config, DEPRECATED_RUNTIME_KEYS
-        assert 'rebalance_min_profit' in DEPRECATED_RUNTIME_KEYS
-        assert Config.classify_runtime_key('rebalance_min_profit') == 'deprecated'
-
-    def test_option_description_marks_no_op(self):
+    def test_option_and_shim_are_gone(self):
         from tests.plugin_test_utils import load_plugin_module
+        from modules.config import Config
         mod = load_plugin_module()
-        desc = mod.plugin.options['revenue-ops-rebalance-min-profit']['description']
-        assert 'Deprecated no-op' in desc
-        assert 'hold-margin' in desc or 'hold_margin' in desc
+        assert 'revenue-ops-rebalance-min-profit' not in mod.plugin.options
+        assert not hasattr(Config(), 'rebalance_min_profit')
 
     def test_status_echo_reports_enforced_gate_not_dead_knob(self):
         """The status surface echoed rebalance_min_profit while enforcing
@@ -766,12 +764,6 @@ class TestRebalanceMinProfitDeprecation:
             'cl-revenue-ops.py')).read()
         assert '"rebalance_min_profit_sats"' not in plugin_src
         assert '"rebalance_hold_margin_sats"' in plugin_src
-
-    def test_config_still_loads_files_that_set_the_option(self):
-        """Deprecation pattern: existing config files must not break."""
-        from modules.config import Config
-        cfg = Config(rebalance_min_profit=42)
-        assert cfg.rebalance_min_profit == 42
 
 
 class TestDeadRebalanceExecuteLoopRemoved:

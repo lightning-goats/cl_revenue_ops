@@ -112,7 +112,7 @@ change.
 | `expansion_treasury_preferred_currency` | `'BTC'` |
 | `rebalance_router` | `'v3'` |
 
-## advanced_expert (59) — Algorithm tuning — expert-only overrides
+## advanced_expert (53) — Algorithm tuning — expert-only overrides
 
 | Field | Default |
 |---|---|
@@ -127,12 +127,6 @@ change.
 | `enable_reputation` | `True` |
 | `enable_vegas_reflex` | `True` |
 | `estimated_open_cost_sats` | `5000` |
-| `fee_market_boundary_cache_seconds` | `60` |
-| `fee_market_boundary_enabled` | `False` |
-| `fee_market_boundary_margin_ppm` | `5` |
-| `fee_market_boundary_margin_ratio` | `0.05` |
-| `fee_market_boundary_max_downshift_ratio` | `0.35` |
-| `fee_market_boundary_min_competitors` | `3` |
 | `flow_window_days` | `7` |
 | `high_liquidity_threshold` | `0.7` |
 | `hot_channel_protection_enabled` | `True` |
@@ -176,11 +170,10 @@ change.
 | `thompson_prior_std_fee` | `100` |
 | `vegas_decay_rate` | `0.85` |
 
-## deprecated_transition (1) — Announced-removal compatibility shims
+## deprecated_transition (0) — Announced-removal compatibility shims
 
-| Field | Default |
-|---|---|
-| `rebalance_min_profit` | `10` |
+(Empty since the 2026-08-12 window executed the `rebalance_min_profit`
+removal; the category is kept as the pattern for future deprecations.)
 
 ## Profile bundles (economic_risk keys only)
 

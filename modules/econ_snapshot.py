@@ -1,6 +1,6 @@
 """Canonical economic snapshot types (refactor Phase 1, Workstream A).
 
-Python implementation of schemas/economic_snapshot.v0.schema.json — the
+Python implementation of schemas/economic_snapshot.v1.schema.json — the
 schema is the normative contract, these dataclasses are one
 implementation of it (J1 rule). Field-to-source mapping:
 docs/refactor/phase0/snapshot-mapping.md.
@@ -30,7 +30,12 @@ from .econ_types import (
 )
 
 SCHEMA_NAME = "economic_snapshot"
-SCHEMA_VERSION = 0
+# v0 -> v1 emission cutover executed 2026-08-12 (announced 2026-07-13,
+# contract-compatibility-policy.md item 2). v1 is the FROZEN closed-object
+# contract — identical field set, additionalProperties: false; additive
+# fields are a v2 matter. The conformance validator still accepts v0
+# payloads read-side.
+SCHEMA_VERSION = 1
 
 # Wire enums — keep byte-identical to the JSON schema.
 ROLES = frozenset({
@@ -173,7 +178,7 @@ def _channel_wire(c: ChannelSnapshot) -> dict:
 
 
 def to_wire(snap: EconomicSnapshot) -> dict:
-    """Plain JSON-safe dict matching economic_snapshot.v0.schema.json."""
+    """Plain JSON-safe dict matching economic_snapshot.v1.schema.json."""
     return {
         "schema_name": snap.schema_name,
         "schema_version": snap.schema_version,

@@ -73,15 +73,9 @@
 # per-role split was retired with the cl-mycelium integration).
 #revenue-ops-base-fee-policy=off
 
-# DEPRECATED no-op compatibility flags. The fee market boundary guard was
-# removed; these options are retained only so existing configs keep loading.
-# Setting them has NO effect (the boundary logic is ignored). Default: disabled.
-#revenue-ops-fee-market-boundary-enabled=false
-#revenue-ops-fee-market-boundary-min-competitors=3
-#revenue-ops-fee-market-boundary-margin-ppm=5
-#revenue-ops-fee-market-boundary-margin-ratio=0.05
-#revenue-ops-fee-market-boundary-max-downshift-ratio=0.35
-#revenue-ops-fee-market-boundary-cache-seconds=60
+# (The deprecated no-op revenue-ops-fee-market-boundary-* options were
+# REMOVED at the announced 2026-08-12 compatibility window. Competitive
+# pricing is handled by the neighbor-median market modes above.)
 
 # --- Vegas Reflex ---
 # Dynamically raise fee floor during mempool congestion
@@ -100,10 +94,10 @@
 # Rebalance candidate evaluation interval in seconds
 #revenue-ops-rebalance-interval=900
 
-# DEPRECATED no-op. Minimum-profit gating is now enforced by the sats-EV
-# gate and revenue-ops-rebalance-hold-margin; this value is parsed and
-# echoed for config-file compatibility only.
-#revenue-ops-rebalance-min-profit=10
+# (The deprecated no-op revenue-ops-rebalance-min-profit option was
+# REMOVED at the announced 2026-08-12 compatibility window; minimum-profit
+# gating is enforced by the sats-EV gate and
+# revenue-ops-rebalance-hold-margin.)
 
 # Rebalance route discovery is pinned to v3/askrene.
 #revenue-ops-rebalance-router=v3

@@ -987,12 +987,6 @@ def _make_config_snapshot(**overrides):
         "max_fee_ppm": 5000,
         "fee_interval": 1800,
         "fee_profile": "active",
-        "fee_market_boundary_enabled": True,
-        "fee_market_boundary_min_competitors": 1,
-        "fee_market_boundary_margin_ppm": 5,
-        "fee_market_boundary_margin_ratio": 0.05,
-        "fee_market_boundary_max_downshift_ratio": 0.35,
-        "fee_market_boundary_cache_seconds": 60,
         "inbound_fee_estimate_ppm": 200,
         "thompson_prior_std_fee": 200.0,
         "routing_intelligence_enabled": False,
@@ -1667,113 +1661,15 @@ class TestMarketBoundaryGuard:
         fc.data_service.get_channels.return_value = {"channels": channels}
         fc._our_node_id = our_id
 
-    def test_market_boundary_lookup_is_deprecated_noop_even_when_enabled(
-        self, mock_plugin, mock_database
-    ):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        cfg.fee_market_boundary_enabled = True
-        peer_id = "02" + "b" * 64
-        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(0, 1, 10, 80, 150))
-
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
-        fc.data_service.get_channels.assert_not_called()
-
-    def test_market_boundary_lookup_ignores_force_refresh_when_deprecated(
-        self, mock_plugin, mock_database
-    ):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        cfg.fee_market_boundary_enabled = True
-        cfg.fee_market_boundary_min_competitors = 3
-        peer_id = "02" + "c" * 64
-        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(1, 10, 80))
-
-        info = fc._get_market_boundary_fee(peer_id, cfg=cfg, force_refresh=True)
-
-        assert info is None
-        fc.data_service.get_channels.assert_not_called()
-
-    def test_market_boundary_respects_min_competitor_threshold(self, mock_plugin, mock_database):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        cfg.fee_market_boundary_min_competitors = 2
-        peer_id = "02" + "c" * 64
-        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(80,))
-
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
-
-    def test_market_boundary_force_refresh_does_not_reenable_deprecated_lookup(
-        self, mock_plugin, mock_database
-    ):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        cfg.fee_market_boundary_enabled = True
-        peer_id = "02" + "e" * 64
-        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(100,))
-
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
-
-        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(60,))
-
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg, force_refresh=True) is None
-
-    def test_market_boundary_deprecation_skips_gossip_even_with_default_like_competitors(
-        self, mock_plugin, mock_database
-    ):
-        fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        cfg.fee_market_boundary_enabled = True
-        peer_id = "02" + "d" * 64
-        our_id = "our-node"
-        fc.data_service = MagicMock()
-        fc.data_service.get_node_id.return_value = our_id
-        fc._our_node_id = our_id
-        fc.data_service.get_channels.return_value = {
-            "channels": [
-                {
-                    "source": our_id,
-                    "destination": peer_id,
-                    "active": True,
-                    "fee_per_millionth": 112,
-                    "fee_base_msat": 0,
-                    "satoshis": 2_000_000,
-                },
-                {
-                    "source": "cln-default",
-                    "destination": peer_id,
-                    "active": True,
-                    "fee_per_millionth": 10,
-                    "fee_base_msat": 1000,
-                    "satoshis": 2_000_000,
-                    "last_update": int(time.time()),
-                },
-                {
-                    "source": "priced-competitor",
-                    "destination": peer_id,
-                    "active": True,
-                    "fee_per_millionth": 80,
-                    "fee_base_msat": 0,
-                    "satoshis": 2_000_000,
-                    "last_update": int(time.time()),
-                },
-            ]
-        }
-
-        info = fc._get_market_boundary_fee(peer_id, cfg=cfg, force_refresh=True)
-
-        assert info is None
-        fc.data_service.get_channels.assert_not_called()
-
     def test_deprecated_market_boundary_helpers_removed(
         self, mock_plugin, mock_database
     ):
-        """Only the two hard-None stub providers survive the dead-code sweep;
-        the unreachable guard/downshift/target helpers are gone."""
+        """2026-08-12 removal: with the fee_market_boundary_* options and
+        config fields deleted at the announced window, the hard-None stub
+        provider went with them — no boundary machinery survives."""
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
-        peer_id = "02" + "5" * 64
-        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(80,))
 
-        # Stub kept (incident rationale lives in its docstring)
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
-
-        # Dead consumers/helpers removed
+        assert not hasattr(fc, "_get_market_boundary_fee")
         assert not hasattr(fc, "_apply_market_boundary_downshift")
         assert not hasattr(fc, "_get_market_boundary_target")
         assert not hasattr(fc, "_market_boundary_has_room")
@@ -1794,7 +1690,6 @@ class TestMarketBoundaryGuard:
         now = int(time.time())
 
         fc._get_neighbor_fee_median = MagicMock(return_value=None)
-        fc._get_market_boundary_fee = MagicMock(return_value=None)
         fc._get_rebalance_cost_floor = MagicMock(return_value=None)
         fc._get_channel_rebalance_cost_ppm = MagicMock(return_value=0)
         fc._calculate_floor = MagicMock(return_value=cfg.min_fee_ppm)
@@ -1905,7 +1800,6 @@ class TestMarketBoundaryGuard:
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
         cfg.min_fee_ppm = 10
         cfg.max_fee_ppm = 2500
-        cfg.fee_market_boundary_min_competitors = 3
         channel_id = "277x1x0"
         peer_id = "02" + "9" * 64
         current_fee_ppm = 112
@@ -1957,7 +1851,6 @@ class TestMarketBoundaryGuard:
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
         cfg.min_fee_ppm = 10
         cfg.max_fee_ppm = 2500
-        cfg.fee_market_boundary_min_competitors = 3
         channel_id = "277x1x0"
         peer_id = "02" + "8" * 64
         current_fee_ppm = 112
@@ -2003,9 +1896,6 @@ class TestMarketBoundaryGuard:
         channel_id = "277x1x0"
         peer_id = "02" + "f" * 64
         current_fee_ppm = 75
-        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(100,))
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
-
         self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(60,))
 
         now = int(time.time())
@@ -2204,8 +2094,6 @@ class TestMarketBoundaryGuard:
         peer_id = "02" + "b" * 64
         current_fee_ppm = 42
 
-        self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(50,))
-        assert fc._get_market_boundary_fee(peer_id, cfg=cfg) is None
         self._install_competitor_gossip(fc, peer_id=peer_id, competitor_fees=(60,))
 
         mock_database.get_volume_since.return_value = 1_000_000

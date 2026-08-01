@@ -45,8 +45,7 @@ def _mod():
          "state": "BALANCED"}]
     mod.config = MagicMock()
     mod.config.fee_interval = 1800
-    mod.config.snapshot.return_value = SimpleNamespace(
-        fee_market_boundary_enabled=False)
+    mod.config.snapshot.return_value = SimpleNamespace()
     fc = MagicMock()
     fc.get_fee_profile_settings.return_value = {
         "name": "active", "min_observation_hours": 6,
@@ -65,6 +64,14 @@ def test_controller_contract_and_cycle_decision_exposed():
     assert contract["stage_order"] == [
         "rails", "rate_limit", "deadband", "cooldown"]
     assert result["last_cycle_decision"]["action"] == "adjusted"
+
+
+def test_no_market_boundary_echo_after_removal():
+    """2026-08-12 removal: the deprecated fee_market_boundary_* settings
+    are gone, so the debug config block no longer echoes them."""
+    result = _mod().revenue_fee_debug(MagicMock())
+    assert not any(k.startswith("market_boundary")
+                   for k in result["config"])
 
 
 def test_per_channel_controller_block():

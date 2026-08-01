@@ -5,6 +5,14 @@ NOTHING below executes before the date without an explicit operator
 change to the compatibility policy. Prep (scanner, staged tests, this
 checklist) shipped as PR 11.
 
+STATUS (branch `phase-a-removals-2026-08-12`, held for the window):
+items 1 and 3 executed (item 1 together with the Phase A
+`fee_market_boundary_*` removals from the 2026-08-01 operator-surface
+reduction §4); item 2 deferred — its zero-active-rows migration check is
+a cutover-time production-DB precondition and the Phase 5
+projection-verification prerequisite has no completed artifact. Scanner
+run on lnnode 2026-08-01: READY (exit 0).
+
 ## Preconditions (run first, must be clean)
 
 1. `python3 tools/deprecation_scan.py` on lnnode → exit 0

@@ -11,7 +11,7 @@ docs/planning/refactor.md Workstream B, with:
 - checked domain types for every amount (econ_types)
 - stable reason codes (reason_codes.CATALOG)
 
-Wire contract: schemas/intent.v0.schema.json.
+Wire contract: schemas/intent.v1.schema.json.
 Additive Phase 1 foundation — not yet consumed by live decision paths.
 """
 from __future__ import annotations
@@ -32,7 +32,12 @@ from .econ_types import (
 from .reason_codes import is_valid_code
 
 SCHEMA_NAME = "intent"
-SCHEMA_VERSION = 0
+# v0 -> v1 emission cutover executed 2026-08-12 (announced 2026-07-13,
+# contract-compatibility-policy.md item 2). v1 is the FROZEN closed-object
+# contract — identical field set, additionalProperties: false. from_wire
+# accepts exactly the emitted version (no persisted v0 re-read paths
+# exist; the standalone conformance validator still accepts v0).
+SCHEMA_VERSION = 1
 
 # Workstream B minimum intent vocabulary — stable wire strings.
 INTENT_TYPES = (

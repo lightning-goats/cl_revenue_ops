@@ -124,7 +124,8 @@ def test_wire_round_trip():
     assert from_wire(to_wire(env)) == env
     wire = to_wire(env)
     assert wire["schema_name"] == "intent"
-    assert wire["schema_version"] == 0
+    # v0 -> v1 emission cutover (2026-08-12 compatibility window)
+    assert wire["schema_version"] == 1
     assert wire["amount_msat"] == 250
     assert wire["explanation"]["kind"] == "fee_target"
 
@@ -147,6 +148,6 @@ def test_wire_form_validates_against_schema():
     import pathlib
     schema = json.loads(
         (pathlib.Path(__file__).resolve().parent.parent / "schemas"
-         / "intent.v0.schema.json").read_text())
+         / "intent.v1.schema.json").read_text())
     env = make_intent(**_fields(reason_codes=("COOLDOWN_ACTIVE",)))
     jsonschema.validate(to_wire(env), schema)

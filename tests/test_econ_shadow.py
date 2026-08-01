@@ -11,7 +11,7 @@ from modules.econ_ledger import EconLedger
 from modules.econ_shadow import EconShadow
 
 SCHEMA_PATH = (pathlib.Path(__file__).resolve().parent.parent
-               / "schemas" / "economic_snapshot.v0.schema.json")
+               / "schemas" / "economic_snapshot.v1.schema.json")
 PEER = "02" + "a" * 64
 NOW = 1_752_400_000
 

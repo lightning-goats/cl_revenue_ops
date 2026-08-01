@@ -301,7 +301,8 @@ class TestCapexBonusSoftDeprecation:
         found = _matching(warnings, "Deprecated",
                           "capex_probability_budget_bonus")
         assert found
-        # Unlike rebalance_min_profit this key still WORKS — the warning
+        # Unlike the removed rebalance_min_profit no-op this key still
+        # WORKS — the warning
         # must not claim it is a no-op, and the value must load.
         assert "no-op" not in found[0]
         assert cfg.capex_probability_budget_bonus == 0.2

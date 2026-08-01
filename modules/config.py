@@ -42,12 +42,6 @@ PUBLIC_RUNTIME_KEYS = (
     'min_fee_ppm_saturated',
     'max_fee_ppm',
     'fee_profile',
-    'fee_market_boundary_enabled',
-    'fee_market_boundary_min_competitors',
-    'fee_market_boundary_margin_ppm',
-    'fee_market_boundary_margin_ratio',
-    'fee_market_boundary_max_downshift_ratio',
-    'fee_market_boundary_cache_seconds',
     'planner_enabled',
     'planner_dry_run',
     'planner_execute_closes',
@@ -157,12 +151,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'min_fee_ppm_saturated': int,
     'max_fee_ppm': int,
     'fee_profile': str,
-    'fee_market_boundary_enabled': bool,
-    'fee_market_boundary_min_competitors': int,
-    'fee_market_boundary_margin_ppm': int,
-    'fee_market_boundary_margin_ratio': float,
-    'fee_market_boundary_max_downshift_ratio': float,
-    'fee_market_boundary_cache_seconds': int,
     'daily_budget_sats': int,
     'growth_budget_enabled': bool,
     'growth_budget_earned_fraction': float,
@@ -225,7 +213,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'askrene_layer': str,
     'askrene_layers': str,
     'rebalance_router': str,
-    'rebalance_min_profit': int,
     'rebalance_max_amount': int,
     'rebalance_cooldown_hours': int,
     'rebalance_emergency_local_ratio': float,
@@ -302,15 +289,14 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
 
 # Explicit migration shims only. Non-public keys remain internal until they are
 # intentionally exposed as deprecated compatibility controls.
-# E-4.5 (2026-07 econ audit): rebalance_min_profit was parsed and echoed but
-# enforced nowhere; the sats-EV gate's rebalance_hold_margin covers the
-# semantics. Kept as a deprecated compatibility shim so config files load.
-DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset({'rebalance_min_profit'})
+# Empty since the 2026-08-12 compatibility-window removal of
+# rebalance_min_profit (E-4.5 no-op; rebalance_hold_margin carries the
+# semantics). The machinery stays — it is the pattern for FUTURE
+# deprecations (docs/refactor/phase0/removal-checklist-2026-08-12.md).
+DEPRECATED_RUNTIME_KEYS: FrozenSet[str] = frozenset()
 
 # Replacement guidance surfaced in the startup deprecation warning.
-DEPRECATED_KEY_REPLACEMENTS: Dict[str, str] = {
-    'rebalance_min_profit': 'rebalance_hold_margin',
-}
+DEPRECATED_KEY_REPLACEMENTS: Dict[str, str] = {}
 
 # Workstream I: settings whose effect is entirely gated behind a boolean
 # flag. An explicit override of a gated key while its gate is off is
@@ -322,10 +308,6 @@ SHADOWED_SETTING_GATES: Dict[str, tuple] = {
         'growth_budget_experiment_fraction',
         'growth_budget_max_extra_sats',
         'growth_budget_hard_ceiling_sats',
-    ),
-    'fee_market_boundary_enabled': (
-        'fee_market_boundary_min_competitors',
-        'fee_market_boundary_margin_ppm',
     ),
     'lnplus_swaps_enabled': (
         'lnplus_execute_applications',
@@ -391,11 +373,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # any other class.
     'min_fee_ppm_saturated': (0, 1000),
     'max_fee_ppm': (1, 100000),
-    'fee_market_boundary_min_competitors': (1, 100),
-    'fee_market_boundary_margin_ppm': (0, 10000),
-    'fee_market_boundary_margin_ratio': (0.0, 0.50),
-    'fee_market_boundary_max_downshift_ratio': (0.05, 1.0),
-    'fee_market_boundary_cache_seconds': (10, 3600),
     'daily_budget_sats': (0, 10000000),
     'growth_budget_earned_fraction': (0.0, 1.0),
     'growth_budget_experiment_fraction': (0.0, 1.0),
@@ -437,7 +414,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'max_concurrent_jobs': (1, 20),
     'base_fee_msat': (0, 10000),
     'neighbor_median_min_competitors': (2, 50),
-    'rebalance_min_profit': (0, 1000000),
     'rebalance_max_amount': (10000, 100000000),
     'flow_window_days': (1, 365),
     # AUDIT FIX C-2/I-4: Missing range validation for float/int fields
@@ -679,25 +655,11 @@ class Config:
     #   - "premium":  price above the median by the same per-corridor weight
     market_fee_mode: str = "undercut"
     fee_profile: str = 'active'    # Fee-controller aggressiveness profile
-    # Experimental competitive boundary guard. Disabled by default because a
-    # market cap derived from peer gossip is too easy to anchor on cheap
-    # outliers and can synchronize unrelated channels around one floor.
-    fee_market_boundary_enabled: bool = False
-    fee_market_boundary_min_competitors: int = 3
-    fee_market_boundary_margin_ppm: int = 5
-    fee_market_boundary_margin_ratio: float = 0.05
-    fee_market_boundary_max_downshift_ratio: float = 0.35
-    fee_market_boundary_cache_seconds: int = 60
-    
+    # (fee_market_boundary_* and rebalance_min_profit were deprecated
+    # no-ops removed at the announced 2026-08-12 compatibility window —
+    # docs/refactor/phase0/contract-compatibility-policy.md.)
+
     # Rebalancing parameters
-    # E-4.5 (2026-07 econ audit): rebalance_min_profit is a DEPRECATED
-    # no-op compatibility field — it was parsed and echoed but enforced
-    # nowhere. Its semantics (absolute sats profit floor) are covered by
-    # rebalance_hold_margin, which the v2 engine's sats-EV do-nothing gate
-    # actually enforces. Kept only so existing config files load cleanly
-    # (mirrors the fee-market-boundary deprecation pattern).
-    rebalance_min_profit: int = 10     # DEPRECATED no-op (use rebalance_hold_margin)
-                                        # Recommended: 20 ppm (~10 sats per 500k chunk)
     rebalance_max_amount: int = 5000000  # Max rebalance amount in sats
     low_liquidity_threshold: float = 0.3  # Below 30% = low outbound
     high_liquidity_threshold: float = 0.7 # Above 70% = high outbound
@@ -1353,14 +1315,7 @@ class ConfigSnapshot:
     base_fee_policy: str
     neighbor_median_min_competitors: int
     fee_profile: str
-    fee_market_boundary_enabled: bool
-    fee_market_boundary_min_competitors: int
-    fee_market_boundary_margin_ppm: int
-    fee_market_boundary_margin_ratio: float
-    fee_market_boundary_max_downshift_ratio: float
-    fee_market_boundary_cache_seconds: int
     # Rebalancing parameters
-    rebalance_min_profit: int
     rebalance_max_amount: int
     low_liquidity_threshold: float
     high_liquidity_threshold: float

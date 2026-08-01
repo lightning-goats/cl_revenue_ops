@@ -48,7 +48,7 @@
     "reason_codes": [],
     "reversible": false,
     "schema_name": "intent",
-    "schema_version": 0,
+    "schema_version": 1,
     "snapshot_id": "snap-1",
     "target": "500x1x0"
    },
@@ -79,7 +79,7 @@
     "reason_codes": [],
     "reversible": false,
     "schema_name": "intent",
-    "schema_version": 0,
+    "schema_version": 1,
     "snapshot_id": "snap-1",
     "target": "600x1x0"
    },
@@ -110,7 +110,7 @@
     "reason_codes": [],
     "reversible": false,
     "schema_name": "intent",
-    "schema_version": 0,
+    "schema_version": 1,
     "snapshot_id": "snap-1",
     "target": "500x1x0"
    },
@@ -141,7 +141,7 @@
     "reason_codes": [],
     "reversible": false,
     "schema_name": "intent",
-    "schema_version": 0,
+    "schema_version": 1,
     "snapshot_id": "snap-1",
     "target": "600x1x0"
    }

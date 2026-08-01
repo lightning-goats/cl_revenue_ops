@@ -3537,23 +3537,13 @@ class FeeController:
         self._neighbor_fee_cache[cache_key] = {"value": result, "ts": time.time()}
         return result
 
-    def _get_market_boundary_fee(
-        self,
-        peer_id: str,
-        cfg: Optional[Any] = None,
-        force_refresh: bool = False,
-    ) -> Optional[Dict[str, Any]]:
-        """Deprecated compatibility stub for fee market boundaries.
-
-        Remote peer fees are not a reliable lower bound for our local fee.
-        Production data showed profitable channels whose remote policies were
-        0-1 ppm, so using those policies as route-choice boundaries can anchor
-        unrelated channels to unsafe low fees. Keep the method and config keys
-        for operator compatibility, but never let persisted
-        fee_market_boundary_enabled=true influence pricing.
-        """
-        return None
-
+    # NOTE (2026-08-12 removal): the deprecated market-boundary stub
+    # (_get_market_boundary_fee) was deleted with the fee_market_boundary_*
+    # options/config keys at the announced compatibility window. Incident
+    # rationale, preserved: remote peer fees are not a reliable lower bound
+    # for our local fee — production data showed profitable channels whose
+    # remote policies were 0-1 ppm, so gossip-derived boundaries can anchor
+    # unrelated channels to unsafe low fees. Do not reintroduce.
 
     def _get_neighbor_fee_median_live(self, peer_id: str, cfg: Optional[Any] = None) -> int | None:
         """Get median fee charged by other nodes to the same peer.
@@ -6293,16 +6283,15 @@ class FeeController:
             else:
                 # Neither condition met yet - wait for more time or data.
                 #
-                # P10 fix (2026-06-10): the old wait path called
-                # _get_market_boundary_fee(force_refresh=True) plus a full
-                # _calculate_floor (DB latency query) for EVERY waiting
-                # channel on EVERY cycle, purely to populate explainability
-                # fields. Both boundary getters are deprecated hard-None
-                # stubs (see _get_market_boundary_fee), so the bypass could
-                # never fire — it was pure per-cycle latency. The dead
-                # consumers and inert explainability fields were removed
-                # entirely in the dead-code sweep; only the two stub
-                # providers remain (incident rationale in their docstrings).
+                # P10 fix (2026-06-10): the old wait path called the
+                # market-boundary getter plus a full _calculate_floor (DB
+                # latency query) for EVERY waiting channel on EVERY cycle,
+                # purely to populate explainability fields. The boundary
+                # getters were deprecated hard-None stubs, so the bypass
+                # could never fire — pure per-cycle latency. The dead
+                # consumers and inert explainability fields were removed in
+                # the dead-code sweep, and the stubs themselves went with
+                # the fee_market_boundary_* removal (2026-08-12 window).
                 # Invariant: the wait path does no market-boundary work.
                 self.plugin.log(
                     f"DYNAMIC_WINDOW: {channel_id[:12]}... waiting "
@@ -7225,11 +7214,12 @@ class FeeController:
                     level='debug'
                 )
 
-            # Market boundary guard removed: the boundary provider
-            # (_get_market_boundary_fee) is a deprecated hard-None stub —
-            # see its docstring for the incident rationale — so the
-            # guard/support/downshift consumers were unreachable dead code
-            # and have been deleted.
+            # Market boundary guard removed: the boundary provider was a
+            # deprecated hard-None stub (deleted 2026-08-12 with the
+            # fee_market_boundary_* settings; incident rationale preserved
+            # above _get_neighbor_fee_median_live), so the guard/support/
+            # downshift consumers were unreachable dead code and have been
+            # deleted.
 
             # Supported-fee ceiling (2026-06-12): cap the target at headroom
             # above the fee region the earning evidence actually supports.

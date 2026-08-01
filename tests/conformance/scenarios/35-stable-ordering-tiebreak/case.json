@@ -39,7 +39,7 @@
     "reason_codes": [],
     "reversible": false,
     "schema_name": "intent",
-    "schema_version": 0,
+    "schema_version": 1,
     "snapshot_id": "snap-1",
     "target": "300x1x0"
    },
@@ -70,7 +70,7 @@
     "reason_codes": [],
     "reversible": false,
     "schema_name": "intent",
-    "schema_version": 0,
+    "schema_version": 1,
     "snapshot_id": "snap-1",
     "target": "100x1x0"
    },
@@ -101,7 +101,7 @@
     "reason_codes": [],
     "reversible": false,
     "schema_name": "intent",
-    "schema_version": 0,
+    "schema_version": 1,
     "snapshot_id": "snap-1",
     "target": "200x1x0"
    },
@@ -132,7 +132,7 @@
     "reason_codes": [],
     "reversible": false,
     "schema_name": "intent",
-    "schema_version": 0,
+    "schema_version": 1,
     "snapshot_id": "snap-1",
     "target": "400x1x0"
    }
