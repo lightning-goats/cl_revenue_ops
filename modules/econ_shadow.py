@@ -18,6 +18,7 @@ docs/planning/2026-07-12-refactor-phase1-wiring.md.
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from .econ_intents import Explanation, make_intent
@@ -47,6 +48,11 @@ class EconShadow:
         # most one per max_age window.
         self.snapshot_provider = None
         self._snapshot_ref_cache: Optional[Tuple[dict, int]] = None
+        # Wave 2: guards the lazy ActiveIntentRegistry init — an
+        # unlocked check-then-create could hand two concurrent
+        # authorizations DIFFERENT registries (one-shot conflict-check
+        # bypass).
+        self._intent_registry_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # plumbing
@@ -366,19 +372,28 @@ class EconShadow:
             if getattr(cfg, "econ_arbiter_enabled", False) is not True:
                 return None
             if self._intent_registry is None:
-                from .econ_arbiter import ActiveIntentRegistry
+                # Wave 2: double-checked under the init lock — the
+                # unlocked check-then-create raced, and two concurrent
+                # authorizations could each build (and consult) their
+                # OWN registry, bypassing the conflict check once.
+                with self._intent_registry_lock:
+                    if self._intent_registry is None:
+                        from . import econ_arbiter
 
-                def _extended_rules() -> bool:
-                    # PR 10: extra conflict rules gated by their own
-                    # flag; read live so a flip needs no restart.
-                    snap = self._config.snapshot() \
-                        if hasattr(self._config, "snapshot") \
-                        else self._config
-                    return getattr(snap, "econ_conflict_rules_extended",
-                                   False) is True
+                        def _extended_rules() -> bool:
+                            # PR 10: extra conflict rules gated by their
+                            # own flag; read live so a flip needs no
+                            # restart.
+                            snap = self._config.snapshot() \
+                                if hasattr(self._config, "snapshot") \
+                                else self._config
+                            return getattr(
+                                snap, "econ_conflict_rules_extended",
+                                False) is True
 
-                self._intent_registry = ActiveIntentRegistry(
-                    extended_rules_provider=_extended_rules)
+                        self._intent_registry = \
+                            econ_arbiter.ActiveIntentRegistry(
+                                extended_rules_provider=_extended_rules)
             return self._intent_registry
         except Exception:
             return None

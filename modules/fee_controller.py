@@ -2983,6 +2983,12 @@ class FeeController:
             )
         self.fee_authority_gate = fee_authority_gate
         self.data_service = None  # Unified data service (injected by main plugin)
+        # Wave 2: (facade, arbitration_key) per governed fee-broadcast
+        # authorization, keyed by channel_id, so the broadcast site can
+        # free the live-arbitration registry slot on its terminal
+        # outcome (RPC success OR failure — a reversible zero-cost
+        # SET_FEE has no pending state).
+        self._governed_intent_completions: Dict[str, tuple] = {}
         if self.policy_manager and hasattr(self.policy_manager, "register_on_change"):
             try:
                 self.policy_manager.register_on_change(self._handle_policy_change)
@@ -8166,6 +8172,12 @@ class FeeController:
                 except Exception:
                     pass
             decision = facade.authorize(env, now)
+            if decision.authorized:
+                # Wave 2: stash the registry completion for the
+                # broadcast site (same channel key the caller passes) —
+                # the return shape stays the pinned (ok, reason) pair.
+                self._governed_intent_completions[str(channel_id)] = (
+                    facade, decision.token.arbitration_key)
             return bool(decision.authorized), str(decision.reason_code)
         except Exception as e:
             return False, f"internal_error ({e})"
@@ -8408,6 +8420,7 @@ class FeeController:
             # precedence + legacy behavior). Fail-closed: an unauthorized
             # or errored authorization skips the broadcast; the channel
             # is repriced next cycle.
+            gov_completion = None
             if not manual and self._fee_governor_enabled():
                 gov_ok, gov_reason = self._governed_authorize_fee_broadcast(
                     channel_id=resolved_channel_id,
@@ -8416,6 +8429,12 @@ class FeeController:
                     reason=reason,
                     reason_code=reason_code,
                 )
+                # Wave 2: the terminal completion for this authorization
+                # (registry-only slot release; a reversible zero-cost
+                # SET_FEE has no pending state, so BOTH broadcast success
+                # and failure are terminal).
+                gov_completion = self._governed_intent_completions.pop(
+                    str(resolved_channel_id), None)
                 if not gov_ok:
                     result["message"] = f"governor_block: {gov_reason}"
                     result["governor_blocked"] = True
@@ -8426,7 +8445,16 @@ class FeeController:
                         level='info')
                     return result
 
-            rpc_result = self.data_service.set_channel(**rpc_params)
+            try:
+                rpc_result = self.data_service.set_channel(**rpc_params)
+            finally:
+                # Wave 2: broadcast attempted — terminal either way.
+                if gov_completion is not None:
+                    gov_facade, gov_arbitration_key = gov_completion
+                    try:
+                        gov_facade.complete(gov_arbitration_key)
+                    except Exception:
+                        pass
             (
                 applied_fee_ppm,
                 applied_htlcmin_msat,

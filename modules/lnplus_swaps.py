@@ -831,6 +831,13 @@ class SwapLifecycle:
                 self._plugin.log(
                     f"LNPLUS: governor blocked swap-open reservation for "
                     f"swap {swap_id}: {decision.reason_code}", level="warn")
+            else:
+                # Wave 2: remember how to release the registry slot when
+                # this attempt reaches a terminal outcome (settle or
+                # definite-failure release; unknown-outcome HOLDS stay
+                # registered), keyed by the attempt's reservation_id.
+                self._governed_intent_completions[str(reservation_id)] = (
+                    facade, decision.token.arbitration_key)
             return bool(decision.authorized)
         except Exception as e:
             self._plugin.log(
@@ -863,6 +870,11 @@ class SwapLifecycle:
         # B13: in-memory only (no DB) — observability of the most recent
         # watcher pass, surfaced via get_status().
         self._last_watcher_pass: Optional[Dict] = None
+        # Wave 2: (facade, arbitration_key) per in-flight governed
+        # reservation, so settle/release can free the live-arbitration
+        # registry slot on a TERMINAL outcome (unknown-outcome HOLDS
+        # deliberately stay registered until envelope expiry).
+        self._governed_intent_completions: Dict[str, Tuple] = {}
 
     # -- breaker -------------------------------------------------------
     def breaker_tripped(self) -> Optional[str]:
@@ -1862,6 +1874,24 @@ class SwapLifecycle:
         except (ValueError, IndexError):
             return None
 
+    def _complete_governed_intent(self, reservation_id) -> None:
+        """Wave 2: registry-only completion at a TERMINAL outcome
+        (settle or definite-failure release) of a governed swap-open
+        attempt. Frees the live-arbitration slot so the obligation's
+        stable intent identity (the key hashes the swap-scoped
+        snapshot_id) is not misblocked as INTENT_SUPERSEDED on retry.
+        NOT called on unknown-outcome HOLDS. Best-effort; budget
+        settlement stays on the legacy paths."""
+        completion = self._governed_intent_completions.pop(
+            str(reservation_id), None)
+        if completion is None:
+            return
+        facade, arbitration_key = completion
+        try:
+            facade.complete(arbitration_key)
+        except Exception:
+            pass
+
     def _release_swap_open_reservation(self, reservation_id: str, sid: str) -> None:
         """Best-effort release on a failed/aborted fundchannel attempt. Never a
         committed spend, so a release failure is logged and swallowed — the
@@ -1872,6 +1902,9 @@ class SwapLifecycle:
             self._plugin.log(
                 f"LNPLUS: release_spend_reservation failed for swap {sid} "
                 f"({reservation_id}): {e}", level="warn")
+        # Wave 2: a definite failure is terminal for this attempt's
+        # governed intent — free the live-arbitration slot.
+        self._complete_governed_intent(reservation_id)
 
     def _settle_swap_open_reservation(self, reservation_id: str, estimated_cost: int, sid: str) -> None:
         """Settle a committed swap-open reservation as a spend event.
@@ -1884,7 +1917,13 @@ class SwapLifecycle:
         committed fee counted on the unified rail. We retry a bounded number of
         times and, on persistent failure, log LOUDLY and leave the reservation
         active — never release a committed spend.
+
+        Wave 2: settling is a TERMINAL outcome for the governed intent —
+        the live-arbitration slot is released here regardless of the
+        settle-write result (the ACTION completed; only bookkeeping can
+        still be pending, and that stays on this legacy rail).
         """
+        self._complete_governed_intent(reservation_id)
         for attempt in range(3):
             try:
                 if self._db.mark_spend_reservation_spent(

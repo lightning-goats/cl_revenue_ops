@@ -142,6 +142,11 @@ class RebalanceEngine:
         # Phase 2C: optional shadow-governor (EconShadow), injected at
         # plugin init; None = no shadow. Fail-open by contract.
         self.econ_shadow = None
+        # Wave 2: (facade, arbitration_key) per in-flight governed
+        # reservation, so _finish_execution_budget can release the
+        # live-arbitration registry slot on a TERMINAL outcome (success
+        # or definite failure — NOT payment_pending holds).
+        self._governed_intent_completions: Dict[str, Tuple[Any, str]] = {}
         self._capex_engine = capex_engine
         self._profitability = profitability
         self._data_service = data_service
@@ -2145,6 +2150,11 @@ class RebalanceEngine:
             decision = facade.authorize(env, int(now),
                                         reservation_id=reservation_id)
             if decision.authorized:
+                # Wave 2: remember how to release the registry slot when
+                # this execution reaches a terminal outcome (keyed by
+                # the SAME reservation_id the finish path already uses).
+                self._governed_intent_completions[str(reservation_id)] = (
+                    facade, decision.token.arbitration_key)
                 return True, None
             if decision.reason_code == "BUDGET_EXHAUSTED":
                 remaining = outcome.get("remaining", 0)
@@ -2248,9 +2258,30 @@ class RebalanceEngine:
             except Exception:
                 ev_enabled = False
                 extended = False
-            env_pairs = rebalance_intent_pairs(live_candidates, ctx,
-                                               ev_enabled=ev_enabled)
-            pair_by_key = {env.idempotency_key: pair
+            # Wave 2: per-candidate envelope construction — ONE
+            # malformed pair drops only itself (logged) instead of
+            # disabling conflict filtering for the whole cycle via the
+            # outer fail-open handler.
+            env_pairs = []
+            for candidate in sorted(
+                    live_candidates,
+                    key=lambda p: (str(p.dest_channel_id),
+                                   str(p.source_channel_id))):
+                try:
+                    env_pairs.extend(rebalance_intent_pairs(
+                        [candidate], ctx, ev_enabled=ev_enabled))
+                except Exception as pair_exc:
+                    self._log(
+                        f"cycle arbitration: dropping malformed candidate "
+                        f"{getattr(candidate, 'source_channel_id', '?')}->"
+                        f"{getattr(candidate, 'dest_channel_id', '?')}: "
+                        f"{pair_exc}",
+                        level="warn")
+            from .econ_arbiter import conflict_slot_key
+            # Wave 2: map by the conflict slot key (idempotency key +
+            # source leg) — plain keys COLLIDE for two pairs sharing
+            # dest+amount, silently collapsing the mapping.
+            pair_by_key = {conflict_slot_key(env): pair
                            for env, pair in env_pairs}
             arbitration = arbitrate([env for env, _ in env_pairs], now=now,
                                     extended_rules=extended)
@@ -2263,7 +2294,7 @@ class RebalanceEngine:
                 except Exception:
                     ledger = None
             for env, code, detail in arbitration.rejected:
-                pair = pair_by_key.get(env.idempotency_key)
+                pair = pair_by_key.get(conflict_slot_key(env))
                 if pair is not None:
                     result.audit_records.append(SkipRecord(
                         channel_id=pair.dest_channel_id,
@@ -2299,9 +2330,9 @@ class RebalanceEngine:
                         )
                     except Exception:
                         pass
-            ordered = [pair_by_key[env.idempotency_key]
+            ordered = [pair_by_key[conflict_slot_key(env)]
                        for env in arbitration.ordered
-                       if env.idempotency_key in pair_by_key]
+                       if conflict_slot_key(env) in pair_by_key]
             self._log(
                 f"cycle arbitration: {len(live_candidates)} candidates -> "
                 f"{len(ordered)} ordered, "
@@ -2309,8 +2340,14 @@ class RebalanceEngine:
                 level="info" if arbitration.rejected else "debug")
             return ordered
         except Exception as exc:
-            self._log(f"cycle arbitration failed open: {exc}",
-                      level="warn")
+            # Wave 2: reaching here means the ARBITER INFRASTRUCTURE
+            # failed (per-candidate construction errors are contained
+            # above) — keep the documented fail-to-current-behavior
+            # fallback, but loudly: conflict filtering is OFF this cycle.
+            self._log(
+                f"cycle arbitration failed open (arbiter infrastructure "
+                f"error — conflict filtering disabled this cycle): {exc}",
+                level="error")
             return live_candidates
 
     def _shadow_authorize_reservation(self, pair, max_fee_sats, reserved,
@@ -2342,6 +2379,13 @@ class RebalanceEngine:
     ) -> None:
         if not reserved_budget or self.database is None:
             return
+        # Wave 2: pop the governed completion up front (a pending hold
+        # never re-enters this method — reconcile_pending_settlements
+        # owns that tail, and the registry entry then expires with its
+        # envelope). Invoked only on TERMINAL outcomes below.
+        completion = self._governed_intent_completions.pop(
+            str(reservation_id), None)
+        terminal = True
         try:
             if result is not None and getattr(result, "payment_pending", False):
                 # P4-007: only HOLD the reservation for a pending payment that
@@ -2363,7 +2407,9 @@ class RebalanceEngine:
                     # active so the budget stays held until the reconciliation
                     # sweep confirms settlement or failure. Releasing here would
                     # let the next cycle spend the same budget while the HTLC
-                    # can still settle.
+                    # can still settle. Wave 2: NOT terminal — the registry
+                    # entry keeps blocking a concurrent duplicate.
+                    terminal = False
                     return
                 self.database.release_budget_reservation(reservation_id)
                 return
@@ -2379,6 +2425,18 @@ class RebalanceEngine:
                 f"budget reservation cleanup failed for {reservation_id}: {exc}",
                 level="warn",
             )
+        finally:
+            # Wave 2: terminal outcome (success OR definite failure) —
+            # release the live-arbitration slot so a legitimate retry of
+            # the same intent identity is not misblocked as
+            # INTENT_SUPERSEDED. Registry-only; budget settlement stayed
+            # on the legacy calls above.
+            if terminal and completion is not None:
+                facade, arbitration_key = completion
+                try:
+                    facade.complete(arbitration_key)
+                except Exception:
+                    pass
 
     def _execution_kwargs(self, pair: PairCandidate) -> Dict[str, Any]:
         router_kind = "v3" if self._cycle_router is self.router_v3 else "v2"

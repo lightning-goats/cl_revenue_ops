@@ -287,6 +287,12 @@ class BoltzCliManager:
         # stashed by _loop_out_locked (under _swap_creation_lock) so the loop_out
         # wrapper can settle-or-release it on every exit including exceptions.
         self._pending_swap_budget = None
+        # Wave 2: (facade, arbitration_key) per in-flight governed
+        # reservation, so _finalize_swap_budget_reservation (the
+        # settle-or-release terminal point) can free the live-arbitration
+        # registry slot; unknown-outcome HOLDS skip finalize and so stay
+        # registered until envelope expiry.
+        self._governed_intent_completions: Dict[str, tuple] = {}
 
     def set_capex_engine(self, engine):
         """Inject the unified capex budget engine."""
@@ -1771,6 +1777,11 @@ class BoltzCliManager:
                 except Exception:
                     pass
                 return False
+            # Wave 2: remember how to release the registry slot at the
+            # settle-or-release terminal point (finalize), keyed by the
+            # SAME reservation_id the finalize path already receives.
+            self._governed_intent_completions[str(reservation_id)] = (
+                facade, decision.token.arbitration_key)
             return reservation_id
         except Exception as e:
             try:
@@ -1849,9 +1860,22 @@ class BoltzCliManager:
         structural: bool = False,
     ) -> None:
         """Settle (swap created) or release (swap failed) the pre-create
-        reservation. Called on every swap-method exit."""
+        reservation. Called on every swap-method exit.
+
+        Wave 2: both branches are TERMINAL for the governed intent —
+        the live-arbitration registry slot is released either way
+        (unknown-outcome HOLD paths deliberately never reach this
+        method, so their entries stay armed until envelope expiry)."""
         if not reservation_id or self._capex_engine is None:
             return
+        completion = self._governed_intent_completions.pop(
+            str(reservation_id), None)
+        if completion is not None:
+            facade, arbitration_key = completion
+            try:
+                facade.complete(arbitration_key)
+            except Exception:
+                pass
         try:
             fee = max(0, int(estimated_fee_sats or 0))
         except (TypeError, ValueError):

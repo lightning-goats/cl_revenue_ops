@@ -25,6 +25,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from .econ_arbiter import conflict_slot_key
 from .econ_intents import IntentEnvelope, is_expired
 from .econ_ledger import EconLedger
 from .econ_types import UnixTime
@@ -107,6 +108,11 @@ class GovernorFacade:
         if is_expired(env, UnixTime(now)):
             return GovernorDecision(False, None, "INTENT_STALE")
 
+        # Wave 2: the registry slot key extends the (contract-pinned)
+        # idempotency key with the rebalance source leg — the slot the
+        # entry occupies, and the key completion/release must use.
+        arbitration_key = conflict_slot_key(env)
+        registered = False
         if self._registry is not None:
             conflict = self._registry.check_and_register(env, int(now))
             if conflict:
@@ -124,16 +130,28 @@ class GovernorFacade:
                     except Exception:
                         pass
                 return GovernorDecision(False, None, conflict)
+            registered = True
 
         effective_reservation_id = str(reservation_id or env.idempotency_key)
         reserve_sats = env.max_cost_msat.to_sats_ceil().value
         if reserve_sats > 0:
-            ok = self._reserve_spend(
-                reservation_id=effective_reservation_id,
-                amount_sats=reserve_sats,
-                category=env.budget_bucket,
-            )
+            # Wave 2 defect fix: every refusal AFTER registration must
+            # release the just-armed registry entry — otherwise a retry
+            # after the budget frees is misblocked as INTENT_SUPERSEDED
+            # for the full envelope TTL.
+            try:
+                ok = self._reserve_spend(
+                    reservation_id=effective_reservation_id,
+                    amount_sats=reserve_sats,
+                    category=env.budget_bucket,
+                )
+            except Exception:
+                if registered:
+                    self._release_registry_entry(arbitration_key)
+                raise
             if not ok:
+                if registered:
+                    self._release_registry_entry(arbitration_key)
                 return GovernorDecision(False, None, "BUDGET_EXHAUSTED")
 
         token = AuthorizationToken(
@@ -143,7 +161,7 @@ class GovernorFacade:
             reserved_msat=reserve_sats * 1000,
             budget_bucket=env.budget_bucket,
             issued_at=now,
-            arbitration_key=env.idempotency_key,
+            arbitration_key=arbitration_key,
         )
         if self._ledger is not None:
             # Best-effort, like the rejection-path append above: the
@@ -182,6 +200,37 @@ class GovernorFacade:
                     "will heal the journal",
                     effective_reservation_id, env.intent_id.value, e)
         return GovernorDecision(True, token, "")
+
+    def _release_registry_entry(self, arbitration_key: str) -> None:
+        """Best-effort registry-only release (guarded like the ledger
+        appends: the registry is arbitration state, never budget truth —
+        a failure here must not mask the caller's real refusal path)."""
+        if self._registry is None:
+            return
+        try:
+            self._registry.release(str(arbitration_key))
+        except Exception as e:
+            _log.error(
+                "registry release failed for %s: %s — entry expires "
+                "with its envelope", str(arbitration_key)[:24], e)
+
+    def complete(self, arbitration_key: str) -> None:
+        """Registry-only completion for a TERMINAL outcome (success OR
+        definite failure) of a governed action.
+
+        Releases the live-arbitration slot so a legitimate retry of the
+        same intent identity is not misblocked as INTENT_SUPERSEDED for
+        the remaining envelope TTL. Deliberately does NOT touch the
+        budget reservation — settlement stays on the callers' legacy
+        finish paths (release()/mark-spent), and routing it here too
+        would risk a double release. Non-terminal states
+        (payment_pending, unknown outcome, held reservations) must NOT
+        call this: the entry is doing its job blocking a concurrent
+        duplicate, and expiry handles the tail. Best-effort; never
+        raises."""
+        if not arbitration_key:
+            return
+        self._release_registry_entry(arbitration_key)
 
     def release(self, token: AuthorizationToken, now: int) -> bool:
         if self._registry is not None:

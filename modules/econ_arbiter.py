@@ -22,11 +22,14 @@ recorded/proposed intents for evaluation.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .econ_intents import IntentEnvelope, is_expired
 from .econ_types import UnixTime
+
+_log = logging.getLogger("cl-revenue-ops.econ_arbiter")
 
 # Spec precedence classes (lower = higher precedence).
 PRECEDENCE = {
@@ -72,6 +75,40 @@ def _sort_key(env: IntentEnvelope):
     )
 
 
+def intent_source_leg(env: IntentEnvelope) -> str:
+    """The REBALANCE source leg carried in the structured Explanation
+    (no first-class envelope field exists yet). Empty for non-rebalance
+    intents or when the explanation carries no source component."""
+    if env.intent_type != "REBALANCE":
+        return ""
+    try:
+        for name, value in env.explanation.components:
+            if name == "source":
+                return str(value)
+    except Exception:
+        pass
+    return ""
+
+
+def conflict_slot_key(env: IntentEnvelope) -> str:
+    """Conflict identity for duplicate detection (batch dedup + live
+    registry slots).
+
+    The wire contract pins the idempotency-key hash to the five-field
+    subset (intent type, target, amount, snapshot id, budget bucket) —
+    see wire-contract-spec J3 and the characterization pin in
+    tests/test_econ_intents.py — which omits the rebalance SOURCE leg.
+    Two pairs with different sources but the same dest+amount therefore
+    share an idempotency key; they are distinct actions and must not
+    collide. The slot key extends the pinned key with the source leg
+    WITHOUT touching the wire hash. For sourceless intents it equals
+    the idempotency key exactly (release-by-key compatibility)."""
+    source = intent_source_leg(env)
+    if not source:
+        return env.idempotency_key
+    return f"{env.idempotency_key}::src={source}"
+
+
 class ActiveIntentRegistry:
     """Phase 3F: live arbitration state at the governor boundary.
 
@@ -112,7 +149,8 @@ class ActiveIntentRegistry:
         """Reason code blocking this intent, or None (then registered)."""
         with self._lock:
             self._prune(int(now))
-            if env.idempotency_key in self._active:
+            slot_key = conflict_slot_key(env)
+            if slot_key in self._active:
                 return "INTENT_SUPERSEDED"
             if env.intent_type == "REBALANCE":
                 for active in self._active.values():
@@ -122,12 +160,30 @@ class ActiveIntentRegistry:
             if self._extended():
                 # PR 10: duplicate opens to one peer (covers the spec's
                 # open-vs-LN+ rule — both paths emit OPEN_CHANNEL to the
-                # peer; first-registered wins live).
+                # peer). Wave 2: an incoming open that outranks the armed
+                # one per the batch J3 ladder PREEMPTS it — an LN+
+                # contractual-obligation open (priority 80) must not be
+                # blocked by an earlier-registered planner growth open
+                # (spec precedence: contractual obligation wins).
                 if env.intent_type == "OPEN_CHANNEL":
-                    for active in self._active.values():
-                        if active.intent_type == "OPEN_CHANNEL" \
-                                and active.target == env.target:
+                    armed = [(key, active)
+                             for key, active in self._active.items()
+                             if active.intent_type == "OPEN_CHANNEL"
+                             and active.target == env.target]
+                    if armed:
+                        if any(_sort_key(active) <= _sort_key(env)
+                               for _key, active in armed):
                             return "CONFLICT_DUPLICATE_OPEN"
+                        for key, active in armed:
+                            del self._active[key]
+                            _log.warning(
+                                "live arbitration PREEMPTION: incoming "
+                                "OPEN_CHANNEL %s (priority %d) outranks "
+                                "armed %s (priority %d) on target %s — "
+                                "armed entry released",
+                                env.intent_id.value, env.priority,
+                                active.intent_id.value, active.priority,
+                                env.target)
                 # PR 10: circular rebalance vs structural swap on one
                 # channel — EITHER active intent blocks the other (no
                 # overlapping opposite work live).
@@ -138,7 +194,7 @@ class ActiveIntentRegistry:
                         if active.intent_type == other \
                                 and active.target == env.target:
                             return "CONFLICT_REBALANCE_SWAP"
-            self._active[env.idempotency_key] = env
+            self._active[slot_key] = env
             return None
 
     def release(self, idempotency_key: str) -> None:
@@ -175,17 +231,22 @@ def arbitrate(intents: List[IntentEnvelope], now: int,
         else:
             fresh.append(env)
 
-    # 2. Duplicate idempotency keys — first (best-sorted) wins.
+    # 2. Duplicate idempotency keys — first (best-sorted) wins. Wave 2:
+    # the duplicate identity is the conflict slot key (idempotency key +
+    # rebalance source leg) so two pairs with different sources but the
+    # same dest+amount are NOT duplicates — the wire contract pins the
+    # key hash, which omits the source (see conflict_slot_key).
     seen_keys: Dict[str, IntentEnvelope] = {}
     deduped = []
     for env in fresh:
-        winner = seen_keys.get(env.idempotency_key)
+        slot = conflict_slot_key(env)
+        winner = seen_keys.get(slot)
         if winner is not None:
             rejected.append((env, "INTENT_SUPERSEDED",
                              "duplicate idempotency key"))
             superseded[env.intent_id.value] = winner.intent_id.value
             continue
-        seen_keys[env.idempotency_key] = env
+        seen_keys[slot] = env
         deduped.append(env)
 
     # 3. Contradictory policy changes on one target — best-sorted wins.

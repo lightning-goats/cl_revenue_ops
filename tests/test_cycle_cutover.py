@@ -76,14 +76,28 @@ def test_rejections_ledgered(tmp_path):
     assert events[0]["details"]["batch"] is True
 
 
-def test_fail_open_on_internal_error(monkeypatch):
+def test_fail_open_on_arbiter_infrastructure_error(monkeypatch):
+    """Wave 2 split: an ARBITER failure keeps the documented
+    fail-to-current-behavior fallback (whole list untouched)..."""
+    engine = _engine()
+    pairs = [_pair()]
+    monkeypatch.setattr(
+        "modules.econ_arbiter.arbitrate",
+        MagicMock(side_effect=RuntimeError("boom")))
+    result = CycleResult()
+    assert engine._arbitrate_execution_list(pairs, result) is pairs
+
+
+def test_construction_failure_contained_per_candidate(monkeypatch):
+    """...while a per-candidate construction failure drops ONLY that
+    candidate instead of disabling conflict filtering for the cycle."""
     engine = _engine()
     pairs = [_pair()]
     monkeypatch.setattr(
         "modules.econ_cycle.rebalance_intent_pairs",
         MagicMock(side_effect=RuntimeError("boom")))
     result = CycleResult()
-    assert engine._arbitrate_execution_list(pairs, result) is pairs
+    assert engine._arbitrate_execution_list(pairs, result) == []
 
 
 def test_seam_is_wired_in_run_cycle():

@@ -185,6 +185,11 @@ class CapacityPlanner:
         self._capex_engine = None
         self._capital_efficiency = None
         self.lnplus_evaluator = None  # Injected by main plugin (Task 5)
+        # Wave 2: (facade, arbitration_key) per in-flight governed
+        # reservation, so the settle/release finish paths can free the
+        # live-arbitration registry slot on a TERMINAL outcome
+        # (unknown-outcome HOLDS deliberately stay registered).
+        self._governed_intent_completions: Dict[str, tuple] = {}
         # Coordination signals: cached from last execute_cycle for Boltz integration
         self._last_loser_scids: set = set()        # SCIDs with action=CLOSE
         self._last_funding_deficit_sats: int = 0    # On-chain shortfall for next open
@@ -3482,6 +3487,9 @@ class CapacityPlanner:
                                 db.release_spend_reservation(reservation_id)
                             except Exception:
                                 pass
+                            # Wave 2: terminal for THIS attempt's intent;
+                            # the retry authorizes its own.
+                            self._complete_governed_intent(reservation_id)
                         return self._execute_open(peer_id, retry_amount, cfg, reason=f"retry: peer min {retry_amount}")
                 except Exception as retry_err:
                     self.plugin.log(f"Retry check failed: {retry_err}", level='debug')
@@ -3497,6 +3505,10 @@ class CapacityPlanner:
                     db.release_spend_reservation(reservation_id)
                 except Exception:
                     pass
+                # Wave 2: definite failure is terminal — free the
+                # live-arbitration slot (unknown-outcome HOLDS above
+                # returned earlier and deliberately stay registered).
+                self._complete_governed_intent(reservation_id)
 
             self.plugin.log(f"Channel open failed for {peer_id[:16]}...: {e}", level='error')
             return {"action_id": action_id, "status": "failed", "error": error_msg, "peer_id": peer_id}
@@ -3514,7 +3526,14 @@ class CapacityPlanner:
         reservation active — never release it. cleanup_stale_spend_reservations
         protects channel_open/channel_close from the blind stale sweep so the
         held reservation cannot later vanish either.
+
+        Wave 2: settling is a TERMINAL outcome for the governed intent —
+        the live-arbitration registry slot is released here regardless
+        of the settle-write result (even a persistently-failed write
+        leaves the ACTION complete; only the budget bookkeeping is
+        pending, and that stays on this legacy rail).
         """
+        self._complete_governed_intent(reservation_id)
         for attempt in range(3):
             try:
                 if db.mark_spend_reservation_spent(
@@ -3673,30 +3692,44 @@ class CapacityPlanner:
                 if not scid:
                     losers_with_keys.append((loser, None))
                     continue
-                env = make_intent(
-                    intent_type="CLOSE_CHANNEL",
-                    snapshot_id=arb_snapshot_id,
-                    created_at=UnixTime(now),
-                    expires_at=UnixTime(now + 600),
-                    target=scid,
-                    amount_msat=None,
-                    expected_benefit_msat=SignedMsat(0),
-                    max_cost_msat=Msat(0),
-                    capital_committed_msat=Msat(0),
-                    confidence_micro=Micro(0),
-                    reason_codes=(),
-                    explanation=Explanation("planner_close_selection", (
-                        ("scid", scid),
-                        ("marginal_roi",
-                         round(float(loser.get("marginal_roi", 0) or 0), 6)),
-                        ("reason", str(loser.get("reason", ""))),
-                    )),
-                    preconditions=(),
-                    priority=50,
-                    budget_bucket="channel_close",
-                    origin_policy="capacity_planner_cycle",
-                    reversible=False,
-                )
+                # Wave 2: per-candidate construction — ONE malformed
+                # loser drops only itself (logged) instead of tripping
+                # the outer fail-open handler and disabling conflict
+                # filtering (and registry arming) for the whole cycle.
+                try:
+                    env = make_intent(
+                        intent_type="CLOSE_CHANNEL",
+                        snapshot_id=arb_snapshot_id,
+                        created_at=UnixTime(now),
+                        expires_at=UnixTime(now + 600),
+                        target=scid,
+                        amount_msat=None,
+                        expected_benefit_msat=SignedMsat(0),
+                        max_cost_msat=Msat(0),
+                        capital_committed_msat=Msat(0),
+                        confidence_micro=Micro(0),
+                        reason_codes=(),
+                        explanation=Explanation("planner_close_selection", (
+                            ("scid", scid),
+                            ("marginal_roi",
+                             round(float(loser.get("marginal_roi", 0)
+                                         or 0), 6)),
+                            ("reason", str(loser.get("reason", ""))),
+                        )),
+                        preconditions=(),
+                        priority=50,
+                        budget_bucket="channel_close",
+                        origin_policy="capacity_planner_cycle",
+                        reversible=False,
+                    )
+                except Exception as loser_exc:
+                    summary["skipped_reasons"].append(
+                        f"Close arbitration dropped malformed candidate "
+                        f"{scid}: {loser_exc}")
+                    self.plugin.log(
+                        f"planner close arbitration: dropping malformed "
+                        f"candidate {scid}: {loser_exc}", level='warn')
+                    continue
                 envs.append(env)
                 env_by_key[env.idempotency_key] = env
                 losers_with_keys.append((loser, env.idempotency_key))
@@ -3762,9 +3795,16 @@ class CapacityPlanner:
                     survivors.append(loser)
             return survivors
         except Exception as e:
+            # Wave 2: reaching here means the ARBITER INFRASTRUCTURE
+            # failed (per-candidate construction errors are contained
+            # above) — keep the documented fail-to-current-behavior
+            # fallback, but loudly: conflict filtering AND registry
+            # arming are OFF this cycle.
             self.plugin.log(
-                f"planner close arbitration failed open: {e}",
-                level='warn')
+                f"planner close arbitration failed open (arbiter "
+                f"infrastructure error — conflict filtering disabled "
+                f"this cycle): {e}",
+                level='error')
             return sorted_closeable
 
     def _planner_governor_enabled(self) -> bool:
@@ -3883,12 +3923,37 @@ class CapacityPlanner:
                     f"Governor blocked planner {category} reservation for "
                     f"{str(target)[:20]}: {decision.reason_code}",
                     level='info')
+            else:
+                # Wave 2: remember how to release the registry slot when
+                # this action reaches a terminal outcome (settle or
+                # definite-failure release), keyed by the SAME
+                # reservation_id the finish paths already use.
+                self._governed_intent_completions[str(reservation_id)] = (
+                    facade, decision.token.arbitration_key)
             return bool(decision.authorized)
         except Exception as e:
             self.plugin.log(
                 f"Governed planner reservation failed closed "
                 f"({category}, {str(target)[:20]}): {e}", level='warn')
             return False
+
+    def _complete_governed_intent(self, reservation_id) -> None:
+        """Wave 2: registry-only completion at a TERMINAL outcome
+        (settle OR definite-failure release) of a governed planner
+        action. Frees the live-arbitration slot so a legitimate retry is
+        not misblocked as INTENT_SUPERSEDED for the envelope TTL. NOT
+        called on unknown-outcome HOLDS — the entry keeps blocking a
+        concurrent duplicate and expires with its envelope. Best-effort;
+        budget settlement stays on the legacy paths."""
+        completion = self._governed_intent_completions.pop(
+            str(reservation_id), None)
+        if completion is None:
+            return
+        facade, arbitration_key = completion
+        try:
+            facade.complete(arbitration_key)
+        except Exception:
+            pass
 
     def _check_close_allowed(self, peer_id: str) -> tuple:
         """Check if a channel close is allowed for this peer.
@@ -4234,6 +4299,10 @@ class CapacityPlanner:
                     db.release_spend_reservation(close_reservation_id)
                 except Exception:
                     pass
+                # Wave 2: definite failure is terminal — free the
+                # live-arbitration slot (unknown-outcome HOLDS above
+                # returned earlier and deliberately stay registered).
+                self._complete_governed_intent(close_reservation_id)
             self.plugin.log(
                 f"Channel close failed for {channel_id}: {e}",
                 level='error',
