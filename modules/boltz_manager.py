@@ -1205,13 +1205,25 @@ class BoltzCliManager:
         return any(token in st for token in ("error", "failed"))
 
     def _is_terminal_swap(self, swap: Optional[Dict[str, Any]]) -> bool:
-        """Check if swap is in any terminal state (completed, error, refunded, abandoned)."""
+        """Check if swap is in any terminal state (completed, error, refunded,
+        abandoned, expired).
+
+        Task 26/79: "expired" (boltzd's swap.expired / invoice.expired) was
+        missing, so an expired swap kept counting as RESERVED liquidity in
+        _get_external_liquidity_costs on top of the boltz:{sid} spend event
+        already recorded at create — a double count that suppressed budget
+        until created_at aged out of the window. The create-time estimate
+        itself is deliberately RETAINED (not reversed) when a swap expires:
+        reversing needs a state-transition watcher, and until one exists the
+        conservative direction is the over-count of one recorded estimate,
+        never an unrecorded committed cost.
+        """
         if not isinstance(swap, dict):
             return False
         if self._is_completed_swap(swap) or self._is_error_swap(swap):
             return True
         st = self._swap_status_text(swap)
-        return any(token in st for token in ("refund", "abandon"))
+        return any(token in st for token in ("refund", "abandon", "expire"))
 
     def _contains_chanids_cln_error(self, payload: Any) -> bool:
         needle = "chanids are not supported for cln"
@@ -2479,6 +2491,11 @@ class BoltzCliManager:
                 swaps = swaps[:lim]
             except Exception:
                 pass
+        # completed_count here is derived from boltzcli listswaps STATUS
+        # TEXT (_is_completed_swap) and has no relationship to settled
+        # spend_reservations / spend_events — do not read it as a
+        # settlement-derived counter (task 26/79; the response shape is
+        # frozen for Rust parity, so the label lives here, not in a field).
         cost_summary = {
             "swap_count": len(swaps),
             "estimated_total_fee_sats": sum(self._estimate_swap_fee_sats(s) for s in swaps),

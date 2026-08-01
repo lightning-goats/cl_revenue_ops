@@ -4615,6 +4615,16 @@ class Database:
         cutoff = int(time.time()) - (window_hours * 3600)
 
         # Get job counts from rebalance history (status lifecycle source of truth)
+        # task 26/79 source label: completed_count counts rebalance_history
+        # STATUS, while settlement truth lives in spend_reservations /
+        # budget_reservations, updated by SEPARATE non-atomic statements — a
+        # crash between them can leave a row counted "completed" with an
+        # active reservation (or vice versa). 'partial'/'timeout' are legacy
+        # values no current producer writes (update_rebalance_result writes
+        # success/failed/skipped/pending_settlement); kept for old rows.
+        # pending_settlement rows are EXCLUDED here while their reservations
+        # still count in total_reserved — by design. Response shape frozen
+        # for Rust parity; the label lives here, not in a field.
         stats = conn.execute("""
             SELECT
                 COUNT(*) as job_count,

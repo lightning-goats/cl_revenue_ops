@@ -280,3 +280,43 @@ class TestAutoCycleErrorCounter:
             if status in ('executed', 'dry_run'):
                 state['consecutive_errors'] = 0
         assert state['consecutive_errors'] == 3
+
+
+class TestExpiredSwapTerminal:
+    """Task 26/79: 'expired' was missing from the terminal vocabulary, so an
+    expired swap kept counting as RESERVED liquidity (on top of the
+    boltz:{sid} spend event already recorded at create) until its
+    created_at aged out of the window — a double count against the
+    unified budget."""
+
+    def test_expired_states_are_terminal(self):
+        mgr = _make_manager()
+        for shape in ({"status": "swap.expired"},
+                      {"status": "invoice.expired"},
+                      {"state": "EXPIRED"}):
+            assert mgr._is_terminal_swap(shape) is True, shape
+
+    def test_pending_states_stay_non_terminal(self):
+        mgr = _make_manager()
+        for shape in ({"status": "swap.created"},
+                      {"status": "transaction.mempool"},
+                      {"state": "PENDING"}):
+            assert mgr._is_terminal_swap(shape) is False, shape
+
+    def test_expired_swap_not_counted_as_reserved(self):
+        mgr = _make_manager()
+        now = int(time.time())
+        swaps = [
+            {"id": "sX", "status": "swap.expired", "createdAt": now - 600,
+             "onchainFee": 400, "serviceFee": 0},
+            {"id": "sY", "status": "swap.created", "createdAt": now - 600,
+             "onchainFee": 400, "serviceFee": 0},
+        ]
+        mgr._listswaps_json = MagicMock(return_value={"swaps": swaps})
+        mgr._augment_with_swap_journal = lambda sw, limit_hint=50: sw
+        mgr._estimate_swap_fee_sats = lambda s: 400
+        costs = mgr.get_boltz_cost_components()
+        # Only the genuinely-pending swap may hold reserved budget.
+        assert costs.get("reserved_24h_sats", 0) <= 400, costs
+        assert costs.get("reserved_24h_sats", 0) > 0, (
+            "the pending swap must still be counted")
