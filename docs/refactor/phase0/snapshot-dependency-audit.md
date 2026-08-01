@@ -204,3 +204,12 @@ before the exception is by definition unable to answer "did the broadcast
 happen"; pinning this to a snapshot would reintroduce the guess the guard
 exists to remove. The read is bounded (one call per failed execute) and
 never feeds a fee/policy decision — only reservation disposition.
+
+### Task 26/78 addendum (2026-08-01): stale-hold age read
+
+`rebalance_engine_v2.reconcile_pending_settlements` adds 1 wall-clock read
+(rebalance wall_clock pin 10→11): one `time.time()` per sweep to compute
+how long each pending_settlement row has held its budget reservation, for
+the >14d escalation log. **PROPER**: it measures elapsed age for operator
+visibility and never feeds a fee/route/spend decision — escalation is
+visibility only and releases nothing.

@@ -3004,12 +3004,56 @@ class RebalanceEngine:
         getter = getattr(self.database, "get_pending_settlement_rebalances", None)
         if getter is None:
             return 0
+        # Task 26/78: page with a rotating offset. ORDER BY timestamp ASC
+        # LIMIT n starved every newer row behind a full page of
+        # persistently-pending older ones — their reservations (exempt from
+        # the stale sweep by design) were then held forever. When a page
+        # comes back full and fully unresolved, the next sweep starts AFTER
+        # it; any shorter or partly-resolved page resets to the front.
+        page = int(getattr(self, "_pending_settlement_page", 50) or 50)
+        offset = int(getattr(self, "_pending_settlement_offset", 0) or 0)
         try:
-            rows = getter() or []
+            rows = getter(limit=page, offset=offset) or []
+        except TypeError:
+            # Older Database without offset support: original behavior.
+            offset = 0
+            try:
+                rows = getter() or []
+            except Exception as exc:
+                self._log(f"pending settlement query failed: {exc}", level="warn")
+                return 0
         except Exception as exc:
             self._log(f"pending settlement query failed: {exc}", level="warn")
             return 0
+        if not rows and offset:
+            # Ran off the end: wrap to the front immediately.
+            self._pending_settlement_offset = 0
+            try:
+                rows = getter(limit=page, offset=0) or []
+            except Exception as exc:
+                self._log(f"pending settlement query failed: {exc}", level="warn")
+                return 0
+            offset = 0
         resolved = 0
+        # Task 26/78: a row past the max hold age whose payment STILL answers
+        # 'pending' is an anomaly (max CLTV is on the order of two weeks) —
+        # escalate at error level so the held budget is operator-visible.
+        # Escalation is VISIBILITY only: the reservation stays held, because
+        # blind-releasing a possibly-live payment is the exact defect the
+        # sweep exemption exists to prevent.
+        max_age = int(getattr(self, "_pending_settlement_max_age_seconds",
+                              14 * 86400))
+        now = int(time.time())
+        for row in rows:
+            ts = int(row.get("timestamp") or 0)
+            if ts and now - ts > max_age:
+                self._log(
+                    f"pending_settlement row id={row.get('id')} has held its "
+                    f"budget reservation for {(now - ts) // 86400}d "
+                    f"(> {max_age // 86400}d max hold age). The payment should "
+                    f"long be terminal — inspect listsendpays for "
+                    f"payment_hash={row.get('payment_hash')} and resolve the "
+                    f"row explicitly.", level="error")
         # Build the SCID -> peer map at most once per sweep (lazily, only
         # when a settled row actually needs cost attribution) instead of one
         # listpeerchannels RPC per settled row.
@@ -3031,6 +3075,12 @@ class RebalanceEngine:
                     f"pending settlement reconcile failed for id={row.get('id')}: {exc}",
                     level="warn",
                 )
+        # Rotate: only a FULL page with nothing resolved advances the
+        # window (those rows are stuck; give the tail a turn next sweep).
+        if resolved == 0 and len(rows) == page:
+            self._pending_settlement_offset = offset + page
+        else:
+            self._pending_settlement_offset = 0
         return resolved
 
     def _reconcile_pending_row(

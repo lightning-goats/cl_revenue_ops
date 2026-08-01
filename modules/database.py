@@ -2518,11 +2518,14 @@ class Database:
               int(time.time()), anchor_ratio, actual_amount,
               str(payment_hash) if payment_hash else None, rebalance_id))
 
-    def get_pending_settlement_rebalances(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_pending_settlement_rebalances(self, limit: int = 50,
+                                          offset: int = 0) -> List[Dict[str, Any]]:
         """Return rebalances parked as 'pending_settlement' awaiting reconciliation.
 
         These are payments whose waitsendpay timed out without a terminal
         state; the engine sweeps them each cycle against listsendpays.
+        ``offset`` (task 26/78) lets the sweep rotate past a full page of
+        persistently-pending rows instead of starving the tail forever.
         """
         conn = self._get_connection()
         rows = conn.execute(
@@ -2532,9 +2535,9 @@ class Database:
             WHERE status = 'pending_settlement'
                   AND payment_hash IS NOT NULL AND payment_hash != ''
             ORDER BY timestamp ASC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (int(limit),),
+            (int(limit), int(offset)),
         ).fetchall()
         return [dict(row) for row in rows]
 

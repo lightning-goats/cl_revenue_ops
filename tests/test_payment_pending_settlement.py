@@ -619,3 +619,90 @@ def test_database_late_settlement_corrects_amount_in_history_row(real_database):
     ).fetchone()
     assert row["status"] == "success"
     assert row["amount_sats"] == 250_000
+
+
+# ---------------------------------------------------------------------------
+# Task 26/78: the pending_settlement hold must be BOUNDED in practice.
+# The sweep exemption (never blind-release a sweepable in-flight payment) is
+# correct, but head-of-line blocking and silence made the hold effectively
+# infinite: ORDER BY timestamp ASC LIMIT 50 starves newer rows behind 50
+# persistently-pending older ones, and nothing ever escalated.
+# ---------------------------------------------------------------------------
+
+def test_sweep_rotates_past_persistently_pending_rows(mock_plugin, mock_database):
+    """Newer rows must reconcile even when a full page of older rows keeps
+    answering 'pending' — the sweep pages forward instead of re-scanning
+    the same starved prefix forever."""
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._pending_settlement_page = 2
+
+    old_a = _reconcile_row(id=1, payment_hash="hash-a")
+    old_b = _reconcile_row(id=2, payment_hash="hash-b")
+    fresh = _reconcile_row(id=3, payment_hash="hash-c")
+
+    def getter(limit=50, offset=0):
+        rows = [old_a, old_b, fresh]
+        return rows[offset:offset + limit]
+
+    mock_database.get_pending_settlement_rebalances.side_effect = getter
+
+    def rpc_call(method, params=None):
+        assert method == "listsendpays"
+        if params["payment_hash"] == "hash-c":
+            return {"payments": [{
+                "status": "complete",
+                "amount_msat": 100_000_000,
+                "amount_sent_msat": 100_005_000,
+            }]}
+        return {"payments": [{"status": "pending"}]}
+
+    mock_plugin.rpc.call.side_effect = rpc_call
+
+    # Sweep 1 visits the starved prefix (ids 1,2): nothing resolves.
+    assert engine.reconcile_pending_settlements() == 0
+    # Sweep 2 must move PAST the full unresolved page and reach id 3.
+    resolved_second = engine.reconcile_pending_settlements()
+    assert resolved_second == 1, (
+        "a full page of persistently-pending rows must not starve newer rows")
+    args, _ = mock_database.update_rebalance_result.call_args
+    assert args[0] == 3
+
+
+def test_sweep_offset_resets_after_reaching_the_end(mock_plugin, mock_database):
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._pending_settlement_page = 2
+    rows = [_reconcile_row(id=i, payment_hash=f"h{i}") for i in (1, 2, 3)]
+
+    def getter(limit=50, offset=0):
+        return rows[offset:offset + limit]
+
+    mock_database.get_pending_settlement_rebalances.side_effect = getter
+    mock_plugin.rpc.call.return_value = {"payments": [{"status": "pending"}]}
+
+    engine.reconcile_pending_settlements()   # page 1 (offset 0)
+    engine.reconcile_pending_settlements()   # page 2 (offset 2, short page)
+    engine.reconcile_pending_settlements()   # must be back at offset 0
+    offsets = [c.kwargs.get("offset", 0)
+               for c in mock_database.get_pending_settlement_rebalances.call_args_list]
+    assert offsets == [0, 2, 0], offsets
+
+
+def test_stale_pending_settlement_escalates_loudly(mock_plugin, mock_database):
+    """A row older than the max hold age that STILL answers 'pending' is an
+    anomaly (max CLTV is ~2 weeks) — it must escalate at error level with
+    the row id, not stay a silent warn-forever."""
+    engine = _make_engine(mock_plugin, mock_database)
+    stale = _reconcile_row(id=7, timestamp=int(time.time()) - 20 * 86400)
+    mock_database.get_pending_settlement_rebalances.return_value = [stale]
+    mock_plugin.rpc.call.return_value = {"payments": [{"status": "pending"}]}
+
+    engine.reconcile_pending_settlements()
+
+    errors = [c for c in mock_plugin.log.call_args_list
+              if (c.kwargs.get("level") or (c.args[1] if len(c.args) > 1 else "")) == "error"
+              and "pending_settlement" in str(c.args[0])
+              and "7" in str(c.args[0])]
+    assert errors, "a stale held reservation must be operator-visible at error level"
+    # The reservation itself must STILL be held — escalation is visibility,
+    # never an automatic release of a possibly-live payment.
+    mock_database.release_budget_reservation.assert_not_called()

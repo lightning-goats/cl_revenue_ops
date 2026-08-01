@@ -53,7 +53,11 @@ PINNED_COUNTS = {
     ("rebalance", "analyzer_cache"): 0,
     ("rebalance", "live_rpc"): 14,
     ("rebalance", "database"): 18,
-    ("rebalance", "wall_clock"): 10,
+    # 10 -> 11 (2026-08-01, task 26/78): reconcile_pending_settlements
+    # reads time.time() once per sweep to compute row AGE for the stale-hold
+    # escalation. Measurement of elapsed time, not a policy input; classified
+    # in docs/refactor/phase0/snapshot-dependency-audit.md.
+    ("rebalance", "wall_clock"): 11,
     ("planner", "analyzer_cache"): 6,
     # 3b: 24 -> 20 (dead _has_direct_peer_channel/_is_peer_connected
     # removed; 4 live-RPC sites gone)
