@@ -3046,6 +3046,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # capex gate inside the manager — the envelope + unified budget gate
         # them instead.
         boltz_manager.structural_envelope_provider = _structural_envelope_sats_provider
+        # Audit 2026-08-01: the governed Boltz facade must see the REAL
+        # `paused` kill-switch (it was pinned False). Mirrors the planner/
+        # fee/rebalance facades' is_paused wiring.
+        boltz_manager.pause_state_provider = (
+            lambda: getattr(config.snapshot(), "paused", False) is True
+            if config is not None else False)
         # Phase 2G: governor/ledger plumbing for Boltz swap reservations.
         try:
             boltz_manager.econ_shadow = econ_shadow
@@ -9963,6 +9969,28 @@ def _execute_boltz_balance_cycle(
     (each build issues per-candidate boltzcli quote subprocesses). It is NOT an
     RPC argument — the revenue-boltz-balance-cycle method never exposes it.
     """
+    # Audit 2026-08-01 (kill-switch coverage): `paused` must stop every
+    # discretionary spend path — only LN+ obligation fulfillment is
+    # pause-exempt (README contract / refactor invariant 6). Planning and
+    # dry-run previews still work while paused; live swap execution must not,
+    # so a live run is gated here before any plan build or swap create.
+    if not dry_run:
+        _pause_cfg = config.snapshot() if config else None
+        if getattr(_pause_cfg, 'paused', False) is True:
+            plugin.log(
+                "cl-revenue-ops: Boltz balance cycle: swap execution skipped "
+                "— plugin paused (revenue-config set paused false to resume)",
+                level='info')
+            return {
+                'status': 'skipped',
+                'reason': 'paused: kill-switch active; Boltz swap execution disabled',
+                'executed_count': 0,
+                'skipped_count': 0,
+                'executed': [],
+                'skipped': [],
+                'plan': precomputed_plan,
+            }
+
     # Pending-swap short-circuit BEFORE building any plan: a pending swap blocks
     # the whole cycle anyway, so don't pay for quotes/profitability first.
     pending_swaps: Optional[int] = None
@@ -10380,6 +10408,24 @@ def _execute_boltz_expansion_treasury_cycle(
     revenue-boltz-expansion-treasury-cycle method never exposes it.
     """
     cfg = config.snapshot() if config else None
+    # Audit 2026-08-01 (kill-switch coverage): same gate as the balance
+    # cycle — `paused` stops live treasury swap execution before any plan
+    # build or swap create; dry-run previews still run.
+    if not dry_run and getattr(cfg, 'paused', False) is True:
+        plugin.log(
+            "cl-revenue-ops: Boltz treasury cycle: swap execution skipped "
+            "— plugin paused (revenue-config set paused false to resume)",
+            level='info')
+        return {
+            'status': 'skipped',
+            'reason': 'paused: kill-switch active; Boltz swap execution disabled',
+            'mode': 'expansion_treasury',
+            'executed_count': 0,
+            'skipped_count': 0,
+            'executed': [],
+            'skipped': [],
+            'plan': precomputed_plan,
+        }
     if isinstance(precomputed_plan, dict):
         plan = precomputed_plan
     else:

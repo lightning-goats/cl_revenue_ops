@@ -15,11 +15,12 @@ import json
 import re
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 BASE_URL = "https://lightningnetwork.plus/api/2"
 _MAX_RESPONSE_BYTES = 1_000_000
@@ -678,6 +679,11 @@ _RECONCILE_GRACE_SECONDS = 600
 # this swap" — a pending ghost matching one of these is cleanup, not a
 # genuine untracked commitment.
 _TERMINAL_PENDING_GHOST_STATUSES = ("failed", "withdrawn", "cancelled_remote")
+# Task 26 companion (audit 2026-08-01): outcome-text marker persisted when a
+# broadcast-capable fundchannel dies with the outcome UNKNOWN and its budget
+# reservation is HELD for the next watcher pass to resolve. Format:
+#   "fundchannel outcome unknown; held_reservation=<reservation_id>:<sats>"
+_HELD_RESERVATION_MARKER = "held_reservation="
 
 
 class SwapLifecycle:
@@ -1552,11 +1558,13 @@ class SwapLifecycle:
             # Already funded on a prior pass — only complete_application is left.
             return self._complete_and_mark_opened(sid)
 
+        probe_ok = True
         try:
             channels = self.rpc.listpeerchannels().get("channels", []) or []
         except Exception as e:
             self._plugin.log(f"LNPLUS: listpeerchannels failed for swap {sid}: {e}", level="error")
             channels = []
+            probe_ok = False
         capacity_sats = int(row.get("capacity_sats") or 0)
         # I5(b): a channel to this peer existing is not, by itself, proof
         # it is OUR swap channel — the idempotency skip used to claim ANY
@@ -1582,13 +1590,51 @@ class SwapLifecycle:
                   or bool(row.get("channel_funding_txid")))),
             None)
 
+        # Task 26 companion: a reservation HELD by a prior unknown-outcome
+        # fundchannel attempt (see the exception handler below) is resolved
+        # here, by measurement, exactly like capacity_planner's post-timeout
+        # probe: a capacity-matched channel proves the broadcast (settle);
+        # a successful listing with no such channel proves absence (release,
+        # then retry normally); a failed probe resolves NOTHING.
+        held = self._parse_held_reservation(row.get("outcome"))
+
         first_fund = False
         if existing is not None:
             # Idempotent-skip fundchannel; record txid if visible.
             txid = existing.get("funding_txid")
             if txid:
                 self._db.lnplus_update_swap(sid, channel_funding_txid=txid, opened_at=now)
+            if held:
+                held_rid, held_cost = held
+                self._plugin.log(
+                    f"LNPLUS: swap {sid} — channel materialized after an "
+                    f"unknown-outcome fundchannel; settling held reservation "
+                    f"{held_rid} ({held_cost} sats)", level="info")
+                self._settle_swap_open_reservation(held_rid, held_cost, sid)
+                self._db.lnplus_update_swap(
+                    sid, outcome="fundchannel unknown outcome resolved: "
+                                 "channel found; held reservation settled")
         else:
+            if held:
+                held_rid, held_cost = held
+                if not probe_ok:
+                    # No evidence either way — keep holding, retry next pass.
+                    self._plugin.log(
+                        f"LNPLUS: swap {sid} — fundchannel outcome still "
+                        f"unknown and the node cannot be probed; reservation "
+                        f"{held_rid} stays HELD ({held_cost} sats); no new "
+                        f"attempt this pass", level="error")
+                    return False
+                # A successful listing with no capacity-matched channel a
+                # full pass later: the earlier attempt never funded.
+                self._plugin.log(
+                    f"LNPLUS: swap {sid} — fundchannel unknown outcome "
+                    f"resolved: never funded; releasing held reservation "
+                    f"{held_rid}", level="info")
+                self._release_swap_open_reservation(held_rid, sid)
+                self._db.lnplus_update_swap(
+                    sid, outcome="fundchannel unknown outcome resolved: "
+                                 "never funded; held reservation released")
             hours_left = ((deadline - now) / 3600.0) if deadline else -1.0
             feerate = "slow" if hours_left > 24 else ("normal" if hours_left > 12 else "urgent")
 
@@ -1631,7 +1677,11 @@ class SwapLifecycle:
                                else _DEFAULT_OPEN_COST_SATS)
             eff_budget, budget_since = (self._budget_params_fn() if self._budget_params_fn
                                          else (None, None))
-            reservation_id = f"lnplus-open-{sid}-{int(time.time())}"
+            # Task 26 companion: the uuid suffix makes the id unique per
+            # ATTEMPT even within one second — a held reservation released
+            # by the resolution path above must never collide with (and so
+            # block) the fresh retry reservation made in the same pass.
+            reservation_id = f"lnplus-open-{sid}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
             if self._lnplus_governor_enabled():
                 # Phase 2F: governor-gated reservation (same reserve_spend
                 # underneath; fail-closed; no pause gate — invariant 6).
@@ -1682,6 +1732,30 @@ class SwapLifecycle:
                     result = self.rpc.fundchannel(
                         peer, int(row["capacity_sats"]), feerate=feerate)
             except Exception as e:
+                # Task 26 companion (audit 2026-08-01): fundchannel is
+                # broadcast-capable — a transport death/timeout may fire
+                # AFTER the funding tx broadcast. Releasing the reservation
+                # then would drop a committed on-chain cost off the unified
+                # budget rail when the next pass matches the channel by
+                # capacity (first_fund=False, settle never runs). HOLD the
+                # reservation, persist a marker, and let the next watcher
+                # pass resolve it by measurement (see `held` above). The
+                # deadline-miss breaker is also skipped: the channel may
+                # exist, so this is not (yet) a missed obligation.
+                from .capacity_planner import _outcome_unknown_exception
+                if _outcome_unknown_exception(e):
+                    self._db.lnplus_update_swap(
+                        sid, outcome=f"fundchannel outcome unknown; "
+                                     f"{_HELD_RESERVATION_MARKER}"
+                                     f"{reservation_id}:{estimated_cost}")
+                    self._plugin.log(
+                        f"LNPLUS: UNKNOWN OUTCOME: fundchannel to {peer} for "
+                        f"swap {sid} raised after a possible broadcast ({e}). "
+                        f"HOLDING reservation {reservation_id} "
+                        f"({estimated_cost} sats) — a committed on-chain fee "
+                        f"must never be released; the next watcher pass "
+                        f"resolves it via listpeerchannels.", level="error")
+                    return False
                 self._plugin.log(f"LNPLUS: fundchannel to {peer} failed for swap {sid}: {e}", level="error")
                 self._release_swap_open_reservation(reservation_id, sid)
                 self._maybe_trip_deadline_miss(row, sid, deadline, now)
@@ -1767,6 +1841,26 @@ class SwapLifecycle:
                 level="info")
         self._db.lnplus_update_swap(sid, status="opened")
         return True
+
+    @staticmethod
+    def _parse_held_reservation(outcome) -> Optional[Tuple[str, int]]:
+        """Extract (reservation_id, estimated_cost_sats) from an outcome text
+        written by the unknown-outcome fundchannel path; None when absent or
+        malformed (a malformed marker must never crash the watcher — the
+        reservation then simply stays active until the operator reconciles)."""
+        text = str(outcome or "")
+        if _HELD_RESERVATION_MARKER not in text:
+            return None
+        try:
+            payload = text.split(_HELD_RESERVATION_MARKER, 1)[1].strip()
+            reservation_id, cost_text = payload.rsplit(":", 1)
+            reservation_id = reservation_id.strip()
+            cost = int(cost_text)
+            if not reservation_id or cost <= 0:
+                return None
+            return reservation_id, cost
+        except (ValueError, IndexError):
+            return None
 
     def _release_swap_open_reservation(self, reservation_id: str, sid: str) -> None:
         """Best-effort release on a failed/aborted fundchannel attempt. Never a

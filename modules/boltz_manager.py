@@ -274,6 +274,12 @@ class BoltzCliManager:
         # the per-channel capex gate (the envelope + unified budget gate them
         # instead); when absent/0/unreadable, no bypass (fail closed).
         self.structural_envelope_provider = None
+        # Audit 2026-08-01: optional callback returning the main plugin's
+        # `paused` kill-switch state. Boltz spending is discretionary — only
+        # LN+ obligation fulfillment is pause-exempt (README contract) — so
+        # the governed reservation facade must see the REAL pause state
+        # instead of the previously pinned False.
+        self.pause_state_provider = None
         # Capability cache: some CLN+boltzd combinations reject reverse-swap chanIds.
         self._reverse_chanids_supported: Optional[bool] = None
         self._capex_engine = None
@@ -1644,6 +1650,16 @@ class BoltzCliManager:
         except Exception:
             return False
 
+    def _is_paused(self) -> bool:
+        """Strict check of the main plugin's `paused` kill-switch (same
+        MagicMock/absent-provider discipline as _boltz_governor_enabled:
+        anything but a literal True reads as not-paused)."""
+        try:
+            provider = self.pause_state_provider
+            return bool(provider is not None and provider() is True)
+        except Exception:
+            return False
+
     def _snapshot_ref(self, now):
         """PR 3c: canonical-snapshot reference from the shadow hub
         (TTL-cached there). None -> callers keep the synthetic label
@@ -1664,8 +1680,10 @@ class BoltzCliManager:
         reserve_boltz_swap_budget call. FAILS CLOSED on internal error
         (returns False = swap rejected) — a deliberate, flag-gated
         strengthening of the legacy infra-error fail-open; flag off
-        restores legacy exactly. No pause gate (matching legacy: Boltz
-        is gated by its own enable flags)."""
+        restores legacy exactly. Audit 2026-08-01: the pause gate uses
+        the REAL `paused` state via pause_state_provider — Boltz spends
+        are discretionary, so the kill-switch must stop them (only LN+
+        obligation fulfillment is pause-exempt)."""
         try:
             import time as _time
 
@@ -1700,7 +1718,7 @@ class BoltzCliManager:
                 reserve_spend=_boltz_reserve_delegate,
                 release_spend=lambda rid: bool(
                     self._capex_engine.release_boltz_swap_reservation(rid)),
-                is_paused=lambda: False,
+                is_paused=self._is_paused,
                 ledger=ledger,
                 registry=registry,
                 authority_check=self.econ_authority_check_provider,
@@ -1997,7 +2015,33 @@ class BoltzCliManager:
                     source="loop_in",
                     metadata={"trigger_channel_id": channel_id, "trigger_peer_id": peer_id},
                 )
-            finally:
+            except Exception as e:
+                if result is not None:
+                    # Create succeeded; only post-create bookkeeping raised —
+                    # settle normally so the live swap cost stays counted.
+                    self._finalize_swap_budget_reservation(
+                        reservation_id, result, est_fee, channel_id, structural=False
+                    )
+                elif reservation_id and self._creation_outcome_unknown(e):
+                    # Task 26 (mirrors loop_out): a create TIMEOUT is not a
+                    # "no" — boltzd may already have created the swap
+                    # server-side, and no swap id exists locally to
+                    # reconcile by. HOLD the reservation so the
+                    # possibly-committed cost stays on the unified budget
+                    # rail; the operator settles or releases it explicitly.
+                    self.plugin.log(
+                        f"UNKNOWN OUTCOME: boltz loop-in create timed out with "
+                        f"reservation {reservation_id} HELD "
+                        f"({est_fee} sats). Check 'revenue-boltz-swaps' for a "
+                        f"fresh swap, then settle or release the reservation "
+                        f"explicitly.", level="error")
+                else:
+                    # Definite rejection → release (no committed cost).
+                    self._finalize_swap_budget_reservation(
+                        reservation_id, None, est_fee, channel_id, structural=False
+                    )
+                raise
+            else:
                 self._finalize_swap_budget_reservation(
                     reservation_id, result, est_fee, channel_id, structural=False
                 )
@@ -2607,10 +2651,35 @@ class BoltzCliManager:
             try:
                 result = self._run_json(args, timeout=max(self.cfg.timeout_seconds, 180))
                 self._record_swap_result(result, source="chainswap")
-            finally:
-                # Settle (swap created) or release (failed/exception) the
-                # pre-create reservation on every exit so the boltz commitment
-                # is counted while live and never held after it resolves.
+            except Exception as e:
+                if result is not None:
+                    # Create succeeded; only post-create bookkeeping raised —
+                    # settle normally so the live swap cost stays counted.
+                    self._finalize_swap_budget_reservation(
+                        reservation_id, result, est_fee, channel_id=None, structural=False
+                    )
+                elif reservation_id and self._creation_outcome_unknown(e):
+                    # Task 26 (mirrors loop_out): a createchainswap TIMEOUT
+                    # is not a "no" — boltzd may already have created the
+                    # swap server-side. HOLD the reservation so the
+                    # possibly-committed cost stays on the unified budget
+                    # rail; the operator settles or releases it explicitly.
+                    self.plugin.log(
+                        f"UNKNOWN OUTCOME: boltz chainswap create timed out "
+                        f"with reservation {reservation_id} HELD "
+                        f"({est_fee} sats). Check 'revenue-boltz-swaps' for a "
+                        f"fresh swap, then settle or release the reservation "
+                        f"explicitly.", level="error")
+                else:
+                    # Definite rejection → release (no committed cost).
+                    self._finalize_swap_budget_reservation(
+                        reservation_id, None, est_fee, channel_id=None, structural=False
+                    )
+                raise
+            else:
+                # Settle (swap created) or release (clean rejection payload)
+                # the pre-create reservation so the boltz commitment is
+                # counted while live and never held after it resolves.
                 self._finalize_swap_budget_reservation(
                     reservation_id, result, est_fee, channel_id=None, structural=False
                 )

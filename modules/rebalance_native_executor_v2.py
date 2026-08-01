@@ -339,6 +339,23 @@ class NativeRouteExecutor:
                 return True
         return "rpc timeout" in str(exc).lower()
 
+    @staticmethod
+    def _is_transport_death(exc: Exception) -> bool:
+        """Socket-level death of the RPC transport (connection reset, broken
+        pipe, bare OSError on the socket): the request may have reached
+        lightningd before the transport died, so the real outcome is UNKNOWN.
+        Structured RPC failures (RpcError and friends) are not OSErrors and
+        stay definite. Mirrors capacity_planner._outcome_unknown_exception
+        (repo rule from 51491da: never record a definite failure after a
+        broadcast-capable RPC dies unresolved)."""
+        if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+            return True
+        msg = str(exc).lower()
+        return any(needle in msg for needle in (
+            "broken pipe", "connection reset",
+            "socket closed", "connection closed",
+        ))
+
     def _is_payment_unresolved(
         self,
         exc: Exception,
@@ -350,15 +367,18 @@ class NativeRouteExecutor:
 
         CLN's waitsendpay code 200 means "timed out, payment still pending".
         A proxy deadline on sendpay/waitsendpay leaves the HTLC state unknown.
-        Treating these as terminal failures would delete the invoice, release
-        the budget, and allow an immediate repeat payment while the first one
-        can still settle.
+        So does a socket-level transport error raised between sendpay
+        submission and waitsendpay resolution. Treating these as terminal
+        failures would delete the invoice, release the budget, and allow an
+        immediate repeat payment while the first one can still settle.
         """
         if not payment_attempted:
             return False
         if details.get("code") == 200:
             return True
         if self._is_proxy_timeout(exc):
+            return True
+        if self._is_transport_death(exc):
             return True
         return "waitsendpay_status=pending" in error_text
 
