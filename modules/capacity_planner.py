@@ -37,6 +37,43 @@ from .demand_flow import DemandFlowClassifier
 from .utils import parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
 
 # Loser severity ranking for sorting (higher = worse)
+# Task 26 (unknown-outcome guard): channel states that prove a broadcast.
+# An in-progress opening state is evidence OUR fundchannel got as far as the
+# funding tx; a pre-existing CHANNELD_NORMAL channel is NOT evidence.
+_OPENING_CHANNEL_STATES = (
+    "OPENINGD",
+    "CHANNELD_AWAITING_LOCKIN",
+    "DUALOPEND_OPEN_INIT",
+    "DUALOPEND_OPEN_COMMITTED",
+    "DUALOPEND_AWAITING_LOCKIN",
+)
+# States (or absence from the listing) that prove a close progressed.
+_CLOSING_EVIDENCE_STATES = (
+    "CHANNELD_SHUTTING_DOWN",
+    "CLOSINGD_SIGEXCHANGE",
+    "CLOSINGD_COMPLETE",
+    "AWAITING_UNILATERAL",
+    "FUNDING_SPEND_SEEN",
+    "ONCHAIN",
+)
+
+
+def _outcome_unknown_exception(e: Exception) -> bool:
+    """True when an exception from a broadcast-capable RPC leaves the real
+    outcome UNKNOWN (transport died; lightningd may have completed the call
+    and broadcast anyway). Structured rejections — lightningd answered with
+    an error — stay definite: the RPC completed and reported failure before
+    committing anything on-chain.
+    """
+    if isinstance(e, (TimeoutError, ConnectionError)):
+        return True
+    msg = str(e).lower()
+    return any(needle in msg for needle in (
+        "timed out", "timeout", "broken pipe", "connection reset",
+        "socket closed", "connection closed",
+    ))
+
+
 _LOSER_SEVERITY = {
     "ZOMBIE": 3,
     "FIRE SALE": 2,
@@ -3036,6 +3073,116 @@ class CapacityPlanner:
             return None
         return float(value)
 
+    def _probe_peer_channels(self, peer_id: str):
+        """One bounded post-exception probe. Returns the channel list, or
+        None when the node cannot answer — callers must then HOLD, never
+        guess."""
+        try:
+            listing = (self.data_service.get_peer_channels(peer_id)
+                       if self.data_service
+                       else self.plugin.rpc.listpeerchannels(peer_id))
+            return list((listing or {}).get("channels", []) or [])
+        except Exception as e:
+            self.plugin.log(
+                f"Post-exception channel probe failed for {peer_id[:16]}...: {e}",
+                level='warn')
+            return None
+
+    def _resolve_unknown_open(self, db, peer_id, action_id, reservation_id,
+                              reservation_active, estimated_cost):
+        """fundchannel raised with the outcome unknown. Measure instead of
+        guessing: an in-progress opening channel to the peer proves the
+        broadcast (settle as committed); a listing with no such channel
+        proves absence (caller releases as an ordinary failure); a failed
+        probe resolves NOTHING — hold the reservation and say unknown.
+        Returns a result dict, or None to fall through to the definite
+        failure path."""
+        channels = self._probe_peer_channels(peer_id)
+        if channels is None:
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status="unknown")
+                except Exception:
+                    pass
+            self.plugin.log(
+                f"UNKNOWN OUTCOME: fundchannel to {peer_id[:16]}... raised after a "
+                f"possible broadcast and the node cannot be probed. HOLDING "
+                f"reservation {reservation_id} — a committed on-chain fee must "
+                f"never be released. Verify with listpeerchannels, then settle or "
+                f"release the reservation explicitly.", level='error')
+            return {"action_id": action_id, "status": "unknown", "peer_id": peer_id,
+                    "error": "outcome unknown: rpc failed after possible broadcast; "
+                             "reservation held"}
+        opening = [c for c in channels
+                   if str(c.get("state") or "").upper() in _OPENING_CHANNEL_STATES]
+        if opening:
+            channel_id = opening[0].get("channel_id") or opening[0].get("short_channel_id")
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status="completed",
+                                             channel_id=channel_id)
+                except Exception:
+                    pass
+            if db:
+                self._settle_capex_reservation(
+                    db, reservation_id, estimated_cost,
+                    what=f"channel_open {channel_id or peer_id[:16]} (post-timeout probe)")
+            self.plugin.log(
+                f"Channel open to {peer_id[:16]}... confirmed by post-timeout probe "
+                f"({channel_id})", level='info')
+            return {"action_id": action_id, "status": "completed",
+                    "channel_id": channel_id, "peer_id": peer_id,
+                    "resolved_by": "post_timeout_probe"}
+        return None
+
+    def _resolve_unknown_close(self, db, channel_id, peer_id, action_id,
+                               close_reservation_id, close_reservation_active,
+                               reserved_close_fee_sats):
+        """close raised with the outcome unknown (CLN falls back to a
+        unilateral close after its own timeout, so the tx may be real).
+        Same discipline as _resolve_unknown_open; a channel ABSENT from the
+        listing has left the channel set, which is close evidence, not
+        absence of one."""
+        channels = self._probe_peer_channels(peer_id)
+        if channels is None:
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status="unknown")
+                except Exception:
+                    pass
+            self.plugin.log(
+                f"UNKNOWN OUTCOME: close of {channel_id} raised after a possible "
+                f"broadcast and the node cannot be probed. HOLDING reservation "
+                f"{close_reservation_id}. Verify with listpeerchannels, then settle "
+                f"or release explicitly.", level='error')
+            return {"action_id": action_id, "status": "unknown",
+                    "channel_id": channel_id, "peer_id": peer_id,
+                    "error": "outcome unknown: rpc failed after possible broadcast; "
+                             "reservation held"}
+        ours = [c for c in channels
+                if c.get("short_channel_id") == channel_id
+                or c.get("channel_id") == channel_id]
+        closing = (not ours) or any(
+            str(c.get("state") or "").upper() in _CLOSING_EVIDENCE_STATES
+            for c in ours)
+        if closing:
+            if db and action_id:
+                try:
+                    db.update_planner_action(action_id, status="completed")
+                except Exception:
+                    pass
+            if db and close_reservation_active:
+                self._settle_capex_reservation(
+                    db, close_reservation_id, reserved_close_fee_sats,
+                    what=f"channel_close {channel_id} (post-timeout probe)")
+            self.plugin.log(
+                f"Channel close of {channel_id} confirmed by post-timeout probe",
+                level='info')
+            return {"action_id": action_id, "status": "completed",
+                    "channel_id": channel_id, "peer_id": peer_id,
+                    "resolved_by": "post_timeout_probe"}
+        return None
+
     @staticmethod
     def _parse_min_chan_size_error(error_msg: str) -> int:
         """Extract peer's minimum channel size from a 'below min chan size' error.
@@ -3206,8 +3353,25 @@ class CapacityPlanner:
         except Exception as e:
             error_msg = str(e)
 
-            # Retry with peer's minimum if we tried too small
-            retry_amount = self._parse_min_chan_size_error(error_msg)
+            # Task 26: a transport/timeout death leaves the outcome UNKNOWN —
+            # fundchannel may already have broadcast. Measure before deciding;
+            # a failed probe HOLDS the reservation (never release a possibly
+            # committed on-chain fee — the same rule _settle_capex_reservation
+            # documents for the settle side).
+            outcome_unknown = _outcome_unknown_exception(e)
+            if outcome_unknown:
+                resolved = self._resolve_unknown_open(
+                    db, peer_id, action_id, reservation_id,
+                    reservation_active, estimated_cost)
+                if resolved is not None:
+                    return resolved
+                # Probe PROVED absence: fall through to the ordinary
+                # definite-failure path (release + failed).
+
+            # Retry with peer's minimum if we tried too small. Gated on a
+            # DEFINITE rejection: recursing after an unknown outcome could
+            # double-open (the first tx may confirm later).
+            retry_amount = None if outcome_unknown else self._parse_min_chan_size_error(error_msg)
             if retry_amount and retry_amount > amount_sats and retry_amount <= cfg.planner_max_channel_sats:
                 # Check if we can afford the retry
                 try:
@@ -3952,13 +4116,25 @@ class CapacityPlanner:
             }
 
         except Exception as e:
+            # Task 26: same unknown-outcome discipline as _execute_open —
+            # CLN's close falls back to a unilateral close after its own
+            # timeout, so an RPC-level death can follow a real broadcast.
+            if _outcome_unknown_exception(e):
+                resolved = self._resolve_unknown_close(
+                    db, channel_id, peer_id, action_id, close_reservation_id,
+                    close_reservation_active, reserved_close_fee_sats)
+                if resolved is not None:
+                    return resolved
+                # Probe found the channel still open and not closing:
+                # definite failure below.
             if db and action_id:
                 try:
                     db.update_planner_action(action_id, status="failed")
                 except Exception:
                     pass
             # Release the pre-close reservation so a failed close does not hold
-            # the budget (release-on-failure).
+            # the budget (release-on-failure). Reached only for DEFINITE
+            # rejections or probe-proven absence of a close.
             if db and close_reservation_active:
                 try:
                     db.release_spend_reservation(close_reservation_id)

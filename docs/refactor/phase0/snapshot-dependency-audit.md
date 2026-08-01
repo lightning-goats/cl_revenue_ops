@@ -192,3 +192,15 @@ snapshot versions with the snapshot's `observed_at`.
 per-(module, category) counts. Any new mutable-source read in a policy
 module trips the pin and must be classified here first. Counts for
 IMPROPER-bearing categories must only decrease as PRs 3a–3e land.
+
+### Task 26 addendum (2026-08-01): post-exception outcome probe
+
+`capacity_planner._probe_peer_channels` adds 2 `listpeerchannels` read
+sites (planner live_rpc pin 20→22). Classification: **PROPER live read.**
+The probe runs only after a broadcast-capable RPC (`fundchannel`/`close`)
+died with an unknown outcome, and its purpose is to measure the node's
+CURRENT channel set to decide settle-vs-release-vs-hold. A snapshot taken
+before the exception is by definition unable to answer "did the broadcast
+happen"; pinning this to a snapshot would reintroduce the guess the guard
+exists to remove. The read is bounded (one call per failed execute) and
+never feeds a fee/policy decision — only reservation disposition.

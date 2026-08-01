@@ -441,6 +441,17 @@ class BoltzCliManager:
         cmd.extend([self.cfg.cli_path, "--datadir", self.cfg.datadir])
         return cmd
 
+    @staticmethod
+    def _creation_outcome_unknown(e: Exception) -> bool:
+        """True when a swap-create exception leaves the outcome UNKNOWN:
+        boltzcli was killed (timeout) or the transport died, so boltzd may
+        have created the swap server-side anyway. A structured non-zero
+        exit is a definite rejection."""
+        if isinstance(e, (TimeoutError, ConnectionError)):
+            return True
+        msg = str(e).lower()
+        return "timed out" in msg or "timeout" in msg
+
     def _run(self, args: List[str], timeout: Optional[int] = None) -> str:
         self._ensure_enabled()
         cmd = self._base_cmd() + args
@@ -2040,14 +2051,34 @@ class BoltzCliManager:
                         ctx["estimated_fee_sats"], ctx["channel_id"], ctx["structural"],
                     )
                 return out
-            except Exception:
+            except Exception as e:
                 ctx = self._pending_swap_budget
                 if ctx and ctx.get("reservation_id"):
-                    # Unknown result → release (no committed cost recorded).
-                    self._finalize_swap_budget_reservation(
-                        ctx["reservation_id"], None,
-                        ctx["estimated_fee_sats"], ctx["channel_id"], ctx["structural"],
-                    )
+                    if self._creation_outcome_unknown(e):
+                        # Task 26: a create TIMEOUT is not a "no" — boltzd may
+                        # already have created the swap server-side, and no
+                        # swap id exists locally to reconcile by. HOLD the
+                        # reservation so the possibly-committed cost stays on
+                        # the unified budget rail (the codebase's own rule for
+                        # committed on-chain categories). If the swap later
+                        # shows up in listswaps its live cost is ALSO counted
+                        # there — a deliberate conservative over-count until
+                        # the operator settles or releases the reservation
+                        # explicitly; the unsafe direction is losing a real
+                        # commitment.
+                        self.plugin.log(
+                            f"UNKNOWN OUTCOME: boltz swap create timed out with "
+                            f"reservation {ctx['reservation_id']} HELD "
+                            f"({ctx['estimated_fee_sats']} sats). Check "
+                            f"'revenue-boltz-swaps' for a fresh swap, then "
+                            f"settle or release the reservation explicitly.",
+                            level="error")
+                    else:
+                        # Definite rejection → release (no committed cost).
+                        self._finalize_swap_budget_reservation(
+                            ctx["reservation_id"], None,
+                            ctx["estimated_fee_sats"], ctx["channel_id"], ctx["structural"],
+                        )
                 raise
             finally:
                 self._pending_swap_budget = None

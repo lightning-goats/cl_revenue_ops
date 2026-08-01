@@ -57,7 +57,14 @@ PINNED_COUNTS = {
     ("planner", "analyzer_cache"): 6,
     # 3b: 24 -> 20 (dead _has_direct_peer_channel/_is_peer_connected
     # removed; 4 live-RPC sites gone)
-    ("planner", "live_rpc"): 20,
+    # 20 -> 22 (2026-08-01, task 26): _probe_peer_channels adds two
+    # listpeerchannels read sites (data_service arm + raw-rpc arm) for the
+    # unknown-outcome guard. DELIBERATELY live, not snapshot: the probe's
+    # whole purpose is to measure CURRENT node state after a
+    # fundchannel/close exception whose outcome is unknown — a pre-exception
+    # snapshot is exactly the thing that cannot answer. Classified in
+    # docs/refactor/phase0/snapshot-dependency-audit.md.
+    ("planner", "live_rpc"): 22,
     ("planner", "database"): 11,
     ("planner", "wall_clock"): 11,
     ("boltz", "analyzer_cache"): 0,
