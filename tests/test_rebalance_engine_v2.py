@@ -2001,9 +2001,8 @@ def test_engine_native_executor_retries_smaller_partial_amount_after_liquidity_f
     assert executor.execute.call_args.kwargs["amount_sats"] == 50_000
     assert executor.execute.call_args.kwargs["route"] == partial_route
 
-    uargs, ukwargs = mock_database.update_rebalance_result.call_args
+    uargs, ukwargs = mock_database.settle_rebalance_success.call_args
     assert uargs[0] == 123
-    assert uargs[1] == "success"
     assert ukwargs["amount_sats"] == 50_000
     assert ukwargs["post_local_ratio"] == pytest.approx(0.15)
 
@@ -2284,10 +2283,10 @@ def test_engine_execute_pair_records_pending_then_success_in_rebalance_history(
     assert rkwargs["status"] == "pending"
     assert rkwargs["reason_code"] == "ev_positive"
 
-    mock_database.update_rebalance_result.assert_called_once()
-    uargs, ukwargs = mock_database.update_rebalance_result.call_args
+    # Audit wave2 FIX 1: a success settles through the atomic path.
+    mock_database.settle_rebalance_success.assert_called_once()
+    uargs, ukwargs = mock_database.settle_rebalance_success.call_args
     assert uargs[0] == 77
-    assert uargs[1] == "success"
     assert ukwargs.get("actual_fee_sats") == 3
     assert ukwargs.get("actual_fee_msat") == 3_000
 
@@ -2456,14 +2455,18 @@ def test_engine_auto_execute_pair_accounts_costs_and_budget_reservation(
     assert rkwargs["amount_sats"] == 10_000
     assert rkwargs["channel_id"] == "200x1x0"
 
-    mock_database.record_rebalance_cost.assert_called_once()
-    ckwargs = mock_database.record_rebalance_cost.call_args.kwargs
-    assert ckwargs["channel_id"] == "200x1x0"
-    assert ckwargs["peer_id"] == "02" + "c" * 64
-    assert ckwargs["cost_sats"] == 3
-    assert ckwargs["cost_msat"] == 2_500
-    assert ckwargs["amount_sats"] == 50_000
-    mock_database.mark_budget_spent.assert_called_once_with("77", 3)
+    # Audit wave2 FIX 1: history + cost + reservation settle atomically.
+    mock_database.settle_rebalance_success.assert_called_once()
+    skwargs = mock_database.settle_rebalance_success.call_args.kwargs
+    assert skwargs["reservation_id"] == "77"
+    assert skwargs["record_cost"] is True
+    assert skwargs["cost_channel_id"] == "200x1x0"
+    assert skwargs["cost_peer_id"] == "02" + "c" * 64
+    assert skwargs["cost_sats"] == 3
+    assert skwargs["cost_msat"] == 2_500
+    assert skwargs["cost_amount_sats"] == 50_000
+    mock_database.record_rebalance_cost.assert_not_called()
+    mock_database.mark_budget_spent.assert_not_called()
     mock_database.release_budget_reservation.assert_not_called()
 
 

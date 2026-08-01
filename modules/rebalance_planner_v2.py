@@ -295,9 +295,15 @@ class RebalancePlanner:
                 # Drain benefit -- how stagnant/overfull the source is.
                 source_drain_term = float(src.source_drain_score or 0.0) * 0.20
 
-                # Cheap-return bonus -- low inbound fee shortens the circular
-                # route cost. Capped so it can't dominate the urgency term.
-                inbound_fee_ppm = max(0, int(src.actual_inbound_fee_ppm or 0))
+                # Cheap-return bonus -- low inbound fee on the DEST channel
+                # shortens the circular route cost. The return leg the route
+                # actually traverses is dest_peer -> us on the destination
+                # channel (what _get_final_hop_policy prices); the source
+                # peer's inbound edge toward us is never on the circular
+                # route (audit wave2 FIX 5a -- it used to score
+                # src.actual_inbound_fee_ppm). Capped so it can't dominate
+                # the urgency term.
+                inbound_fee_ppm = max(0, int(dest.actual_inbound_fee_ppm or 0))
                 cheap_return_term = max(
                     0.0, (5_000 - min(5_000, inbound_fee_ppm)) / 50_000.0
                 )

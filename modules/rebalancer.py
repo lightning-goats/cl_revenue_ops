@@ -1869,10 +1869,23 @@ class EVRebalancer:
                 elif not getattr(exec_result, "payment_pending", False):
                     # Engine shares this history row; leave its
                     # 'pending_settlement' status for the reconcile sweep.
-                    self.database.update_rebalance_result(
-                        rebalance_id, 'failed',
-                        error_message=exec_result.error or "rebalance failed"
-                    )
+                    # Audit wave2 FIX 3: budget/governor blocks are recorded
+                    # by the engine as 'skipped' (no route was attempted) —
+                    # rewriting them to 'failed' here re-poisoned the dest
+                    # success-rate aggregate that gates the sats-EV planner.
+                    # Only overwrite for an actual routing failure. Uses the
+                    # engine CLASS's classifier (single source of truth) so
+                    # a mocked engine instance cannot skew the check.
+                    from .rebalance_engine_v2 import RebalanceEngine
+                    try:
+                        is_block = RebalanceEngine._is_budget_block(exec_result)
+                    except Exception:
+                        is_block = False
+                    if not is_block:
+                        self.database.update_rebalance_result(
+                            rebalance_id, 'failed',
+                            error_message=exec_result.error or "rebalance failed"
+                        )
                 shock_ok = exec_result.success
                 shock_pending = bool(getattr(exec_result, "payment_pending", False)) and not shock_ok
                 # A shock rejected by the atomic unified-budget reserve delivered

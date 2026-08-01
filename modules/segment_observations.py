@@ -14,7 +14,15 @@ class SegmentObservationStore:
     SCHEMA_VERSION = 1
     DEFAULT_TTL_SECONDS = 900
     DEFAULT_MAX_OBSERVATIONS = 200
+    # Audit wave2 FIX 5b: sub-50k floor buckets. Partial-fill retries go
+    # down to ~1-5k sats; with 50k as the smallest bucket their failures
+    # were recorded as "cannot pass 50k" evidence (the old floor returned
+    # BUCKETS[0] for ANY amount below it, contradicting the docstring).
     BUCKETS = (
+        1_000,
+        5_000,
+        10_000,
+        25_000,
         50_000,
         100_000,
         250_000,
@@ -38,7 +46,12 @@ class SegmentObservationStore:
 
     @classmethod
     def bucket_amount_sats(cls, amount_sats: int) -> int:
-        """Return the largest configured amount bucket not exceeding amount_sats."""
+        """Return the largest configured amount bucket not exceeding amount_sats.
+
+        Amounts below the smallest bucket return 0: failure evidence must
+        never over-claim ("cannot pass 1,000 sats" from a 600-sat attempt),
+        and record_failure treats a 0 bucket as "do not record".
+        """
         try:
             amount = int(amount_sats)
         except (TypeError, ValueError):
@@ -46,7 +59,7 @@ class SegmentObservationStore:
         if amount <= 0:
             return 0
 
-        bucket = cls.BUCKETS[0]
+        bucket = 0
         for candidate in cls.BUCKETS:
             if amount < candidate:
                 break

@@ -7,7 +7,7 @@ The historical external executor was removed. New code should import
 
 from __future__ import annotations
 
-from .rebalance_execution import ExecutionResult, stable_failure_reason
+from .rebalance_execution import ExecutionResult
 from .rebalance_native_executor_v2 import NativeRouteExecutor as RebalanceExecutor
 
-__all__ = ["ExecutionResult", "RebalanceExecutor", "stable_failure_reason"]
+__all__ = ["ExecutionResult", "RebalanceExecutor"]

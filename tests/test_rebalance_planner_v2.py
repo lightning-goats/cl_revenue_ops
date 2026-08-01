@@ -411,25 +411,30 @@ class TestScoring:
         pair = result.selected[0]
         assert pair.score > 0.0
 
-    def test_cheaper_return_source_wins_when_other_terms_equal(self):
-        """Phase 2.3: when two sources have the same value class and the same
-        local ratio, the one offering a cheaper inbound return path should win
-        because it lowers expected circular route cost."""
+    def test_cheaper_return_dest_wins_when_other_terms_equal(self):
+        """Audit wave2 FIX 5(a): the return leg the circular route actually
+        traverses is the DEST channel's inbound edge (dest_peer -> us), so
+        when two destinations have the same value class and the same local
+        ratio, the one with the cheaper inbound return path should win —
+        it lowers expected circular route cost. (The source peer's inbound
+        edge is never on the route and must not influence the score.)"""
         planner = RebalancePlanner()
+        src = _ch(channel_id="src", peer_id="02" + "aa" * 32,
+                  local_ratio=0.90, value_class="active",
+                  actual_inbound_fee_ppm=5_000)
         # Order with expensive first to prove insertion order doesn't decide.
-        expensive = _ch(channel_id="expensive_src", peer_id="02" + "bb" * 32,
-                        local_ratio=0.90, value_class="active",
+        expensive = _ch(channel_id="expensive_dest", peer_id="02" + "bb" * 32,
+                        local_ratio=0.10, value_class="active",
                         actual_inbound_fee_ppm=5_000)
-        cheap = _ch(channel_id="cheap_src", peer_id="02" + "aa" * 32,
-                    local_ratio=0.90, value_class="active",
+        cheap = _ch(channel_id="cheap_dest", peer_id="02" + "cc" * 32,
+                    local_ratio=0.10, value_class="active",
                     actual_inbound_fee_ppm=10)
-        dest = _ch(channel_id="dest", peer_id="02" + "cc" * 32, local_ratio=0.10)
-        snap = _snap(expensive, cheap, dest)
+        snap = _snap(src, expensive, cheap)
 
         result = planner.plan(snap)
 
         assert len(result.selected) == 1
-        assert result.selected[0].source_channel_id == "cheap_src"
+        assert result.selected[0].dest_channel_id == "cheap_dest"
 
     def test_polar_s2_shape_forms_a_pair(self):
         """Phase 2.4 regression: S2 had a depleted profitable destination plus

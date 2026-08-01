@@ -214,3 +214,15 @@ how long each pending_settlement row has held its budget reservation, for
 the >14d escalation log. **PROPER**: it measures elapsed age for operator
 visibility and never feeds a fee/route/spend decision — escalation is
 visibility only and releases nothing.
+
+### Audit wave2 addendum (2026-08-01): atomic settlement + pending-row recovery
+
+`rebalance_engine_v2` adds 2 database reads (pin 18→20) and 2 wall-clock
+reads (pin 11→13). All four sit in execution/settlement bookkeeping, not
+the decision path:
+
+| Site | Read | Class |
+|---|---|---|
+| `_recover_missing_pending_row` | `self.database.record_rebalance` + `self.database.update_rebalance_result` retry after a failed 'pending' insert on a payment_pending outcome (FIX 5d) | execution/reconciliation — allowed. Recovers the sweepable `pending_settlement` row so a late settlement's fee can be recorded; feeds no fee/route/spend decision |
+| `_settle_rebalance_success` | `time.time()` for the cost row's timestamp in the atomic success settlement (FIX 1) | execution timestamping — allowed (same read the legacy `_record_rebalance_result` path performs; the settlement moved, the read class did not) |
+| `_reconcile_pending_row` (atomic branch) | `time.time()` for the reconcile-path cost timestamp passed into `settle_rebalance_success` (FIX 1) | execution timestamping — allowed (mirror of the legacy branch's existing read, kept alongside it for the fallback) |

@@ -337,11 +337,17 @@ class RebalanceRouterV3:
         exclude: Optional[List[str]] = None,
         *,
         layer_names_override: Optional[List[str]] = None,
+        maxfee_sats: Optional[int] = None,
     ) -> RouteResult:
         """Discover and price a circular rebalance route via askrene getroutes.
 
         Returns a RouteResult matching the v2 router's shape so the engine
         and executor can consume either router's output transparently.
+
+        ``maxfee_sats`` (audit wave2 FIX 4): the engine's largest
+        gate-acceptable TOTAL route cost for this pair. When provided, the
+        getroutes maxfee is capped accordingly instead of allowing 100% of
+        the amount as fee. None keeps the legacy unconstrained behavior.
         """
         # Self-heal an empty node id: a transient getinfo failure during
         # engine init froze our_node_id="" for the plugin's lifetime, which
@@ -386,6 +392,25 @@ class RebalanceRouterV3:
         )
 
         route_amount_msat = (amount_sats + final_hop_fee_sats) * 1000
+        # Audit wave2 FIX 4: constrain askrene's MCF by the engine's
+        # acceptance bound instead of allowing 100% of the amount as fee.
+        # ``maxfee_sats`` is the TOTAL circular route cost the engine's
+        # budget gate could accept; getroutes' maxfee covers only the
+        # middle-path fees (source_peer -> dest_peer), so subtract the
+        # final-hop fee, which is embedded in route_amount_msat rather than
+        # counted as fee. The first-middle-hop fee is unknown until a route
+        # returns and is >= 0, so this cap never excludes a route the gate
+        # would have accepted (the gate compares ceil'd sats, and the
+        # final-hop fee enters the gate's cost at exactly
+        # final_hop_fee_sats * 1000 msat — the subtraction is msat-exact,
+        # no rounding slack needed). The gate stays authoritative; this is
+        # both a correctness fix (no more high-reliability routes priced
+        # over budget while a cheaper in-budget route exists) and a runtime
+        # fix (the unconstrained solve took 6-16s on large amounts).
+        maxfee_msat = route_amount_msat
+        if maxfee_sats is not None:
+            middle_fee_budget_sats = max(0, int(maxfee_sats) - final_hop_fee_sats)
+            maxfee_msat = min(route_amount_msat, middle_fee_budget_sats * 1000)
         # Re-probe live layers each call so layers created after engine
         # startup are picked up without a plugin restart.
         layers = list(self._probe_layers(layer_names_override))
@@ -413,6 +438,7 @@ class RebalanceRouterV3:
                     dest_peer_id=dest_peer_id,
                     amount_sats=amount_sats,
                     route_amount_msat=route_amount_msat,
+                    maxfee_msat=maxfee_msat,
                     final_hop_fee_ppm=final_hop_fee_ppm,
                     final_hop_fee_base_msat=final_hop_fee_base_msat,
                     invoice_final_cltv=invoice_final_cltv,
@@ -426,6 +452,7 @@ class RebalanceRouterV3:
             dest_peer_id=dest_peer_id,
             amount_sats=amount_sats,
             route_amount_msat=route_amount_msat,
+            maxfee_msat=maxfee_msat,
             final_hop_fee_ppm=final_hop_fee_ppm,
             final_hop_fee_base_msat=final_hop_fee_base_msat,
             invoice_final_cltv=invoice_final_cltv,
@@ -442,6 +469,7 @@ class RebalanceRouterV3:
         dest_peer_id: str,
         amount_sats: int,
         route_amount_msat: int,
+        maxfee_msat: int,
         final_hop_fee_ppm: int,
         final_hop_fee_base_msat: int,
         invoice_final_cltv: int,
@@ -454,7 +482,7 @@ class RebalanceRouterV3:
                 "destination": dest_peer_id,
                 "amount_msat": route_amount_msat,
                 "layers": layers,
-                "maxfee_msat": route_amount_msat,
+                "maxfee_msat": maxfee_msat,
                 "final_cltv": required_final_cltv,
             }
             if self.data_service is not None:

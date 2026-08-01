@@ -424,14 +424,19 @@ def test_reconcile_settled_payment_records_cost_and_marks_spent(
     resolved = engine.reconcile_pending_settlements()
 
     assert resolved == 1
-    args, kwargs = mock_database.update_rebalance_result.call_args
+    # Audit wave2 FIX 1: history + cost + reservation settle in ONE
+    # atomic call instead of three independent writes.
+    args, kwargs = mock_database.settle_rebalance_success.call_args
     assert args[0] == 42
-    assert args[1] == "success"
-    assert kwargs.get("actual_fee_msat") == 5000
-    cost_kwargs = mock_database.record_rebalance_cost.call_args.kwargs
-    assert cost_kwargs["channel_id"] == "200x1x0"
-    assert cost_kwargs["cost_msat"] == 5000
-    mock_database.mark_budget_spent.assert_called_once_with("42", 5)
+    assert kwargs["reservation_id"] == "42"
+    assert kwargs["actual_fee_msat"] == 5000
+    assert kwargs["actual_fee_sats"] == 5
+    assert kwargs["record_cost"] is True
+    assert kwargs["cost_channel_id"] == "200x1x0"
+    assert kwargs["cost_msat"] == 5000
+    mock_database.update_rebalance_result.assert_not_called()
+    mock_database.record_rebalance_cost.assert_not_called()
+    mock_database.mark_budget_spent.assert_not_called()
 
 
 def test_reconcile_partial_fill_settles_with_actual_amount(
@@ -459,13 +464,11 @@ def test_reconcile_partial_fill_settles_with_actual_amount(
     resolved = engine.reconcile_pending_settlements()
 
     assert resolved == 1
-    args, kwargs = mock_database.update_rebalance_result.call_args
+    args, kwargs = mock_database.settle_rebalance_success.call_args
     assert args[0] == 42
-    assert args[1] == "success"
-    assert kwargs.get("amount_sats") == 250_000
-    cost_kwargs = mock_database.record_rebalance_cost.call_args.kwargs
-    assert cost_kwargs["amount_sats"] == 250_000
-    mock_database.mark_budget_spent.assert_called_once_with("42", 5)
+    assert kwargs["amount_sats"] == 250_000
+    assert kwargs["cost_amount_sats"] == 250_000
+    assert kwargs["actual_fee_sats"] == 5
 
 
 def test_reconcile_settled_amount_missing_falls_back_to_planned(
@@ -490,11 +493,9 @@ def test_reconcile_settled_amount_missing_falls_back_to_planned(
     resolved = engine.reconcile_pending_settlements()
 
     assert resolved == 1
-    args, kwargs = mock_database.update_rebalance_result.call_args
-    assert args[1] == "success"
-    assert kwargs.get("amount_sats") == 1_000_000
-    cost_kwargs = mock_database.record_rebalance_cost.call_args.kwargs
-    assert cost_kwargs["amount_sats"] == 1_000_000
+    args, kwargs = mock_database.settle_rebalance_success.call_args
+    assert kwargs["amount_sats"] == 1_000_000
+    assert kwargs["cost_amount_sats"] == 1_000_000
 
 
 def test_reconcile_failed_payment_releases_reservation(mock_plugin, mock_database):
@@ -664,7 +665,7 @@ def test_sweep_rotates_past_persistently_pending_rows(mock_plugin, mock_database
     resolved_second = engine.reconcile_pending_settlements()
     assert resolved_second == 1, (
         "a full page of persistently-pending rows must not starve newer rows")
-    args, _ = mock_database.update_rebalance_result.call_args
+    args, _ = mock_database.settle_rebalance_success.call_args
     assert args[0] == 3
 
 

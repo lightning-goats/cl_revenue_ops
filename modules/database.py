@@ -3824,6 +3824,109 @@ class Database:
         """, (reservation_id,))
         return cursor.rowcount > 0
 
+    def settle_rebalance_success(self, rebalance_id: Optional[int],
+                                 reservation_id: Optional[str] = None, *,
+                                 actual_fee_sats: Optional[int] = None,
+                                 actual_fee_msat: Optional[int] = None,
+                                 amount_sats: Optional[int] = None,
+                                 post_local_ratio: Optional[float] = None,
+                                 record_cost: bool = False,
+                                 cost_channel_id: Optional[str] = None,
+                                 cost_peer_id: Optional[str] = None,
+                                 cost_sats: Optional[int] = None,
+                                 cost_msat: Optional[int] = None,
+                                 cost_amount_sats: int = 0,
+                                 cost_timestamp: Optional[int] = None) -> bool:
+        """Atomically settle a successful rebalance (audit 2026-08-01 wave2).
+
+        Mirrors the P2-003 transaction discipline of
+        ``mark_spend_reservation_spent``: the success settlement used to run
+        as three independent autocommit writes —
+        ``update_rebalance_result('success')``, ``record_rebalance_cost``,
+        ``mark_budget_spent`` — and a crash between the first and second
+        permanently lost the actually-paid routing fee from the budget rail
+        (the history row had left 'pending_settlement', so
+        ``reconcile_pending_settlements`` never revisits it, while the
+        still-active reservation is force-released by the 4h stale sweep).
+
+        All three steps now commit or roll back together inside one
+        BEGIN IMMEDIATE. The component helpers run on this thread's
+        connection (``isolation_level=None``), so their statements join this
+        transaction — same columns, same values as before; the change is
+        atomicity, not behavior. The reservation step inlines
+        ``mark_budget_spent`` (whose own BEGIN IMMEDIATE cannot nest):
+        unified ``spend_reservations`` row first with record_event=False
+        semantics (the rebalance cost stays in ``rebalance_costs`` —
+        nothing double-counts), legacy ``budget_reservations`` fallback
+        otherwise.
+
+        Raises on failure after rolling back, so callers can retry or fall
+        back knowing nothing was partially recorded.
+        """
+        conn = self._get_connection()
+        journal_note = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if rebalance_id is not None:
+                self.update_rebalance_result(
+                    int(rebalance_id),
+                    'success',
+                    actual_fee_sats=actual_fee_sats,
+                    actual_fee_msat=actual_fee_msat,
+                    post_local_ratio=post_local_ratio,
+                    amount_sats=amount_sats,
+                )
+            if record_cost:
+                self.record_rebalance_cost(
+                    channel_id=str(cost_channel_id or ""),
+                    peer_id=str(cost_peer_id or ""),
+                    cost_sats=cost_sats,
+                    cost_msat=cost_msat,
+                    amount_sats=int(cost_amount_sats or 0),
+                    timestamp=cost_timestamp,
+                )
+            rid = str(reservation_id or "").strip()
+            if rid:
+                row = conn.execute(
+                    "SELECT category, reserved_sats FROM spend_reservations "
+                    "WHERE reservation_id = ?", (rid,)
+                ).fetchone()
+                unified_spent = False
+                if row is not None:
+                    cursor = conn.execute("""
+                        UPDATE spend_reservations
+                        SET status = 'spent'
+                        WHERE reservation_id = ? AND status = 'active'
+                    """, (rid,))
+                    unified_spent = cursor.rowcount > 0
+                if unified_spent:
+                    journal_note = (rid, row)
+                else:
+                    conn.execute("""
+                        UPDATE budget_reservations
+                        SET status = 'spent'
+                        WHERE reservation_id = ? AND status = 'active'
+                    """, (rid,))
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        if journal_note is not None and self.spend_journal is not None:
+            rid, row = journal_note
+            try:
+                settled = self._sanitize_amount(
+                    actual_fee_sats if actual_fee_sats is not None
+                    else row["reserved_sats"], "actual_spent_sats")
+                self.spend_journal.note_spend_settled(
+                    rid, settled, row["category"])
+            except Exception as journal_err:
+                self.plugin.log(f"spend journal skipped: {journal_err}",
+                                level='debug')
+        return True
+
     def cleanup_stale_reservations(self, max_age_seconds: int = 14400) -> int:
         """
         Clean up stale reservations older than max_age.

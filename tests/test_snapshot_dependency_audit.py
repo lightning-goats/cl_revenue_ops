@@ -52,12 +52,21 @@ PINNED_COUNTS = {
     ("fee", "wall_clock"): 37,
     ("rebalance", "analyzer_cache"): 0,
     ("rebalance", "live_rpc"): 14,
-    ("rebalance", "database"): 18,
+    # 18 -> 20 (audit 2026-08-01 wave2): _recover_missing_pending_row
+    # retries the 'pending' history insert (record_rebalance +
+    # update_rebalance_result) when the original insert failed and the
+    # payment ended payment_pending — execution/reconciliation writes, not
+    # decision reads; classified in the audit doc.
+    ("rebalance", "database"): 20,
     # 10 -> 11 (2026-08-01, task 26/78): reconcile_pending_settlements
     # reads time.time() once per sweep to compute row AGE for the stale-hold
     # escalation. Measurement of elapsed time, not a policy input; classified
     # in docs/refactor/phase0/snapshot-dependency-audit.md.
-    ("rebalance", "wall_clock"): 11,
+    # 11 -> 13 (audit 2026-08-01 wave2 FIX 1): cost-row timestamps in the
+    # atomic success settlement (_settle_rebalance_success and the
+    # reconcile atomic branch) — execution timestamping, same class as the
+    # legacy sites they mirror; classified in the audit doc.
+    ("rebalance", "wall_clock"): 13,
     ("planner", "analyzer_cache"): 6,
     # 3b: 24 -> 20 (dead _has_direct_peer_channel/_is_peer_connected
     # removed; 4 live-RPC sites gone)

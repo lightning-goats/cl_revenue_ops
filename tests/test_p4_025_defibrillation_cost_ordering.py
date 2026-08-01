@@ -1,18 +1,16 @@
 """P4-025: a successful defibrillation shock must never leave the fee counted by
 NEITHER the reservation nor rebalance_costs.
 
-The defibrillation SUCCESS path used to mark the reservation spent
-(``mark_budget_spent`` in rebalance_engine_v2 ``_finish_execution_budget``) —
-which drops it from the active-reservation SUM — BEFORE the rebalancer wrote
-``record_rebalance_cost``. Between those two writes the shock fee was counted by
-neither side: a transient overspend-direction window (unlike the auto cycle,
-which records the cost BEFORE marking spent).
+Historical defect: the defibrillation SUCCESS path marked the reservation
+spent BEFORE the fee reached ``rebalance_costs`` — a transient
+overspend-direction window. P4-025 first fixed the ordering
+(record-before-mark); audit 2026-08-01 wave2 FIX 1 subsumed the ordering fix
+entirely: the history update, the cost insert and the reservation mark-spent
+now commit TOGETHER in one ``Database.settle_rebalance_success`` transaction,
+so no instant exists where the fee is counted by neither side (or by both).
 
-The fix routes the shock through the auto-cycle ordering (account_costs=True) so
-the engine records the cost into rebalance_costs BEFORE it marks the reservation
-spent. This test drives the real ``diagnostic_rebalance`` against a real Database
-+ real engine and asserts that at the instant ``mark_budget_spent`` is invoked
-the fee is ALREADY present in rebalance_costs (i.e. record-before-mark holds).
+These tests drive the real ``diagnostic_rebalance`` / worker path against a
+real Database + real engine and assert the atomic settlement invariant.
 """
 
 import os
@@ -42,6 +40,13 @@ def _rebalance_costs_total(db):
     return int(conn.execute(
         "SELECT COALESCE(SUM(cost_sats),0) FROM rebalance_costs"
     ).fetchone()[0] or 0)
+
+
+def _reservation_rows(db):
+    conn = db._get_connection()
+    return [dict(r) for r in conn.execute(
+        "SELECT reservation_id, status FROM spend_reservations"
+    ).fetchall()]
 
 
 def _build(db, budget=100_000):
@@ -85,55 +90,44 @@ def _build(db, budget=100_000):
     return r, engine
 
 
-def test_successful_shock_records_cost_before_marking_spent(tmp_path):
+def test_successful_shock_settles_fee_and_reservation_atomically(tmp_path):
     db = _make_db(tmp_path)
     r, engine = _build(db)
 
-    events = []
-    orig_mark = db.mark_budget_spent
-    orig_cost = db.record_rebalance_cost
+    # INVARIANT: the settlement runs as ONE transaction. Snapshot the state
+    # visible at the atomic call and verify the post-state is consistent.
+    settle_calls = []
+    orig_settle = db.settle_rebalance_success
 
-    def wrapped_mark(reservation_id, actual_spent):
-        # INVARIANT: at the instant we drop the reservation from the active
-        # sum, the fee must ALREADY be counted by rebalance_costs — otherwise
-        # there is an instant where it is counted by neither.
-        events.append(("mark_spent", _rebalance_costs_total(db)))
-        return orig_mark(reservation_id, actual_spent)
+    def wrapped_settle(*a, **k):
+        out = orig_settle(*a, **k)
+        # Immediately after the atomic call BOTH effects are visible.
+        settle_calls.append({
+            "cost_total": _rebalance_costs_total(db),
+            "reservations": _reservation_rows(db),
+        })
+        return out
 
-    def wrapped_cost(*a, **k):
-        events.append(("record_cost", None))
-        return orig_cost(*a, **k)
-
-    db.mark_budget_spent = wrapped_mark
-    db.record_rebalance_cost = wrapped_cost
+    db.settle_rebalance_success = wrapped_settle
 
     res = r.diagnostic_rebalance("200x1x0")
     assert res.get("shock_status") == "completed", res
 
-    names = [e[0] for e in events]
-    assert "record_cost" in names, "the shock fee was never recorded into rebalance_costs"
-    assert "mark_spent" in names, "the reservation was never marked spent"
-    # record_rebalance_cost must precede mark_budget_spent...
-    assert names.index("record_cost") < names.index("mark_spent"), (
-        f"mark_budget_spent ran before record_rebalance_cost (neither-counted "
-        f"window): order={names}"
+    assert len(settle_calls) == 1, "success must settle through the atomic path"
+    snap = settle_calls[0]
+    assert snap["cost_total"] == 120, "fee not in rebalance_costs at settle"
+    assert all(row["status"] == "spent" for row in snap["reservations"]), (
+        f"reservation not spent at settle: {snap['reservations']}"
     )
-    # ...and at the mark instant the cost was already counted (> 0).
-    mark_snapshot = next(cost for name, cost in events if name == "mark_spent")
-    assert mark_snapshot > 0, (
-        "at mark_budget_spent the fee was not yet in rebalance_costs -> "
-        "transient window where the fee is counted by neither side"
-    )
-    # Exactly one cost row for the shock (no double-count from the rebalancer
-    # ALSO recording it).
+    # The legacy independent mark-spent path must not run again afterwards.
     conn = db._get_connection()
     rows = int(conn.execute("SELECT COUNT(*) FROM rebalance_costs").fetchone()[0])
     assert rows == 1, f"expected exactly one shock cost row, got {rows} (double count?)"
 
 
-def test_auto_cycle_ordering_still_records_before_marks(tmp_path):
-    """Guard the auto-cycle path was not regressed: with account_costs=True the
-    engine records the cost before marking the reservation spent."""
+def test_auto_cycle_success_settles_atomically(tmp_path):
+    """Guard the auto-cycle path: with account_costs=True the engine settles
+    history + cost + reservation in one settle_rebalance_success call."""
     from modules.rebalance_types_v2 import PairCandidate
 
     db = _make_db(tmp_path)
@@ -151,13 +145,25 @@ def test_auto_cycle_ordering_still_records_before_marks(tmp_path):
         reason_code="ev_positive",
     )
 
-    events = []
+    legacy_calls = []
     orig_mark = db.mark_budget_spent
     orig_cost = db.record_rebalance_cost
-    db.mark_budget_spent = lambda i, a: (events.append("mark"), orig_mark(i, a))[1]
-    db.record_rebalance_cost = lambda *a, **k: (events.append("cost"), orig_cost(*a, **k))[1]
+    db.mark_budget_spent = lambda i, a: (legacy_calls.append("mark"), orig_mark(i, a))[1]
 
     executor = engine._make_executor()
     engine._execute_pair(pair, executor, reserve_budget=True,
                          account_costs=True, rebalance_id=rid)
-    assert events == ["cost", "mark"], f"auto-cycle ordering regressed: {events}"
+
+    # Atomic settlement: the legacy independent mark-spent never runs...
+    assert legacy_calls == [], f"legacy mark_budget_spent ran: {legacy_calls}"
+    # ...and the final state carries all three effects.
+    conn = db._get_connection()
+    row = conn.execute(
+        "SELECT status, actual_fee_sats FROM rebalance_history WHERE id = ?",
+        (rid,)).fetchone()
+    assert row["status"] == "success"
+    assert row["actual_fee_sats"] == 120
+    assert _rebalance_costs_total(db) == 120
+    reservations = _reservation_rows(db)
+    assert reservations and all(x["status"] == "spent" for x in reservations)
+    db.record_rebalance_cost = orig_cost

@@ -168,6 +168,11 @@ class RebalanceEngine:
         # cleanup refactor; this replaces it at the engine level so it covers
         # both v2 and v3 routers).
         self._pair_failures: Dict[Tuple[str, str], List[float]] = {}
+        # Audit wave2 FIX 2: workers record their own pair outcomes, so the
+        # tracker is now mutated from pool threads (including orphans running
+        # past the cycle lock's release) concurrently with the cycle thread's
+        # prune/read. Brief dedicated lock, no nesting, never held across IO.
+        self._pair_failures_lock = threading.Lock()
         self._futility_threshold: int = 3
         self._futility_window_sec: float = 1800.0  # 30 minutes
         # Per-cycle memo for the empirical dest success-rate DB aggregate
@@ -1672,6 +1677,7 @@ class RebalanceEngine:
         exclude: Optional[List[str]],
         *,
         market_only_layers: bool = False,
+        maxfee_sats: Optional[int] = None,
     ):
         kwargs = {
             "source_channel_id": pair.source_channel_id,
@@ -1683,18 +1689,30 @@ class RebalanceEngine:
         }
         if market_only_layers:
             kwargs.update({"layer_names_override": []})
+        if maxfee_sats is not None:
+            # Audit wave2 FIX 4: thread the engine's acceptance bound to the
+            # router so askrene's MCF is fee-constrained.
+            kwargs["maxfee_sats"] = maxfee_sats
         try:
             return router.price_pair(**kwargs)
         except TypeError as exc:
-            if not market_only_layers:
-                raise
             message = str(exc)
-            if (
-                "layer_names_override" not in message
-                and "unexpected keyword" not in message
+            unexpected = "unexpected keyword" in message
+            retry = False
+            # Older router signatures / test doubles: drop the optional
+            # kwargs they do not know and retry once.
+            if "maxfee_sats" in kwargs and (
+                "maxfee_sats" in message or unexpected
             ):
+                kwargs.pop("maxfee_sats", None)
+                retry = True
+            if market_only_layers and (
+                "layer_names_override" in message or unexpected
+            ):
+                kwargs.pop("layer_names_override", None)
+                retry = True
+            if not retry:
                 raise
-            kwargs.pop("layer_names_override", None)
             return router.price_pair(**kwargs)
 
     @staticmethod
@@ -1717,21 +1735,51 @@ class RebalanceEngine:
             router,
             pair,
             exclude,
+            maxfee_sats=self._pair_route_fee_bound_sats(pair),
         ), "market"
+
+    def _pair_route_fee_bound_sats(
+        self, pair: PairCandidate
+    ) -> Optional[int]:
+        """Audit wave2 FIX 4: largest total route fee the acceptance gate
+        could approve for this pair, threaded to askrene as its maxfee.
+
+        The gate accepts ``route_cost_sats <= _per_attempt_fee_ceiling(
+        _probability_adjusted_budget(pair_budget))``. Probability is unknown
+        before pricing, so the bound uses the MAXIMUM relaxation
+        (probability_ppm=1e6): every gate-acceptable route still fits under
+        it — the bound is never tighter than the gate, which stays
+        authoritative. Without it, getroutes ran with maxfee = 100% of the
+        amount, so askrene could return an expensive high-reliability route
+        the gate then rejected (route_over_budget) even when a cheaper
+        in-budget route existed — burning the pair's cycle slot — and
+        large-amount calls solved the unconstrained MCF (6-16s per call).
+        None = unconstrained (fail-open on any error).
+        """
+        try:
+            budget = max(0, int(getattr(pair, "pair_budget_sats", 0) or 0))
+            bound = self._probability_adjusted_budget(budget, 1_000_000)
+            bound = self._per_attempt_fee_ceiling(
+                int(getattr(pair, "amount_sats", 0) or 0), bound
+            )
+            return max(0, int(bound))
+        except Exception:
+            return None
 
     def _prune_pair_failures(self, key: Tuple[str, str]) -> List[float]:
         """Drop failure timestamps older than the futility window and return survivors."""
-        timestamps = self._pair_failures.get(key, [])
-        if not timestamps:
-            return timestamps
-        cutoff = time.time() - self._futility_window_sec
-        fresh = [t for t in timestamps if t >= cutoff]
-        if len(fresh) != len(timestamps):
-            if fresh:
-                self._pair_failures[key] = fresh
-            else:
-                self._pair_failures.pop(key, None)
-        return fresh
+        with self._pair_failures_lock:
+            timestamps = self._pair_failures.get(key, [])
+            if not timestamps:
+                return timestamps
+            cutoff = time.time() - self._futility_window_sec
+            fresh = [t for t in timestamps if t >= cutoff]
+            if len(fresh) != len(timestamps):
+                if fresh:
+                    self._pair_failures[key] = fresh
+                else:
+                    self._pair_failures.pop(key, None)
+            return fresh
 
     def _get_persisted_pair_cooldown(
         self, source_channel_id: str, dest_channel_id: str
@@ -1760,11 +1808,13 @@ class RebalanceEngine:
     def _record_pair_failure(self, source_channel_id: str, dest_channel_id: str) -> None:
         """Record an execution failure for this pair at the current time."""
         key = (source_channel_id, dest_channel_id)
-        self._pair_failures.setdefault(key, []).append(time.time())
+        with self._pair_failures_lock:
+            self._pair_failures.setdefault(key, []).append(time.time())
 
     def _record_pair_success(self, source_channel_id: str, dest_channel_id: str) -> None:
         """Clear any failure history for this pair (success resets the counter)."""
-        self._pair_failures.pop((source_channel_id, dest_channel_id), None)
+        with self._pair_failures_lock:
+            self._pair_failures.pop((source_channel_id, dest_channel_id), None)
 
     def _classify_failure_kind(self, exec_result: ExecutionResult) -> str:
         error = str(getattr(exec_result, "error", "") or "").lower()
@@ -2855,6 +2905,7 @@ class RebalanceEngine:
         reserve_budget: bool = False,
         account_costs: bool = False,
         rebalance_id: Optional[int] = None,
+        record_pair_outcome: bool = False,
     ) -> Optional[ExecutionResult]:
         """Execute a single pair in a worker thread.
 
@@ -2866,7 +2917,46 @@ class RebalanceEngine:
         row, it passes that row id here and the engine updates it in place
         instead of inserting a second 'pending' row. This keeps one history
         row per rebalance so success-rate/fee stats are not double-counted.
+
+        ``record_pair_outcome`` (audit wave2 FIX 2): automatic cycle workers
+        pass True so the pair-level futility/cooldown bookkeeping runs HERE,
+        in the worker itself, on completion. It used to live only in the
+        cycle thread's consume_future_result, which never runs for a worker
+        still executing at the 120s as_completed ceiling — a chronically
+        slow-failing pair (one waitsendpay timeout + one exclusion-retry
+        pricing already exceeds 120s) kept a clean record and was re-selected
+        every cycle forever. Recording is idempotent per ExecutionResult
+        (_record_pair_outcome), so the cycle thread's own call for
+        non-orphaned futures cannot double-count. Manual callers keep the
+        default False: they never participated in futility bookkeeping.
         """
+        result: Optional[ExecutionResult] = None
+        try:
+            result = self._execute_pair_inner(
+                pair,
+                executor,
+                reserve_budget=reserve_budget,
+                account_costs=account_costs,
+                rebalance_id=rebalance_id,
+            )
+            return result
+        finally:
+            if record_pair_outcome:
+                # Runs even when the inner execution raised (result None →
+                # counted as a failure, mirroring the cycle thread's legacy
+                # exception handling) — the orphan case cannot rely on the
+                # cycle thread ever seeing this worker's outcome.
+                self._record_pair_outcome(pair, result)
+
+    def _execute_pair_inner(
+        self,
+        pair: PairCandidate,
+        executor: NativeRouteExecutor,
+        *,
+        reserve_budget: bool = False,
+        account_costs: bool = False,
+        rebalance_id: Optional[int] = None,
+    ) -> Optional[ExecutionResult]:
         policy_ok, policy_reason = self._pair_policy_allowed(pair)
         if not policy_ok:
             # Lazy re-check at the execution sink: candidate selection may be
@@ -2930,17 +3020,40 @@ class RebalanceEngine:
             if result is not None:
                 result = self._retry_native_pair_with_partial_amounts(pair, executor, result)
 
-            self._record_rebalance_result(
-                rebalance_id,
-                result,
-                pair=pair,
-                account_costs=account_costs,
-            )
-            self._finish_execution_budget(
-                reservation_id=reservation_id,
-                reserved_budget=reserved_budget,
-                result=result,
-            )
+            # Audit wave2 FIX 1: a SUCCESS settles atomically (history
+            # 'success' + cost insert + reservation mark-spent in ONE DB
+            # transaction). The legacy three-independent-writes sequence is
+            # kept only as the fallback for a Database without the atomic
+            # method or an atomic write that failed outright.
+            settled_atomically = False
+            if result is not None and getattr(result, "success", False):
+                settled_atomically = self._settle_rebalance_success(
+                    rebalance_id=rebalance_id,
+                    reservation_id=reservation_id,
+                    reserved_budget=reserved_budget,
+                    result=result,
+                    pair=pair,
+                    account_costs=account_costs,
+                )
+            if not settled_atomically:
+                self._record_rebalance_result(
+                    rebalance_id,
+                    result,
+                    pair=pair,
+                    account_costs=account_costs,
+                )
+                if rebalance_id is None:
+                    # Audit wave2 FIX 5(d): the 'pending' insert failed
+                    # earlier; a payment_pending outcome needs a sweepable
+                    # row or reconcile can never record its fee.
+                    self._recover_missing_pending_row(
+                        pair, result, reservation_id
+                    )
+                self._finish_execution_budget(
+                    reservation_id=reservation_id,
+                    reserved_budget=reserved_budget,
+                    result=result,
+                )
             if result is not None and not result.success:
                 self._push_segment_observation_snapshot()
             return result
@@ -2979,13 +3092,234 @@ class RebalanceEngine:
 
     @staticmethod
     def _is_budget_block(result: Optional[ExecutionResult]) -> bool:
-        """True when the result is a budget-reservation block: no route was
-        attempted, so it must not count as a routing failure anywhere
-        (pair futility, persisted cooldowns, destination success rates)."""
+        """True when the result is a budget-reservation OR governor
+        authorization block: no route was attempted, so it must not count as
+        a routing failure anywhere (pair futility, persisted cooldowns,
+        destination success rates). Audit wave2 FIX 3: governor rejections
+        (``governor_block: PAUSED / INTENT_STALE / AUTHORITY_LEVEL_BLOCKED /
+        INTENT_SUPERSEDED / CONFLICT_* / internal_error``) are capital-
+        control decisions, not routing evidence — recording them as 'failed'
+        poisoned the dest success-rate aggregate feeding the sats-EV gate
+        and charged futility strikes for pairs that never sent a payment."""
         if result is None or getattr(result, "success", False):
             return False
         error = str(getattr(result, "error", "") or "")
-        return error.startswith(("local_budget_block", "zero_budget_blocks"))
+        return error.startswith(
+            ("local_budget_block", "zero_budget_blocks", "governor_block")
+        )
+
+    def _settle_rebalance_success(
+        self,
+        *,
+        rebalance_id: Optional[int],
+        reservation_id: str,
+        reserved_budget: bool,
+        result: ExecutionResult,
+        pair: Optional[PairCandidate],
+        account_costs: bool,
+    ) -> bool:
+        """Settle a successful execution in ONE database transaction.
+
+        Audit wave2 FIX 1: computes the exact same values the legacy
+        sequence passed (_record_rebalance_result success branch +
+        _finish_execution_budget mark-spent) and hands them to
+        Database.settle_rebalance_success. Returns True when the atomic
+        path fully handled the bookkeeping; False sends the caller down the
+        legacy independent-write fallback (older Database without the
+        method, or an atomic write that failed — best-effort writes beat
+        losing the settlement entirely when the DB is already erroring).
+        """
+        if self.database is None:
+            return True  # nothing to record anywhere (legacy no-op parity)
+        settle = getattr(self.database, "settle_rebalance_success", None)
+        if not callable(settle):
+            return False
+        post_local_ratio = None
+        if pair is not None:
+            capacity = int(getattr(pair, "dest_capacity_sats", 0) or 0)
+            amount = int(getattr(pair, "amount_sats", 0) or 0)
+            pre_ratio = float(getattr(pair, "dest_local_ratio", 0.0) or 0.0)
+            if capacity > 0:
+                post_local_ratio = max(
+                    0.0, min(1.0, pre_ratio + amount / capacity)
+                )
+        fee_sats = int(getattr(result, "fee_sats", 0) or 0)
+        fee_msat = int(getattr(result, "fee_msat", 0) or 0)
+        settled_amount = int(
+            getattr(result, "amount_sats", 0)
+            or getattr(pair, "amount_sats", 0)
+            or 0
+        )
+        cost_msat = fee_msat if fee_msat > 0 else fee_sats * 1000
+        record_cost = bool(
+            account_costs
+            and pair is not None
+            and rebalance_id is not None
+            and cost_msat > 0
+        )
+        # Wave 2 registry semantics preserved: pop the governed completion
+        # and release the live-arbitration slot on this terminal outcome,
+        # exactly as _finish_execution_budget would have.
+        completion = None
+        if reserved_budget:
+            completion = self._governed_intent_completions.pop(
+                str(reservation_id), None
+            )
+        try:
+            settle(
+                rebalance_id,
+                reservation_id=(
+                    str(reservation_id) if reserved_budget else None
+                ),
+                actual_fee_sats=fee_sats,
+                actual_fee_msat=fee_msat,
+                amount_sats=settled_amount,
+                post_local_ratio=post_local_ratio,
+                record_cost=record_cost,
+                cost_channel_id=(pair.dest_channel_id if record_cost else None),
+                cost_peer_id=(pair.dest_peer_id if record_cost else None),
+                cost_sats=(base_to_sats_ceil(cost_msat) if record_cost else None),
+                cost_msat=(cost_msat if record_cost else None),
+                cost_amount_sats=(settled_amount if record_cost else 0),
+                cost_timestamp=(int(time.time()) if record_cost else None),
+            )
+            return True
+        except Exception as exc:
+            self._log(
+                f"atomic success settlement failed for id={rebalance_id} "
+                f"reservation={reservation_id}: {exc}; falling back to "
+                f"independent writes",
+                level="warn",
+            )
+            return False
+        finally:
+            if completion is not None:
+                facade, arbitration_key = completion
+                try:
+                    facade.complete(arbitration_key)
+                except Exception:
+                    pass
+
+    def _recover_missing_pending_row(
+        self,
+        pair: Optional[PairCandidate],
+        result: Optional[ExecutionResult],
+        reservation_id: str,
+    ) -> None:
+        """Audit wave2 FIX 5(d): recover a sweepable pending_settlement row.
+
+        Reached when the 'pending' history insert failed (DB hiccup) so the
+        reservation was created under a SYNTHETIC id, and the payment ended
+        unresolved-but-sweepable (payment_pending with a payment_hash).
+        Without a 'pending_settlement' row, reconcile_pending_settlements
+        can never record a late settlement's fee. Retrying the insert now is
+        safe — the original insert failed, so no duplicate row can exist —
+        and idempotent (runs once per execution outcome).
+
+        Escalates at error level either way: the budget hold is keyed to the
+        synthetic reservation id, which no history row can ever match, so
+        the P4-015 stale-sweep exemption cannot protect it — the 4h sweep
+        WILL release the hold even though the HTLC may still settle. The
+        recovered row at least gets the fee into rebalance_costs when the
+        payment completes (and blocks re-filling the dest meanwhile via the
+        pending-settlement dest guard).
+        """
+        if self.database is None or result is None or pair is None:
+            return
+        if not getattr(result, "payment_pending", False):
+            return
+        failure_data = getattr(result, "failure_data", {}) or {}
+        payment_hash = str(failure_data.get("payment_hash", "") or "")
+        if not payment_hash:
+            return
+        error = str(getattr(result, "error", "") or "")
+        try:
+            late_id = int(
+                self.database.record_rebalance(
+                    from_channel=pair.source_channel_id,
+                    to_channel=pair.dest_channel_id,
+                    amount_sats=int(pair.amount_sats),
+                    max_fee_sats=int(pair.pair_budget_sats or 0),
+                    expected_profit_sats=0,
+                    status="pending",
+                    rebalance_type="normal",
+                    reason_code=pair.reason_code or "ev_positive",
+                )
+            )
+            self.database.update_rebalance_result(
+                late_id,
+                "pending_settlement",
+                error_message=error,
+                payment_hash=payment_hash,
+            )
+        except Exception as exc:
+            self._log(
+                f"UNRECONCILABLE pending payment: pending-row insert failed "
+                f"twice for {pair.source_channel_id}->{pair.dest_channel_id} "
+                f"payment_hash={payment_hash} reservation={reservation_id}: "
+                f"{exc}. A late settlement's fee will NOT be recorded and "
+                f"the budget hold will be force-released by the stale sweep "
+                f"— inspect listsendpays for this payment_hash and resolve "
+                f"manually.",
+                level="error",
+            )
+            return
+        self._log(
+            f"pending-row insert had failed for "
+            f"{pair.source_channel_id}->{pair.dest_channel_id}; recovered a "
+            f"sweepable pending_settlement row id={late_id} for "
+            f"payment_hash={payment_hash}. NOTE: the budget hold sits under "
+            f"synthetic reservation {reservation_id}, which the stale sweep "
+            f"can release before the payment resolves.",
+            level="error",
+        )
+
+    def _record_pair_outcome(
+        self,
+        pair: PairCandidate,
+        exec_result: Optional[ExecutionResult],
+    ) -> None:
+        """Record one execution outcome in the pair futility/cooldown books.
+
+        Audit wave2 FIX 2: called by the worker itself at the end of
+        _execute_pair (so orphaned workers past the 120s cycle ceiling still
+        get their bookkeeping) AND by the cycle thread's
+        consume_future_result as an idempotent backstop. Idempotency is per
+        ExecutionResult via the pair_outcome_recorded marker; a None result
+        carries no marker, so its single recording site is the worker.
+        Budget/governor blocks never count as strikes (no route attempted).
+        """
+        if exec_result is not None:
+            if getattr(exec_result, "pair_outcome_recorded", False):
+                return
+            try:
+                exec_result.pair_outcome_recorded = True
+            except Exception:
+                pass
+        try:
+            if exec_result is not None and getattr(exec_result, "success", False):
+                self._record_pair_success(
+                    pair.source_channel_id, pair.dest_channel_id
+                )
+                self._clear_persisted_pair_failure(pair)
+            elif self._is_budget_block(exec_result):
+                # No route was attempted — a depleted unified budget or a
+                # governor rejection says nothing about this pair's
+                # routability, so do not charge futility strikes or
+                # persisted cooldowns.
+                pass
+            else:
+                self._record_pair_failure(
+                    pair.source_channel_id, pair.dest_channel_id
+                )
+                if exec_result is not None:
+                    self._persist_pair_failure(pair, exec_result)
+        except Exception as exc:
+            self._log(
+                f"pair outcome bookkeeping failed for "
+                f"{pair.source_channel_id}->{pair.dest_channel_id}: {exc}",
+                level="warn",
+            )
 
     def _record_rebalance_result(
         self,
@@ -3223,27 +3557,62 @@ class RebalanceEngine:
             settled_amount_sats = base_to_sats_floor(amount_msat)
             if settled_amount_sats <= 0:
                 settled_amount_sats = int(row.get("amount_sats") or 0)
-            self.database.update_rebalance_result(
-                rebalance_id,
-                "success",
-                actual_fee_sats=fee_sats,
-                actual_fee_msat=fee_msat,
-                amount_sats=(
-                    settled_amount_sats if settled_amount_sats > 0 else None
-                ),
-            )
-            if fee_msat > 0:
-                self.database.record_rebalance_cost(
-                    channel_id=dest_channel,
-                    peer_id=self._peer_id_for_channel(
-                        dest_channel, scid_peer_map_provider
+            # Audit wave2 FIX 1: settle atomically (history + cost +
+            # reservation in one transaction). On failure the exception
+            # propagates to the sweep's per-row handler and the row stays
+            # 'pending_settlement' with NOTHING partially recorded, so the
+            # next sweep retries cleanly.
+            settle = getattr(self.database, "settle_rebalance_success", None)
+            if callable(settle):
+                settle(
+                    rebalance_id,
+                    reservation_id=reservation_id,
+                    actual_fee_sats=fee_sats,
+                    actual_fee_msat=fee_msat,
+                    amount_sats=(
+                        settled_amount_sats if settled_amount_sats > 0
+                        else None
                     ),
-                    cost_sats=fee_sats,
-                    cost_msat=fee_msat,
-                    amount_sats=settled_amount_sats,
-                    timestamp=int(time.time()),
+                    record_cost=fee_msat > 0,
+                    cost_channel_id=(dest_channel if fee_msat > 0 else None),
+                    cost_peer_id=(
+                        self._peer_id_for_channel(
+                            dest_channel, scid_peer_map_provider
+                        )
+                        if fee_msat > 0
+                        else None
+                    ),
+                    cost_sats=(fee_sats if fee_msat > 0 else None),
+                    cost_msat=(fee_msat if fee_msat > 0 else None),
+                    cost_amount_sats=(
+                        settled_amount_sats if fee_msat > 0 else 0
+                    ),
+                    cost_timestamp=(int(time.time()) if fee_msat > 0 else None),
                 )
-            self.database.mark_budget_spent(reservation_id, fee_sats)
+            else:
+                # Legacy Database fallback: the original independent writes.
+                self.database.update_rebalance_result(
+                    rebalance_id,
+                    "success",
+                    actual_fee_sats=fee_sats,
+                    actual_fee_msat=fee_msat,
+                    amount_sats=(
+                        settled_amount_sats if settled_amount_sats > 0
+                        else None
+                    ),
+                )
+                if fee_msat > 0:
+                    self.database.record_rebalance_cost(
+                        channel_id=dest_channel,
+                        peer_id=self._peer_id_for_channel(
+                            dest_channel, scid_peer_map_provider
+                        ),
+                        cost_sats=fee_sats,
+                        cost_msat=fee_msat,
+                        amount_sats=settled_amount_sats,
+                        timestamp=int(time.time()),
+                    )
+                self.database.mark_budget_spent(reservation_id, fee_sats)
             self._record_pair_success(
                 str(row.get("from_channel") or ""), dest_channel
             )
@@ -3710,6 +4079,10 @@ class RebalanceEngine:
                 executor,
                 reserve_budget=True,
                 account_costs=True,
+                # Audit wave2 FIX 2: the worker records its own pair-level
+                # outcome so bookkeeping survives orphaning at the 120s
+                # as_completed ceiling below.
+                record_pair_outcome=True,
             )
             futures[future] = pair
 
@@ -3722,31 +4095,19 @@ class RebalanceEngine:
                 completed_futures.add(future)
                 if exec_result is not None:
                     result.executions.append(exec_result)
-                    if exec_result.success:
-                        self._record_pair_success(
-                            pair.source_channel_id, pair.dest_channel_id
-                        )
-                        self._clear_persisted_pair_failure(pair)
-                    elif self._is_budget_block(exec_result):
-                        # No route was attempted — a depleted unified budget
-                        # says nothing about this pair's routability, so do
-                        # not charge futility strikes or persisted cooldowns.
-                        pass
-                    else:
-                        self._record_pair_failure(
-                            pair.source_channel_id, pair.dest_channel_id
-                        )
-                        self._persist_pair_failure(pair, exec_result)
-                else:
-                    # _execute_pair returned None (no route stored on the pair) — count as failure
-                    self._record_pair_failure(
-                        pair.source_channel_id, pair.dest_channel_id
-                    )
+                    # Idempotent backstop: the worker already recorded this
+                    # result's pair outcome (record_pair_outcome=True) and
+                    # marked it, making this a no-op. It still covers
+                    # stubbed execution paths that bypass the worker-side
+                    # recording.
+                    self._record_pair_outcome(pair, exec_result)
+                # exec_result None: the worker's own completion path already
+                # counted the failure (a None result carries no idempotency
+                # marker, so recording it here again would double-strike).
             except Exception as e:
                 completed_futures.add(future)
-                self._record_pair_failure(
-                    pair.source_channel_id, pair.dest_channel_id
-                )
+                # The worker's finally recorded the failure even though it
+                # raised; do not double-record here.
                 self._log(
                     f"Execution thread failed for "
                     f"{pair.source_channel_id}->{pair.dest_channel_id}: {e}",

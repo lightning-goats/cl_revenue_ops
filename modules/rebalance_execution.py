@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 @dataclass
@@ -23,27 +23,3 @@ class ExecutionResult:
     excluded_channels: List[str] = field(default_factory=list)
     failure_data: Dict[str, object] = field(default_factory=dict)
     payment_pending: bool = False
-
-
-def stable_failure_reason(error: Optional[str]) -> str:
-    """Map executor-local errors to stable coordination reasons."""
-    normalized = str(error or "").strip().lower()
-    if not normalized:
-        return "local_execution_failed"
-    if (
-        normalized == "route_over_budget"
-        or normalized.startswith("route_over_budget:")
-        or normalized.startswith("native_route_over_budget:")
-    ):
-        return "route_segment_exhausted"
-    if normalized.startswith("native_route_invalid:"):
-        return "local_policy_block"
-    if "temporary_channel_failure" in normalized or "fee_insufficient" in normalized:
-        return "shared_conflict_changed"
-    if "incorrect_cltv_expiry" in normalized:
-        return "shared_conflict_changed"
-    if "timeout" in normalized or normalized == "payment_pending_timeout":
-        return "executor_timeout"
-    if normalized.startswith("retriable_failure:"):
-        return "local_execution_failed"
-    return "local_execution_failed"

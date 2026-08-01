@@ -428,9 +428,10 @@ def test_engine_execute_candidate_reuses_caller_rebalance_row(
 
     assert result.success is True
     mock_database.record_rebalance.assert_not_called()
-    assert mock_database.update_rebalance_result.call_count >= 1
-    for call in mock_database.update_rebalance_result.call_args_list:
-        assert call.args[0] == 55
+    # Audit wave2 FIX 1: the success settles through the atomic path,
+    # against the CALLER's row id (no second history row).
+    assert mock_database.settle_rebalance_success.call_count == 1
+    assert mock_database.settle_rebalance_success.call_args.args[0] == 55
 
 
 def test_manual_rebalance_records_exactly_one_history_row(

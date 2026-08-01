@@ -1,6 +1,15 @@
-"""Tests for shared rebalance execution contracts."""
+"""Tests for shared rebalance execution contracts.
 
-from modules.rebalance_execution import ExecutionResult, stable_failure_reason
+Audit wave2 FIX 5(c): the module-level ``stable_failure_reason`` in
+rebalance_execution.py was verified-dead code (zero callers — shadowed by
+the native executor's own staticmethod copy) and was removed. The mapping
+tests now target the LIVE copy on NativeRouteExecutor.
+"""
+
+from modules.rebalance_execution import ExecutionResult
+from modules.rebalance_native_executor_v2 import NativeRouteExecutor
+
+stable_failure_reason = NativeRouteExecutor.stable_failure_reason
 
 
 def test_execution_result_defaults_to_native_route_type():
@@ -33,8 +42,16 @@ def test_temporary_channel_failure_maps_to_shared_conflict_changed():
     )
 
 
-def test_incorrect_cltv_expiry_maps_to_shared_conflict_changed():
+def test_incorrect_cltv_expiry_maps_to_local_execution_failed():
+    # The live executor mapping (unlike the removed dead copy) has no CLTV
+    # branch: it falls through to the conservative default.
     assert (
         stable_failure_reason("native_sendpay_error: WIRE_INCORRECT_CLTV_EXPIRY")
-        == "shared_conflict_changed"
+        == "local_execution_failed"
     )
+
+
+def test_dead_module_level_copy_removed():
+    import modules.rebalance_execution as mod
+
+    assert not hasattr(mod, "stable_failure_reason")
