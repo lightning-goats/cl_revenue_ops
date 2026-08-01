@@ -120,6 +120,7 @@ with a freshness gate rather than per-cycle injection:
 | `_check_participants`:349 | `rpc.getinfo` live | IMPROPER (node identity — trivially snapshot-able) |
 | `_check_existing_channel`:431 | `rpc.listpeerchannels` live | IMPROPER — channel-existence check from snapshot channel set |
 | `_execute_swap_open`:1489, `_derive_outbound_for_import`:1127, watcher/reconcile paths | live reads during execution/obligation tracking | execution — allowed |
+| `_activate` fallback ends_at (audit 2026-08-01 wave2 FIX 5) | `time.time()` when LN+ supplies no parseable `ends` (derives a local contract-end estimate so the row cannot wedge at `active`) | execution/obligation tracking — allowed (wall_clock pin 12→13) |
 
 ## Migration work list (feeds PRs 3a–3e)
 

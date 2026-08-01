@@ -83,7 +83,11 @@ PINNED_COUNTS = {
     # per-swap read kept only as the fail-open fallback.
     ("lnplus", "live_rpc"): 13,
     ("lnplus", "database"): 0,
-    ("lnplus", "wall_clock"): 12,
+    # 12→13 (audit 2026-08-01 wave2 FIX 5): _activate's fallback ends_at
+    # derivation reads time.time() when LN+ supplies no parseable 'ends' —
+    # watcher/obligation-tracking class (execution — allowed), classified in
+    # docs/refactor/phase0/snapshot-dependency-audit.md.
+    ("lnplus", "wall_clock"): 13,
     ("admission", "analyzer_cache"): 0,
     ("admission", "live_rpc"): 0,
     ("admission", "database"): 0,

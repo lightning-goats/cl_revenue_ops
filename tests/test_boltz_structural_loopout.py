@@ -231,10 +231,30 @@ def _make_prof_mock():
     return prof
 
 
+def _publish_drain_demand(mod, scids):
+    """Wire a mock rebalance engine that reports `scids` as the circular
+    rebalancer's unplaceable drain residual. The structural credit contract
+    (README): ONLY drain_demand members may earn the Boltz structural
+    credit, so the harness publishes the test channels by default."""
+    mod.rebalancer = MagicMock()
+    demand = MagicMock()
+    entries = []
+    for scid in scids:
+        entry = MagicMock()
+        entry.channel_id = scid
+        entries.append(entry)
+    demand.entries = entries
+    mod.rebalancer.rebalance_engine_v2.get_drain_demand.return_value = demand
+    return demand
+
+
 def _structural_module(scarcity, realized_ppm=500, structural_budget=1000):
     mod = _make_planner_module()
     from modules.config import Config
     mod.config = Config(boltz_structural_budget_sats_per_day=structural_budget)
+    # Drain-demand contract: the structural credit is only available to
+    # channels the circular rebalancer could not drain internally.
+    _publish_drain_demand(mod, ["100x1x0", "101x1x0"])
     mod._node_receivable_status = lambda: {
         "receivable_ratio": 0.05, "scarcity": scarcity,
         "total_capacity_sats": 10_000_000, "total_receivable_sats": 500_000,
@@ -693,6 +713,130 @@ def test_candidate_passing_without_credit_not_structural():
     assert econ["passes_profit_guard"] is True
     assert econ["structural_uplift_sats"] > 0
     assert econ["structural"] is False
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-08-01 wave2 FIX 1: the drain-demand contract on the structural
+# credit. README: "only the residual it [the circular rebalancer] cannot
+# place (drain_demand) may earn the Boltz structural credit". Membership in
+# the engine-published residual is a hard eligibility gate, not a sort bonus.
+# ---------------------------------------------------------------------------
+
+
+def test_structural_credit_requires_drain_demand_membership():
+    """A starved node's loop-out candidate that is NOT in the drain_demand
+    residual earns NO structural credit — it competes on ordinary profit
+    math only (here: zero historical contribution, so it fails the guard)."""
+    mod = _structural_module(scarcity=1.0)
+    _publish_drain_demand(mod, ["999x9x0"])  # some other channel
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    recs = plan["recommendations"]
+    assert len(recs) == 1
+    econ = recs[0]["economics"]
+    assert econ["structural_uplift_sats"] == 0
+    assert econ["structural"] is False
+    assert econ["structural_credit_eligible"] is False
+    assert econ["passes_profit_guard"] is False
+
+
+def test_structural_credit_zero_when_drain_demand_unavailable():
+    """No rebalance engine (or no cycle yet): the drain residual is unknown,
+    so NO structural credit may be granted this cycle — conservative."""
+    mod = _structural_module(scarcity=1.0)
+    mod.rebalancer = None
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    econ = plan["recommendations"][0]["economics"]
+    assert econ["structural_uplift_sats"] == 0
+    assert econ["structural"] is False
+    assert econ["structural_credit_eligible"] is False
+    assert plan["structural_credit"]["drain_demand_available"] is False
+
+
+def test_structural_credit_zero_when_engine_reports_none():
+    """Engine present but get_drain_demand() returns None (stale/no plan):
+    same conservative outcome as no engine at all."""
+    mod = _structural_module(scarcity=1.0)
+    mod.rebalancer.rebalance_engine_v2.get_drain_demand.return_value = None
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    econ = plan["recommendations"][0]["economics"]
+    assert econ["structural_uplift_sats"] == 0
+    assert econ["structural"] is False
+    assert plan["structural_credit"]["drain_demand_available"] is False
+
+
+def test_structural_credit_zero_when_drain_demand_fetch_errors():
+    """get_drain_demand raising must not crash the plan build AND must not
+    leak any structural credit (fail conservative, not fail open)."""
+    mod = _structural_module(scarcity=1.0)
+    mod.rebalancer.rebalance_engine_v2.get_drain_demand.side_effect = (
+        RuntimeError("engine exploded")
+    )
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    econ = plan["recommendations"][0]["economics"]
+    assert econ["structural_uplift_sats"] == 0
+    assert econ["structural"] is False
+    assert plan["structural_credit"]["drain_demand_available"] is False
+
+
+def test_structural_credit_zero_when_residual_empty():
+    """Engine reports an EMPTY residual (the circular rebalancer can place
+    everything internally): no channel earns the credit — the whole point
+    of the contract is to prevent the double-drain."""
+    mod = _structural_module(scarcity=1.0)
+    _publish_drain_demand(mod, [])
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    econ = plan["recommendations"][0]["economics"]
+    assert econ["structural_uplift_sats"] == 0
+    assert econ["structural"] is False
+    assert econ["structural_credit_eligible"] is False
+    # The residual WAS available — it just has no members.
+    assert plan["structural_credit"]["drain_demand_available"] is True
+
+
+def test_drain_demand_member_earns_credit_and_is_flagged_eligible():
+    """The reporting flag: a member candidate is marked credit-eligible and
+    the plan-level surface reports residual availability, so operators can
+    see credit-eligible vs not."""
+    mod = _structural_module(scarcity=1.0)
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    econ = plan["recommendations"][0]["economics"]
+    assert econ["structural_uplift_sats"] == 2500
+    assert econ["structural"] is True
+    assert econ["structural_credit_eligible"] is True
+    assert plan["structural_credit"]["drain_demand_available"] is True
+    assert plan["structural_credit"]["drain_demand_scid_count"] == 2
+
+
+def test_drain_demand_membership_normalizes_colon_scids():
+    """A colon-form engine channel_id (100:1:0) must match the x-form
+    candidate scid for credit eligibility, like the sort bonus already does."""
+    mod = _structural_module(scarcity=1.0)
+    _publish_drain_demand(mod, ["100:1:0"])
+
+    plan = mod._build_boltz_balance_plan(require_profitable=True)
+
+    assert "error" not in plan
+    econ = plan["recommendations"][0]["economics"]
+    assert econ["structural_uplift_sats"] == 2500
+    assert econ["structural_credit_eligible"] is True
 
 
 # ---------------------------------------------------------------------------

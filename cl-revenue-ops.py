@@ -2295,7 +2295,23 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False,
             # envelope still gets a turn. Blocked cycles (pending swaps)
             # would block the balance cycle too, so don't bother.
             _treasury_status = str(result.get('status') or '') if isinstance(result, dict) else ''
-            _treasury_executed = int(result.get('executed_count', 0) or 0) if isinstance(result, dict) else 0
+            # Audit 2026-08-01 wave2 FIX 2 (F1 leg): rejected/errored swaps
+            # stay listed in `executed` (with their status) but nothing
+            # actually ran, so they must NOT suppress the balance-cycle
+            # fallback for the whole interval. Count only entries that may
+            # have moved funds (accepted / would_execute / unknown — an
+            # unknown outcome may be in flight, so it conservatively still
+            # suppresses a second swap). Fall back to executed_count when
+            # the list is absent (older/mocked result shapes).
+            _treasury_exec_list = result.get('executed') if isinstance(result, dict) else None
+            if isinstance(_treasury_exec_list, list):
+                _treasury_executed = sum(
+                    1 for e in _treasury_exec_list
+                    if isinstance(e, dict)
+                    and str(e.get('status') or '') not in ('rejected', 'error')
+                )
+            else:
+                _treasury_executed = int(result.get('executed_count', 0) or 0) if isinstance(result, dict) else 0
             if _treasury_status == 'executed' and _treasury_executed == 0:
                 # Reuse the selection-time balance plan when one exists;
                 # otherwise build it once (and only once) for the fall-through.
@@ -7925,10 +7941,20 @@ def revenue_spend_settle(
     """Mark a reservation spent and optionally record a generic spend event."""
     if database is None:
         return {"error": "Database not initialized"}
+    # Audit 2026-08-01 wave2 FIX 4: validate at the RPC boundary — a negative
+    # actual_spent_sats would record a negative spend event and silently
+    # inflate the remaining daily budget for every autonomous spender.
+    if actual_spent_sats is not None:
+        try:
+            actual_spent_sats = int(actual_spent_sats)
+        except (ValueError, TypeError):
+            return {"error": f"invalid actual_spent_sats: {actual_spent_sats!r} (must be a non-negative integer)"}
+        if actual_spent_sats < 0:
+            return {"error": f"invalid actual_spent_sats: {actual_spent_sats} (must be >= 0)"}
     try:
         ok = database.mark_spend_reservation_spent(
             reservation_id=str(reservation_id),
-            actual_spent_sats=(None if actual_spent_sats is None else int(actual_spent_sats)),
+            actual_spent_sats=actual_spent_sats,
             source=source,
             record_event=bool(record_event),
         )
@@ -9066,16 +9092,27 @@ def _build_boltz_balance_plan(
     # Snapshot from the last rebalance cycle: a channel drained since then
     # simply won't pass the loop-out trigger below (live balances re-read),
     # so staleness is self-correcting.
+    # Audit 2026-08-01 wave2 FIX 1: drain_demand membership is the HARD
+    # eligibility gate for the structural credit (README contract: only the
+    # residual the circular rebalancer cannot place may earn it — the engine
+    # nets pairable sources out of drain_demand precisely to prevent a
+    # double-drain). drain_demand_available distinguishes "engine published
+    # an (possibly empty) residual" from "residual unknown" (no engine, no
+    # cycle yet, or fetch error) — when unknown, NO structural credit may be
+    # granted this plan build (conservative).
     drain_demand_scids: set = set()
+    drain_demand_available = False
     try:
         engine = getattr(rebalancer, "rebalance_engine_v2", None) if rebalancer else None
         demand = engine.get_drain_demand() if engine is not None and hasattr(engine, "get_drain_demand") else None
         if demand is not None:
+            drain_demand_available = True
             drain_demand_scids = {
                 str(e.channel_id).replace(":", "x") for e in demand.entries
             }
     except Exception:
         drain_demand_scids = set()
+        drain_demand_available = False
 
     # Route-pair awareness: protect inbound legs of top revenue routes from loop-out drain
     route_pair_in_channels = set()
@@ -9518,8 +9555,16 @@ def _build_boltz_balance_plan(
         # rebalancer must never use it: rebalancing conserves the aggregate
         # ratio, so inbound scarcity is not actionable there.
         structural_uplift_sats = 0
+        # FIX 1 (drain-demand contract): only a channel in the engine's
+        # current drain_demand residual may earn the structural credit.
+        # Membership implies the residual was available this build; when the
+        # residual is unknown the set is empty and nobody is eligible.
+        # Non-members keep competing on ordinary profit math.
+        structural_credit_eligible = (
+            direction == "loop_out" and scid_display in drain_demand_scids
+        )
         if (
-            direction == "loop_out"
+            structural_credit_eligible
             and structural_budget_sats > 0
             and structural_scarcity > 0.0
             and structural_realized_ppm > 0
@@ -9622,6 +9667,11 @@ def _build_boltz_balance_plan(
                 "profit_margin_factor": effective_profit_margin,
                 "passes_profit_guard": bool(passes_profit_guard),
                 "structural_uplift_sats": structural_uplift_sats,
+                # FIX 1 reporting: True only when this candidate was allowed
+                # to earn the credit at all (loop-out AND in the engine's
+                # drain_demand residual) — lets operators see credit-eligible
+                # vs not, independent of whether the credit moved the guard.
+                "structural_credit_eligible": bool(structural_credit_eligible),
                 # True only when the pass actually DEPENDED on the credit:
                 # with require_profitable=False every candidate passes anyway,
                 # so nothing is structural (the envelope must not be charged).
@@ -9702,6 +9752,11 @@ def _build_boltz_balance_plan(
             "scarcity": round(structural_scarcity, 4),
             "realized_ppm": int(structural_realized_ppm),
             "source": structural_credit_source,
+            # FIX 1: whether the engine published a drain residual this
+            # build (False = unknown => no candidate was credit-eligible)
+            # and how many channels it contains.
+            "drain_demand_available": bool(drain_demand_available),
+            "drain_demand_scid_count": len(drain_demand_scids),
         },
         "planner_coordination": {
             "loser_scids_excluded": len(planner_loser_scids),
@@ -10465,7 +10520,13 @@ def _execute_boltz_expansion_treasury_cycle(
     recs = list(plan.get('recommendations', []))
     budget = plan.get('budget', {}) if isinstance(plan.get('budget'), dict) else {}
     remaining_budget = int(budget.get('remaining_24h_sats_estimate', 0) or 0)
-    cooldown_seconds = max(0, int(float(cooldown_hours) * 3600))
+    # P1-012 class (audit 2026-08-01 wave2 FIX 3): coerce operator-supplied
+    # cooldown_hours; a non-numeric must not raise out of the treasury-cycle
+    # RPC. Mirrors the balance-cycle twin: fall back to the 4h default.
+    try:
+        cooldown_seconds = max(0, int(float(cooldown_hours) * 3600))
+    except (ValueError, TypeError):
+        cooldown_seconds = 4 * 3600
     target_deficit_remaining = int(((plan.get('treasury') or {}).get('deficit_sats', 0) if isinstance(plan.get('treasury'), dict) else 0) or 0)
     max_exec = max(1, int(max_actions if max_actions is not None else (getattr(cfg, 'expansion_treasury_max_actions', 1) if cfg else 1)))
 
@@ -10537,12 +10598,16 @@ def _execute_boltz_expansion_treasury_cycle(
                 # C1: Pre-claim already set; just update budget
                 remaining_budget = max(0, remaining_budget - est_fee)
                 target_deficit_remaining = max(0, target_deficit_remaining - est_receive)
-            elif status == 'rejected':
-                # C1: Rejected - restore original cooldown timestamp
+            elif status in ('rejected', 'error'):
+                # Audit 2026-08-01 wave2 FIX 2 — mirror the balance cycle:
+                # "error" is a swap boltzcli reported as failed inside an
+                # exit-0 payload (BoltzManager._is_error_swap). Like
+                # "rejected", it moved no funds, so it must not consume
+                # budget/deficit or hold the pre-claimed C1 cooldown slot.
                 with _boltz_balance_lock:
                     if _boltz_balance_last_action.get(ch_id) == now:
                         _boltz_balance_last_action[ch_id] = last_ts
-                skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'execution_rejected', 'result': res})
+                skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': f'execution_{status}', 'result': res})
         except Exception as e:
             # C1: Exception - restore original cooldown timestamp
             with _boltz_balance_lock:

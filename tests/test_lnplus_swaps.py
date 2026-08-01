@@ -1133,6 +1133,106 @@ class TestSwapLifecycle:
         policy.add_tag.assert_not_called()
         assert row["tag_added"] == 0
 
+    def test_activation_with_unparseable_ends_derives_fallback(self):
+        """Audit 2026-08-01 wave2 FIX 5: an unparseable 'ends' must not leave
+        the row active with ends_at NULL forever (phase 5 only finalizes rows
+        with truthy ends_at => permanent no_close on both peers). Activation
+        derives a local estimate from the contract duration instead."""
+        peer = PK_A
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "s1", "incoming_peer_pubkey": PK_B, "ends": "not-a-date",
+             "duration_months": 3}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", status="opened")
+        before = int(time.time())
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "active"
+        assert row["ends_at"] is not None
+        # 3 months approximated at 30 days each.
+        assert abs(row["ends_at"] - (before + 3 * 30 * 86400)) < 120
+        warned = [c for c in lc._plugin.log.call_args_list
+                  if c.kwargs.get("level") == "warn" and "ends" in str(c.args[0])]
+        assert warned, "activation must warn about the derived ends_at"
+
+    def test_activation_with_missing_ends_uses_row_duration(self):
+        """No 'ends' at all on the completed entry: fall back to the row's
+        duration_months recorded at apply time."""
+        peer = PK_A
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "s1", "incoming_peer_pubkey": PK_B}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=6, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", status="opened")
+        before = int(time.time())
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "active"
+        assert row["ends_at"] is not None
+        assert abs(row["ends_at"] - (before + 6 * 30 * 86400)) < 120
+
+    def test_activation_fallback_row_still_finalizable(self):
+        """The derived ends_at must actually unwedge the contract: once the
+        clock passes it, phase 5 finalizes the row (no permanent 'active')."""
+        peer = PK_A
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "s1", "incoming_peer_pubkey": PK_B, "ends": "garbage",
+             "duration_months": 3}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", status="opened")
+        lc.run_watcher_once()
+        assert db.lnplus_get_swap("s1")["status"] == "active"
+        # Simulate the derived end passing.
+        db.lnplus_update_swap("s1", ends_at=int(time.time()) - 60)
+        rpc.listpeerchannels.return_value = {"channels": [
+            {"peer_id": PK_B, "state": "CHANNELD_NORMAL"}]}
+        lc.run_watcher_once()
+        assert db.lnplus_get_swap("s1")["status"] == "ended"
+
+    def test_activation_invalid_incoming_pubkey_stored_null(self):
+        """I3: LN+ is untrusted — an invalid incoming_peer_pubkey must not be
+        written to the row (it later feeds no_close protection lookups)."""
+        peer = PK_A
+        ends = "2026-10-05T00:00:00Z"
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "s1", "incoming_peer_pubkey": "junk-not-a-pubkey",
+             "ends": ends}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", status="opened")
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "active"
+        assert row["incoming_peer"] is None
+        tagged = {c.args[0] for c in policy.add_tag.call_args_list}
+        assert "junk-not-a-pubkey" not in tagged
+        warned = [c for c in lc._plugin.log.call_args_list
+                  if c.kwargs.get("level") == "warn"
+                  and "incoming_peer_pubkey" in str(c.args[0])]
+        assert warned, "activation must warn about the discarded pubkey"
+
+    def test_activation_valid_incoming_pubkey_still_stored(self):
+        """Guard: a VALID incoming pubkey keeps being stored and protected."""
+        peer = PK_A
+        ends = "2026-10-05T00:00:00Z"
+        my = {"pending": [], "opening": [], "completed": [
+            {"id": "s1", "incoming_peer_pubkey": PK_B, "ends": ends}]}
+        lc, db, rpc, client, policy, _ = _make_lifecycle(my_swaps=my, local_rows=[
+            dict(swap_id="s1", status="applied", capacity_sats=2_000_000,
+                 duration_months=3, outbound_peer=peer)])
+        db.lnplus_update_swap("s1", status="opened")
+        lc.run_watcher_once()
+        row = db.lnplus_get_swap("s1")
+        assert row["incoming_peer"] == PK_B
+        tagged = {c.args[0] for c in policy.add_tag.call_args_list}
+        assert PK_B in tagged
+
     def test_pre_existing_operator_tag_survives_contract_end(self):
         """C-3: since this row never added the tag (tag_added=0), _finalize
         must not remove it — an operator-set (or otherwise foreign) tag on

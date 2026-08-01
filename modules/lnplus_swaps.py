@@ -1937,16 +1937,57 @@ class SwapLifecycle:
     def _activate(self, row: Dict, entry: Dict) -> None:
         sid = row["swap_id"]
         ends_ts = _parse_ts(entry.get("ends"))
-        incoming = entry.get("incoming_peer_pubkey") or row.get("incoming_peer")
+        if not ends_ts:
+            # Audit 2026-08-01 wave2 FIX 5 (contract wedge): phase 5 only
+            # finalizes rows with a truthy ends_at — activating without one
+            # left the row 'active' forever with both peers permanently
+            # no_close-protected. Derive a local estimate from the contract
+            # duration (months approximated at 30 days), preferring any
+            # ends_at already on the row.
+            existing = row.get("ends_at")
+            if existing:
+                ends_ts = int(existing)
+                self._plugin.log(
+                    f"LNPLUS: swap {sid} — LN+ supplied no parseable 'ends' "
+                    f"({entry.get('ends')!r}); keeping existing ends_at "
+                    f"{ends_ts}", level="warn")
+            else:
+                duration = 0
+                try:
+                    duration = int(entry.get("duration_months")
+                                   or row.get("duration_months") or 0)
+                except (ValueError, TypeError):
+                    duration = 0
+                if duration <= 0:
+                    # Duration unknown too (should not happen: it is recorded
+                    # at apply time). One month keeps the contract protected
+                    # for a while but guarantees a finite end.
+                    duration = 1
+                ends_ts = int(time.time()) + duration * 30 * 86400
+                self._plugin.log(
+                    f"LNPLUS: swap {sid} — LN+ supplied no parseable 'ends' "
+                    f"({entry.get('ends')!r}); local estimate from contract "
+                    f"duration ({duration}mo ~ 30d/mo) in force: ends_at "
+                    f"{ends_ts}", level="warn")
+
+        # I3: LN+ is an untrusted API — never write an unvalidated pubkey
+        # into the row (it later feeds no_close protection lookups), same
+        # rule as the phase-2 outgoing_peer_pubkey and backfill paths.
+        incoming = entry.get("incoming_peer_pubkey")
+        if incoming is not None and not _valid_pubkey(incoming):
+            self._plugin.log(
+                f"LNPLUS: swap {sid} — LN+ returned an invalid "
+                f"incoming_peer_pubkey ({incoming!r}); storing NULL",
+                level="warn")
+            incoming = None
+        if not incoming:
+            incoming = row.get("incoming_peer")
 
         # Intent: persist the authoritative contract terms first.
-        pre_fields = {}
-        if ends_ts:
-            pre_fields["ends_at"] = ends_ts
+        pre_fields = {"ends_at": ends_ts}
         if incoming:
             pre_fields["incoming_peer"] = incoming
-        if pre_fields:
-            self._db.lnplus_update_swap(sid, **pre_fields)
+        self._db.lnplus_update_swap(sid, **pre_fields)
 
         outbound_peer = row.get("outbound_peer")
         if outbound_peer:
