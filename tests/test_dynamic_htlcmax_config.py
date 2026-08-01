@@ -33,9 +33,11 @@ def _snapshot():
 
 class TestDynamicHtlcmaxConfig:
 
-    def test_disabled_by_default(self):
+    def test_enabled_by_default(self):
+        # Phase B (2026-08 surface reduction): prod-proven bounded valve,
+        # default flipped ON.
         snap = _snapshot()
-        assert snap.enable_dynamic_htlcmax is False
+        assert snap.enable_dynamic_htlcmax is True
 
     def test_pct_fields_exist_with_sane_defaults(self):
         snap = _snapshot()

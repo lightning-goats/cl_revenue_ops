@@ -1,7 +1,7 @@
 # Public compatibility catalog (baseline 5e8f747)
 
 What the refactor MUST keep working (refactor invariants 2 and 3).
-Pin test: `tests/test_rpc_surface_inventory.py` (69 methods; 64 at baseline + econ-shadow diagnostics `revenue-econ-snapshot`, `revenue-econ-reconcile`, `revenue-econ-cycle` + risk-profile diagnostic `revenue-profile-preview` (PR 8, read-only) + Python fee-authority diagnostic `revenue-fee-authority-status`).
+Pin test: `tests/test_rpc_surface_inventory.py` (73 methods; 64 at baseline + econ-shadow diagnostics `revenue-econ-snapshot`, `revenue-econ-reconcile`, `revenue-econ-cycle` + risk-profile diagnostic `revenue-profile-preview` (PR 8, read-only) + Python fee-authority diagnostic `revenue-fee-authority-status` + the 4 Phase C dispatchers added 2026-08-01 (`revenue-boltz`, `revenue-cycle`, `revenue-planner`, `revenue-budget`) — the merged old names remain registered as deprecated aliases until 2026-09-05 per `docs/audits/OPERATOR_SURFACE_REDUCTION_2026-08-01.md`).
 
 ## RPC surface
 
@@ -19,7 +19,15 @@ Classification per method: `docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md`
 (header refreshed 2026-07-09; body dated 2026-05-20 — refresh during
 Workstream I).
 
-Full 69-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
+Full 73-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
+
+Phase C (2026-08-01, operator-surface reduction): `revenue-boltz <verb>`,
+`revenue-cycle <subsystem>`, `revenue-planner <view>`, `revenue-budget
+[section]`, and the `revenue-policy ban|unban|list-banned` actions are the
+primary operator names. Every merged old name keeps working as a thin
+forwarding alias whose dict response carries an additive `deprecation`
+field; the alias window ends 2026-09-05 (announcement:
+`docs/refactor/phase0/contract-compatibility-policy.md`, 2026-08-01).
 
 ## Config surface
 
@@ -151,22 +159,22 @@ dataclass is normative).
 | `drain_fee_discount_max` | `0.0` | yes |
 | `node_drain_bias_enabled` | `False` | yes |
 | `node_drain_bias_max` | `0.3` | yes |
-| `enable_dynamic_htlcmax` | `False` | yes |
+| `enable_dynamic_htlcmax` | `True` | yes |
 | `htlcmax_source_pct` | `0.5` | yes |
 | `htlcmax_sink_pct` | `0.25` | yes |
 | `htlcmax_balanced_pct` | `0.45` | yes |
-| `econ_shadow_enabled` | `False` | yes |
-| `econ_governor_rebalance_enabled` | `False` | yes |
-| `econ_governor_planner_enabled` | `False` | yes |
-| `econ_governor_lnplus_enabled` | `False` | yes |
-| `econ_governor_boltz_enabled` | `False` | yes |
-| `econ_governor_fees_enabled` | `False` | yes |
-| `econ_arbiter_enabled` | `False` | yes |
-| `econ_cycle_rebalance_enabled` | `False` | yes |
-| `econ_cycle_planner_enabled` | `False` | yes |
-| `econ_cycle_boltz_enabled` | `False` | yes |
-| `econ_ev_populated` | `False` | yes |
-| `econ_conflict_rules_extended` | `False` | yes |
+| `econ_shadow_enabled` | `True` | yes |
+| `econ_governor_rebalance_enabled` | `True` | yes |
+| `econ_governor_planner_enabled` | `True` | yes |
+| `econ_governor_lnplus_enabled` | `True` | yes |
+| `econ_governor_boltz_enabled` | `True` | yes |
+| `econ_governor_fees_enabled` | `True` | yes |
+| `econ_arbiter_enabled` | `True` | yes |
+| `econ_cycle_rebalance_enabled` | `True` | yes |
+| `econ_cycle_planner_enabled` | `True` | yes |
+| `econ_cycle_boltz_enabled` | `True` | yes |
+| `econ_ev_populated` | `True` | yes |
+| `econ_conflict_rules_extended` | `True` | yes |
 | `authority_level` | `'capital'` | yes |
 | `risk_profile` | `'custom'` | yes |
 | `expansion_treasury_enabled` | `False` |  |
@@ -179,7 +187,7 @@ dataclass is normative).
 | `flow_window_days` | `7` |  |
 | `source_threshold` | `0.05` |  |
 | `sink_threshold` | `-0.05` |  |
-| `min_fee_ppm` | `10` | yes |
+| `min_fee_ppm` | `50` | yes |
 | `min_fee_ppm_saturated` | `0` | yes |
 | `max_fee_ppm` | `2000` | yes |
 | `base_fee_msat` | `0` |  |
@@ -248,7 +256,7 @@ dataclass is normative).
 | `planner_close_fee_reserve_multiplier` | `2.0` |  |
 | `planner_close_fee_cap_sats` | `0` |  |
 | `planner_close_feerange_enabled` | `False` |  |
-| `planner_min_channel_sats` | `500000` |  |
+| `planner_min_channel_sats` | `1000000` |  |
 | `planner_max_channel_sats` | `10000000` |  |
 | `planner_max_fee_rate_sat_vb` | `50.0` |  |
 | `planner_min_annual_roi_pct` | `1.0` | yes |

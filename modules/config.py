@@ -348,6 +348,38 @@ SHADOWED_SETTING_GATES: Dict[str, tuple] = {
         'expansion_treasury_min_source_local_pct',
         'expansion_treasury_exclude_protected',
     ),
+    # Phase B (2026-08-01 surface reduction, section 5.4): the structural
+    # loop-out envelope only spends inside the Boltz auto-cycle's balance
+    # cycle — the exact shadow found in production.
+    'boltz_auto_cycle_enabled': (
+        'boltz_structural_budget_sats_per_day',
+    ),
+    # capacity_planner.run_cycle bails when planner_enabled is false, so the
+    # per-cycle open/close limits are inert until the planner is on.
+    'planner_enabled': (
+        'planner_max_opens_per_cycle',
+        'planner_max_closes_per_cycle',
+    ),
+}
+
+# Reverse map for set-time shadowed-gate warnings on revenue-config set:
+# gated key -> the boolean gate that must be on for it to have any effect.
+_GATE_FOR_GATED_KEY: Dict[str, str] = {
+    gated_key: gate
+    for gate, gated_keys in SHADOWED_SETTING_GATES.items()
+    for gated_key in gated_keys
+}
+
+# Phase B (2026-08-01 surface reduction): keys that still WORK but are
+# scheduled for removal in the announced Phase C window. Unlike
+# DEPRECATED_RUNTIME_KEYS these are NOT no-ops yet — the warning must not
+# claim otherwise. revenue-config set returns the note; startup warns when
+# an override row exists.
+SOFT_DEPRECATED_RUNTIME_KEYS: Dict[str, str] = {
+    'capex_probability_budget_bonus': (
+        'capex_probability_budget_bonus is deprecated and scheduled for '
+        'removal in the announced surface-reduction window (Phase C); it '
+        'is still enforced until then'),
 }
 
 # Range constraints for numeric fields
@@ -540,39 +572,48 @@ class Config:
     node_drain_bias_enabled: bool = False
     # Max node-scaled drain discount (0.0-0.5); only active when enabled.
     node_drain_bias_max: float = 0.3
-    # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit). Off by
-    # default; when enabled, max HTLC = capacity * pct by flow state
-    # (sinks tightest: throttle drain-through; CLN's only inbound-side
-    # control surface). Bounds in fee_controller keep it >= 10k sats.
-    enable_dynamic_htlcmax: bool = False
+    # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit). Phase B
+    # (2026-08-01 surface reduction): default ON — prod-proven, bounded
+    # valve. Max HTLC = capacity * pct by flow state (sinks tightest:
+    # throttle drain-through; CLN's only inbound-side control surface).
+    # Bounds in fee_controller keep it >= 10k sats. The CLN option
+    # revenue-ops-enable-dynamic-htlcmax feeds this at plugin init and
+    # shares this default.
+    enable_dynamic_htlcmax: bool = True
     htlcmax_source_pct: float = 0.50
     htlcmax_sink_pct: float = 0.25
     htlcmax_balanced_pct: float = 0.45
+    # econ_* rollout flags — Phase B (2026-08-01 surface reduction, section
+    # 2e/3): all 12 default TRUE so fresh nodes run the governed paths that
+    # production actually tests (10 stable-True for months; the two Boltz
+    # flags were False only because Boltz automation was off). The flags are
+    # scheduled for removal (with the legacy branches) after one stable
+    # default-True release (Phase D).
     # Refactor Phase 1 shadow: observe-mode intent recording into
     # econ_ledger.db + revenue-econ-snapshot preview. Read-only wrt node
-    # state; default off (docs/planning/2026-07-12-refactor-phase1-wiring.md).
-    econ_shadow_enabled: bool = False
+    # state (docs/planning/2026-07-12-refactor-phase1-wiring.md).
+    econ_shadow_enabled: bool = True
     # Refactor Phase 2D: governor-gated rebalance reservations (see
     # docs/planning/2026-07-12-refactor-phase2-governed-rebalance.md).
-    econ_governor_rebalance_enabled: bool = False
+    econ_governor_rebalance_enabled: bool = True
     # Refactor Phase 2E: governor-gated planner open/close reservations.
-    econ_governor_planner_enabled: bool = False
+    econ_governor_planner_enabled: bool = True
     # Refactor Phase 2F: governor-gated LN+ swap-open reservations.
-    econ_governor_lnplus_enabled: bool = False
+    econ_governor_lnplus_enabled: bool = True
     # Refactor Phase 2G: governor-gated Boltz swap reservations.
-    econ_governor_boltz_enabled: bool = False
+    econ_governor_boltz_enabled: bool = True
     # Refactor Phase 2H: governor-gated automated fee broadcasts.
-    econ_governor_fees_enabled: bool = False
+    econ_governor_fees_enabled: bool = True
     # Refactor Phase 3F: live governor-boundary arbitration.
-    econ_arbiter_enabled: bool = False
+    econ_arbiter_enabled: bool = True
     # Workstream H: cycle-arbitrated rebalance execution list.
-    econ_cycle_rebalance_enabled: bool = False
+    econ_cycle_rebalance_enabled: bool = True
     # Workstream H: cycle-arbitrated planner close list.
-    econ_cycle_planner_enabled: bool = False
+    econ_cycle_planner_enabled: bool = True
     # Workstream H: cycle-arbitrated Boltz recommendations.
-    econ_cycle_boltz_enabled: bool = False
-    econ_ev_populated: bool = False
-    econ_conflict_rules_extended: bool = False
+    econ_cycle_boltz_enabled: bool = True
+    econ_ev_populated: bool = True
+    econ_conflict_rules_extended: bool = True
     # Phase 4: global authority level (observe|fees|liquidity|capital).
     authority_level: str = "capital"
     risk_profile: str = "custom"
@@ -598,7 +639,11 @@ class Config:
     sink_threshold: float = -0.05    # FlowRatio < -0.05/day = Sink (filling)
     
     # Fee parameters
-    min_fee_ppm: int = 10          # Floor fee in PPM (matches plugin option default)
+    # Phase B (2026-08-01 surface reduction, section 3): 10 -> 50. A 10 PPM
+    # floor invites unprofitable forwards; 50 matches the production
+    # operator value. The CLN option revenue-ops-min-fee-ppm feeds this
+    # at plugin init and shares this default.
+    min_fee_ppm: int = 50          # Floor fee in PPM
     # E-2 (2026-07 econ audit): class-aware min-fee floor. Channels the
     # controller classifies as saturated (outbound_ratio >= 0.85) or source
     # (flow_state == 'source') use min(min_fee_ppm, min_fee_ppm_saturated)
@@ -799,7 +844,11 @@ class Config:
     planner_close_fee_reserve_multiplier: float = 2.0
     planner_close_fee_cap_sats: int = 0
     planner_close_feerange_enabled: bool = False
-    planner_min_channel_sats: int = 500000      # 500k sats
+    # Phase B (2026-08-01 surface reduction): 500k -> 1M. Sub-1M opens
+    # rarely clear chain-cost ROI; production runs 2M. The CLN option
+    # revenue-ops-planner-min-channel-sats feeds this at plugin init and
+    # shares this default.
+    planner_min_channel_sats: int = 1000000     # 1M sats
     planner_max_channel_sats: int = 10000000    # 10M sats
     planner_max_fee_rate_sat_vb: float = 50.0
     planner_min_annual_roi_pct: float = 1.0
@@ -914,8 +963,20 @@ class Config:
         self._override_warnings.clear()
         overrides = database.get_all_config_overrides()
         for key, value in overrides.items():
+            if key.startswith('_'):
+                # Internal marker rows (e.g. _closure_sweep_tripped,
+                # _version_bump, _lnplus_backfill_done) share the override
+                # table but are not config keys.
+                continue
             if hasattr(self, key) and key not in IMMUTABLE_CONFIG_KEYS:
                 self._apply_override(key, value)
+            elif not hasattr(self, key):
+                # Phase B (2026-08-01 surface reduction, section 5.5): a
+                # silently skipped unknown row rots invisibly — the
+                # production lnplus_fleet_pubkeys case dangled for months.
+                self._override_warnings.append(
+                    f"config override '{key}' does not match any known key "
+                    f"— ignored (stale after an upgrade?)")
         self._version = database.get_config_version()
         # PR 7 (Phase D): apply the selected risk profile's derived values
         # to keys WITHOUT explicit overrides (precedence: explicit >
@@ -995,14 +1056,31 @@ class Config:
                 f"({self.lnplus_min_participants}) > lnplus_max_participants "
                 f"({self.lnplus_max_participants}); repaired max to min")
             self.lnplus_max_participants = self.lnplus_min_participants
-        # Warn-only (no repair): a daily budget above the weekly budget is
-        # individually legal but the weekly cap binds first, so the daily
-        # figure can never be spent in a single day.
+        # Phase B (2026-08-01 surface reduction, section 5.1): a crossed
+        # budget pair is repaired UPWARD like the crossed fee rails
+        # (fc4c76b) — the weekly ceiling rises to meet the operator's
+        # stated daily figure. Repairing downward would silently discard
+        # the daily intent; without repair the weekly cap binds first and
+        # the daily figure can never be spent in a single day.
         if self.daily_budget_sats > self.weekly_budget_sats:
             self._override_warnings.append(
                 f"Contradictory settings: daily_budget_sats "
                 f"({self.daily_budget_sats}) > weekly_budget_sats "
-                f"({self.weekly_budget_sats}); the weekly cap binds first")
+                f"({self.weekly_budget_sats}); repaired weekly_budget_sats "
+                f"to {self.daily_budget_sats}")
+            self.weekly_budget_sats = self.daily_budget_sats
+        # Phase B (section 5.2): a crossed planner channel-size band
+        # silently disables ALL automated opens. Repair upward (max rises
+        # to min) for the same reason as the fee rails: the operator's
+        # stated minimum viable size is honored and only the cap widens.
+        if self.planner_min_channel_sats > self.planner_max_channel_sats:
+            self._override_warnings.append(
+                f"Contradictory settings: planner_min_channel_sats "
+                f"({self.planner_min_channel_sats}) > "
+                f"planner_max_channel_sats "
+                f"({self.planner_max_channel_sats}); repaired "
+                f"planner_max_channel_sats to {self.planner_min_channel_sats}")
+            self.planner_max_channel_sats = self.planner_min_channel_sats
         return list(self._override_warnings)
 
     def _detect_shadowed_and_deprecated(self, explicit_keys: set) -> None:
@@ -1015,6 +1093,12 @@ class Config:
                 f"Deprecated option {key} is set — it is a no-op{hint} "
                 f"(scheduled for removal after the announced compatibility "
                 f"window)")
+        # Phase B soft deprecations: still functional (NOT no-ops), but
+        # scheduled for Phase C removal — warn when an override row exists.
+        for key in sorted(explicit_keys & set(SOFT_DEPRECATED_RUNTIME_KEYS)):
+            self._override_warnings.append(
+                f"Deprecated option {key} is set — "
+                f"{SOFT_DEPRECATED_RUNTIME_KEYS[key]}")
         for gate, gated_keys in SHADOWED_SETTING_GATES.items():
             if getattr(self, gate, False):
                 continue
@@ -1157,6 +1241,19 @@ class Config:
                 return {"error": f"receivable_ratio_floor ({typed_value}) cannot exceed receivable_ratio_target ({self.receivable_ratio_target})"}
             if key == 'receivable_ratio_target' and typed_value < self.receivable_ratio_floor:
                 return {"error": f"receivable_ratio_target ({typed_value}) cannot be less than receivable_ratio_floor ({self.receivable_ratio_floor})"}
+            # Phase B (2026-08-01 surface reduction, section 5.1): the budget
+            # pair is rejected at set-time when crossed (the profile preview
+            # already treats it as a contradiction; boot repairs upward).
+            if key == 'daily_budget_sats' and typed_value > self.weekly_budget_sats:
+                return {"error": f"daily_budget_sats ({typed_value}) cannot exceed current weekly_budget_sats ({self.weekly_budget_sats})"}
+            if key == 'weekly_budget_sats' and typed_value < self.daily_budget_sats:
+                return {"error": f"weekly_budget_sats ({typed_value}) cannot be less than current daily_budget_sats ({self.daily_budget_sats})"}
+            # Phase B (section 5.2): a crossed planner channel-size band
+            # silently disables all automated opens — reject it at set-time.
+            if key == 'planner_min_channel_sats' and typed_value > self.planner_max_channel_sats:
+                return {"error": f"planner_min_channel_sats ({typed_value}) cannot exceed current planner_max_channel_sats ({self.planner_max_channel_sats})"}
+            if key == 'planner_max_channel_sats' and typed_value < self.planner_min_channel_sats:
+                return {"error": f"planner_max_channel_sats ({typed_value}) cannot be less than current planner_min_channel_sats ({self.planner_min_channel_sats})"}
 
             old_value = getattr(self, key)
 
@@ -1177,13 +1274,27 @@ class Config:
             setattr(self, key, typed_value)
             self._version = new_version
 
-        return {
-            "status": "success",
-            "key": key,
-            "old_value": old_value,
-            "new_value": typed_value,
-            "version": new_version
-        }
+            result = {
+                "status": "success",
+                "key": key,
+                "old_value": old_value,
+                "new_value": typed_value,
+                "version": new_version
+            }
+            # Phase B (2026-08-01 surface reduction, section 5.4): set-time
+            # shadowed-gate warning — the write succeeded, but the key's
+            # effect is entirely gated behind a flag that is currently off,
+            # so tell the operator NOW instead of at the next restart.
+            gate = _GATE_FOR_GATED_KEY.get(key)
+            if gate is not None and not getattr(self, gate, False):
+                result["warning"] = (
+                    f"{key} is set, but {gate} is currently false — it has "
+                    f"no effect until the gate is enabled")
+            # Phase B soft deprecation note (still enforced; Phase C removes).
+            if key in SOFT_DEPRECATED_RUNTIME_KEYS:
+                result["deprecation"] = SOFT_DEPRECATED_RUNTIME_KEYS[key]
+
+        return result
 
 
 @dataclass(frozen=True)
@@ -1347,7 +1458,7 @@ class ConfigSnapshot:
     planner_close_fee_reserve_multiplier: float = 2.0
     planner_close_fee_cap_sats: int = 0
     planner_close_feerange_enabled: bool = False
-    planner_min_channel_sats: int = 500000
+    planner_min_channel_sats: int = 1000000
     planner_max_channel_sats: int = 10000000
     planner_max_fee_rate_sat_vb: float = 50.0
     planner_min_annual_roi_pct: float = 1.0
@@ -1367,28 +1478,26 @@ class ConfigSnapshot:
     drain_fee_discount_max: float = 0.0
     node_drain_bias_enabled: bool = False
     node_drain_bias_max: float = 0.3
-    # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit). Off by
-    # default; when enabled, max HTLC = capacity * pct by flow state
-    # (sinks tightest: throttle drain-through; CLN's only inbound-side
-    # control surface). Bounds in fee_controller keep it >= 10k sats.
-    enable_dynamic_htlcmax: bool = False
+    # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit). Phase B
+    # (2026-08-01 surface reduction): default ON, mirroring Config.
+    enable_dynamic_htlcmax: bool = True
     htlcmax_source_pct: float = 0.50
     htlcmax_sink_pct: float = 0.25
     htlcmax_balanced_pct: float = 0.45
-    # Refactor Phase 1 shadow flag — mirrored from Config (a key missing
-    # from the snapshot reads as absent in production).
-    econ_shadow_enabled: bool = False
-    econ_governor_rebalance_enabled: bool = False
-    econ_governor_planner_enabled: bool = False
-    econ_governor_lnplus_enabled: bool = False
-    econ_governor_boltz_enabled: bool = False
-    econ_governor_fees_enabled: bool = False
-    econ_arbiter_enabled: bool = False
-    econ_cycle_rebalance_enabled: bool = False
-    econ_cycle_planner_enabled: bool = False
-    econ_cycle_boltz_enabled: bool = False
-    econ_ev_populated: bool = False
-    econ_conflict_rules_extended: bool = False
+    # econ_* rollout flags — mirrored from Config (a key missing from the
+    # snapshot reads as absent in production). Phase B: default TRUE.
+    econ_shadow_enabled: bool = True
+    econ_governor_rebalance_enabled: bool = True
+    econ_governor_planner_enabled: bool = True
+    econ_governor_lnplus_enabled: bool = True
+    econ_governor_boltz_enabled: bool = True
+    econ_governor_fees_enabled: bool = True
+    econ_arbiter_enabled: bool = True
+    econ_cycle_rebalance_enabled: bool = True
+    econ_cycle_planner_enabled: bool = True
+    econ_cycle_boltz_enabled: bool = True
+    econ_ev_populated: bool = True
+    econ_conflict_rules_extended: bool = True
     authority_level: str = "capital"
     risk_profile: str = "custom"
     # E-2: class-aware min-fee floor for saturated/source channels (0 =

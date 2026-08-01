@@ -257,10 +257,12 @@ class TestShadowAuthorizeRebalance:
 
 
 class TestConfigFlag:
-    def test_flag_defaults_off_and_is_runtime_settable(self):
+    def test_flag_defaults_on_and_is_runtime_settable(self):
+        # Phase B (2026-08 surface reduction): econ_* rollout flags default
+        # TRUE — fresh nodes run the governed paths production tests.
         from modules.config import PUBLIC_RUNTIME_KEYS, Config, ConfigSnapshot
         import dataclasses
-        assert Config().econ_shadow_enabled is False
+        assert Config().econ_shadow_enabled is True
         assert "econ_shadow_enabled" in PUBLIC_RUNTIME_KEYS
         # A key missing from the snapshot mirror reads as absent in
         # production — pin the mirror.

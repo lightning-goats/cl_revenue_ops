@@ -50,20 +50,22 @@ class TestContradictoryPairs:
         ("overrides", "expected"),
         [
             # Persisted ceilings below the min_fee_ppm floor of 5: the case
-            # the downward repair breached outright.
-            ({"max_fee_ppm": "1"}, (10, 10)),
-            ({"max_fee_ppm": "4"}, (10, 10)),
+            # the downward repair breached outright. (Default min_fee_ppm
+            # is 50 since the 2026-08 Phase B surface reduction.)
+            ({"max_fee_ppm": "1"}, (50, 50)),
+            ({"max_fee_ppm": "4"}, (50, 50)),
             # Crossed but both individually in band.
-            ({"max_fee_ppm": "9"}, (10, 10)),
+            ({"max_fee_ppm": "9"}, (50, 50)),
+            ({"max_fee_ppm": "10"}, (50, 50)),
             ({"min_fee_ppm": "5", "max_fee_ppm": "1"}, (5, 5)),
             ({"min_fee_ppm": "900", "max_fee_ppm": "100"}, (900, 900)),
             ({"min_fee_ppm": "100000", "max_fee_ppm": "1"}, (100000, 100000)),
             # Range ends and already-ordered pairs must be left alone.
-            ({"max_fee_ppm": "10"}, (10, 10)),
+            ({"max_fee_ppm": "50"}, (50, 50)),
             ({"min_fee_ppm": "100", "max_fee_ppm": "2000"}, (100, 2000)),
             # Out of range persists nothing: _apply_override skips it, so
             # the defaults stand and the invariant still holds.
-            ({"max_fee_ppm": "0"}, (10, 2000)),
+            ({"max_fee_ppm": "0"}, (50, 2000)),
         ],
     )
     def test_persisted_fee_bounds_end_ordered_and_in_band(self, overrides,
@@ -102,14 +104,15 @@ class TestContradictoryPairs:
         assert _matching(warnings, "Contradictory",
                          "lnplus_min_participants")
 
-    def test_daily_budget_above_weekly_warns_without_repair(self):
+    def test_daily_budget_above_weekly_warns_and_repairs_upward(self):
         cfg, warnings = _load({"daily_budget_sats": "5000",
                                "weekly_budget_sats": "1000"})
         assert _matching(warnings, "Contradictory", "daily_budget_sats",
                          "weekly_budget_sats")
-        # No repair: both values individually legal, weekly cap binds.
+        # Phase B (2026-08 surface reduction): repaired upward like the
+        # crossed fee rails — the weekly ceiling rises to the stated daily.
         assert cfg.daily_budget_sats == 5000
-        assert cfg.weekly_budget_sats == 1000
+        assert cfg.weekly_budget_sats == 5000
 
 
 class TestShadowedSettings:
