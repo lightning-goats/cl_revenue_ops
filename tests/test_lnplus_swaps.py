@@ -2420,3 +2420,80 @@ class TestCompleteApplicationIdempotency:
         assert db.lnplus_get_swap("s1")["status"] == "opening"
         assert "s1" not in summary["opened"], \
             "a row that never left 'opening' must not be reported as opened"
+
+
+class TestDeleteApplicationTerminal422:
+    """Task 26 finding 12: a structured 422 saying the application is GONE
+    must terminalize the row instead of retrying delete_application forever
+    (which held the serialization slot and capacity reservation for good).
+    """
+
+    @staticmethod
+    def _aged_applied_row(db, sid):
+        conn = db._get_connection()
+        conn.execute("UPDATE lnplus_swaps SET applied_at = ? WHERE swap_id = ?",
+                     (int(time.time()) - 30 * 86400, sid))
+
+    def test_timeout_phase_terminal_422_terminalizes_row(self):
+        lc, db, _rpc, client, *_ = _make_lifecycle(
+            my_swaps={"pending": [{"id": "s1"}], "opening": [], "completed": []},
+            local_rows=[dict(swap_id="s1", status="applied",
+                             capacity_sats=1_000_000, duration_months=3)])
+        self._aged_applied_row(db, "s1")
+        client.delete_application.side_effect = LNPlusError(
+            "Unprocessable Entity", http_status=422,
+            errors={"id": ["no application found"]})
+        withdrawn = lc._handle_pending_timeouts(client.get_my_swaps.return_value)
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "withdrawn", (
+            f"a gone-application 422 must terminalize, got {row['status']!r}")
+        assert "s1" in withdrawn
+        # Terminal now: the next pass must NOT retry the delete.
+        client.delete_application.reset_mock()
+        lc._handle_pending_timeouts(client.get_my_swaps.return_value)
+        assert client.delete_application.call_count == 0
+
+    def test_timeout_phase_transport_error_stays_retryable(self):
+        lc, db, _rpc, client, *_ = _make_lifecycle(
+            my_swaps={"pending": [{"id": "s1"}], "opening": [], "completed": []},
+            local_rows=[dict(swap_id="s1", status="applied",
+                             capacity_sats=1_000_000, duration_months=3)])
+        self._aged_applied_row(db, "s1")
+        client.delete_application.side_effect = LNPlusError("LN+ unreachable")
+        lc._handle_pending_timeouts(client.get_my_swaps.return_value)
+        row = db.lnplus_get_swap("s1")
+        assert row["status"] == "applied", "transport failures must stay retryable"
+
+    def test_timeout_phase_not_pending_422_leaves_row_for_reconcile(self):
+        """'not pending' means the swap ADVANCED remotely — terminalizing
+        locally could bury a swap whose channel is about to fund. The row
+        must be left for promote/reconcile to resolve from the next
+        listing, not marked withdrawn."""
+        lc, db, _rpc, client, *_ = _make_lifecycle(
+            my_swaps={"pending": [{"id": "s1"}], "opening": [], "completed": []},
+            local_rows=[dict(swap_id="s1", status="applied",
+                             capacity_sats=1_000_000, duration_months=3)])
+        self._aged_applied_row(db, "s1")
+        client.delete_application.side_effect = LNPlusError(
+            "Unprocessable Entity", http_status=422,
+            errors={"id": ["application is not pending"]})
+        lc._handle_pending_timeouts(client.get_my_swaps.return_value)
+        assert db.lnplus_get_swap("s1")["status"] == "applied"
+
+    def test_pending_ghost_terminal_422_logs_resolved_not_warn(self):
+        """B5(b) second instance: the stale-application cleanup must classify
+        the same gone-application 422 as RESOLVED (info) instead of a
+        retryable failure (warn)."""
+        lc, db, _rpc, client, plugin_holder = None, None, None, None, None
+        lc, db, _rpc, client, *_ = _make_lifecycle(
+            my_swaps={"pending": [{"id": "sg"}], "opening": [], "completed": []},
+            local_rows=[dict(swap_id="sg", status="failed",
+                             capacity_sats=1_000_000, duration_months=3)])
+        client.delete_application.side_effect = LNPlusError(
+            "Unprocessable Entity", http_status=422,
+            errors={"id": ["no application found"]})
+        assert lc.reconcile_ok() is True
+        warn_calls = [c for c in lc._plugin.log.call_args_list
+                      if c.kwargs.get("level") == "warn"
+                      and "delete_application" in str(c.args[0])]
+        assert not warn_calls, f"gone-422 must not be warn/retryable: {warn_calls}"

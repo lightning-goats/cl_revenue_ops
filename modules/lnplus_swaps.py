@@ -1013,6 +1013,16 @@ class SwapLifecycle:
             if local_row and local_row.get("status") in _TERMINAL_PENDING_GHOST_STATUSES:
                 try:
                     self._client.delete_application(sid)
+                except LNPlusError as e:
+                    if self._application_already_gone(e):
+                        self._plugin.log(
+                            f"LNPLUS: stale pending application {sid} is "
+                            "already gone on LN+ — resolved", level="info")
+                    else:
+                        self._plugin.log(
+                            f"LNPLUS: delete_application({sid}) failed for a "
+                            f"stale pending application (local status "
+                            f"{local_row.get('status')!r}): {e}", level="warn")
                 except Exception as e:
                     self._plugin.log(
                         f"LNPLUS: delete_application({sid}) failed for a "
@@ -1699,6 +1709,31 @@ class SwapLifecycle:
         return marked_opened
 
     @staticmethod
+    def _application_already_gone(e: LNPlusError) -> bool:
+        """True when LN+ rejects delete_application because the application
+        no longer EXISTS on their side (task 26 / task-23 finding 12).
+
+        Like _already_past_opening, that is a success signal wearing a 422:
+        the delete's goal (no application remains) is already achieved, and
+        retrying can never succeed. Treating it as retryable left the row at
+        'applied' forever — non-terminal, permanently past the timeout
+        cutoff, re-selected every pass, and holding the serialization slot.
+
+        Deliberately narrow: only the GONE class terminalizes. A 422 saying
+        the application is "not pending" means the swap ADVANCED remotely —
+        the next listing resolves that via promote/reconcile, and writing a
+        terminal state here could bury a swap whose channel is about to
+        fund. Transport failures and 5xx stay retryable.
+        """
+        if e.http_status != 422 or not isinstance(e.errors, dict):
+            return False
+        gone = ("no application", "not found", "does not exist")
+        return any(needle in str(message).lower()
+                   for value in e.errors.values()
+                   for message in (value if isinstance(value, list) else [value])
+                   for needle in gone)
+
+    @staticmethod
     def _already_past_opening(e: LNPlusError) -> bool:
         """True when LN+ rejects complete_application because the application
         has ALREADY left the opening state.
@@ -2078,6 +2113,14 @@ class SwapLifecycle:
                 continue
             try:
                 self._client.delete_application(sid)
+            except LNPlusError as e:
+                if not self._application_already_gone(e):
+                    self._plugin.log(f"LNPLUS: delete_application failed for {sid}: {e}", level="warn")
+                    continue
+                self._plugin.log(
+                    f"LNPLUS: delete_application for {sid} reports the application "
+                    "is already gone — treating the withdrawal as complete",
+                    level="info")
             except Exception as e:
                 self._plugin.log(f"LNPLUS: delete_application failed for {sid}: {e}", level="warn")
                 continue
