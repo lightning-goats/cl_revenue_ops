@@ -1,6 +1,6 @@
 """Route-pricing failure handling (2026-07-16 audit).
 
-Two production defects found while diagnosing a week of failed defibrillator
+Route-pricing failure-path coverage for ordinary rebalance execution
 shocks (every attempt recorded as ``native_route_invalid: missing_route``):
 
 1. ``RebalanceEngine._execute_candidate_locked`` logged a failed route
@@ -65,7 +65,7 @@ def _candidate():
     candidate.to_peer_id = "03" + "b" * 64
     candidate.amount_sats = 50_000
     candidate.max_budget_sats = 400
-    candidate.reason_code = "defibrillator"
+    candidate.reason_code = "route_pricing_test"
     candidate.route_decision = None
     return candidate
 
@@ -99,98 +99,3 @@ def test_execute_candidate_returns_pricing_error_without_executing(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Fix 2: the defibrillator retries the shock from the next-best source when
-# route pricing says the current source cannot route.
-# ---------------------------------------------------------------------------
-def _make_rebalancer(engine_side_effects, sources):
-    """sources: list of (scid, spendable_sats) best-first."""
-    from modules.config import Config
-    from modules.rebalancer import EVRebalancer
-
-    plugin = MagicMock()
-    cfg = Config(dry_run=True, daily_budget_sats=1000,
-                 diagnostic_rebalance_max_fee_sats=400)
-    db = MagicMock()
-    db.record_rebalance.return_value = 42
-    r = EVRebalancer(plugin, cfg, db)
-    r.rebalance_engine_v2 = MagicMock()
-    r.rebalance_engine_v2.execute_candidate.side_effect = engine_side_effects
-    channels = {
-        "200x1x0": {"peer_id": "03" + "b" * 64, "spendable_sats": 10_000},
-    }
-    for i, (scid, spendable) in enumerate(sources):
-        channels[scid] = {
-            "peer_id": "02" + format(i, "x").rjust(2, "0") * 32,
-            "spendable_sats": spendable,
-            "fee_ppm": 100,
-        }
-    r._get_channels_with_balances = MagicMock(return_value=channels)
-    r._check_capital_controls = MagicMock(return_value=True)
-    r._estimate_inbound_fee = MagicMock(return_value=100)
-    r._record_successful_rebalance_fee = MagicMock(return_value=120)
-    return r
-
-
-def _route_failure():
-    return ExecutionResult(
-        success=False,
-        error=("route_pricing_failed: no_route: RPC call failed: getroutes "
-               "code 206 Could not find route without excessive delays (market)"),
-        amount_sats=50_000,
-    )
-
-
-def test_defibrillator_retries_next_source_on_route_failure():
-    r = _make_rebalancer(
-        engine_side_effects=[
-            _route_failure(),
-            ExecutionResult(success=True, fee_sats=120, fee_msat=120_000,
-                            amount_sats=50_000),
-        ],
-        sources=[("101x1x0", 500_000), ("102x1x0", 400_000)],
-    )
-
-    res = r.diagnostic_rebalance("200x1x0")
-
-    assert res.get("shock_status") == "completed"
-    calls = r.rebalance_engine_v2.execute_candidate.call_args_list
-    assert len(calls) == 2
-    assert calls[0].args[0].from_channel == "101x1x0"
-    assert calls[1].args[0].from_channel == "102x1x0"
-
-
-def test_defibrillator_does_not_retry_on_non_route_failure():
-    r = _make_rebalancer(
-        engine_side_effects=[
-            ExecutionResult(
-                success=False,
-                error="local_execution_failed: sendpay crashed",
-                amount_sats=50_000,
-            ),
-        ],
-        sources=[("101x1x0", 500_000), ("102x1x0", 400_000)],
-    )
-
-    res = r.diagnostic_rebalance("200x1x0")
-
-    assert res.get("shock_status") == "failed"
-    assert r.rebalance_engine_v2.execute_candidate.call_count == 1
-
-
-def test_defibrillator_source_attempts_are_capped():
-    r = _make_rebalancer(
-        engine_side_effects=[_route_failure(), _route_failure(), _route_failure()],
-        sources=[
-            ("101x1x0", 500_000),
-            ("102x1x0", 400_000),
-            ("103x1x0", 300_000),
-            ("104x1x0", 200_000),
-            ("105x1x0", 150_000),
-        ],
-    )
-
-    res = r.diagnostic_rebalance("200x1x0")
-
-    assert res.get("shock_status") == "failed"
-    # Bounded: 3 source attempts max even with 5 valid sources.
-    assert r.rebalance_engine_v2.execute_candidate.call_count == 3

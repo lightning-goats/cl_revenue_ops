@@ -41,7 +41,6 @@ from modules.config import CONFIG_FIELD_RANGES, Config
 from modules.growth_budget import compute_growth_budget_status
 from modules.database import Database
 from modules.profitability_analyzer import ChannelProfitabilityAnalyzer
-from modules.capacity_planner import CapacityPlanner
 from modules.policy_manager import (
     PolicyManager,
     FeeStrategy,
@@ -83,11 +82,10 @@ from modules.econ_shadow import EconShadow
 #     stay deleted, no non-comment hive/mycelium references in runtime source).
 #   - Docs: hive contracts/audits deleted, README/AGENTS rewritten standalone.
 #   - Grep gate: modules/ + cl-revenue-ops.py contain only historical comments.
-# v2.16.0: Standalone Phases 2-3 — de-hive the revenue core (2026-07-09)
-#   - Removed all remaining cl-hive/fleet/coordination code from the revenue
+# v2.16.0: Standalone Phases 2-3 — de-hive the revenue core (2026-07-09)#   - Removed all remaining cl-hive/fleet/coordination code from the revenue
 #     engine: profitability_analyzer, capital_efficiency, policy_manager,
 #     capex_budget, database (hive tables + corridor instrumentation),
-#     rebalancer (coordination cluster), capacity_planner (hive discovery +
+#     and rebalancer (coordination cluster, hive discovery +
 #     close-protection + value weights), the atomic routing cluster (deleted
 #     rebalance_coordination_overlay + rebalance_hive_router; collapsed
 #     rebalance_route_policy to market-only; de-hived rebalance_engine_v2 /
@@ -993,7 +991,6 @@ rebalancer: Optional[EVRebalancer] = None
 database: Optional[Database] = None
 config: Optional[Config] = None
 profitability_analyzer: Optional[ChannelProfitabilityAnalyzer] = None
-capacity_planner: Optional[CapacityPlanner] = None
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 data_service = None  # Unified data service (DataService instance)
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
@@ -1421,15 +1418,6 @@ plugin.add_option(
     description='Local hard ceiling for dynamic effective daily budget; fleet hints cannot exceed this (default: 10000)'
 )
 
-plugin.add_option(
-    name='revenue-ops-diagnostic-rebalance-max-fee-sats',
-    default='400',
-    description=(
-        'Fee cap in sats for the diagnostic (defibrillator) shock rebalance; '
-        'the shock ppm ceiling is derived from this cap. Clamped to '
-        '[1, min(daily budget, 10000)] (default: 400)'
-    )
-)
 
 plugin.add_option(
     name='revenue-ops-allow-zero-cost-auto-rebalance-when-budget-zero',
@@ -1604,72 +1592,6 @@ plugin.add_option(
     description='Max HTLC as a fraction of capacity for balanced channels when dynamic htlcmax is enabled (0.01-1.0)'
 )
 
-plugin.add_option(
-    name='revenue-ops-planner-enabled',
-    default='false',
-    description='Enable automated capacity planner for channel opens/closes (default: false)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-interval',
-    default='21600',
-    description='Seconds between capacity planner evaluation cycles (default: 21600 = 6 hours)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-dry-run',
-    default='false',
-    description='Log planner decisions without executing (default: false)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-max-opens-per-cycle',
-    default='1',
-    description='Maximum automated channel opens per planner cycle (default: 1)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-max-closes-per-cycle',
-    default='0',
-    description='Maximum planner close executions per cycle when close execution is enabled (default: 0)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-close-fee-reserve-multiplier',
-    default='2.0',
-    description='Multiplier applied to estimated close fee for planner close budget reservation (default: 2.0)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-close-fee-cap-sats',
-    default='0',
-    description='Fixed planner close fee cap/reservation in sats; 0 uses reserve multiplier (default: 0)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-close-feerange-enabled',
-    default='false',
-    description='Pass a CLN close feerange cap derived from the planner close fee reservation (default: false)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-min-channel-sats',
-    default='1000000',
-    description='Minimum channel size in sats for automated opens (default: 1000000)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-max-channel-sats',
-    default='10000000',
-    description='Maximum channel size in sats for automated opens (default: 10000000)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-max-fee-rate',
-    default='50.0',
-    description='Maximum on-chain fee rate (sat/vB) for automated opens/closes (default: 50.0)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-min-annual-roi-pct',
-    default='1.0',
-    description='Minimum annualized return hurdle for automated channel opens (default: 1.0%)'
-)
-plugin.add_option(
-    name='revenue-ops-planner-execute-closes',
-    default='false',
-    description='Allow the capacity planner to execute close RPCs (default: false)',
-    dynamic=True
-)
 def _on_rebalance_router_change(plugin_: Plugin, option_name: str, new_value: Any) -> None:
     """Validate + log a runtime rebalance-router flip triggered by setconfig.
 
@@ -1734,7 +1656,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, capex_engine, data_service, econ_shadow
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, safe_plugin, policy_manager, capex_engine, data_service, econ_shadow
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -1943,9 +1865,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         growth_budget_hard_ceiling_sats=_safe_int_opt(
             'revenue-ops-growth-budget-hard-ceiling-sats', '10000'
         ),
-        diagnostic_rebalance_max_fee_sats=_safe_int_opt(
-            'revenue-ops-diagnostic-rebalance-max-fee-sats', '400'
-        ),
         allow_zero_cost_auto_rebalance_when_budget_zero=options.get(
             'revenue-ops-allow-zero-cost-auto-rebalance-when-budget-zero', 'false'
         ).lower() in ('true', '1', 'yes'),
@@ -1961,22 +1880,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         vegas_decay_rate=_safe_float('revenue-ops-vegas-decay'),
         rpc_timeout_seconds=_safe_int('revenue-ops-rpc-timeout-seconds'),
         reservation_timeout_hours=_safe_int('revenue-ops-reservation-timeout-hours'),
-        planner_enabled=options.get('revenue-ops-planner-enabled', 'false').lower() in ('true', '1', 'yes'),
-        planner_interval=_safe_int('revenue-ops-planner-interval'),
-        planner_dry_run=options.get('revenue-ops-planner-dry-run', 'false').lower() in ('true', '1', 'yes'),
-        planner_execute_closes=options.get('revenue-ops-planner-execute-closes', 'false').lower() in ('true', '1', 'yes'),
-        planner_max_opens_per_cycle=_safe_int('revenue-ops-planner-max-opens-per-cycle'),
-        planner_max_closes_per_cycle=_safe_int('revenue-ops-planner-max-closes-per-cycle'),
-        planner_close_fee_reserve_multiplier=_safe_float('revenue-ops-planner-close-fee-reserve-multiplier'),
-        planner_close_fee_cap_sats=_safe_int('revenue-ops-planner-close-fee-cap-sats'),
-        planner_close_feerange_enabled=options.get('revenue-ops-planner-close-feerange-enabled', 'false').lower() in ('true', '1', 'yes'),
-        planner_min_channel_sats=_safe_int('revenue-ops-planner-min-channel-sats'),
-        planner_max_channel_sats=_safe_int('revenue-ops-planner-max-channel-sats'),
-        planner_max_fee_rate_sat_vb=_safe_float('revenue-ops-planner-max-fee-rate'),
-        planner_min_annual_roi_pct=_safe_float_opt(
-            'revenue-ops-planner-min-annual-roi-pct',
-            '1.0',
-        ),
         rebalance_router='v3',
         askrene_layers=str(options.get('revenue-ops-askrene-layers', '') or '').strip() or 'standalone',
     )
@@ -2224,7 +2127,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Initialize analysis modules
     flow_analyzer = FlowAnalyzer(safe_plugin, config, database)
-    capacity_planner = CapacityPlanner(safe_plugin, profitability_analyzer, flow_analyzer, policy_manager=policy_manager, config=config)
     fee_controller = FeeController(
         safe_plugin,
         config,
@@ -2244,8 +2146,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # Phase 2 pilot: journal the generic spend lifecycle (all callers
         # of Database.reserve_spend/settle/release) into the econ ledger.
         database.spend_journal = econ_shadow
-        # Phase 2E: governor/ledger plumbing for planner reservations.
-        capacity_planner.econ_shadow = econ_shadow
         # Phase 2H: governor/ledger plumbing for fee broadcasts.
         fee_controller.econ_shadow = econ_shadow
     except Exception as e:
@@ -2255,18 +2155,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         safe_plugin, config, database, policy_manager,
     )
     rebalancer.set_profitability_analyzer(profitability_analyzer)
-    rebalancer.set_capacity_planner(capacity_planner)
-    capacity_planner.rebalancer = rebalancer
-    if hasattr(capacity_planner, "set_rebalancer"):
-        capacity_planner.set_rebalancer(rebalancer)
-    # Unified liquidity-cost accounting for retained rebalance and planner paths.
+    # Unified liquidity-cost accounting for the retained rebalance path.
     if rebalancer is not None:
         rebalancer.external_liquidity_cost_provider = _non_rebalance_liquidity_cost_components
         rebalancer.global_budget_limit_provider = _total_cost_budget_limit_provider
 
-    if capacity_planner is not None:
-        capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
-        capacity_planner.external_liquidity_cost_provider = _non_rebalance_liquidity_cost_components
 
     capital_efficiency = CapitalEfficiencyAnalyzer(
         profitability_analyzer=profitability_analyzer,
@@ -2288,11 +2181,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Wire capex engine to all consumers
     if rebalancer is not None:
         rebalancer.set_capex_engine(capex_engine)
-    if capacity_planner is not None:
-        capacity_planner.set_capital_efficiency(capital_efficiency)
-        capacity_planner.set_capex_engine(capex_engine)
-        capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
-        capacity_planner.external_liquidity_cost_provider = _non_rebalance_liquidity_cost_components
 
     # Rebalance engine: unified actual-fee pipeline
     from modules.rebalance_engine_v2 import RebalanceEngine
@@ -2326,8 +2214,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         policy_manager.data_service = data_service
     if flow_analyzer is not None:
         flow_analyzer.data_service = data_service
-    if capacity_planner is not None:
-        capacity_planner.data_service = data_service
 
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client
@@ -2470,95 +2356,24 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     pass
                 if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
                     break
-    def capacity_planner_loop():
-        """Background loop for automated capacity planning."""
-        if not config.planner_enabled:
-            plugin.log("Capacity planner disabled, loop not started", level='debug')
-            return
-
-        # Respect the interval from the last cycle (survives restarts).
-        # Fall back to a warmup delay if no prior cycle exists.
-        warmup_delay = 300
-        startup_delay = warmup_delay
-        try:
-            if database:
-                recent = database.get_planner_actions(limit=1)
-                if recent:
-                    last_ts = recent[0].get("created_at", 0)
-                    elapsed = int(time.time()) - last_ts
-                    interval = max(600, config.planner_interval if hasattr(config, 'planner_interval') else 21600)
-                    remaining = interval - elapsed
-                    if remaining > 0:
-                        startup_delay = remaining
-                        plugin.log(f"Planner: last cycle {elapsed}s ago, waiting {remaining}s", level='info')
-                    else:
-                        plugin.log(f"Planner: last cycle {elapsed}s ago, starting after warmup", level='info')
-        except Exception:
-            pass  # Fall back to default warmup delay
-
-        if shutdown_event.wait(startup_delay):
-            return
-
-        while not shutdown_event.is_set():
-            # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
-            try:
-                _hb_cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-                _record_loop_heartbeat("capacity-planner", interval_seconds=max(600, _hb_cfg_snap.planner_interval))
-                try:
-                    _refresh_dynamic_config()
-                    plugin.log("Running scheduled capacity planner cycle...")
-                    result = capacity_planner.execute_cycle()
-                    if result.get("skipped"):
-                        plugin.log(f"Planner cycle skipped: {result.get('reason')}", level='debug')
-                    else:
-                        opens = len(result.get("opens", []))
-                        closes = len(result.get("closes", []))
-                        plugin.log(f"Planner cycle complete: {opens} opens, {closes} closes")
-                except Exception as e:
-                    plugin.log(f"Error in capacity planner cycle: {e}", level='error')
-                    plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
-
-                cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-                interval = max(600, cfg_snap.planner_interval)
-                jitter = int(interval * 0.2)
-                sleep_time = interval + random.randint(-jitter, jitter)
-                if shutdown_event.wait(sleep_time):
-                    break
-            except Exception as e:
-                plugin.log(f"Unhandled error in capacity-planner loop iteration: {e}", level='error')
-                try:
-                    plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
-                except Exception:
-                    pass
-                if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
-                    break
 
     def snapshot_peers_delayed():
-        """
-        One-time delayed snapshot of connected peers.
-        
-        Sleeps to allow lightningd to establish connections, then records
-        a snapshot for all currently connected peers. Exits after completion.
-        """
+        """Record one delayed startup snapshot of connected peers."""
         delay_seconds = 60
-        plugin.log(f"Startup snapshot: waiting {delay_seconds}s for network connections...")
-        
-        # Interruptible delay
+        plugin.log(
+            f"Startup snapshot: waiting {delay_seconds}s for network connections..."
+        )
         if shutdown_event.wait(delay_seconds):
             plugin.log("Startup snapshot cancelled due to shutdown signal")
             return
 
-        # P1-021: delegate to the extracted helper, which closes the
-        # thread-local DB connection before this one-shot thread exits.
-        # DD5 / P1-010: guard the single run so an exception cannot kill the
-        # thread silently; record a heartbeat so the one-shot is observable.
         _record_loop_heartbeat("startup-snapshot", one_shot=True)
         try:
             _snapshot_peers_once()
         except Exception as e:
-            plugin.log(f"Startup snapshot failed: {e}", level='error')
+            plugin.log(f"Startup snapshot failed: {e}", level="error")
             try:
-                plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
+                plugin.log(f"Traceback: {traceback.format_exc()}", level="debug")
             except Exception:
                 pass
 
@@ -2669,7 +2484,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
-    threading.Thread(target=capacity_planner_loop, daemon=True, name="capacity-planner").start()
 
     plugin.log("cl-revenue-ops plugin initialized successfully!")
     return None
@@ -3729,116 +3543,6 @@ def _rpc_wake_all(plugin: Plugin) -> Dict[str, Any]:
 def revenue_wake_all(plugin: Plugin) -> Dict[str, Any]:
     """Deprecated alias for 'revenue-cycle all' (removal 2026-09-05)."""
     return _deprecated_alias(_rpc_wake_all(plugin), "revenue-cycle all")
-
-
-def _rpc_capacity_report(plugin: Plugin, **kwargs):
-    """
-    Generate a strategic capital redeployment report.
-
-    Identifies "Winner" channels for capital injection
-    and "Loser" channels for capital extraction or closure.
-    """
-    if capacity_planner is None:
-        return {"error": "Capacity planner not initialized"}
-
-    try:
-        return capacity_planner.generate_report()
-    except Exception as e:
-        plugin.log(f"Error generating capacity report: {e}", level='error')
-        return {"error": f"Report generation failed: {e}"}
-
-
-@plugin.method("revenue-capacity-report")
-def revenue_capacity_report(plugin: Plugin, **kwargs):
-    """Deprecated alias for 'revenue-planner report' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_capacity_report(plugin, **kwargs), "revenue-planner report"
-    )
-
-
-def _rpc_planner_status(plugin: Plugin) -> Dict[str, Any]:
-    """Get capacity planner status — pending actions, last cycle result, config."""
-    if capacity_planner is None:
-        return {"error": "Capacity planner not initialized"}
-    return capacity_planner.get_status()
-
-
-@plugin.method("revenue-planner-status")
-def revenue_planner_status(plugin: Plugin) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-planner status' (removal 2026-09-05)."""
-    return _deprecated_alias(_rpc_planner_status(plugin), "revenue-planner status")
-
-
-
-def _rpc_planner_candidate_sources(plugin: Plugin):
-    """Show strategy distribution of the current candidate pool."""
-    if capacity_planner is None:
-        return {"error": "Capacity planner not initialized"}
-    return capacity_planner.get_candidate_sources()
-
-
-@plugin.method("revenue-planner-candidate-sources")
-def planner_candidate_sources(plugin: Plugin):
-    """Deprecated alias for 'revenue-planner sources' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_planner_candidate_sources(plugin), "revenue-planner sources"
-    )
-
-
-def _rpc_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
-    """List scored peer candidates for channel opens."""
-    if capacity_planner is None:
-        return {"error": "Capacity planner not initialized"}
-    try:
-        limit = _clamp_query_limit(limit)
-    except _ParamError as e:
-        return {"error": str(e)}
-    candidates = database.get_planner_candidates(limit=limit)
-    return {
-        "candidates": candidates,
-        "count": len(candidates),
-    }
-
-
-@plugin.method("revenue-planner-candidates")
-def revenue_planner_candidates(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-planner candidates' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_planner_candidates(plugin, limit=limit), "revenue-planner candidates"
-    )
-
-
-def _rpc_planner_execute(plugin: Plugin) -> Dict[str, Any]:
-    """Manually trigger a capacity planner cycle."""
-    if capacity_planner is None:
-        return {"error": "Capacity planner not initialized"}
-    return capacity_planner.execute_cycle()
-
-
-@plugin.method("revenue-planner-execute")
-def revenue_planner_execute(plugin: Plugin) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-cycle planner' (removal 2026-09-05)."""
-    return _deprecated_alias(_rpc_planner_execute(plugin), "revenue-cycle planner")
-
-
-def _rpc_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
-    """Get audit log of past planner actions."""
-    if capacity_planner is None:
-        return {"error": "Capacity planner not initialized"}
-    try:
-        limit = _clamp_query_limit(limit)
-    except _ParamError as e:
-        return {"error": str(e)}
-    actions = database.get_planner_actions(limit=limit)
-    return {"actions": actions, "count": len(actions)}
-
-
-@plugin.method("revenue-planner-history")
-def revenue_planner_history(plugin: Plugin, limit: int = 20) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-planner history' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_planner_history(plugin, limit=limit), "revenue-planner history"
-    )
 
 
 @plugin.method("revenue-set-fee")
@@ -5470,16 +5174,6 @@ def revenue_health(plugin: Plugin) -> Dict[str, Any]:
     except Exception as e:
         result["budget"] = {"error": str(e)}
 
-    # --- 6. Planner state ---
-    if capacity_planner:
-        try:
-            status = capacity_planner.get_status()
-            result["planner"] = {
-                "enabled": status.get("enabled", False),
-                "candidate_pool_size": status.get("candidate_pool_size", 0),
-            }
-        except Exception as e:
-            result["planner"] = {"error": str(e)}
 
     # --- 8. Route pairs (top 5 revenue routes) ---
     if database:
@@ -5869,36 +5563,13 @@ def _refresh_dynamic_config():
     populated at init. This function bridges the gap.
     """
     try:
-        # Use the timeout-protected proxy: this runs on the planner
-        # background threads, where a hung lightningd response would
+        # Use the timeout-protected proxy so a hung lightningd response cannot
         # otherwise stall the loop indefinitely.
         rpc = safe_plugin.rpc if safe_plugin is not None else plugin.rpc
         all_configs = rpc.listconfigs()
         configs = all_configs.get("configs", {})
     except Exception:
         return
-
-    if config:
-        # Same override-precedence rule as other scoped loops: an active
-        # revenue-config DB override wins over the listconfigs view. Without
-        # this guard the refresh stomped a DB-overridden false back to true
-        # every cycle on nexus-01 (lightningd's parsed config predated the
-        # operator's file edit) — re-enabling planner closes the operator had
-        # explicitly disabled (observed live 2026-07-08, v41 override).
-        _ec_overridden = False
-        try:
-            _ec_overridden = (database is not None and
-                              database.get_config_override("planner_execute_closes") is not None)
-        except Exception:
-            pass
-        if not _ec_overridden:
-            ec = configs.get("revenue-ops-planner-execute-closes", {})
-            val = ec.get("value_str", "")
-            if val:
-                new_val = val.lower() in ("true", "1", "yes")
-                if new_val != config.planner_execute_closes:
-                    config.planner_execute_closes = new_val
-                    plugin.log(f"Dynamic config refresh: planner_execute_closes = {new_val}")
 
     if config:
         for _opt, _field, _cast in (
@@ -6805,7 +6476,7 @@ def revenue_total_cost_budget(plugin: Plugin, window_hours: int = None) -> Dict[
 def _rpc_capex_status(plugin, **kwargs):
     """Return unified capex budget allocations.
 
-    Shows per-channel budgets, fleet exploration budget,
+    Shows per-channel rebalance budgets,
     priority class, and global envelope. Pushes summary to datastore.
     """
     global capex_engine
@@ -6835,7 +6506,6 @@ def _rpc_capex_status(plugin, **kwargs):
         "status": "ok",
         "priority_class": alloc.priority_class,
         "global_envelope_sats": alloc.global_envelope_sats,
-        "fleet_exploration_budget_sats": alloc.fleet_exploration_budget_sats,
         "total_fleet_contribution_sats": alloc.total_fleet_contribution_sats,
         "allocated_by_priority_sats": alloc.allocated_by_priority_sats,
         "channel_count": len(channels),
@@ -6852,8 +6522,6 @@ def _rpc_capex_status(plugin, **kwargs):
             "status": "ok",
             "priority_class": alloc.priority_class,
             "global_envelope_sats": alloc.global_envelope_sats,
-            "fleet_exploration_budget_sats": alloc.fleet_exploration_budget_sats,
-            "tactical_budget_sats": alloc.tactical_budget_sats,
             "total_fleet_contribution_sats": alloc.total_fleet_contribution_sats,
             "allocated_by_priority_sats": alloc.allocated_by_priority_sats,
             "channel_count": len(channels),
@@ -7436,41 +7104,17 @@ def revenue_cycle(plugin: Plugin, subsystem: str = None, **kwargs) -> Dict[str, 
     Usage: lightning-cli -k revenue-cycle subsystem=<subsystem> [key=value ...]
 
     Subsystems: fees (was revenue-fee-cycle), rebalance
-    (revenue-rebalance-cycle), flow (revenue-analyze), planner
-    (revenue-planner-execute),
-    all (revenue-wake-all). An unknown subsystem returns the valid list.
+    (revenue-rebalance-cycle), flow (revenue-analyze), all (revenue-wake-all). An unknown subsystem returns the valid list.
     """
     table = {
         "fees": _rpc_fee_cycle,
         "rebalance": _rpc_rebalance_cycle,
         "flow": _rpc_analyze,
-        "planner": _rpc_planner_execute,
         "all": _rpc_wake_all,
     }
     return _dispatch_subcommand(
         plugin, "revenue-cycle", "subsystem", table, subsystem, kwargs
     )
-
-
-@plugin.method("revenue-planner")
-def revenue_planner(plugin: Plugin, view: str = "status", **kwargs) -> Dict[str, Any]:
-    """Capacity-planner read surface (primary name since 2026-08-01).
-
-    Usage: lightning-cli -k revenue-planner view=<view> [key=value ...]
-
-    Views: status (default; was revenue-planner-status), candidates
-    (revenue-planner-candidates), sources (revenue-planner-candidate-sources),
-    history (revenue-planner-history), report (revenue-capacity-report).
-    An unknown view returns the valid list.
-    """
-    table = {
-        "status": _rpc_planner_status,
-        "candidates": _rpc_planner_candidates,
-        "sources": _rpc_planner_candidate_sources,
-        "history": _rpc_planner_history,
-        "report": _rpc_capacity_report,
-    }
-    return _dispatch_subcommand(plugin, "revenue-planner", "view", table, view, kwargs)
 
 
 @plugin.method("revenue-budget")

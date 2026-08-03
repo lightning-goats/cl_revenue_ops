@@ -93,16 +93,6 @@ def test_startup_hydration_uses_helper_window_for_empty_table():
         def set_profitability_analyzer(self, *args, **kwargs):
             return None
 
-        def set_capacity_planner(self, *args, **kwargs):
-            return None
-
-        def set_capex_engine(self, *args, **kwargs):
-            return None
-
-    class _FakeCapacityPlanner(_FakeComponent):
-        def set_capital_efficiency(self, *args, **kwargs):
-            return None
-
         def set_capex_engine(self, *args, **kwargs):
             return None
 
@@ -123,7 +113,6 @@ def test_startup_hydration_uses_helper_window_for_empty_table():
         patch.object(mod, "PolicyManager", return_value=_FakeComponent()),
         patch.object(mod, "ChannelProfitabilityAnalyzer", return_value=_FakeComponent()),
         patch.object(mod, "FlowAnalyzer", return_value=_FakeComponent()),
-        patch.object(mod, "CapacityPlanner", return_value=_FakeCapacityPlanner()),
         patch.object(mod, "FeeController", return_value=_FakeComponent()),
         patch.object(mod, "EVRebalancer", return_value=_FakeRebalancer()),
         patch.object(mod, "CapitalEfficiencyAnalyzer", return_value=_FakeComponent()),

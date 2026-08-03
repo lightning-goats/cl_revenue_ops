@@ -107,7 +107,6 @@ class TestNoHiveReintroduction:
 
     def test_no_hive_symbols_on_core_classes(self):
         from modules.fee_controller import FeeController
-        from modules.capacity_planner import CapacityPlanner
         from modules.rebalance_engine_v2 import RebalanceEngine
         from modules.rebalance_types_v2 import PairCandidate
         from modules.config import Config
@@ -116,7 +115,6 @@ class TestNoHiveReintroduction:
             (FeeController, ["_get_hive_fee_bias", "_get_temporal_fee_adjustment",
                              "_is_fleet_sibling", "_maybe_reseed_skewed_prior",
                              "_check_hive_member_fee"]),
-            (CapacityPlanner, ["_is_protected_hive_member", "_discover_from_hive"]),
             (RebalanceEngine, ["_apply_metabolic_rebalance_bias",
                                "_apply_immune_rebalance_bias",
                                "_get_hive_rebalance_bias"]),

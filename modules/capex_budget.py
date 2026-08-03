@@ -1,6 +1,6 @@
 """Unified Capex Budget Engine.
 
-Computes per-channel and fleet exploration budgets from
+Computes per-channel rebalance budgets from
 profitability and spend data. Pure calculation layer — no CLN RPC calls.
 
 Inputs:
@@ -10,7 +10,6 @@ Inputs:
 
 Outputs:
 - Per-channel budgets with tier classification
-- Fleet exploration budget for opens and recycling
 - Priority class based on fleet state
 """
 
@@ -83,7 +82,6 @@ class CapexAllocations:
     priority_class: str = "growth"
     global_envelope_msat: int = 0
     channel_budgets: Dict[str, ChannelCapexBudget] = field(default_factory=dict)
-    fleet_exploration_budget_msat: int = 0
     allocated_by_priority_msat: Dict[str, int] = field(default_factory=dict)
     total_fleet_contribution_msat: int = 0
     # CB-4 fail-closed: True when spend history could not be read from the
@@ -100,16 +98,6 @@ class CapexAllocations:
     def global_envelope_sats(self) -> int:
         """Global envelope in sats, ceiling-rounded."""
         return base_to_sats_ceil(self.global_envelope_msat)
-
-    @property
-    def fleet_exploration_budget_sats(self) -> int:
-        """Fleet exploration budget in sats, ceiling-rounded."""
-        return base_to_sats_ceil(self.fleet_exploration_budget_msat)
-
-    @property
-    def tactical_budget_sats(self) -> int:
-        """Tactical budget in sats, ceiling-rounded."""
-        return base_to_sats_ceil(self.tactical_budget_msat)
 
     @property
     def total_fleet_contribution_sats(self) -> int:
@@ -146,7 +134,7 @@ class CapexBudgetEngine:
         """Compute all budgets for the current cycle.
 
         Reads profitability cache + spend history, computes per-channel
-        budgets, fleet exploration, and priority class.
+        budgets and priority class.
         """
         cfg = self._config.snapshot() if hasattr(self._config, 'snapshot') else self._config
 
@@ -249,52 +237,20 @@ class CapexBudgetEngine:
             reserve_deficit=self._get_reserve_deficit(cfg),
         )
 
-        # Compute the retained fleet exploration budget (msat).
-        spend_summary = self._get_spend_ledger_summary(window_days=30)
-        if spend_summary is None:
-            db_degraded = True
-            spend_summary = {"spent_by_category": {}, "reserved_by_category": {}}
-        if prof_unavailable:
-            # Wave2 F2 fail-closed: bootstrap mode requires AFFIRMATIVE
-            # evidence of a zero-revenue node (a real, non-error snapshot).
-            # With no snapshot at all, a mature revenue node would otherwise
-            # flip into bootstrap and get the entire wallet excess as
-            # exploration budget. Grant nothing this cycle.
-            _log.warning(
-                "capex_budget: profitability data unavailable this cycle — "
-                "granting NO exploration budget (bootstrap requires a real "
-                "zero-revenue snapshot, not a data outage)"
-            )
-            exploration_msat = 0
-        elif total_fleet_contribution_msat > 0:
-            revenue_exploration_msat = int(total_fleet_contribution_msat * cfg.capex_exploration_rate)
-            wallet_floor_msat = self._get_wallet_exploration_floor_msat(cfg)
-            exploration_msat = max(revenue_exploration_msat, wallet_floor_msat)
-            exploration_msat = self._apply_category_spend_remaining(
-                budget_msat=exploration_msat,
-                summary=spend_summary,
-                category="channel_open",
-            )
-        else:
-            exploration_msat = self._get_bootstrap_wallet_exploration_budget_msat(
-                cfg=cfg,
-                summary=spend_summary,
-            )
         # CB-4 fail-closed: with spend history unreadable we cannot know what
         # has already been spent or reserved, so deny ALL spend this cycle
         # (zero every budget) rather than re-grant full budgets fleet-wide.
         if db_degraded:
             _log.warning(
                 "capex_budget: DB degraded this cycle — failing closed: "
-                "all channel and exploration budgets zeroed"
+                "all channel budgets zeroed"
             )
-            exploration_msat = 0
             for b in channel_budgets.values():
                 b.budget_msat = 0
 
         # Global envelope enforcement (msat)
         total_channel_budgets_msat = sum(b.budget_msat for b in channel_budgets.values())
-        raw_total_msat = total_channel_budgets_msat + exploration_msat
+        raw_total_msat = total_channel_budgets_msat
 
         if cfg.capex_global_envelope_sats > 0:
             envelope_msat = cfg.capex_global_envelope_sats * MSAT_PER_SAT
@@ -312,7 +268,6 @@ class CapexBudgetEngine:
         # Scale down if over envelope
         if raw_total_msat > envelope_msat and raw_total_msat > 0:
             scale = envelope_msat / raw_total_msat
-            exploration_msat = int(exploration_msat * scale)
             for b in channel_budgets.values():
                 b.budget_msat = int(b.budget_msat * scale)
 
@@ -325,19 +280,27 @@ class CapexBudgetEngine:
             b.budget_msat for b in channel_budgets.values()
             if b.priority_class == "preservation"
         )
+        operational_total_msat = sum(
+            b.budget_msat for b in channel_budgets.values()
+            if b.priority_class == "operational"
+        )
+        growth_total_msat = sum(
+            b.budget_msat for b in channel_budgets.values()
+            if b.priority_class == "growth"
+        )
 
         alloc = CapexAllocations(
             priority_class=priority_class,
             global_envelope_msat=envelope_msat,
             channel_budgets=channel_budgets,
-            fleet_exploration_budget_msat=exploration_msat,
             total_fleet_contribution_msat=total_fleet_contribution_msat,
             db_degraded=db_degraded,
             profitability_unavailable=prof_unavailable,
             allocated_by_priority_msat={
                 "defensive": defensive_total_msat,
                 "preservation": preservation_total_msat,
-                "growth": exploration_msat,
+                "operational": operational_total_msat,
+                "growth": growth_total_msat,
             },
         )
         self._last_allocations = alloc
@@ -348,12 +311,6 @@ class CapexBudgetEngine:
         if self._last_allocations and channel_id in self._last_allocations.channel_budgets:
             return self._last_allocations.channel_budgets[channel_id]
         return ChannelCapexBudget(channel_id=channel_id)
-
-    def get_fleet_exploration_budget(self) -> int:
-        """Remaining fleet exploration budget in sats (ceiling)."""
-        if self._last_allocations:
-            return self._last_allocations.fleet_exploration_budget_sats
-        return 0
 
     def get_priority_class(self) -> str:
         """Current fleet state priority class."""
@@ -601,44 +558,6 @@ class CapexBudgetEngine:
         except Exception:
             return None
 
-    def _get_bootstrap_wallet_exploration_budget_msat(self, cfg, summary) -> int:
-        """Use wallet excess for bootstrap opens when the fleet has no fee revenue yet.
-
-        This path is intentionally wallet-backed rather than spend-ledger-backed:
-        confirmed on-chain balance already reflects prior open fees, so subtracting
-        historical spend again would double-count. We only remove active reservations.
-        """
-        onchain_sats = self._get_confirmed_onchain_sats()
-        if onchain_sats is None:
-            # Wave2 F3: unknown wallet -> no bootstrap exploration budget.
-            return 0
-        wallet_excess_sats = max(0, onchain_sats - cfg.min_wallet_reserve)
-        reserved_by_category = summary.get("reserved_by_category", {}) or {}
-        reserved_open_sats = int(reserved_by_category.get("channel_open", 0) or 0)
-        return max(0, wallet_excess_sats - reserved_open_sats) * MSAT_PER_SAT
-
-    def _get_wallet_exploration_floor_msat(self, cfg) -> int:
-        """Allow one open-fee worth of exploration when wallet excess exists.
-
-        Revenue-funded fleets can otherwise get stuck below the current open
-        fee after earning small amounts. This floor covers only the configured
-        fee estimate, not the full wallet excess used during zero-revenue
-        bootstrap.
-        """
-        onchain_sats = self._get_confirmed_onchain_sats()
-        if onchain_sats is None:
-            # Wave2 F3: unknown wallet -> no wallet-backed exploration floor.
-            return 0
-        wallet_excess_sats = max(0, onchain_sats - cfg.min_wallet_reserve)
-        if wallet_excess_sats <= 0:
-            return 0
-        try:
-            open_fee_sats = int(getattr(cfg, "estimated_open_cost_sats", 0) or 0)
-        except (TypeError, ValueError):
-            open_fee_sats = 0
-        open_fee_sats = max(0, open_fee_sats)
-        return min(wallet_excess_sats, open_fee_sats) * MSAT_PER_SAT
-
     def _get_total_capex_by_channel(self, window_days: int = 30) -> Optional[Dict[str, int]]:
         """Get total capex per channel from rebalance_costs + spend_events.
 
@@ -654,35 +573,3 @@ class CapexBudgetEngine:
                 "failing closed — denying capex spend this cycle", exc
             )
             return None
-
-    def _get_spend_ledger_summary(self, window_days: int = 30) -> Optional[Dict[str, Dict[str, int]]]:
-        """Get generic spend ledger totals for the requested rolling window.
-
-        CB-4 fail-closed: returns None on DB error (never empty category dicts,
-        which downstream depletion would treat as fully un-depleted budgets).
-        Callers must treat None as degraded and deny spend.
-        """
-        try:
-            return self._database.get_spend_ledger_summary(window_hours=window_days * 24)
-        except Exception as exc:
-            _log.warning(
-                "capex_budget: DB error reading spend ledger summary (%s); "
-                "failing closed — denying capex spend this cycle", exc
-            )
-            return None
-
-    def _apply_category_spend_remaining(
-        self,
-        *,
-        budget_msat: int,
-        summary: Dict[str, Dict[str, int]],
-        category: str,
-    ) -> int:
-        """Subtract spent and reserved sats for one category from a nominal msat budget."""
-        spent_by_category = summary.get("spent_by_category", {}) or {}
-        reserved_by_category = summary.get("reserved_by_category", {}) or {}
-        consumed_sats = int(spent_by_category.get(category, 0) or 0) + int(
-            reserved_by_category.get(category, 0) or 0
-        )
-        remaining_msat = budget_msat - (consumed_sats * MSAT_PER_SAT)
-        return max(0, remaining_msat)

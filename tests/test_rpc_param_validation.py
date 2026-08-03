@@ -13,7 +13,7 @@ operator param one at a time. The invariant under test:
 Differential design: if a handler cannot be exercised with generic mocks (its
 baseline call raises or returns a non-dict because a MagicMock return value
 flows into real arithmetic/parsing), it is recorded as SKIPPED rather than
-producing a false failure. The critical validated handlers (planner limit,
+producing a false failure. The critical validated handlers (query limits,
 analyze/set-fee/rebalance channel_id, dashboard window, hive-hints segment) are
 additionally pinned by the dedicated per-finding tests.
 """
@@ -127,10 +127,7 @@ def _handler_specs(mod):
 RPC_HANDLER_FUNCS = {
     "revenue_rebalance_cycle", "revenue_status",
     "revenue_rebalance_debug", "revenue_fee_debug", "revenue_fee_cycle",
-    "revenue_analyze", "revenue_wake_all", "revenue_capacity_report",
-    "revenue_planner_status", "planner_candidate_sources",
-    "revenue_planner_candidates", "revenue_planner_execute",
-    "revenue_planner_history", "revenue_set_fee", "revenue_rebalance",
+    "revenue_analyze", "revenue_wake_all", "revenue_set_fee", "revenue_rebalance",
     "revenue_profitability", "revenue_history", "revenue_ignore",
     "revenue_unignore", "revenue_list_ignored", "revenue_policy",
     "revenue_report", "revenue_hot_channel_protection_peers", "revenue_config",
@@ -140,7 +137,7 @@ RPC_HANDLER_FUNCS = {
     "revenue_spend_release", "revenue_spend_release_stale",
     "revenue_spend_settle",
     # Phase C dispatchers (operator-surface reduction 2026-08-01).
-    "revenue_cycle", "revenue_planner", "revenue_budget",
+    "revenue_cycle", "revenue_budget",
 }
 
 
@@ -149,7 +146,7 @@ def _setup_env(mod):
     from unittest.mock import MagicMock
     mod.config = Config()
     for name in ("flow_analyzer", "fee_controller", "rebalancer", "database",
-                 "profitability_analyzer", "capacity_planner", "safe_plugin",
+                 "profitability_analyzer", "safe_plugin",
                  "data_service", "policy_manager",
                  "capex_engine", "hive_hints"):
         if hasattr(mod, name):
@@ -166,8 +163,8 @@ def test_handler_discovery_covers_full_surface(mod):
     found = {s[0] for s in specs}
     missing = RPC_HANDLER_FUNCS - found
     assert not missing, f"handlers not discovered: {sorted(missing)}"
-    # 38 handlers is the retained post-Boltz surface.
-    assert len(found) == len(RPC_HANDLER_FUNCS) == 38
+    # 31 handlers is the retained post-liquidity-executor surface.
+    assert len(found) == len(RPC_HANDLER_FUNCS) == 31
 
 
 def test_param_matrix_no_leaks(mod):

@@ -152,8 +152,6 @@ def test_capex_summary_producer_payload_matches_contract():
     mod.capex_engine.compute_allocations.return_value = SimpleNamespace(
         priority_class="growth",
         global_envelope_sats=10_000,
-        fleet_exploration_budget_sats=1_000,
-        tactical_budget_sats=500,
         total_fleet_contribution_sats=20_000,
         allocated_by_priority_sats={"growth": 1_500},
         channel_budgets={
@@ -191,8 +189,6 @@ def test_capex_summary_producer_payload_matches_contract():
         "status": "ok",
         "priority_class": "growth",
         "global_envelope_sats": 10_000,
-        "fleet_exploration_budget_sats": 1_000,
-        "tactical_budget_sats": 500,
         "total_fleet_contribution_sats": 20_000,
         "allocated_by_priority_sats": {"growth": 1_500},
         "channel_count": 1,

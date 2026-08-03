@@ -14,9 +14,7 @@ EXPECTED_RPC_METHODS = frozenset({
     "revenue-rebalance-cycle", "revenue-status", "revenue-rebalance-debug",
     "revenue-fee-debug", "revenue-fee-cycle", "revenue-fee-authority-status",
     "revenue-analyze",
-    "revenue-wake-all", "revenue-capacity-report", "revenue-planner-status",
-    "revenue-planner-candidate-sources", "revenue-planner-candidates",
-    "revenue-planner-execute", "revenue-planner-history", "revenue-set-fee",
+    "revenue-wake-all", "revenue-set-fee",
     "revenue-rebalance", "revenue-profitability", "revenue-history",
     "revenue-ignore", "revenue-unignore", "revenue-list-ignored",
     "revenue-ban", "revenue-unban", "revenue-list-banned", "revenue-policy",
@@ -29,7 +27,7 @@ EXPECTED_RPC_METHODS = frozenset({
     "revenue-spend-ledger", "revenue-spend-reserve", "revenue-spend-release",
     "revenue-spend-release-stale", "revenue-spend-settle",
     # Retained Phase C dispatchers.
-    "revenue-cycle", "revenue-planner", "revenue-budget",
+    "revenue-cycle", "revenue-budget",
 })
 
 
@@ -49,5 +47,5 @@ def test_rpc_surface_matches():
 
 
 def test_expected_count():
-    # Post-Boltz retained RPC surface.
-    assert len(EXPECTED_RPC_METHODS) == 46
+    # Post-liquidity-executor retained RPC surface.
+    assert len(EXPECTED_RPC_METHODS) == 39

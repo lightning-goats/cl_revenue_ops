@@ -1,7 +1,7 @@
 # Public compatibility catalog (liquidity executors retired)
 
 What the refactor MUST keep working (refactor invariants 2 and 3).
-Pin test: `tests/test_rpc_surface_inventory.py` (46 retained methods).
+Pin test: `tests/test_rpc_surface_inventory.py` (39 retained methods).
 
 ## RPC surface
 
@@ -10,8 +10,7 @@ refactor.md Workstream I these become facades over projections):
 `revenue-status`, `revenue-fee-authority-status`, `revenue-fee-debug`,
 `revenue-rebalance-debug`,
 `revenue-config get|set`, `revenue-profitability`, `revenue-analyze`,
-`revenue-wake-all`, `revenue-dashboard`, `revenue-health`,
-planner diagnostics.
+`revenue-wake-all`, `revenue-dashboard`, `revenue-health`.
 
 Action/mutation RPCs (AGENTS.md list; execution-gated): see AGENTS.md
 "Action RPC warning".
@@ -19,19 +18,18 @@ Classification per method: `docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md`
 (header refreshed 2026-07-09; body dated 2026-05-20 — refresh during
 Workstream I).
 
-Full 46-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
+Full 39-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
 
-Phase C retained operator-surface dispatchers: `revenue-cycle <subsystem>`,
-`revenue-planner <view>`, `revenue-budget [section]`, and the `revenue-policy ban|unban|list-banned` actions are the
+Phase C retained operator-surface dispatchers: `revenue-cycle <subsystem>`, `revenue-budget [section]`, and the `revenue-policy ban|unban|list-banned` actions are the
 primary operator names.
 
 ## Config surface
 
-Owner: `modules/config.py` — a single `Config` dataclass (119 fields)
+Owner: `modules/config.py` — a single `Config` dataclass (102 fields)
 plus the `config_overrides` table (`revenue-config set` persists
 overrides; precedence documented in README.md §revenue-config).
 
-- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (45, listed below).
+- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (37, listed below).
 - Immutable at runtime: `db_path`, `dry_run` (`IMMUTABLE_CONFIG_KEYS` —
   dry_run is immutable so enabling it cannot HIDE actions).
 - The refactor's Workstream I risk-profile work must preserve every
@@ -61,7 +59,7 @@ dataclass is normative).
 
 ---
 
-### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 49)
+### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 37)
 
 - `paused`
 - `daily_budget_sats`
@@ -81,12 +79,6 @@ dataclass is normative).
 - `fee_market_boundary_margin_ratio`
 - `fee_market_boundary_max_downshift_ratio`
 - `fee_market_boundary_cache_seconds`
-- `planner_enabled`
-- `planner_dry_run`
-- `planner_execute_closes`
-- `planner_max_opens_per_cycle`
-- `planner_max_closes_per_cycle`
-- `planner_min_annual_roi_pct`
 - `capex_probability_budget_bonus`
 - `receivable_ratio_target`
 - `receivable_ratio_floor`
@@ -99,17 +91,15 @@ dataclass is normative).
 - `htlcmax_balanced_pct`
 - `econ_shadow_enabled` (added 2026-07-12, Phase 1 wiring)
 - `econ_governor_rebalance_enabled` (added 2026-07-12, Phase 2D)
-- `econ_governor_planner_enabled` (added 2026-07-12, Phase 2E)
 - `econ_governor_fees_enabled` (added 2026-07-12, Phase 2H)
 - `econ_arbiter_enabled` (added 2026-07-13, Phase 3F)
 - `econ_cycle_rebalance_enabled` (added 2026-07-13, Workstream H cutover)
-- `econ_cycle_planner_enabled` (added 2026-07-13, Workstream H cutover)
 - `econ_ev_populated` (added 2026-07-13, Phase E PR 6)
 - `econ_conflict_rules_extended` (added 2026-07-13, Phase G PR 10)
 - `authority_level` (added 2026-07-13, Phase 4 Workstream I; observe/fees/liquidity/capital, default `capital`)
 - `risk_profile` (added 2026-07-13, Phase D PR 7; default `custom`)
 
-### Full Config dataclass surface (119 fields with defaults)
+### Full Config dataclass surface (102 fields with defaults)
 
 | Field | Default | Runtime-settable |
 |---|---|---|
@@ -137,11 +127,9 @@ dataclass is normative).
 | `htlcmax_balanced_pct` | `0.45` | yes |
 | `econ_shadow_enabled` | `True` | yes |
 | `econ_governor_rebalance_enabled` | `True` | yes |
-| `econ_governor_planner_enabled` | `True` | yes |
 | `econ_governor_fees_enabled` | `True` | yes |
 | `econ_arbiter_enabled` | `True` | yes |
 | `econ_cycle_rebalance_enabled` | `True` | yes |
-| `econ_cycle_planner_enabled` | `True` | yes |
 | `econ_ev_populated` | `True` | yes |
 | `econ_conflict_rules_extended` | `True` | yes |
 | `authority_level` | `'capital'` | yes |
@@ -192,7 +180,6 @@ dataclass is normative).
 | `growth_budget_hard_ceiling_sats` | `10000` | yes |
 | `allow_zero_cost_auto_rebalance_when_budget_zero` | `False` |  |
 | `weekly_budget_sats` | `35000` | yes |
-| `diagnostic_rebalance_max_fee_sats` | `400` |  |
 | `min_wallet_reserve` | `1000000` |  |
 | `rpc_timeout_seconds` | `15` |  |
 | `reservation_timeout_hours` | `4` |  |
@@ -209,24 +196,10 @@ dataclass is normative).
 | `enable_vegas_reflex` | `True` |  |
 | `vegas_decay_rate` | `0.85` |  |
 | `thompson_prior_std_fee` | `100` |  |
-| `planner_enabled` | `False` | yes |
-| `planner_interval` | `21600` |  |
-| `planner_dry_run` | `False` | yes |
-| `planner_execute_closes` | `False` | yes |
-| `planner_max_opens_per_cycle` | `1` | yes |
-| `planner_max_closes_per_cycle` | `0` | yes |
-| `planner_close_fee_reserve_multiplier` | `2.0` |  |
-| `planner_close_fee_cap_sats` | `0` |  |
-| `planner_close_feerange_enabled` | `False` |  |
-| `planner_min_channel_sats` | `1000000` |  |
-| `planner_max_channel_sats` | `10000000` |  |
-| `planner_max_fee_rate_sat_vb` | `50.0` |  |
-| `planner_min_annual_roi_pct` | `1.0` | yes |
 | `capex_reinvestment_rate` | `0.5` |  |
 | `capex_bootstrap_bps` | `10` |  |
 | `capex_bootstrap_max_sats` | `200` |  |
 | `capex_grace_days` | `14` |  |
-| `capex_exploration_rate` | `0.1` |  |
 | `capex_global_envelope_sats` | `0` |  |
 | `capex_probability_budget_bonus` | `0.0` | yes |
 | `_version` | `0` |  |

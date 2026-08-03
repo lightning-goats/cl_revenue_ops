@@ -130,19 +130,6 @@ def test_golden_classify(name, roi, net, last, days, fwd):
     })
 
 
-def test_golden_classify_zombie_after_failed_defib():
-    """Underwater + inactive >=7d + 2 failed diagnostic attempts."""
-    analyzer = _analyzer(diag_stats={"attempt_count": 2,
-                                     "last_success_time": None})
-    result = analyzer._classify_channel(
-        -0.40, -8000, FROZEN_NOW - 86_400 * 30, 200,
-        channel_id="111x222x0", peer_id="02" + "a" * 64, forward_count=5,
-    )
-    golden_check("profitability/classify_zombie_after_failed_defib", {
-        "classification": result,
-    })
-
-
 def test_marginal_roi_hand_computed_anchor():
     prof = _make_prof()
     prof.marginal_profit_30d_sats = 500

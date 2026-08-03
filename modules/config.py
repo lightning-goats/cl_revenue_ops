@@ -48,12 +48,6 @@ PUBLIC_RUNTIME_KEYS = (
     'fee_market_boundary_margin_ratio',
     'fee_market_boundary_max_downshift_ratio',
     'fee_market_boundary_cache_seconds',
-    'planner_enabled',
-    'planner_dry_run',
-    'planner_execute_closes',
-    'planner_max_opens_per_cycle',
-    'planner_max_closes_per_cycle',
-    'planner_min_annual_roi_pct',
     # V3 router probability-aware budget relaxation (default 0.0 = off).
     # Exposed so operators running the askrene router can enable the
     # reliability-weighted budget bonus without editing code or the database.
@@ -85,7 +79,6 @@ PUBLIC_RUNTIME_KEYS = (
     'econ_governor_rebalance_enabled',
     # Refactor Phase 2E: planner open/close reservations gated by the
     # governor facade (same reserve_spend accounting). Default off.
-    'econ_governor_planner_enabled',
     # governor facade. Default off.
     # Refactor Phase 2H: automated fee broadcasts gated by the governor
     # (paused/stale + audit trail; zero-cost, no reservation). Manual
@@ -99,7 +92,6 @@ PUBLIC_RUNTIME_KEYS = (
     'econ_cycle_rebalance_enabled',
     # Workstream H cutover: planner close list passes through batch
     # arbitration (dedup + selection-time conflict arming). Default off.
-    'econ_cycle_planner_enabled',
     # through batch arbitration (dedup, ledgered). Default off.
     # PR 6 (gap-closure Phase E): populate real EV/confidence in intent
     # envelopes. CAUTION: flipping changes J3 batch-arbitration ORDER in
@@ -143,7 +135,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'growth_budget_experiment_fraction': float,
     'growth_budget_max_extra_sats': int,
     'growth_budget_hard_ceiling_sats': int,
-    'diagnostic_rebalance_max_fee_sats': int,
     'allow_zero_cost_auto_rebalance_when_budget_zero': bool,
     'weekly_budget_sats': int,
     'hot_channel_protection_enabled': bool,
@@ -164,11 +155,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'htlcmax_balanced_pct': float,
     'econ_shadow_enabled': bool,
     'econ_governor_rebalance_enabled': bool,
-    'econ_governor_planner_enabled': bool,
     'econ_governor_fees_enabled': bool,
     'econ_arbiter_enabled': bool,
     'econ_cycle_rebalance_enabled': bool,
-    'econ_cycle_planner_enabled': bool,
     'econ_ev_populated': bool,
     'econ_conflict_rules_extended': bool,
     'authority_level': str,
@@ -222,26 +211,12 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'source_threshold': float,
     'sink_threshold': float,
     # Capacity Planner
-    'planner_enabled': bool,
-    'planner_interval': int,
-    'planner_dry_run': bool,
-    'planner_execute_closes': bool,
-    'planner_max_opens_per_cycle': int,
-    'planner_max_closes_per_cycle': int,
-    'planner_close_fee_reserve_multiplier': float,
-    'planner_close_fee_cap_sats': int,
-    'planner_close_feerange_enabled': bool,
-    'planner_min_channel_sats': int,
-    'planner_max_channel_sats': int,
-    'planner_max_fee_rate_sat_vb': float,
-    'planner_min_annual_roi_pct': float,
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': float,
     'capex_bootstrap_bps': int,
     'capex_bootstrap_max_sats': int,
     'capex_grace_days': int,
     'capex_probability_budget_bonus': float,
-    'capex_exploration_rate': float,
     'capex_global_envelope_sats': int,
 }
 
@@ -274,12 +249,7 @@ SHADOWED_SETTING_GATES: Dict[str, tuple] = {
     ),
     # Phase B (2026-08-01 surface reduction, section 5.4): the structural
     # cycle — the exact shadow found in production.
-    # capacity_planner.run_cycle bails when planner_enabled is false, so the
     # per-cycle open/close limits are inert until the planner is on.
-    'planner_enabled': (
-        'planner_max_opens_per_cycle',
-        'planner_max_closes_per_cycle',
-    ),
 }
 
 # Reverse map for set-time shadowed-gate warnings on revenue-config set:
@@ -324,7 +294,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # Operator ruling D4: diagnostic fee cap must stay a small, bounded
     # diagnostic spend — never 0 (would disable the defibrillator envelope)
     # and never above 10k sats (a typo must not authorize huge spend).
-    'diagnostic_rebalance_max_fee_sats': (1, 10_000),
     'weekly_budget_sats': (0, 70_000_000),
     'receivable_ratio_target': (0.0, 1.0),
     'receivable_ratio_floor': (0.0, 1.0),
@@ -387,13 +356,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_small_channel_band_half_width': (0.0, 0.5),
     'estimated_open_cost_sats': (0, 1000000),
     # Capacity Planner
-    'planner_interval': (600, 604800),
-    'planner_max_opens_per_cycle': (0, 10),
-    'planner_max_closes_per_cycle': (0, 10),
-    'planner_min_channel_sats': (100000, 100000000),
-    'planner_max_channel_sats': (500000, 1677721500),
-    'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
-    'planner_min_annual_roi_pct': (0.0, 100.0),
     # Z-2 (2026-07-08): 0 disables the grace fallback entirely (immediate
     # release on hint staleness); ceiling is 30 days.
     # Unified Capex Budget Engine
@@ -401,7 +363,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'capex_bootstrap_bps': (0, 100),
     'capex_bootstrap_max_sats': (0, 10000),
     'capex_grace_days': (0, 90),
-    'capex_exploration_rate': (0.0, 1.0),
     'capex_probability_budget_bonus': (0.0, 1.0),
     'capex_global_envelope_sats': (0, 100_000_000),
 }
@@ -484,7 +445,6 @@ class Config:
     # docs/planning/2026-07-12-refactor-phase2-governed-rebalance.md).
     econ_governor_rebalance_enabled: bool = True
     # Refactor Phase 2E: governor-gated planner open/close reservations.
-    econ_governor_planner_enabled: bool = True
     # Refactor Phase 2H: governor-gated automated fee broadcasts.
     econ_governor_fees_enabled: bool = True
     # Refactor Phase 3F: live governor-boundary arbitration.
@@ -492,7 +452,6 @@ class Config:
     # Workstream H: cycle-arbitrated rebalance execution list.
     econ_cycle_rebalance_enabled: bool = True
     # Workstream H: cycle-arbitrated planner close list.
-    econ_cycle_planner_enabled: bool = True
     econ_ev_populated: bool = True
     econ_conflict_rules_extended: bool = True
     # Phase 4: global authority level (observe|fees|liquidity|capital).
@@ -651,7 +610,6 @@ class Config:
     # knob. Default 400 covers observed market route prices (118-363 sats)
     # that the old hardcoded 100-sat envelope rejected route_over_budget.
     # At use it is clamped to [1, min(daily_budget_sats, 10_000)].
-    diagnostic_rebalance_max_fee_sats: int = 400
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
 
     # RPC Hardening
@@ -708,30 +666,11 @@ class Config:
     # Routing Intelligence Integration
     # ==========================================================================
 
-    # Capacity Planner
-    planner_enabled: bool = False
-    planner_interval: int = 21600               # 6 hours
-    planner_dry_run: bool = False
-    planner_execute_closes: bool = False
-    planner_max_opens_per_cycle: int = 1
-    planner_max_closes_per_cycle: int = 0
-    planner_close_fee_reserve_multiplier: float = 2.0
-    planner_close_fee_cap_sats: int = 0
-    planner_close_feerange_enabled: bool = False
-    # Phase B (2026-08-01 surface reduction): 500k -> 1M. Sub-1M opens
-    # rarely clear chain-cost ROI; production runs 2M. The CLN option
-    # revenue-ops-planner-min-channel-sats feeds this at plugin init and
-    # shares this default.
-    planner_min_channel_sats: int = 1000000     # 1M sats
-    planner_max_channel_sats: int = 10000000    # 10M sats
-    planner_max_fee_rate_sat_vb: float = 50.0
-    planner_min_annual_roi_pct: float = 1.0
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50       # Fraction of channel contribution for all capex
     capex_bootstrap_bps: int = 10               # Bootstrap: basis points of capacity per 30d
     capex_bootstrap_max_sats: int = 200         # Bootstrap cap per channel per 30d
     capex_grace_days: int = 14                  # Days before bootstrap activates
-    capex_exploration_rate: float = 0.10        # Fleet contribution fraction for opens/growth
     capex_global_envelope_sats: int = 0         # Global cap (0 = auto-computed)
     # Probability-aware budget relaxation. When a router reports a route
     # probability (v3/askrene does; v2/getroute returns 0), the engine allows
@@ -918,14 +857,6 @@ class Config:
         # silently disables ALL automated opens. Repair upward (max rises
         # to min) for the same reason as the fee rails: the operator's
         # stated minimum viable size is honored and only the cap widens.
-        if self.planner_min_channel_sats > self.planner_max_channel_sats:
-            self._override_warnings.append(
-                f"Contradictory settings: planner_min_channel_sats "
-                f"({self.planner_min_channel_sats}) > "
-                f"planner_max_channel_sats "
-                f"({self.planner_max_channel_sats}); repaired "
-                f"planner_max_channel_sats to {self.planner_min_channel_sats}")
-            self.planner_max_channel_sats = self.planner_min_channel_sats
         return list(self._override_warnings)
 
     def _detect_shadowed_and_deprecated(self, explicit_keys: set) -> None:
@@ -1089,10 +1020,6 @@ class Config:
                 return {"error": f"weekly_budget_sats ({typed_value}) cannot be less than current daily_budget_sats ({self.daily_budget_sats})"}
             # Phase B (section 5.2): a crossed planner channel-size band
             # silently disables all automated opens — reject it at set-time.
-            if key == 'planner_min_channel_sats' and typed_value > self.planner_max_channel_sats:
-                return {"error": f"planner_min_channel_sats ({typed_value}) cannot exceed current planner_max_channel_sats ({self.planner_max_channel_sats})"}
-            if key == 'planner_max_channel_sats' and typed_value < self.planner_min_channel_sats:
-                return {"error": f"planner_max_channel_sats ({typed_value}) cannot be less than current planner_min_channel_sats ({self.planner_min_channel_sats})"}
 
             old_value = getattr(self, key)
 
@@ -1274,28 +1201,13 @@ class ConfigSnapshot:
     weekly_budget_sats: int = 35000
 
     # Diagnostic (defibrillator) shock fee cap — operator ruling D4
-    diagnostic_rebalance_max_fee_sats: int = 400
 
     # Capacity Planner
-    planner_enabled: bool = False
-    planner_interval: int = 21600
-    planner_dry_run: bool = False
-    planner_execute_closes: bool = False
-    planner_max_opens_per_cycle: int = 1
-    planner_max_closes_per_cycle: int = 0
-    planner_close_fee_reserve_multiplier: float = 2.0
-    planner_close_fee_cap_sats: int = 0
-    planner_close_feerange_enabled: bool = False
-    planner_min_channel_sats: int = 1000000
-    planner_max_channel_sats: int = 10000000
-    planner_max_fee_rate_sat_vb: float = 50.0
-    planner_min_annual_roi_pct: float = 1.0
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50
     capex_bootstrap_bps: int = 10
     capex_bootstrap_max_sats: int = 200
     capex_grace_days: int = 14
-    capex_exploration_rate: float = 0.10
     capex_global_envelope_sats: int = 0
     capex_probability_budget_bonus: float = 0.0
     # Structural loop-out / drain-demand fields
@@ -1314,11 +1226,9 @@ class ConfigSnapshot:
     # snapshot reads as absent in production). Phase B: default TRUE.
     econ_shadow_enabled: bool = True
     econ_governor_rebalance_enabled: bool = True
-    econ_governor_planner_enabled: bool = True
     econ_governor_fees_enabled: bool = True
     econ_arbiter_enabled: bool = True
     econ_cycle_rebalance_enabled: bool = True
-    econ_cycle_planner_enabled: bool = True
     econ_ev_populated: bool = True
     econ_conflict_rules_extended: bool = True
     authority_level: str = "capital"

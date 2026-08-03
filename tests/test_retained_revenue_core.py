@@ -52,7 +52,7 @@ def test_read_only_surfaces_degrade_without_mutation(name, kwargs, monkeypatch):
     for attr in (
         "database", "config", "fee_controller", "rebalancer",
         "profitability_analyzer", "policy_manager", "capex_engine",
-        "data_service", "capacity_planner",
+        "data_service",
     ):
         monkeypatch.setattr(mod, attr, None)
     mutation_names = (
@@ -142,6 +142,53 @@ def test_ordinary_rebalance_reserves_daily_weekly_and_global_rails_atomically():
     assert kwargs["budget_limit"] == 1_000
     assert kwargs["weekly_budget_limit"] == 35_000
     assert kwargs["channel_id"] == "200x1x0"
+
+
+def test_ordinary_rebalance_reaches_executor_after_authority_and_budget_pass():
+    from modules.rebalance_executor_v2 import ExecutionResult
+
+    engine = _governed_engine()
+    engine._policy_manager = MagicMock()
+    engine._policy_manager.get_policy.return_value = SimpleNamespace(
+        strategy="dynamic", rebalance_mode="enabled"
+    )
+    engine._record_rebalance_pending = MagicMock(return_value=7)
+    engine._execution_kwargs = MagicMock(return_value={"route": ["priced"]})
+    engine._retry_native_pair_with_exclusions = lambda pair, executor, result: result
+    engine._retry_native_pair_with_partial_amounts = lambda pair, executor, result: result
+    engine._record_rebalance_result = MagicMock()
+    engine._finish_execution_budget = MagicMock()
+    executor = MagicMock()
+    executor.execute.return_value = ExecutionResult(
+        success=False, amount_sats=50_000, error="no route"
+    )
+
+    result = engine._execute_pair(
+        _pair(), executor, reserve_budget=True, account_costs=True
+    )
+
+    assert result.error == "no route"
+    executor.execute.assert_called_once_with(route=["priced"])
+    engine.database.reserve_budget.assert_called_once()
+
+
+def test_duplicate_rebalance_reservation_cannot_reserve_twice(tmp_path):
+    db = _database(tmp_path)
+    now = int(time.time())
+    first = db.reserve_budget(
+        reservation_id="same-rebalance", amount_sats=100,
+        channel_id="200x1x0", budget_limit=1_000,
+        since_timestamp=now - 86_400,
+    )
+    second = db.reserve_budget(
+        reservation_id="same-rebalance", amount_sats=100,
+        channel_id="200x1x0", budget_limit=1_000,
+        since_timestamp=now - 86_400,
+    )
+
+    assert first[0] is True
+    assert second[0] is True  # idempotent retry, not a second hold
+    assert db.get_daily_rebalance_spend()["total_reserved_sats"] == 100
 
 
 def test_ordinary_rebalance_policy_gate_fails_closed():

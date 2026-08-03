@@ -2809,33 +2809,6 @@ class Database:
         except Exception:
             return None
 
-    def get_diagnostic_rebalance_stats(self, channel_id: str, days: int = 14) -> Dict[str, Any]:
-        """
-        Get stats for diagnostic rebalance attempts for a channel.
-        
-        Args:
-            channel_id: The destination channel SCID
-            days: Lookback window in days
-            
-        Returns:
-            Dict with count and last_success_time
-        """
-        conn = self._get_connection()
-        since = int(time.time()) - (days * 86400)
-        
-        row = conn.execute("""
-            SELECT 
-                COUNT(*) as attempt_count,
-                MAX(CASE WHEN status = 'success' THEN timestamp ELSE 0 END) as last_success
-            FROM rebalance_history 
-            WHERE to_channel = ? AND rebalance_type = 'diagnostic' AND timestamp >= ?
-        """, (channel_id, since)).fetchone()
-        
-        return {
-            "attempt_count": int(row['attempt_count']) if row else 0,
-            "last_success_time": int(row['last_success']) if row and row['last_success'] and row['last_success'] > 0 else None
-        }
-    
     def get_total_rebalance_fees(self, since_timestamp: int) -> int:
         """
         Get the total rebalancing fees spent since a given timestamp.
@@ -7539,127 +7512,6 @@ class Database:
             raise
     
     # =========================================================================
-    # Capacity Planner
-    # =========================================================================
-
-    def record_planner_candidate(self, peer_id: str, score: float, source: str,
-                                  capacity_recommendation_sats: int = None,
-                                  metadata: dict = None) -> None:
-        """Record or update a planner candidate peer."""
-        conn = self._get_connection()
-        conn.execute("""
-            INSERT OR REPLACE INTO planner_candidates
-            (peer_id, score, source, last_evaluated, capacity_recommendation_sats, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (peer_id, score, source, int(time.time()),
-              capacity_recommendation_sats,
-              json.dumps(metadata) if metadata else None))
-
-    def get_planner_candidates(self, min_score: float = -999.0, source: str = None,
-                                limit: int = 32) -> List[Dict[str, Any]]:
-        """Get planner candidates, optionally filtered by score and source."""
-        conn = self._get_connection()
-        if source:
-            rows = conn.execute("""
-                SELECT * FROM planner_candidates
-                WHERE score >= ? AND source = ?
-                ORDER BY score DESC LIMIT ?
-            """, (min_score, source, limit)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT * FROM planner_candidates
-                WHERE score >= ?
-                ORDER BY score DESC LIMIT ?
-            """, (min_score, limit)).fetchall()
-        return [dict(row) for row in rows]
-
-    def update_candidate_score(self, peer_id: str, delta: float) -> None:
-        """Increment a candidate's score by delta."""
-        conn = self._get_connection()
-        conn.execute("""
-            UPDATE planner_candidates SET score = score + ?, last_evaluated = ?
-            WHERE peer_id = ?
-        """, (delta, int(time.time()), peer_id))
-
-    def delete_planner_candidate(self, peer_id: str) -> None:
-        """Remove a candidate from the pool."""
-        conn = self._get_connection()
-        conn.execute("DELETE FROM planner_candidates WHERE peer_id = ?", (peer_id,))
-
-    def record_planner_action(self, action_type: str, peer_id: str,
-                               amount_sats: int = None, estimated_cost_sats: int = None,
-                               reason: str = None, channel_id: str = None,
-                               metadata: dict = None) -> int:
-        """Record a planner action and return its id."""
-        conn = self._get_connection()
-        cursor = conn.execute("""
-            INSERT INTO planner_actions
-            (action_type, peer_id, channel_id, amount_sats, estimated_cost_sats,
-             status, created_at, reason, metadata_json)
-            VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?)
-        """, (action_type, peer_id, channel_id, amount_sats, estimated_cost_sats,
-              int(time.time()), reason,
-              json.dumps(metadata) if metadata else None))
-        return cursor.lastrowid
-
-    def update_planner_action(self, action_id: int, status: str = None,
-                               actual_cost_sats: int = None, channel_id: str = None,
-                               completed_at: int = None) -> None:
-        """Update a planner action's status and/or cost."""
-        conn = self._get_connection()
-        updates = []
-        params = []
-        if status is not None:
-            updates.append("status = ?")
-            params.append(status)
-        if actual_cost_sats is not None:
-            updates.append("actual_cost_sats = ?")
-            params.append(actual_cost_sats)
-        if channel_id is not None:
-            updates.append("channel_id = ?")
-            params.append(channel_id)
-        if completed_at is not None:
-            updates.append("completed_at = ?")
-            params.append(completed_at)
-        elif status in ("completed", "failed"):
-            updates.append("completed_at = ?")
-            params.append(int(time.time()))
-        if updates:
-            params.append(action_id)
-            conn.execute(f"UPDATE planner_actions SET {', '.join(updates)} WHERE id = ?", params)
-
-    def get_planner_action(self, action_id: int) -> Optional[Dict[str, Any]]:
-        """Get a single planner action by id."""
-        conn = self._get_connection()
-        row = conn.execute("SELECT * FROM planner_actions WHERE id = ?", (action_id,)).fetchone()
-        return dict(row) if row else None
-
-    def get_planner_actions(self, status: str = None, limit: int = 20) -> List[Dict[str, Any]]:
-        """Get planner actions, optionally filtered by status."""
-        conn = self._get_connection()
-        if status:
-            rows = conn.execute("""
-                SELECT * FROM planner_actions WHERE status = ?
-                ORDER BY created_at DESC LIMIT ?
-            """, (status, limit)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT * FROM planner_actions
-                ORDER BY created_at DESC LIMIT ?
-            """, (limit,)).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_recent_planner_actions(self, peer_id: str, hours: int = 24) -> List[Dict[str, Any]]:
-        """Get recent planner actions for a peer (for cooldown checks)."""
-        conn = self._get_connection()
-        since = int(time.time()) - (hours * 3600)
-        rows = conn.execute("""
-            SELECT * FROM planner_actions
-            WHERE peer_id = ? AND created_at >= ?
-            ORDER BY created_at DESC
-        """, (peer_id, since)).fetchall()
-        return [dict(row) for row in rows]
-
     def get_dead_capital_stages(self) -> Dict[str, Dict[str, Any]]:
         """Return dead-capital stage rows keyed by channel id."""
         conn = self._get_connection()
@@ -7674,22 +7526,6 @@ class Database:
             }
             for row in rows
         }
-
-    def upsert_dead_capital_stage(self, channel_id: str, stage: str, entered_at: int) -> None:
-        """Insert or update dead-capital stage state for a channel."""
-        conn = self._get_connection()
-        conn.execute("""
-            INSERT INTO dead_capital_stage (channel_id, stage, entered_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(channel_id) DO UPDATE SET
-                stage = excluded.stage,
-                entered_at = excluded.entered_at
-        """, (channel_id, stage, entered_at))
-
-    def delete_dead_capital_stage(self, channel_id: str) -> None:
-        """Delete dead-capital stage state for a channel."""
-        conn = self._get_connection()
-        conn.execute("DELETE FROM dead_capital_stage WHERE channel_id = ?", (channel_id,))
 
     # =========================================================================
     # Mempool Fee History Methods (Vegas Reflex)
@@ -7731,67 +7567,6 @@ class Database:
         ).fetchone()
         return row['avg_fee'] if row and row['avg_fee'] else 1.0
     
-    def create_recycle_op(self, close_scid: str, close_peer_id: str,
-                          open_peer_id: str, open_amount_sats: int,
-                          recycle_ev_sats: int, funding_source: str = "close") -> int:
-        """Create a new recycle operation. Returns the operation ID."""
-        conn = self._get_connection()
-        cursor = conn.execute(
-            """INSERT INTO planner_recycle_ops
-               (close_scid, close_peer_id, open_peer_id, open_amount_sats,
-                recycle_ev_sats, funding_source, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending_close', ?)""",
-            (close_scid, close_peer_id, open_peer_id, open_amount_sats,
-             recycle_ev_sats, funding_source, int(time.time())),
-        )
-        return cursor.lastrowid
-
-    def get_pending_recycle_op(self) -> dict | None:
-        """Get the active (non-terminal) recycle operation, if any."""
-        conn = self._get_connection()
-        row = conn.execute(
-            """SELECT * FROM planner_recycle_ops
-               WHERE status IN ('pending_close', 'pending_open')
-               ORDER BY created_at DESC LIMIT 1"""
-        ).fetchone()
-        if row:
-            return dict(row)
-        return None
-
-    def update_recycle_op(self, op_id: int, status: str = None,
-                          close_action_id: int = None,
-                          open_action_id: int = None):
-        """Update a recycle operation's status and action IDs."""
-        conn = self._get_connection()
-        updates = []
-        params = []
-        if status:
-            updates.append("status = ?")
-            params.append(status)
-            if status in ("completed", "failed", "expired"):
-                updates.append("completed_at = ?")
-                params.append(int(time.time()))
-        if close_action_id is not None:
-            updates.append("close_action_id = ?")
-            params.append(close_action_id)
-        if open_action_id is not None:
-            updates.append("open_action_id = ?")
-            params.append(open_action_id)
-        if updates:
-            params.append(op_id)
-            conn.execute(
-                f"UPDATE planner_recycle_ops SET {', '.join(updates)} WHERE id = ?",
-                params,
-            )
-
-    def increment_recycle_cycles_waited(self, op_id: int):
-        """Increment the cycles_waited counter for a recycle operation."""
-        conn = self._get_connection()
-        conn.execute(
-            "UPDATE planner_recycle_ops SET cycles_waited = cycles_waited + 1 WHERE id = ?",
-            (op_id,),
-        )
-
     # ------------------------------------------------------------------
     # Policy CRUD (replaces direct SQL in policy_manager.py)
     # ------------------------------------------------------------------

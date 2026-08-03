@@ -2,17 +2,16 @@
 
 Generator: `tools/conformance/generate_scenarios.py` (deterministic; regenerating must be byte-identical). Validation: `tools/conformance/validate_fixtures.py` — no plugin imports. Golden-derived cases copy fixture bytes verbatim; generated cases are produced BY the reference implementation.
 
-Scenario classes: 35/40. Documented gaps: 0 (listed last — these are honest holes with pointers, not silent omissions).
+Scenario classes: 31/40. Documented gaps: 0 (listed last — these are honest holes with pointers, not silent omissions).
 
 | # Scenario | Category | Requirement | Source | Files |
 |---|---|---|---|---|
 | `01-ordinary-profitable-channel` | classification | DoD 1/9: profitable classification from routing evidence | tests/golden/fixtures/profitability/classify_young_profitable.json | case.json |
-| `02-source-gateway-protection` | classification | F5: inbound-gateway channels protected from closure | tests/golden/fixtures/close_protection/gateway_30d_protected.json | case.json |
+| `02-source-gateway-classification` | classification | Retained reporting: inbound-gateway role derives from 30d sourced flow | tests/golden/fixtures/profitability/role30d_gateway_30d_dominant_sourced.json | case.json |
 | `03-sink-depletion` | rebalance_mode | F4: depleted profitable destinations preferred for refill | tests/golden/fixtures/rebalance/plan_profitable_dest_preferred.json | case.json |
 | `04-balanced-channel` | classification | Workstream A: BALANCED role from 30d flow evidence | tests/golden/fixtures/profitability/role30d_balanced_30d.json | case.json |
 | `05-underwater-classification` | classification | Workstream A: negative marginal ROI (underwater) | tests/golden/fixtures/profitability/marginal_roi_negative_profit.json | case.json |
 | `06-stagnant-candidate` | classification | Workstream A: stagnant classification | tests/golden/fixtures/profitability/classify_old_loser_stagnant.json | case.json |
-| `07-zombie-classification` | classification | Workstream A: zombie after failed defibrillation | tests/golden/fixtures/profitability/classify_zombie_after_failed_defib.json | case.json |
 | `08-fee-rail` | fee_stage | ADR-001 stage 1 (rails): fee floor | tests/golden/fixtures/fee/floor_defaults_no_chain_costs.json | case.json |
 | `09-fee-rate-limit` | fee_stage | ADR-001 stage 2 (rate_limit): per-cycle delta cap | tests/golden/fixtures/fee/damping_large_raise_clamped.json | case.json |
 | `10-fee-deadband` | fee_stage | ADR-001 stage 3 (deadband): no-op suppression | tests/golden/fixtures/fee/damping_no_change.json | case.json |
@@ -21,10 +20,7 @@ Scenario classes: 35/40. Documented gaps: 0 (listed last — these are honest ho
 | `13-dynamic-htlcmax` | admission | F3: dynamic htlc_max admission control | tests/golden/fixtures/htlcmax/balanced_mid_share.json | case.json |
 | `14-hot-channel-priority` | rebalance_mode | F4 table: hot-channel protection outranks normal redistribution as priority data, not a separate path | generated | case.json |
 | `15-normal-rebalance` | rebalance_mode | F4: one planner; chunk-bounded amounts | tests/golden/fixtures/rebalance/plan_amount_bounded_by_chunk.json | case.json |
-| `17-manual-diagnostic-rebalance` | rebalance_mode | F4 + contradiction #7: manual is operator-directed; diagnostic is a BOUNDED spend (evidence purchase), not free | generated | case.json |
-| `18-conflicting-close-rebalance` | arbitration | J3/spec conflict rule: rebalance into a channel scheduled for closure is rejected (CONFLICT_CLOSE_REBALANCE) | generated | case.json |
-| `19-protected-close-rejection` | authorization | F5: protection tags veto closure before any intent exists | tests/golden/fixtures/close_protection/allowed_protect_tag_blocks.json | case.json |
-| `20-duplicate-open-priority` | arbitration | Duplicate OPEN_CHANNEL intents to one peer are deduplicated; the higher-priority intent wins | generated | case.json |
+| `17-manual-rebalance` | rebalance_mode | F4: manual rebalance remains operator-directed and caller-accounted | generated | case.json |
 | `22-budget-exhaustion` | authorization | DoD 4/5: refused reservation -> BUDGET_EXHAUSTED, no spend | generated | case.json |
 | `23-concurrent-reservation-contention` | reservation | DoD 5: atomic reservations cannot jointly oversubscribe | generated | case.json |
 | `24-restart-outstanding-reservation` | reservation | DoD 5: reservations survive restart (durable store) | generated | case.json |

@@ -5,7 +5,6 @@ The adapter set is now EXPLICIT:
   plus its execution arm modules/rebalance_native_executor_v2.py (the
   timeout-managed sendpay pipeline — part of the adapter boundary, not
   a bypass).
-- Boltz adapter: modules/boltz_manager.py (boltzcli subprocess).
 
 Policy/decision modules must stay pure of the execution surface. The
 mutating-verb inventory itself is pinned by
@@ -19,7 +18,6 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 PURE_POLICY_MODULES = [
     "modules/classification.py",
     "modules/admission_policy.py",
-    "modules/protection_service.py",
     "modules/rebalance_modes.py",
     "modules/rebalance_planner_v2.py",
     "modules/rebalance_state_v2.py",
@@ -51,9 +49,8 @@ def test_cln_adapter_does_not_retain_lnplus_only_surfaces():
 
 
 def test_external_adapters_do_not_leak_wire_formats():
-    """The Boltz manager may parse boltzcli output; nothing outside that
-    adapter may invoke boltzcli or the retired LN+ HTTP base URL."""
-    adapter_files = {"boltz_manager.py"}
+    """Retired external liquidity adapters must not reappear in runtime modules."""
+    adapter_files = set()
     for path in sorted((REPO / "modules").glob("*.py")):
         if path.name in adapter_files:
             continue

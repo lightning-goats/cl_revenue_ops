@@ -32,13 +32,8 @@ def _option_literals(prefix: str) -> set[str]:
     return set(re.findall(rf'["\']({re.escape(prefix)}[a-z0-9-]+)["\']', sources))
 
 
-def test_remaining_retiring_module_roots_are_present_at_characterization_checkpoint():
-    expected = {"planner", "demand_flow", "protection"}
-    actual = {
-        name for name, path in RETIRED_MODULES.items()
-        if name not in {"lnplus", "boltz"} and path.is_file()
-    }
-    assert actual == expected
+def test_all_retired_module_roots_are_absent():
+    assert not {name for name, path in RETIRED_MODULES.items() if path.exists()}
 
 
 def test_lnplus_module_and_import_are_absent():
@@ -46,9 +41,9 @@ def test_lnplus_module_and_import_are_absent():
     assert "modules.lnplus_swaps" not in PLUGIN.read_text(encoding="utf-8")
 
 
-def test_remaining_retired_rpc_and_option_families_are_nonempty():
-    assert _registered_rpcs("revenue-planner-")
-    assert _option_literals("revenue-ops-planner-")
+def test_planner_rpc_and_option_families_are_absent():
+    assert not _registered_rpcs("revenue-planner-")
+    assert not _option_literals("revenue-ops-planner-")
 
 
 def test_lnplus_rpc_and_option_families_are_absent():
@@ -56,14 +51,17 @@ def test_lnplus_rpc_and_option_families_are_absent():
     assert not _option_literals("revenue-ops-lnplus-")
 
 
-def test_direct_mutation_verbs_have_the_expected_owner():
-    expected = {
-        "planner": ("fund_channel", "close_channel", "diagnostic_rebalance"),
-    }
-    for owner, symbols in expected.items():
-        source = RETIRED_MODULES[owner].read_text(encoding="utf-8")
-        for symbol in symbols:
-            assert symbol in source, f"{owner} lost audited mutation symbol {symbol}"
+def test_planner_channel_mutation_symbols_are_absent_from_live_sources():
+    sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in [PLUGIN, *sorted((ROOT / "modules").glob("*.py"))]
+    )
+    for symbol in (
+        "CapacityPlanner", "revenue-planner-", "revenue-ops-planner-",
+        "diagnostic_rebalance", "def fund_channel(", "def close_channel(",
+        'rpc.call("fundchannel"', 'rpc.call("close"',
+    ):
+        assert symbol not in sources
 
 
 def test_boltz_module_rpc_options_and_writers_are_absent():

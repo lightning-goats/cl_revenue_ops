@@ -135,9 +135,9 @@ def s01():
 
 def s02():
     return {"case.json": _from_golden(
-        "source-gateway-protection", "classification",
-        "close_protection/gateway_30d_protected.json",
-        "F5: inbound-gateway channels protected from closure")}
+        "source-gateway-classification", "classification",
+        "profitability/role30d_gateway_30d_dominant_sourced.json",
+        "Retained reporting: inbound-gateway role derives from 30d sourced flow")}
 
 
 def s03():
@@ -168,13 +168,6 @@ def s06():
         "stagnant-candidate", "classification",
         "profitability/classify_old_loser_stagnant.json",
         "Workstream A: stagnant classification")}
-
-
-def s07():
-    return {"case.json": _from_golden(
-        "zombie-classification", "classification",
-        "profitability/classify_zombie_after_failed_defib.json",
-        "Workstream A: zombie after failed defibrillation")}
 
 
 def s08():
@@ -263,54 +256,13 @@ def s15():
 
 def s17():
     manual = MODES["manual"]
-    diagnostic = MODES["diagnostic"]
     return {"case.json": _case(
-        "manual-and-diagnostic-modes", "rebalance_mode",
-        {"modes": ["manual", "diagnostic"]},
+        "manual-rebalance-mode", "rebalance_mode",
+        {"modes": ["manual"]},
         {"manual": {"priority": manual.priority,
-                    "operator_directed": True},
-         "diagnostic": {"priority": diagnostic.priority,
-                        "bounded_spend": True}},
-        "F4 + contradiction #7: manual is operator-directed; "
-        "diagnostic is a BOUNDED spend (evidence purchase), not free")}
-
-
-def s18():
-    close = _env(intent_type="CLOSE_CHANNEL", target="111x222x0",
-                 amount=0, max_cost=0, bucket="channel_open", priority=60)
-    reb = _env(intent_type="REBALANCE", target="111x222x0")
-    result = arbitrate([close, reb], now=NOW)
-    return {"case.json": _case(
-        "conflicting-close-and-rebalance", "arbitration",
-        {"intents": [to_wire(close), to_wire(reb)]},
-        _arb_wire(result),
-        "J3/spec conflict rule: rebalance into a channel scheduled "
-        "for closure is rejected (CONFLICT_CLOSE_REBALANCE)")}
-
-
-def s19():
-    return {"case.json": _from_golden(
-        "protected-close-rejection", "authorization",
-        "close_protection/allowed_protect_tag_blocks.json",
-        "F5: protection tags veto closure before any intent exists")}
-
-
-def s20():
-    higher = _env("OPEN_CHANNEL", target="02" + "b" * 64,
-                  amount=2_000_000, priority=80, bucket="channel_open",
-                  policy="operator_contract")
-    lower = _env("OPEN_CHANNEL", target="02" + "b" * 64,
-                 amount=1_000_000, priority=50, bucket="channel_open",
-                 policy="automated_growth")
-    result = arbitrate([lower, higher], now=NOW, extended_rules=True)
-    return {"case.json": _case(
-        "duplicate-open-priority-conflict", "arbitration",
-        {"intents": [to_wire(lower), to_wire(higher)],
-         "extended_rules": True},
-        _arb_wire(result),
-        "Duplicate OPEN_CHANNEL intents to one peer are deduplicated; "
-        "the higher-priority intent wins",
-        notes=["Gated by econ_conflict_rules_extended."])}
+                    "operator_directed": True,
+                    "accounting_owner": manual.accounting_owner}},
+        "F4: manual rebalance remains operator-directed and caller-accounted")}
 
 
 def s22():
@@ -607,12 +559,11 @@ def s40():
 
 SCENARIOS = {
     "01-ordinary-profitable-channel": s01,
-    "02-source-gateway-protection": s02,
+    "02-source-gateway-classification": s02,
     "03-sink-depletion": s03,
     "04-balanced-channel": s04,
     "05-underwater-classification": s05,
     "06-stagnant-candidate": s06,
-    "07-zombie-classification": s07,
     "08-fee-rail": s08,
     "09-fee-rate-limit": s09,
     "10-fee-deadband": s10,
@@ -621,10 +572,7 @@ SCENARIOS = {
     "13-dynamic-htlcmax": s13,
     "14-hot-channel-priority": s14,
     "15-normal-rebalance": s15,
-    "17-manual-diagnostic-rebalance": s17,
-    "18-conflicting-close-rebalance": s18,
-    "19-protected-close-rejection": s19,
-    "20-duplicate-open-priority": s20,
+    "17-manual-rebalance": s17,
     "22-budget-exhaustion": s22,
     "23-concurrent-reservation-contention": s23,
     "24-restart-outstanding-reservation": s24,

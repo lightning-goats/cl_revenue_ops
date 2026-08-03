@@ -18,9 +18,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 MODULES = {
     "fee": "modules/fee_controller.py",
     "rebalance": "modules/rebalance_engine_v2.py",
-    "planner": "modules/capacity_planner.py",
     "admission": "modules/admission_policy.py",
-    "protection": "modules/protection_service.py",
     "profitability": "modules/profitability_analyzer.py",
     "treasury": "modules/capex_budget.py",
 }
@@ -65,34 +63,17 @@ PINNED_COUNTS = {
     # reconcile atomic branch) — execution timestamping, same class as the
     # legacy sites they mirror; classified in the audit doc.
     ("rebalance", "wall_clock"): 13,
-    ("planner", "analyzer_cache"): 6,
-    # 3b: 24 -> 20 (dead _has_direct_peer_channel/_is_peer_connected
-    # removed; 4 live-RPC sites gone)
-    # 20 -> 22 (2026-08-01, task 26): _probe_peer_channels adds two
-    # listpeerchannels read sites (data_service arm + raw-rpc arm) for the
-    # unknown-outcome guard. DELIBERATELY live, not snapshot: the probe's
-    # whole purpose is to measure CURRENT node state after a
-    # fundchannel/close exception whose outcome is unknown — a pre-exception
-    # snapshot is exactly the thing that cannot answer. Classified in
-    # docs/refactor/phase0/snapshot-dependency-audit.md.
-    ("planner", "live_rpc"): 22,
-    ("planner", "database"): 11,
-    ("planner", "wall_clock"): 10,
     ("admission", "analyzer_cache"): 0,
     ("admission", "live_rpc"): 0,
     ("admission", "database"): 0,
     ("admission", "wall_clock"): 0,
-    ("protection", "analyzer_cache"): 0,
-    ("protection", "live_rpc"): 0,
-    ("protection", "database"): 0,
-    ("protection", "wall_clock"): 0,
     ("profitability", "analyzer_cache"): 0,
     ("profitability", "live_rpc"): 5,
-    ("profitability", "database"): 28,
-    ("profitability", "wall_clock"): 24,
+    ("profitability", "database"): 27,
+    ("profitability", "wall_clock"): 23,
     ("treasury", "analyzer_cache"): 0,
     ("treasury", "live_rpc"): 0,
-    ("treasury", "database"): 4,
+    ("treasury", "database"): 3,
     ("treasury", "wall_clock"): 0,
 }
 
@@ -122,9 +103,9 @@ def test_mutable_read_counts_pinned(module, category):
     )
 
 
-def test_admission_and_protection_stay_pure():
-    """The two already-pure policy modules must never regress."""
-    for module in ("admission", "protection"):
+def test_admission_stays_pure():
+    """The retained pure admission policy module must never regress."""
+    for module in ("admission",):
         for category in PATTERNS:
             assert PINNED_COUNTS[(module, category)] == 0
             assert _count(REPO / MODULES[module], PATTERNS[category]) == 0
@@ -138,9 +119,6 @@ def test_synthetic_snapshot_ids_still_present_until_migrated():
         # 3a DONE: rebalance threads real snapshot refs; the synthetic
         # label survives only as the documented fail-open FALLBACK.
         "modules/rebalance_engine_v2.py": 'or f"rebalance-cycle-',
-        # 3b DONE: planner threads real snapshot refs; synthetic label
-        # survives only as the fail-open fallback.
-        "modules/capacity_planner.py": 'or f"planner-cycle-',
     }
     for rel, marker in expected.items():
         assert marker in (REPO / rel).read_text(), (

@@ -2746,35 +2746,7 @@ class ChannelProfitabilityAnalyzer:
         else:
             days_inactive = days_open  # Never routed
         
-        # 1. Check for ZOMBIE (refinement with Defibrillator logic)
-        # Requirement: Underwater AND inactive AND (at least 2 diagnostic attempts in 14 days)
-        # If there are no diagnostic attempts, it's just UNDERWATER or STAGNANT_CANDIDATE
-        if channel_id and roi < self.UNDERWATER_ROI_THRESHOLD:
-            diag_stats = self.database.get_diagnostic_rebalance_stats(channel_id, days=14)
-            
-            # --- FIX FOR NoneType CRASH STARTS HERE ---
-            attempt_count = diag_stats.get("attempt_count", 0)
-            last_success_time = diag_stats.get("last_success_time") or 0 # Explicitly use 0 if None
-            
-            if attempt_count >= 2:
-                if last_success_time > 0:
-                    hours_since_diag_success = (int(time.time()) - last_success_time) // 3600
-                    
-                    # If it succeeded but still didn't route in 48h, it's a zombie
-                    if hours_since_diag_success > 48 and (not last_routed or last_routed < last_success_time):
-                        return ProfitabilityClass.ZOMBIE
-                elif last_success_time == 0:
-                    # No success in 2+ attempts — but only ZOMBIE if truly inactive
-                    if days_inactive >= 7:
-                        return ProfitabilityClass.ZOMBIE
-                    else:
-                        self.plugin.log(
-                            f"PROFITABILITY: Diagnostic failed for {channel_id[:12]}... but channel "
-                            f"routed {days_inactive}d ago. Skipping ZOMBIE classification.",
-                            level='debug'
-                        )
-            # --- FIX FOR NoneType CRASH ENDS HERE ---
-                    
+
         # 2. Check for STAGNANT_CANDIDATE (0 forwards in last 7 days + unprofitable)
         # Bug C Fix: Ensure low-volume profitable channels are BREAK_EVEN/BALANCED, not STAGNANT.
         # STAGNANT_CANDIDATE only if ROI < -10% and inactive for 7+ days.

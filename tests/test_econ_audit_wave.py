@@ -698,52 +698,6 @@ class TestHtlcmaxChurnDeadband:
 # E-4.6: close-cost estimator must use the close feerate, not opening
 # =============================================================================
 
-class TestCloseCostFeerate:
-
-    def _planner(self, mock_plugin, perkb):
-        from modules.capacity_planner import CapacityPlanner
-        planner = CapacityPlanner(mock_plugin, MagicMock(), MagicMock())
-        planner.data_service = MagicMock()
-        planner.data_service.get_feerates.return_value = {"perkb": perkb}
-        return planner
-
-    def test_mutual_close_rate_preferred(self, mock_plugin):
-        planner = self._planner(mock_plugin, {
-            "opening": 10_000, "mutual_close": 4_000, "unilateral_close": 20_000,
-        })
-        # 4000 perkb = 4 sat/vB * 200 vbytes = 800 sats
-        assert planner._estimate_close_cost() == 800
-
-    def test_unilateral_fallback_is_conservative(self, mock_plugin):
-        planner = self._planner(mock_plugin, {
-            "opening": 10_000, "unilateral_close": 20_000,
-        })
-        assert planner._estimate_close_cost() == 4_000  # 20 sat/vB * 200
-
-    def test_opening_only_keeps_legacy_behavior(self, mock_plugin):
-        planner = self._planner(mock_plugin, {"opening": 10_000})
-        assert planner._estimate_close_cost() == 2_000
-
-    def test_malformed_feerates_fall_back_to_default(self, mock_plugin):
-        from modules.config import ChainCostDefaults
-        planner = self._planner(mock_plugin, "garbage")
-        assert planner._estimate_close_cost() == ChainCostDefaults.CHANNEL_CLOSE_COST_SATS
-
-    def test_open_ev_volume_model_shares_one_constant(self):
-        """E-4.6 second half: the revenue and rebalance-cost sides of the
-        open-EV model must read ONE assumed-fee constant (was already
-        aligned by a prior wave; this pins it)."""
-        import modules.capacity_planner as cp
-        import inspect
-        assert hasattr(cp, "ASSUMED_AVG_FEE_PPM")
-        src = inspect.getsource(cp.CapacityPlanner._calculate_open_ev)
-        assert "ASSUMED_AVG_FEE_PPM" in src
-
-
-# =============================================================================
-# E-4.5: dead rebalance_min_profit config + dead caller-side execute loop
-# =============================================================================
-
 class TestRebalanceMinProfitDeprecation:
 
     def test_key_classified_deprecated(self):

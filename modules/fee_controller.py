@@ -95,7 +95,7 @@ if TYPE_CHECKING:
 # =============================================================================
 # Node-wide receivable-ratio / drain-pressure helpers for the node-liquidity-aware
 # auto-drain-bias feature. These mirror the aggregate-liquidity pattern used in
-# capacity_planner.py (_check_portfolio_balance_gate, ~lines 312-325) but expressed
+# the retired capacity planner portfolio gate, expressed
 # as the REMOTE/receivable fraction rather than local percentage. Kept pure and
 # side-effect free so later wiring into _drain_fee_multiplier stays unit-testable
 # in isolation. Per the design's no-double-count invariant, these must never read
@@ -4083,7 +4083,7 @@ class FeeController:
             # nested fee_state payload and fall back to flat for rows written
             # before this change (_extract_fee_state_payload, plus the
             # external readers in flow_analysis / profitability_analyzer /
-            # capacity_planner).
+            # the retired capacity planner).
             # TODO(other-agent): cl-revenue-ops.py:~3303 still reads the flat
             # v2_state["thompson_state"]; migrate it to nested-first
             # (v2_state.get("fee_state", {}).get("thompson_state")) with flat

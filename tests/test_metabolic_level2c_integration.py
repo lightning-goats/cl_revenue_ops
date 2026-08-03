@@ -15,7 +15,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from modules.capacity_planner import CapacityPlanner
 from modules.config import Config
 from modules.fee_controller import FeeController
 from modules.rebalance_engine_v2 import RebalanceEngine

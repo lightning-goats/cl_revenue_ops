@@ -43,12 +43,6 @@ def test_public_runtime_keys_are_safety_only():
         "fee_market_boundary_margin_ratio",
         "fee_market_boundary_max_downshift_ratio",
         "fee_market_boundary_cache_seconds",
-        "planner_enabled",
-        "planner_dry_run",
-        "planner_execute_closes",
-        "planner_max_opens_per_cycle",
-        "planner_max_closes_per_cycle",
-        "planner_min_annual_roi_pct",
         "capex_probability_budget_bonus",
         "receivable_ratio_target",
         "receivable_ratio_floor",
@@ -62,11 +56,9 @@ def test_public_runtime_keys_are_safety_only():
         "htlcmax_balanced_pct",
         "econ_shadow_enabled",
         "econ_governor_rebalance_enabled",
-        "econ_governor_planner_enabled",
         "econ_governor_fees_enabled",
         "econ_arbiter_enabled",
         "econ_cycle_rebalance_enabled",
-        "econ_cycle_planner_enabled",
         "econ_ev_populated",
         "econ_conflict_rules_extended",
         "authority_level",
@@ -106,12 +98,6 @@ def test_public_runtime_dict_returns_only_public_keys():
         "fee_market_boundary_margin_ratio": 0.05,
         "fee_market_boundary_max_downshift_ratio": 0.35,
         "fee_market_boundary_cache_seconds": 60,
-        "planner_enabled": False,
-        "planner_dry_run": False,
-        "planner_execute_closes": False,
-        "planner_max_opens_per_cycle": 1,
-        "planner_max_closes_per_cycle": 0,
-        "planner_min_annual_roi_pct": 1.0,
         "capex_probability_budget_bonus": 0.0,
         "receivable_ratio_target": 0.3,
         "receivable_ratio_floor": 0.2,
@@ -124,11 +110,9 @@ def test_public_runtime_dict_returns_only_public_keys():
         "htlcmax_balanced_pct": 0.45,
         "econ_shadow_enabled": True,
         "econ_governor_rebalance_enabled": True,
-        "econ_governor_planner_enabled": True,
         "econ_governor_fees_enabled": True,
         "econ_arbiter_enabled": True,
         "econ_cycle_rebalance_enabled": True,
-        "econ_cycle_planner_enabled": True,
         "econ_ev_populated": True,
         "econ_conflict_rules_extended": True,
         "authority_level": "capital",
@@ -231,13 +215,9 @@ def _run_init_with_stubbed_dependencies(
     monkeypatch.setattr(mod, "PolicyManager", lambda *args, **kwargs: MagicMock())
     monkeypatch.setattr(mod, "ChannelProfitabilityAnalyzer", lambda *args, **kwargs: MagicMock())
     monkeypatch.setattr(mod, "FlowAnalyzer", lambda *args, **kwargs: MagicMock())
-    monkeypatch.setattr(mod, "CapacityPlanner", lambda *args, **kwargs: MagicMock(
-        execute_cycle=MagicMock(return_value={"skipped": True, "reason": "noop"})
-    ))
     monkeypatch.setattr(mod, "FeeController", lambda *args, **kwargs: MagicMock())
     monkeypatch.setattr(mod, "EVRebalancer", lambda *args, **kwargs: MagicMock(
         set_profitability_analyzer=MagicMock(),
-        set_capacity_planner=MagicMock(),
     ))
     monkeypatch.setattr(mod.threading, "Thread", DummyThread)
 
@@ -259,146 +239,6 @@ def test_fee_authority_option_is_parsed_during_init_and_initializes_gate(monkeyp
     assert status.enabled is False
     assert status.generation == 1
     assert status.reason == "init"
-
-
-def test_planner_execute_closes_plugin_option_defaults_false():
-    mod = load_plugin_module()
-    snapshot = Config().snapshot()
-
-    assert "revenue-ops-planner-execute-closes" in mod.plugin.options
-    assert mod.plugin.options["revenue-ops-planner-execute-closes"]["default"] == "false"
-    assert snapshot.planner_execute_closes is False
-
-
-def test_planner_cycle_limit_defaults_match_config():
-    mod = load_plugin_module()
-    cfg = Config()
-    snapshot = cfg.snapshot()
-
-    assert cfg.planner_max_opens_per_cycle == 1
-    assert cfg.planner_max_closes_per_cycle == 0
-    assert snapshot.planner_max_opens_per_cycle == 1
-    assert snapshot.planner_max_closes_per_cycle == 0
-    assert snapshot.planner_min_annual_roi_pct == 1.0
-    assert snapshot.planner_close_fee_reserve_multiplier == 2.0
-    assert snapshot.planner_close_fee_cap_sats == 0
-    assert snapshot.planner_close_feerange_enabled is False
-    assert mod.plugin.options["revenue-ops-planner-max-opens-per-cycle"]["default"] == "1"
-    assert mod.plugin.options["revenue-ops-planner-max-closes-per-cycle"]["default"] == "0"
-    assert mod.plugin.options["revenue-ops-planner-min-annual-roi-pct"]["default"] == "1.0"
-    assert mod.plugin.options["revenue-ops-planner-close-fee-reserve-multiplier"]["default"] == "2.0"
-    assert mod.plugin.options["revenue-ops-planner-close-fee-cap-sats"]["default"] == "0"
-    assert mod.plugin.options["revenue-ops-planner-close-feerange-enabled"]["default"] == "false"
-
-
-def test_planner_execute_closes_option_is_parsed_during_init(monkeypatch):
-    mod = load_plugin_module()
-    cfg = _run_init_with_stubbed_dependencies(
-        mod,
-        monkeypatch,
-        {"revenue-ops-planner-execute-closes": "true"},
-    )
-
-    assert cfg.planner_execute_closes is True
-
-
-def test_planner_cycle_limits_are_parsed_during_init(monkeypatch):
-    mod = load_plugin_module()
-    cfg = _run_init_with_stubbed_dependencies(
-        mod,
-        monkeypatch,
-        {
-            "revenue-ops-planner-max-opens-per-cycle": "3",
-            "revenue-ops-planner-max-closes-per-cycle": "2",
-        },
-    )
-
-    assert cfg.planner_max_opens_per_cycle == 3
-    assert cfg.planner_max_closes_per_cycle == 2
-
-
-def test_planner_close_fee_cap_options_are_parsed_during_init(monkeypatch):
-    mod = load_plugin_module()
-    cfg = _run_init_with_stubbed_dependencies(
-        mod,
-        monkeypatch,
-        {
-            "revenue-ops-planner-close-fee-reserve-multiplier": "2.5",
-            "revenue-ops-planner-close-fee-cap-sats": "9000",
-            "revenue-ops-planner-close-feerange-enabled": "true",
-        },
-    )
-
-    assert cfg.planner_close_fee_reserve_multiplier == 2.5
-    assert cfg.planner_close_fee_cap_sats == 9000
-    assert cfg.planner_close_feerange_enabled is True
-
-
-def test_planner_min_annual_roi_option_is_parsed_during_init(monkeypatch):
-    mod = load_plugin_module()
-    cfg = _run_init_with_stubbed_dependencies(
-        mod,
-        monkeypatch,
-        {"revenue-ops-planner-min-annual-roi-pct": "2.5"},
-    )
-
-    assert cfg.planner_min_annual_roi_pct == 2.5
-
-
-def test_init_wires_rebalancer_back_into_capacity_planner(monkeypatch):
-    mod = load_plugin_module()
-    mod.shutdown_event.clear()
-
-    options = _default_plugin_options(mod)
-    fake_db = MagicMock()
-    fake_db.initialize.return_value = None
-    fake_db.cleanup_stale_reservations.return_value = 0
-    fake_db.get_latest_forward_timestamp.return_value = None
-    fake_db.bulk_insert_forwards.return_value = 0
-    fake_db.has_recent_connection_history.return_value = False
-    fake_db.record_connection_event.return_value = None
-    fake_db.get_all_config_overrides.return_value = {}
-    fake_db.get_config_version.return_value = 0
-
-    fake_rpc = MagicMock()
-    fake_rpc.plugin.return_value = {"plugins": []}
-    fake_rpc.listplugins.return_value = {"plugins": []}
-    fake_rpc.listforwards.return_value = {"forwards": []}
-    fake_rpc.listpeers.return_value = {"peers": []}
-    fake_rpc.listconfigs.return_value = {"configs": {}}
-
-    fake_proxy = MagicMock()
-    fake_proxy.rpc = fake_rpc
-    fake_proxy._executor = MagicMock()
-    fake_proxy._async_executor = MagicMock()
-
-    planner_mock = MagicMock()
-    planner_mock.rebalancer = None
-    rebalancer_mock = MagicMock(
-        set_profitability_analyzer=MagicMock(),
-        set_capacity_planner=MagicMock(),
-    )
-
-    class DummyThread:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def start(self):
-            return None
-
-    monkeypatch.setattr(mod, "ThreadSafePluginProxy", lambda plugin: fake_proxy)
-    monkeypatch.setattr(mod, "Database", lambda *args, **kwargs: fake_db)
-    monkeypatch.setattr(mod, "PolicyManager", lambda *args, **kwargs: MagicMock())
-    monkeypatch.setattr(mod, "ChannelProfitabilityAnalyzer", lambda *args, **kwargs: MagicMock())
-    monkeypatch.setattr(mod, "FlowAnalyzer", lambda *args, **kwargs: MagicMock())
-    monkeypatch.setattr(mod, "CapacityPlanner", lambda *args, **kwargs: planner_mock)
-    monkeypatch.setattr(mod, "FeeController", lambda *args, **kwargs: MagicMock())
-    monkeypatch.setattr(mod, "EVRebalancer", lambda *args, **kwargs: rebalancer_mock)
-    monkeypatch.setattr(mod.threading, "Thread", DummyThread)
-
-    mod.init(options, {}, mod.plugin)
-
-    assert planner_mock.rebalancer is rebalancer_mock
 
 
 def test_init_logs_native_route_rebalancing(monkeypatch):
@@ -555,11 +395,9 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "drain_fee_discount_max",
         "econ_arbiter_enabled",
         "econ_conflict_rules_extended",
-        "econ_cycle_planner_enabled",
         "econ_cycle_rebalance_enabled",
         "econ_ev_populated",
         "econ_governor_fees_enabled",
-        "econ_governor_planner_enabled",
         "econ_governor_rebalance_enabled",
         "econ_shadow_enabled",
         "enable_dynamic_htlcmax",
@@ -584,18 +422,12 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "node_drain_bias_enabled",
         "node_drain_bias_max",
         "paused",
-        "planner_dry_run",
-        "planner_enabled",
-        "planner_execute_closes",
-        "planner_max_closes_per_cycle",
-        "planner_max_opens_per_cycle",
-        "planner_min_annual_roi_pct",
         "receivable_ratio_floor",
         "receivable_ratio_target",
         "risk_profile",
         "weekly_budget_sats",
     ]
-    assert result["count"] == 45
+    assert result["count"] == 37
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -622,12 +454,6 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "fee_market_boundary_margin_ratio": 0.05,
         "fee_market_boundary_max_downshift_ratio": 0.35,
         "fee_market_boundary_cache_seconds": 60,
-        "planner_enabled": False,
-        "planner_dry_run": False,
-        "planner_execute_closes": False,
-        "planner_max_opens_per_cycle": 1,
-        "planner_max_closes_per_cycle": 0,
-        "planner_min_annual_roi_pct": 1.0,
         "capex_probability_budget_bonus": 0.0,
         "receivable_ratio_target": 0.3,
         "receivable_ratio_floor": 0.2,
@@ -640,11 +466,9 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "htlcmax_balanced_pct": 0.45,
         "econ_shadow_enabled": True,
         "econ_governor_rebalance_enabled": True,
-        "econ_governor_planner_enabled": True,
         "econ_governor_fees_enabled": True,
         "econ_arbiter_enabled": True,
         "econ_cycle_rebalance_enabled": True,
-        "econ_cycle_planner_enabled": True,
         "econ_ev_populated": True,
         "econ_conflict_rules_extended": True,
         "authority_level": "capital",
@@ -1093,12 +917,6 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "fee_market_boundary_margin_ratio": 0.05,
         "fee_market_boundary_max_downshift_ratio": 0.35,
         "fee_market_boundary_cache_seconds": 60,
-        "planner_enabled": False,
-        "planner_dry_run": False,
-        "planner_execute_closes": False,
-        "planner_max_opens_per_cycle": 1,
-        "planner_max_closes_per_cycle": 0,
-        "planner_min_annual_roi_pct": 1.0,
         "capex_probability_budget_bonus": 0.0,
         "receivable_ratio_target": 0.3,
         "receivable_ratio_floor": 0.2,
@@ -1111,11 +929,9 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "htlcmax_balanced_pct": 0.45,
         "econ_shadow_enabled": True,
         "econ_governor_rebalance_enabled": True,
-        "econ_governor_planner_enabled": True,
         "econ_governor_fees_enabled": True,
         "econ_arbiter_enabled": True,
         "econ_cycle_rebalance_enabled": True,
-        "econ_cycle_planner_enabled": True,
         "econ_ev_populated": True,
         "econ_conflict_rules_extended": True,
         "authority_level": "capital",
@@ -1176,21 +992,6 @@ def test_agent_docs_describe_standalone_invariants():
 
     assert "standalone" in agent_docs
     assert "fully independent" in agent_docs
-
-
-def test_readme_states_planner_closes_are_recommendation_only_by_default():
-    readme = Path("README.md").read_text()
-
-    assert "Planner closes are recommendation-only by default." in readme
-    assert "revenue-ops-planner-execute-closes=true" in readme
-
-
-def test_readme_describes_boltz_treasury_first_boundary():
-    readme = Path("README.md").read_text()
-
-    assert "standing on-chain reserve" in readme
-    assert "treasury mode first" in readme
-    assert "balance cycle" in readme
 
 
 def test_revenue_profitability_defaults_to_cached_analysis():

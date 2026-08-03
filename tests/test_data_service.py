@@ -393,36 +393,6 @@ class TestNeverCachedTier:
         ds.get_peer_channels()  # should re-fetch
         assert plugin.rpc.listpeerchannels.call_count == 2
 
-    def test_fund_channel_invalidates_funds_and_channels(self):
-        from modules.data_service import DataService
-        plugin = _make_mock_plugin()
-        plugin.rpc.listfunds.return_value = {"channels": []}
-        plugin.rpc.listpeerchannels.return_value = {"channels": []}
-        plugin.rpc.call.return_value = {"tx": "abc", "txid": "def"}
-        ds = DataService(plugin)
-        ds.get_funds()
-        ds.get_peer_channels()
-        ds.fund_channel(id="abc123", amount=1000000)
-        ds.get_funds()
-        ds.get_peer_channels()
-        assert plugin.rpc.listfunds.call_count == 2
-        assert plugin.rpc.listpeerchannels.call_count == 2
-
-    def test_close_channel_invalidates_funds_and_channels(self):
-        from modules.data_service import DataService
-        plugin = _make_mock_plugin()
-        plugin.rpc.listfunds.return_value = {"channels": []}
-        plugin.rpc.listpeerchannels.return_value = {"channels": []}
-        plugin.rpc.call.return_value = {"type": "mutual"}
-        ds = DataService(plugin)
-        ds.get_funds()
-        ds.get_peer_channels()
-        ds.close_channel(id="100x1x0")
-        ds.get_funds()
-        ds.get_peer_channels()
-        assert plugin.rpc.listfunds.call_count == 2
-        assert plugin.rpc.listpeerchannels.call_count == 2
-
     def test_get_route_never_cached(self):
         from modules.data_service import DataService
         plugin = _make_mock_plugin()

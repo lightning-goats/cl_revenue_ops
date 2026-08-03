@@ -2,7 +2,7 @@
 
 Pins the additive half of Phase C:
 
-1. The new dispatchers (revenue-boltz / revenue-cycle / revenue-planner /
+1. The new dispatchers (revenue-cycle /
    revenue-budget, plus revenue-policy ban actions) route each subcommand
    onto the SAME shared helper the old standalone method calls — same
    underlying calls, same argument names, same result.
@@ -106,18 +106,6 @@ class TestCycleDispatcher:
         _assert_no_deprecation(new)
         assert new == _strip(old) == {"status": "Flow analysis triggered"}
 
-    def test_planner(self, mod, plugin, monkeypatch):
-        planner = MagicMock()
-        planner.execute_cycle.return_value = {"executed": True}
-        monkeypatch.setattr(mod, "capacity_planner", planner)
-
-        new = mod.revenue_cycle(plugin, "planner")
-        old = mod.revenue_planner_execute(plugin)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"executed": True}
-
-
     def test_all(self, mod, plugin, monkeypatch):
         monkeypatch.setattr(mod, "fee_authority_gate", _OpenGate())
         controller = MagicMock()
@@ -135,85 +123,13 @@ class TestCycleDispatcher:
         result = mod.revenue_cycle(plugin, "everything")
         assert "error" in result
         assert set(result["valid_subsystems"]) == {
-            "fees", "rebalance", "flow", "planner", "all"}
+            "fees", "rebalance", "flow", "all"}
 
 
 # ---------------------------------------------------------------------------
 # revenue-planner <view>
 # ---------------------------------------------------------------------------
 
-class TestPlannerDispatcher:
-    def test_status(self, mod, plugin, monkeypatch):
-        planner = MagicMock()
-        planner.get_status.return_value = {"pending": 0}
-        monkeypatch.setattr(mod, "capacity_planner", planner)
-
-        new = mod.revenue_planner(plugin, "status")
-        old = mod.revenue_planner_status(plugin)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"pending": 0}
-        # status is also the default view
-        assert mod.revenue_planner(plugin) == new
-
-    def test_candidates(self, mod, plugin, monkeypatch):
-        monkeypatch.setattr(mod, "capacity_planner", MagicMock())
-        database = MagicMock()
-        database.get_planner_candidates.return_value = [{"peer_id": PEER}]
-        monkeypatch.setattr(mod, "database", database)
-
-        new = mod.revenue_planner(plugin, "candidates", limit=5)
-        old = mod.revenue_planner_candidates(plugin, limit=5)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old)
-        assert new["count"] == 1
-        for call in database.get_planner_candidates.call_args_list:
-            assert call.kwargs == {"limit": 5}
-
-    def test_sources(self, mod, plugin, monkeypatch):
-        planner = MagicMock()
-        planner.get_candidate_sources.return_value = {"sources": {}}
-        monkeypatch.setattr(mod, "capacity_planner", planner)
-
-        new = mod.revenue_planner(plugin, "sources")
-        old = mod.planner_candidate_sources(plugin)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"sources": {}}
-
-    def test_history(self, mod, plugin, monkeypatch):
-        monkeypatch.setattr(mod, "capacity_planner", MagicMock())
-        database = MagicMock()
-        database.get_planner_actions.return_value = [{"action": "open"}]
-        monkeypatch.setattr(mod, "database", database)
-
-        new = mod.revenue_planner(plugin, "history", limit=3)
-        old = mod.revenue_planner_history(plugin, limit=3)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old)
-        assert new["count"] == 1
-
-    def test_report(self, mod, plugin, monkeypatch):
-        planner = MagicMock()
-        planner.generate_report.return_value = {"winners": [], "losers": []}
-        monkeypatch.setattr(mod, "capacity_planner", planner)
-
-        new = mod.revenue_planner(plugin, "report")
-        old = mod.revenue_capacity_report(plugin)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"winners": [], "losers": []}
-
-    def test_unknown_view_lists_valid(self, mod, plugin):
-        result = mod.revenue_planner(plugin, "wat")
-        assert "error" in result
-        assert set(result["valid_views"]) == {
-            "status", "candidates", "sources", "history", "report"}
-
-
-# ---------------------------------------------------------------------------
 # revenue-budget
 # ---------------------------------------------------------------------------
 
@@ -226,7 +142,6 @@ def _wire_budget_sections(mod, monkeypatch):
         channel_budgets={},
         priority_class="growth",
         global_envelope_sats=100,
-        fleet_exploration_budget_sats=0,
         total_fleet_contribution_sats=0,
         allocated_by_priority_sats={},
     )
@@ -359,11 +274,6 @@ class TestDeprecationNotices:
         assert "revenue-cycle fees" in mod.revenue_fee_cycle(
             plugin)["deprecation"]
 
-        planner = MagicMock()
-        planner.get_status.return_value = {}
-        monkeypatch.setattr(mod, "capacity_planner", planner)
-        assert "revenue-planner status" in mod.revenue_planner_status(
-            plugin)["deprecation"]
 
         monkeypatch.setattr(mod, "_total_cost_budget_status",
                             lambda window_hours=None: {})
@@ -398,11 +308,3 @@ class TestDeprecationNotices:
         unignored = mod.revenue_unignore(plugin, PEER)
         assert "error" in unignored
         assert "no replacement" in unignored["deprecation"]
-
-    def test_error_paths_of_aliases_carry_notice(self, mod, plugin,
-                                                 monkeypatch):
-        monkeypatch.setattr(mod, "capacity_planner", None)
-        old = mod.revenue_planner_status(plugin)
-        assert "error" in old and "deprecation" in old
-        new = mod.revenue_planner(plugin, "status")
-        assert "error" in new and "deprecation" not in new

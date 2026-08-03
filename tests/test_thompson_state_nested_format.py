@@ -295,43 +295,6 @@ class TestProfitabilityReaderBothFormats:
             "Old flat rows must keep widening thresholds"
 
 
-class TestCapacityPlannerReaderBothFormats:
-
-    def _winners(self, fee_state_row):
-        from modules.capacity_planner import CapacityPlanner
-
-        planner = CapacityPlanner.__new__(CapacityPlanner)
-        planner.plugin = MagicMock()
-        planner.profitability = MagicMock()
-        planner.profitability.database.get_channel_rebalance_success_rate \
-            .return_value = None
-        planner.profitability.database.get_fee_strategy_state \
-            .return_value = fee_state_row
-
-        prof = MagicMock()
-        prof.capacity_sats = 1_000_000
-        prof.marginal_roi_percent = 50.0
-        prof.peer_id = PEER_ID
-        prof.channel_role = None
-        flow = MagicMock()
-        flow.daily_volume = 900_000  # turnover 0.9
-        flow.flow_ratio = 0.9
-        flow.kalman_velocity = 0.0
-        flow.is_congested = False
-
-        return planner._identify_winners(
-            {CHANNEL_ID: prof}, {CHANNEL_ID: flow}
-        )
-
-    def test_nested_format_dts_mean(self, mock_plugin):
-        winners = self._winners(_nested_row(posterior_mean=387.5))
-        assert winners and winners[0]["dts_posterior_mean"] == pytest.approx(387.5)
-
-    def test_flat_format_dts_mean(self, mock_plugin):
-        winners = self._winners(_flat_row(posterior_mean=387.5))
-        assert winners and winners[0]["dts_posterior_mean"] == pytest.approx(387.5)
-
-
 class TestFlowAnalysisReaderBothFormats:
 
     def _classify_with_row(self, fee_state_row):

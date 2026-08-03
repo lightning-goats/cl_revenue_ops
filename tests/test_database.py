@@ -411,7 +411,7 @@ class TestAuditTurn3KalmanNaNGuard:
 
 
 class TestDeadCapitalStages:
-    """Real SQLite tests for dead-capital stage persistence."""
+    """Historical dead-capital rows remain readable after planner retirement."""
 
     def _make_db(self, tmp_path):
         db_path = os.path.join(tmp_path, "test_dead_capital.db")
@@ -421,37 +421,17 @@ class TestDeadCapitalStages:
         return db
 
     def test_dead_capital_stage_round_trip(self, tmp_path):
-        """Stages can be inserted and read back by channel id."""
+        """Legacy stage rows remain readable by channel id."""
         db = self._make_db(tmp_path)
 
-        db.upsert_dead_capital_stage("100x1x0", "fee_reduction", 123)
+        db._get_connection().execute(
+            "INSERT INTO dead_capital_stage (channel_id, stage, entered_at) VALUES (?, ?, ?)",
+            ("100x1x0", "fee_reduction", 123),
+        )
 
         stages = db.get_dead_capital_stages()
         assert stages["100x1x0"]["stage"] == "fee_reduction"
         assert stages["100x1x0"]["entered_at"] == 123
-
-    def test_upsert_replaces_existing_stage(self, tmp_path):
-        """Upsert should replace stage and entered_at for an existing row."""
-        db = self._make_db(tmp_path)
-
-        db.upsert_dead_capital_stage("100x1x0", "fee_reduction", 123)
-        db.upsert_dead_capital_stage("100x1x0", "close", 456)
-
-        stages = db.get_dead_capital_stages()
-        assert stages["100x1x0"]["stage"] == "close"
-        assert stages["100x1x0"]["entered_at"] == 456
-
-    def test_delete_dead_capital_stage(self, tmp_path):
-        """Deleting a stage removes it from the lookup."""
-        db = self._make_db(tmp_path)
-
-        db.upsert_dead_capital_stage("100x1x0", "close", 123)
-        db.delete_dead_capital_stage("100x1x0")
-
-        assert "100x1x0" not in db.get_dead_capital_stages()
-
-        states = db.get_all_kalman_states()
-        assert len(states) == 0
 
     def test_valid_state_persisted(self, tmp_path):
         """Normal finite values should be persisted successfully."""

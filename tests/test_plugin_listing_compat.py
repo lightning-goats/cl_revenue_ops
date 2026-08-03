@@ -126,11 +126,8 @@ def test_plugin_listing_rpc_and_safe_default_contract():
         "revenue-fee-debug",
         "revenue-rebalance-debug",
         "revenue-profitability",
-        "revenue-planner-status",
     }.issubset(methods)
 
-    assert options["revenue-ops-planner-enabled"]["default"] == "false"
-    assert options["revenue-ops-planner-execute-closes"]["default"] == "false"
     assert options["revenue-ops-fee-market-boundary-enabled"]["default"] == "false"
     assert "revenue-ops-dry-run" in options
     assert mod.plugin.init_functions

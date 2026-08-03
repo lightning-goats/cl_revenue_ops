@@ -176,49 +176,6 @@ class TestSourceLegIdentity:
 # ---------------------------------------------------------------------------
 # Defect 4 — higher-precedence OPEN_CHANNEL preempts the armed one
 # ---------------------------------------------------------------------------
-class TestOpenPreemption:
-    PEER = "02" + "c" * 64
-
-    def _registry(self):
-        return ActiveIntentRegistry(extended_rules_provider=lambda: True)
-
-    def _planner_open(self):
-        return _intent(intent_type="OPEN_CHANNEL", target=self.PEER,
-                       snapshot_id="planner-cycle-1", priority=50)
-
-    def _higher_priority_open(self):
-        return _intent(intent_type="OPEN_CHANNEL", target=self.PEER,
-                       snapshot_id="operator-contract-42", priority=80,
-                       reason_codes=("CONTRACT_OBLIGATION",))
-
-    def test_obligation_preempts_planner_open(self):
-        registry = self._registry()
-        assert registry.check_and_register(self._planner_open(), NOW) is None
-        # The contract obligation outranks per the batch J3 ladder — it must
-        # preempt, not be rejected.
-        assert registry.check_and_register(self._higher_priority_open(), NOW) is None
-        # The higher-priority entry now holds the slot.
-        assert registry.check_and_register(self._planner_open(), NOW) == \
-            "CONFLICT_DUPLICATE_OPEN"
-        assert registry.active_count(NOW) == 1
-
-    def test_lower_priority_incoming_still_blocked(self):
-        registry = self._registry()
-        assert registry.check_and_register(self._higher_priority_open(), NOW) is None
-        assert registry.check_and_register(self._planner_open(), NOW) == \
-            "CONFLICT_DUPLICATE_OPEN"
-
-    def test_mirrors_batch_ordering(self):
-        """The live preemption must agree with batch arbitration's
-        winner for the same pair of intents."""
-        batch = arbitrate([self._planner_open(), self._higher_priority_open()],
-                          now=NOW, extended_rules=True)
-        assert [e.priority for e in batch.ordered] == [80]
-
-
-# ---------------------------------------------------------------------------
-# Defect 5 — lazy registry init is race-free
-# ---------------------------------------------------------------------------
 class TestShadowRegistryInitLocked:
     def test_concurrent_first_access_yields_one_registry(self, tmp_path,
                                                          monkeypatch):
@@ -363,52 +320,6 @@ PEER = "02" + "b" * 64
 
 
 
-class TestPlannerTerminalCompletion:
-    def _planner(self, registry):
-        from modules.capacity_planner import CapacityPlanner
-        planner = CapacityPlanner(MagicMock(), MagicMock(), MagicMock())
-        cfg = MagicMock()
-        cfg.snapshot.return_value = SimpleNamespace(
-            econ_governor_planner_enabled=True, paused=False,
-            authority_level="capital")
-        planner.config = cfg
-        shadow = MagicMock()
-        shadow.ledger_for_reconciliation.return_value = None
-        shadow.arbitration_registry.return_value = registry
-        shadow.snapshot_ref.return_value = None
-        planner.econ_shadow = shadow
-        return planner
-
-    def _reserve(self, planner, db, reservation_id):
-        return planner._governed_reserve_spend(
-            db, reservation_id=reservation_id, amount_sats=300,
-            category="channel_open", subcategory="automated",
-            metadata={}, effective_budget_sats=1000, since_timestamp=NOW,
-            intent_type="OPEN_CHANNEL", target=PEER,
-            committed_sats=1_000_000)
-
-    def test_settle_frees_slot(self):
-        registry = ActiveIntentRegistry()
-        planner = self._planner(registry)
-        db = MagicMock()
-        db.reserve_spend.return_value = True
-        db.mark_spend_reservation_spent.return_value = True
-        assert self._reserve(planner, db, "rid-1") is True
-        assert registry.active_count(NOW) == 1
-        planner._settle_capex_reservation(db, "rid-1", 300, what="test")
-        assert registry.active_count(NOW) == 0
-
-    def test_completion_helper_frees_slot_on_failure_release(self):
-        registry = ActiveIntentRegistry()
-        planner = self._planner(registry)
-        db = MagicMock()
-        db.reserve_spend.return_value = True
-        assert self._reserve(planner, db, "rid-1") is True
-        assert self._reserve(planner, db, "rid-2") is False  # in flight
-        planner._complete_governed_intent("rid-1")
-        assert self._reserve(planner, db, "rid-3") is True
-
-
 class TestFeeBroadcastCompletion:
     def test_completion_stashed_and_frees_slot(self):
         from modules.config import Config
@@ -503,28 +414,3 @@ class TestEngineBatchIsolation:
                             MagicMock(side_effect=RuntimeError("boom")))
         assert engine._arbitrate_execution_list(pairs, CycleResult()) \
             is pairs
-
-
-class TestPlannerBatchIsolation:
-    def _planner(self):
-        from modules.capacity_planner import CapacityPlanner
-        planner = CapacityPlanner(MagicMock(), MagicMock(), MagicMock())
-        cfg = MagicMock()
-        cfg.snapshot.return_value = SimpleNamespace(
-            econ_cycle_planner_enabled=True)
-        planner.config = cfg
-        planner.econ_shadow = None
-        return planner
-
-    def _loser(self, scid, roi=-90.0):
-        return {"scid": scid, "peer_id": "02" + "a" * 64,
-                "marginal_roi": roi, "reason": "dead"}
-
-    def test_single_malformed_candidate_drops_alone(self):
-        planner = self._planner()
-        good = self._loser("100x1x0")
-        bad = self._loser("500x1x0", roi="not-a-number")  # float() raises
-        summary = {"skipped_reasons": []}
-        survivors = planner._arbitrate_close_list([good, bad], summary)
-        assert [l["scid"] for l in survivors] == ["100x1x0"]
-        assert any("500x1x0" in r for r in summary["skipped_reasons"])

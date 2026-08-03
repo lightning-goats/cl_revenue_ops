@@ -92,14 +92,11 @@ class TestFacadeGate:
 
 
 def test_path_level_assignments():
-    """Structural pin: each governed path declares the spec's required
-    level (LN+ deliberately ungated — invariant 6)."""
+    """Structural pin: each retained governed path declares its authority level."""
     import pathlib
     repo = pathlib.Path(__file__).resolve().parent.parent
     assert '"liquidity"),' in (repo / "modules" /
                                "rebalance_engine_v2.py").read_text()
-    assert '"capital"),' in (repo / "modules" /
-                             "capacity_planner.py").read_text()
     assert '"fees"),' in (repo / "modules" /
                           "fee_controller.py").read_text()
     assert not (repo / "modules" / "lnplus_swaps.py").exists()

@@ -276,21 +276,7 @@ class DataService:
         self.invalidate("listpeerchannels")
         return result
 
-    def fund_channel(self, **kwargs) -> Dict:
-        """Open a new channel. Invalidates funds + peer channels cache."""
-        result = self._plugin.rpc.call("fundchannel", kwargs)
-        self.invalidate("listfunds")
-        self.invalidate("listpeerchannels")
-        return result
 
-    def close_channel(self, **kwargs) -> Dict:
-        """Close a channel. Invalidates funds + peer channels cache."""
-        result = self._plugin.rpc.call("close", kwargs)
-        self.invalidate("listfunds")
-        self.invalidate("listpeerchannels")
-        return result
-
-    # --- Route discovery ---
 
     def get_route(self, node_id: str, amount_msat: int, **kwargs) -> Dict:
         """Discover route to node. Never cached (amount-dependent)."""

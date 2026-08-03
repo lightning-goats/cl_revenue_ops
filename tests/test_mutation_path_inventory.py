@@ -35,13 +35,12 @@ PAT_CALL = re.compile(
 # The complete inventory at baseline commit 5e8f747. Keys are repo-relative
 # paths; values are the sorted set of mutating verbs the file may invoke.
 MUTATING_CALL_SITES = {
-    "modules/capacity_planner.py": ["close", "fundchannel"],
     "modules/data_service.py": [
         "askrene-age", "askrene-bias-channel", "askrene-bias-node",
         "askrene-create-layer", "askrene-disable-node",
         "askrene-inform-channel", "askrene-remove-layer", "askrene-reserve",
-        "askrene-unreserve", "askrene-update-channel", "close",
-        "datastore", "delinvoice", "delpay", "fundchannel", "invoice",
+        "askrene-unreserve", "askrene-update-channel",
+        "datastore", "delinvoice", "delpay", "invoice",
         "sendpay", "setchannel", "waitsendpay",
     ],
     "modules/rebalance_engine_v2.py": [

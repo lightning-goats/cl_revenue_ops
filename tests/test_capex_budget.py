@@ -31,9 +31,6 @@ class TestCapexBudgetConfig:
     def test_grace_days(self):
         assert Config().capex_grace_days == 14
 
-    def test_exploration_rate(self):
-        assert Config().capex_exploration_rate == 0.10
-
     def test_global_envelope(self):
         assert Config().capex_global_envelope_sats == 0
 
@@ -43,9 +40,7 @@ class TestCapexBudgetConfig:
         assert snap.capex_bootstrap_bps == 10
         assert snap.capex_bootstrap_max_sats == 200
         assert snap.capex_grace_days == 14
-        assert snap.capex_exploration_rate == 0.10
         assert snap.capex_global_envelope_sats == 0
-        assert snap.planner_min_annual_roi_pct == 1.0
 
 
 from modules.capex_budget import (
@@ -129,7 +124,6 @@ class TestEngineConstruction:
         alloc = engine.compute_allocations()
         assert isinstance(alloc, CapexAllocations)
         assert isinstance(alloc.channel_budgets, dict)
-        assert isinstance(alloc.fleet_exploration_budget_sats, int)
         assert alloc.priority_class in ("defensive", "preservation", "operational", "growth")
 
 
@@ -546,107 +540,6 @@ class TestPerChannelBudget:
         assert b.priority_class == "defensive"
 
 
-class TestFleetExplorationBudget:
-    """Fleet exploration budget for opens/growth."""
-
-    def test_exploration_proportional_to_fleet_revenue(self):
-        """Exploration = fleet_contribution x exploration_rate."""
-        engine = _make_engine(
-            channel_profitabilities={
-                "100x1x0": _make_mock_profitability(
-                    contribution_msat=500_000,
-                    fees_earned_msat=500_000,
-                    total_forward_count=50,
-                ),
-                "200x1x0": _make_mock_profitability(
-                    contribution_msat=300_000,
-                    fees_earned_msat=300_000,
-                    total_forward_count=30,
-                    channel_id="200x1x0",
-                ),
-            },
-        )
-        alloc = engine.compute_allocations()
-        # Fleet revenue = 500_000 + 300_000 = 800_000 msat (exit fees only)
-        # Exploration = 800_000 * 0.10 = 80_000 msat = 80 sats
-        assert alloc.fleet_exploration_budget_sats == 80
-
-    def test_zero_revenue_zero_exploration_without_wallet_excess(self):
-        engine = _make_engine()
-        alloc = engine.compute_allocations()
-        assert alloc.fleet_exploration_budget_sats == 0
-
-    def test_zero_revenue_uses_wallet_excess_for_bootstrap_exploration(self):
-        engine = _make_engine(
-            confirmed_onchain_sats=1_250_000,
-            config_overrides={"daily_budget_sats": 0, "weekly_budget_sats": 0},
-        )
-        alloc = engine.compute_allocations()
-        assert alloc.fleet_exploration_budget_sats == 250_000
-
-    def test_zero_revenue_bootstrap_exploration_subtracts_open_reservations_only(self):
-        engine = _make_engine(
-            confirmed_onchain_sats=1_010_000,
-            spend_summary={
-                "spent_by_category": {"channel_open": 4_000},
-                "reserved_by_category": {"channel_open": 3_000},
-            },
-        )
-        alloc = engine.compute_allocations()
-        assert alloc.fleet_exploration_budget_sats == 7_000
-
-    def test_revenue_funded_exploration_gets_one_open_fee_wallet_floor(self):
-        engine = _make_engine(
-            channel_profitabilities={
-                "100x1x0": _make_mock_profitability(
-                    contribution_msat=500_000,
-                    fees_earned_msat=500_000,
-                    total_forward_count=50,
-                ),
-            },
-            confirmed_onchain_sats=1_250_000,
-        )
-        alloc = engine.compute_allocations()
-        assert alloc.fleet_exploration_budget_sats == 5_000
-
-    def test_revenue_funded_exploration_floor_does_not_exceed_wallet_excess(self):
-        engine = _make_engine(
-            channel_profitabilities={
-                "100x1x0": _make_mock_profitability(
-                    contribution_msat=500_000,
-                    fees_earned_msat=500_000,
-                    total_forward_count=50,
-                ),
-            },
-            confirmed_onchain_sats=1_001_000,
-        )
-        alloc = engine.compute_allocations()
-        assert alloc.fleet_exploration_budget_sats == 1_000
-
-    def test_exploration_budget_reduced_by_open_spend_and_reservations(self):
-        engine = _make_engine(
-            channel_profitabilities={
-                "100x1x0": _make_mock_profitability(
-                    contribution_msat=500_000,
-                    fees_earned_msat=500_000,
-                    total_forward_count=50,
-                ),
-                "200x1x0": _make_mock_profitability(
-                    contribution_msat=300_000,
-                    fees_earned_msat=300_000,
-                    total_forward_count=30,
-                    channel_id="200x1x0",
-                ),
-            },
-            spend_summary={
-                "spent_by_category": {"channel_open": 30},
-                "reserved_by_category": {"channel_open": 25},
-            },
-        )
-        alloc = engine.compute_allocations()
-        assert alloc.fleet_exploration_budget_sats == 25
-
-
 class TestPriorityClass:
     """Fleet state detection and priority classification."""
 
@@ -777,7 +670,6 @@ class TestGlobalEnvelope:
         # msat total is the true invariant (ceiling per-component can overshoot)
         total_msat = (
             sum(b.budget_msat for b in alloc.channel_budgets.values())
-            + alloc.fleet_exploration_budget_msat
         )
         assert total_msat <= 100 * MSAT_PER_SAT
 
@@ -795,7 +687,6 @@ class TestGlobalEnvelope:
         alloc = engine.compute_allocations()
         total_msat = (
             sum(b.budget_msat for b in alloc.channel_budgets.values())
-            + alloc.fleet_exploration_budget_msat
         )
         assert total_msat <= 3000 * MSAT_PER_SAT
 
@@ -838,7 +729,6 @@ class TestCapexStatusOutput:
         # Required fields for RPC output
         assert hasattr(alloc, 'priority_class')
         assert hasattr(alloc, 'global_envelope_sats')
-        assert hasattr(alloc, 'fleet_exploration_budget_sats')
         assert hasattr(alloc, 'total_fleet_contribution_sats')
         assert hasattr(alloc, 'allocated_by_priority_sats')
         assert hasattr(alloc, 'channel_budgets')
@@ -1017,24 +907,6 @@ class TestWindowedCapexFunding:
         assert b.tier == "bootstrap"
         assert b.budget_sats == 200
 
-    def test_exploration_funded_by_30d_exit_fees(self):
-        """Fleet exploration budget derives from 30d exit fees, not lifetime."""
-        engine = _make_engine(
-            channel_profitabilities={
-                "100x1x0": _make_mock_profitability(
-                    contribution_msat=500_000_000,      # large lifetime
-                    fees_earned_msat=500_000_000,
-                    total_forward_count=500,
-                    contribution_30d_msat=800_000,      # 800 sats in 30d
-                    fees_earned_30d_msat=800_000,
-                ),
-            },
-        )
-        alloc = engine.compute_allocations()
-        # Fleet 30d revenue = 800_000 msat; exploration = 10% = 80_000 msat
-        assert alloc.total_fleet_contribution_msat == 800_000
-        assert alloc.fleet_exploration_budget_sats == 80
-
     def test_legacy_prof_without_window_falls_back_to_lifetime(self):
         """Prof objects without windowed data keep the lifetime behavior."""
         engine = _make_engine(
@@ -1057,12 +929,12 @@ class TestWindowedCapexFunding:
 class TestDbErrorFailsClosed:
     """CB-4 fix: DB errors must fail CLOSED (deny spend), never re-grant budgets.
 
-    Previously _get_total_capex_by_channel / _get_spend_ledger_summary swallowed
-    any DB exception and returned empty dicts, so downstream arithmetic computed
+    Previously _get_total_capex_by_channel swallowed DB exceptions and returned
+    an empty dict, so downstream arithmetic computed
     budgets as if nothing had been spent in 30 days (fail-open).
     """
 
-    def _make_raw_engine(self, *, capex_raises=False, ledger_raises=False):
+    def _make_raw_engine(self, *, capex_raises=False):
         """Engine whose DB wrappers are NOT monkeypatched (unlike _make_engine)."""
         mock_profitability = MagicMock()
         mock_profitability.analyze_all_channels.return_value = {
@@ -1082,13 +954,6 @@ class TestDbErrorFailsClosed:
             mock_db.get_total_capex_by_channel.side_effect = Exception("db locked")
         else:
             mock_db.get_total_capex_by_channel.return_value = {}
-        if ledger_raises:
-            mock_db.get_spend_ledger_summary.side_effect = Exception("db locked")
-        else:
-            mock_db.get_spend_ledger_summary.return_value = {
-                "spent_by_category": {},
-                "reserved_by_category": {},
-            }
 
         return CapexBudgetEngine(
             profitability_analyzer=mock_profitability,
@@ -1104,18 +969,7 @@ class TestDbErrorFailsClosed:
         for b in alloc.channel_budgets.values():
             assert b.budget_msat == 0
             assert b.budget_sats == 0
-        assert alloc.fleet_exploration_budget_msat == 0
-        assert engine.get_fleet_exploration_budget() == 0
         assert engine.get_channel_budget("100x1x0").budget_sats == 0
-
-    def test_spend_ledger_db_error_zeroes_all_budgets(self):
-        engine = self._make_raw_engine(ledger_raises=True)
-        alloc = engine.compute_allocations()
-
-        assert alloc.db_degraded is True
-        for b in alloc.channel_budgets.values():
-            assert b.budget_msat == 0
-        assert alloc.fleet_exploration_budget_msat == 0
 
     def test_healthy_db_path_unchanged(self):
         engine = self._make_raw_engine()
@@ -1124,7 +978,6 @@ class TestDbErrorFailsClosed:
         assert alloc.db_degraded is False
         # Proven earner with zero recorded spend keeps a real budget
         assert alloc.channel_budgets["100x1x0"].budget_msat > 0
-        assert alloc.fleet_exploration_budget_msat > 0
 
     def test_db_error_logs_fail_closed_warning(self, caplog):
         import logging

@@ -43,7 +43,6 @@ from modules.profitability_analyzer import (
     BleederClassification,
 )
 from modules.capex_budget import CapexBudgetEngine, MSAT_PER_SAT
-from modules.capacity_planner import CapacityPlanner
 
 
 # ---------------------------------------------------------------------------
@@ -146,59 +145,6 @@ def _make_capex_engine(
     return engine
 
 
-def _make_cycle_cfg(**over):
-    cfg = MagicMock()
-    cfg.planner_enabled = True
-    cfg.planner_max_opens_per_cycle = 2
-    cfg.planner_max_closes_per_cycle = 2
-    cfg.planner_dry_run = False
-    cfg.planner_execute_closes = False
-    cfg.planner_max_defibrillations_per_cycle = 1
-    cfg.planner_max_fee_rate_sat_vb = 50.0
-    cfg.min_wallet_reserve = 500000
-    cfg.planner_min_channel_sats = 500000
-    cfg.planner_max_channel_sats = 10_000_000
-    cfg.planner_min_annual_roi_pct = 1.0
-    for k, v in over.items():
-        setattr(cfg, k, v)
-    return cfg
-
-
-def _make_cycle_planner():
-    plugin = MagicMock()
-    plugin.rpc.feerates.return_value = {"perkb": {"opening": 10000}}
-    plugin.rpc.listfunds.return_value = {
-        "outputs": [{"amount_msat": 50_000_000_000, "status": "confirmed"}],
-        "channels": [],
-    }
-    plugin.rpc.listnodes.return_value = {"nodes": []}
-    plugin.rpc.listchannels.return_value = {"channels": []}
-    plugin.rpc.getinfo.return_value = {"id": "our_node_id"}
-    plugin.rpc.listpeerchannels.return_value = {"channels": []}
-
-    prof_analyzer = MagicMock()
-    flow_analyzer = MagicMock()
-    prof_analyzer.analyze_all_channels.return_value = {}
-    flow_analyzer.analyze_all_channels.return_value = {}
-    prof_analyzer.data_available.return_value = True
-    prof_analyzer.database.get_planner_actions.return_value = []
-    prof_analyzer.database.get_recent_planner_actions.return_value = []
-    prof_analyzer.database.get_planner_candidates.return_value = []
-    prof_analyzer.database.get_channel_rebalance_success_rate.return_value = None
-    prof_analyzer.database.get_diagnostic_rebalance_stats.return_value = {"attempt_count": 5}
-    prof_analyzer.database.get_fee_strategy_state.return_value = None
-    prof_analyzer.database.get_peer_reputation.return_value = None
-    prof_analyzer.database.get_peer_closed_channel_profit_summary.return_value = {
-        'count': 0, 'marginal_roi_proxy': 0,
-    }
-    prof_analyzer.database.record_planner_action.return_value = 1
-    prof_analyzer.identify_bleeders_v2.return_value = []
-
-    planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
-    return planner, plugin, prof_analyzer, flow_analyzer
-
-
-# ---------------------------------------------------------------------------
 # FIX 1: profitability_analyzer conservative failure semantics
 # ---------------------------------------------------------------------------
 
@@ -316,38 +262,6 @@ class TestBleederStatusUnavailable:
 # FIX 2: capex bootstrap requires affirmative zero-revenue evidence
 # ---------------------------------------------------------------------------
 
-class TestCapexBootstrapGating:
-
-    def test_no_exploration_budget_when_profitability_raises(self):
-        engine = _make_capex_engine(prof_raises=True)
-        alloc = engine.compute_allocations()
-        assert alloc.fleet_exploration_budget_msat == 0
-
-    def test_no_exploration_budget_when_snapshot_unavailable(self):
-        engine = _make_capex_engine(
-            channel_profitabilities={}, prof_available=False
-        )
-        alloc = engine.compute_allocations()
-        assert alloc.fleet_exploration_budget_msat == 0
-
-    def test_real_empty_snapshot_still_gets_bootstrap_budget(self):
-        """A genuine zero-revenue node keeps the wallet-excess bootstrap."""
-        engine = _make_capex_engine(
-            channel_profitabilities={},
-            prof_available=True,
-            confirmed_onchain_sats=5_000_000,
-        )
-        alloc = engine.compute_allocations()
-        # Wallet excess (5M - 1M reserve) funds bootstrap exploration; the
-        # global daily/weekly envelope may clamp it, but it must be nonzero.
-        assert alloc.fleet_exploration_budget_msat > 0
-        assert alloc.profitability_unavailable is False
-
-
-# ---------------------------------------------------------------------------
-# FIX 3: unreadable wallet is not an empty wallet
-# ---------------------------------------------------------------------------
-
 class TestCapexWalletUnreadable:
 
     def test_confirmed_onchain_none_when_listfunds_fails(self):
@@ -397,153 +311,6 @@ class TestCapexWalletUnreadable:
 
 # ---------------------------------------------------------------------------
 # FIX 4: portfolio governor and exposure cap fail closed
-# ---------------------------------------------------------------------------
-
-class TestPortfolioGovernorFailClosed:
-
-    def test_peer_exposure_cap_blocks_when_fetch_fails(self):
-        planner, plugin, prof, flow = _make_cycle_planner()
-        planner._cycle_peer_channels = None
-        plugin.rpc.listpeerchannels.side_effect = RuntimeError("rpc down")
-        cfg = _make_cycle_cfg()
-
-        reason = planner._peer_exposure_cap_reason(PEER, cfg)
-
-        assert reason is not None
-        assert "unavailable" in reason or "unknown" in reason
-
-    def test_unknown_portfolio_state_blocks_opens(self):
-        planner, plugin, prof, flow = _make_cycle_planner()
-        plugin.rpc.listpeerchannels.side_effect = RuntimeError("rpc down")
-        planner._discover_peers = MagicMock(return_value=[{
-            "peer_id": "03" + "b" * 64, "score": 1.0,
-            "source": "winner", "reason": "test",
-        }])
-        planner._execute_open = MagicMock(return_value={"status": "completed"})
-        cfg = _make_cycle_cfg()
-
-        result = planner.execute_cycle(cfg)
-
-        assert result["portfolio_state"] == "unknown"
-        assert result["opens"] == []
-        planner._execute_open.assert_not_called()
-        assert any("unknown" in r.lower() for r in result["skipped_reasons"])
-
-
-# ---------------------------------------------------------------------------
-# FIX 5: conservative EV bootstrap prior; no EV opens without data
-# ---------------------------------------------------------------------------
-
-class TestOpenEvConservative:
-
-    def _ev_planner(self):
-        planner, plugin, prof, flow = _make_cycle_planner()
-        prof.database.get_peer_closed_channel_profit_summary.return_value = {
-            'daily_net_est_sats': 0,
-        }
-        prof.database.get_historical_inbound_fee_ppm.return_value = None
-        planner._estimate_open_cost = lambda: 1000
-        planner._estimate_close_cost = lambda: 1000
-        return planner, prof
-
-    def test_bootstrap_prior_is_low_single_digit_ppm(self):
-        from modules.capacity_planner import BOOTSTRAP_FORECAST_DAILY_PPM
-        assert 0 < BOOTSTRAP_FORECAST_DAILY_PPM <= 5.0
-
-    def test_bootstrap_ev_no_longer_approves_everything(self):
-        """With no routing history a 1M-sat open must not look profitable."""
-        planner, prof = self._ev_planner()
-        planner._observed_daily_ppm_cache = (None,)  # no anchor
-        cfg = _make_cycle_cfg()
-
-        ev = planner._calculate_open_ev(PEER, 1_000_000, cfg)
-
-        # Legacy 45 ppm/day fallback made this ~+360 sats; conservative
-        # bootstrap prior must reject it.
-        assert ev < 0
-
-    def test_ev_zero_when_profitability_unavailable(self):
-        planner, prof = self._ev_planner()
-        prof.data_available.return_value = False
-        prof.database.get_peer_closed_channel_profit_summary.return_value = {
-            'daily_net_est_sats': 50,
-        }
-        cfg = _make_cycle_cfg()
-
-        ev = planner._calculate_open_ev(PEER, 1_000_000, cfg)
-
-        assert ev <= 0
-
-
-# ---------------------------------------------------------------------------
-# FIX 6: single-flight execute_cycle + collision-proof reservation ids
-# ---------------------------------------------------------------------------
-
-class TestPlannerSingleFlight:
-
-    def test_concurrent_cycle_is_rejected(self):
-        planner, plugin, prof, flow = _make_cycle_planner()
-        cfg = _make_cycle_cfg()
-        planner._cycle_peer_channels = ["sentinel"]
-
-        assert planner._cycle_lock.acquire(blocking=False)
-        try:
-            result = planner.execute_cycle(cfg)
-        finally:
-            planner._cycle_lock.release()
-
-        assert result.get("skipped") is True
-        assert result.get("reason") == "cycle_already_running"
-        # Shared per-cycle state must not have been reset by the loser.
-        assert planner._cycle_peer_channels == ["sentinel"]
-
-    def test_lock_released_after_cycle(self):
-        planner, plugin, prof, flow = _make_cycle_planner()
-        cfg = _make_cycle_cfg()
-        planner.execute_cycle(cfg)
-        assert planner._cycle_lock.acquire(blocking=False)
-        planner._cycle_lock.release()
-
-    def test_reservation_ids_unique_within_same_second(self):
-        planner, plugin, prof, flow = _make_cycle_planner()
-        planner._check_open_allowed = lambda peer_id: (True, "ok")
-        prof.database.reserve_spend.return_value = False  # abort after reserve
-        cfg = _make_cycle_cfg(planner_dry_run=False)
-
-        planner._execute_open(PEER, 1_000_000, cfg, reason="t1")
-        planner._execute_open(PEER, 1_000_000, cfg, reason="t2")
-
-        ids = [
-            call.kwargs["reservation_id"]
-            for call in prof.database.reserve_spend.call_args_list
-        ]
-        assert len(ids) == 2
-        assert ids[0] != ids[1]
-
-
-# ---------------------------------------------------------------------------
-# FIX 7: protection_service permissive defaults
-# ---------------------------------------------------------------------------
-
-class TestProtectionService:
-
-    def test_zero_confidence_is_low_confidence(self):
-        from types import SimpleNamespace
-        from modules.protection_service import close_protection_reason
-        prof = SimpleNamespace(
-            role_30d=None, channel_role=None, marginal_roi_percent=-90.0,
-            window_30d_available=True, sourced_fee_30d_msat=0, days_open=10,
-            revenue=SimpleNamespace(sourced_fee_contribution_sats=0),
-        )
-        flow = SimpleNamespace(confidence=0.0, forward_count=5)
-
-        reason = close_protection_reason(SCID, prof, flow, set())
-
-        assert reason == "KALMAN_LOW_CONFIDENCE"
-
-
-# ---------------------------------------------------------------------------
-# FIX 8: flow results keyed by normalized scid
 # ---------------------------------------------------------------------------
 
 class TestFlowScidNormalization:

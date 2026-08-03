@@ -31,18 +31,6 @@ if TYPE_CHECKING:
     from .capex_budget import CapexBudgetEngine
 
 
-# Operator ruling D4 (2026-07-01): static ceiling on the diagnostic
-# ("defibrillator") shock fee cap. Whatever diagnostic_rebalance_max_fee_sats
-# is configured to, the effective envelope never exceeds this (nor the daily
-# budget) — a typo cannot authorize huge diagnostic spend.
-DIAGNOSTIC_FEE_CAP_CEILING_SATS = 10_000
-
-# Bound on how many shock sources the defibrillator tries per run. Each
-# failed pricing costs a getroutes call and a rebalance_history row; a
-# route-availability failure is source-specific, so a small fallback list
-# covers the pathological-source case without spraying attempts.
-DIAGNOSTIC_MAX_SOURCE_ATTEMPTS = 3
-
 
 # =============================================================================
 # REASON CODES FOR EXPLAINABILITY
@@ -305,7 +293,6 @@ class EVRebalancer:
         # Optional callback injected by cl-revenue-ops to provide unified total-cost budget limit.
         self.global_budget_limit_provider = None
 
-        self._capacity_planner = None  # Set via set_capacity_planner()
         self.rebalance_engine_v2 = None  # Injected by plugin init
 
         self._last_decision_summary: Dict[str, Any] = {
@@ -654,10 +641,6 @@ class EVRebalancer:
     def build_state_v2(self, channels, capex_allocations):
         """Build the normalized v2 state snapshot from normalized inputs."""
         return build_state_snapshot_v2(channels, capex_allocations)
-
-    def set_capacity_planner(self, planner) -> None:
-        """Set reference to capacity planner for coordination."""
-        self._capacity_planner = planner
 
     def find_rebalance_candidates(self) -> List[RebalanceCandidate]:
         """
@@ -1671,233 +1654,6 @@ class EVRebalancer:
                 "no_route",
             )
         )
-
-    def diagnostic_rebalance(self, channel_id: str) -> Dict[str, Any]:
-        """
-        Trigger a "Channel Defibrillator" sequence:
-        1. Enable bounded low-fee exploration (Passive Lure).
-        2. Execute small active rebalance (Active Shock).
-        
-        This is a diagnostic operation to verify channel liveness before
-        confirming a channel as a "Zombie" for closure. The small rebalance
-        (50k sats) forces liquidity into the channel immediately rather than
-        waiting for organic routing traffic.
-        """
-        self.plugin.log(f"Defibrillator: Triggering bounded exploration for channel {channel_id}")
-        
-        # 1. Set the exploration flag in the database (Fee Controller will
-        # map it to bounded low-fee exploration above the configured floor)
-        self.database.set_channel_probe(channel_id, probe_type='bounded_low_fee')
-        
-        # 2. THE ACTIVE SHOCK: Attempt a small rebalance immediately
-        try:
-            # Find a healthy source channel
-            channels = self._get_channels_with_balances()
-            if channel_id not in channels:
-                return {
-                    "success": False,
-                    "shock_status": "failed",
-                    "message": "Channel not found locally",
-                }
-
-            dest_info = channels[channel_id]
-            
-            # Find best source (highest spendable sats, excluding target)
-            valid_sources = [
-                (cid, info) for cid, info in channels.items() 
-                if cid != channel_id and info.get('spendable_sats', 0) > 100_000
-            ]
-            
-            if not valid_sources:
-                return {
-                    "success": True,
-                    "shock_status": "failed",
-                    "message": "Exploration flag set, but no sources available for active shock."
-                }
-            
-            # Sort by spendable capacity desc. The shock retries down this
-            # list when route pricing says a source cannot route: picking
-            # only the single largest source made the diagnostic fail forever
-            # when that source's peer is unroutable (e.g. Tallship advertises
-            # 600/1201/2016 CLTV deltas, so askrene can never build a route
-            # from it within its 2016 delay ceiling).
-            ranked_sources = sorted(
-                valid_sources,
-                key=lambda x: x[1].get('spendable_sats', 0),
-                reverse=True
-            )[:DIAGNOSTIC_MAX_SOURCE_ATTEMPTS]
-
-            # Construct a diagnostic candidate (50k sats - small enough to be OpEx)
-            shock_amount = 50_000
-
-            # Operator ruling D4 (2026-07-01): the shock fee envelope is the
-            # configured diagnostic_rebalance_max_fee_sats (default 400),
-            # clamped to [1, min(daily_budget_sats, 10_000)] so a typo can't
-            # authorize huge diagnostic spend. The ppm ceiling is DERIVED from
-            # the sat cap (ceil(cap/amount*1e6)) so the sat cap is the single
-            # binding knob — under the old hardcoded pair (100 sats, 2000 ppm)
-            # both bounds bound at exactly 100 sats on the 50k shock and every
-            # observed market route (118-363 sats) was rejected
-            # route_over_budget, so the diagnostic could never fire.
-            max_fee_sats = max(1, min(
-                int(getattr(self.config, 'diagnostic_rebalance_max_fee_sats', 400)),
-                int(getattr(self.config, 'daily_budget_sats', 0) or 0),
-                DIAGNOSTIC_FEE_CAP_CEILING_SATS,
-            ))
-            max_fee_ppm = math.ceil(max_fee_sats / shock_amount * 1_000_000)
-
-
-            # Estimate inbound fee (we accept a loss here, it's a diagnostic cost)
-            # Note: outbound_fee is 0 because the active shock itself is not the
-            # fee-controller path; the controller-side exploration remains non-zero.
-            inbound_fee = self._estimate_inbound_fee(dest_info.get('peer_id', ''))
-
-            # Capital Controls Check - diagnostic rebalances count against daily budget
-            if not self._check_capital_controls():
-                self.plugin.log("Defibrillator Active Shock blocked by capital controls", level='warn')
-                # Audit (defibrillation honesty): a blocked shock delivered
-                # no liquidity — report it as blocked, never completed.
-                return {
-                    "success": True,
-                    "shock_status": "blocked",
-                    "message": "Zero-Fee flag set, but Active Shock blocked: daily budget exhausted or reserve too low"
-                }
-
-            actual_fee_sats = None
-            shock_ok = False
-            shock_pending = False
-            shock_budget_blocked = False
-            for source_id, source_info in ranked_sources:
-                candidate = RebalanceCandidate(
-                    source_candidates=[source_id],
-                    to_channel=channel_id,
-                    primary_source_peer_id=source_info.get('peer_id', ''),
-                    to_peer_id=dest_info.get('peer_id', ''),
-                    amount_sats=shock_amount,
-                    amount_msat=sats_to_base(shock_amount),
-                    outbound_fee_ppm=0,
-                    inbound_fee_ppm=inbound_fee,
-                    source_fee_ppm=source_info.get('fee_ppm', 0),
-                    weighted_opp_cost_ppm=0,
-                    spread_ppm=0,  # Likely negative, we don't care for diagnostic
-                    max_budget_sats=max_fee_sats,  # Configured diagnostic fee cap (D4)
-                    max_budget_msat=sats_to_base(max_fee_sats),
-                    max_fee_ppm=max_fee_ppm,  # Derived from the sat cap (D4)
-                    expected_profit_sats=-50,  # Expect a small loss (diagnostic cost)
-                    liquidity_ratio=0.5,
-                    dest_flow_state="diagnostic",
-                    dest_turnover_rate=0.0,
-                    source_turnover_rate=0.0
-                )
-
-                # Record in database (direct diagnostic execution bypasses normal job flow)
-                rebalance_id = self.database.record_rebalance(
-                    from_channel=source_id,
-                    to_channel=channel_id,
-                    amount_sats=shock_amount,
-                    max_fee_sats=max_fee_sats,
-                    expected_profit_sats=-50,
-                    rebalance_type='diagnostic',
-                    reason_code='defibrillator'
-                )
-
-                if not self.rebalance_engine_v2:
-                    self.database.update_rebalance_result(rebalance_id, 'failed', error_message="no rebalance engine available")
-                    break
-
-                # P4-020: reserve the shock's fee cap atomically on the unified
-                # cross-category rail (reserve_budget=True). If the budget is
-                # exhausted by other categories' reservations the engine returns
-                # a 'local_budget_block' result and never pays.
-                # P4-025: account_costs=True makes the engine record the settled
-                # fee into rebalance_costs BEFORE it marks the reservation spent
-                # (the auto-cycle ordering), so there is no instant where the
-                # shock fee is counted by neither the reservation nor
-                # rebalance_costs. The engine also updates the shared history row
-                # to 'success' with the actual fee, so this path must NOT call
-                # _record_successful_rebalance_fee again (it would double-count
-                # the cost).
-                from .rebalance_modes import engine_kwargs
-                exec_result = self._execute_candidate_v2(
-                    candidate, rebalance_id=rebalance_id,
-                    **engine_kwargs("diagnostic")
-                )
-                if exec_result.success:
-                    actual_fee_sats = base_to_sats_ceil(
-                        max(0, int(getattr(exec_result, "fee_msat", 0) or 0))
-                    )
-                elif not getattr(exec_result, "payment_pending", False):
-                    # Engine shares this history row; leave its
-                    # 'pending_settlement' status for the reconcile sweep.
-                    # Audit wave2 FIX 3: budget/governor blocks are recorded
-                    # by the engine as 'skipped' (no route was attempted) —
-                    # rewriting them to 'failed' here re-poisoned the dest
-                    # success-rate aggregate that gates the sats-EV planner.
-                    # Only overwrite for an actual routing failure. Uses the
-                    # engine CLASS's classifier (single source of truth) so
-                    # a mocked engine instance cannot skew the check.
-                    from .rebalance_engine_v2 import RebalanceEngine
-                    try:
-                        is_block = RebalanceEngine._is_budget_block(exec_result)
-                    except Exception:
-                        is_block = False
-                    if not is_block:
-                        self.database.update_rebalance_result(
-                            rebalance_id, 'failed',
-                            error_message=exec_result.error or "rebalance failed"
-                        )
-                shock_ok = exec_result.success
-                shock_pending = bool(getattr(exec_result, "payment_pending", False)) and not shock_ok
-                # A shock rejected by the atomic unified-budget reserve delivered
-                # no liquidity because the budget was full — that is a capital
-                # control block, not an execution failure, so report it honestly
-                # as 'blocked' (D4), same as the pre-reserve capital-controls gate.
-                shock_budget_blocked = (
-                    not shock_ok and not shock_pending
-                    and "local_budget_block" in str(getattr(exec_result, "error", "") or "")
-                )
-                if shock_ok or shock_pending or shock_budget_blocked:
-                    break
-                # Only a route-availability failure justifies trying the next
-                # source: no payment was attempted, so a retry cannot double-
-                # pay. Any other failure stops the sequence (a payment may
-                # have gone out, or the cause is not source-specific).
-                if not self._is_source_route_failure(exec_result.error):
-                    break
-                self.plugin.log(
-                    f"Defibrillator: source {source_id} unroutable "
-                    f"({exec_result.error}); trying next source",
-                    level='info',
-                )
-
-            # Audit (defibrillation honesty): report the ACTUAL shock
-            # outcome. A failed or still-pending shock delivered no
-            # confirmed liquidity and must not read as completed.
-            if shock_ok:
-                shock_status = "completed"
-            elif shock_pending:
-                shock_status = "pending"
-            elif shock_budget_blocked:
-                # P4-020: rejected by the atomic unified-budget reserve.
-                shock_status = "blocked"
-            else:
-                shock_status = "failed"
-            result = {
-                "success": True,
-                "shock_status": shock_status,
-                "message": f"Defibrillator active: Zero-Fee flag set + Shock {shock_status}"
-            }
-            if actual_fee_sats is not None:
-                result["actual_fee_sats"] = actual_fee_sats
-            return result
-
-        except Exception as e:
-            self.plugin.log(f"Defibrillator shock failed: {e}", level='error')
-            return {
-                "success": False,
-                "shock_status": "failed",
-                "message": f"Zero-Fee flag set, but active shock failed: {e}"
-            }
 
     def manual_rebalance(self, from_channel: str, to_channel: str,
                          amount_sats: int, max_fee_sats: Optional[int] = None,

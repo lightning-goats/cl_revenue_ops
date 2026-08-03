@@ -292,15 +292,7 @@ ALLOWLIST = {
         "+ (ok, remaining) via _return_remaining) — one atomic reservation "
         "implementation; the legacy budget_reservations insert no longer runs.",
     ),
-    ("capacity_planner.py", "_planner_reserve_delegate", "reserve_spend"): (
-        ATOMIC_RESERVE, 1,
-        "Phase 2E governed entry (2026-07-12): GovernorFacade delegate closure "
-        "inside _governed_reserve_spend — the SAME atomic reserve_spend call "
-        "as the legacy _execute_open/_execute_close sites, same "
-        "reservation_id/kwargs; active only when "
-        "econ_governor_planner_enabled is true.",
-    ),
-    # --- Daemon spender 5/6: defibrillation diagnostic shock (T7) -----------
+    # --- Shared rebalance dispatch ------------------------------------------
     ("rebalancer.py", "_execute_candidate_v2", "execute_candidate"): (
         ATOMIC_RESERVE, 1,
         "Dispatches one candidate to the engine. The defibrillation daemon path "
@@ -309,66 +301,12 @@ ALLOWLIST = {
         "recorded before the reservation is marked spent (P4-025); manual/explicit "
         "callers pass False and own their own accounting (operator-only).",
     ),
-    # --- Daemon spender 3/6: capacity-planner channel OPEN (T7) -------------
-    ("capacity_planner.py", "_execute_open", "reserve_spend"): (
-        ATOMIC_RESERVE, 1,
-        "Planner open reserve (T7), category='channel_open', effective_budget passed "
-        "-> atomic cross-category rejection before fundchannel (P4-018/DD1).",
-    ),
-    ("capacity_planner.py", "_execute_open", "fundchannel_rpc"): (
-        RAIL_COUNTED_COST, 1,
-        "The on-chain channel open. Its fee is reserved atomically by the "
-        "reserve_spend in the same method (P4-018) and settled loud/retry + "
-        "protected from the stale sweep (P4-021).",
-    ),
-    # --- Daemon spender 4/6: capacity-planner channel CLOSE (T7) ------------
-    ("capacity_planner.py", "_execute_close", "reserve_spend"): (
-        ATOMIC_RESERVE, 1,
-        "Planner close reserve (T7), category='channel_close', reserved BEFORE the "
-        "on-chain close, effective_budget passed (P4-018/DD1).",
-    ),
-    ("capacity_planner.py", "_execute_close", "close_rpc"): (
-        RAIL_COUNTED_COST, 1,
-        "The on-chain channel close. Fee reserved atomically by the reserve_spend in "
-        "the same method (P4-018), settled loud/retry + sweep-protected (P4-021).",
-    ),
     # --- Operator-only RPC spender (T0 dispatch; other plugins / operator) --
     ("cl-revenue-ops.py", "revenue_spend_reserve", "reserve_spend"): (
         OPERATOR_ONLY, 1,
         "revenue-spend-reserve RPC (T0 pyln dispatch). Atomic (effective_budget "
         "passed, force_fresh gate, P2-011/DD1). Reachable only by an operator / "
         "sibling plugin, not an autonomous daemon.",
-    ),
-    # --- Pure RPC transport wrappers (no independent budget decision) -------
-    ("capacity_planner.py", "_rpc_fundchannel", "fund_channel"): (
-        NOT_A_SPEND, 1,
-        "Transport wrapper: forwards to data_service.fund_channel. Only "
-        "daemon-reachable via _execute_open, which reserves atomically first (P4-018).",
-    ),
-    ("capacity_planner.py", "_rpc_fundchannel", "rpc_fundchannel"): (
-        NOT_A_SPEND, 1,
-        "rpc.call('fundchannel') fallback inside the _rpc_fundchannel transport "
-        "wrapper; reserving caller is _execute_open (P4-018).",
-    ),
-    ("capacity_planner.py", "_rpc_close", "close_channel"): (
-        NOT_A_SPEND, 1,
-        "Transport wrapper: forwards to data_service.close_channel. Reserving caller "
-        "is _execute_close (P4-018).",
-    ),
-    ("capacity_planner.py", "_rpc_close", "rpc_close"): (
-        NOT_A_SPEND, 1,
-        "rpc.call('close') fallback inside the _rpc_close transport wrapper; "
-        "reserving caller is _execute_close (P4-018).",
-    ),
-    ("data_service.py", "fund_channel", "rpc_fundchannel"): (
-        NOT_A_SPEND, 1,
-        "DataService RPC transport (rpc.call('fundchannel')). Reached only via the "
-        "planner open path, which reserves atomically first (P4-018).",
-    ),
-    ("data_service.py", "close_channel", "rpc_close"): (
-        NOT_A_SPEND, 1,
-        "DataService RPC transport (rpc.call('close')). Reached only via the planner "
-        "close path, which reserves atomically first (P4-018).",
     ),
     # --- Attribute-style money RPC dispatch (rpc.<method>(...), P4-026) -----
     ("data_service.py", "send_pay", "rpc_attr_sendpay"): (
@@ -465,10 +403,8 @@ def test_scanner_finds_the_retained_daemon_spenders():
     sites = collect_spend_sites()
     required = {
         ("rebalancer.py", "execute_rebalance", "reserve_budget"),                 # rebalance auto
-        ("rebalance_engine_v2.py", "_reserve_execution_budget", "reserve_budget"),  # engine/defib reserve
-        ("rebalancer.py", "_execute_candidate_v2", "execute_candidate"),          # defibrillation dispatch
-        ("capacity_planner.py", "_execute_open", "reserve_spend"),                # capex open
-        ("capacity_planner.py", "_execute_close", "reserve_spend"),               # capex close
+        ("rebalance_engine_v2.py", "_reserve_execution_budget", "reserve_budget"),  # engine reserve
+        ("rebalancer.py", "_execute_candidate_v2", "execute_candidate"),          # shared rebalance dispatch
         ("cl-revenue-ops.py", "revenue_spend_reserve", "reserve_spend"),          # operator RPC
         # dynamic native executor site:
         ("rebalance_native_executor_v2.py", "_rpc_call", _DYNAMIC_METHOD_MARKER),  # computed sendpay
@@ -676,18 +612,18 @@ def test_the_test_detects_a_duplicate_same_marker_call():
     allowlisted function raises the scanned occurrence count above the declared
     count and trips the guard on the count axis -- the exact absorption the old
     set-collapse allowed. Here two extra reserve_spend calls are injected into
-    capacity_planner._execute_open (declared count 1); the guard must report a
+    database.reserve_budget (declared count 1); the guard must report a
     count mismatch for that key."""
     rogue = (
         "class Dup:\n"
-        "    def _execute_open(self, db, amt):\n"
+        "    def reserve_budget(self, db, amt):\n"
         "        db.reserve_spend(reservation_id='a', amount_sats=amt, category='x')\n"
         "        db.reserve_spend(reservation_id='b', amount_sats=amt, category='x')\n"
     )
     unaccounted, stale, count_mismatch = _guard_failures(
-        extra_sources=[("capacity_planner.py", rogue)]
+        extra_sources=[("database.py", rogue)]
     )
-    key = ("capacity_planner.py", "_execute_open", "reserve_spend")
+    key = ("database.py", "reserve_budget", "reserve_spend")
     assert key in count_mismatch, (
         "a SECOND same-marker call in an allowlisted function was absorbed -- the "
         f"guard did not surface a count mismatch (mismatches={count_mismatch})"
@@ -891,7 +827,7 @@ def test_alias_lint_allowlists_only_the_known_generic_proxy():
 def test_alias_lint_ignores_canonical_rpc_rebind():
     """A canonical rebind (``self.rpc = rpc`` -- target is itself a canonical
     handle) is NOT an evasion and must not be flagged: the scanner still sees
-    money calls on ``self.rpc``. (BoltzCliManager.__init__ does exactly this.)"""
+    money calls on ``self.rpc``. (This remains a valid scanner property.)"""
     rebind = (
         "class Mgr:\n"
         "    def __init__(self, plugin, rpc):\n"
