@@ -23,6 +23,13 @@ def _source_files():
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FINAL_RUNTIME_FILES = [
+    path for path in sorted((ROOT / "modules").glob("*.py"))
+    if path.name not in {
+        "lnplus_swaps.py", "boltz_manager.py", "capacity_planner.py",
+        "demand_flow.py", "protection_service.py",
+    }
+] + [ROOT / "cl-revenue-ops.py"]
 REBALANCE_BOUNDARY_FILES = [
     ROOT / "modules" / "rebalance_engine_v2.py",
     ROOT / "modules" / "rebalance_router_v2.py",
@@ -244,3 +251,20 @@ class TestNoSlingDependency:
         for path in (ROOT / "requirements.txt", ROOT / "pyproject.toml"):
             source = path.read_text(encoding="utf-8").lower()
             assert "sling" not in source, f"dependency Sling reference found in {path}"
+
+
+class TestFinalRuntimeAuthorityBoundary:
+    def test_no_sling_or_coordinator_imports_in_post_removal_source_set(self):
+        forbidden = ("hive", "mycelium", "sling")
+        for path in FINAL_RUNTIME_FILES:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            imported = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.extend(alias.name.lower() for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    imported.append(str(node.module or "").lower())
+            for module_name in imported:
+                assert not any(token in module_name for token in forbidden), (
+                    f"forbidden runtime import {module_name} returned in {path}"
+                )
