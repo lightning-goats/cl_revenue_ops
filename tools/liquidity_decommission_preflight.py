@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Read-only fail-closed preflight for liquidity executor decommissioning."""
+"""Read-only SQLite preflight for liquidity executor decommissioning.
+
+External Boltz daemon/journal state is deliberately outside this report and must
+be verified through the old runtime read-only status surface before shutdown.
+"""
 
 from __future__ import annotations
 
@@ -146,7 +150,6 @@ def _inspect(conn: sqlite3.Connection) -> tuple[dict, list[dict]]:
         "safe": True,
         "unresolved_lnplus_rows": 0,
         "active_retired_reservations": 0,
-        "pending_boltz_rows": 0,
         "active_contract_peer_tags_verified": len(contracts),
     }, contracts
 

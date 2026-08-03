@@ -40,12 +40,32 @@ lightning-cli --lightning-dir=/data/lightningd revenue-rebalance-debug
 lightning-cli --lightning-dir=/data/lightningd revenue-profitability
 lightning-cli --lightning-dir=/data/lightningd revenue-total-cost-budget
 lightning-cli --lightning-dir=/data/lightningd revenue-spend-ledger
+lightning-cli --lightning-dir=/data/lightningd revenue-boltz-status
+lightning-cli --lightning-dir=/data/lightningd revenue-lnplus-status
 ```
 
 Stop if the plugin entrypoint or database path is ambiguous, health is already
-red, a rebalance settlement is pending without an understood outcome, the
-reviewed commits do not match the artifacts, or the independent approvals are
-missing. A read timeout is not evidence of a safe idle state.
+red, a rebalance settlement is pending without an understood outcome, Boltz
+reports any pending swap, LN+ reports an unresolved application or opening, the
+reviewed commits do not match the artifacts, or independent approvals are
+missing. A read timeout is not evidence of a safe idle state. The SQLite
+preflight does not inspect the external Boltz daemon or journal, so the old
+runtime status check is mandatory.
+
+First create the private evidence directory with mode 0700. Run the repository
+preflight against the resolved database and write its output
+to the private evidence directory. The tool opens SQLite in read-only and
+query-only mode, refuses symlinks and overwrites, verifies unresolved LN+ rows,
+active retired reservations, and generic no_close tags, and creates a mode-0600
+report:
+
+```bash
+umask 077
+install -d -m 0700 /data/lightningd/private/revenue-ops-decommission-20260803
+.venv/bin/python tools/liquidity_decommission_preflight.py \
+  --db /resolved/path/to/revenue_ops.db \
+  --output /data/lightningd/private/revenue-ops-decommission-20260803/preflight.json
+```
 
 ## 2. Pin the old runtime inert
 
@@ -67,7 +87,17 @@ change only under the separately approved production cutover. Read back every
 value after changing it. Database overrides win over file defaults in the old
 runtime, so a false config-file value alone is insufficient.
 
-Render two configs before the outage:
+Render two configs before the outage. Use the repository renderer so the v3
+file removes retired options and the rollback file contains one exact false
+gate for every retired executor:
+
+```bash
+umask 077
+.venv/bin/python tools/render_liquidity_decommission_config.py \
+  --input /data/lightningd/config \
+  --active-output /data/lightningd/private/revenue-ops-decommission-20260803/config.v3 \
+  --rollback-output /data/lightningd/private/revenue-ops-decommission-20260803/config.rollback
+```
 
 - active v3 config: every removed `revenue-ops-planner-*`,
   `revenue-ops-lnplus-*`, `revenue-ops-boltz-*`, diagnostic-rebalance,

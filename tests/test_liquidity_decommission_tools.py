@@ -71,6 +71,7 @@ def test_preflight_safe_contract_only_is_read_only_and_private(tmp_path):
     payload = json.loads(output.read_text())
     assert payload["schema_version"] == 1
     assert payload["preconditions"]["safe"] is True
+    assert "pending_boltz_rows" not in payload["preconditions"]
     assert {c["direction"] for c in payload["contracts"]} == {"outbound", "incoming"}
     assert {c["tag_removal_owner"] for c in payload["contracts"]} == {"operator"}
 

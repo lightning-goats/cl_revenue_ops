@@ -6,14 +6,14 @@ Do not hand-edit chunk rows; regenerate. Owner/status columns are the one place 
 ## Summary
 
 - Total tracked source files: **81**
-- Total tracked source lines: **64772**
+- Total tracked source lines: **64775**
 - Total chunks: **179**
 
 | Tier | Chunk size | Files | Lines | Chunks |
 | --- | --- | --- | --- | --- |
 | 1 | 400 | 10 | 32757 | 88 |
 | 2 | 700 | 8 | 8428 | 17 |
-| 3 | 700 | 63 | 23587 | 74 |
+| 3 | 700 | 63 | 23590 | 74 |
 
 ## Chunks
 
@@ -183,7 +183,7 @@ Do not hand-edit chunk rows; regenerate. Owner/status columns are the one place 
 | tools/fee_tournament_loop.py#2 | tools/fee_tournament_loop.py | 701 | 712 | 3 | 705085d4a4853e2bc711ab13b3136018200bd768 |  | UNASSIGNED |
 | tools/hive_mcp_compat.py#1 | tools/hive_mcp_compat.py | 1 | 700 | 3 | d1727679f4bc3984aa590731c107f0f2b4c0f525 |  | UNASSIGNED |
 | tools/hive_mcp_compat.py#2 | tools/hive_mcp_compat.py | 701 | 929 | 3 | d1727679f4bc3984aa590731c107f0f2b4c0f525 |  | UNASSIGNED |
-| tools/liquidity_decommission_preflight.py#1 | tools/liquidity_decommission_preflight.py | 1 | 212 | 3 | 9186c5af9c7f17e2f3d02be993a41373102b170a |  | UNASSIGNED |
+| tools/liquidity_decommission_preflight.py#1 | tools/liquidity_decommission_preflight.py | 1 | 215 | 3 | 4d5df6c92978ddb2a356299e1978abf014fe8095 |  | UNASSIGNED |
 | tools/long_fee_tournament.py#1 | tools/long_fee_tournament.py | 1 | 526 | 3 | 5078f3d0bce728b878c1b3b3a09fa0ed40ec6c3e |  | UNASSIGNED |
 | tools/perf/cycle_driver.py#1 | tools/perf/cycle_driver.py | 1 | 173 | 3 | 5405380a1223b45778c51ca83e3e4816108682c5 |  | UNASSIGNED |
 | tools/perf/profile_cycles.py#1 | tools/perf/profile_cycles.py | 1 | 517 | 3 | 44da0f4ea0116d4376780966247aa3318e26fbda |  | UNASSIGNED |
