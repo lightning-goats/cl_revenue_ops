@@ -5579,11 +5579,11 @@ class FeeController:
     DTS_SUMMARY_LOCK_TIMEOUT_SECONDS = 1.0
 
     def get_dts_summary(self, channel_id: str) -> Optional[Dict[str, Any]]:
-        """Return DTS posterior and cycle state summary for external consumers (e.g. Boltz planner).
+        """Return DTS posterior and cycle state summary for diagnostics.
 
         Returns None if no state exists for the channel.
 
-        Called from Boltz plan builds on another thread while the fee cycle
+        May be called from diagnostics on another thread while the fee cycle
         may hold _state_lock for the whole channel loop. Reads shared state
         under the lock (7caf3dd discipline) but with a bounded acquire: on
         contention the last-known snapshot is returned (None if there has
@@ -8150,7 +8150,7 @@ class FeeController:
                                "explanation": env.explanation.render()}
                     # PR 3e: canonical-snapshot linkage as EVIDENCE only —
                     # the timestamped label keeps its identity semantics
-                    # (same rationale as LN+; the idempotency key hashes
+                    # (stable retry identity; the idempotency key hashes
                     # snapshot_id).
                     try:
                         shadow = getattr(self, "econ_shadow", None)

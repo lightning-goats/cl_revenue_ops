@@ -13,7 +13,6 @@ most modules are imported directly by cl-revenue-ops.py. Module families:
   rebalance_execution
 - Capital allocation: capacity_planner (channel opens/closes/defibrillation),
   capex_budget (budget/reservation engine), capital_efficiency (dead-capital analysis)
-- On-/off-chain swaps: boltz_manager (submarine swap integration)
 - Analysis & reporting: profitability_analyzer, demand_flow, segment_observations
 - Infrastructure: config (configuration and constants), database (SQLite storage layer),
   data_service, policy_manager (peer-level policy management, v1.4), utils

@@ -378,12 +378,10 @@ class TestCapexWalletUnreadable:
             config_overrides={"min_wallet_reserve": 1_000_000},
         )
         alloc = engine.compute_allocations()
-        # An unreadable wallet must NOT read as "wallet empty, deficit = full
-        # reserve" — no tactical (Boltz refill) budget, no operational flip.
-        assert alloc.tactical_budget_msat == 0
+        # Unknown wallet state cannot create an operational priority flip.
         assert alloc.priority_class != "operational"
 
-    def test_readable_deficit_still_grants_tactical(self):
+    def test_readable_deficit_still_sets_operational_priority(self):
         prof = _make_capex_prof(
             contribution_msat=10_000 * MSAT_PER_SAT,
             fees_earned_msat=10_000 * MSAT_PER_SAT,
@@ -395,7 +393,6 @@ class TestCapexWalletUnreadable:
         )
         alloc = engine.compute_allocations()
         assert alloc.priority_class == "operational"
-        assert alloc.tactical_budget_msat > 0
 
 
 # ---------------------------------------------------------------------------

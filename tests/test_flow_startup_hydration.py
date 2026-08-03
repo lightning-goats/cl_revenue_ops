@@ -109,12 +109,6 @@ def test_startup_hydration_uses_helper_window_for_empty_table():
     class _FakeCapexEngine(_FakeComponent):
         pass
 
-    class _FakeBoltzManager(_FakeComponent):
-        enabled = False
-
-        def set_capex_engine(self, *args, **kwargs):
-            return None
-
     options = {}
     for name, spec in mod.plugin.options.items():
         default = spec.get("default", "")
@@ -122,7 +116,6 @@ def test_startup_hydration_uses_helper_window_for_empty_table():
 
     options["revenue-ops-flow-window-days"] = "7"
     options["revenue-ops-db-path"] = ":memory:"
-    options["revenue-ops-boltz-enabled"] = "false"
 
     with (
         patch.object(mod, "Database", return_value=fake_db),
@@ -135,7 +128,6 @@ def test_startup_hydration_uses_helper_window_for_empty_table():
         patch.object(mod, "EVRebalancer", return_value=_FakeRebalancer()),
         patch.object(mod, "CapitalEfficiencyAnalyzer", return_value=_FakeComponent()),
         patch.object(mod, "CapexBudgetEngine", return_value=_FakeCapexEngine()),
-        patch.object(mod, "BoltzCliManager", return_value=_FakeBoltzManager()),
         patch.object(mod.Config, "load_overrides", return_value=[]),
         patch.object(mod, "_start_background_tasks", return_value=None, create=True),
         patch.object(data_service_module, "DataService", return_value=fake_data_service),

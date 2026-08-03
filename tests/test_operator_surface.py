@@ -50,8 +50,6 @@ def test_public_runtime_keys_are_safety_only():
         "planner_max_closes_per_cycle",
         "planner_min_annual_roi_pct",
         "capex_probability_budget_bonus",
-        "boltz_auto_cycle_enabled",
-        "boltz_structural_budget_sats_per_day",
         "receivable_ratio_target",
         "receivable_ratio_floor",
         "drain_fee_discount_max",
@@ -65,12 +63,10 @@ def test_public_runtime_keys_are_safety_only():
         "econ_shadow_enabled",
         "econ_governor_rebalance_enabled",
         "econ_governor_planner_enabled",
-        "econ_governor_boltz_enabled",
         "econ_governor_fees_enabled",
         "econ_arbiter_enabled",
         "econ_cycle_rebalance_enabled",
         "econ_cycle_planner_enabled",
-        "econ_cycle_boltz_enabled",
         "econ_ev_populated",
         "econ_conflict_rules_extended",
         "authority_level",
@@ -117,8 +113,6 @@ def test_public_runtime_dict_returns_only_public_keys():
         "planner_max_closes_per_cycle": 0,
         "planner_min_annual_roi_pct": 1.0,
         "capex_probability_budget_bonus": 0.0,
-        "boltz_auto_cycle_enabled": False,
-        "boltz_structural_budget_sats_per_day": 0,
         "receivable_ratio_target": 0.3,
         "receivable_ratio_floor": 0.2,
         "drain_fee_discount_max": 0.0,
@@ -131,12 +125,10 @@ def test_public_runtime_dict_returns_only_public_keys():
         "econ_shadow_enabled": True,
         "econ_governor_rebalance_enabled": True,
         "econ_governor_planner_enabled": True,
-        "econ_governor_boltz_enabled": True,
         "econ_governor_fees_enabled": True,
         "econ_arbiter_enabled": True,
         "econ_cycle_rebalance_enabled": True,
         "econ_cycle_planner_enabled": True,
-        "econ_cycle_boltz_enabled": True,
         "econ_ev_populated": True,
         "econ_conflict_rules_extended": True,
         "authority_level": "capital",
@@ -247,7 +239,6 @@ def _run_init_with_stubbed_dependencies(
         set_profitability_analyzer=MagicMock(),
         set_capacity_planner=MagicMock(),
     ))
-    monkeypatch.setattr(mod, "BoltzCliManager", lambda *args, **kwargs: MagicMock(enabled=False))
     monkeypatch.setattr(mod.threading, "Thread", DummyThread)
 
     mod.init(options, {}, mod.plugin)
@@ -403,7 +394,6 @@ def test_init_wires_rebalancer_back_into_capacity_planner(monkeypatch):
     monkeypatch.setattr(mod, "CapacityPlanner", lambda *args, **kwargs: planner_mock)
     monkeypatch.setattr(mod, "FeeController", lambda *args, **kwargs: MagicMock())
     monkeypatch.setattr(mod, "EVRebalancer", lambda *args, **kwargs: rebalancer_mock)
-    monkeypatch.setattr(mod, "BoltzCliManager", lambda *args, **kwargs: MagicMock(enabled=False))
     monkeypatch.setattr(mod.threading, "Thread", DummyThread)
 
     mod.init(options, {}, mod.plugin)
@@ -443,9 +433,6 @@ def test_revenue_rebalance_debug_includes_last_cycle_score_breakdown():
             "actual_spent_by_category": {},
             "reserved_by_category": {},
         }
-    )
-    mod._boltz_liquidity_cost_components = MagicMock(
-        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
     )
     engine_debug = {
         "summary": {
@@ -563,18 +550,14 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
 
     assert result["mutable_keys"] == [
         "authority_level",
-        "boltz_auto_cycle_enabled",
-        "boltz_structural_budget_sats_per_day",
         "capex_probability_budget_bonus",
         "daily_budget_sats",
         "drain_fee_discount_max",
         "econ_arbiter_enabled",
         "econ_conflict_rules_extended",
-        "econ_cycle_boltz_enabled",
         "econ_cycle_planner_enabled",
         "econ_cycle_rebalance_enabled",
         "econ_ev_populated",
-        "econ_governor_boltz_enabled",
         "econ_governor_fees_enabled",
         "econ_governor_planner_enabled",
         "econ_governor_rebalance_enabled",
@@ -612,7 +595,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "risk_profile",
         "weekly_budget_sats",
     ]
-    assert result["count"] == 49
+    assert result["count"] == 45
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -646,8 +629,6 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "planner_max_closes_per_cycle": 0,
         "planner_min_annual_roi_pct": 1.0,
         "capex_probability_budget_bonus": 0.0,
-        "boltz_auto_cycle_enabled": False,
-        "boltz_structural_budget_sats_per_day": 0,
         "receivable_ratio_target": 0.3,
         "receivable_ratio_floor": 0.2,
         "drain_fee_discount_max": 0.0,
@@ -660,12 +641,10 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "econ_shadow_enabled": True,
         "econ_governor_rebalance_enabled": True,
         "econ_governor_planner_enabled": True,
-        "econ_governor_boltz_enabled": True,
         "econ_governor_fees_enabled": True,
         "econ_arbiter_enabled": True,
         "econ_cycle_rebalance_enabled": True,
         "econ_cycle_planner_enabled": True,
-        "econ_cycle_boltz_enabled": True,
         "econ_ev_populated": True,
         "econ_conflict_rules_extended": True,
         "authority_level": "capital",
@@ -915,15 +894,17 @@ def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
     )
     mod.database = MagicMock()
     mod.database.get_spend_ledger_summary.return_value = {
-        "spent_24h_sats": 72,
-        "reserved_24h_sats": 23,
+        "spent_24h_sats": 77,
+        "reserved_24h_sats": 27,
         "spent_by_category": {
             "channel_open": 50,
             "channel_close": 15,
+            "boltz": 5,
             "misc_ops": 7,
         },
         "reserved_by_category": {
             "channel_open": 20,
+            "boltz": 4,
             "misc_ops": 3,
         },
         "event_count_by_category": {
@@ -945,9 +926,6 @@ def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
     }
     mod._rebalance_liquidity_cost_components = MagicMock(
         return_value={"spent_24h_sats": 11, "reserved_24h_sats": 2}
-    )
-    mod._boltz_liquidity_cost_components = MagicMock(
-        return_value={"spent_24h_sats": 5, "reserved_24h_sats": 4}
     )
 
     result = mod._total_cost_budget_status(window_hours=24)
@@ -977,6 +955,7 @@ def test_total_cost_budget_excludes_canonical_open_close_from_generic_spend():
     assert result["components"]["generic_ledger"]["excluded_spent_categories"] == {
         "channel_open": 50,
         "channel_close": 15,
+        "boltz": 5,
     }
     assert result["open_close_cost_visibility"] == {
         "canonical_open_cost_available": True,
@@ -1007,9 +986,6 @@ def _total_cost_budget_module_with_stub_components():
     mod.database.get_opening_costs_since.return_value = 0
     mod.database.get_closure_costs_since.return_value = 0
     mod._rebalance_liquidity_cost_components = MagicMock(
-        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
-    )
-    mod._boltz_liquidity_cost_components = MagicMock(
         return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
     )
     return mod
@@ -1079,9 +1055,6 @@ def test_total_cost_budget_reports_pending_open_close_visibility_delay():
     mod._rebalance_liquidity_cost_components = MagicMock(
         return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
     )
-    mod._boltz_liquidity_cost_components = MagicMock(
-        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
-    )
 
     result = mod._total_cost_budget_status(window_hours=24)
 
@@ -1127,8 +1100,6 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "planner_max_closes_per_cycle": 0,
         "planner_min_annual_roi_pct": 1.0,
         "capex_probability_budget_bonus": 0.0,
-        "boltz_auto_cycle_enabled": False,
-        "boltz_structural_budget_sats_per_day": 0,
         "receivable_ratio_target": 0.3,
         "receivable_ratio_floor": 0.2,
         "drain_fee_discount_max": 0.0,
@@ -1141,12 +1112,10 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "econ_shadow_enabled": True,
         "econ_governor_rebalance_enabled": True,
         "econ_governor_planner_enabled": True,
-        "econ_governor_boltz_enabled": True,
         "econ_governor_fees_enabled": True,
         "econ_arbiter_enabled": True,
         "econ_cycle_rebalance_enabled": True,
         "econ_cycle_planner_enabled": True,
-        "econ_cycle_boltz_enabled": True,
         "econ_ev_populated": True,
         "econ_conflict_rules_extended": True,
         "authority_level": "capital",

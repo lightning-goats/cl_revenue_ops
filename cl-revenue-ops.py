@@ -51,7 +51,6 @@ from modules.policy_manager import (
     TACTICAL_POLICY_ACTIONS,
     BANNED_TAG,
 )
-from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
 from modules.capex_budget import CapexBudgetEngine
 from modules.capital_efficiency import CapitalEfficiencyAnalyzer
 from modules.segment_observations import SegmentObservationStore
@@ -68,19 +67,12 @@ from modules.econ_shadow import EconShadow
 #     verification pass. 1 critical (days_open frozen at 30 for every
 #     channel opened in the last ~9 months — SCID timestamp estimate now
 #     tip-anchored, poisoned opened_at rows repaired), 13 major (dead
-#     revenue-boltz-auto-cycle-status RPC, LN+ notifications NameError,
-#     boltz loop_in/chainswap embedded-error detection, balance-cycle
 #     cooldown burn on dry-run/policy-block, RPC-handler tracebacks,
-#     crossed LN+ participants band, reconcile completed-while-applied
-#     misclassification, LN+ same-cycle funds race, loser-pipeline defib
-#     deadlock, dead boltz-coordination exhaustion signal, budget blocks
 #     poisoning futility/success-rates, execute_candidate inflight-guard
 #     bypass, PnL 30d-revenue-vs-8d-volume window mismatch), and ~20 minor
 #     fixes. Orphan hive tables dropped by migration. fee_controller dead
 #     code removed (-207 lines). Full suite 3091 green.
 # v2.17.0: Standalone Phases 4-5 — complete the de-hive (2026-07-09/10)
-#   - Phase 4: de-hived lnplus_swaps — LN+ automation stays; the fleet-trust
-#     exemption, mycelium swap hints, and lnplus_fleet_pubkeys option are gone.
 #   - Phase 5: removed every remaining inert hive branch — fee_controller
 #     (temporal adjustment, fleet fee prior, skewed-prior reseed, fleet-sibling
 #     exclusion), the orchestrator's hive globals/RPC (revenue-hive-hints-status
@@ -105,7 +97,6 @@ from modules.econ_shadow import EconShadow
 #     force-priced to 0 ppm (they price normally via DTS/PID). Neither has any
 #     effect today — there are no fleet members without cl-hive.
 #   - Preserved all general pricing/routing math (DTS/PID, drain bias, the
-#     composite temporal-bias clamp, market routing, capex/budget, LN+, Boltz).
 # v2.15.0: Standalone Phase 1 — delete the dedicated hive modules (2026-07-09)
 #   - Removed modules/hive_hints.py, hive_router.py, hive_runtime.py (~3,368
 #     lines) and every orchestrator reference to them: the imports, the
@@ -135,14 +126,11 @@ from modules.econ_shadow import EconShadow
 #     highest-frequency spend path previously never read policy at all
 #   - Recycle protection set actually populates (list/.items() crash was
 #     swallowed); close/open/swap/defib gates fail CLOSED on policy errors
-#   - Boltz executes with fresh policy (plans are minutes stale) and the
 #     hive-route override's first-hop peer passes the same gate
 #   - Close gate lazily re-reads hive membership; opens blocked for passive
 #     peers; defib respects rebalance_mode (no_close never blocks defib)
-#   - LN+ outbound no_close self-heals like the incoming side; ownership is
 #     never claimed under policy-lookup uncertainty
 # v2.13.1: RPC surface-quality fixes from the read-only sweep (2026-07-08)
-#   - revenue-boltz-status returns a usage error (not a raw traceback) without
 #     swap_id and points at the global-state RPCs
 #   - expansion-treasury-recommendations returns one stable key set on every
 #     branch; auto-cycle-status embeds compact recommendation summaries
@@ -197,13 +185,12 @@ PLUGIN_VERSION = "2.19.0"
 # These drive NON-FATAL startup probes: a version below floor logs a warning but
 # never blocks init, so a running production node is not bricked by a skew.
 CLN_VERSION_FLOOR = "24.11.1"   # CORE_LIGHTNING_COMPATIBILITY.md minimum
-BOLTZCLI_MIN_VERSION = "2.11.0"  # documented in loop-out/loop-in help text
 
 
 def _parse_version_tuple(raw: Optional[str]):
     """Extract a numeric (major, minor, patch, ...) tuple from a version string.
 
-    Tolerant of command prefixes ("boltzcli version v2.12.0-9bf31be"),
+    Tolerant of command prefixes,
     leading "v", suffixes ("2.11.0-beta", "24.11.1gl"), and build
     metadata. Returns () when no version-shaped numeric component is found,
     which callers treat as "unknown / skip the comparison".
@@ -522,7 +509,6 @@ _INIT_ENUM_DEFAULTS = {
     'market_fee_mode': 'undercut',
     'base_fee_policy': 'off',
     'fee_profile': 'active',
-    'expansion_treasury_preferred_currency': 'BTC',
 }
 _BASE_FEE_POLICY_VALID = ('off', 'adaptive')
 
@@ -1011,48 +997,8 @@ capacity_planner: Optional[CapacityPlanner] = None
 safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrapper
 data_service = None  # Unified data service (DataService instance)
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
-boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
 capex_engine: Optional[CapexBudgetEngine] = None  # Unified capex budget engine
 econ_shadow: Optional[EconShadow] = None  # Phase 1 shadow: observe-mode intents + snapshot preview (fail-open)
-_boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
-_boltz_balance_lock = threading.Lock()
-# Resource-growth bound: _boltz_balance_last_action only stores per-channel
-# cooldown timestamps. Nothing evicted closed-channel entries, so the dict grew
-# one entry per channel ever swapped for the process lifetime. Prune entries far
-# older than any realistic cooldown (default 4h; hint overrides are hours). A
-# 30-day TTL dwarfs every cooldown window, so eviction is provably
-# non-behavioral: any pruned entry is already treated as expired by the cooldown
-# check (now - last_ts >> any cooldown_seconds).
-_BOLTZ_BALANCE_ACTION_TTL_SECONDS: int = 30 * 86400
-
-
-def _prune_boltz_balance_actions(now: int) -> int:
-    """Evict cooldown entries older than the TTL. Returns entries removed.
-
-    Acquires _boltz_balance_lock internally; callers must NOT already hold it.
-    """
-    cutoff = int(now) - _BOLTZ_BALANCE_ACTION_TTL_SECONDS
-    with _boltz_balance_lock:
-        stale = [k for k, ts in _boltz_balance_last_action.items()
-                 if int(ts or 0) < cutoff]
-        for k in stale:
-            _boltz_balance_last_action.pop(k, None)
-    return len(stale)
-_boltz_auto_cycle_run_lock = threading.Lock()
-_boltz_auto_cycle_state_lock = threading.Lock()
-_boltz_auto_cycle_state: Dict[str, Any] = {
-    'enabled': False,
-    'thread_started': False,
-    'running': False,
-    'next_run_ts': None,
-    'last_trigger': None,
-    'last_started_ts': None,
-    'last_finished_ts': None,
-    'last_duration_ms': None,
-    'last_result': None,
-    'last_error': None,
-    'consecutive_errors': 0,
-}
 
 # SCID to Peer ID cache for reputation tracking
 # Maps short_channel_id -> peer_id for quick lookups
@@ -1605,104 +1551,6 @@ plugin.add_option(
 )
 
 plugin.add_option(
-    name='revenue-ops-boltz-enabled',
-    default='false',
-    description='Enable Boltz CLI integration for revenue-boltz-* RPCs (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-cli-path',
-    default='/usr/local/bin/boltzcli',
-    description='Path to boltzcli binary (default: /usr/local/bin/boltzcli)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-datadir',
-    default='/var/lib/boltz',
-    description='Boltz data dir for boltzd client auth (default: /var/lib/boltz)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-use-sudo',
-    default='false',
-    description='Run boltzcli via sudo -n -u <user> (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-sudo-user',
-    default='boltz',
-    description='User for sudo boltzcli execution when enabled (default: boltz)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-timeout-seconds',
-    default='60',
-    description='boltzcli command timeout in seconds (default: 60)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-daily-budget-sats',
-    default='3000',
-    description='Daily Boltz swap fee budget used by revenue-boltz loop methods (default: 3000)',
-    dynamic=True
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-enforce-budget',
-    default='true',
-    description='If true, reject Boltz swaps when estimated fee exceeds remaining daily budget (default: true)',
-    dynamic=True
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-btc-wallet',
-    default='CLN',
-    description='Preferred boltzd BTC wallet name (default: CLN)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-lbtc-wallet',
-    default='LOOP-LBTC',
-    description='Preferred boltzd LBTC wallet name (default: LOOP-LBTC)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-routing-fee-limit-ppm',
-    default='0',
-    description='Max routing fee in PPM for reverse swaps (0 = no limit, boltzcli default)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-max-withdraw-sats',
-    default='10000000',
-    description='Hard cap on a single Boltz on-chain withdraw in sats (default: 10000000; 0 disables). A sweep withdraw bypasses this cap and requires confirm_sweep=true.'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-auto-cycle-enabled',
-    default='false',
-    description='Enable in-plugin periodic profit-gated Boltz balance cycles (default: false; automated spending must be opted into explicitly)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-auto-cycle-interval-minutes',
-    default='15',
-    description='Minutes between scheduled Boltz auto-balance cycles (default: 15)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-auto-cycle-max-actions',
-    default='1',
-    description='Maximum Boltz actions per scheduled auto-cycle (default: 1)'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-auto-cycle-startup-delay-seconds',
-    default='120',
-    description='Startup delay before first Boltz auto-cycle run (default: 120)'
-)
-
-plugin.add_option(
     name='revenue-ops-receivable-ratio-target',
     default='0.30',
     description='Node receivable/capacity ratio at which structural drain pressure reaches zero'
@@ -1712,12 +1560,6 @@ plugin.add_option(
     name='revenue-ops-receivable-ratio-floor',
     default='0.20',
     description='Receivable/capacity ratio below which the node is considered inbound-starved'
-)
-
-plugin.add_option(
-    name='revenue-ops-boltz-structural-budget-sats',
-    default='0',
-    description='Daily swap-fee budget (sats) for scarcity-credited Boltz loop-outs (0 = disabled)'
 )
 
 plugin.add_option(
@@ -1760,48 +1602,6 @@ plugin.add_option(
     name='revenue-ops-htlcmax-balanced-pct',
     default='0.45',
     description='Max HTLC as a fraction of capacity for balanced channels when dynamic htlcmax is enabled (0.01-1.0)'
-)
-
-plugin.add_option(
-    name='revenue-ops-expansion-treasury-enabled',
-    default='false',
-    description='Enable expansion treasury mode (reverse-swap excess LN to on-chain for opens) (default: false)'
-)
-
-plugin.add_option(
-    name='revenue-ops-expansion-treasury-onchain-target-sats',
-    default='5000000',
-    description='Target confirmed on-chain reserve in sats for expansion treasury mode (default: 5000000)'
-)
-
-plugin.add_option(
-    name='revenue-ops-expansion-treasury-min-deficit-sats',
-    default='250000',
-    description='Minimum on-chain reserve deficit before treasury swaps are attempted (default: 250000)'
-)
-
-plugin.add_option(
-    name='revenue-ops-expansion-treasury-preferred-currency',
-    default='BTC',
-    description='Preferred Boltz reverse-swap output currency for expansion treasury (BTC or LBTC; default: BTC)'
-)
-
-plugin.add_option(
-    name='revenue-ops-expansion-treasury-max-actions',
-    default='1',
-    description='Max treasury reverse swaps per treasury cycle (default: 1)'
-)
-
-plugin.add_option(
-    name='revenue-ops-expansion-treasury-min-source-local-pct',
-    default='80.0',
-    description='Minimum local balance percent to consider a channel as treasury harvest source (default: 80.0)'
-)
-
-plugin.add_option(
-    name='revenue-ops-expansion-treasury-exclude-protected',
-    default='true',
-    description='Exclude hot/protected channels from treasury harvesting (default: true)'
 )
 
 plugin.add_option(
@@ -1920,389 +1720,6 @@ plugin.add_option(
 )
 
 
-def _boltz_auto_cycle_mark_state(**updates):
-    with _boltz_auto_cycle_state_lock:
-        _boltz_auto_cycle_state.update(updates)
-
-
-def _treasury_recommendation_executable(rec: Any) -> bool:
-    """True when the treasury executor would actually RUN this rec.
-
-    The treasury executor skips recs that fail the profit guard
-    (profit_guard_failed) and recs whose pass depends on the structural
-    inbound-scarcity credit (structural_credit_requires_balance_cycle).
-    Counting those toward treasury-mode selection deadlocks the auto-cycle:
-    treasury wins the mode pick, executes 0 actions, and the balance cycle
-    (where the structural envelope lives) never gets a turn.
-    """
-    if not isinstance(rec, dict):
-        return False
-    econ = rec.get("economics")
-    econ = econ if isinstance(econ, dict) else {}
-    return bool(econ.get("passes_profit_guard")) and not bool(econ.get("structural"))
-
-
-def _select_boltz_auto_cycle_mode(
-    *,
-    treasury_plan: Optional[Dict[str, Any]],
-    balance_plan: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Pick the next Boltz mode without side effects."""
-    treasury_plan = treasury_plan if isinstance(treasury_plan, dict) else {}
-    balance_plan = balance_plan if isinstance(balance_plan, dict) else {}
-
-    treasury = treasury_plan.get("treasury")
-    treasury = treasury if isinstance(treasury, dict) else {}
-    treasury_recommendations = (
-        list(treasury_plan.get("recommendations", []))
-        if isinstance(treasury_plan.get("recommendations", []), list)
-        else []
-    )
-    balance_recommendations = (
-        list(balance_plan.get("recommendations", []))
-        if isinstance(balance_plan.get("recommendations", []), list)
-        else []
-    )
-    # Only EXECUTABLE treasury recs count toward picking treasury mode.
-    treasury_executable = [
-        r for r in treasury_recommendations if _treasury_recommendation_executable(r)
-    ]
-    reserve_deficit_sats = int(treasury.get("deficit_sats", 0) or 0)
-
-    if str(treasury_plan.get("status") or "") == "ok" and treasury_executable:
-        return {
-            "mode": "treasury",
-            "reason": "standing_onchain_reserve_below_target",
-            "reserve_deficit_sats": reserve_deficit_sats,
-            "treasury_candidate_count": len(treasury_recommendations),
-            "treasury_executable_count": len(treasury_executable),
-            "balance_candidate_count": len(balance_recommendations),
-        }
-
-    if balance_recommendations:
-        return {
-            "mode": "balance",
-            "reason": "onchain_reserve_healthy_use_balance_mode",
-            "reserve_deficit_sats": reserve_deficit_sats,
-            "treasury_candidate_count": len(treasury_recommendations),
-            "treasury_executable_count": len(treasury_executable),
-            "balance_candidate_count": len(balance_recommendations),
-        }
-
-    return {
-        "mode": "idle",
-        "reason": "no_eligible_boltz_actions",
-        "reserve_deficit_sats": reserve_deficit_sats,
-        "treasury_candidate_count": len(treasury_recommendations),
-        "treasury_executable_count": len(treasury_executable),
-        "balance_candidate_count": len(balance_recommendations),
-    }
-
-
-def _select_boltz_currency(direction: str, amount_sats: int) -> str:
-    """Compare BTC vs LBTC quote for a swap and return the cheaper currency.
-
-    Prefers LBTC when costs are equal (faster settlement).
-    Falls back to LBTC if quoting fails.
-    """
-    bm = _require_boltz_manager()
-    swap_type = "submarine" if direction == "loop_in" else "reverse"
-
-    try:
-        btc_quote = bm.quote(amount_sats, swap_type=swap_type, currency="BTC")
-        btc_fee = int(btc_quote.get("estimated_total_fee_sats", 0) or 0)
-    except Exception:
-        btc_fee = float('inf')
-
-    try:
-        lbtc_quote = bm.quote(amount_sats, swap_type=swap_type, currency="LBTC")
-        lbtc_fee = int(lbtc_quote.get("estimated_total_fee_sats", 0) or 0)
-    except Exception:
-        lbtc_fee = float('inf')
-
-    if btc_fee == float('inf') and lbtc_fee == float('inf'):
-        return "LBTC"  # fallback
-
-    # Prefer LBTC when equal (faster settlement)
-    if lbtc_fee <= btc_fee:
-        chosen, reason = "LBTC", f"LBTC={lbtc_fee} <= BTC={btc_fee}"
-    else:
-        chosen, reason = "BTC", f"BTC={btc_fee} < LBTC={lbtc_fee}"
-
-    if plugin:
-        plugin.log(f"Boltz currency selection ({direction}, {amount_sats}sats): {chosen} ({reason})", level='debug')
-
-    return chosen
-
-
-def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False,
-                               dry_run: bool = False) -> Dict[str, Any]:
-    """Run one in-plugin Boltz auto-cycle using existing RPC logic (single-flight).
-
-    DD4 / P1-018 (operator ruling 2026-07-02): dry_run defaults False so both
-    the scheduled daemon path AND the manual RPC (revenue-boltz-auto-cycle-run-now)
-    run live by default — force=true alone runs one live cycle. dry_run=true is
-    an opt-in preview (builds the plan, computes profitability) without creating
-    any swap.
-    """
-    if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
-        result = {
-            'status': 'disabled',
-            'reason': 'boltz integration disabled',
-            'trigger': trigger,
-        }
-        _boltz_auto_cycle_mark_state(last_result=result, last_error=None, enabled=False)
-        return result
-
-    cfg = config.snapshot() if config else None
-    enabled = bool(getattr(cfg, 'boltz_auto_cycle_enabled', False)) if cfg else False
-    _boltz_auto_cycle_mark_state(enabled=enabled)
-    if not enabled and not force:
-        result = {
-            'status': 'disabled',
-            'reason': 'boltz auto-cycle disabled by config',
-            'trigger': trigger,
-        }
-        _boltz_auto_cycle_mark_state(last_result=result, last_error=None)
-        return result
-
-    # L-1 FIX: Guard lock release with acquired flag to prevent RuntimeError
-    acquired = _boltz_auto_cycle_run_lock.acquire(blocking=False)
-    if not acquired:
-        result = {'status': 'skipped', 'reason': 'auto-cycle already running', 'trigger': trigger}
-        _boltz_auto_cycle_mark_state(last_result=result)
-        return result
-
-    try:
-        started = int(time.time())
-        start_monotonic = time.monotonic()
-        _boltz_auto_cycle_mark_state(
-            running=True,
-            last_trigger=trigger,
-            last_started_ts=started,
-            last_error=None,
-        )
-        max_actions = max(1, int(getattr(cfg, 'boltz_auto_cycle_max_actions', 1) if cfg else 1))
-        treasury_max_actions = max(1, int(getattr(cfg, 'expansion_treasury_max_actions', max_actions) if cfg else max_actions))
-        treasury_plan = None
-        selection = {
-            "mode": "idle",
-            "reason": "no_eligible_boltz_actions",
-            "reserve_deficit_sats": 0,
-        }
-
-        # Fetch coordination signals from capacity planner and rebalancer
-        _planner_coord = None
-        if capacity_planner is not None:
-            try:
-                _planner_coord = capacity_planner.get_boltz_coordination()
-            except Exception:
-                pass
-        _rebalancer_coord = None
-        if rebalancer is not None:
-            try:
-                _rebalancer_coord = rebalancer.get_boltz_coordination()
-            except Exception:
-                pass
-        # Merge rebalancer exhaustion into planner coord for single-param passing
-        if _planner_coord is None:
-            _planner_coord = {}
-        if _rebalancer_coord:
-            _planner_coord["rebalancer_exhausted"] = _rebalancer_coord.get("rebalancer_exhausted", False)
-            _planner_coord["rebalancer_depleted_count"] = _rebalancer_coord.get("depleted_count", 0)
-
-        # One pending-swap listswaps subprocess for the whole cycle: every
-        # plan build below (treasury, balance, fall-through) reuses this
-        # count instead of paying its own boltzcli call. None = no treasury
-        # involvement; the balance build then resolves it itself.
-        pending_swaps: Optional[int] = None
-
-        if bool(getattr(cfg, 'expansion_treasury_enabled', False)) if cfg else False:
-            pending_swaps = _boltz_pending_swap_count()
-            treasury_plan = _build_boltz_expansion_treasury_plan(
-                onchain_target_sats=int(getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000),
-                min_deficit_sats=int(getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000),
-                preferred_currency=str(getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC').upper(),
-                max_actions=treasury_max_actions,
-                min_source_local_pct=float(getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0),
-                exclude_protected=bool(getattr(cfg, 'expansion_treasury_exclude_protected', True)) if cfg else True,
-                planner_coordination=_planner_coord,
-                pending_swap_count=pending_swaps,
-            )
-            if isinstance(treasury_plan, dict) and 'error' in treasury_plan:
-                result = dict(treasury_plan)
-                result['trigger'] = trigger
-                with _boltz_auto_cycle_state_lock:
-                    _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
-                _boltz_auto_cycle_mark_state(last_error=str(result.get('error')))
-                return result
-            selection = _select_boltz_auto_cycle_mode(treasury_plan=treasury_plan, balance_plan=None)
-
-        balance_plan = None
-        if selection.get("mode") != "treasury":
-            balance_plan = _build_boltz_balance_plan(
-                max_candidates=max(max(5, int(max_actions) * 5), 20),
-                require_profitable=True,
-                min_marginal_roi=0.0,
-                profit_margin_factor=1.2,
-                expected_horizon_days=3.0,
-                loop_in_currency='auto',
-                loop_out_currency='auto',
-                planner_coordination=_planner_coord,
-                pending_swap_count=pending_swaps,
-            )
-            if isinstance(balance_plan, dict) and 'error' in balance_plan:
-                result = balance_plan
-            else:
-                # Detect when profitability data is completely missing —
-                # all channels skipped with no_profitability_data means the
-                # profitability analyzer hasn't produced results yet.
-                if isinstance(balance_plan, dict):
-                    skipped_examples = balance_plan.get("skipped_examples", [])
-                    total_candidates = balance_plan.get("total_candidates", 0)
-                    no_prof_count = sum(
-                        1 for s in skipped_examples
-                        if s.get("reason") == "no_profitability_data"
-                    )
-                    if total_candidates == 0 and no_prof_count > 0 and no_prof_count == len(skipped_examples):
-                        plugin.log(
-                            f"cl-revenue-ops: Boltz auto-cycle: all {no_prof_count} channels "
-                            "lack profitability data — profitability analyzer may not have run yet",
-                            level='warn',
-                        )
-
-                selection = _select_boltz_auto_cycle_mode(treasury_plan=treasury_plan, balance_plan=balance_plan)
-                if selection.get("mode") == "balance":
-                    # Reuse the plan built above for mode selection — rebuilding
-                    # it would repeat every per-candidate boltzcli quote call.
-                    result = _execute_boltz_balance_cycle(
-                        dry_run=dry_run,
-                        max_actions=max_actions,
-                        allow_concurrent_swaps=False,
-                        loop_in_currency='auto',
-                        loop_out_currency='auto',
-                        precomputed_plan=balance_plan,
-                    )
-                else:
-                    reason = selection.get("reason", "no_eligible_boltz_actions")
-                    # Surface profitability gap in the reason
-                    if isinstance(balance_plan, dict):
-                        skipped_examples = balance_plan.get("skipped_examples", [])
-                        total_candidates = balance_plan.get("total_candidates", 0)
-                        no_prof_count = sum(
-                            1 for s in skipped_examples
-                            if s.get("reason") == "no_profitability_data"
-                        )
-                        if total_candidates == 0 and no_prof_count > 0:
-                            reason = f"no_profitability_data ({no_prof_count} channels)"
-                    result = {
-                        'status': 'idle',
-                        'executed_count': 0,
-                        'skipped_count': 0,
-                        'reason': reason,
-                    }
-        else:
-            # Reuse the selection-time treasury plan — rebuilding it inside
-            # the cycle would repeat the nested balance-plan build (quotes,
-            # budget, listswaps subprocesses) a second time per cycle.
-            result = _execute_boltz_expansion_treasury_cycle(
-                dry_run=dry_run,
-                max_actions=treasury_max_actions,
-                allow_concurrent_swaps=False,
-                precomputed_plan=treasury_plan,
-            )
-            # F1 fall-through: when treasury mode executed nothing (every
-            # candidate was skipped at execution time), run the balance
-            # cycle within the same auto-cycle run so the structural drain
-            # envelope still gets a turn. Blocked cycles (pending swaps)
-            # would block the balance cycle too, so don't bother.
-            _treasury_status = str(result.get('status') or '') if isinstance(result, dict) else ''
-            # Audit 2026-08-01 wave2 FIX 2 (F1 leg): rejected/errored swaps
-            # stay listed in `executed` (with their status) but nothing
-            # actually ran, so they must NOT suppress the balance-cycle
-            # fallback for the whole interval. Count only entries that may
-            # have moved funds (accepted / would_execute / unknown — an
-            # unknown outcome may be in flight, so it conservatively still
-            # suppresses a second swap). Fall back to executed_count when
-            # the list is absent (older/mocked result shapes).
-            _treasury_exec_list = result.get('executed') if isinstance(result, dict) else None
-            if isinstance(_treasury_exec_list, list):
-                _treasury_executed = sum(
-                    1 for e in _treasury_exec_list
-                    if isinstance(e, dict)
-                    and str(e.get('status') or '') not in ('rejected', 'error')
-                )
-            else:
-                _treasury_executed = int(result.get('executed_count', 0) or 0) if isinstance(result, dict) else 0
-            if _treasury_status == 'executed' and _treasury_executed == 0:
-                # Reuse the selection-time balance plan when one exists;
-                # otherwise build it once (and only once) for the fall-through.
-                if isinstance(balance_plan, dict) and 'error' not in balance_plan:
-                    fallback_plan = balance_plan
-                else:
-                    fallback_plan = _build_boltz_balance_plan(
-                        max_candidates=max(max(5, int(max_actions) * 5), 20),
-                        require_profitable=True,
-                        min_marginal_roi=0.0,
-                        profit_margin_factor=1.2,
-                        expected_horizon_days=3.0,
-                        loop_in_currency='auto',
-                        loop_out_currency='auto',
-                        planner_coordination=_planner_coord,
-                        pending_swap_count=pending_swaps,
-                    )
-                if isinstance(fallback_plan, dict) and 'error' not in fallback_plan:
-                    fallback_selection = _select_boltz_auto_cycle_mode(
-                        treasury_plan=None, balance_plan=fallback_plan,
-                    )
-                    if fallback_selection.get("mode") == "balance":
-                        selection = dict(fallback_selection)
-                        selection["reason"] = "treasury_executed_zero_fallback_to_balance"
-                        result = _execute_boltz_balance_cycle(
-                            dry_run=dry_run,
-                            max_actions=max_actions,
-                            allow_concurrent_swaps=False,
-                            loop_in_currency='auto',
-                            loop_out_currency='auto',
-                            precomputed_plan=fallback_plan,
-                        )
-        status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
-        if isinstance(result, dict):
-            result.update({
-                'mode': str(selection.get("mode") or 'idle'),
-                'selection_reason': str(selection.get("reason") or 'no_eligible_boltz_actions'),
-                'reserve_deficit_sats': int(selection.get("reserve_deficit_sats", 0) or 0),
-                'trigger': trigger,
-            })
-        if isinstance(result, dict) and 'error' in result:
-            with _boltz_auto_cycle_state_lock:
-                _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
-            _boltz_auto_cycle_mark_state(last_error=str(result.get('error')))
-        else:
-            # C3 FIX: Only reset error counter on actual success, not on blocked/other states
-            status = str(result.get('status') or 'unknown') if isinstance(result, dict) else 'unknown'
-            if status in ('executed', 'dry_run'):
-                with _boltz_auto_cycle_state_lock:
-                    _boltz_auto_cycle_state['consecutive_errors'] = 0
-            _boltz_auto_cycle_mark_state(last_error=None)
-        return result if isinstance(result, dict) else {'status': status, 'result': result}
-    except Exception as e:
-        with _boltz_auto_cycle_state_lock:
-            _boltz_auto_cycle_state['consecutive_errors'] = int(_boltz_auto_cycle_state.get('consecutive_errors', 0) or 0) + 1
-        _boltz_auto_cycle_mark_state(last_error=str(e))
-        raise
-    finally:
-        finished = int(time.time())
-        duration_ms = int((time.monotonic() - start_monotonic) * 1000)
-        with _boltz_auto_cycle_state_lock:
-            _boltz_auto_cycle_state['running'] = False
-            _boltz_auto_cycle_state['last_finished_ts'] = finished
-            _boltz_auto_cycle_state['last_duration_ms'] = duration_ms
-            # Preserve last_result if set by success/skip/disabled path, otherwise leave as-is.
-        if acquired:
-            _boltz_auto_cycle_run_lock.release()
-
-
 # =============================================================================
 # INITIALIZATION
 # =============================================================================
@@ -2317,7 +1734,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, boltz_manager, capex_engine, data_service, econ_shadow
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, capex_engine, data_service, econ_shadow
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -2432,13 +1849,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         hot_channel_protection_profit_budget_pct=_safe_float_opt('revenue-ops-hot-channel-protection-profit-budget-pct', '0.75'),
         hot_channel_protection_max_chunk_multiplier=_safe_float_opt('revenue-ops-hot-channel-protection-max-chunk-multiplier', '4.0'),
         hot_channel_protection_min_cooldown_hours=_safe_float_opt('revenue-ops-hot-channel-protection-min-cooldown-hours', '1.0'),
-        boltz_auto_cycle_enabled=options.get('revenue-ops-boltz-auto-cycle-enabled', 'false').lower() == 'true',
-        boltz_auto_cycle_interval_minutes=_safe_int_opt('revenue-ops-boltz-auto-cycle-interval-minutes', '15'),
-        boltz_auto_cycle_max_actions=_safe_int_opt('revenue-ops-boltz-auto-cycle-max-actions', '1'),
-        boltz_auto_cycle_startup_delay_seconds=_safe_int_opt('revenue-ops-boltz-auto-cycle-startup-delay-seconds', '120'),
         receivable_ratio_target=_safe_float_opt('revenue-ops-receivable-ratio-target', '0.30'),
         receivable_ratio_floor=_safe_float_opt('revenue-ops-receivable-ratio-floor', '0.20'),
-        boltz_structural_budget_sats_per_day=_safe_int_opt('revenue-ops-boltz-structural-budget-sats', '0'),
         drain_fee_discount_max=_safe_float_opt('revenue-ops-drain-fee-discount-max', '0.0'),
         node_drain_bias_enabled=options.get('revenue-ops-node-drain-bias-enabled', 'false').lower() == 'true',
         node_drain_bias_max=_safe_float_opt('revenue-ops-node-drain-bias-max', '0.3'),
@@ -2446,13 +1858,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         htlcmax_source_pct=_safe_float_opt('revenue-ops-htlcmax-source-pct', '0.50'),
         htlcmax_sink_pct=_safe_float_opt('revenue-ops-htlcmax-sink-pct', '0.25'),
         htlcmax_balanced_pct=_safe_float_opt('revenue-ops-htlcmax-balanced-pct', '0.45'),
-        expansion_treasury_enabled=options.get('revenue-ops-expansion-treasury-enabled', 'false').lower() == 'true',
-        expansion_treasury_onchain_target_sats=_safe_int_opt('revenue-ops-expansion-treasury-onchain-target-sats', '5000000'),
-        expansion_treasury_min_deficit_sats=_safe_int_opt('revenue-ops-expansion-treasury-min-deficit-sats', '250000'),
-        expansion_treasury_preferred_currency=str(options.get('revenue-ops-expansion-treasury-preferred-currency', 'BTC') or 'BTC').upper(),
-        expansion_treasury_max_actions=_safe_int_opt('revenue-ops-expansion-treasury-max-actions', '1'),
-        expansion_treasury_min_source_local_pct=_safe_float_opt('revenue-ops-expansion-treasury-min-source-local-pct', '80.0'),
-        expansion_treasury_exclude_protected=options.get('revenue-ops-expansion-treasury-exclude-protected', 'true').lower() == 'true',
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         min_fee_ppm_saturated=_safe_int('revenue-ops-min-fee-ppm-saturated'),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
@@ -2620,35 +2025,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     from modules.data_service import DataService
     data_service = DataService(safe_plugin)
 
-    # Optional Boltz CLI integration (manual quotes/swaps, wallet ops).
-    try:
-        boltz_cfg = BoltzCliConfig(
-            enabled=options.get('revenue-ops-boltz-enabled', 'false').lower() == 'true',
-            cli_path=options.get('revenue-ops-boltz-cli-path', '/usr/local/bin/boltzcli'),
-            datadir=options.get('revenue-ops-boltz-datadir', '/var/lib/boltz'),
-            use_sudo=options.get('revenue-ops-boltz-use-sudo', 'false').lower() == 'true',
-            sudo_user=options.get('revenue-ops-boltz-sudo-user', 'boltz'),
-            timeout_seconds=int(options.get('revenue-ops-boltz-timeout-seconds', '60')),
-            daily_budget_sats=int(options.get('revenue-ops-boltz-daily-budget-sats', '3000')),
-            enforce_budget=options.get('revenue-ops-boltz-enforce-budget', 'true').lower() == 'true',
-            btc_wallet=options.get('revenue-ops-boltz-btc-wallet', 'CLN'),
-            lbtc_wallet=options.get('revenue-ops-boltz-lbtc-wallet', 'LOOP-LBTC'),
-            routing_fee_limit_ppm=int(options.get('revenue-ops-boltz-routing-fee-limit-ppm', '0')),
-            max_withdraw_sats=int(options.get('revenue-ops-boltz-max-withdraw-sats', '10000000')),
-        )
-        boltz_manager = BoltzCliManager(safe_plugin, safe_plugin.rpc, boltz_cfg)
-        if boltz_cfg.enabled:
-            plugin.log(
-                f"Boltz CLI integration enabled (datadir={boltz_cfg.datadir}, "
-                f"sudo={boltz_cfg.use_sudo}, budget={boltz_cfg.daily_budget_sats} sats/day)",
-                level='info'
-            )
-        else:
-            plugin.log("Boltz CLI integration disabled (set revenue-ops-boltz-enabled=true to enable)", level='debug')
-    except Exception as e:
-        boltz_manager = None
-        plugin.log(f"Warning: Failed to initialize Boltz CLI integration: {e}", level='warn')
-
     # =========================================================================
     # STARTUP VERSION PROBES (Phase 3C supply-chain)
     # NON-FATAL: a version below floor logs a warning but never aborts init.
@@ -2679,48 +2055,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log(f"Core Lightning version check OK ({cln_version} >= v{CLN_VERSION_FLOOR})")
     except Exception as e:
         plugin.log(f"Core Lightning version probe failed (non-fatal): {e}", level='warn')
-
-    # boltzcli --version probe (only when the integration is enabled and a
-    # binary path is configured). Warning-only: a skew must not block init.
-    try:
-        if boltz_manager is not None and getattr(boltz_manager, "enabled", False):
-            import subprocess
-            cli_path = boltz_cfg.cli_path
-            try:
-                proc = subprocess.run(
-                    [cli_path, "--version"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    timeout=10,
-                    text=True,
-                )
-                boltz_version_raw = (proc.stdout or "").strip()
-                below = _version_below_floor(boltz_version_raw, BOLTZCLI_MIN_VERSION)
-                if below is True:
-                    plugin.log(
-                        f"boltzcli reports version '{boltz_version_raw}', below the "
-                        f"documented minimum v{BOLTZCLI_MIN_VERSION}. Loop-in/loop-out "
-                        f"channel-pinning and quote fields may differ. Continuing anyway.",
-                        level='warn'
-                    )
-                elif below is None:
-                    plugin.log(
-                        f"Could not parse boltzcli version from '{boltz_version_raw}'; "
-                        f"skipping the v{BOLTZCLI_MIN_VERSION} minimum check.",
-                        level='warn'
-                    )
-                else:
-                    plugin.log(f"boltzcli version check OK ({boltz_version_raw} >= v{BOLTZCLI_MIN_VERSION})")
-            except FileNotFoundError:
-                plugin.log(
-                    f"boltzcli not found at '{cli_path}' during version probe; "
-                    f"Boltz integration is enabled but the binary is missing.",
-                    level='warn'
-                )
-            except subprocess.TimeoutExpired:
-                plugin.log("boltzcli --version timed out (non-fatal); skipping version check", level='warn')
-    except Exception as e:
-        plugin.log(f"boltzcli version probe failed (non-fatal): {e}", level='warn')
 
     # =========================================================================
     # STARTUP DEPENDENCY CHECKS (Stability)
@@ -2925,45 +2259,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     capacity_planner.rebalancer = rebalancer
     if hasattr(capacity_planner, "set_rebalancer"):
         capacity_planner.set_rebalancer(rebalancer)
-    # Unified liquidity-cost accounting:
-    # - Rebalancer sees Boltz spend as external liquidity cost
-    # - Boltz manager sees rebalance spend/reservations as external liquidity cost
+    # Unified liquidity-cost accounting for retained rebalance and planner paths.
     if rebalancer is not None:
         rebalancer.external_liquidity_cost_provider = _non_rebalance_liquidity_cost_components
         rebalancer.global_budget_limit_provider = _total_cost_budget_limit_provider
-    if boltz_manager is not None:
-        boltz_manager.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
-        boltz_manager.global_budget_limit_provider = _total_cost_budget_limit_provider
-        # Live envelope read (runtime-mutable config): with a configured
-        # structural envelope, structural loop-outs skip the per-channel
-        # capex gate inside the manager — the envelope + unified budget gate
-        # them instead.
-        boltz_manager.structural_envelope_provider = _structural_envelope_sats_provider
-        # Audit 2026-08-01: the governed Boltz facade must see the REAL
-        # `paused` kill-switch (it was pinned False). Mirrors the planner/
-        # fee/rebalance facades' is_paused wiring.
-        boltz_manager.pause_state_provider = (
-            lambda: getattr(config.snapshot(), "paused", False) is True
-            if config is not None else False)
-        # Phase 2G: governor/ledger plumbing for Boltz swap reservations.
-        try:
-            boltz_manager.econ_shadow = econ_shadow
-            boltz_manager.econ_governor_enabled_provider = (
-                lambda: getattr(config.snapshot(),
-                                "econ_governor_boltz_enabled", False) is True
-                if config is not None else False)
-            from modules.governor_facade import authority_allows
-            boltz_manager.econ_authority_check_provider = (
-                lambda: authority_allows(
-                    getattr(config.snapshot(), "authority_level",
-                            "capital") if config is not None else "capital",
-                    "capital"))
-        except Exception:
-            pass
 
     if capacity_planner is not None:
         capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
-        capacity_planner.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
+        capacity_planner.external_liquidity_cost_provider = _non_rebalance_liquidity_cost_components
 
     capital_efficiency = CapitalEfficiencyAnalyzer(
         profitability_analyzer=profitability_analyzer,
@@ -2989,9 +2292,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         capacity_planner.set_capital_efficiency(capital_efficiency)
         capacity_planner.set_capex_engine(capex_engine)
         capacity_planner.global_budget_limit_provider = _total_cost_budget_limit_provider
-        capacity_planner.external_liquidity_cost_provider = _non_boltz_liquidity_cost_components
-    if boltz_manager is not None:
-        boltz_manager.set_capex_engine(capex_engine)
+        capacity_planner.external_liquidity_cost_provider = _non_rebalance_liquidity_cost_components
 
     # Rebalance engine: unified actual-fee pipeline
     from modules.rebalance_engine_v2 import RebalanceEngine
@@ -3027,8 +2328,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         flow_analyzer.data_service = data_service
     if capacity_planner is not None:
         capacity_planner.data_service = data_service
-    if boltz_manager is not None:
-        boltz_manager.data_service = data_service
 
     # Set up periodic background tasks using threading
     # Note: plugin.log() is safe to call from threads in pyln-client
@@ -3171,66 +2470,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     pass
                 if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
                     break
-    
-    def boltz_auto_cycle_loop():
-        """Background loop for profit-gated Boltz auto-balance cycles."""
-        if boltz_manager is None or not getattr(boltz_manager, 'enabled', False):
-            _boltz_auto_cycle_mark_state(enabled=False, thread_started=False, next_run_ts=None)
-            plugin.log("Boltz auto-cycle loop disabled: Boltz CLI integration not enabled", level='debug')
-            return
-
-        _boltz_auto_cycle_mark_state(enabled=bool(getattr(config, 'boltz_auto_cycle_enabled', False)), thread_started=True)
-
-        startup_delay = max(0, int(getattr(config, 'boltz_auto_cycle_startup_delay_seconds', 120) or 0))
-        if startup_delay > 0:
-            _boltz_auto_cycle_mark_state(next_run_ts=int(time.time()) + startup_delay)
-            if shutdown_event.wait(startup_delay):
-                plugin.log("Boltz auto-cycle loop cancelled during startup delay")
-                _boltz_auto_cycle_mark_state(next_run_ts=None)
-                return
-
-        while not shutdown_event.is_set():
-            # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
-            try:
-                _hb_interval_min = max(1, int(getattr(config, 'boltz_auto_cycle_interval_minutes', 15) or 15))
-                _record_loop_heartbeat("boltz-auto-cycle", interval_seconds=_hb_interval_min * 60)
-                enabled = bool(getattr(config, 'boltz_auto_cycle_enabled', False))
-                _boltz_auto_cycle_mark_state(enabled=enabled)
-
-                if enabled:
-                    try:
-                        _refresh_dynamic_config()
-                        result = _run_boltz_auto_cycle_once(trigger='scheduler')
-                        _boltz_auto_cycle_mark_state(last_result=result)
-                        summary = ''
-                        if isinstance(result, dict):
-                            summary = f"status={result.get('status')} executed={result.get('executed_count', 0)} skipped={result.get('skipped_count', 0)}"
-                        plugin.log(f"Boltz auto-cycle completed ({summary})", level='debug')
-                    except Exception as e:
-                        plugin.log(f"Error in Boltz auto-cycle: {e}", level='warn')
-                        plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
-                else:
-                    _boltz_auto_cycle_mark_state(last_result={'status': 'disabled', 'reason': 'boltz auto-cycle disabled by config', 'trigger': 'scheduler'})
-
-                interval_min = max(1, int(getattr(config, 'boltz_auto_cycle_interval_minutes', 15) or 15))
-                interval_sec = interval_min * 60
-                jitter = max(0, int(interval_sec * 0.1))
-                sleep_time = interval_sec + (random.randint(-jitter, jitter) if jitter > 0 else 0)
-                _boltz_auto_cycle_mark_state(next_run_ts=int(time.time()) + max(1, sleep_time))
-                if shutdown_event.wait(max(1, sleep_time)):
-                    plugin.log("Boltz auto-cycle loop stopping due to shutdown signal")
-                    break
-            except Exception as e:
-                plugin.log(f"Unhandled error in boltz-auto-cycle loop iteration: {e}", level='error')
-                try:
-                    plugin.log(f"Traceback: {traceback.format_exc()}", level='debug')
-                except Exception:
-                    pass
-                if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
-                    break
-
-        _boltz_auto_cycle_mark_state(next_run_ts=None, running=False)
-
     def capacity_planner_loop():
         """Background loop for automated capacity planning."""
         if not config.planner_enabled:
@@ -3430,7 +2669,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
-    threading.Thread(target=boltz_auto_cycle_loop, daemon=True, name="boltz-auto-cycle").start()
     threading.Thread(target=capacity_planner_loop, daemon=True, name="capacity-planner").start()
 
     plugin.log("cl-revenue-ops plugin initialized successfully!")
@@ -3636,7 +2874,6 @@ def run_rebalance_check():
 # =============================================================================
 # Phase C (operator-surface reduction 2026-08-01): deprecated-alias plumbing.
 #
-# The dispatcher RPCs (revenue-boltz / revenue-cycle / revenue-planner /
 # revenue-budget, plus the ban actions on revenue-policy) are the primary
 # operator names. Every pre-existing name keeps working as a thin forwarding
 # alias whose dict response gains ONLY an additive `deprecation` field; the
@@ -3926,11 +3163,8 @@ def revenue_rebalance_debug(
         stale_count = spend_info.get('stale_reservations', 0)
         total_budget = _total_cost_budget_status()
         daily_budget = int(total_budget.get("effective_budget_sats", cfg.daily_budget_sats) or cfg.daily_budget_sats)
-        boltz_costs = _boltz_liquidity_cost_components()
-        boltz_spent = int(boltz_costs.get("spent_24h_sats", 0) or 0)
-        boltz_reserved = int(boltz_costs.get("reserved_24h_sats", 0) or 0)
-        total_liquidity_spent = int(total_budget.get("actual_spent_sats", int(daily_spent) + boltz_spent) or 0)
-        total_liquidity_reserved = int(total_budget.get("reserved_sats", int(daily_reserved) + boltz_reserved) or 0)
+        total_liquidity_spent = int(total_budget.get("actual_spent_sats", int(daily_spent)) or 0)
+        total_liquidity_reserved = int(total_budget.get("reserved_sats", int(daily_reserved)) or 0)
         budget_remaining = int(total_budget.get("remaining_sats", daily_budget - total_liquidity_spent - total_liquidity_reserved) or 0)
 
         result["capital_controls"] = {
@@ -3945,8 +3179,6 @@ def revenue_rebalance_debug(
             "budget_floor_sats": total_budget.get("daily_budget_sats", cfg.daily_budget_sats),
             "daily_spent_sats": daily_spent,
             "daily_reserved_sats": daily_reserved,
-            "boltz_spent_sats": boltz_spent,
-            "boltz_reserved_sats": boltz_reserved,
             "total_liquidity_spent_sats": total_liquidity_spent,
             "total_liquidity_reserved_sats": total_liquidity_reserved,
             "total_liquidity_breakdown": {
@@ -3967,8 +3199,8 @@ def revenue_rebalance_debug(
             )
         if budget_remaining <= 0:
             result["rejection_reasons"].append(
-                f"Unified liquidity budget exhausted: rebalance {daily_spent}+{daily_reserved}, "
-                f"boltz {boltz_spent}+{boltz_reserved}, budget {daily_budget}"
+                f"Unified liquidity budget exhausted: spent {total_liquidity_spent}, "
+                f"reserved {total_liquidity_reserved}, budget {daily_budget}"
             )
         if stale_count > 0:
             result["rejection_reasons"].append(
@@ -4155,24 +3387,6 @@ def revenue_rebalance_debug(
             )
         except Exception as e:
             result["last_cycle"] = {"error": str(e)}
-
-    try:
-        drain = None
-        demand = engine.get_drain_demand() if engine is not None and hasattr(engine, "get_drain_demand") else None
-        if demand is not None:
-            drain = {
-                "total_excess_sats": demand.total_excess_sats,
-                "over_local_count": demand.over_local_count,
-                "paired_count": demand.paired_count,
-                "top_entries": [
-                    {"channel_id": entry.channel_id, "excess_sats": entry.excess_sats,
-                     "drain_score": entry.drain_score, "value_class": entry.value_class}
-                    for entry in demand.entries[:10]
-                ],
-            }
-        result["drain_demand"] = drain
-    except Exception as e:
-        result["drain_demand"] = {"error": str(e)}
 
     return result
 
@@ -5171,12 +4385,10 @@ def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
 
 def _rpc_ban(plugin: Plugin, peer_id: str, reason: str = "operator", **kwargs) -> Dict[str, Any]:
     """
-    Ban a peer: the planner will never open channels to it, the LN+
-    evaluator rejects any swap that includes it, and fee/rebalance
+    Ban a peer: the planner will never open channels to it, and fee/rebalance
     management stops (passive strategy, rebalancing disabled).
 
-    Existing channels are NOT closed and in-flight swap obligations are
-    NOT abandoned — the ban gates new capital commitments only.
+    Existing channels are NOT closed; the ban gates new capital commitments only.
 
     Usage: lightning-cli revenue-ban peer_id [reason]
     """
@@ -5196,8 +4408,8 @@ def _rpc_ban(plugin: Plugin, peer_id: str, reason: str = "operator", **kwargs) -
         "reason": reason,
         "tags": policy.tags,
         "message": (
-            "Peer banned: no channel opens, no LN+ swaps, no fee/rebalance "
-            "management. Existing channels and in-flight swaps are untouched."
+            "Peer banned: no channel opens or fee/rebalance "
+            "management. Existing channels are untouched."
         ),
     }
 
@@ -6231,16 +5443,12 @@ def revenue_health(plugin: Plugin) -> Dict[str, Any]:
     # --- 4. Rebalance state ---
     if rebalancer:
         try:
-            coord = rebalancer.get_boltz_coordination()
             decision = rebalancer.get_last_decision_summary()
             active_jobs = rebalancer.job_manager.active_job_count if hasattr(rebalancer, 'job_manager') else 0
             result["rebalancer"] = {
                 "last_action": decision.get("action"),
                 "last_reason": decision.get("reason"),
                 "active_jobs": active_jobs,
-                "depleted_channels": coord.get("depleted_count", 0),
-                "profitable_candidates": coord.get("profitable_count", 0),
-                "rebalancer_exhausted": coord.get("rebalancer_exhausted", False),
             }
         except Exception as e:
             result["rebalancer"] = {"error": str(e)}
@@ -6262,31 +5470,12 @@ def revenue_health(plugin: Plugin) -> Dict[str, Any]:
     except Exception as e:
         result["budget"] = {"error": str(e)}
 
-    # --- 6. Boltz state ---
-    if boltz_manager and getattr(boltz_manager, 'enabled', False):
-        try:
-            with _boltz_auto_cycle_state_lock:
-                cycle_state = dict(_boltz_auto_cycle_state)
-            result["boltz"] = {
-                "last_mode": cycle_state.get("last_result", {}).get("mode") if isinstance(cycle_state.get("last_result"), dict) else None,
-                "last_status": cycle_state.get("last_result", {}).get("status") if isinstance(cycle_state.get("last_result"), dict) else None,
-                "consecutive_errors": cycle_state.get("consecutive_errors", 0),
-                "running": cycle_state.get("running", False),
-            }
-        except Exception as e:
-            result["boltz"] = {"error": str(e)}
-    else:
-        result["boltz"] = {"enabled": False}
-
-    # --- 7. Planner state ---
+    # --- 6. Planner state ---
     if capacity_planner:
         try:
-            coord = capacity_planner.get_boltz_coordination()
             status = capacity_planner.get_status()
             result["planner"] = {
                 "enabled": status.get("enabled", False),
-                "loser_close_candidates": len(coord.get("loser_scids", set())),
-                "funding_deficit_sats": coord.get("funding_deficit_sats", 0),
                 "candidate_pool_size": status.get("candidate_pool_size", 0),
             }
         except Exception as e:
@@ -6675,12 +5864,12 @@ def _parse_msat(msat_val: Any) -> int:
 def _refresh_dynamic_config():
     """Read dynamic option values from CLN and update in-memory objects.
 
-    Called at the top of each boltz/planner cycle. CLN stores setconfig
+    Called at the top of each planner cycle. CLN stores setconfig
     values persistently but pyln-client's plugin.options dict is only
     populated at init. This function bridges the gap.
     """
     try:
-        # Use the timeout-protected proxy: this runs on the boltz/planner
+        # Use the timeout-protected proxy: this runs on the planner
         # background threads, where a hung lightningd response would
         # otherwise stall the loop indefinitely.
         rpc = safe_plugin.rpc if safe_plugin is not None else plugin.rpc
@@ -6688,36 +5877,6 @@ def _refresh_dynamic_config():
         configs = all_configs.get("configs", {})
     except Exception:
         return
-
-    if boltz_manager and boltz_manager.cfg:
-        eb = configs.get("revenue-ops-boltz-enforce-budget", {})
-        val = eb.get("value_str", "")
-        if val:
-            new_val = val.lower() in ("true", "1", "yes")
-            if new_val != boltz_manager.cfg.enforce_budget:
-                boltz_manager.cfg.enforce_budget = new_val
-                plugin.log(f"Dynamic config refresh: enforce_budget = {new_val}")
-
-        # Override precedence (see planner_execute_closes guard below): a
-        # revenue-config DB override on daily_budget_sats must not be stomped
-        # by the listconfigs view. enforce_budget has no runtime key, so its
-        # block above stays unguarded.
-        _bb_overridden = False
-        try:
-            _bb_overridden = (database is not None and
-                              database.get_config_override("daily_budget_sats") is not None)
-        except Exception:
-            pass
-        db_cfg = configs.get("revenue-ops-boltz-daily-budget-sats", {})
-        val = db_cfg.get("value_str", "")
-        if val and not _bb_overridden:
-            try:
-                new_val = int(val)
-                if new_val != boltz_manager.cfg.daily_budget_sats:
-                    boltz_manager.cfg.daily_budget_sats = new_val
-                    plugin.log(f"Dynamic config refresh: daily_budget_sats = {new_val}")
-            except ValueError:
-                pass
 
     if config:
         # Same override-precedence rule as other scoped loops: an active
@@ -7624,26 +6783,11 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
 
 
 # =============================================================================
-# BOLTZ CLI INTEGRATION (optional)
+# UNIFIED COST REPORTING
 # =============================================================================
 
-def _require_boltz_manager() -> BoltzCliManager:
-    if boltz_manager is None:
-        raise BoltzCliError("Boltz CLI integration not initialized")
-    return boltz_manager
-
-
-def _structural_envelope_sats_provider() -> int:
-    """Current daily structural envelope (sats) for the Boltz manager.
-
-    Reads the live config at call time so revenue-config runtime updates to
-    boltz_structural_budget_sats_per_day take effect without a restart.
-    """
-    return int(getattr(config, "boltz_structural_budget_sats_per_day", 0) or 0)
-
-
 def _rpc_total_cost_budget(plugin: Plugin, window_hours: int = None) -> Dict[str, Any]:
-    """Unified budget status across rebalances, Boltz, and on-chain liquidity costs."""
+    """Unified budget status across rebalances and historical liquidity costs."""
     try:
         return _total_cost_budget_status(window_hours=window_hours)
     except Exception as e:
@@ -7661,7 +6805,7 @@ def revenue_total_cost_budget(plugin: Plugin, window_hours: int = None) -> Dict[
 def _rpc_capex_status(plugin, **kwargs):
     """Return unified capex budget allocations.
 
-    Shows per-channel budgets, fleet exploration budget, tactical budget,
+    Shows per-channel budgets, fleet exploration budget,
     priority class, and global envelope. Pushes summary to datastore.
     """
     global capex_engine
@@ -7692,7 +6836,6 @@ def _rpc_capex_status(plugin, **kwargs):
         "priority_class": alloc.priority_class,
         "global_envelope_sats": alloc.global_envelope_sats,
         "fleet_exploration_budget_sats": alloc.fleet_exploration_budget_sats,
-        "tactical_budget_sats": alloc.tactical_budget_sats,
         "total_fleet_contribution_sats": alloc.total_fleet_contribution_sats,
         "allocated_by_priority_sats": alloc.allocated_by_priority_sats,
         "channel_count": len(channels),
@@ -7915,307 +7058,6 @@ def revenue_spend_settle(
         return {"error": str(e)}
 
 
-def _rpc_boltz_quote(plugin: Plugin, amount_sats: int, swap_type: str = "reverse", currency: str = None) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().quote(amount_sats=amount_sats, swap_type=swap_type, currency=currency)
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-quote")
-def revenue_boltz_quote(plugin: Plugin, amount_sats: int, swap_type: str = "reverse", currency: str = None) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz quote' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_quote(plugin, amount_sats=amount_sats, swap_type=swap_type, currency=currency),
-        "revenue-boltz quote",
-    )
-
-
-def _rpc_boltz_loop_out(plugin: Plugin, amount_sats: int, address: str = None, channel_id: str = None,
-                           peer_id: str = None, currency: str = None, routing_fee_limit_ppm: int = None) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().loop_out(
-            amount_sats=amount_sats, address=address, channel_id=channel_id, peer_id=peer_id, currency=currency,
-            routing_fee_limit_ppm=routing_fee_limit_ppm
-        )
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-loop-out")
-def revenue_boltz_loop_out(plugin: Plugin, amount_sats: int, address: str = None, channel_id: str = None,
-                           peer_id: str = None, currency: str = None, routing_fee_limit_ppm: int = None) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz loop-out' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_loop_out(plugin, amount_sats=amount_sats, address=address, channel_id=channel_id, peer_id=peer_id, currency=currency, routing_fee_limit_ppm=routing_fee_limit_ppm),
-        "revenue-boltz loop-out",
-    )
-
-
-def _rpc_boltz_loop_in(plugin: Plugin, amount_sats: int, channel_id: str = None,
-                          peer_id: str = None, currency: str = None) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().loop_in(
-            amount_sats=amount_sats, channel_id=channel_id, peer_id=peer_id, currency=currency
-        )
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-loop-in")
-def revenue_boltz_loop_in(plugin: Plugin, amount_sats: int, channel_id: str = None,
-                          peer_id: str = None, currency: str = None) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz loop-in' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_loop_in(plugin, amount_sats=amount_sats, channel_id=channel_id, peer_id=peer_id, currency=currency),
-        "revenue-boltz loop-in",
-    )
-
-
-def _rpc_boltz_status(plugin: Plugin, swap_id: str = None) -> Dict[str, Any]:
-    if not swap_id:
-        return {"error": "usage: revenue-boltz-status swap_id (per-swap status; "
-                         "see revenue-boltz-wallet/-budget/-history for global state)"}
-    try:
-        return _require_boltz_manager().swap_status(swap_id)
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-status")
-def revenue_boltz_status(plugin: Plugin, swap_id: str = None) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz status' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_status(plugin, swap_id=swap_id),
-        "revenue-boltz status",
-    )
-
-
-def _rpc_boltz_history(plugin: Plugin, limit: int = None) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().swap_history(limit=limit)
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-history")
-def revenue_boltz_history(plugin: Plugin, limit: int = None) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz history' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_history(plugin, limit=limit),
-        "revenue-boltz history",
-    )
-
-
-def _rpc_boltz_external_pay_ignores(plugin: Plugin, action: str = "list", swap_id: str = None, note: str = None) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().manage_external_pay_ignores(action=action, swap_id=swap_id, note=note)
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-external-pay-ignores")
-def revenue_boltz_external_pay_ignores(plugin: Plugin, action: str = "list", swap_id: str = None, note: str = None) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz external-pay-ignores' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_external_pay_ignores(plugin, action=action, swap_id=swap_id, note=note),
-        "revenue-boltz external-pay-ignores",
-    )
-
-
-def _rpc_boltz_budget(plugin: Plugin) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().budget()
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-budget")
-def revenue_boltz_budget(plugin: Plugin) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz budget' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_budget(plugin),
-        "revenue-boltz budget",
-    )
-
-
-def _rpc_boltz_wallet(plugin: Plugin) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().wallet_balances()
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-wallet")
-def revenue_boltz_wallet(plugin: Plugin) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz wallet' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_wallet(plugin),
-        "revenue-boltz wallet",
-    )
-
-
-def _rpc_boltz_refund(plugin: Plugin, swap_id: str = None, destination: str = None) -> Dict[str, Any]:
-    if not swap_id:
-        return {"error": "usage: revenue-boltz-refund swap_id [destination]"}
-    try:
-        return _require_boltz_manager().refund(swap_id=swap_id, destination=destination)
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-refund")
-def revenue_boltz_refund(plugin: Plugin, swap_id: str = None, destination: str = None) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz refund' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_refund(plugin, swap_id=swap_id, destination=destination),
-        "revenue-boltz refund",
-    )
-
-
-def _rpc_boltz_claim(plugin: Plugin, swap_ids: List[str] = None, destination: str = None) -> Dict[str, Any]:
-    if not swap_ids:
-        return {"error": "usage: revenue-boltz-claim swap_ids [destination]"}
-    try:
-        return _require_boltz_manager().claim(swap_ids=swap_ids, destination=destination)
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-claim")
-def revenue_boltz_claim(plugin: Plugin, swap_ids: List[str] = None, destination: str = None) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz claim' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_claim(plugin, swap_ids=swap_ids, destination=destination),
-        "revenue-boltz claim",
-    )
-
-
-def _rpc_boltz_chainswap(plugin: Plugin, amount_sats: int, from_currency: str = None,
-                            to_currency: str = None, to_address: str = None) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().chainswap(
-            amount_sats=amount_sats, from_currency=from_currency, to_currency=to_currency, to_address=to_address
-        )
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-chainswap")
-def revenue_boltz_chainswap(plugin: Plugin, amount_sats: int, from_currency: str = None,
-                            to_currency: str = None, to_address: str = None) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz chainswap' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_chainswap(plugin, amount_sats=amount_sats, from_currency=from_currency, to_currency=to_currency, to_address=to_address),
-        "revenue-boltz chainswap",
-    )
-
-
-def _rpc_boltz_withdraw(plugin: Plugin, amount_sats: int = None, destination: str = None, currency: str = None,
-                           sat_per_vbyte: int = None, sweep: bool = False,
-                           confirm_sweep: bool = False) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().withdraw(
-            amount_sats=amount_sats, destination=destination, currency=currency,
-            sat_per_vbyte=sat_per_vbyte, sweep=sweep, confirm_sweep=bool(confirm_sweep)
-        )
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-withdraw")
-def revenue_boltz_withdraw(plugin: Plugin, amount_sats: int = None, destination: str = None, currency: str = None,
-                           sat_per_vbyte: int = None, sweep: bool = False,
-                           confirm_sweep: bool = False) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz withdraw' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_withdraw(plugin, amount_sats=amount_sats, destination=destination, currency=currency, sat_per_vbyte=sat_per_vbyte, sweep=sweep, confirm_sweep=confirm_sweep),
-        "revenue-boltz withdraw",
-    )
-
-
-def _rpc_boltz_deposit(plugin: Plugin, currency: str = None) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().deposit_address(currency=currency)
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-deposit")
-def revenue_boltz_deposit(plugin: Plugin, currency: str = None) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz deposit' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_deposit(plugin, currency=currency),
-        "revenue-boltz deposit",
-    )
-
-
-def _rpc_boltz_backup(plugin: Plugin, include_mnemonic: bool = False) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().backup(include_mnemonic=bool(include_mnemonic))
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-backup")
-def revenue_boltz_backup(plugin: Plugin, include_mnemonic: bool = False) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz backup' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_backup(plugin, include_mnemonic=include_mnemonic),
-        "revenue-boltz backup",
-    )
-
-
-def _rpc_boltz_backup_verify(plugin: Plugin, swap_mnemonic: str) -> Dict[str, Any]:
-    try:
-        return _require_boltz_manager().backup_verify(swap_mnemonic=swap_mnemonic)
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-backup-verify")
-def revenue_boltz_backup_verify(plugin: Plugin, swap_mnemonic: str) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz backup-verify' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_backup_verify(plugin, swap_mnemonic=swap_mnemonic),
-        "revenue-boltz backup-verify",
-    )
-
-
-def _boltz_balance_pct_from_channel_info(channel_info: Dict[str, Any]) -> float:
-    capacity = int(channel_info.get("capacity", 0) or 0)
-    spendable_msat = parse_msat(channel_info.get("spendable_msat", 0))
-    local_sats = spendable_msat // 1000
-    if capacity <= 0:
-        return 50.0
-    return max(0.0, min(100.0, (100.0 * local_sats) / capacity))
-
-
-def _boltz_pending_swap_count() -> int:
-    """Best-effort count of active/pending manual swaps to avoid overlap."""
-    try:
-        history = _require_boltz_manager().swap_history(limit=200)
-        swaps = history.get("swaps", []) if isinstance(history, dict) else []
-        pending = 0
-        for sw in swaps:
-            if not isinstance(sw, dict):
-                continue
-            if bool(sw.get("ignored_external_swap")):
-                continue
-            state = str(sw.get("state") or "").lower()
-            status = str(sw.get("status") or "").lower()
-            txt = f"{state} {status}"
-            # Treat explicit error states as terminal even if status text remains "swap.created".
-            done = any(x in txt for x in ("success", "completed", "claimed", "failed", "refunded", "expired", "cancel", "error"))
-            active = any(x in txt for x in ("pending", "created", "mempool", "transaction", "lockup", "invoice", "claim"))
-            if active and not done:
-                pending += 1
-        return pending
-    except Exception as exc:
-        plugin.log(f"boltz: pending swap count check failed, assuming 1 pending: {exc}", level="warn")
-        return 1  # Fail closed: assume a swap is pending to prevent overlap
-
-
 def _rebalance_liquidity_cost_components(window_hours: int = 24) -> Dict[str, Any]:
     """Rebalance spend/reservations for unified liquidity-cost accounting."""
     if database is None:
@@ -8241,50 +7083,15 @@ def _rebalance_liquidity_cost_components(window_hours: int = 24) -> Dict[str, An
         }
 
 
-def _boltz_liquidity_cost_components(window_hours: int = 24) -> Dict[str, Any]:
-    """Boltz swap spend component only (no external costs, no unified budget recursion)."""
-    if boltz_manager is None:
-        return {"source": "boltz", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
+_CANONICAL_TOTAL_COST_LEDGER_CATEGORIES = frozenset({"channel_open", "channel_close", "rebalance", "boltz"})
+
+
+def _safe_cost_int(value: Any) -> int:
+    """Return a neutral non-negative cost for malformed historical values."""
     try:
-        if not hasattr(boltz_manager, "get_boltz_cost_components"):
-            return {"source": "boltz", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
-        # Pass the unified budget cap explicitly instead of letting the Boltz
-        # manager call back into the global budget provider (which evaluates
-        # this very function — mutual recursion). In fixed mode the effective
-        # unified budget equals the configured daily budget.
-        global_cap_sats = None
-        try:
-            if config is not None:
-                cfg = config.snapshot() if hasattr(config, "snapshot") else config
-                global_cap_sats = max(0, int(getattr(cfg, "daily_budget_sats", 0) or 0))
-        except Exception:
-            global_cap_sats = None
-        try:
-            comps = boltz_manager.get_boltz_cost_components(
-                window_hours=window_hours,
-                global_budget_cap_sats=global_cap_sats,
-            )
-        except TypeError:
-            # Older/stubbed managers without the explicit-cap parameter.
-            comps = boltz_manager.get_boltz_cost_components(window_hours=window_hours)
-        return {
-            "source": "boltz",
-            "available": True,
-            "spent_24h_sats": int(comps.get("spent_24h_sats", 0) or 0),
-            "reserved_24h_sats": int(comps.get("reserved_24h_sats", 0) or 0),
-            "counted_swaps": int(comps.get("counted_swaps", 0) or 0),
-        }
-    except Exception as e:
-        return {
-            "source": "boltz",
-            "available": False,
-            "error": str(e),
-            "spent_24h_sats": 0,
-            "reserved_24h_sats": 0,
-        }
-
-
-_CANONICAL_TOTAL_COST_LEDGER_CATEGORIES = frozenset({"channel_open", "channel_close"})
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _normalize_generic_ledger_for_total_cost_budget(generic_ledger: Dict[str, Any]) -> Dict[str, Any]:
@@ -8297,7 +7104,7 @@ def _normalize_generic_ledger_for_total_cost_budget(generic_ledger: Dict[str, An
     counted_spent_categories = {}
     excluded_spent_categories = {}
     for category, amount in spent_by_category.items():
-        amount_int = int(amount or 0)
+        amount_int = _safe_cost_int(amount)
         if str(category) in _CANONICAL_TOTAL_COST_LEDGER_CATEGORIES:
             excluded_spent_categories[str(category)] = amount_int
         else:
@@ -8386,8 +7193,7 @@ def _node_receivable_status() -> Dict[str, Any]:
 
 
 # Memoization for _total_cost_budget_status: the status is advisory (budgets are
-# enforced atomically at reservation time) but expensive to compute (boltzcli
-# subprocess + ~6 aggregate queries). One rebalance/boltz cycle evaluates it
+# enforced atomically at reservation time) but expensive to compute (~6 aggregate queries). One retained decision cycle evaluates it
 # 4-8 times through the provider wiring, so a short TTL collapses those calls.
 _TOTAL_COST_BUDGET_MEMO_TTL_SECONDS = 30.0
 _total_cost_budget_memo: Dict[int, Tuple[float, Dict[str, Any]]] = {}
@@ -8399,7 +7205,7 @@ _total_cost_budget_reentry = threading.local()
 
 def _total_cost_budget_status(window_hours: Optional[int] = None,
                               force_fresh: bool = False) -> Dict[str, Any]:
-    """Unified budget status across rebalances, Boltz swaps, and on-chain liquidity ops.
+    """Unified budget status across rebalances and historical liquidity costs.
 
     Memoized per window_hours with a short TTL; guarded against re-entrant
     evaluation from cost-component providers (returns the last cached value or
@@ -8467,7 +7273,6 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
 
     # Actual cost components (canonical data sources)
     rebalance = _rebalance_liquidity_cost_components(window_hours=wh)
-    boltz = _boltz_liquidity_cost_components(window_hours=wh)
     if database:
         try:
             generic_ledger = database.get_spend_ledger_summary(window_hours=wh, include_reservations=True)
@@ -8488,25 +7293,26 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
         closure_cost_sats,
     )
 
+    _historical_spent = generic_ledger.get("excluded_spent_categories", {})
     actual_by_category = {
-        "rebalance": int(rebalance.get("spent_24h_sats", 0) or 0),
-        "boltz": int(boltz.get("spent_24h_sats", 0) or 0),
-        "open": open_cost_sats,
-        "close": closure_cost_sats,
-        "ledger": int(generic_ledger.get("spent_24h_sats", 0) or 0),
+        "rebalance": _safe_cost_int(rebalance.get("spent_24h_sats", 0)),
+        "boltz": _safe_cost_int(_historical_spent.get("boltz", 0)),
+        "open": _safe_cost_int(open_cost_sats),
+        "close": _safe_cost_int(closure_cost_sats),
+        "ledger": _safe_cost_int(generic_ledger.get("spent_24h_sats", 0)),
     }
     # Phase 2J: unified rebalance reservations live in the generic ledger
     # under category='rebalance' AND are already counted in the
     # "rebalance" bucket (get_daily_rebalance_spend sums both halves) —
     # exclude them from the "ledger" bucket so each hold counts once.
     _ledger_reserved = int(generic_ledger.get("reserved_24h_sats", 0) or 0)
-    _ledger_rebalance_reserved = int(
-        (generic_ledger.get("reserved_by_category", {}) or {}).get(
-            "rebalance", 0) or 0)
+    _reserved_categories = generic_ledger.get("reserved_by_category", {}) or {}
+    _ledger_rebalance_reserved = _safe_cost_int(_reserved_categories.get("rebalance", 0))
+    _ledger_boltz_reserved = _safe_cost_int(_reserved_categories.get("boltz", 0))
     reserved_by_category = {
-        "rebalance": int(rebalance.get("reserved_24h_sats", 0) or 0),
-        "boltz": int(boltz.get("reserved_24h_sats", 0) or 0),
-        "ledger": max(0, _ledger_reserved - _ledger_rebalance_reserved),
+        "rebalance": _safe_cost_int(rebalance.get("reserved_24h_sats", 0)),
+        "boltz": _ledger_boltz_reserved,
+        "ledger": max(0, _ledger_reserved - _ledger_rebalance_reserved - _ledger_boltz_reserved),
     }
 
     actual_total = sum(max(0, int(v or 0)) for v in actual_by_category.values())
@@ -8578,7 +7384,6 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
         "open_close_cost_visibility": open_close_cost_visibility,
         "components": {
             "rebalance": rebalance,
-            "boltz": boltz,
             "generic_ledger": generic_ledger,
             "open_cost_sats": open_cost_sats,
             "closure_cost_sats": closure_cost_sats,
@@ -8588,7 +7393,7 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
 
 def _total_cost_budget_limit_provider() -> Dict[str, Any]:
     # DD1 / P4-018: this provider feeds the GATING path of every autonomous
-    # spender (rebalance capital controls, boltz gate, and the capacity-planner
+    # spender (rebalance capital controls and the capacity-planner
     # open/close + defibrillation gates via _check_unified_budget /
     # _check_capital_controls). Gating callers must read the LIVE unified total,
     # not the 30s telemetry memo — otherwise N gate checks in one window admit
@@ -8624,2289 +7429,6 @@ def _non_rebalance_liquidity_cost_components(window_hours: Optional[int] = None)
     }
 
 
-def _non_boltz_liquidity_cost_components(window_hours: Optional[int] = None) -> Dict[str, Any]:
-    # DD1 / P4-014: this feeds the Boltz budget GATE (get_budget_status ->
-    # _get_external_liquidity_costs). The P2-011 force_fresh fix only touched the
-    # generic spend-reserve gate (cro:6719) and left this boltz-side component on
-    # the 30s memo, so N boltz gate checks in one window read the same stale
-    # non-boltz total → cross-category overspend. Read the LIVE total here; the
-    # authoritative rail is the atomic reserve (reserve_boltz_swap_budget), but
-    # the gate must not admit against a stale snapshot.
-    status = _total_cost_budget_status(window_hours=window_hours, force_fresh=True)
-    if "error" in status:
-        return {"source": "non_boltz_total_costs", "spent_24h_sats": 0, "reserved_24h_sats": 0, "available": False}
-    actual = status.get("actual_spent_by_category", {}) if isinstance(status.get("actual_spent_by_category"), dict) else {}
-    reserved = status.get("reserved_by_category", {}) if isinstance(status.get("reserved_by_category"), dict) else {}
-    return {
-        "source": "non_boltz_total_costs",
-        "available": True,
-        "spent_24h_sats": max(0, int(status.get("actual_spent_sats", 0) or 0) - int(actual.get("boltz", 0) or 0)),
-        "reserved_24h_sats": max(0, int(status.get("reserved_sats", 0) or 0) - int(reserved.get("boltz", 0) or 0)),
-        "window_hours": int(status.get("window_hours", 24) or 24),
-    }
-
-
-def _boltz_exec_policy_recheck(peer_id: str, direction: str) -> Tuple[bool, str]:
-    """Lazy re-check at swap EXECUTION time (lazy-eval audit F2).
-
-    Plans are built minutes before execution; policy may flip in between.
-    PolicyManager is a write-through cache, so this read is fresh-as-DB.
-    """
-    return _boltz_direction_allowed_by_policy(peer_id, direction)
-
-
-def _boltz_direction_allowed_by_policy(peer_id: str, direction: str) -> Tuple[bool, str]:
-    """direction: loop_in (fill local) or loop_out (drain local)."""
-    if policy_manager is None:
-        # Lazy-eval audit F6: constructed unconditionally at init; None means
-        # broken init. Swapping without policy checks is the dangerous
-        # direction — fail closed.
-        return False, "policy_manager_unavailable_fail_closed"
-    try:
-        pol = policy_manager.get_policy(peer_id)
-    except Exception as e:
-        return False, f"policy_lookup_failed: {e}"
-
-    if pol.strategy == FeeStrategy.PASSIVE:
-        return False, "policy_passive"
-
-    mode = pol.rebalance_mode
-    if direction == "loop_in":
-        if mode in (RebalanceMode.ENABLED, RebalanceMode.SINK_ONLY):
-            return True, mode.value
-        return False, f"policy_rebalance_mode={mode.value}"
-    if direction == "loop_out":
-        if mode in (RebalanceMode.ENABLED, RebalanceMode.SOURCE_ONLY):
-            return True, mode.value
-        return False, f"policy_rebalance_mode={mode.value}"
-    return False, "unknown_direction"
-
-
-def _boltz_channel_daily_contribution_estimate_sats(prof) -> float:
-    if not prof:
-        return 0.0
-    try:
-        total = float(getattr(prof.revenue, "total_contribution_sats", 0) or 0)
-        days_open = int(getattr(prof, "days_open", 0) or 0)
-        # Conservative normalization: use up to 30 days if channel is older.
-        days = max(1, min(days_open, 30))
-        return total / days
-    except Exception as e:
-        plugin.log(f"Daily contribution estimate failed: {e}", level='debug')
-        return 0.0
-
-
-# F2: minimum gap (percentage points) between the tuned loop-in target and
-# the tuned loop-out trigger. Without it, hot channels tuned to overlapping
-# bands (eff_low_target above eff_high_trigger) and ping-ponged loop-in ->
-# loop-out, burning swap fees in circles.
-BAND_SEPARATION_MARGIN_PP = 5.0
-# Maximum tuning movement of the band edges (must match the boost/cut math
-# inside _boltz_dynamic_channel_tuning): trigger_boost <= 20pp on the loop-in
-# trigger, out_adjust <= 15pp (10 hotness + 5 source) on the loop-out trigger.
-MAX_LOW_TRIGGER_BOOST_PP = 20.0
-MAX_HIGH_TRIGGER_CUT_PP = 15.0
-
-
-def _boltz_dynamic_channel_tuning(*,
-    local_pct: float,
-    low_trigger_pct: float,
-    low_target_pct: float,
-    high_trigger_pct: float,
-    high_target_pct: float,
-    flow_state: str,
-    daily_contrib_est: float,
-    marginal_roi: Optional[float],
-    state_row: Optional[Dict[str, Any]] = None,
-    predicted_depletion_hours: Optional[float] = None,
-) -> Dict[str, Any]:
-    """Derive per-channel dynamic thresholds/sizing hints for Boltz balancing.
-
-    Purpose: protect hot, fast-draining channels (e.g. LOOP) by refilling earlier and
-    more deeply while preserving profit/budget guards.
-    """
-    state_row = state_row or {}
-
-    # Normalize profitability and velocity signals into 0..1 scores.
-    roi = float(marginal_roi or 0.0)
-    # roi is typically fraction (e.g. 0.1 = 10%); clamp aggressively for safety.
-    roi_score = max(0.0, min(1.0, roi / 0.25))  # full score at ~25% marginal ROI
-
-    daily_contrib = max(0.0, float(daily_contrib_est or 0.0))
-    contrib_score = max(0.0, min(1.0, daily_contrib / 5000.0))  # full score at 5k sats/day
-
-    kalman_ratio = float(state_row.get('kalman_flow_ratio', state_row.get('flow_ratio', 0.0)) or 0.0)
-    kalman_velocity = float(state_row.get('kalman_velocity', state_row.get('velocity', 0.0)) or 0.0)
-
-    # SOURCE channels (draining local) are the key loop-in protection case.
-    source_signal = 1.0 if str(flow_state).lower() == 'source' else 0.0
-    source_signal = max(source_signal, max(0.0, min(1.0, kalman_ratio)))
-
-    # Positive velocity means source-ness increasing (more urgently draining) in this model.
-    drain_accel_score = max(0.0, min(1.0, kalman_velocity / (0.05 / 24.0)))  # saturate at ~0.05/day (velocity is per-hour)
-
-    # Anticipatory liquidity signal -- predicted depletion boosts urgency
-    anticipatory_urgency = 0.0
-    if predicted_depletion_hours is not None and predicted_depletion_hours > 0:
-        # Saturate at 6h: anything <6h gets max urgency
-        anticipatory_urgency = max(0.0, min(1.0, (6.0 - predicted_depletion_hours) / 6.0))
-
-    # Low local balance also contributes to urgency before the static threshold is crossed.
-    depletion_score = max(0.0, min(1.0, (60.0 - float(local_pct)) / 40.0))
-
-    hotness_score = max(0.0, min(1.0, 0.55 * contrib_score + 0.45 * roi_score))
-    drain_score = max(0.0, min(1.0,
-        0.40 * source_signal +
-        0.25 * drain_accel_score +
-        0.20 * depletion_score +
-        0.15 * anticipatory_urgency
-    ))
-    protection_score = max(0.0, min(1.0, 0.60 * hotness_score + 0.40 * drain_score))
-
-    # Dynamic loop-in behavior: trigger earlier and refill deeper for high-score channels.
-    trigger_boost = 20.0 * protection_score      # up to +20pp (40 -> 60)
-    target_boost = 15.0 * protection_score       # up to +15pp (55 -> 70)
-    amount_multiplier = 1.0 + (2.0 * protection_score)  # up to 3x amount cap
-    cooldown_multiplier = 1.0 - (0.75 * protection_score)  # down to 25% of base cooldown
-
-    eff_low_trigger = min(70.0, max(float(low_trigger_pct), float(low_trigger_pct) + trigger_boost))
-    # keep target at least 10pp above trigger, bounded for safety
-    eff_low_target = min(85.0, max(float(low_target_pct), eff_low_trigger + 10.0, float(low_target_pct) + target_boost))
-
-    # Loop-out: primary Boltz action (generates on-chain funds + rebalances).
-    # Profitable source channels get a lower trigger to enable more loop-out opportunities.
-    # source_signal adds up to 5pp extra for channels with natural local refill.
-    out_adjust = 10.0 * max(0.0, min(1.0, hotness_score)) + 5.0 * source_signal
-    eff_high_trigger = max(55.0, min(float(high_trigger_pct), float(high_trigger_pct) - out_adjust))
-    eff_high_target = min(float(high_target_pct) + out_adjust * 0.5, float(high_target_pct) + 10.0)
-
-    # F2: enforce band ordering AFTER tuning. The loop-in target must sit at
-    # least BAND_SEPARATION_MARGIN_PP below the loop-out trigger, and the
-    # targets must stay strictly inside their triggers, or a hot channel
-    # ping-pongs loop-in <-> loop-out and burns swap fees in circles.
-    band_clamped = False
-    if eff_low_target > eff_high_trigger - BAND_SEPARATION_MARGIN_PP:
-        band_clamped = True
-        # Reduce the loop-in target first, keeping it strictly above the
-        # loop-in trigger; if that cannot create the gap, raise the loop-out
-        # trigger instead.
-        low_target_floor = eff_low_trigger + 1.0
-        eff_low_target = max(low_target_floor, eff_high_trigger - BAND_SEPARATION_MARGIN_PP)
-        if eff_low_target > eff_high_trigger - BAND_SEPARATION_MARGIN_PP:
-            eff_high_trigger = eff_low_target + BAND_SEPARATION_MARGIN_PP
-    if eff_high_target >= eff_high_trigger:
-        band_clamped = True
-        eff_high_target = eff_high_trigger - 1.0
-    if eff_low_trigger >= eff_low_target:
-        band_clamped = True
-        eff_low_trigger = max(0.0, eff_low_target - 1.0)
-
-    return {
-        'band_clamped': band_clamped,
-        'hotness_score': round(hotness_score, 4),
-        'drain_score': round(drain_score, 4),
-        'protection_score': round(protection_score, 4),
-        'dynamic_thresholds': {
-            'low_trigger_pct': round(eff_low_trigger, 2),
-            'low_target_pct': round(eff_low_target, 2),
-            'high_trigger_pct': round(eff_high_trigger, 2),
-            'high_target_pct': round(eff_high_target, 2),
-        },
-        'execution_hints': {
-            'amount_cap_multiplier': round(amount_multiplier, 3),
-            'cooldown_multiplier': round(max(0.25, cooldown_multiplier), 3),
-            'prioritize_channel_protection': protection_score >= 0.6,
-        },
-        'signals': {
-            'contrib_score': round(contrib_score, 4),
-            'roi_score': round(roi_score, 4),
-            'source_signal': round(source_signal, 4),
-            'drain_accel_score': round(drain_accel_score, 4),
-            'depletion_score': round(depletion_score, 4),
-            'anticipatory_urgency': round(anticipatory_urgency, 4),
-            'predicted_depletion_hours': predicted_depletion_hours,
-            'kalman_flow_ratio': round(kalman_ratio, 4),
-            'kalman_velocity': round(kalman_velocity, 6),
-        },
-    }
-
-
-def _get_confirmed_onchain_sats() -> Optional[int]:
-    """Return confirmed on-chain wallet outputs in sats from CLN listfunds.
-
-    F9 fail-safe: returns None on RPC failure. Returning 0 made a telemetry
-    failure look like a full reserve deficit and engaged treasury harvesting
-    — callers must treat None as 'unknown, skip treasury this cycle'
-    (mirroring the scarcity-neutralizes-on-error convention).
-    """
-    try:
-        lf = data_service.get_funds() if data_service else safe_plugin.rpc.listfunds()
-    except Exception as e:
-        plugin.log(f"listfunds RPC failed for onchain balance: {e}", level='warn')
-        return None
-    outputs = lf.get("outputs", []) if isinstance(lf, dict) else []
-    total = 0
-    for o in outputs:
-        if str(o.get("status") or "") != "confirmed":
-            continue
-        total += _parse_msat(o.get("amount_msat", 0)) // 1000
-    return int(total)
-
-
-def _filter_boltz_treasury_recommendations(
-    plan: Dict[str, Any],
-    *,
-    deficit_sats: int,
-    exclude_protected: bool = True,
-    min_source_local_pct: Optional[float] = None,
-    min_amount_sats: int = 100_000,
-) -> Dict[str, Any]:
-    """Filter a balance plan down to treasury-appropriate reverse swaps."""
-    recs = list(plan.get("recommendations", [])) if isinstance(plan, dict) else []
-    filtered = []
-    skipped = []
-    remaining_target = max(0, int(deficit_sats))
-    for rec in recs:
-        direction = str(rec.get("direction") or "")
-        if direction != "loop_out":
-            skipped.append({"channel_id": rec.get("channel_id"), "reason": "not_loop_out"})
-            continue
-        # F6: hard floor on source local balance. The treasury plan passes
-        # min_source_local_pct as the balance plan's high_trigger_pct, but
-        # dynamic tuning may lower the effective trigger by up to 15pp —
-        # letting under-floor channels into the plan. Enforce the floor here
-        # regardless of tuning.
-        if min_source_local_pct is not None:
-            local_pct = float(rec.get("local_balance_pct", 0.0) or 0.0)
-            if local_pct < float(min_source_local_pct):
-                skipped.append({
-                    "channel_id": rec.get("channel_id"),
-                    "peer_id": rec.get("peer_id"),
-                    "reason": "below_min_source_local_pct",
-                    "local_balance_pct": local_pct,
-                    "min_source_local_pct": float(min_source_local_pct),
-                })
-                continue
-        tuning = rec.get("dynamic_tuning", {}) if isinstance(rec.get("dynamic_tuning"), dict) else {}
-        hints = rec.get("execution_hints", {}) if isinstance(rec.get("execution_hints"), dict) else {}
-        if exclude_protected and (bool(hints.get("prioritize_channel_protection")) or float(tuning.get("protection_score", 0.0) or 0.0) >= 0.6):
-            skipped.append({
-                "channel_id": rec.get("channel_id"),
-                "peer_id": rec.get("peer_id"),
-                "reason": "protected_or_hot_channel",
-                "protection_score": tuning.get("protection_score"),
-            })
-            continue
-        amt = int(rec.get("amount_sats", 0) or 0)
-        if remaining_target > 0 and amt > remaining_target:
-            # F10: enforce the target cap at plan time. The annotation alone
-            # was never honored by the executor, which swapped the full
-            # amount and overshot the treasury target.
-            if remaining_target < int(min_amount_sats):
-                skipped.append({
-                    "channel_id": rec.get("channel_id"),
-                    "peer_id": rec.get("peer_id"),
-                    "reason": "remaining_target_below_min_amount",
-                    "remaining_target_sats": int(remaining_target),
-                    "min_amount_sats": int(min_amount_sats),
-                })
-                continue
-            rec = dict(rec)
-            rec["amount_sats"] = int(remaining_target)
-            rec["treasury_target_cap_sats"] = int(remaining_target)
-            rec["treasury_amount_exceeds_deficit"] = True
-            rec["treasury_amount_clamped"] = True
-        filtered.append(rec)
-    out = dict(plan)
-    out["recommendations"] = filtered
-    out["total_candidates"] = len(filtered)
-    examples = list(plan.get("skipped_examples", [])) if isinstance(plan.get("skipped_examples"), list) else []
-    out["skipped_examples"] = (examples + skipped)[:20]
-    out["skipped_count"] = int(plan.get("skipped_count", 0) or 0) + len(skipped)
-    return out
-
-
-def _build_boltz_expansion_treasury_plan(
-    *,
-    onchain_target_sats: int,
-    min_deficit_sats: int = 250_000,
-    preferred_currency: str = "BTC",
-    max_actions: int = 1,
-    min_source_local_pct: float = 80.0,
-    exclude_protected: bool = True,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    max_amount_sats: int = 1_500_000,
-    min_amount_sats: int = 100_000,
-    planner_coordination: Optional[Dict[str, Any]] = None,
-    pending_swap_count: Optional[int] = None,
-) -> Dict[str, Any]:
-    # Fail fast when Boltz is unavailable; the budget/pending reads moved to
-    # the post-deficit-check path (F4), so only the guard remains here.
-    _require_boltz_manager()
-    onchain_confirmed_sats = _get_confirmed_onchain_sats()
-    target = max(0, int(onchain_target_sats))
-    if onchain_confirmed_sats is None:
-        # F9: unknown on-chain balance (listfunds failed) must not read as a
-        # full deficit. Report the plan unavailable so the auto-cycle skips
-        # treasury mode this cycle instead of harvesting on bad telemetry.
-        return {
-            "generated_at": int(time.time()),
-            "treasury": {
-                "enabled": bool(getattr(config, "expansion_treasury_enabled", False)) if config else False,
-                "onchain_confirmed_sats": None,
-                "onchain_target_sats": target,
-                "deficit_sats": 0,
-                "min_deficit_sats": int(min_deficit_sats),
-                "preferred_currency": str(preferred_currency).upper(),
-                "exclude_protected": bool(exclude_protected),
-                "max_actions": int(max_actions),
-                "min_source_local_pct": float(min_source_local_pct),
-            },
-            "status": "unavailable",
-            "reason": "onchain_balance_unavailable_rpc_error",
-            "recommendations": [],
-            "total_candidates": 0,
-            "skipped_count": 0,
-            "skipped_examples": [],
-            "budget": None,
-            "pending_swap_count": None,
-            "thresholds": None,
-            "planner_coordination": None,
-            "structural_credit": None,
-        }
-    deficit = max(0, target - onchain_confirmed_sats)
-
-    treasury = {
-        "enabled": bool(getattr(config, "expansion_treasury_enabled", False)) if config else False,
-        "onchain_confirmed_sats": onchain_confirmed_sats,
-        "onchain_target_sats": target,
-        "deficit_sats": deficit,
-        "min_deficit_sats": int(min_deficit_sats),
-        "preferred_currency": str(preferred_currency).upper(),
-        "exclude_protected": bool(exclude_protected),
-        "max_actions": int(max_actions),
-        "min_source_local_pct": float(min_source_local_pct),
-    }
-
-    if deficit < int(min_deficit_sats):
-        # Deliberately NO bm.budget() / pending-swap lookup here: both are
-        # boltzcli subprocess calls and nothing consumes them on an
-        # at_target plan — the treasury cycle and the auto-cycle mode
-        # selector early-return on status alone. The caller's count is
-        # echoed when provided; otherwise None means "not evaluated".
-        return {
-            "generated_at": int(time.time()),
-            "treasury": treasury,
-            "status": "at_target",
-            "reason": "onchain_reserve_deficit_below_minimum",
-            "recommendations": [],
-            "total_candidates": 0,
-            "skipped_count": 0,
-            "skipped_examples": [],
-            "budget": None,
-            "pending_swap_count": (
-                int(pending_swap_count) if pending_swap_count is not None else None
-            ),
-            "thresholds": None,
-            "planner_coordination": None,
-            "structural_credit": None,
-        }
-
-    max_amt = max(int(min_amount_sats), min(int(max_amount_sats), int(max(deficit, min_amount_sats))))
-    base_plan = _build_boltz_balance_plan(
-        low_trigger_pct=0.0,
-        low_target_pct=50.0,
-        high_trigger_pct=float(min_source_local_pct),
-        high_target_pct=max(50.0, float(min_source_local_pct) - 20.0),
-        min_amount_sats=int(min_amount_sats),
-        max_amount_sats=max_amt,
-        max_candidates=max(10, int(max_actions) * 8),
-        require_profitable=bool(require_profitable),
-        min_marginal_roi=float(min_marginal_roi),
-        profit_margin_factor=float(profit_margin_factor),
-        expected_horizon_days=float(expected_horizon_days),
-        loop_out_currency=str(preferred_currency).upper(),
-        loop_in_currency="LBTC",
-        planner_coordination=planner_coordination,
-        pending_swap_count=pending_swap_count,
-    )
-    if "error" in base_plan:
-        base_plan["treasury"] = treasury
-        return base_plan
-    filtered = _filter_boltz_treasury_recommendations(
-        base_plan,
-        deficit_sats=deficit,
-        exclude_protected=bool(exclude_protected),
-        min_source_local_pct=float(min_source_local_pct),
-        min_amount_sats=int(min_amount_sats),
-    )
-    filtered["treasury"] = treasury
-    filtered["status"] = "ok"
-    filtered.setdefault("reason", None)
-    return filtered
-
-
-# Minimum settled outbound volume (sats) in the 7d window before the node's
-# realized fee ppm is trusted to price the structural inbound credit. Below
-# this floor a handful of lucky high-fee forwards would set a wildly
-# unrepresentative rate, so the credit is disabled instead.
-STRUCTURAL_MIN_VOLUME_SATS = 1_000_000
-
-# Final-stage discount applied when the structural credit is priced from our
-# OWN current out-fee policies instead of realized forwards: our asks are
-# optimistic — they have never cleared at volume (if they had, a realized
-# window would have priced the credit instead), so take them at half value.
-OWN_POLICY_HAIRCUT = 0.5
-
-# How many ~3-day turnover horizons of value the structural inbound credit
-# amortizes over (10 ≈ 30 days of the structural asset working). One horizon
-# priced only ~0.5x amount of freed-inbound turnover, while real reverse-swap
-# costs run ~1000-2500 ppm — the profit guard could essentially never flip.
-# The freed inbound keeps earning beyond one horizon, and actual spend is
-# bounded by the daily structural envelope, not by this estimate; the credit
-# prices a month of the structural asset.
-STRUCTURAL_AMORTIZATION_HORIZONS = 10
-
-# Quote-subprocess budget for _build_boltz_balance_plan: only the top
-# QUOTE_CANDIDATE_MULTIPLIER x max_candidates trigger-passing candidates
-# (ranked by severity, then estimated daily contribution) pay a boltzcli
-# quote; the rest are skipped as quote_budget_exceeded. The margin above
-# max_candidates is deliberate — the profit guard needs the quote, so some
-# quoted candidates fail post-quote and a 1x budget could starve the final
-# slice; 3x bounds the worst case while leaving room for guard failures and
-# the post-quote multi-goal re-ranking.
-QUOTE_CANDIDATE_MULTIPLIER = 3
-
-
-def _policy_derived_fee_ppm(channels: Dict[str, Dict[str, Any]]) -> int:
-    """Capacity-weighted mean of our own out-fee policies, haircut applied.
-
-    Last stage of the structural-credit pricing cascade: an inbound-starved
-    node may have NO realized volume in any window (it cannot route — that
-    is exactly why it needs the drain), leaving only our advertised fee
-    policies as a price signal. Channels with a zero policy still count in
-    the denominator: a zero ask IS the policy.
-    """
-    total_cap = 0
-    weighted = 0.0
-    for ch in channels.values():
-        cap = int(ch.get("capacity", 0) or 0)
-        if cap <= 0:
-            continue
-        ppm = int(ch.get("fee_proportional_millionths", 0) or 0)
-        total_cap += cap
-        weighted += cap * max(0, ppm)
-    if total_cap <= 0:
-        return 0
-    return int((weighted / total_cap) * OWN_POLICY_HAIRCUT)
-
-
-def _build_boltz_balance_plan(
-    *,
-    low_trigger_pct: float = 40.0,
-    low_target_pct: float = 55.0,
-    high_trigger_pct: float = 80.0,
-    high_target_pct: float = 60.0,
-    min_amount_sats: int = 100_000,
-    max_amount_sats: int = 1_000_000,
-    max_candidates: int = 20,
-    only_peer_id: Optional[str] = None,
-    only_channel_id: Optional[str] = None,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    loop_out_currency: str = "LBTC",
-    loop_in_currency: str = "LBTC",
-    planner_coordination: Optional[Dict[str, Any]] = None,
-    pending_swap_count: Optional[int] = None,
-) -> Dict[str, Any]:
-    if fee_controller is None or database is None:
-        return {"error": "Plugin not initialized"}
-
-    # F2: reject caller bases that dynamic tuning could push into overlap.
-    # Tuning may raise the loop-in trigger by up to MAX_LOW_TRIGGER_BOOST_PP
-    # and lower the loop-out trigger by up to MAX_HIGH_TRIGGER_CUT_PP; bases
-    # that collide under maximum tuning would ping-pong loop-in/loop-out.
-    if float(low_trigger_pct) + MAX_LOW_TRIGGER_BOOST_PP >= float(high_trigger_pct) - MAX_HIGH_TRIGGER_CUT_PP:
-        return {
-            "error": (
-                f"invalid trigger bands: low_trigger_pct={float(low_trigger_pct)} + "
-                f"max tuning boost ({MAX_LOW_TRIGGER_BOOST_PP}pp) overlaps "
-                f"high_trigger_pct={float(high_trigger_pct)} - max tuning cut "
-                f"({MAX_HIGH_TRIGGER_CUT_PP}pp); widen the trigger band"
-            )
-        }
-
-    bm = _require_boltz_manager()
-
-    channels = fee_controller._get_channels_info()
-    if not channels:
-        return {"error": "No normal channels available"}
-
-    # Planner + rebalancer coordination: avoid loser channels, factor in funding needs
-    planner_coord = planner_coordination if isinstance(planner_coordination, dict) else {}
-    planner_loser_scids = set(planner_coord.get("loser_scids", set()))
-    planner_funding_deficit = int(planner_coord.get("funding_deficit_sats", 0) or 0)
-    rebalancer_exhausted = bool(planner_coord.get("rebalancer_exhausted", False))
-
-    # Channels the circular rebalancer reported as unplaceable this cycle.
-    # Snapshot from the last rebalance cycle: a channel drained since then
-    # simply won't pass the loop-out trigger below (live balances re-read),
-    # so staleness is self-correcting.
-    # Audit 2026-08-01 wave2 FIX 1: drain_demand membership is the HARD
-    # eligibility gate for the structural credit (README contract: only the
-    # residual the circular rebalancer cannot place may earn it — the engine
-    # nets pairable sources out of drain_demand precisely to prevent a
-    # double-drain). drain_demand_available distinguishes "engine published
-    # an (possibly empty) residual" from "residual unknown" (no engine, no
-    # cycle yet, or fetch error) — when unknown, NO structural credit may be
-    # granted this plan build (conservative).
-    drain_demand_scids: set = set()
-    drain_demand_available = False
-    try:
-        engine = getattr(rebalancer, "rebalance_engine_v2", None) if rebalancer else None
-        demand = engine.get_drain_demand() if engine is not None and hasattr(engine, "get_drain_demand") else None
-        if demand is not None:
-            drain_demand_available = True
-            drain_demand_scids = {
-                str(e.channel_id).replace(":", "x") for e in demand.entries
-            }
-    except Exception:
-        drain_demand_scids = set()
-        drain_demand_available = False
-
-    # Route-pair awareness: protect inbound legs of top revenue routes from loop-out drain
-    route_pair_in_channels = set()
-    try:
-        pairs = database.get_top_route_pairs(days=30, min_forwards=3, limit=10)
-        for p in pairs:
-            in_ch = str(p.get("in_channel", "")).replace(":", "x")
-            if in_ch:
-                route_pair_in_channels.add(in_ch)
-    except Exception:
-        pass
-
-    # Refresh profitability cache on demand.
-    if profitability_analyzer is not None:
-        try:
-            profitability_analyzer.analyze_all_channels()
-        except Exception as e:
-            plugin.log(f"BOLTZ_BALANCE: profitability refresh failed: {e}", level='warn')
-
-    state_rows = {str(r.get("channel_id")): r for r in database.get_all_channel_states()}
-
-    budget_status = bm.budget()
-    # Reuse the caller's pending-swap count when provided (it is a boltzcli
-    # subprocess call) — e.g. the balance cycle checks it before plan build.
-    pending_swaps = int(pending_swap_count) if pending_swap_count is not None else _boltz_pending_swap_count()
-
-    # Structural inbound-credit inputs, hoisted to ONE evaluation per plan
-    # build (the candidate loop runs for up to ~50-100 channels and must not
-    # re-query node receivable status or the realized fee rate per channel).
-    # Both default to neutral (0) on error or when the envelope is disabled.
-    structural_budget_sats = int(getattr(config, "boltz_structural_budget_sats_per_day", 0) or 0)
-    structural_scarcity = 0.0
-    structural_realized_ppm = 0
-    structural_credit_source: Optional[str] = None
-    if structural_budget_sats > 0:
-        try:
-            structural_scarcity = float(_node_receivable_status().get("scarcity", 0.0) or 0.0)
-        except Exception:
-            structural_scarcity = 0.0
-        if structural_scarcity > 0.0:
-            # Pricing cascade — each stage only runs when the prior returned
-            # 0. The volume floor means an inbound-starved node frequently
-            # has NO qualifying realized window (it cannot route — that is
-            # exactly why it needs the drain), so the credit must not die
-            # with the 7d query (chicken-and-egg).
-            #   (a) 7d realized rate, 1M-sat floor (raw forwards);
-            #   (b) 30d realized rate, 1M-sat floor (daily rollups + raw);
-            #   (c) capacity-weighted mean of our OWN out-fee policies,
-            #       discounted by OWN_POLICY_HAIRCUT (asks that never
-            #       cleared at volume are optimistic).
-            try:
-                structural_realized_ppm = int(database.get_node_realized_fee_ppm(
-                    window_days=7, min_volume_sats=STRUCTURAL_MIN_VOLUME_SATS) or 0)
-            except Exception:
-                structural_realized_ppm = 0
-            if structural_realized_ppm > 0:
-                structural_credit_source = "realized_7d"
-            else:
-                try:
-                    structural_realized_ppm = int(database.get_node_realized_fee_ppm_30d(
-                        min_volume_sats=STRUCTURAL_MIN_VOLUME_SATS) or 0)
-                except Exception:
-                    structural_realized_ppm = 0
-                if structural_realized_ppm > 0:
-                    structural_credit_source = "realized_30d"
-                else:
-                    try:
-                        structural_realized_ppm = _policy_derived_fee_ppm(channels)
-                    except Exception:
-                        structural_realized_ppm = 0
-                    if structural_realized_ppm > 0:
-                        structural_credit_source = "policy_derived"
-
-    # 'auto' currency must be resolved at PLAN time: _norm_currency passes
-    # unknown strings through uppercased, so an unresolved 'auto' would reach
-    # the boltzcli quote subprocess as a literal "AUTO" currency argument.
-    # Resolution (a BTC-vs-LBTC quote comparison) runs lazily, at most once
-    # per direction per plan build, sized by the LARGEST-deficit candidate's
-    # amount in that direction (E-4.7 — sizing by whichever candidate
-    # happened to trigger first let a small probe pick the currency for the
-    # whole plan). E-4.7: resolution failure falls back to LBTC, matching
-    # _select_boltz_currency's own fallback (BTC here contradicted the
-    # cheaper-default policy the selector implements).
-    _resolved_auto_currency: Dict[str, Optional[str]] = {}
-
-    def _plan_currency(direction: str, configured: str, amount_sats: int) -> str:
-        if str(configured or "").strip().lower() != "auto":
-            return configured
-        if direction not in _resolved_auto_currency:
-            try:
-                _resolved_auto_currency[direction] = _select_boltz_currency(direction, int(amount_sats))
-            except Exception:
-                _resolved_auto_currency[direction] = "LBTC"
-        return _resolved_auto_currency[direction] or "LBTC"
-
-    def _annotated_currency(direction: str, configured: str) -> Optional[str]:
-        """Concrete currency this plan's quotes used for `direction`.
-
-        None when 'auto' was configured but no candidate in that direction
-        ever triggered (resolution never ran).
-        """
-        if str(configured or "").strip().lower() == "auto":
-            return _resolved_auto_currency.get(direction)
-        return str(configured).upper()
-
-    candidates: List[Dict[str, Any]] = []
-    skipped: List[Dict[str, Any]] = []
-    # Phase 1 output: quote-ready candidates (passed triggers, policy, and
-    # amount gates) that have NOT paid a quote subprocess yet.
-    pending_quotes: List[Dict[str, Any]] = []
-
-    for channel_id, ch in channels.items():
-        peer_id = str(ch.get("peer_id") or "")
-        if only_channel_id and str(channel_id).replace(':', 'x') != str(only_channel_id).replace(':', 'x'):
-            continue
-        if only_peer_id and peer_id != only_peer_id:
-            continue
-
-        # Skip channels marked for closure by capacity planner (avoid wasting swap fees)
-        scid_display = str(channel_id).replace(':', 'x')
-        if planner_loser_scids and scid_display in planner_loser_scids:
-            skipped.append({"channel_id": channel_id, "peer_id": peer_id, "reason": "planner_loser_close_pending"})
-            continue
-
-        capacity_sats = int(ch.get("capacity", 0) or 0)
-        if capacity_sats <= 0:
-            skipped.append({"channel_id": channel_id, "peer_id": peer_id, "reason": "zero_capacity"})
-            continue
-
-        local_pct = _boltz_balance_pct_from_channel_info(ch)
-        local_sats = parse_msat(ch.get("spendable_msat", 0)) // 1000
-        receivable_sats = parse_msat(ch.get("receivable_msat", 0)) // 1000
-        state_row = state_rows.get(channel_id, {})
-        flow_state = str(state_row.get("state") or "unknown")
-
-        prof = profitability_analyzer.get_profitability(channel_id) if profitability_analyzer is not None else None
-        marginal_roi = float(getattr(prof, "marginal_roi", 0.0) or 0.0) if prof else None
-        prof_class = getattr(getattr(prof, "classification", None), "value", None)
-        daily_contrib_est = _boltz_channel_daily_contribution_estimate_sats(prof)
-
-        if require_profitable:
-            if prof is None:
-                skipped.append({"channel_id": channel_id, "peer_id": peer_id, "reason": "no_profitability_data"})
-                continue
-            if marginal_roi is None or marginal_roi < float(min_marginal_roi):
-                skipped.append({
-                    "channel_id": channel_id,
-                    "peer_id": peer_id,
-                    "reason": "below_marginal_roi_threshold",
-                    "marginal_roi": marginal_roi,
-                    "min_marginal_roi": min_marginal_roi,
-                })
-                continue
-
-        # --- Enrichment: DTS posterior, rebalance feasibility ---
-        dts_summary = None
-        if fee_controller is not None:
-            try:
-                dts_summary = fee_controller.get_dts_summary(channel_id)
-            except Exception:
-                pass
-        broadcast_fee_ppm = int((dts_summary or {}).get("broadcast_fee_ppm", 0) or 0)
-        posterior_mean = float((dts_summary or {}).get("posterior_mean", 0) or 0)
-        posterior_std = float((dts_summary or {}).get("posterior_std", 200) or 200)
-
-        # Predicted depletion hours from Kalman flow state.
-        predicted_depletion_hours = None
-        kalman_velocity = float(state_row.get('kalman_velocity', 0.0) or 0.0)
-        kalman_ratio = float(state_row.get('kalman_flow_ratio', 0.0) or 0.0)
-        # Source channels (positive ratio = draining local): estimate hours
-        # until depleted. Gate lowered from 0.1 to 0.02 so mild but
-        # persistent drains are anticipated too.
-        if kalman_ratio > 0.02 and local_sats > 0 and capacity_sats > 0:
-            # Preferred: flow_analysis.estimate_depletion_hours, the pure
-            # helper with correct day-fraction units (kalman_ratio is net
-            # flow per day as a fraction of capacity). The old in-plan
-            # contrib/fee proxy below was ~7-8x off.
-            _estimate_depletion = getattr(flow_analysis_mod, "estimate_depletion_hours", None)
-            if callable(_estimate_depletion):
-                try:
-                    predicted_depletion_hours = _estimate_depletion(
-                        local_sats, capacity_sats, kalman_ratio, kalman_velocity
-                    )
-                except Exception:
-                    predicted_depletion_hours = None
-            elif daily_contrib_est > 0:
-                # Legacy proxy (helper absent): back volume out of revenue.
-                # revenue = volume * fee_ppm / 1e6 => volume ≈ revenue * 1e6 / fee_ppm
-                est_fee = max(broadcast_fee_ppm, 50)  # floor at 50 to avoid division issues
-                daily_volume_est = daily_contrib_est * 1_000_000 / est_fee
-                net_drain_sats_per_day = daily_volume_est * min(1.0, kalman_ratio)
-                if net_drain_sats_per_day > 0:
-                    predicted_depletion_hours = (local_sats / net_drain_sats_per_day) * 24.0
-
-        tuning = _boltz_dynamic_channel_tuning(
-            local_pct=local_pct,
-            low_trigger_pct=low_trigger_pct,
-            low_target_pct=low_target_pct,
-            high_trigger_pct=high_trigger_pct,
-            high_target_pct=high_target_pct,
-            flow_state=flow_state,
-            daily_contrib_est=daily_contrib_est,
-            marginal_roi=marginal_roi,
-            state_row=state_row,
-            predicted_depletion_hours=predicted_depletion_hours,
-        )
-        dyn = tuning.get("dynamic_thresholds", {}) if isinstance(tuning, dict) else {}
-        hints = tuning.get("execution_hints", {}) if isinstance(tuning, dict) else {}
-        eff_low_trigger_pct = float(dyn.get("low_trigger_pct", low_trigger_pct) or low_trigger_pct)
-        eff_low_target_pct = float(dyn.get("low_target_pct", low_target_pct) or low_target_pct)
-        eff_high_trigger_pct = float(dyn.get("high_trigger_pct", high_trigger_pct) or high_trigger_pct)
-        eff_high_target_pct = float(dyn.get("high_target_pct", high_target_pct) or high_target_pct)
-
-        direction = None
-        target_pct = None
-        target_currency = None
-        severity = 0.0
-
-        if local_pct < eff_low_trigger_pct:
-            direction = "loop_in"
-            target_pct = eff_low_target_pct
-            target_currency = loop_in_currency
-            severity = max(0.0, (eff_low_trigger_pct - local_pct) / max(eff_low_trigger_pct, 1.0))
-        elif local_pct > eff_high_trigger_pct:
-            direction = "loop_out"
-            target_pct = eff_high_target_pct
-            target_currency = loop_out_currency
-            severity = max(0.0, (local_pct - eff_high_trigger_pct) / max(100.0 - eff_high_trigger_pct, 1.0))
-        else:
-            continue
-
-        # --- Post-trigger enrichment (deliberately AFTER direction selection so
-        # balanced channels never pay these per-channel DB/hint lookups) ---
-
-        # Rebalance feasibility: if native rebalancer can't rebalance this channel, Boltz is the only option
-        rebal_success = None
-        rebalance_impossible = False
-        if database is not None:
-            try:
-                rebal_success = database.get_channel_rebalance_success_rate(channel_id, window_days=7)
-            except Exception:
-                pass
-        if rebal_success is not None:
-            # 3+ attempts with 0% success in last 7 days = rebalancer can't do it
-            if rebal_success.get("total", 0) >= 3 and rebal_success.get("success_rate", 1.0) == 0.0:
-                rebalance_impossible = True
-
-        allowed, policy_reason = _boltz_direction_allowed_by_policy(peer_id, direction)
-        if not allowed:
-            skipped.append({"channel_id": channel_id, "peer_id": peer_id, "reason": policy_reason, "direction": direction})
-            continue
-
-        target_local_sats = int(capacity_sats * (float(target_pct) / 100.0))
-        if direction == "loop_in":
-            raw_amount = max(0, target_local_sats - local_sats)
-        else:
-            raw_amount = max(0, local_sats - target_local_sats)
-
-        dynamic_amount_cap = int(max_amount_sats)
-        try:
-            dynamic_amount_cap = int(max(int(max_amount_sats), int(int(max_amount_sats) * float(hints.get("amount_cap_multiplier", 1.0) or 1.0))))
-        except Exception:
-            dynamic_amount_cap = int(max_amount_sats)
-        # Safety caps: never exceed 25% of channel capacity or 5M sats in one Boltz action.
-        dynamic_amount_cap = min(dynamic_amount_cap, max(1, int(capacity_sats * 0.25)), 5_000_000)
-        amount_sats = 0
-        if raw_amount > 0:
-            amount_sats = min(int(dynamic_amount_cap), int(raw_amount))
-        if amount_sats < int(min_amount_sats):
-            skipped.append({
-                "channel_id": channel_id,
-                "peer_id": peer_id,
-                "reason": "below_min_amount",
-                "raw_amount_sats": raw_amount,
-                "min_amount_sats": int(min_amount_sats),
-                "direction": direction,
-            })
-            continue
-
-        # Quote deferred to phase 2: only the best-ranked candidates pay the
-        # boltzcli quote subprocess. Capture everything phase 2 needs.
-        pending_quotes.append({
-            "channel_id": channel_id,
-            "peer_id": peer_id,
-            "direction": direction,
-            "target_currency": target_currency,
-            "target_pct": target_pct,
-            "severity": severity,
-            "amount_sats": amount_sats,
-            "raw_amount": raw_amount,
-            "dynamic_amount_cap": dynamic_amount_cap,
-            "daily_contrib_est": daily_contrib_est,
-            "marginal_roi": marginal_roi,
-            "prof": prof,
-            "prof_class": prof_class,
-            "posterior_mean": posterior_mean,
-            "posterior_std": posterior_std,
-            "broadcast_fee_ppm": broadcast_fee_ppm,
-            "rebalance_impossible": rebalance_impossible,
-            "flow_state": flow_state,
-            "local_pct": local_pct,
-            "scid_display": scid_display,
-            "tuning": tuning,
-            "hints": hints,
-            "eff_low_trigger_pct": eff_low_trigger_pct,
-            "eff_high_trigger_pct": eff_high_trigger_pct,
-            "capacity_sats": capacity_sats,
-            "local_sats": local_sats,
-            "receivable_sats": receivable_sats,
-            "policy_reason": policy_reason,
-            "predicted_depletion_hours": predicted_depletion_hours,
-        })
-
-    # --- Phase 2: bounded quoting. Every quote is a boltzcli subprocess, but
-    # only max_candidates recommendations survive the final slice — so rank
-    # quote-ready candidates by (severity, daily_contrib_est) and quote only
-    # the top QUOTE_CANDIDATE_MULTIPLIER x max_candidates. The multiplier
-    # margin matters: the profit guard needs the quote, so some quoted
-    # candidates fail post-quote and a 1x budget could starve the slice.
-    quote_budget = max(0, int(max_candidates)) * QUOTE_CANDIDATE_MULTIPLIER
-    pending_quotes.sort(
-        key=lambda p: (float(p["severity"]), int(p["daily_contrib_est"])),
-        reverse=True,
-    )
-    for p in pending_quotes[quote_budget:]:
-        skipped.append({
-            "channel_id": p["channel_id"],
-            "peer_id": p["peer_id"],
-            "direction": p["direction"],
-            "reason": "quote_budget_exceeded",
-            "severity": round(float(p["severity"]), 4),
-            "quote_budget": quote_budget,
-        })
-
-    # E-4.7: size the lazy per-direction auto-currency resolution by the
-    # LARGEST amount among quote-eligible candidates in that direction (the
-    # largest deficit), not by whichever candidate the loop reaches first.
-    _auto_sizing_amounts: Dict[str, int] = {}
-    for p in pending_quotes[:quote_budget]:
-        d = str(p["direction"])
-        _auto_sizing_amounts[d] = max(
-            _auto_sizing_amounts.get(d, 0), int(p["amount_sats"])
-        )
-
-    for p in pending_quotes[:quote_budget]:
-        channel_id = p["channel_id"]
-        peer_id = p["peer_id"]
-        direction = p["direction"]
-        target_currency = p["target_currency"]
-        target_pct = p["target_pct"]
-        severity = p["severity"]
-        amount_sats = p["amount_sats"]
-        raw_amount = p["raw_amount"]
-        dynamic_amount_cap = p["dynamic_amount_cap"]
-        daily_contrib_est = p["daily_contrib_est"]
-        marginal_roi = p["marginal_roi"]
-        prof = p["prof"]
-        prof_class = p["prof_class"]
-        posterior_mean = p["posterior_mean"]
-        posterior_std = p["posterior_std"]
-        broadcast_fee_ppm = p["broadcast_fee_ppm"]
-        rebalance_impossible = p["rebalance_impossible"]
-        flow_state = p["flow_state"]
-        local_pct = p["local_pct"]
-        scid_display = p["scid_display"]
-        tuning = p["tuning"]
-        hints = p["hints"]
-        eff_low_trigger_pct = p["eff_low_trigger_pct"]
-        eff_high_trigger_pct = p["eff_high_trigger_pct"]
-        capacity_sats = p["capacity_sats"]
-        local_sats = p["local_sats"]
-        receivable_sats = p["receivable_sats"]
-        policy_reason = p["policy_reason"]
-        predicted_depletion_hours = p["predicted_depletion_hours"]
-
-        target_currency = _plan_currency(
-            direction, target_currency,
-            _auto_sizing_amounts.get(str(direction), amount_sats),
-        )
-        try:
-            quote_resp = bm.quote(
-                amount_sats=amount_sats,
-                swap_type=("submarine" if direction == "loop_in" else "reverse"),
-                currency=target_currency,
-            )
-            estimated_fee_sats = int(quote_resp.get("estimated_total_fee_sats", 0) or 0)
-        except Exception as e:
-            skipped.append({
-                "channel_id": channel_id,
-                "peer_id": peer_id,
-                "direction": direction,
-                "reason": f"quote_failed: {e}",
-            })
-            continue
-
-        # Conservative expected uplift model (heuristic): daily contribution * imbalance severity * horizon.
-        # This is intentionally cautious and is only used as a profit guard/ranking signal.
-        severity_factor = max(0.1, min(1.0, severity))
-        # F4 amount-proportionality: the heuristic estimates the value of
-        # closing the FULL gap (raw_amount); a cap-bound partial swap only
-        # earns the pro-rata share of it.
-        amount_fraction = min(1.0, amount_sats / max(1, raw_amount))
-        expected_gross_uplift_sats = int(
-            max(0.0, daily_contrib_est) * float(expected_horizon_days) * severity_factor * amount_fraction
-        )
-
-        # DTS posterior uplift: if the channel has a proven high fee (tight posterior),
-        # use the posterior mean to estimate potential revenue even if recent history is thin.
-        dts_uplift_sats = 0
-        if posterior_mean > 0 and posterior_std < 100:
-            # Tight posterior = confident fee estimate; project revenue from rebalanced capacity
-            # Conservative: use 50% of the amount as volume estimate over the horizon.
-            # F3b horizon honesty: the 0.5 turnover IS the per-horizon volume
-            # assumption, so there is no extra xhorizon_days multiplier (it
-            # used to inflate the projection into 150% turnover at 3 days).
-            projected_volume = amount_sats * 0.5
-            dts_uplift_sats = int(projected_volume * posterior_mean / 1_000_000)
-        # Use the better of historical and DTS-projected uplift
-        expected_gross_uplift_sats = max(expected_gross_uplift_sats, dts_uplift_sats)
-
-        required_profit_threshold_sats = int(round(estimated_fee_sats * float(profit_margin_factor)))
-
-        # Rebalance-impossible channels get a relaxed profit threshold: when native rebalancing
-        # can't work (all sources have negative spread), Boltz is the only option.
-        # rebalancer_exhausted: system-wide signal (depleted channels exist, 0 profitable rebalances)
-        effective_profit_margin = float(profit_margin_factor)
-        if rebalance_impossible:
-            effective_profit_margin = max(0.5, effective_profit_margin * 0.6)
-        elif rebalancer_exhausted and direction == "loop_in":
-            # Rebalancer is stuck globally — Boltz loop-ins should be more willing
-            effective_profit_margin = max(0.8, effective_profit_margin * 0.8)
-        if effective_profit_margin != float(profit_margin_factor):
-            required_profit_threshold_sats = int(round(estimated_fee_sats * effective_profit_margin))
-
-        # Structural inbound credit: a receivable-starved node values the
-        # inbound capacity a loop-out creates, priced at the node's realized
-        # earn rate. Zero when the node is healthy or the structural
-        # envelope is disabled — the per-channel guard is then unchanged.
-        # NOTE: this is deliberately a Boltz-only concept. The circular
-        # rebalancer must never use it: rebalancing conserves the aggregate
-        # ratio, so inbound scarcity is not actionable there.
-        structural_uplift_sats = 0
-        # FIX 1 (drain-demand contract): only a channel in the engine's
-        # current drain_demand residual may earn the structural credit.
-        # Membership implies the residual was available this build; when the
-        # residual is unknown the set is empty and nobody is eligible.
-        # Non-members keep competing on ordinary profit math.
-        structural_credit_eligible = (
-            direction == "loop_out" and scid_display in drain_demand_scids
-        )
-        if (
-            structural_credit_eligible
-            and structural_budget_sats > 0
-            and structural_scarcity > 0.0
-            and structural_realized_ppm > 0
-        ):
-            # F3 marginal credit: when DTS already prices this channel's own
-            # volume (tight posterior), expected_gross already contains that
-            # revenue via dts_uplift — crediting the full realized rate again
-            # would double-pay for the same freed volume. Structural therefore
-            # only credits the NODE-LEVEL PREMIUM over the channel's own rate.
-            # With a loose posterior (std >= 100) the channel rate is unknown
-            # and the full realized rate applies.
-            channel_posterior_ppm = (
-                float(posterior_mean) if (posterior_mean > 0 and posterior_std < 100) else 0.0
-            )
-            premium_ppm = max(0.0, float(structural_realized_ppm) - channel_posterior_ppm)
-            # Mirror the conservative DTS-uplift volume model: half the freed
-            # inbound turns over per horizon — then amortize over
-            # STRUCTURAL_AMORTIZATION_HORIZONS, because the freed inbound
-            # keeps working long past one ~3-day horizon. Spend is bounded
-            # by the daily structural envelope, not this estimate; the
-            # credit prices a month of the structural asset.
-            projected_volume = (
-                amount_sats * 0.5 * structural_scarcity
-                * STRUCTURAL_AMORTIZATION_HORIZONS
-            )
-            structural_uplift_sats = int(projected_volume * premium_ppm / 1_000_000)
-        passes_without_credit = expected_gross_uplift_sats >= required_profit_threshold_sats
-        expected_gross_uplift_sats += structural_uplift_sats
-
-        passes_profit_guard = (expected_gross_uplift_sats >= required_profit_threshold_sats) if require_profitable else True
-        expected_net_sats = expected_gross_uplift_sats - estimated_fee_sats
-
-        # Additional guard for loop-in with no channel pinning support.
-        non_pinned_penalty = 0.7 if direction == "loop_in" else 1.0
-        risk_adjusted_net_sats = int(expected_net_sats * non_pinned_penalty)
-        if require_profitable and direction == "loop_in":
-            # Make loop-in more conservative because it cannot be channel-pinned with current boltzcli.
-            passes_profit_guard = passes_profit_guard and (risk_adjusted_net_sats > 0)
-
-        # Multi-goal value for loop-outs: one swap achieves both on-chain fund generation
-        # AND channel rebalancing.  Higher score = more beneficial to drain this channel.
-        #   - excess_ratio: how much local balance exceeds 50% (0-1)
-        #   - profitability: marginal ROI signal (0-1)
-        #   - fee_value: broadcast fee indicating revenue potential from freed remote cap
-        #   - flow_bonus: source channels naturally refill local, so draining is safe
-        #   - rebalance_bonus: if native rebalancer can't rebalance, Boltz is the only option
-        #   - planner_bonus: capacity planner needs on-chain funds for a channel open
-        #   - route_bonus: loop-out through inbound revenue legs creates headroom for more inbound traffic
-        #   - drain_bonus: channels the circular rebalancer reported unplaceable drain first
-        multi_goal_value = 0.0
-        if direction == "loop_out":
-            excess_ratio = max(0.0, min(1.0, (local_pct - 50.0) / 50.0))
-            # F7: marginal_roi is a FRACTION (0.25 = 25%), matching the
-            # dynamic-tuning roi_score above; full signal at 25% marginal
-            # ROI. The old /25.0 treated it as a percent, capping the signal
-            # at <=0.08 and deadening 35% of the loop-out score.
-            roi_signal = max(0.0, min(1.0, (float(marginal_roi or 0.0)) / 0.25))
-            fee_signal = min(1.0, broadcast_fee_ppm / 500.0) if broadcast_fee_ppm > 0 else 0.0
-            flow_bonus = 1.3 if flow_state in ('source',) else 1.0
-            rebalance_bonus = 1.2 if rebalance_impossible else 1.0
-            planner_bonus = 1.25 if planner_funding_deficit > 0 else 1.0
-            route_bonus = 1.3 if scid_display in route_pair_in_channels else 1.0
-            drain_bonus = 1.5 if scid_display in drain_demand_scids else 1.0
-            multi_goal_value = excess_ratio * (0.35 * roi_signal + 0.35 * fee_signal + 0.30) * flow_bonus * rebalance_bonus * planner_bonus * route_bonus * drain_bonus
-
-        candidate = {
-            "channel_id": channel_id,
-            "peer_id": peer_id,
-            "direction": direction,
-            "trigger_threshold_pct": eff_low_trigger_pct if direction == "loop_in" else eff_high_trigger_pct,
-            "target_pct": target_pct,
-            "dynamic_tuning": tuning,
-            "execution_hints": {
-                **(hints if isinstance(hints, dict) else {}),
-                "dynamic_amount_cap_sats": int(dynamic_amount_cap),
-                "recommended_cooldown_hours": round(max(0.5, 4.0 * float((hints or {}).get("cooldown_multiplier", 1.0) or 1.0)), 2),
-            },
-            "local_balance_pct": round(local_pct, 2),
-            "capacity_sats": capacity_sats,
-            "local_sats": local_sats,
-            "remote_sats": receivable_sats,
-            "amount_sats": amount_sats,
-            "raw_amount_sats": raw_amount,
-            "flow_state": flow_state,
-            "policy_gate": policy_reason,
-            "profitability": None if prof is None else {
-                "classification": prof_class,
-                "net_profit_sats": getattr(prof, "net_profit_sats", None),
-                "roi_percent": getattr(prof, "roi_percent", None),
-                "marginal_roi_percent": round(getattr(prof, "marginal_roi_percent", 0.0), 2),
-                "is_operationally_profitable": bool(getattr(prof, "is_operationally_profitable", False)),
-                "daily_contribution_estimate_sats": int(daily_contrib_est),
-            },
-            "economics": {
-                "estimated_swap_fee_sats": estimated_fee_sats,
-                "expected_gross_uplift_sats": expected_gross_uplift_sats,
-                "dts_uplift_sats": dts_uplift_sats,
-                "expected_net_sats": expected_net_sats,
-                "risk_adjusted_net_sats": risk_adjusted_net_sats,
-                "profit_margin_factor": effective_profit_margin,
-                "passes_profit_guard": bool(passes_profit_guard),
-                "structural_uplift_sats": structural_uplift_sats,
-                # FIX 1 reporting: True only when this candidate was allowed
-                # to earn the credit at all (loop-out AND in the engine's
-                # drain_demand residual) — lets operators see credit-eligible
-                # vs not, independent of whether the credit moved the guard.
-                "structural_credit_eligible": bool(structural_credit_eligible),
-                # True only when the pass actually DEPENDED on the credit:
-                # with require_profitable=False every candidate passes anyway,
-                # so nothing is structural (the envelope must not be charged).
-                "structural": bool(
-                    require_profitable
-                    and passes_profit_guard
-                    and structural_uplift_sats > 0
-                    and not passes_without_credit
-                ),
-                "rebalance_impossible": rebalance_impossible,
-                "loop_in_non_pinnable": direction == "loop_in",
-            },
-            "dts": {
-                "broadcast_fee_ppm": broadcast_fee_ppm,
-                "posterior_mean": round(posterior_mean, 1) if posterior_mean else None,
-                "posterior_std": round(posterior_std, 1) if posterior_std else None,
-            },
-            "quote": quote_resp,
-            "score": {
-                "multi_goal_value": round(multi_goal_value, 4),
-                "severity": round(severity, 4),
-                "daily_contribution_estimate_sats": int(daily_contrib_est),
-                "risk_adjusted_net_sats": risk_adjusted_net_sats,
-                "broadcast_fee_ppm": broadcast_fee_ppm,
-                "rebalance_impossible": rebalance_impossible,
-                "predicted_depletion_hours": round(predicted_depletion_hours, 1) if predicted_depletion_hours is not None else None,
-                "in_drain_demand": scid_display in drain_demand_scids,
-            }
-        }
-        candidates.append(candidate)
-
-    # Sort: loop-outs first (generate on-chain funds + rebalance), then by multi-goal
-    # value, profit safety, rebalance impossibility, estimated net, and severity.
-    candidates.sort(
-        key=lambda c: (
-            1 if c.get("direction") == "loop_out" else 0,
-            1 if c.get("economics", {}).get("passes_profit_guard") else 0,
-            float(c.get("score", {}).get("multi_goal_value", 0.0) or 0.0),
-            1 if c.get("economics", {}).get("rebalance_impossible") else 0,
-            int(c.get("economics", {}).get("risk_adjusted_net_sats", 0) or 0),
-            int(c.get("score", {}).get("broadcast_fee_ppm", 0) or 0),
-            float(c.get("dynamic_tuning", {}).get("protection_score", 0.0) or 0.0),
-            float(c.get("score", {}).get("severity", 0.0) or 0.0),
-        ),
-        reverse=True,
-    )
-
-    return {
-        "generated_at": int(time.time()),
-        "budget": budget_status,
-        "pending_swap_count": pending_swaps,
-        "thresholds": {
-            "low_trigger_pct": low_trigger_pct,
-            "low_target_pct": low_target_pct,
-            "high_trigger_pct": high_trigger_pct,
-            "high_target_pct": high_target_pct,
-            "min_amount_sats": int(min_amount_sats),
-            "max_amount_sats": int(max_amount_sats),
-            "profit_margin_factor": float(profit_margin_factor),
-            "expected_horizon_days": float(expected_horizon_days),
-            "require_profitable": bool(require_profitable),
-            "min_marginal_roi": float(min_marginal_roi),
-            "loop_in_currency": str(loop_in_currency).upper(),
-            "loop_out_currency": str(loop_out_currency).upper(),
-            # Concrete currency the quotes used ('auto' resolves at plan
-            # time; None = 'auto' configured but direction never triggered).
-            "resolved_loop_in_currency": _annotated_currency("loop_in", loop_in_currency),
-            "resolved_loop_out_currency": _annotated_currency("loop_out", loop_out_currency),
-        },
-        "recommendations": candidates[: max(0, int(max_candidates))],
-        "total_candidates": len(candidates),
-        "skipped_count": len(skipped),
-        "skipped_examples": skipped[:20],
-        # Which cascade stage priced the structural inbound credit this plan
-        # build: "realized_7d" / "realized_30d" / "policy_derived", or None
-        # when no stage produced a positive rate (credit disabled).
-        "structural_credit": {
-            "scarcity": round(structural_scarcity, 4),
-            "realized_ppm": int(structural_realized_ppm),
-            "source": structural_credit_source,
-            # FIX 1: whether the engine published a drain residual this
-            # build (False = unknown => no candidate was credit-eligible)
-            # and how many channels it contains.
-            "drain_demand_available": bool(drain_demand_available),
-            "drain_demand_scid_count": len(drain_demand_scids),
-        },
-        "planner_coordination": {
-            "loser_scids_excluded": len(planner_loser_scids),
-            "funding_deficit_sats": planner_funding_deficit,
-            "best_open_candidate": planner_coord.get("best_candidate"),
-        } if planner_coord else None,
-    }
-
-
-def _rpc_boltz_balance_recommendations(
-    plugin: Plugin,
-    low_trigger_pct: float = 40.0,
-    low_target_pct: float = 55.0,
-    high_trigger_pct: float = 80.0,
-    high_target_pct: float = 60.0,
-    min_amount_sats: int = 100_000,
-    max_amount_sats: int = 1_000_000,
-    max_candidates: int = 20,
-    only_peer_id: str = None,
-    only_channel_id: str = None,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    loop_in_currency: str = "LBTC",
-    loop_out_currency: str = "LBTC",
-) -> Dict[str, Any]:
-    """Recommend profit-constrained Boltz loop-in/out actions by channel balance."""
-    try:
-        return _build_boltz_balance_plan(
-            low_trigger_pct=low_trigger_pct,
-            low_target_pct=low_target_pct,
-            high_trigger_pct=high_trigger_pct,
-            high_target_pct=high_target_pct,
-            min_amount_sats=min_amount_sats,
-            max_amount_sats=max_amount_sats,
-            max_candidates=max_candidates,
-            only_peer_id=only_peer_id,
-            only_channel_id=only_channel_id,
-            require_profitable=require_profitable,
-            min_marginal_roi=min_marginal_roi,
-            profit_margin_factor=profit_margin_factor,
-            expected_horizon_days=expected_horizon_days,
-            loop_in_currency=loop_in_currency,
-            loop_out_currency=loop_out_currency,
-        )
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-balance-recommendations")
-def revenue_boltz_balance_recommendations(
-    plugin: Plugin,
-    low_trigger_pct: float = 40.0,
-    low_target_pct: float = 55.0,
-    high_trigger_pct: float = 80.0,
-    high_target_pct: float = 60.0,
-    min_amount_sats: int = 100_000,
-    max_amount_sats: int = 1_000_000,
-    max_candidates: int = 20,
-    only_peer_id: str = None,
-    only_channel_id: str = None,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    loop_in_currency: str = "LBTC",
-    loop_out_currency: str = "LBTC",
-) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz balance-recommendations' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_balance_recommendations(plugin, low_trigger_pct=low_trigger_pct, low_target_pct=low_target_pct, high_trigger_pct=high_trigger_pct, high_target_pct=high_target_pct, min_amount_sats=min_amount_sats, max_amount_sats=max_amount_sats, max_candidates=max_candidates, only_peer_id=only_peer_id, only_channel_id=only_channel_id, require_profitable=require_profitable, min_marginal_roi=min_marginal_roi, profit_margin_factor=profit_margin_factor, expected_horizon_days=expected_horizon_days, loop_in_currency=loop_in_currency, loop_out_currency=loop_out_currency),
-        "revenue-boltz balance-recommendations",
-    )
-
-
-def _compact_boltz_recommendation(rec: Any) -> Dict[str, Any]:
-    """Compact summary of a balance/treasury recommendation for status
-    payloads. Skip/plan entries in revenue-boltz-auto-cycle-status embed
-    these instead of the full recommendation (which nests route plans and
-    tuning breakdowns and pushed the status RPC past 100KB)."""
-    if not isinstance(rec, dict):
-        return {}
-    compact = {
-        key: rec.get(key)
-        for key in ("channel_id", "peer_id", "direction", "amount_sats",
-                    "local_balance_pct")
-        if key in rec
-    }
-    econ = rec.get("economics")
-    if isinstance(econ, dict):
-        compact["economics"] = {
-            key: econ.get(key)
-            for key in ("passes_profit_guard", "estimated_swap_fee_sats",
-                        "expected_uplift_sats", "structural", "marginal_roi")
-            if key in econ
-        }
-    else:
-        compact["economics"] = {}
-    return compact
-
-
-def _rpc_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
-    """Return scheduler status for the in-plugin Boltz auto-cycle."""
-    with _boltz_auto_cycle_state_lock:
-        state = dict(_boltz_auto_cycle_state)
-    state.update({
-        "boltz_enabled": bool(boltz_manager and getattr(boltz_manager, 'enabled', False)),
-        "config": {
-            "boltz_auto_cycle_enabled": bool(getattr(config, 'boltz_auto_cycle_enabled', False)) if config else None,
-            "boltz_auto_cycle_interval_minutes": int(getattr(config, 'boltz_auto_cycle_interval_minutes', 15)) if config else None,
-            "boltz_auto_cycle_max_actions": int(getattr(config, 'boltz_auto_cycle_max_actions', 1)) if config else None,
-            "boltz_auto_cycle_startup_delay_seconds": int(getattr(config, 'boltz_auto_cycle_startup_delay_seconds', 120)) if config else None,
-            "expansion_treasury_enabled": bool(getattr(config, 'expansion_treasury_enabled', False)) if config else None,
-            "expansion_treasury_onchain_target_sats": int(getattr(config, 'expansion_treasury_onchain_target_sats', 5_000_000)) if config else None,
-            "expansion_treasury_min_deficit_sats": int(getattr(config, 'expansion_treasury_min_deficit_sats', 250_000)) if config else None,
-        },
-    })
-    return state
-
-
-@plugin.method("revenue-boltz-auto-cycle-status")
-def revenue_boltz_auto_cycle_status(plugin: Plugin) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz auto-cycle-status' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_auto_cycle_status(plugin),
-        "revenue-boltz auto-cycle-status",
-    )
-
-
-def _rpc_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False,
-                                     dry_run: bool = False) -> Dict[str, Any]:
-    """Trigger one immediate Boltz auto-cycle run using scheduler settings.
-
-    DD4 / P1-018 (operator ruling 2026-07-02): dry_run defaults False —
-    `force=true` alone runs a LIVE cycle (preserves the prior "run one now"
-    semantics and bypasses the boltz_auto_cycle_enabled toggle). The dry_run
-    option is exposed so an operator CAN preview with dry_run=true, but the
-    default is not a preview. All economic gates (budget/cooldown/profit/
-    pending-swap) still apply to the live run.
-    """
-    try:
-        result = _run_boltz_auto_cycle_once(
-            trigger="manual", force=bool(force), dry_run=bool(dry_run)
-        )
-        _boltz_auto_cycle_mark_state(last_result=result)
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@plugin.method("revenue-boltz-auto-cycle-run-now")
-def revenue_boltz_auto_cycle_run_now(plugin: Plugin, force: bool = False,
-                                     dry_run: bool = False) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz auto-cycle-run-now' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_auto_cycle_run_now(plugin, force=force, dry_run=dry_run),
-        "revenue-boltz auto-cycle-run-now",
-    )
-
-
-def _arbitrate_boltz_recommendations(recommendations):
-    """Workstream H (Boltz): batch-arbitrate balance-cycle
-    recommendations behind econ_cycle_boltz_enabled. Dedup drops
-    repeats (ledgered); LEGACY plan order preserved among survivors
-    (EV-based J3 reordering waits for Phase 4 fields). Fail-open."""
-    try:
-        cfg = config.snapshot() if config else None
-        if getattr(cfg, "econ_cycle_boltz_enabled", False) is not True:
-            return recommendations
-        if not recommendations:
-            return recommendations
-        import time as _time
-
-        from modules.econ_arbiter import arbitrate
-        from modules.econ_intents import Explanation, make_intent
-        from modules.econ_types import Micro, Msat, SignedMsat, UnixTime
-
-        now = int(_time.time())
-        cycle_id = f"boltz-arb-{now}"
-        # PR 3c: stamp the canonical snapshot into this cycle's swap
-        # intents; the hub's TTL cache keeps the manager's subsequent
-        # governed reservations on the same ref. Fallback: synthetic.
-        snap_ref = None
-        if econ_shadow is not None:
-            try:
-                snap_ref = econ_shadow.snapshot_ref(now)
-            except Exception:
-                snap_ref = None
-        arb_snapshot_id = (snap_ref or {}).get("snapshot_id") or cycle_id
-        # PR 6 (econ_ev_populated): real risk-adjusted EV from the
-        # recommendation economics; flag off keeps zeros. EV here is
-        # EVIDENCE — survivors deliberately keep legacy plan order.
-        ev_on = getattr(cfg, "econ_ev_populated", False) is True
-        from modules.econ_ev import benefit_msat_from_sats
-        recs_with_keys = []
-        envs = []
-        for rec in recommendations:
-            try:
-                direction = str(rec.get("direction") or "loop_out")
-                intent_type = "SWAP_IN" if direction == "loop_in" \
-                    else "SWAP_OUT"
-                economics = rec.get("economics") or {}
-                fee = int(economics.get("estimated_swap_fee_sats", 0) or 0)
-                ev_benefit = (
-                    benefit_msat_from_sats(
-                        economics.get("risk_adjusted_net_sats"))
-                    if ev_on and "risk_adjusted_net_sats" in economics
-                    else SignedMsat(0))
-                env = make_intent(
-                    intent_type=intent_type,
-                    snapshot_id=arb_snapshot_id,
-                    created_at=UnixTime(now),
-                    expires_at=UnixTime(now + 600),
-                    target=str(rec.get("channel_id") or "onchain"),
-                    amount_msat=None,
-                    expected_benefit_msat=ev_benefit,
-                    max_cost_msat=Msat(max(0, fee) * 1000),
-                    capital_committed_msat=Msat(0),
-                    confidence_micro=Micro(0),
-                    reason_codes=(),
-                    explanation=Explanation("boltz_recommendation", (
-                        ("direction", direction),
-                        ("channel", str(rec.get("channel_id") or "")),
-                        ("amount_sats",
-                         int(rec.get("amount_sats", 0) or 0)),
-                    )),
-                    preconditions=(),
-                    priority=50,
-                    budget_bucket="boltz",
-                    origin_policy="boltz_cycle",
-                    reversible=False,
-                )
-                envs.append(env)
-                recs_with_keys.append((rec, env.idempotency_key))
-            except Exception:
-                recs_with_keys.append((rec, None))  # keep (fail open)
-        arbitration = arbitrate(
-            envs, now=now,
-            extended_rules=getattr(cfg, "econ_conflict_rules_extended",
-                                   False) is True)
-        surviving = {env.idempotency_key for env in arbitration.ordered}
-        ledger = None
-        if econ_shadow is not None:
-            try:
-                ledger = econ_shadow.ledger_for_reconciliation()
-            except Exception:
-                ledger = None
-        if ledger is not None:
-            for env, code, detail in arbitration.rejected:
-                try:
-                    ledger.append(
-                        event_type="intent_rejected",
-                        intent_id=env.intent_id.value,
-                        idempotency_key=env.idempotency_key,
-                        cycle_id=cycle_id,
-                        at=now,
-                        details={"reason_code": code,
-                                 "arbitration": True, "batch": True},
-                    )
-                except Exception:
-                    pass
-        seen = set()
-        survivors = []
-        for rec, key in recs_with_keys:
-            if key is None:
-                survivors.append(rec)
-            elif key in surviving and key not in seen:
-                seen.add(key)
-                survivors.append(rec)
-        return survivors
-    except Exception as _arb_err:
-        try:
-            plugin.log(f"boltz arbitration failed open: {_arb_err}",
-                       level="warn")
-        except Exception:
-            pass
-        return recommendations
-
-
-def _execute_boltz_balance_cycle(
-    *,
-    dry_run: bool = True,
-    max_actions: int = 1,
-    low_trigger_pct: float = 40.0,
-    low_target_pct: float = 55.0,
-    high_trigger_pct: float = 80.0,
-    high_target_pct: float = 60.0,
-    min_amount_sats: int = 100_000,
-    max_amount_sats: int = 1_000_000,
-    only_peer_id: str = None,
-    only_channel_id: str = None,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    cooldown_hours: float = 4.0,
-    allow_concurrent_swaps: bool = False,
-    loop_in_currency: str = "LBTC",
-    loop_out_currency: str = "LBTC",
-    precomputed_plan: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Internal Boltz balance cycle executor.
-
-    precomputed_plan lets internal callers (the auto-cycle scheduler) reuse a
-    balance plan they already built instead of rebuilding the identical plan
-    (each build issues per-candidate boltzcli quote subprocesses). It is NOT an
-    RPC argument — the revenue-boltz-balance-cycle method never exposes it.
-    """
-    # Audit 2026-08-01 (kill-switch coverage): `paused` must stop every
-    # discretionary spend path — only LN+ obligation fulfillment is
-    # pause-exempt (README contract / refactor invariant 6). Planning and
-    # dry-run previews still work while paused; live swap execution must not,
-    # so a live run is gated here before any plan build or swap create.
-    if not dry_run:
-        _pause_cfg = config.snapshot() if config else None
-        if getattr(_pause_cfg, 'paused', False) is True:
-            plugin.log(
-                "cl-revenue-ops: Boltz balance cycle: swap execution skipped "
-                "— plugin paused (revenue-config set paused false to resume)",
-                level='info')
-            return {
-                'status': 'skipped',
-                'reason': 'paused: kill-switch active; Boltz swap execution disabled',
-                'executed_count': 0,
-                'skipped_count': 0,
-                'executed': [],
-                'skipped': [],
-                'plan': precomputed_plan,
-            }
-
-    # Pending-swap short-circuit BEFORE building any plan: a pending swap blocks
-    # the whole cycle anyway, so don't pay for quotes/profitability first.
-    pending_swaps: Optional[int] = None
-    if isinstance(precomputed_plan, dict) and "pending_swap_count" in precomputed_plan:
-        pending_swaps = int(precomputed_plan.get("pending_swap_count", 0) or 0)
-    if not allow_concurrent_swaps:
-        if pending_swaps is None:
-            pending_swaps = _boltz_pending_swap_count()
-        if pending_swaps > 0:
-            return {
-                "status": "blocked",
-                "reason": f"{pending_swaps} pending Boltz swap(s) detected",
-                "plan": precomputed_plan,
-                "executed": [],
-                "skipped": [],
-            }
-
-    if isinstance(precomputed_plan, dict):
-        plan = precomputed_plan
-    else:
-        try:
-            plan = _build_boltz_balance_plan(
-                low_trigger_pct=low_trigger_pct,
-                low_target_pct=low_target_pct,
-                high_trigger_pct=high_trigger_pct,
-                high_target_pct=high_target_pct,
-                min_amount_sats=min_amount_sats,
-                max_amount_sats=max_amount_sats,
-                max_candidates=max(max(5, int(max_actions) * 5), 20),
-                only_peer_id=only_peer_id,
-                only_channel_id=only_channel_id,
-                require_profitable=require_profitable,
-                min_marginal_roi=min_marginal_roi,
-                profit_margin_factor=profit_margin_factor,
-                expected_horizon_days=expected_horizon_days,
-                loop_in_currency=loop_in_currency,
-                loop_out_currency=loop_out_currency,
-                pending_swap_count=pending_swaps,
-            )
-        except Exception as e:
-            return {"error": str(e)}
-
-    if "error" in plan:
-        return plan
-
-    recommendations = list(plan.get("recommendations", []))
-    # Workstream H cutover: batch-arbitrate the recommendation list
-    # (dedup + ledgered rejections; legacy plan order preserved among
-    # survivors). Fail-open.
-    recommendations = _arbitrate_boltz_recommendations(recommendations)
-    budget = plan.get("budget", {}) if isinstance(plan.get("budget"), dict) else {}
-    remaining_budget = int(budget.get("remaining_24h_sats_estimate", 0) or 0)
-    # P1-012 class: coerce operator-supplied cooldown_hours; a non-numeric must
-    # not raise out of the balance-cycle path. Fall back to the 4h default.
-    try:
-        cooldown_seconds = max(0, int(float(cooldown_hours) * 3600))
-    except (ValueError, TypeError):
-        cooldown_seconds = 4 * 3600
-
-    executed: List[Dict[str, Any]] = []
-    skipped_exec: List[Dict[str, Any]] = []
-    now = int(time.time())
-    # Bound _boltz_balance_last_action: drop cooldown entries for channels not
-    # touched within the TTL (e.g. closed channels) so it can't grow unbounded.
-    _prune_boltz_balance_actions(now)
-
-    for rec in recommendations:
-        if len(executed) >= max(0, int(max_actions)):
-            break
-
-        ch_id = str(rec.get("channel_id") or "")
-        peer_id = str(rec.get("peer_id") or "")
-        direction = str(rec.get("direction") or "")
-        amount_sats = int(rec.get("amount_sats", 0) or 0)
-        econ = rec.get("economics", {}) if isinstance(rec.get("economics"), dict) else {}
-        est_fee = int(econ.get("estimated_swap_fee_sats", 0) or 0)
-
-        if not econ.get("passes_profit_guard", False):
-            skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id, "reason": "profit_guard_failed", "recommendation": _compact_boltz_recommendation(rec)})
-            continue
-        if est_fee > remaining_budget:
-            skipped_exec.append({
-                "channel_id": ch_id,
-                "peer_id": peer_id,
-                "reason": "insufficient_remaining_budget",
-                "estimated_fee_sats": est_fee,
-                "remaining_budget_sats": remaining_budget,
-                "recommendation": _compact_boltz_recommendation(rec),
-            })
-            continue
-
-        # Structural envelope gate: candidates that only pass the profit guard
-        # because of the inbound-scarcity credit spend from a dedicated daily
-        # envelope (boltz_structural_budget_sats_per_day) on top of the
-        # tactical budget gate above. The 24h sum is fed by structural swap
-        # fees recorded under category="boltz"/subcategory="structural".
-        if econ.get("structural"):
-            envelope = int(getattr(config, "boltz_structural_budget_sats_per_day", 0) or 0)
-            spent_24h = None
-            if envelope > 0:
-                try:
-                    spent_24h = int(database.get_category_spend_sats(
-                        "boltz", subcategory="structural",
-                        since_timestamp=now - 86400,
-                    ) or 0)
-                except Exception:
-                    # Fail closed: unknown spend means no structural execution.
-                    spent_24h = None
-            if envelope <= 0 or spent_24h is None or spent_24h + est_fee > envelope:
-                skipped_exec.append({
-                    "channel_id": ch_id,
-                    "peer_id": peer_id,
-                    "reason": "structural_envelope_exhausted",
-                    "envelope_sats": envelope,
-                    "spent_24h_sats": spent_24h,
-                    "estimated_fee_sats": est_fee,
-                    "recommendation": _compact_boltz_recommendation(rec),
-                })
-                continue
-
-        rec_hints = rec.get("execution_hints", {}) if isinstance(rec.get("execution_hints"), dict) else {}
-        rec_cooldown_hours = rec_hints.get("recommended_cooldown_hours")
-        rec_cooldown_seconds = cooldown_seconds
-        try:
-            if rec_cooldown_hours is not None:
-                rec_cooldown_seconds = max(0, int(float(rec_cooldown_hours) * 3600))
-        except Exception:
-            rec_cooldown_seconds = cooldown_seconds
-
-        # H-5 FIX: Keep lock held during cooldown decision to prevent TOCTOU race
-        with _boltz_balance_lock:
-            last_ts = int(_boltz_balance_last_action.get(ch_id, 0) or 0)
-            if rec_cooldown_seconds > 0 and last_ts > 0 and (now - last_ts) < rec_cooldown_seconds:
-                skipped_exec.append({
-                    "channel_id": ch_id,
-                    "peer_id": peer_id,
-                    "reason": "cooldown_active",
-                    "cooldown_remaining_sec": rec_cooldown_seconds - (now - last_ts),
-                    "recommendation": _compact_boltz_recommendation(rec),
-                })
-                continue
-            # C1 FIX: Pre-claim cooldown slot to prevent TOCTOU double-execution
-            _boltz_balance_last_action[ch_id] = now
-
-        if dry_run:
-            # A preview must not consume the live cooldown slot (C1 pre-claim
-            # above) — otherwise a dry-run pass suppresses the next live run
-            # for hours per channel.
-            with _boltz_balance_lock:
-                if _boltz_balance_last_action.get(ch_id) == now:
-                    _boltz_balance_last_action[ch_id] = last_ts
-            executed.append({
-                "status": "would_execute",
-                "direction": direction,
-                "channel_id": ch_id,
-                "peer_id": peer_id,
-                "amount_sats": amount_sats,
-                "estimated_fee_sats": est_fee,
-                "recommendation": _compact_boltz_recommendation(rec),
-            })
-            remaining_budget = max(0, remaining_budget - est_fee)
-            continue
-
-        try:
-            bm = _require_boltz_manager()
-
-            # Resolve currency: "auto" compares BTC vs LBTC and picks cheaper
-            if direction == "loop_in":
-                currency = loop_in_currency
-                if currency == "auto":
-                    try:
-                        currency = _select_boltz_currency("loop_in", amount_sats)
-                    except Exception:
-                        currency = "LBTC"
-                _ok, _why = _boltz_exec_policy_recheck(peer_id, "loop_in")
-                if not _ok:
-                    with _boltz_balance_lock:
-                        if _boltz_balance_last_action.get(ch_id) == now:
-                            _boltz_balance_last_action[ch_id] = last_ts
-                    skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id,
-                                         "reason": f"policy_recheck_blocked: {_why}"})
-                    continue
-                res = bm.loop_in(amount_sats=amount_sats, channel_id=ch_id, peer_id=peer_id, currency=currency)
-            elif direction == "loop_out":
-                currency = loop_out_currency
-                if currency == "auto":
-                    try:
-                        currency = _select_boltz_currency("loop_out", amount_sats)
-                    except Exception:
-                        currency = "LBTC"
-                exec_ch_id = ch_id
-                exec_peer_id = peer_id
-                _ok, _why = _boltz_exec_policy_recheck(exec_peer_id, "loop_out")
-                if not _ok:
-                    with _boltz_balance_lock:
-                        if _boltz_balance_last_action.get(ch_id) == now:
-                            _boltz_balance_last_action[ch_id] = last_ts
-                    skipped_exec.append({"channel_id": ch_id, "peer_id": exec_peer_id,
-                                         "reason": f"policy_recheck_blocked: {_why}"})
-                    continue
-                # structural=True routes the swap fee into the dedicated
-                # "structural" spend subcategory so the envelope gate's 24h
-                # sum advances with each structural execution.
-                res = bm.loop_out(
-                    amount_sats=amount_sats,
-                    channel_id=exec_ch_id,
-                    peer_id=exec_peer_id,
-                    currency=currency,
-                    structural=bool(econ.get("structural")),
-                )
-            else:
-                raise BoltzCliError(f"Unknown direction: {direction}")
-
-            # Treat accepted/rejected/error separately. "error" is a swap
-            # boltzcli reported as failed inside an exit-0 payload (see
-            # BoltzManager._is_error_swap) — like "rejected", it must not
-            # consume budget or hold the cooldown slot.
-            status = str(res.get("status") or "")
-            if status in ("accepted", "rejected", "error"):
-                executed.append({
-                    "status": status,
-                    "direction": direction,
-                    "channel_id": ch_id,
-                    "peer_id": peer_id,
-                    "amount_sats": amount_sats,
-                    "estimated_fee_sats": est_fee,
-                    "result": res,
-                    "recommendation": _compact_boltz_recommendation(rec),
-                })
-                if status == "accepted":
-                    # C1: Pre-claim already set; just update budget
-                    remaining_budget = max(0, remaining_budget - est_fee)
-                else:
-                    # C1: Rejected/errored - restore original cooldown timestamp
-                    with _boltz_balance_lock:
-                        if _boltz_balance_last_action.get(ch_id) == now:
-                            _boltz_balance_last_action[ch_id] = last_ts
-                    skipped_exec.append({"channel_id": ch_id, "peer_id": peer_id, "reason": f"execution_{status}", "result": res})
-            else:
-                executed.append({
-                    "status": "unknown",
-                    "direction": direction,
-                    "channel_id": ch_id,
-                    "peer_id": peer_id,
-                    "amount_sats": amount_sats,
-                    "estimated_fee_sats": est_fee,
-                    "result": res,
-                    "recommendation": _compact_boltz_recommendation(rec),
-                })
-        except Exception as e:
-            # C1: Exception - restore original cooldown timestamp
-            with _boltz_balance_lock:
-                if _boltz_balance_last_action.get(ch_id) == now:
-                    _boltz_balance_last_action[ch_id] = last_ts
-            skipped_exec.append({
-                "channel_id": ch_id,
-                "peer_id": peer_id,
-                "reason": f"execution_failed: {e}",
-                "recommendation": _compact_boltz_recommendation(rec),
-            })
-
-    return {
-        "status": "dry_run" if dry_run else "executed",
-        "executed_count": len(executed),
-        "skipped_count": len(skipped_exec),
-        "remaining_budget_sats_estimate_after_cycle": remaining_budget,
-        "executed": executed,
-        "skipped": skipped_exec,
-        "plan": plan,
-        "notes": [
-            "loop-out is channel-pinnable via boltzcli --chan-id",
-            "loop-in (submarine) is not channel-pinnable on boltzcli v2.11.0; target channel/peer is a planning hint and should be verified post-swap",
-            "profit guard uses a conservative heuristic expected-uplift estimate based on recent channel contribution and imbalance severity",
-            "dynamic channel protection tuning raises loop-in trigger/target, amount cap, and cadence for fast-draining high-profit channels",
-        ],
-    }
-
-
-def _rpc_boltz_balance_cycle(
-    plugin: Plugin,
-    dry_run: bool = True,
-    max_actions: int = 1,
-    low_trigger_pct: float = 40.0,
-    low_target_pct: float = 55.0,
-    high_trigger_pct: float = 80.0,
-    high_target_pct: float = 60.0,
-    min_amount_sats: int = 100_000,
-    max_amount_sats: int = 1_000_000,
-    only_peer_id: str = None,
-    only_channel_id: str = None,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    cooldown_hours: float = 4.0,
-    allow_concurrent_swaps: bool = False,
-    loop_in_currency: str = "LBTC",
-    loop_out_currency: str = "LBTC",
-) -> Dict[str, Any]:
-    """Execute a profit-constrained Boltz balance cycle (loop-in/loop-out) with budget + cooldown guards."""
-    return _execute_boltz_balance_cycle(
-        dry_run=dry_run,
-        max_actions=max_actions,
-        low_trigger_pct=low_trigger_pct,
-        low_target_pct=low_target_pct,
-        high_trigger_pct=high_trigger_pct,
-        high_target_pct=high_target_pct,
-        min_amount_sats=min_amount_sats,
-        max_amount_sats=max_amount_sats,
-        only_peer_id=only_peer_id,
-        only_channel_id=only_channel_id,
-        require_profitable=require_profitable,
-        min_marginal_roi=min_marginal_roi,
-        profit_margin_factor=profit_margin_factor,
-        expected_horizon_days=expected_horizon_days,
-        cooldown_hours=cooldown_hours,
-        allow_concurrent_swaps=allow_concurrent_swaps,
-        loop_in_currency=loop_in_currency,
-        loop_out_currency=loop_out_currency,
-    )
-
-
-@plugin.method("revenue-boltz-balance-cycle")
-def revenue_boltz_balance_cycle(
-    plugin: Plugin,
-    dry_run: bool = True,
-    max_actions: int = 1,
-    low_trigger_pct: float = 40.0,
-    low_target_pct: float = 55.0,
-    high_trigger_pct: float = 80.0,
-    high_target_pct: float = 60.0,
-    min_amount_sats: int = 100_000,
-    max_amount_sats: int = 1_000_000,
-    only_peer_id: str = None,
-    only_channel_id: str = None,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    cooldown_hours: float = 4.0,
-    allow_concurrent_swaps: bool = False,
-    loop_in_currency: str = "LBTC",
-    loop_out_currency: str = "LBTC",
-) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz balance-cycle' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_balance_cycle(plugin, dry_run=dry_run, max_actions=max_actions, low_trigger_pct=low_trigger_pct, low_target_pct=low_target_pct, high_trigger_pct=high_trigger_pct, high_target_pct=high_target_pct, min_amount_sats=min_amount_sats, max_amount_sats=max_amount_sats, only_peer_id=only_peer_id, only_channel_id=only_channel_id, require_profitable=require_profitable, min_marginal_roi=min_marginal_roi, profit_margin_factor=profit_margin_factor, expected_horizon_days=expected_horizon_days, cooldown_hours=cooldown_hours, allow_concurrent_swaps=allow_concurrent_swaps, loop_in_currency=loop_in_currency, loop_out_currency=loop_out_currency),
-        "revenue-boltz balance-cycle",
-    )
-
-
-def _rpc_boltz_expansion_treasury_status(plugin: Plugin) -> Dict[str, Any]:
-    """Show expansion treasury reserve target status and current on-chain reserve."""
-    try:
-        bm = _require_boltz_manager()
-        cfg = config.snapshot() if config else None
-        preferred = str(getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC').upper()
-        target = int(getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000)
-        min_deficit = int(getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000)
-        onchain = _get_confirmed_onchain_sats()
-        # F9: None means listfunds failed — report unavailable, never a
-        # fabricated full deficit.
-        deficit = max(0, target - onchain) if onchain is not None else None
-        return {
-            'enabled': bool(getattr(cfg, 'expansion_treasury_enabled', False)) if cfg else False,
-            'status': 'ok' if onchain is not None else 'unavailable',
-            'onchain_confirmed_sats': onchain,
-            'onchain_target_sats': target,
-            'deficit_sats': deficit,
-            'min_deficit_sats': min_deficit,
-            'needs_harvest': bool(deficit is not None and deficit >= min_deficit),
-            'preferred_currency': preferred,
-            'budget': bm.budget(),
-            'pending_swap_count': _boltz_pending_swap_count(),
-        }
-    except Exception as e:
-        return {'error': str(e)}
-
-
-@plugin.method("revenue-boltz-expansion-treasury-status")
-def revenue_boltz_expansion_treasury_status(plugin: Plugin) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz treasury-status' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_expansion_treasury_status(plugin),
-        "revenue-boltz treasury-status",
-    )
-
-
-def _rpc_boltz_expansion_treasury_recommendations(
-    plugin: Plugin,
-    onchain_target_sats: int = None,
-    min_deficit_sats: int = None,
-    preferred_currency: str = None,
-    max_actions: int = None,
-    min_source_local_pct: float = None,
-    exclude_protected: bool = None,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    min_amount_sats: int = 100_000,
-    max_amount_sats: int = 1_500_000,
-) -> Dict[str, Any]:
-    """Recommend reverse swaps to build on-chain expansion treasury funds."""
-    try:
-        cfg = config.snapshot() if config else None
-        return _build_boltz_expansion_treasury_plan(
-            onchain_target_sats=int(onchain_target_sats if onchain_target_sats is not None else (getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000)),
-            min_deficit_sats=int(min_deficit_sats if min_deficit_sats is not None else (getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000)),
-            preferred_currency=str(preferred_currency if preferred_currency is not None else (getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC')).upper(),
-            max_actions=int(max_actions if max_actions is not None else (getattr(cfg, 'expansion_treasury_max_actions', 1) if cfg else 1)),
-            min_source_local_pct=float(min_source_local_pct if min_source_local_pct is not None else (getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0)),
-            exclude_protected=bool(exclude_protected if exclude_protected is not None else (getattr(cfg, 'expansion_treasury_exclude_protected', True) if cfg else True)),
-            require_profitable=bool(require_profitable),
-            min_marginal_roi=float(min_marginal_roi),
-            profit_margin_factor=float(profit_margin_factor),
-            expected_horizon_days=float(expected_horizon_days),
-            min_amount_sats=int(min_amount_sats),
-            max_amount_sats=int(max_amount_sats),
-        )
-    except Exception as e:
-        return {'error': str(e)}
-
-
-@plugin.method("revenue-boltz-expansion-treasury-recommendations")
-def revenue_boltz_expansion_treasury_recommendations(
-    plugin: Plugin,
-    onchain_target_sats: int = None,
-    min_deficit_sats: int = None,
-    preferred_currency: str = None,
-    max_actions: int = None,
-    min_source_local_pct: float = None,
-    exclude_protected: bool = None,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    min_amount_sats: int = 100_000,
-    max_amount_sats: int = 1_500_000,
-) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz treasury-recommendations' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_expansion_treasury_recommendations(plugin, onchain_target_sats=onchain_target_sats, min_deficit_sats=min_deficit_sats, preferred_currency=preferred_currency, max_actions=max_actions, min_source_local_pct=min_source_local_pct, exclude_protected=exclude_protected, require_profitable=require_profitable, min_marginal_roi=min_marginal_roi, profit_margin_factor=profit_margin_factor, expected_horizon_days=expected_horizon_days, min_amount_sats=min_amount_sats, max_amount_sats=max_amount_sats),
-        "revenue-boltz treasury-recommendations",
-    )
-
-
-def _execute_boltz_expansion_treasury_cycle(
-    *,
-    dry_run: bool = True,
-    max_actions: int = None,
-    onchain_target_sats: int = None,
-    min_deficit_sats: int = None,
-    preferred_currency: str = None,
-    min_source_local_pct: float = None,
-    exclude_protected: bool = None,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    min_amount_sats: int = 100_000,
-    max_amount_sats: int = 1_500_000,
-    cooldown_hours: float = 4.0,
-    allow_concurrent_swaps: bool = False,
-    precomputed_plan: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Internal treasury-funding cycle executor.
-
-    precomputed_plan lets internal callers (the auto-cycle scheduler) reuse the
-    treasury plan they already built for mode selection instead of rebuilding it
-    (each build nests a full balance-plan build: per-candidate boltzcli quotes
-    plus budget/listswaps subprocesses). It is NOT an RPC argument — the
-    revenue-boltz-expansion-treasury-cycle method never exposes it.
-    """
-    cfg = config.snapshot() if config else None
-    # Audit 2026-08-01 (kill-switch coverage): same gate as the balance
-    # cycle — `paused` stops live treasury swap execution before any plan
-    # build or swap create; dry-run previews still run.
-    if not dry_run and getattr(cfg, 'paused', False) is True:
-        plugin.log(
-            "cl-revenue-ops: Boltz treasury cycle: swap execution skipped "
-            "— plugin paused (revenue-config set paused false to resume)",
-            level='info')
-        return {
-            'status': 'skipped',
-            'reason': 'paused: kill-switch active; Boltz swap execution disabled',
-            'mode': 'expansion_treasury',
-            'executed_count': 0,
-            'skipped_count': 0,
-            'executed': [],
-            'skipped': [],
-            'plan': precomputed_plan,
-        }
-    if isinstance(precomputed_plan, dict):
-        plan = precomputed_plan
-    else:
-        try:
-            plan = _build_boltz_expansion_treasury_plan(
-                onchain_target_sats=int(onchain_target_sats if onchain_target_sats is not None else (getattr(cfg, 'expansion_treasury_onchain_target_sats', 5_000_000) if cfg else 5_000_000)),
-                min_deficit_sats=int(min_deficit_sats if min_deficit_sats is not None else (getattr(cfg, 'expansion_treasury_min_deficit_sats', 250_000) if cfg else 250_000)),
-                preferred_currency=str(preferred_currency if preferred_currency is not None else (getattr(cfg, 'expansion_treasury_preferred_currency', 'BTC') if cfg else 'BTC')).upper(),
-                max_actions=int(max_actions if max_actions is not None else (getattr(cfg, 'expansion_treasury_max_actions', 1) if cfg else 1)),
-                min_source_local_pct=float(min_source_local_pct if min_source_local_pct is not None else (getattr(cfg, 'expansion_treasury_min_source_local_pct', 80.0) if cfg else 80.0)),
-                exclude_protected=bool(exclude_protected if exclude_protected is not None else (getattr(cfg, 'expansion_treasury_exclude_protected', True) if cfg else True)),
-                require_profitable=bool(require_profitable),
-                min_marginal_roi=float(min_marginal_roi),
-                profit_margin_factor=float(profit_margin_factor),
-                expected_horizon_days=float(expected_horizon_days),
-                min_amount_sats=int(min_amount_sats),
-                max_amount_sats=int(max_amount_sats),
-            )
-        except Exception as e:
-            return {'error': str(e)}
-
-    if 'error' in plan:
-        return plan
-    if str(plan.get('status') or '') in ('at_target', 'unavailable'):
-        return {'status': str(plan.get('status')), 'plan': plan, 'executed': [], 'skipped': []}
-
-    pending_swaps = int(plan.get('pending_swap_count', 0) or 0)
-    if pending_swaps > 0 and not allow_concurrent_swaps:
-        return {
-            'status': 'blocked',
-            'reason': f'{pending_swaps} pending Boltz swap(s) detected',
-            'plan': plan,
-            'executed': [],
-            'skipped': [],
-        }
-
-    recs = list(plan.get('recommendations', []))
-    budget = plan.get('budget', {}) if isinstance(plan.get('budget'), dict) else {}
-    remaining_budget = int(budget.get('remaining_24h_sats_estimate', 0) or 0)
-    # P1-012 class (audit 2026-08-01 wave2 FIX 3): coerce operator-supplied
-    # cooldown_hours; a non-numeric must not raise out of the treasury-cycle
-    # RPC. Mirrors the balance-cycle twin: fall back to the 4h default.
-    try:
-        cooldown_seconds = max(0, int(float(cooldown_hours) * 3600))
-    except (ValueError, TypeError):
-        cooldown_seconds = 4 * 3600
-    target_deficit_remaining = int(((plan.get('treasury') or {}).get('deficit_sats', 0) if isinstance(plan.get('treasury'), dict) else 0) or 0)
-    max_exec = max(1, int(max_actions if max_actions is not None else (getattr(cfg, 'expansion_treasury_max_actions', 1) if cfg else 1)))
-
-    executed = []
-    skipped_exec = []
-    now = int(time.time())
-    # Bound _boltz_balance_last_action (see _prune_boltz_balance_actions).
-    _prune_boltz_balance_actions(now)
-
-    for rec in recs:
-        if len(executed) >= max_exec:
-            break
-        if target_deficit_remaining <= 0:
-            break
-
-        ch_id = str(rec.get('channel_id') or '')
-        peer_id = str(rec.get('peer_id') or '')
-        direction = str(rec.get('direction') or '')
-        amount_sats = int(rec.get('amount_sats', 0) or 0)
-        econ = rec.get('economics', {}) if isinstance(rec.get('economics'), dict) else {}
-        est_fee = int(econ.get('estimated_swap_fee_sats', 0) or 0)
-        quote = rec.get('quote', {}) if isinstance(rec.get('quote'), dict) else {}
-        est_receive = int(quote.get('receiveAmount') or quote.get('receive_amount_sats') or amount_sats or 0)
-
-        if direction != 'loop_out':
-            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'not_loop_out'})
-            continue
-        if not econ.get('passes_profit_guard', False):
-            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'profit_guard_failed', 'recommendation': rec})
-            continue
-        if econ.get('structural'):
-            # Credit-dependent (structural) passes are balance-cycle only: the
-            # treasury executor has no structural-envelope accounting, so a
-            # swap justified solely by the inbound-scarcity credit must not
-            # fund the treasury. Candidates that clear the guard on their own
-            # economics have structural=False and proceed unchanged.
-            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'structural_credit_requires_balance_cycle', 'recommendation': rec})
-            continue
-        if est_fee > remaining_budget:
-            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'insufficient_remaining_budget', 'estimated_fee_sats': est_fee, 'remaining_budget_sats': remaining_budget, 'recommendation': rec})
-            continue
-
-        rec_hints = rec.get('execution_hints', {}) if isinstance(rec.get('execution_hints'), dict) else {}
-        try:
-            rec_cd = int(float(rec_hints.get('recommended_cooldown_hours', cooldown_hours) or cooldown_hours) * 3600)
-        except Exception:
-            rec_cd = cooldown_seconds
-        with _boltz_balance_lock:
-            last_ts = int(_boltz_balance_last_action.get(ch_id, 0) or 0)
-            if rec_cd > 0 and last_ts > 0 and (now - last_ts) < rec_cd:
-                skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': 'cooldown_active', 'cooldown_remaining_sec': rec_cd - (now - last_ts), 'recommendation': rec})
-                continue
-            # C1 FIX: Pre-claim cooldown slot to prevent TOCTOU double-execution
-            _boltz_balance_last_action[ch_id] = now
-
-        if dry_run:
-            executed.append({'status': 'would_execute', 'direction': direction, 'channel_id': ch_id, 'peer_id': peer_id, 'amount_sats': amount_sats, 'estimated_fee_sats': est_fee, 'estimated_receive_onchain_sats': est_receive, 'recommendation': rec})
-            remaining_budget = max(0, remaining_budget - est_fee)
-            target_deficit_remaining = max(0, target_deficit_remaining - est_receive)
-            continue
-
-        try:
-            bm = _require_boltz_manager()
-            res = bm.loop_out(amount_sats=amount_sats, channel_id=ch_id, peer_id=peer_id, currency=str(((plan.get('treasury') or {}).get('preferred_currency', 'BTC'))).upper())
-            status = str(res.get('status') or '')
-            payload = {'status': status or 'unknown', 'direction': direction, 'channel_id': ch_id, 'peer_id': peer_id, 'amount_sats': amount_sats, 'estimated_fee_sats': est_fee, 'estimated_receive_onchain_sats': est_receive, 'result': res, 'recommendation': rec}
-            executed.append(payload)
-            if status == 'accepted':
-                # C1: Pre-claim already set; just update budget
-                remaining_budget = max(0, remaining_budget - est_fee)
-                target_deficit_remaining = max(0, target_deficit_remaining - est_receive)
-            elif status in ('rejected', 'error'):
-                # Audit 2026-08-01 wave2 FIX 2 — mirror the balance cycle:
-                # "error" is a swap boltzcli reported as failed inside an
-                # exit-0 payload (BoltzManager._is_error_swap). Like
-                # "rejected", it moved no funds, so it must not consume
-                # budget/deficit or hold the pre-claimed C1 cooldown slot.
-                with _boltz_balance_lock:
-                    if _boltz_balance_last_action.get(ch_id) == now:
-                        _boltz_balance_last_action[ch_id] = last_ts
-                skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': f'execution_{status}', 'result': res})
-        except Exception as e:
-            # C1: Exception - restore original cooldown timestamp
-            with _boltz_balance_lock:
-                if _boltz_balance_last_action.get(ch_id) == now:
-                    _boltz_balance_last_action[ch_id] = last_ts
-            skipped_exec.append({'channel_id': ch_id, 'peer_id': peer_id, 'reason': f'execution_failed: {e}', 'recommendation': rec})
-
-    return {
-        'status': 'dry_run' if dry_run else 'executed',
-        'mode': 'expansion_treasury',
-        'executed_count': len(executed),
-        'skipped_count': len(skipped_exec),
-        'remaining_budget_sats_estimate_after_cycle': remaining_budget,
-        'remaining_treasury_deficit_sats_estimate_after_cycle': target_deficit_remaining,
-        'executed': executed,
-        'skipped': skipped_exec,
-        'plan': plan,
-        'notes': [
-            'Treasury mode only executes reverse swaps (LN -> BTC/LBTC) to build on-chain expansion reserve',
-            'Protected hot channels can be excluded to avoid harvesting liquidity from critical routing channels',
-            'Reverse swaps on CLN are not channel-pinnable via chanIds; exact path control uses external-pay + first-hop constrained CLN pay when available',
-        ],
-    }
-
-
-def _rpc_boltz_expansion_treasury_cycle(
-    plugin: Plugin,
-    dry_run: bool = True,
-    max_actions: int = None,
-    onchain_target_sats: int = None,
-    min_deficit_sats: int = None,
-    preferred_currency: str = None,
-    min_source_local_pct: float = None,
-    exclude_protected: bool = None,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    min_amount_sats: int = 100_000,
-    max_amount_sats: int = 1_500_000,
-    cooldown_hours: float = 4.0,
-    allow_concurrent_swaps: bool = False,
-) -> Dict[str, Any]:
-    """Run a treasury-funding reverse-swap cycle (LN -> on-chain) for expansion reserve."""
-    return _execute_boltz_expansion_treasury_cycle(
-        dry_run=dry_run,
-        max_actions=max_actions,
-        onchain_target_sats=onchain_target_sats,
-        min_deficit_sats=min_deficit_sats,
-        preferred_currency=preferred_currency,
-        min_source_local_pct=min_source_local_pct,
-        exclude_protected=exclude_protected,
-        require_profitable=require_profitable,
-        min_marginal_roi=min_marginal_roi,
-        profit_margin_factor=profit_margin_factor,
-        expected_horizon_days=expected_horizon_days,
-        min_amount_sats=min_amount_sats,
-        max_amount_sats=max_amount_sats,
-        cooldown_hours=cooldown_hours,
-        allow_concurrent_swaps=allow_concurrent_swaps,
-    )
-
-
-@plugin.method("revenue-boltz-expansion-treasury-cycle")
-def revenue_boltz_expansion_treasury_cycle(
-    plugin: Plugin,
-    dry_run: bool = True,
-    max_actions: int = None,
-    onchain_target_sats: int = None,
-    min_deficit_sats: int = None,
-    preferred_currency: str = None,
-    min_source_local_pct: float = None,
-    exclude_protected: bool = None,
-    require_profitable: bool = True,
-    min_marginal_roi: float = 0.0,
-    profit_margin_factor: float = 1.2,
-    expected_horizon_days: float = 3.0,
-    min_amount_sats: int = 100_000,
-    max_amount_sats: int = 1_500_000,
-    cooldown_hours: float = 4.0,
-    allow_concurrent_swaps: bool = False,
-) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-boltz treasury-cycle' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_boltz_expansion_treasury_cycle(plugin, dry_run=dry_run, max_actions=max_actions, onchain_target_sats=onchain_target_sats, min_deficit_sats=min_deficit_sats, preferred_currency=preferred_currency, min_source_local_pct=min_source_local_pct, exclude_protected=exclude_protected, require_profitable=require_profitable, min_marginal_roi=min_marginal_roi, profit_margin_factor=profit_margin_factor, expected_horizon_days=expected_horizon_days, min_amount_sats=min_amount_sats, max_amount_sats=max_amount_sats, cooldown_hours=cooldown_hours, allow_concurrent_swaps=allow_concurrent_swaps),
-        "revenue-boltz treasury-cycle",
-    )
-
-
-# =============================================================================
-# PHASE C DISPATCHER RPCS (operator-surface reduction 2026-08-01)
-#
-# Primary operator names. Each verb/subsystem/view routes onto the SAME
-# shared helper the corresponding old standalone method calls; the old
-# names stay as deprecated aliases until 2026-09-05.
-# =============================================================================
-
-
-@plugin.method("revenue-boltz")
-def revenue_boltz(plugin: Plugin, verb: str = None, **kwargs) -> Dict[str, Any]:
-    """Unified Boltz swap surface (primary name since 2026-08-01).
-
-    Usage: lightning-cli -k revenue-boltz verb=<verb> [key=value ...]
-
-    Verbs map 1:1 onto the former revenue-boltz-* methods (same argument
-    names, same behavior). An unknown verb returns the list of valid verbs.
-    """
-    table = {
-        "quote": _rpc_boltz_quote,
-        "loop-out": _rpc_boltz_loop_out,
-        "loop-in": _rpc_boltz_loop_in,
-        "status": _rpc_boltz_status,
-        "history": _rpc_boltz_history,
-        "budget": _rpc_boltz_budget,
-        "wallet": _rpc_boltz_wallet,
-        "refund": _rpc_boltz_refund,
-        "claim": _rpc_boltz_claim,
-        "chainswap": _rpc_boltz_chainswap,
-        "withdraw": _rpc_boltz_withdraw,
-        "deposit": _rpc_boltz_deposit,
-        "backup": _rpc_boltz_backup,
-        "backup-verify": _rpc_boltz_backup_verify,
-        "external-pay-ignores": _rpc_boltz_external_pay_ignores,
-        "balance-recommendations": _rpc_boltz_balance_recommendations,
-        "balance-cycle": _rpc_boltz_balance_cycle,
-        "auto-cycle-status": _rpc_boltz_auto_cycle_status,
-        "auto-cycle-run-now": _rpc_boltz_auto_cycle_run_now,
-        "treasury-status": _rpc_boltz_expansion_treasury_status,
-        "treasury-recommendations": _rpc_boltz_expansion_treasury_recommendations,
-        "treasury-cycle": _rpc_boltz_expansion_treasury_cycle,
-    }
-    return _dispatch_subcommand(plugin, "revenue-boltz", "verb", table, verb, kwargs)
-
-
 @plugin.method("revenue-cycle")
 def revenue_cycle(plugin: Plugin, subsystem: str = None, **kwargs) -> Dict[str, Any]:
     """Run one manual cycle of a subsystem (primary name since 2026-08-01).
@@ -10915,7 +7437,7 @@ def revenue_cycle(plugin: Plugin, subsystem: str = None, **kwargs) -> Dict[str, 
 
     Subsystems: fees (was revenue-fee-cycle), rebalance
     (revenue-rebalance-cycle), flow (revenue-analyze), planner
-    (revenue-planner-execute), boltz (revenue-boltz-auto-cycle-run-now),
+    (revenue-planner-execute),
     all (revenue-wake-all). An unknown subsystem returns the valid list.
     """
     table = {
@@ -10923,7 +7445,6 @@ def revenue_cycle(plugin: Plugin, subsystem: str = None, **kwargs) -> Dict[str, 
         "rebalance": _rpc_rebalance_cycle,
         "flow": _rpc_analyze,
         "planner": _rpc_planner_execute,
-        "boltz": _rpc_boltz_auto_cycle_run_now,
         "all": _rpc_wake_all,
     }
     return _dispatch_subcommand(
@@ -10959,8 +7480,7 @@ def revenue_budget(plugin: Plugin, section: str = None, **kwargs) -> Dict[str, A
     Usage:
       lightning-cli revenue-budget
           One response with sections: total_cost (was
-          revenue-total-cost-budget), capex (revenue-capex-status), and
-          boltz (revenue-boltz-budget).
+          revenue-total-cost-budget) and capex (revenue-capex-status).
       lightning-cli -k revenue-budget section=ledger [window_hours=N]
           [include_reservations=true] [reservation_limit=N]
           Forwards to the spend ledger (was revenue-spend-ledger).
@@ -10979,7 +7499,6 @@ def revenue_budget(plugin: Plugin, section: str = None, **kwargs) -> Dict[str, A
         return {
             "total_cost": _section(_rpc_total_cost_budget, **total_cost_kwargs),
             "capex": _section(_rpc_capex_status),
-            "boltz": _section(_rpc_boltz_budget),
         }
     table = {"ledger": _rpc_spend_ledger}
     return _dispatch_subcommand(

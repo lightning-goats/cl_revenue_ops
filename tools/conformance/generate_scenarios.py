@@ -261,13 +261,6 @@ def s15():
         "F4: one planner; chunk-bounded amounts")}
 
 
-def s16():
-    return {"case.json": _from_golden(
-        "structural-drain-boltz", "rebalance_mode",
-        "boltz/cycle_dry_run_executable_balance_plan.json",
-        "F4/G: structural drain via Boltz balance plan (dry-run)")}
-
-
 def s17():
     manual = MODES["manual"]
     diagnostic = MODES["diagnostic"]
@@ -318,22 +311,6 @@ def s20():
         "Duplicate OPEN_CHANNEL intents to one peer are deduplicated; "
         "the higher-priority intent wins",
         notes=["Gated by econ_conflict_rules_extended."])}
-
-
-def s21():
-    swap = _env("SWAP_OUT", target="111x222x0", amount=250_000,
-                bucket="rebalance", policy="boltz")
-    reb = _env("REBALANCE", target="111x222x0")
-    result = arbitrate([reb, swap], now=NOW, extended_rules=True)
-    return {"case.json": _case(
-        "circular-rebalance-vs-boltz-structural", "arbitration",
-        {"intents": [to_wire(reb), to_wire(swap)],
-         "extended_rules": True},
-        _arb_wire(result),
-        "Spec conflict rule: rebalance vs structural swap — the "
-        "structural SWAP_OUT outranks; CONFLICT_REBALANCE_SWAP rejects "
-        "the circular rebalance (live registry blocks both directions)",
-        notes=["Gated by econ_conflict_rules_extended (PR 10)."])}
 
 
 def s22():
@@ -430,18 +407,6 @@ def s26():
          "reserved_msat": dict(state.reserved_msat)},
         "Workstream E: unknown outcome is a TERMINAL state pending "
         "reconciliation; reservation state preserved for the sweep")}
-
-
-def s27():
-    return {"case.json": _case(
-        "boltz-timeout-after-acceptance", "failure_mode",
-        {"lifecycle": ["execution_started"], "stale_after_seconds": 3600,
-         "age_seconds": 7200},
-        {"resolvable_as_db_missing": False, "quarantine_when_stale": True},
-        "Reconciler spec: in-flight (started-without-terminal) keys are "
-        "NEVER auto-zeroed; stale ones quarantine only",
-        source="modules/econ_reconcile.py (TDD-pinned in "
-               "tests/test_econ_reconcile.py)")}
 
 
 def s30():
@@ -656,18 +621,15 @@ SCENARIOS = {
     "13-dynamic-htlcmax": s13,
     "14-hot-channel-priority": s14,
     "15-normal-rebalance": s15,
-    "16-structural-drain": s16,
     "17-manual-diagnostic-rebalance": s17,
     "18-conflicting-close-rebalance": s18,
     "19-protected-close-rejection": s19,
     "20-duplicate-open-priority": s20,
-    "21-circular-vs-boltz-structural": s21,
     "22-budget-exhaustion": s22,
     "23-concurrent-reservation-contention": s23,
     "24-restart-outstanding-reservation": s24,
     "25-missing-execution-cost": s25,
     "26-unknown-execution-outcome": s26,
-    "27-boltz-timeout-after-acceptance": s27,
     "30-stale-intent": s30,
     "31-duplicate-idempotency-key": s31,
     "32-numeric-overflow-underflow": s32,

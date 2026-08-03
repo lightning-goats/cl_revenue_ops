@@ -52,7 +52,7 @@ def test_read_only_surfaces_degrade_without_mutation(name, kwargs, monkeypatch):
     for attr in (
         "database", "config", "fee_controller", "rebalancer",
         "profitability_analyzer", "policy_manager", "capex_engine",
-        "data_service", "capacity_planner", "boltz_manager",
+        "data_service", "capacity_planner",
     ):
         monkeypatch.setattr(mod, attr, None)
     mutation_names = (

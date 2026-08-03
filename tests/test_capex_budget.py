@@ -34,9 +34,6 @@ class TestCapexBudgetConfig:
     def test_exploration_rate(self):
         assert Config().capex_exploration_rate == 0.10
 
-    def test_tactical_rate(self):
-        assert Config().capex_tactical_rate == 0.15
-
     def test_global_envelope(self):
         assert Config().capex_global_envelope_sats == 0
 
@@ -47,7 +44,6 @@ class TestCapexBudgetConfig:
         assert snap.capex_bootstrap_max_sats == 200
         assert snap.capex_grace_days == 14
         assert snap.capex_exploration_rate == 0.10
-        assert snap.capex_tactical_rate == 0.15
         assert snap.capex_global_envelope_sats == 0
         assert snap.planner_min_annual_roi_pct == 1.0
 
@@ -134,7 +130,6 @@ class TestEngineConstruction:
         assert isinstance(alloc, CapexAllocations)
         assert isinstance(alloc.channel_budgets, dict)
         assert isinstance(alloc.fleet_exploration_budget_sats, int)
-        assert isinstance(alloc.tactical_budget_sats, int)
         assert alloc.priority_class in ("defensive", "preservation", "operational", "growth")
 
 
@@ -652,68 +647,6 @@ class TestFleetExplorationBudget:
         assert alloc.fleet_exploration_budget_sats == 25
 
 
-class TestTacticalBudget:
-    """Tactical budget for Boltz treasury."""
-
-    def test_tactical_equals_deficit_when_small(self):
-        """Tactical = min(deficit, fleet_contrib x rate)."""
-        engine = _make_engine(
-            channel_profitabilities={
-                "100x1x0": _make_mock_profitability(
-                    contribution_msat=10_000_000,
-                    fees_earned_msat=10_000_000,
-                    total_forward_count=100,
-                ),
-            },
-            reserve_deficit=500,
-        )
-        alloc = engine.compute_allocations()
-        # fleet_contrib = 10_000_000 msat, tactical_rate = 0.15 -> 1_500_000 msat
-        # deficit = 500 sats = 500_000 msat
-        # min(500_000, 1_500_000) = 500_000 msat = 500 sats
-        assert alloc.tactical_budget_sats == 500
-
-    def test_tactical_capped_at_rate(self):
-        engine = _make_engine(
-            channel_profitabilities={
-                "100x1x0": _make_mock_profitability(
-                    contribution_msat=1_000_000,
-                    fees_earned_msat=1_000_000,
-                    total_forward_count=100,
-                ),
-            },
-            reserve_deficit=500_000,  # Large deficit
-        )
-        alloc = engine.compute_allocations()
-        # fleet_contrib = 1_000_000 msat, tactical_rate = 0.15 -> 150_000 msat
-        # deficit = 500_000 sats = 500_000_000 msat
-        # min(500_000_000, 150_000) = 150_000 msat = 150 sats
-        assert alloc.tactical_budget_sats == 150
-
-    def test_no_deficit_no_tactical(self):
-        engine = _make_engine(reserve_deficit=0)
-        alloc = engine.compute_allocations()
-        assert alloc.tactical_budget_sats == 0
-
-    def test_tactical_budget_reduced_by_boltz_spend_and_reservations(self):
-        engine = _make_engine(
-            channel_profitabilities={
-                "100x1x0": _make_mock_profitability(
-                    contribution_msat=10_000_000,
-                    fees_earned_msat=10_000_000,
-                    total_forward_count=100,
-                ),
-            },
-            reserve_deficit=500,
-            spend_summary={
-                "spent_by_category": {"boltz": 120},
-                "reserved_by_category": {"boltz": 80},
-            },
-        )
-        alloc = engine.compute_allocations()
-        assert alloc.tactical_budget_sats == 300
-
-
 class TestPriorityClass:
     """Fleet state detection and priority classification."""
 
@@ -826,27 +759,6 @@ class TestPriorityClass:
         assert alloc.priority_class == "operational"
 
 
-class TestBoltzCostAttribution:
-    """Boltz cost splitting between channel and tactical."""
-
-    def test_pure_treasury_all_tactical(self):
-        engine = _make_engine()
-        split = engine.attribute_boltz_cost(200, channel_id=None)
-        assert split["channel"] == 0
-        assert split["tactical"] == 200
-
-    def test_channel_targeted_50_50(self):
-        engine = _make_engine()
-        split = engine.attribute_boltz_cost(200, channel_id="100x1x0")
-        assert split["channel"] == 100
-        assert split["tactical"] == 100
-
-    def test_odd_amount_rounds_correctly(self):
-        engine = _make_engine()
-        split = engine.attribute_boltz_cost(201, channel_id="100x1x0")
-        assert split["channel"] + split["tactical"] == 201
-
-
 class TestGlobalEnvelope:
     """Global envelope enforcement."""
 
@@ -866,7 +778,6 @@ class TestGlobalEnvelope:
         total_msat = (
             sum(b.budget_msat for b in alloc.channel_budgets.values())
             + alloc.fleet_exploration_budget_msat
-            + alloc.tactical_budget_msat
         )
         assert total_msat <= 100 * MSAT_PER_SAT
 
@@ -885,7 +796,6 @@ class TestGlobalEnvelope:
         total_msat = (
             sum(b.budget_msat for b in alloc.channel_budgets.values())
             + alloc.fleet_exploration_budget_msat
-            + alloc.tactical_budget_msat
         )
         assert total_msat <= 3000 * MSAT_PER_SAT
 
@@ -929,7 +839,6 @@ class TestCapexStatusOutput:
         assert hasattr(alloc, 'priority_class')
         assert hasattr(alloc, 'global_envelope_sats')
         assert hasattr(alloc, 'fleet_exploration_budget_sats')
-        assert hasattr(alloc, 'tactical_budget_sats')
         assert hasattr(alloc, 'total_fleet_contribution_sats')
         assert hasattr(alloc, 'allocated_by_priority_sats')
         assert hasattr(alloc, 'channel_budgets')
@@ -1196,9 +1105,7 @@ class TestDbErrorFailsClosed:
             assert b.budget_msat == 0
             assert b.budget_sats == 0
         assert alloc.fleet_exploration_budget_msat == 0
-        assert alloc.tactical_budget_msat == 0
         assert engine.get_fleet_exploration_budget() == 0
-        assert engine.get_tactical_budget() == 0
         assert engine.get_channel_budget("100x1x0").budget_sats == 0
 
     def test_spend_ledger_db_error_zeroes_all_budgets(self):
@@ -1209,7 +1116,6 @@ class TestDbErrorFailsClosed:
         for b in alloc.channel_budgets.values():
             assert b.budget_msat == 0
         assert alloc.fleet_exploration_budget_msat == 0
-        assert alloc.tactical_budget_msat == 0
 
     def test_healthy_db_path_unchanged(self):
         engine = self._make_raw_engine()

@@ -34,7 +34,7 @@ from .rebalance_state_v2 import (
     build_state_snapshot,
 )
 from .segment_observations import SegmentObservationStore
-from .rebalance_types_v2 import DrainDemand, PairCandidate, PlanResult, SkipRecord
+from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
 from .utils import base_to_sats_ceil, base_to_sats_floor, parse_msat
 
 # ---------------------------------------------------------------------------
@@ -808,16 +808,6 @@ class RebalanceEngine:
                 buckets["source_inside_band"] += 1
         return buckets
 
-    def get_drain_demand(self) -> Optional[DrainDemand]:
-        """Residual over-local demand from the last planning pass, or None.
-
-        Consumed by the Boltz structural loop-out path. Read-only snapshot;
-        the planner regenerates it every cycle.
-        """
-        last = self._last_cycle_result
-        plan = getattr(last, "plan", None) if last is not None else None
-        return getattr(plan, "drain_demand", None)
-
     def get_last_cycle_debug(self, max_candidates: int = 10) -> Dict[str, Any]:
         result = self._last_cycle_result or CycleResult()
         limit = max(0, int(max_candidates or 0))
@@ -1349,28 +1339,6 @@ class RebalanceEngine:
                     continue
                 kept_selected.append(pair)
             plan.selected = kept_selected
-
-        # Net the planner's residual drain demand against the final merged
-        # selection. Overlay/equalization pairs drain sources the planner-
-        # phase pairing reported as unplaceable; leaving those entries in
-        # drain_demand would let the Boltz structural loop-out double-drain
-        # the same channel. Removal (rather than reducing excess_sats) is
-        # simpler and self-corrects next cycle. drain_demand.paired_count and
-        # over_local_count intentionally keep their planner-phase semantics
-        # (sources paired by the planner / source-eligible over-local count).
-        drain_demand = getattr(plan, "drain_demand", None)
-        if drain_demand is not None and plan.selected:
-            claimed_sources = {pair.source_channel_id for pair in plan.selected}
-            kept_entries = [
-                entry
-                for entry in drain_demand.entries
-                if entry.channel_id not in claimed_sources
-            ]
-            if len(kept_entries) != len(drain_demand.entries):
-                drain_demand.entries = kept_entries
-                drain_demand.total_excess_sats = sum(
-                    entry.excess_sats for entry in kept_entries
-                )
 
         for pair in plan.selected:
             self._route_decision_for_pair(pair)
@@ -2031,7 +1999,7 @@ class RebalanceEngine:
         # P4-016: pass the FULL unified budget and let _reserve_budget_atomic
         # count each category exactly once inside its BEGIN IMMEDIATE. That
         # transaction already SUMs the non-rebalance categories (generic
-        # spend_events + spend_reservations, which include boltz and settled
+        # spend_events + spend_reservations, which include historical external costs and settled
         # channel open/close), so pre-subtracting them here via the external
         # provider double-counted them (starving the rebalance budget on a
         # capex-active node). This mirrors the generic reserve_spend path, which

@@ -33,10 +33,10 @@ def _option_literals(prefix: str) -> set[str]:
 
 
 def test_remaining_retiring_module_roots_are_present_at_characterization_checkpoint():
-    expected = {"boltz", "planner", "demand_flow", "protection"}
+    expected = {"planner", "demand_flow", "protection"}
     actual = {
         name for name, path in RETIRED_MODULES.items()
-        if name != "lnplus" and path.is_file()
+        if name not in {"lnplus", "boltz"} and path.is_file()
     }
     assert actual == expected
 
@@ -47,9 +47,7 @@ def test_lnplus_module_and_import_are_absent():
 
 
 def test_remaining_retired_rpc_and_option_families_are_nonempty():
-    assert _registered_rpcs("revenue-boltz-")
     assert _registered_rpcs("revenue-planner-")
-    assert _option_literals("revenue-ops-boltz-")
     assert _option_literals("revenue-ops-planner-")
 
 
@@ -60,13 +58,29 @@ def test_lnplus_rpc_and_option_families_are_absent():
 
 def test_direct_mutation_verbs_have_the_expected_owner():
     expected = {
-        "boltz": ("subprocess.run", "boltzcli"),
         "planner": ("fund_channel", "close_channel", "diagnostic_rebalance"),
     }
     for owner, symbols in expected.items():
         source = RETIRED_MODULES[owner].read_text(encoding="utf-8")
         for symbol in symbols:
             assert symbol in source, f"{owner} lost audited mutation symbol {symbol}"
+
+
+def test_boltz_module_rpc_options_and_writers_are_absent():
+    assert not RETIRED_MODULES["boltz"].exists()
+    assert not _registered_rpcs("revenue-boltz-")
+    assert not _option_literals("revenue-ops-boltz-")
+    sources = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8")
+        for path in ("cl-revenue-ops.py", "modules/config.py",
+                     "modules/database.py", "modules/data_service.py")
+    )
+    for symbol in (
+        "BoltzCliManager", "BoltzManager", "boltzcli", "boltzd",
+        "revenue-boltz-", "boltz_record_swap", "boltz_update_swap",
+        "def pay(",
+    ):
+        assert symbol not in sources
 
 
 def test_lnplus_network_signing_and_state_writers_are_absent():

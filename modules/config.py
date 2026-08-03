@@ -62,8 +62,6 @@ PUBLIC_RUNTIME_KEYS = (
     # only load at lightningd startup; these are exposed at runtime so the
     # drain can be enabled and tuned via revenue-config without a daemon
     # restart. All default to off/neutral.
-    'boltz_auto_cycle_enabled',
-    'boltz_structural_budget_sats_per_day',
     'receivable_ratio_target',
     'receivable_ratio_floor',
     'drain_fee_discount_max',
@@ -88,9 +86,7 @@ PUBLIC_RUNTIME_KEYS = (
     # Refactor Phase 2E: planner open/close reservations gated by the
     # governor facade (same reserve_spend accounting). Default off.
     'econ_governor_planner_enabled',
-    # Refactor Phase 2G: Boltz pre-create swap reservations gated by the
     # governor facade. Default off.
-    'econ_governor_boltz_enabled',
     # Refactor Phase 2H: automated fee broadcasts gated by the governor
     # (paused/stale + audit trail; zero-cost, no reservation). Manual
     # revenue-set-fee stays operator-direct. Default off.
@@ -104,15 +100,13 @@ PUBLIC_RUNTIME_KEYS = (
     # Workstream H cutover: planner close list passes through batch
     # arbitration (dedup + selection-time conflict arming). Default off.
     'econ_cycle_planner_enabled',
-    # Workstream H cutover: Boltz balance-cycle recommendations pass
     # through batch arbitration (dedup, ledgered). Default off.
-    'econ_cycle_boltz_enabled',
     # PR 6 (gap-closure Phase E): populate real EV/confidence in intent
     # envelopes. CAUTION: flipping changes J3 batch-arbitration ORDER in
     # the cutover loops (EV sorts before target). Default off = zeros.
     'econ_ev_populated',
     # PR 10 (gap-closure Phase G): extra arbiter conflict rules —
-    # duplicate opens per peer (covers open-vs-LN+), rebalance vs
+    # duplicate opens per peer, rebalance vs
     # structural swap. Default off = the three original rules only.
     'econ_conflict_rules_extended',
     # Phase 4 (Workstream I): global authority level — observe < fees <
@@ -159,13 +153,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hot_channel_protection_profit_budget_pct': float,
     'hot_channel_protection_max_chunk_multiplier': float,
     'hot_channel_protection_min_cooldown_hours': float,
-    'boltz_auto_cycle_enabled': bool,
-    'boltz_auto_cycle_interval_minutes': int,
-    'boltz_auto_cycle_max_actions': int,
-    'boltz_auto_cycle_startup_delay_seconds': int,
     'receivable_ratio_target': float,
     'receivable_ratio_floor': float,
-    'boltz_structural_budget_sats_per_day': int,
     'drain_fee_discount_max': float,
     'node_drain_bias_enabled': bool,
     'node_drain_bias_max': float,
@@ -176,23 +165,14 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'econ_shadow_enabled': bool,
     'econ_governor_rebalance_enabled': bool,
     'econ_governor_planner_enabled': bool,
-    'econ_governor_boltz_enabled': bool,
     'econ_governor_fees_enabled': bool,
     'econ_arbiter_enabled': bool,
     'econ_cycle_rebalance_enabled': bool,
     'econ_cycle_planner_enabled': bool,
-    'econ_cycle_boltz_enabled': bool,
     'econ_ev_populated': bool,
     'econ_conflict_rules_extended': bool,
     'authority_level': str,
     'risk_profile': str,
-    'expansion_treasury_enabled': bool,
-    'expansion_treasury_onchain_target_sats': int,
-    'expansion_treasury_min_deficit_sats': int,
-    'expansion_treasury_preferred_currency': str,
-    'expansion_treasury_max_actions': int,
-    'expansion_treasury_min_source_local_pct': float,
-    'expansion_treasury_exclude_protected': bool,
     'min_wallet_reserve': int,
     'low_liquidity_threshold': float,
     'high_liquidity_threshold': float,
@@ -262,7 +242,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'capex_grace_days': int,
     'capex_probability_budget_bonus': float,
     'capex_exploration_rate': float,
-    'capex_tactical_rate': float,
     'capex_global_envelope_sats': int,
 }
 
@@ -293,20 +272,8 @@ SHADOWED_SETTING_GATES: Dict[str, tuple] = {
         'fee_market_boundary_min_competitors',
         'fee_market_boundary_margin_ppm',
     ),
-    'expansion_treasury_enabled': (
-        'expansion_treasury_onchain_target_sats',
-        'expansion_treasury_min_deficit_sats',
-        'expansion_treasury_preferred_currency',
-        'expansion_treasury_max_actions',
-        'expansion_treasury_min_source_local_pct',
-        'expansion_treasury_exclude_protected',
-    ),
     # Phase B (2026-08-01 surface reduction, section 5.4): the structural
-    # loop-out envelope only spends inside the Boltz auto-cycle's balance
     # cycle — the exact shadow found in production.
-    'boltz_auto_cycle_enabled': (
-        'boltz_structural_budget_sats_per_day',
-    ),
     # capacity_planner.run_cycle bails when planner_enabled is false, so the
     # per-cycle open/close limits are inert until the planner is on.
     'planner_enabled': (
@@ -359,12 +326,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # and never above 10k sats (a typo must not authorize huge spend).
     'diagnostic_rebalance_max_fee_sats': (1, 10_000),
     'weekly_budget_sats': (0, 70_000_000),
-    'boltz_auto_cycle_interval_minutes': (1, 1440),
-    'boltz_auto_cycle_max_actions': (1, 10),
-    'boltz_auto_cycle_startup_delay_seconds': (0, 3600),
     'receivable_ratio_target': (0.0, 1.0),
     'receivable_ratio_floor': (0.0, 1.0),
-    'boltz_structural_budget_sats_per_day': (0, 1_000_000),
     'drain_fee_discount_max': (0.0, 0.5),
     'node_drain_bias_max': (0.0, 0.5),
     'htlcmax_source_pct': (0.01, 1.0),
@@ -398,7 +361,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # beyond ~±0.2 are effectively dead for typical daily turnover.
     'source_threshold': (-1.0, 1.0),
     'sink_threshold': (-1.0, 1.0),
-    'expansion_treasury_min_source_local_pct': (0.0, 100.0),
     'hot_channel_protection_max_chunk_multiplier': (1.0, 20.0),
     'hot_channel_protection_min_cooldown_hours': (0.0, 168.0),
     'hot_channel_protection_min_marginal_roi': (0.0, 10.0),
@@ -424,9 +386,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_size_reference_percentile': (0.0, 1.0),
     'rebalance_small_channel_band_half_width': (0.0, 0.5),
     'estimated_open_cost_sats': (0, 1000000),
-    'expansion_treasury_max_actions': (1, 10),
-    'expansion_treasury_min_deficit_sats': (0, 100000000),
-    'expansion_treasury_onchain_target_sats': (0, 1000000000),
     # Capacity Planner
     'planner_interval': (600, 604800),
     'planner_max_opens_per_cycle': (0, 10),
@@ -443,14 +402,12 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'capex_bootstrap_max_sats': (0, 10000),
     'capex_grace_days': (0, 90),
     'capex_exploration_rate': (0.0, 1.0),
-    'capex_tactical_rate': (0.0, 1.0),
     'capex_probability_budget_bonus': (0.0, 1.0),
     'capex_global_envelope_sats': (0, 100_000_000),
 }
 
 # Valid values for string enum fields
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
-    'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
     'fee_profile': ('active', 'conservative'),
     'rebalance_router': ('v3',),
     'market_fee_mode': ('undercut', 'match', 'premium', 'competition_aware'),
@@ -487,17 +444,12 @@ class Config:
     hot_channel_protection_profit_budget_pct: float = 0.75
     hot_channel_protection_max_chunk_multiplier: float = 4.0
     hot_channel_protection_min_cooldown_hours: float = 1.0
-    boltz_auto_cycle_enabled: bool = False  # Run profit-gated Boltz auto-balance cycle in background (opt-in)
-    boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
-    boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
-    boltz_auto_cycle_startup_delay_seconds: int = 120  # Delay before first Boltz auto-cycle
     # Source-heavy drain: node-level receivable objective and envelopes.
     # receivable_ratio = total receivable / total capacity across channels.
     receivable_ratio_target: float = 0.30   # structural credit scales to 0 here
     receivable_ratio_floor: float = 0.20    # below this the node is "starved"
     # Daily cap (sats of swap fees) for loop-outs that only pass the profit
     # guard via the structural credit. 0 = structural loop-outs disabled.
-    boltz_structural_budget_sats_per_day: int = 0
     # Max bounded fee discount applied to stagnant over-local channels.
     # 0.0 = disabled. 0.10 means fees may be biased down by at most 10%.
     drain_fee_discount_max: float = 0.0
@@ -522,8 +474,6 @@ class Config:
     htlcmax_balanced_pct: float = 0.45
     # econ_* rollout flags — Phase B (2026-08-01 surface reduction, section
     # 2e/3): all 12 default TRUE so fresh nodes run the governed paths that
-    # production actually tests (10 stable-True for months; the two Boltz
-    # flags were False only because Boltz automation was off). The flags are
     # scheduled for removal (with the legacy branches) after one stable
     # default-True release (Phase D).
     # Refactor Phase 1 shadow: observe-mode intent recording into
@@ -535,8 +485,6 @@ class Config:
     econ_governor_rebalance_enabled: bool = True
     # Refactor Phase 2E: governor-gated planner open/close reservations.
     econ_governor_planner_enabled: bool = True
-    # Refactor Phase 2G: governor-gated Boltz swap reservations.
-    econ_governor_boltz_enabled: bool = True
     # Refactor Phase 2H: governor-gated automated fee broadcasts.
     econ_governor_fees_enabled: bool = True
     # Refactor Phase 3F: live governor-boundary arbitration.
@@ -545,21 +493,12 @@ class Config:
     econ_cycle_rebalance_enabled: bool = True
     # Workstream H: cycle-arbitrated planner close list.
     econ_cycle_planner_enabled: bool = True
-    # Workstream H: cycle-arbitrated Boltz recommendations.
-    econ_cycle_boltz_enabled: bool = True
     econ_ev_populated: bool = True
     econ_conflict_rules_extended: bool = True
     # Phase 4: global authority level (observe|fees|liquidity|capital).
     authority_level: str = "capital"
     risk_profile: str = "custom"
     # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
-    expansion_treasury_enabled: bool = False
-    expansion_treasury_onchain_target_sats: int = 5_000_000
-    expansion_treasury_min_deficit_sats: int = 250_000
-    expansion_treasury_preferred_currency: str = 'BTC'
-    expansion_treasury_max_actions: int = 1
-    expansion_treasury_min_source_local_pct: float = 80.0  # I-7: 0-100 scale (not 0-1)
-    expansion_treasury_exclude_protected: bool = True
     
     # Flow analysis parameters
     flow_window_days: int = 7      # Days to analyze for flow calculation
@@ -793,7 +732,6 @@ class Config:
     capex_bootstrap_max_sats: int = 200         # Bootstrap cap per channel per 30d
     capex_grace_days: int = 14                  # Days before bootstrap activates
     capex_exploration_rate: float = 0.10        # Fleet contribution fraction for opens/growth
-    capex_tactical_rate: float = 0.15           # Fleet contribution fraction for Boltz treasury
     capex_global_envelope_sats: int = 0         # Global cap (0 = auto-computed)
     # Probability-aware budget relaxation. When a router reports a route
     # probability (v3/askrene does; v2/getroute returns 0), the engine allows
@@ -814,7 +752,6 @@ class Config:
         for _key in (
             'receivable_ratio_target',
             'receivable_ratio_floor',
-            'boltz_structural_budget_sats_per_day',
             'drain_fee_discount_max',
             'node_drain_bias_max',
         ):
@@ -1228,17 +1165,6 @@ class ConfigSnapshot:
     hot_channel_protection_profit_budget_pct: float
     hot_channel_protection_max_chunk_multiplier: float
     hot_channel_protection_min_cooldown_hours: float
-    boltz_auto_cycle_enabled: bool
-    boltz_auto_cycle_interval_minutes: int
-    boltz_auto_cycle_max_actions: int
-    boltz_auto_cycle_startup_delay_seconds: int
-    expansion_treasury_enabled: bool
-    expansion_treasury_onchain_target_sats: int
-    expansion_treasury_min_deficit_sats: int
-    expansion_treasury_preferred_currency: str
-    expansion_treasury_max_actions: int
-    expansion_treasury_min_source_local_pct: float
-    expansion_treasury_exclude_protected: bool
     
     # Flow analysis parameters
     flow_window_days: int
@@ -1370,13 +1296,11 @@ class ConfigSnapshot:
     capex_bootstrap_max_sats: int = 200
     capex_grace_days: int = 14
     capex_exploration_rate: float = 0.10
-    capex_tactical_rate: float = 0.15
     capex_global_envelope_sats: int = 0
     capex_probability_budget_bonus: float = 0.0
     # Structural loop-out / drain-demand fields
     receivable_ratio_target: float = 0.30
     receivable_ratio_floor: float = 0.20
-    boltz_structural_budget_sats_per_day: int = 0
     drain_fee_discount_max: float = 0.0
     node_drain_bias_enabled: bool = False
     node_drain_bias_max: float = 0.3
@@ -1391,12 +1315,10 @@ class ConfigSnapshot:
     econ_shadow_enabled: bool = True
     econ_governor_rebalance_enabled: bool = True
     econ_governor_planner_enabled: bool = True
-    econ_governor_boltz_enabled: bool = True
     econ_governor_fees_enabled: bool = True
     econ_arbiter_enabled: bool = True
     econ_cycle_rebalance_enabled: bool = True
     econ_cycle_planner_enabled: bool = True
-    econ_cycle_boltz_enabled: bool = True
     econ_ev_populated: bool = True
     econ_conflict_rules_extended: bool = True
     authority_level: str = "capital"

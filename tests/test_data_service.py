@@ -503,29 +503,6 @@ class TestNeverCachedTier:
         ds.delete_invoice("label123", "unpaid")
         plugin.rpc.delinvoice.assert_called_once_with("label123", "unpaid")
 
-    def test_pay(self):
-        from modules.data_service import DataService
-        plugin = _make_mock_plugin()
-        plugin.rpc.call.return_value = {"status": "complete"}
-        ds = DataService(plugin)
-        result = ds.pay(bolt11="lnbc...")
-        assert result["status"] == "complete"
-
-    def test_list_pays(self):
-        from modules.data_service import DataService
-        plugin = _make_mock_plugin()
-        plugin.rpc.call.return_value = {"pays": []}
-        ds = DataService(plugin)
-        result = ds.list_pays()
-        assert "pays" in result
-
-    def test_decode(self):
-        from modules.data_service import DataService
-        plugin = _make_mock_plugin()
-        plugin.rpc.call.return_value = {"type": "bolt11"}
-        ds = DataService(plugin)
-        result = ds.decode("lnbc...")
-        assert result["type"] == "bolt11"
 
 
 class TestAskrenePassthrough:

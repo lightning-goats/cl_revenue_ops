@@ -1,7 +1,7 @@
 """Phase B of the 2026-08-01 operator-surface reduction (additive only).
 
 Covers:
-- Default flips: 12 econ_* rollout flags -> True, min_fee_ppm 10 -> 50,
+- Default flips: 9 econ_* rollout flags -> True, min_fee_ppm 10 -> 50,
   planner_min_channel_sats 500k -> 1M, enable_dynamic_htlcmax False -> True
   (Config AND ConfigSnapshot declared defaults stay consistent).
 - Unknown-override startup warning (with '_' internal-marker exemption).
@@ -22,12 +22,10 @@ ECON_FLAGS = (
     "econ_shadow_enabled",
     "econ_governor_rebalance_enabled",
     "econ_governor_planner_enabled",
-    "econ_governor_boltz_enabled",
     "econ_governor_fees_enabled",
     "econ_arbiter_enabled",
     "econ_cycle_rebalance_enabled",
     "econ_cycle_planner_enabled",
-    "econ_cycle_boltz_enabled",
     "econ_ev_populated",
     "econ_conflict_rules_extended",
 )
@@ -98,7 +96,6 @@ class TestDefaultFlips:
         assert cfg.weekly_budget_sats == 35000
         assert cfg.planner_max_channel_sats == 10_000_000
         assert cfg.planner_enabled is False
-        assert cfg.boltz_auto_cycle_enabled is False
 
     def test_new_min_fee_default_within_declared_range(self):
         from modules.config import CONFIG_FIELD_RANGES
@@ -231,20 +228,6 @@ class TestPlannerChannelBandCrossField:
 # ---------------------------------------------------------------------------
 
 class TestSetTimeShadowedGateWarnings:
-    def test_structural_budget_warns_when_boltz_cycle_off(self):
-        cfg = Config()
-        assert cfg.boltz_auto_cycle_enabled is False
-        result = cfg.update_runtime(
-            _mock_db(), "boltz_structural_budget_sats_per_day", "5000")
-        assert result.get("status") == "success"
-        assert "boltz_auto_cycle_enabled" in result.get("warning", "")
-
-    def test_structural_budget_no_warning_when_gate_on(self):
-        cfg = Config(boltz_auto_cycle_enabled=True)
-        result = cfg.update_runtime(
-            _mock_db(), "boltz_structural_budget_sats_per_day", "5000")
-        assert result.get("status") == "success"
-        assert "warning" not in result
 
     @pytest.mark.parametrize("key", ["planner_max_opens_per_cycle",
                                      "planner_max_closes_per_cycle"])
@@ -271,12 +254,6 @@ class TestSetTimeShadowedGateWarnings:
         assert result.get("status") == "success"
         assert "growth_budget_enabled" in result.get("warning", "")
 
-    def test_boot_detection_covers_new_gates(self):
-        _, warnings = _load(
-            {"boltz_structural_budget_sats_per_day": "5000"})
-        assert _matching(warnings, "Shadowed",
-                         "boltz_structural_budget_sats_per_day",
-                         "boltz_auto_cycle_enabled")
 
 
 # ---------------------------------------------------------------------------

@@ -63,10 +63,3 @@ class TestRecycleInCycle:
         result = planner.execute_cycle(cfg)
         assert result["portfolio_state"] == "blocked"
         assert result["opens"] == []
-
-    def test_preferred_loop_out_in_coordination(self):
-        """Boltz coordination includes preferred_loop_out fields."""
-        planner = _make_planner()
-        coord = planner.get_boltz_coordination()
-        assert "preferred_loop_out_scid" in coord
-        assert "preferred_loop_out_reason" in coord

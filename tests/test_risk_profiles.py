@@ -218,7 +218,7 @@ def test_no_profile_name_conditionals_in_policies():
     import pathlib
     repo = pathlib.Path(__file__).resolve().parent.parent
     for module in ("fee_controller", "rebalance_engine_v2",
-                   "capacity_planner", "boltz_manager",
+                   "capacity_planner",
                    "admission_policy", "protection_service"):
         source = (repo / "modules" / f"{module}.py").read_text()
         assert "risk_profile" not in source, \

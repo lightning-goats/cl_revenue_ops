@@ -12,8 +12,6 @@ this module also:
   demand-flow sink adjacency) with normalized cross-strategy scoring and pool-slot quotas;
 - gates a portfolio-balance governor (hard block on outbound opens above a local-liquidity
   ceiling, constrained allow-list below it) ahead of every discovery/execution pass;
-- coordinates with the Boltz auto-cycle (loser SCIDs to avoid loop-out through, on-chain
-  funding-deficit signal, preferred loop-out target) via `get_boltz_coordination`;
 - prices and reserves channel-close fees through a shared close-fee-gating subsystem
   (fixed cap or reserve-multiplier, optional CLN close feerange) rather than each close
   path deriving its own cap.
@@ -186,17 +184,11 @@ class CapacityPlanner:
         # live-arbitration registry slot on a TERMINAL outcome
         # (unknown-outcome HOLDS deliberately stay registered).
         self._governed_intent_completions: Dict[str, tuple] = {}
-        # Coordination signals: cached from last execute_cycle for Boltz integration
-        self._last_loser_scids: set = set()        # SCIDs with action=CLOSE
-        self._last_funding_deficit_sats: int = 0    # On-chain shortfall for next open
-        self._last_best_candidate: dict = {}        # Top candidate that needs funding
-        self._last_cycle_ts: int = 0
+        # Cached cycle state for planner diagnostics
         # Demand-flow classifier state (populated per cycle)
         self._demand_flow_profiles: Dict[str, Any] = {}
         self._demand_flow_sink_adjacent: set = set()
         # Capital recycling state
-        self._last_preferred_loop_out_scid: str | None = None
-        self._last_preferred_loop_out_reason: str = ""
         self._pending_recycle: dict | None = None
         # Per-cycle gossip cache (cleared at start of each execute_cycle)
         self._cycle_nodes_by_id: Dict[str, dict] = {}
@@ -227,20 +219,6 @@ class CapacityPlanner:
     def set_rebalancer(self, rebalancer) -> None:
         """Inject the rebalance engine used for diagnostic shocks."""
         self.rebalancer = rebalancer
-
-    def get_boltz_coordination(self) -> Dict[str, Any]:
-        """Return signals for Boltz planner coordination.
-
-        Called by the Boltz auto-cycle to avoid working against the capacity planner.
-        """
-        return {
-            "loser_scids": set(self._last_loser_scids),
-            "funding_deficit_sats": self._last_funding_deficit_sats,
-            "best_candidate": dict(self._last_best_candidate) if self._last_best_candidate else None,
-            "cycle_ts": self._last_cycle_ts,
-            "preferred_loop_out_scid": self._last_preferred_loop_out_scid,
-            "preferred_loop_out_reason": self._last_preferred_loop_out_reason,
-        }
 
     def get_status(self) -> Dict[str, Any]:
         """Return planner status for RPC query."""
@@ -388,7 +366,7 @@ class CapacityPlanner:
         dual-funded opens remain allowed: they are the REMEDY for being
         local-heavy (they drain local balance / bring inbound), not the
         disease. Candidate discovery also still runs when blocked so
-        recycle/Boltz coordination has candidates to work with.
+        recycle evaluation has candidates to work with.
         """
         total_local = 0
         total_capacity = 0
@@ -478,13 +456,6 @@ class CapacityPlanner:
         # closed channels without pricing whether the freed capital had
         # anywhere profitable to go.
         self._apply_redeployment_ev_demotion(losers, winners, cfg)
-
-        # Publish loser SCIDs for Boltz coordination (avoid loop-out through doomed channels)
-        self._last_loser_scids = {
-            l.get("scid") for l in losers
-            if l.get("action") == "CLOSE" and l.get("scid")
-        }
-        self._last_cycle_ts = int(time.time())
 
         # 4. Defibrillate stagnant losers (bounded; budget/capex enforced in rebalancer)
         defibrillations_this_cycle = 0
@@ -615,13 +586,9 @@ class CapacityPlanner:
         # 7. Discover and open channels (up to max_opens_per_cycle)
         candidates = []
         # Reset funding coordination before evaluating opens
-        self._last_funding_deficit_sats = 0
-        self._last_best_candidate = {}
-        self._last_preferred_loop_out_scid = None
-        self._last_preferred_loop_out_reason = ""
         if fee_ok:
             # F6c (audit): discovery always runs — even when blocked — so
-            # recycle/Boltz coordination receives candidates. Only open
+            # recycle diagnostics receive candidates. Only open
             # EXECUTION is restricted by the portfolio state (and even then,
             # sink-adjacent/dual-funded remedies stay allowed — F6a).
             candidates = self._discover_peers(winners, all_profitability, all_flow)
@@ -640,18 +607,6 @@ class CapacityPlanner:
             except Exception as e:
                 self.plugin.log(f"Cannot determine available funds: {e}", level='debug')
 
-            # Detect funding deficit: best candidate needs more than available
-            if candidates:
-                top = max(candidates, key=lambda c: c.get("score", 0))
-                min_open = getattr(cfg, 'planner_min_channel_sats', 500000)
-                if available_sats < min_open:
-                    self._last_funding_deficit_sats = max(0, min_open - available_sats)
-                    self._last_best_candidate = {
-                        "peer_id": top.get("peer_id"),
-                        "score": top.get("score"),
-                        "source": top.get("source"),
-                        "min_amount_sats": min_open,
-                    }
 
             # Exploration budget gate: check if budget can fund this cycle's opens
             exploration_budget_sats = 0
@@ -2160,13 +2115,6 @@ class CapacityPlanner:
                         "recycle_ev": ev,
                     }
 
-        if best_pair:
-            self._last_preferred_loop_out_scid = best_pair["loser"]["scid"]
-            self._last_preferred_loop_out_reason = (
-                f"Recycle target: EV={best_pair['recycle_ev']:.0f} sats, "
-                f"candidate={best_pair['candidate']['peer_id'][:12]}..."
-            )
-
         return best_pair
 
     def _score_candidate(self, peer_id: str, base_score: float) -> float:
@@ -2706,7 +2654,7 @@ class CapacityPlanner:
         """Read the LIVE unified budget for an atomic spend reservation.
 
         DD1 / P4-018: opens and closes must reserve their committed cost against
-        the SAME cross-category budget the rebalance/boltz paths use, so that
+        the SAME cross-category budget the other liquidity paths use, so that
         reserve_spend's BEGIN IMMEDIATE (serialized by the WAL single-writer
         lock) counts them against — and rejects them past — the unified total.
         Returns (effective_budget_sats, since_timestamp): effective_budget_sats
@@ -3302,7 +3250,7 @@ class CapacityPlanner:
         # Reserve budget (BEFORE the on-chain fundchannel RPC).
         # DD1 / P4-018: pass the LIVE unified budget so the atomic cross-category
         # rejection inside reserve_spend's BEGIN IMMEDIATE runs — a concurrent
-        # rebalance/boltz reserve and this open cannot jointly overshoot.
+        # concurrent liquidity reserve and this open cannot jointly overshoot.
         eff_budget, budget_since = self._unified_reserve_budget_params()
         # Wave2 F6: uuid suffix makes the id unique even when two opens to
         # the same peer land in the same second.
@@ -3520,8 +3468,7 @@ class CapacityPlanner:
         nomination. Returns a set, or None when the policy source failed
         (lazy-eval audit F1: get_all_policies returns a LIST — the old
         .items() iteration raised AttributeError into a bare except, so the
-        set was silently always empty and tagged peers were nominatable as
-        Boltz loop-out targets)."""
+        set was silently always empty and tagged peers were nominatable)."""
         if not self.policy_manager:
             return set()
         try:
@@ -4125,7 +4072,7 @@ class CapacityPlanner:
         # DD1 / P4-018: reserve the close fee against the LIVE unified budget
         # BEFORE the on-chain close RPC, passing effective_budget_sats so the
         # atomic cross-category rejection inside reserve_spend's BEGIN IMMEDIATE
-        # runs. A concurrent rebalance/boltz/open reserve and this close can then
+        # runs. A concurrent concurrent liquidity reserve and this close can then
         # never jointly overshoot the budget. Reserve-before-spend; settle the
         # actual cost on success; release on failure (no leak, no double-spend).
         close_reservation_id = f"planner-close-{channel_id}-{int(time.time())}"

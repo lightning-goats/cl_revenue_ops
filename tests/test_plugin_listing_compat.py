@@ -129,7 +129,6 @@ def test_plugin_listing_rpc_and_safe_default_contract():
         "revenue-planner-status",
     }.issubset(methods)
 
-    assert options["revenue-ops-boltz-enabled"]["default"] == "false"
     assert options["revenue-ops-planner-enabled"]["default"] == "false"
     assert options["revenue-ops-planner-execute-closes"]["default"] == "false"
     assert options["revenue-ops-fee-market-boundary-enabled"]["default"] == "false"

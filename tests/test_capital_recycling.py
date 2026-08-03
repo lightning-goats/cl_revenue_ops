@@ -112,22 +112,6 @@ class TestRecycleEV:
         assert ev < 5000
 
 
-class TestBoltzCoordination:
-
-    def test_preferred_loop_out_in_coordination(self):
-        planner = _make_planner()
-        planner._last_preferred_loop_out_scid = "200x1x0"
-        planner._last_preferred_loop_out_reason = "lowest marginal ROI"
-        coord = planner.get_boltz_coordination()
-        assert coord["preferred_loop_out_scid"] == "200x1x0"
-        assert coord["preferred_loop_out_reason"] == "lowest marginal ROI"
-
-    def test_no_preferred_loop_out_returns_none(self):
-        planner = _make_planner()
-        coord = planner.get_boltz_coordination()
-        assert coord["preferred_loop_out_scid"] is None
-
-
 class TestDualFundDetection:
 
     def test_dual_fund_params_passed_when_available(self):
@@ -267,7 +251,6 @@ class TestRecycleProtections:
         )
 
         assert plan is None
-        assert planner._last_preferred_loop_out_scid is None
 
     def test_unprotected_loser_still_nominated(self):
         planner, loser, candidate, all_prof, all_flow = self._setup(sourced_fee_sats=0)

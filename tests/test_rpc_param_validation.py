@@ -138,19 +138,9 @@ RPC_HANDLER_FUNCS = {
     "revenue_clear_reservations", "revenue_total_cost_budget",
     "revenue_capex_status", "revenue_spend_ledger", "revenue_spend_reserve",
     "revenue_spend_release", "revenue_spend_release_stale",
-    "revenue_spend_settle", "revenue_boltz_quote", "revenue_boltz_loop_out",
-    "revenue_boltz_loop_in", "revenue_boltz_status", "revenue_boltz_history",
-    "revenue_boltz_external_pay_ignores", "revenue_boltz_budget",
-    "revenue_boltz_wallet", "revenue_boltz_refund", "revenue_boltz_claim",
-    "revenue_boltz_chainswap", "revenue_boltz_withdraw", "revenue_boltz_deposit",
-    "revenue_boltz_backup", "revenue_boltz_backup_verify",
-    "revenue_boltz_balance_recommendations", "revenue_boltz_auto_cycle_status",
-    "revenue_boltz_auto_cycle_run_now", "revenue_boltz_balance_cycle",
-    "revenue_boltz_expansion_treasury_status",
-    "revenue_boltz_expansion_treasury_recommendations",
-    "revenue_boltz_expansion_treasury_cycle",
+    "revenue_spend_settle",
     # Phase C dispatchers (operator-surface reduction 2026-08-01).
-    "revenue_boltz", "revenue_cycle", "revenue_planner", "revenue_budget",
+    "revenue_cycle", "revenue_planner", "revenue_budget",
 }
 
 
@@ -160,7 +150,7 @@ def _setup_env(mod):
     mod.config = Config()
     for name in ("flow_analyzer", "fee_controller", "rebalancer", "database",
                  "profitability_analyzer", "capacity_planner", "safe_plugin",
-                 "data_service", "policy_manager", "boltz_manager",
+                 "data_service", "policy_manager",
                  "capex_engine", "hive_hints"):
         if hasattr(mod, name):
             setattr(mod, name, MagicMock())
@@ -176,9 +166,8 @@ def test_handler_discovery_covers_full_surface(mod):
     found = {s[0] for s in specs}
     missing = RPC_HANDLER_FUNCS - found
     assert not missing, f"handlers not discovered: {sorted(missing)}"
-    # 61 handlers is the current full surface (57 + the 4 Phase C
-    # dispatchers added 2026-08-01).
-    assert len(found) == len(RPC_HANDLER_FUNCS) == 61
+    # 38 handlers is the retained post-Boltz surface.
+    assert len(found) == len(RPC_HANDLER_FUNCS) == 38
 
 
 def test_param_matrix_no_leaks(mod):

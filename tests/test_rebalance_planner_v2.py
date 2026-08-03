@@ -640,33 +640,6 @@ class TestSizeTieredPlannerSizingAndScoring:
     each channel's OWN per-channel band, not the planner's flat
     self.target_band_low/high scalars -- coherent with classification."""
 
-    def test_drain_demand_excess_uses_source_own_band_not_flat(self):
-        """A big over-local channel with no over-remote partner publishes its
-        residual via DrainDemand. Its excess_sats must be measured against
-        ITS OWN target_band_high (0.80), not the planner's flat 0.65 --
-        giving a smaller excess than the old flat-band math would."""
-        planner = RebalancePlanner(target_band_low=0.35, target_band_high=0.65)
-
-        big = _ch(
-            channel_id="big",
-            peer_id="02" + "aa" * 32,
-            capacity_sats=20_000_000,
-            local_ratio=0.85,
-            value_class="active",
-            target_band_low=0.20,
-            target_band_high=0.80,
-        )
-        snap = _snap(big)
-
-        result = planner.plan(snap)
-
-        assert len(result.selected) == 0
-        assert result.drain_demand.total_excess_sats > 0
-        entry = result.drain_demand.entries[0]
-        assert entry.channel_id == "big"
-        # Correct (own band 0.80): (0.85 - 0.80) * 20_000_000 = 1_000_000.
-        # Old flat-band bug (0.65): (0.85 - 0.65) * 20_000_000 = 4_000_000.
-        assert entry.excess_sats == 1_000_000
 
     def test_pair_amount_uses_source_own_high_and_dest_own_low(self):
         """A big source/dest pair whose per-channel bands are wider than the

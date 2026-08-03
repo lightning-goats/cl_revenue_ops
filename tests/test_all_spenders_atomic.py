@@ -97,7 +97,6 @@ _CALLEE_MARKERS = {
     "reserve_spend": "reserve_spend",                  # generic ledger atomic reserve
     "reserve_budget": "reserve_budget",                # rebalance atomic reserve
     "execute_candidate": "execute_candidate",          # rebalance execution dispatch
-    "_open_swap_budget_reservation": "boltz_swap_reserve",  # boltz atomic pre-create reserve
     "_rpc_fundchannel": "fundchannel_rpc",             # planner channel-open wrapper call
     "fund_channel": "fund_channel",                    # data_service fundchannel wrapper
     "_rpc_close": "close_rpc",                          # planner channel-close wrapper call
@@ -310,61 +309,6 @@ ALLOWLIST = {
         "recorded before the reservation is marked spent (P4-025); manual/explicit "
         "callers pass False and own their own accounting (operator-only).",
     ),
-    # --- Daemon spender 2/6: boltz auto-cycle (T6) --------------------------
-    ("capex_budget.py", "reserve_boltz_swap_budget", "reserve_spend"): (
-        ATOMIC_RESERVE, 1,
-        "Boltz swap pre-create reserve (T6 auto-cycle + manual), category='boltz', "
-        "effective_budget passed -> atomic cross-category rejection (P4-014/DD1). "
-        "Reached from every boltz swap-create path incl. chainswap (P4-023).",
-    ),
-    # boltz atomic pre-create reserves (loop_in / loop_out / chainswap) -------
-    ("boltz_manager.py", "loop_in", "boltz_swap_reserve"): (
-        ATOMIC_RESERVE, 1,
-        "loop_in (createswap) reserves the swap fee atomically via "
-        "_open_swap_budget_reservation BEFORE creation (P4-014/DD1).",
-    ),
-    ("boltz_manager.py", "_loop_out_locked", "boltz_swap_reserve"): (
-        ATOMIC_RESERVE, 1,
-        "loop_out (createreverseswap) reserves the swap fee atomically via "
-        "_open_swap_budget_reservation BEFORE creation (P4-014/DD1).",
-    ),
-    ("boltz_manager.py", "chainswap", "boltz_swap_reserve"): (
-        ATOMIC_RESERVE, 1,
-        "chainswap (createchainswap) NEW atomic pre-create reserve via "
-        "_open_swap_budget_reservation BEFORE createchainswap; rejects the swap "
-        "when the unified budget would be exceeded (P4-023/DD1).",
-    ),
-    # boltz swap-create argv lists (the committing CLI action) ----------------
-    ("boltz_manager.py", "loop_in", "boltz_swap_create"): (
-        RAIL_COUNTED_COST, 1,
-        "boltzcli 'createswap' (submarine/loop-in). Reserved atomically by "
-        "_open_swap_budget_reservation BEFORE creation (P4-014), settled "
-        "loud/retry (P4-019); the CLI call itself commits the reserved cost.",
-    ),
-    ("boltz_manager.py", "_loop_out_locked", "boltz_swap_create"): (
-        RAIL_COUNTED_COST, 1,
-        "boltzcli 'createreverseswap --external-pay' (loop-out). Reserved "
-        "atomically (P4-014), settled loud/retry (P4-019).",
-    ),
-    ("boltz_manager.py", "_build_args", "boltz_swap_create"): (
-        RAIL_COUNTED_COST, 1,
-        "Nested arg-builder for 'createreverseswap' inside _loop_out_locked; same "
-        "boltz reserve/settle rail (P4-014/P4-019).",
-    ),
-    ("boltz_manager.py", "chainswap", "boltz_swap_create"): (
-        RAIL_COUNTED_COST, 1,
-        "boltzcli 'createchainswap' (the 6th swap-create). Now reserved "
-        "atomically by _open_swap_budget_reservation BEFORE creation and settled "
-        "loud/retry on the boltz rail (P4-023/DD1).",
-    ),
-    # boltz loop-out first-hop invoice payment (rail-counted) -----------------
-    ("boltz_manager.py", "_pay_invoice_via_first_hop", "rpc_pay"): (
-        RAIL_COUNTED_COST, 1,
-        "rpc.call('pay') fallback that settles the reverse-swap invoice inside "
-        "_loop_out_locked. The swap fee is reserved atomically by "
-        "_open_swap_budget_reservation BEFORE the swap is created (P4-014); this "
-        "pay commits the reserved cost.",
-    ),
     # --- Daemon spender 3/6: capacity-planner channel OPEN (T7) -------------
     ("capacity_planner.py", "_execute_open", "reserve_spend"): (
         ATOMIC_RESERVE, 1,
@@ -425,12 +369,6 @@ ALLOWLIST = {
         NOT_A_SPEND, 1,
         "DataService RPC transport (rpc.call('close')). Reached only via the planner "
         "close path, which reserves atomically first (P4-018).",
-    ),
-    ("data_service.py", "pay", "rpc_pay"): (
-        NOT_A_SPEND, 1,
-        "DataService RPC transport (rpc.call('pay')). Only production caller is the "
-        "boltz loop-out first-hop pay, whose swap fee is reserved atomically on the "
-        "boltz rail first (P4-014).",
     ),
     # --- Attribute-style money RPC dispatch (rpc.<method>(...), P4-026) -----
     ("data_service.py", "send_pay", "rpc_attr_sendpay"): (
@@ -522,23 +460,17 @@ def _guard_failures(extra_sources=None):
 # ---------------------------------------------------------------------------
 # Guard tests.
 # ---------------------------------------------------------------------------
-def test_scanner_finds_the_known_six_daemon_spenders():
-    """Sanity guard for the scanner itself: the six known autonomous daemon
-    spenders (and the operator RPC reserve) must all be seen, including the
-    chainswap atomic reserve + createchainswap surfaced in pass 4 and the
-    attribute-dispatch sendpay surfaced by P4-026."""
+def test_scanner_finds_the_retained_daemon_spenders():
+    """Sanity guard for retained autonomous spenders and the operator reserve."""
     sites = collect_spend_sites()
     required = {
         ("rebalancer.py", "execute_rebalance", "reserve_budget"),                 # rebalance auto
         ("rebalance_engine_v2.py", "_reserve_execution_budget", "reserve_budget"),  # engine/defib reserve
         ("rebalancer.py", "_execute_candidate_v2", "execute_candidate"),          # defibrillation dispatch
-        ("capex_budget.py", "reserve_boltz_swap_budget", "reserve_spend"),        # boltz
         ("capacity_planner.py", "_execute_open", "reserve_spend"),                # capex open
         ("capacity_planner.py", "_execute_close", "reserve_spend"),               # capex close
         ("cl-revenue-ops.py", "revenue_spend_reserve", "reserve_spend"),          # operator RPC
-        # pass-4 surfaced sites:
-        ("boltz_manager.py", "chainswap", "boltz_swap_create"),                   # createchainswap
-        ("boltz_manager.py", "chainswap", "boltz_swap_reserve"),                  # chainswap atomic reserve
+        # dynamic native executor site:
         ("rebalance_native_executor_v2.py", "_rpc_call", _DYNAMIC_METHOD_MARKER),  # computed sendpay
         # P4-026 surfaced site (pyln attribute dispatch):
         ("data_service.py", "send_pay", "rpc_attr_sendpay"),                      # self._plugin.rpc.sendpay

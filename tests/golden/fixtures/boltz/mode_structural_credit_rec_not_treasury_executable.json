@@ -1,8 +1,0 @@
-{
-  "balance_candidate_count": 1,
-  "mode": "balance",
-  "reason": "onchain_reserve_healthy_use_balance_mode",
-  "reserve_deficit_sats": 400000,
-  "treasury_candidate_count": 1,
-  "treasury_executable_count": 0
-}

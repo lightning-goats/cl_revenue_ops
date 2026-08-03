@@ -331,19 +331,6 @@ class DataService:
         """Delete an invoice."""
         return self._plugin.rpc.delinvoice(label, status)
 
-    def pay(self, bolt11: str, **kwargs) -> Dict:
-        """Pay a bolt11 invoice."""
-        params = {"bolt11": bolt11, **kwargs}
-        return self._plugin.rpc.call("pay", params)
-
-    def list_pays(self, **kwargs) -> Dict:
-        """List payment attempts."""
-        return self._plugin.rpc.call("listpays", kwargs if kwargs else {})
-
-    def decode(self, string: str) -> Dict:
-        """Decode a bolt11/bolt12 invoice or rune."""
-        return self._plugin.rpc.call("decode", {"string": string})
-
     # --- Bookkeeper ---
 
     def bkpr_inspect(self, account: str) -> Dict:

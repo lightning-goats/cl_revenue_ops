@@ -28,21 +28,8 @@ EXPECTED_RPC_METHODS = frozenset({
     "revenue-total-cost-budget", "revenue-capex-status",
     "revenue-spend-ledger", "revenue-spend-reserve", "revenue-spend-release",
     "revenue-spend-release-stale", "revenue-spend-settle",
-    "revenue-boltz-quote", "revenue-boltz-loop-out", "revenue-boltz-loop-in",
-    "revenue-boltz-status", "revenue-boltz-history",
-    "revenue-boltz-external-pay-ignores", "revenue-boltz-budget",
-    "revenue-boltz-wallet", "revenue-boltz-refund", "revenue-boltz-claim",
-    "revenue-boltz-chainswap", "revenue-boltz-withdraw",
-    "revenue-boltz-deposit", "revenue-boltz-backup",
-    "revenue-boltz-backup-verify", "revenue-boltz-balance-recommendations",
-    "revenue-boltz-auto-cycle-status", "revenue-boltz-auto-cycle-run-now",
-    "revenue-boltz-balance-cycle", "revenue-boltz-expansion-treasury-status",
-    "revenue-boltz-expansion-treasury-recommendations",
-    "revenue-boltz-expansion-treasury-cycle",
-    # Phase C dispatchers (operator-surface reduction 2026-08-01): the new
-    # primary names; every merged old name above keeps working as a
-    # deprecated alias until 2026-09-05.
-    "revenue-boltz", "revenue-cycle", "revenue-planner", "revenue-budget",
+    # Retained Phase C dispatchers.
+    "revenue-cycle", "revenue-planner", "revenue-budget",
 })
 
 
@@ -62,13 +49,5 @@ def test_rpc_surface_matches():
 
 
 def test_expected_count():
-    # 64 at baseline 5e8f747; + econ-shadow diagnostics (no compat
-    # promise yet): revenue-econ-snapshot (Phase 1), revenue-econ-
-    # reconcile (Phase 2B), revenue-econ-cycle (Workstream H shadow),
-    # revenue-profile-preview (PR 8, read-only risk-profile diff), and
-    # revenue-fee-authority-status (Python fee-authority handoff status);
-    # + the 4 Phase C dispatchers (2026-08-01 operator-surface reduction:
-    # revenue-boltz, revenue-cycle, revenue-planner, revenue-budget). The
-    # merged old names remain registered as deprecated aliases until
-    # 2026-09-05.
-    assert len(EXPECTED_RPC_METHODS) == 69
+    # Post-Boltz retained RPC surface.
+    assert len(EXPECTED_RPC_METHODS) == 46

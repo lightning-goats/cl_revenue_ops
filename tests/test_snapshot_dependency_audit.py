@@ -19,7 +19,6 @@ MODULES = {
     "fee": "modules/fee_controller.py",
     "rebalance": "modules/rebalance_engine_v2.py",
     "planner": "modules/capacity_planner.py",
-    "boltz": "modules/boltz_manager.py",
     "admission": "modules/admission_policy.py",
     "protection": "modules/protection_service.py",
     "profitability": "modules/profitability_analyzer.py",
@@ -78,11 +77,7 @@ PINNED_COUNTS = {
     # docs/refactor/phase0/snapshot-dependency-audit.md.
     ("planner", "live_rpc"): 22,
     ("planner", "database"): 11,
-    ("planner", "wall_clock"): 11,
-    ("boltz", "analyzer_cache"): 0,
-    ("boltz", "live_rpc"): 7,
-    ("boltz", "database"): 0,
-    ("boltz", "wall_clock"): 5,
+    ("planner", "wall_clock"): 10,
     ("admission", "analyzer_cache"): 0,
     ("admission", "live_rpc"): 0,
     ("admission", "database"): 0,
@@ -98,7 +93,7 @@ PINNED_COUNTS = {
     ("treasury", "analyzer_cache"): 0,
     ("treasury", "live_rpc"): 0,
     ("treasury", "database"): 4,
-    ("treasury", "wall_clock"): 1,
+    ("treasury", "wall_clock"): 0,
 }
 
 
@@ -146,9 +141,6 @@ def test_synthetic_snapshot_ids_still_present_until_migrated():
         # 3b DONE: planner threads real snapshot refs; synthetic label
         # survives only as the fail-open fallback.
         "modules/capacity_planner.py": 'or f"planner-cycle-',
-        # 3c DONE: Boltz threads real snapshot refs; synthetic label
-        # survives only as the fail-open fallback.
-        "modules/boltz_manager.py": 'or f"boltz-swap-',
     }
     for rel, marker in expected.items():
         assert marker in (REPO / rel).read_text(), (

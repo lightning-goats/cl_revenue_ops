@@ -300,17 +300,12 @@ class EVRebalancer:
         self._profitability_analyzer: Optional['ChannelProfitabilityAnalyzer'] = None
         self._capex_engine: Optional['CapexBudgetEngine'] = None
 
-        # Optional callback injected by cl-revenue-ops to report external liquidity
-        # costs (e.g. Boltz swap fees) for unified budget gating.
+        # Optional callback injected by cl-revenue-ops for unified budget gating.
         self.external_liquidity_cost_provider = None
         # Optional callback injected by cl-revenue-ops to provide unified total-cost budget limit.
         self.global_budget_limit_provider = None
 
         self._capacity_planner = None  # Set via set_capacity_planner()
-        # Exhaustion tracking: cached after each cycle for Boltz coordination
-        self._last_depleted_count: int = 0
-        self._last_profitable_count: int = 0
-        self._last_cycle_ts: int = 0
         self.rebalance_engine_v2 = None  # Injected by plugin init
 
         self._last_decision_summary: Dict[str, Any] = {
@@ -415,20 +410,6 @@ class EVRebalancer:
             if int(diagnostics.get(bucket, 0) or 0) > 0:
                 return bucket
         return "no_rebalance_candidates"
-
-    def get_boltz_coordination(self) -> Dict[str, Any]:
-        """Return rebalancer exhaustion state for Boltz integration.
-
-        When depleted channels exist but 0 profitable candidates were found,
-        the rebalancer is exhausted and Boltz should be more aggressive.
-        """
-        exhausted = (self._last_depleted_count > 0 and self._last_profitable_count == 0)
-        return {
-            "rebalancer_exhausted": exhausted,
-            "depleted_count": self._last_depleted_count,
-            "profitable_count": self._last_profitable_count,
-            "cycle_ts": self._last_cycle_ts,
-        }
 
 
     @staticmethod
@@ -694,10 +675,7 @@ class EVRebalancer:
         3. Delegates selection AND execution to RebalanceEngineV2
         """
         candidates = []
-        # Early-suppression paths (no slots / capital controls) deliberately
-        # do NOT report liquidity state: no engine snapshot exists on those
-        # paths. The NORMAL path derives exhaustion tracking from the
-        # engine cycle result below (see get_boltz_coordination).
+        # Early-suppression paths do not report liquidity state because no engine snapshot exists.
 
         # Initialize ephemeral fee cache for this run (cleared at end)
         with self._cache_lock:  # P2-005
@@ -789,24 +767,6 @@ class EVRebalancer:
                 return []
 
             cycle_result = engine.run_cycle()
-
-            # Exhaustion tracking for get_boltz_coordination(): the original
-            # writers were removed with the v1 engine, leaving the signal
-            # permanently "not exhausted". Derive it from the v2 cycle:
-            # depleted = channels under their target band, profitable = pairs
-            # the planner selected as executable.
-            try:
-                snapshot = getattr(cycle_result, "snapshot", None)
-                if snapshot is not None:
-                    self._last_depleted_count = sum(
-                        1 for ch in getattr(snapshot, "channels", ())
-                        if float(getattr(ch, "local_ratio", 1.0) or 0.0)
-                        < float(getattr(ch, "target_band_low", 0.35) or 0.0)
-                    )
-                self._last_profitable_count = len(cycle_result.candidates or [])
-                self._last_cycle_ts = int(time.time())
-            except Exception:
-                pass
 
             executed = len(cycle_result.executions)
             succeeded = sum(1 for e in cycle_result.executions if e.success)
@@ -1413,7 +1373,7 @@ class EVRebalancer:
 
                 # P4-016: pass the FULL unified budget to reserve_budget; the
                 # atomic BEGIN IMMEDIATE already SUMs the non-rebalance categories
-                # (generic spend_events + spend_reservations, incl. boltz and
+                # (generic spend_events + spend_reservations, incl. historical external costs and
                 # settled open/close) exactly once. Pre-subtracting them here via
                 # the external provider double-counted them and starved the
                 # rebalance budget. ext_spent/ext_reserved are kept for the
@@ -2127,7 +2087,7 @@ class EVRebalancer:
             ext_costs = self._get_external_liquidity_costs()
             ext_spent = int(ext_costs.get("spent_24h_sats", 0) or 0)
             ext_reserved = int(ext_costs.get("reserved_24h_sats", 0) or 0)
-            # Gate on actual spending only — each subsystem (Boltz, rebalancer)
+            # Gate on actual spending only — the rebalancer
             # enforces its own reservation limits independently.
             total_actual_spent = fees_spent_24h + ext_spent
             if total_actual_spent >= effective_budget:
@@ -2151,8 +2111,7 @@ class EVRebalancer:
 
             weekly_fees_spent = self.database.get_total_rebalance_fees(now - 7 * 86400)
             # Use daily external spend as-is for the weekly check rather than
-            # multiplying by 7 (which grossly overestimates after a single
-            # large Boltz swap).  The weekly rebalance fees already cover 7
+            # multiplying by 7 (which grossly overestimates after a single large external cost).  The weekly rebalance fees already cover 7
             # days; adding one day of external costs is conservative enough.
             weekly_total_spent = weekly_fees_spent + ext_spent
             if weekly_total_spent >= effective_weekly:

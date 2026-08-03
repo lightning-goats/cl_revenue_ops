@@ -1,6 +1,6 @@
 """PR 9 (gap-closure Phase F): conformance-corpus integrity.
 
-- 38 retained scenario classes exist and every payload validates against the
+- 35 retained scenario classes exist and every payload validates against the
   schemas via the STANDALONE validator (no plugin imports there);
 - regenerating the corpus is byte-identical (the generator is
   deterministic — drift means the reference behavior changed and must
@@ -24,7 +24,7 @@ COVERAGE = REPO / "docs" / "refactor" / "phase0" / "conformance-coverage.md"
 
 def test_retained_scenario_classes_present():
     dirs = sorted(d.name for d in SCENARIOS.iterdir() if d.is_dir())
-    assert len(dirs) == 38
+    assert len(dirs) == 35
     assert dirs[0].startswith("01-") and dirs[-1].startswith("40-")
 
 

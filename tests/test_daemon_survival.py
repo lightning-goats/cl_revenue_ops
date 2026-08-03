@@ -18,7 +18,6 @@ The 7 daemon loops started as threads in ``cl-revenue-ops.py`` (see the
     startup-snapshot   -> snapshot_peers_delayed   (ONE-SHOT, no while loop)
     financial-snapshot -> financial_snapshot_loop  (inverted: sleep-tail is at
                                                     the TOP of the while body)
-    boltz-auto-cycle   -> boltz_auto_cycle_loop
     capacity-planner   -> capacity_planner_loop
 
 Testing strategy
@@ -85,7 +84,6 @@ LOOP_SPECS = {
     "flow_analysis_loop":     {"thread": "flow-analysis",      "work": "run_flow_analysis",         "has_while": True},
     "fee_adjustment_loop":    {"thread": "fee-adjustment",     "work": "run_fee_adjustment",        "has_while": True},
     "rebalance_check_loop":   {"thread": "rebalance-check",    "work": "run_rebalance_check",       "has_while": True},
-    "boltz_auto_cycle_loop":  {"thread": "boltz-auto-cycle",   "work": "_run_boltz_auto_cycle_once","has_while": True},
     "capacity_planner_loop":  {"thread": "capacity-planner",   "work": ("capacity_planner", "execute_cycle"), "has_while": True},
     "financial_snapshot_loop":{"thread": "financial-snapshot", "work": "_take_financial_snapshot",  "has_while": True},
     "snapshot_peers_delayed": {"thread": "startup-snapshot",   "work": "_snapshot_peers_once",      "has_while": False},
@@ -205,7 +203,6 @@ def _build_namespace(event, work_name, work_callable, randint_mock):
     config.planner_enabled = True
     config.planner_interval = 600
     config.flow_window_days = 7
-    config.boltz_auto_cycle_enabled = True
     config.boltz_auto_cycle_startup_delay_seconds = 0
     config.boltz_auto_cycle_interval_minutes = 15
     config.snapshot.return_value = types.SimpleNamespace(

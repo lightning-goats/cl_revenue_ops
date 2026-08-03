@@ -357,44 +357,10 @@ class TestEngineTerminalCompletion:
 
 
 # ---------------------------------------------------------------------------
-# Defect 1 (caller side) — contract / planner / boltz terminal hooks
+# Defect 1 (caller side) — contract and planner terminal hooks
 # ---------------------------------------------------------------------------
 PEER = "02" + "b" * 64
 
-
-class TestBoltzTerminalCompletion:
-    def _manager(self, registry):
-        from modules.boltz_manager import BoltzCliConfig, BoltzCliManager
-        cfg = MagicMock(spec=BoltzCliConfig)
-        cfg.enforce_budget = True
-        manager = BoltzCliManager(MagicMock(), MagicMock(), cfg)
-        capex = MagicMock()
-        capex.reserve_boltz_swap_budget.return_value = True
-        capex.release_boltz_swap_reservation.return_value = True
-        manager._capex_engine = capex
-        manager._get_global_budget_limit = lambda: {"budget_sats": 1000}
-        manager.econ_governor_enabled_provider = lambda: True
-        shadow = MagicMock()
-        shadow.ledger_for_reconciliation.return_value = None
-        shadow.arbitration_registry.return_value = registry
-        shadow.snapshot_ref.return_value = None
-        manager.econ_shadow = shadow
-        return manager
-
-    def test_release_frees_slot_for_retry(self):
-        registry = ActiveIntentRegistry()
-        manager = self._manager(registry)
-        rid = manager._open_swap_budget_reservation(
-            214, "111x222x0", intent_type="SWAP_OUT")
-        assert isinstance(rid, str)
-        assert registry.active_count(NOW) == 1
-        # Definite failure: finalize with no created swap -> release.
-        manager._finalize_swap_budget_reservation(
-            rid, None, 214, "111x222x0")
-        assert registry.active_count(NOW) == 0
-        rid2 = manager._open_swap_budget_reservation(
-            214, "111x222x0", intent_type="SWAP_OUT")
-        assert isinstance(rid2, str)
 
 
 class TestPlannerTerminalCompletion:
