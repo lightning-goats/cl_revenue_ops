@@ -231,3 +231,32 @@ def test_rebalance_cycle_dispatch_cannot_drop_authority_or_budget_flags():
     submit = submit[:submit.index(")\n            futures[future]")]
     assert "reserve_budget=True" in submit
     assert "account_costs=True" in submit
+
+
+def test_total_cost_reporting_does_not_release_reservations():
+    mod = load_plugin_module()
+    mod.plugin.log = MagicMock()
+    mod.config = SimpleNamespace(
+        daily_budget_sats=5000, reservation_timeout_hours=4,
+        growth_budget_enabled=False,
+    )
+    db = MagicMock()
+    db.get_spend_ledger_summary.return_value = {
+        "spent_24h_sats": 0, "reserved_24h_sats": 0,
+        "spent_by_category": {}, "reserved_by_category": {},
+        "event_count_by_category": {},
+        "active_reservation_count_by_category": {},
+    }
+    db.get_total_routing_revenue.return_value = 0
+    db.get_opening_costs_since.return_value = 0
+    db.get_closure_costs_since.return_value = 0
+    db.get_daily_rebalance_spend.return_value = {
+        "total_spent_sats": 0, "total_reserved_sats": 0,
+        "job_count": 0, "success_count": 0,
+    }
+    mod.database = db
+
+    result = mod._compute_total_cost_budget_status(24)
+
+    assert "error" not in result
+    db.cleanup_stale_spend_reservations.assert_not_called()

@@ -1,3 +1,7 @@
+# HISTORICAL CONTRACT - RETIRED IN VERSION 3.0.0
+
+This document records the removed implementation at its cited commit. The module, RPCs, options, threads, and execution authority described below are absent from the current plugin. It is not an operator guide.
+
 # Intent Contract: modules/capacity_planner.py
 
 Tier 1 — deep treatment. Authored 2026-06-12 from code at commit 9f8f219. Anchors refreshed

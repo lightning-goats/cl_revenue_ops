@@ -8,7 +8,8 @@ It owns local execution:
 
 - fee decisioning
 - rebalance decisioning/execution
-- planner/capex
+- rebalance budget allocation
+- revenue reporting
 - profitability analysis
 - budget enforcement
 
@@ -30,8 +31,7 @@ retired and fully removed in 2026-07 (see `docs/audit/HIVE_REMOVAL_PLAN.md`).
 Read:
 
 - `README.md`
-- `modules/lnplus_swaps.py`
-- rebalance engine / planner / capex / profitability modules
+- rebalance engine, capex budget, profitability, and reporting modules
 - existing revenue RPC tests
 
 ## Action RPC warning
@@ -40,7 +40,6 @@ The following are action/mutation RPCs and must not be called in read-only tests
 
 - `revenue-rebalance-cycle`
 - `revenue-fee-cycle`
-- `revenue-planner-execute`
 - `revenue-set-fee`
 - `revenue-rebalance`
 - `revenue-spend-reserve`
@@ -55,11 +54,7 @@ The following are action/mutation RPCs and must not be called in read-only tests
 - `revenue-clear-reservations`
 - `revenue-policy set`
 - `revenue-config set`
-- `revenue-lnplus-abandon`
-- `revenue-lnplus-breaker-clear`
-- `revenue-lnplus-backfill`
-- any Boltz action RPC
-- any CLN open/close/pay/withdraw RPC
+- any direct CLN mutation RPC; this plugin has no open, close, or withdraw caller
 
 ## Required tests
 

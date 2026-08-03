@@ -222,10 +222,10 @@ def build_trend_record(
                 ("routed_volume_sats",),
             ],
         ),
-        "planner_enabled": controls.get("planner_enabled"),
-        "planner_execute_closes": controls.get("planner_execute_closes"),
-        "planner_max_opens_per_cycle": controls.get("planner_max_opens_per_cycle"),
-        "planner_max_closes_per_cycle": controls.get("planner_max_closes_per_cycle"),
+        "paused": controls.get("paused"),
+        "daily_budget_sats": controls.get("daily_budget_sats"),
+        "weekly_budget_sats": controls.get("weekly_budget_sats"),
+        "risk_profile": controls.get("risk_profile"),
     }
 
 

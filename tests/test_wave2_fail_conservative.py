@@ -5,21 +5,10 @@ downstream code treated as confident data, and every default was permissive —
 one hiccup could loosen capital controls (bootstrap wallet raids, vanished
 hard-bleeder blocks, skipped portfolio governors, 45 ppm/day EV fantasies).
 
-Fix inventory covered here:
-  F1: profitability_analyzer — RPC failure never overwrites a good cache and
-      never masquerades as "node has no channels".
-  F2: capex_budget — bootstrap wallet-exploration requires a REAL zero-revenue
-      snapshot, never a data outage.
-  F3: capex_budget — unreadable wallet is not an empty wallet (no
-      reserve-deficit budget when listfunds fails).
-  F4: capacity_planner — portfolio governor and peer-exposure cap fail closed.
-  F5: capacity_planner — conservative EV bootstrap prior; no EV opens when
-      profitability data is unavailable.
-  F6: capacity_planner — execute_cycle single-flight + collision-proof
-      reservation ids.
-  F7: protection_service — confidence 0.0 is LOW confidence; LN+ contract
-      protection expires.
-  F8: flow_analysis — flow results keyed by normalized scid.
+Retained fix inventory covered here:
+  F1: profitability_analyzer preserves a good snapshot across RPC failure.
+  F2: capex_budget treats an unreadable wallet as unknown, not empty.
+  F3: flow_analysis keys results by normalized SCID.
 """
 
 import os

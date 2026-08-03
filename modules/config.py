@@ -77,29 +77,23 @@ PUBLIC_RUNTIME_KEYS = (
     # facade (same reserve_budget accounting, new authorization
     # boundary). Instant rollback by setting false. Default off.
     'econ_governor_rebalance_enabled',
-    # Refactor Phase 2E: planner open/close reservations gated by the
-    # governor facade (same reserve_spend accounting). Default off.
-    # governor facade. Default off.
     # Refactor Phase 2H: automated fee broadcasts gated by the governor
     # (paused/stale + audit trail; zero-cost, no reservation). Manual
     # revenue-set-fee stays operator-direct. Default off.
     'econ_governor_fees_enabled',
     # Refactor Phase 3F: live conflict arbitration at the governor
-    # (duplicate suppression + close-vs-rebalance). Default off.
+    # (duplicate suppression for retained intents). Default off.
     'econ_arbiter_enabled',
     # Workstream H cutover: the rebalance loop's execution list passes
     # through cycle intent generation + batch arbitration. Default off.
     'econ_cycle_rebalance_enabled',
-    # Workstream H cutover: planner close list passes through batch
-    # arbitration (dedup + selection-time conflict arming). Default off.
-    # through batch arbitration (dedup, ledgered). Default off.
     # PR 6 (gap-closure Phase E): populate real EV/confidence in intent
     # envelopes. CAUTION: flipping changes J3 batch-arbitration ORDER in
     # the cutover loops (EV sorts before target). Default off = zeros.
     'econ_ev_populated',
     # PR 10 (gap-closure Phase G): extra arbiter conflict rules —
-    # duplicate opens per peer, rebalance vs
-    # structural swap. Default off = the three original rules only.
+    # retained extended intent-conflict rules. Default off preserves the
+    # original arbitration set.
     'econ_conflict_rules_extended',
     # Phase 4 (Workstream I): global authority level — observe < fees <
     # liquidity < capital. Governed actions above the level are blocked
@@ -444,21 +438,17 @@ class Config:
     # Refactor Phase 2D: governor-gated rebalance reservations (see
     # docs/planning/2026-07-12-refactor-phase2-governed-rebalance.md).
     econ_governor_rebalance_enabled: bool = True
-    # Refactor Phase 2E: governor-gated planner open/close reservations.
     # Refactor Phase 2H: governor-gated automated fee broadcasts.
     econ_governor_fees_enabled: bool = True
     # Refactor Phase 3F: live governor-boundary arbitration.
     econ_arbiter_enabled: bool = True
     # Workstream H: cycle-arbitrated rebalance execution list.
     econ_cycle_rebalance_enabled: bool = True
-    # Workstream H: cycle-arbitrated planner close list.
     econ_ev_populated: bool = True
     econ_conflict_rules_extended: bool = True
     # Phase 4: global authority level (observe|fees|liquidity|capital).
     authority_level: str = "capital"
     risk_profile: str = "custom"
-    # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
-    
     # Flow analysis parameters
     flow_window_days: int = 7      # Days to analyze for flow calculation
     

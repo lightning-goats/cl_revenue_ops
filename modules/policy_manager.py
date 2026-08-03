@@ -832,15 +832,10 @@ class PolicyManager:
 
     def ban_peer(self, peer_id: str, reason: str = "") -> PeerPolicy:
         """
-        Operator ban: never open channels to this
-        peer. Implemented as passive strategy + disabled rebalancing (the
-        canonical 'unmanaged' state) plus the durable BANNED_TAG that the
-        planner open gate and the planner open gate enforces. Existing tags (e.g.
-        no_close) are preserved; any policy expiry is cleared — bans are
-        permanent until unban_peer.
-
-        Existing channels are NOT closed and in-flight swap obligations are
-        NOT abandoned: the ban only gates new capital commitments.
+        Operator ban implemented as passive fee strategy plus disabled
+        rebalancing and the durable BANNED_TAG. Existing tags such as no_close
+        are preserved and policy expiry is cleared, so the ban remains until
+        unban_peer. Existing channels are untouched.
         """
         self._validate_peer_id(peer_id)
         existing = self.get_policy(peer_id)

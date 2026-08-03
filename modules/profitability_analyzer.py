@@ -394,10 +394,9 @@ class ChannelProfitability:
         that sourced volume two years ago and nothing since decays to
         DORMANT instead of staying a protected gateway forever.
 
-        NOTE for consumers (capacity planner close-protection gate): this
-        is the honest signal for "is this channel CURRENTLY a gateway".
-        Prefer role_30d + sourced_fee_30d_msat over channel_role +
-        sourced_fee_contribution_msat for close/keep decisions.
+        NOTE for consumers: this is the honest signal for whether a channel
+        is currently a gateway. Prefer role_30d plus sourced_fee_30d_msat
+        over lifetime fields for reporting and manual keep decisions.
 
         Falls back to the lifetime channel_role when no 30d window was
         fetched (window_30d_available is False).

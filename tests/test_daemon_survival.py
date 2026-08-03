@@ -184,42 +184,24 @@ def _build_namespace(event, work_name, work_callable, randint_mock):
 
     # Collaborators.
     database = MagicMock()
-    database.get_planner_actions.return_value = []
     ns["database"] = database
     ns["policy_manager"] = MagicMock()
-    ns["capacity_planner"] = MagicMock()
-    ns["capacity_planner"].execute_cycle.return_value = {}
-    ns["hive_hints"] = MagicMock()
-    ns["hive_router"] = MagicMock()
-
-    boltz_manager = MagicMock()
-    boltz_manager.enabled = True
-    ns["boltz_manager"] = boltz_manager
-
     # config: real numeric attrs (MagicMock attrs break max()/int()).
     config = MagicMock()
-    config.planner_enabled = True
-    config.planner_interval = 600
     config.flow_window_days = 7
-    config.boltz_auto_cycle_startup_delay_seconds = 0
-    config.boltz_auto_cycle_interval_minutes = 15
     config.snapshot.return_value = types.SimpleNamespace(
         flow_interval=60,
         fee_interval=60,
         rebalance_interval=60,
-        planner_interval=600,
         flow_window_days=7,
     )
     ns["config"] = config
 
     # Helper functions closed over by the loops.
     for helper in (
-        "_refresh_fee_cycle_hive_inputs",
         "_refresh_dynamic_config",
-        "_boltz_auto_cycle_mark_state",
         "_take_financial_snapshot",
         "_snapshot_peers_once",
-        "_run_boltz_auto_cycle_once",
         "run_flow_analysis",
         "run_fee_adjustment",
         "run_rebalance_check",

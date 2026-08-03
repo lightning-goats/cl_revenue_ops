@@ -427,7 +427,7 @@ class TestProfitableCorpseClassification:
         """D2 (audit): structural hive signals must NOT rewrite the class.
         A corridor owner with underwater ROI is classified UNDERWATER —
         close protection is expressed downstream via explicit protection
-        reasons (capacity_planner), never by falsifying profitability."""
+        explicit downstream policy reasons, never by falsifying profitability."""
         analyzer = self._analyzer()
         mock_hints = MagicMock()
         mock_hints.is_hive_member.return_value = True
@@ -479,7 +479,7 @@ class TestD2FleetLossVisibility:
     """Operator decision D2: the UNDERWATER -> BREAK_EVEN reclassification
     for hive members / corridor owners / high-centrality peers hid real
     losses on fleet channels. Losses must be visible; close protection is
-    an explicit reason in capacity_planner, never a class rewrite."""
+    an explicit downstream policy reason, never a class rewrite."""
 
     def _analyzer_with_hints(self, is_member=False, centrality=0.0,
                              corridor_role=None):

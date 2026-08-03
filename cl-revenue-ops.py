@@ -60,6 +60,11 @@ from modules.econ_shadow import EconShadow
 # =============================================================================
 # PLUGIN VERSION
 # =============================================================================
+# v3.0.0: Retire unused liquidity executors (2026-08-03)
+#   - Removed the capacity lifecycle planner, automatic channel open/close, planner defibrillation,
+#     Boltz, and LN+ execution surfaces. Historical accounting rows remain readable.
+#   - Retained fee control, revenue reporting, profitability analysis, and
+#     budget-constrained automatic/manual circular rebalancing.
 # v2.17.1: Deep-audit fix release (2026-07-10)
 #   - Six-agent top-to-bottom audit (module clusters + live RPC/DB
 #     cross-validation) followed by two fix iterations and an adversarial
@@ -177,7 +182,7 @@ from modules.econ_shadow import EconShadow
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "2.19.0"
+PLUGIN_VERSION = "3.0.0"
 
 # Supply-chain / runtime version floors (Phase 3C).
 # These drive NON-FATAL startup probes: a version below floor logs a warning but
@@ -311,7 +316,7 @@ _LOOP_BACKOFF_SECONDS = 30
 # derived from its OWN interval: max(_LOOP_STALL_FLOOR_SECONDS,
 # _LOOP_STALL_INTERVAL_MULTIPLE * its_own_interval). This avoids false
 # positives for loops that legitimately run less than hourly (e.g. the
-# capacity-planner's default 24h cycle or the daily financial-snapshot).
+# daily financial-snapshot loop).
 # A one-shot loop (ticks exactly once, e.g. startup-snapshot) is never
 # considered stalled. _LOOP_STALL_SECONDS remains the fallback used to
 # derive a threshold (~3600s, matching the multiple below) for any loop
@@ -1312,9 +1317,8 @@ plugin.add_option(
     on_change=_on_rebalance_tuning_change,
 )
 
-# Upstream rebalancer patterns (flow-facts / EV / planner tuning). Consumed
-# by ChannelFlowFacts (activity + utilization knobs) and by the rebalance
-# engine EV / capacity planner (size-tiering knobs).
+# Rebalancer flow-fact and EV tuning used by ChannelFlowFacts and the
+# retained rebalance engine.
 plugin.add_option(
     name='revenue-ops-rebalance-activity-window-seconds',
     default='3600',
@@ -4089,10 +4093,9 @@ def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
 
 def _rpc_ban(plugin: Plugin, peer_id: str, reason: str = "operator", **kwargs) -> Dict[str, Any]:
     """
-    Ban a peer: the planner will never open channels to it, and fee/rebalance
-    management stops (passive strategy, rebalancing disabled).
+    Ban a peer: fee and rebalance management stops (passive strategy, rebalancing disabled).
 
-    Existing channels are NOT closed; the ban gates new capital commitments only.
+    Existing channels are not closed; the ban is a retained local policy gate.
 
     Usage: lightning-cli revenue-ban peer_id [reason]
     """
@@ -4112,8 +4115,7 @@ def _rpc_ban(plugin: Plugin, peer_id: str, reason: str = "operator", **kwargs) -
         "reason": reason,
         "tags": policy.tags,
         "message": (
-            "Peer banned: no channel opens or fee/rebalance "
-            "management. Existing channels are untouched."
+            "Peer banned from fee and rebalance management. Existing channels are untouched."
         ),
     }
 
@@ -5036,7 +5038,7 @@ _econ_cycle_seq = 0
 @plugin.method("revenue-econ-cycle")
 def revenue_econ_cycle(plugin: Plugin) -> Dict[str, Any]:
     """READ-ONLY Workstream H shadow cycle: one collection pass, pure
-    intent generation from planner candidates, BATCH arbitration under
+    intent generation from retained fee and rebalance evidence, BATCH arbitration under
     the J3 ladder. No execution authority — publishes and ledgers only.
     Requires econ_shadow_enabled. Internal diagnostic."""
     global _econ_cycle_seq
@@ -5558,7 +5560,7 @@ def _parse_msat(msat_val: Any) -> int:
 def _refresh_dynamic_config():
     """Read dynamic option values from CLN and update in-memory objects.
 
-    Called at the top of each planner cycle. CLN stores setconfig
+    Called by retained runtime cycles before reading dynamic options. CLN stores setconfig
     values persistently but pyln-client's plugin.options dict is only
     populated at init. This function bridges the gap.
     """
@@ -6930,15 +6932,6 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
     now = int(time.time())
     since = now - (wh * 3600)
 
-    # Best-effort cleanup for generic spend reservations (e.g. channel open
-    # reservations) so accepted actions that aren't explicitly settled do not block
-    # budget for an entire window. Keep timeout bounded and independent from window size.
-    try:
-        stale_hours = max(1, int(getattr(cfg, "reservation_timeout_hours", 4) or 4))
-        database.cleanup_stale_spend_reservations(max_age_seconds=stale_hours * 3600)
-    except Exception as exc:
-        plugin.log(f"cleanup_stale_spend_reservations failed: {exc}", level="debug")
-
     # Actual cost components (canonical data sources)
     rebalance = _rebalance_liquidity_cost_components(window_hours=wh)
     if database:
@@ -7060,13 +7053,9 @@ def _compute_total_cost_budget_status(wh: int) -> Dict[str, Any]:
 
 
 def _total_cost_budget_limit_provider() -> Dict[str, Any]:
-    # DD1 / P4-018: this provider feeds the GATING path of every autonomous
-    # spender (rebalance capital controls and the capacity-planner
-    # open/close + defibrillation gates via _check_unified_budget /
-    # _check_capital_controls). Gating callers must read the LIVE unified total,
-    # not the 30s telemetry memo — otherwise N gate checks in one window admit
-    # against the same stale snapshot (the P2-011 mechanism, uncovered on the
-    # planner path). force_fresh; the authoritative rail remains the atomic
+    # This provider feeds the retained rebalance gating path. Gating callers must
+    # read the live unified total, not the telemetry memo, so concurrent checks
+    # do not admit against the same stale snapshot. force_fresh; the authoritative rail remains the atomic
     # reserve, but the gate must not admit against a stale budget.
     status = _total_cost_budget_status(force_fresh=True)
     if "error" in status:

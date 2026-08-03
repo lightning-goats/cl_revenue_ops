@@ -12,8 +12,7 @@ Covers:
    serialized row is roughly half the mirrored size.
 2. Read compatibility: old rows (nested + flat) and ancient rows
    (flat only) still load; re-saving an old row drops the mirrors.
-3. External readers (flow_analysis, profitability_analyzer,
-   capacity_planner) work against BOTH formats.
+3. External readers (flow_analysis and profitability_analyzer) work against BOTH formats.
 """
 
 import json

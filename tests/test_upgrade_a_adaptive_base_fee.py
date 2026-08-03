@@ -122,7 +122,7 @@ def test_policy_adaptive_uses_legacy_base_fee(mock_plugin, mock_database):
 def test_explicit_override_beats_policy(mock_plugin, mock_database):
     """base_fee_msat_override on set_channel_fee is absolute — it
     should win over both the legacy fallback and the adaptive policy
-    so capacity_planner or manual callers can force a value."""
+    so explicit manual callers can force a value."""
     from modules.config import Config
     from modules.fee_controller import FeeController
 

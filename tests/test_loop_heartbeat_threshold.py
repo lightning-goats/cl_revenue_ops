@@ -82,13 +82,11 @@ def test_all_alive_true_when_only_long_interval_and_one_shot_loops_are_old():
     mod.profitability_analyzer = None
     mod.fee_controller = None
     mod.rebalancer = None
-    mod.capacity_planner = None
-    mod.boltz_manager = None
     mod.database = None
     mod._loop_heartbeats.clear()
     now_mono = time.monotonic()
-    # capacity-planner: 2.5h old, 24h interval -> alive
-    mod._loop_heartbeats["capacity-planner"] = {
+    # financial-snapshot: 2.5h old, 24h interval -> alive
+    mod._loop_heartbeats["financial-snapshot"] = {
         "last_tick_monotonic": now_mono - 9000,
         "last_tick_ts": int(time.time()) - 9000,
         "interval_seconds": 86400,
@@ -113,8 +111,6 @@ def test_all_alive_false_when_a_periodic_loop_genuinely_stalls():
     mod.profitability_analyzer = None
     mod.fee_controller = None
     mod.rebalancer = None
-    mod.capacity_planner = None
-    mod.boltz_manager = None
     mod.database = None
     mod._loop_heartbeats.clear()
     now_mono = time.monotonic()

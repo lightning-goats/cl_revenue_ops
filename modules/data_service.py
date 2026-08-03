@@ -10,7 +10,7 @@ Cache Tiers:
     LONG     — 5-10 minute TTL (listnodes, feerates)
     MEDIUM   — 30 second TTL (listpeerchannels, listfunds, listpeers)
     NEVER    — Transactional or shared mutable state, always live
-               (sendpay, fundchannel, setchannel, askrene-listlayers)
+               (sendpay, setchannel, askrene-listlayers)
 
 Thread-safe: uses threading.Lock for all cache operations.
 """

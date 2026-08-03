@@ -984,7 +984,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_budget_reservations_status ON budget_reservations(status, reserved_at)")
 
         # Generic spend reservations/events for unified total-cost budget gating.
-        # Used by actions outside the rebalance engine (e.g. channel open/close proposals)
+        # Preserved for generic and historical non-rebalance accounting
         # to reserve and optionally record spend against the same budget envelope.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS spend_reservations (
@@ -1312,7 +1312,7 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
-        # Capacity Planner tables
+        # Historical channel-planner tables retained for read-only audit compatibility
         conn.execute("""
             CREATE TABLE IF NOT EXISTS planner_candidates (
                 peer_id TEXT PRIMARY KEY,
@@ -1354,7 +1354,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_peer_time ON planner_actions(peer_id, created_at)")
         conn.execute("DROP INDEX IF EXISTS idx_planner_actions_peer")
 
-        # LN+ liquidity swap terms ledger (one row per swap we've touched)
+        # Historical LN+ liquidity swap terms ledger retained for read-only audit compatibility (one row per swap we've touched)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS lnplus_swaps (
                 swap_id TEXT PRIMARY KEY,
@@ -1388,15 +1388,14 @@ class Database:
             self.plugin.log("Added tag_added column to lnplus_swaps")
         except sqlite3.OperationalError:
             pass  # Column already exists
-        # Incoming-side contract protection (2026-07-08): the counterparty's
-        # channel to us is bound by the same LN+ agreement.
+        # Historical incoming-side contract marker retained for schema compatibility.
         try:
             conn.execute("ALTER TABLE lnplus_swaps ADD COLUMN incoming_tag_added INTEGER")
             self.plugin.log("Added incoming_tag_added column to lnplus_swaps")
         except sqlite3.OperationalError:
             pass  # Column already exists
 
-        # LN+ counterparty history
+        # Historical LN+ counterparty history retained for read-only audit compatibility
         conn.execute("""
             CREATE TABLE IF NOT EXISTS lnplus_peers (
                 pubkey TEXT PRIMARY KEY,
@@ -4371,7 +4370,7 @@ class Database:
                                 since_timestamp: int = 0) -> int:
         """Sum of spend_events sats for a category (optionally subcategory)."""
         conn = self._get_connection()
-        # Normalize identically to record_spend_event so "Boltz"/" boltz" match.
+        # Normalize identically to record_spend_event for historical category compatibility.
         cat = str(category or "").strip().lower()
         if subcategory is None:
             row = conn.execute(
@@ -4387,26 +4386,9 @@ class Database:
             ).fetchone()
         return int(row['total'])
 
-    # P4-021: categories whose reservation represents a COMMITTED on-chain spend
-    # (a channel open/close). These are settled explicitly
-    # (mark_spend_reservation_spent) or released on RPC failure by the planner —
-    # they must NEVER be blind-released by the stale timeout sweep.
-    # NOTE (2026-07-10 audit): actual open/close SPEND is counted on the
-    # unified rail from the canonical cost tables (channel_costs /
-    # channel_closure_costs via get_opening_costs_since /
-    # get_closure_costs_since) — which also captures closes performed
-    # OUTSIDE the plugin — while spend_events rows in these categories are
-    # EXCLUDED from the generic-ledger bucket
-    # (_normalize_generic_ledger_for_total_cost_budget) precisely to avoid
-    # double-counting. The RESERVATION half below still matters: while a
-    # planner open/close is in flight, only the reservation holds the
-    # committed fee against the budget, so if the settle's spend-event write
-    # persistently fails the reservation legitimately stays 'active';
-    # blind-releasing it would make that committed cost vanish in the
-    # overspend-permitting direction.
-    # Mirrors P4-015's protection of pending_settlement budget reservations.
-    # counts only via spend_events; the journal re-settle is not guaranteed
-    # within the 4h blind-sweep window, so the blind sweep must not release it.
+    # Historical open/close reservations represent potentially committed on-chain
+    # spend. They remain excluded from blind stale cleanup and require explicit
+    # operator reconciliation. No v3 runtime path creates or executes them.
     _COMMITTED_ONCHAIN_SPEND_CATEGORIES = ("channel_open", "channel_close")
 
     def cleanup_stale_spend_reservations(self, max_age_seconds: int = 86400, category: Optional[str] = None) -> int:

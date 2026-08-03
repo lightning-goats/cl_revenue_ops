@@ -15,8 +15,7 @@ refactor.md Workstream I these become facades over projections):
 Action/mutation RPCs (AGENTS.md list; execution-gated): see AGENTS.md
 "Action RPC warning".
 Classification per method: `docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md`
-(header refreshed 2026-07-09; body dated 2026-05-20 — refresh during
-Workstream I).
+(current v3 inventory, refreshed 2026-08-03).
 
 Full 39-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
 
@@ -32,9 +31,8 @@ overrides; precedence documented in README.md §revenue-config).
 - Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (37, listed below).
 - Immutable at runtime: `db_path`, `dry_run` (`IMMUTABLE_CONFIG_KEYS` —
   dry_run is immutable so enabling it cannot HIDE actions).
-- The refactor's Workstream I risk-profile work must preserve every
-  currently-accepted key until the deprecation window defined in
-  refactor.md Phase 5.
+- Version 3.0.0 intentionally removes the planner, Boltz, and LN+ option
+  families; retained keys remain governed by the compatibility policy.
 
 The full generated field table below is the baseline enumeration
 (regenerate with `dataclasses.fields(Config)` if it drifts; the
@@ -54,8 +52,9 @@ dataclass is normative).
 
 ## External obligations
 
-  when new-obligation creation is disabled (invariant 6)
-  across restart
+The v3 plugin creates no external swap or channel-lifecycle obligation.
+Historical planner and LN+ rows survive restart for audit compatibility but
+cannot schedule work or authorize action.
 
 ---
 
