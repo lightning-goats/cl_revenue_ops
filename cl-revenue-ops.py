@@ -55,7 +55,6 @@ from modules.boltz_manager import BoltzCliManager, BoltzCliConfig, BoltzCliError
 from modules.capex_budget import CapexBudgetEngine
 from modules.capital_efficiency import CapitalEfficiencyAnalyzer
 from modules.segment_observations import SegmentObservationStore
-from modules.lnplus_swaps import LNPlusClient, SwapEvaluator, SwapLifecycle
 from modules.utils import normalize_scid, parse_msat
 from modules.econ_shadow import EconShadow
 
@@ -159,12 +158,10 @@ from modules.econ_shadow import EconShadow
 #   - Durable through hint staleness via a DB-confirmed membership grace window
 #     (hive_zero_fee_stale_grace_seconds, default 7 days)
 #   - Adds mycelial corridor-flow utilization instrumentation (internal/edge/external)
-# v2.11.0: LN+ (lightningnetwork.plus) swap automation (2026-07-08)
 #   - Autonomous join-only liquidity-swap ring participation, scored against the
 #     capacity planner's own open-EV machinery with an inbound-liquidity credit
 #   - One swap in flight per node; one-strike circuit breaker; both-side no_close
 #     contract protection; intent-first ledger writes on every irreversible step
-#   - New revenue-lnplus-status/-breaker-clear/-abandon/-backfill operator RPCs
 # v2.10.0: Hive member zero-fee policy restoration
 #   - Restores confirmed hive-member channels to 0 ppm and 0 msat base fee
 #   - Keeps stale/malformed/missing hive hints neutral unless recent membership grace applies
@@ -1015,8 +1012,6 @@ safe_plugin: Optional['ThreadSafePluginProxy'] = None  # Thread-safe plugin wrap
 data_service = None  # Unified data service (DataService instance)
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 boltz_manager: Optional[BoltzCliManager] = None  # Boltz CLI integration (optional)
-lnplus_client = None  # LNPlusClient: LN+ API client (LN+ swap automation)
-lnplus_lifecycle = None  # SwapLifecycle: LN+ obligations watcher / state machine
 capex_engine: Optional[CapexBudgetEngine] = None  # Unified capex budget engine
 econ_shadow: Optional[EconShadow] = None  # Phase 1 shadow: observe-mode intents + snapshot preview (fail-open)
 _boltz_balance_last_action: Dict[str, int] = {}  # channel_id -> unix ts of last Boltz balance action
@@ -1875,79 +1870,6 @@ plugin.add_option(
     description='Allow the capacity planner to execute close RPCs (default: false)',
     dynamic=True
 )
-plugin.add_option(
-    name='revenue-ops-lnplus-swaps-enabled',
-    default='true',
-    description='Enable LN+ liquidity swap automation (default: true)',
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-lnplus-execute-applications',
-    default='true',
-    description='Allow live LN+ swap applications; false = recommendation-only (default: true)',
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-lnplus-swap-preference-margin',
-    default='0.2',
-    description='Regular open must beat swap EV by this fraction to win the slot (default: 0.2)',
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-lnplus-max-duration-months',
-    default='3',
-    description='Maximum LN+ swap contract duration in months (default: 3)',
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-lnplus-min-peer-positive-ratings',
-    default='5',
-    description='Minimum LN+ positive ratings for every non-fleet swap participant (default: 5)',
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-lnplus-min-peer-rank',
-    default='8',
-    description='Minimum LN+ rank (1-10, higher better; 8="Gold") for every non-fleet swap participant (default: 8)',
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-lnplus-max-participants',
-    default='4',
-    description='Maximum LN+ swap participant count (default: 4)',
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-lnplus-min-participants',
-    default='3',
-    description='Minimum LN+ swap participant count; among equal-EV qualifiers fewer participants win (default: 3)',
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-lnplus-apply-feerate-ceiling',
-    default='5000',
-    description='No LN+ applications when opening feerate exceeds this (perkw, default: 5000)',
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-lnplus-pending-timeout-days',
-    default='7',
-    description='Withdraw LN+ applications stuck pending beyond this (default: 7)',
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-lnplus-inbound-credit-factor',
-    default='0.5',
-    description='Damping on the inbound-liquidity EV credit for LN+ swaps (default: 0.5)',
-    dynamic=True
-)
-plugin.add_option(
-    name='revenue-ops-lnplus-watcher-interval',
-    default='3600',
-    description='LN+ obligations watcher interval in seconds (default: 3600)',
-    dynamic=True
-)
-
 def _on_rebalance_router_change(plugin_: Plugin, option_name: str, new_value: Any) -> None:
     """Validate + log a runtime rebalance-router flip triggered by setconfig.
 
@@ -2381,39 +2303,6 @@ def _run_boltz_auto_cycle_once(trigger: str = "manual", force: bool = False,
             _boltz_auto_cycle_run_lock.release()
 
 
-def _lnplus_ignore_peer(peer_id: str, reason: str) -> None:
-    """Stop cl-revenue-ops from managing a peer, reusing the same internal DB
-    path as the (deprecated) `revenue-ignore` RPC handler: set the peer's
-    policy to passive strategy with rebalancing disabled.
-
-    Called by SwapLifecycle when an LN+ swap participant must be excluded
-    from ordinary fee/rebalance management (spec gate: ignore-during-swap).
-    Best-effort — must never raise, since it runs inside the obligations
-    watcher where a raised exception would abort an in-flight state
-    transition.
-    """
-    try:
-        if policy_manager is None:
-            return
-        # set_policy REPLACES tags: merge with the existing set so durable
-        # operator tags (banned, no_close, protect) survive the ignore.
-        existing_tags = list(policy_manager.get_policy(peer_id).tags)
-        merged_tags = list(dict.fromkeys(
-            existing_tags + ["ignored", "lnplus-swap", str(reason or "lnplus-swap")]
-        ))
-        policy_manager.set_policy(
-            peer_id=peer_id,
-            strategy="passive",
-            rebalance_mode="disabled",
-            tags=merged_tags,
-        )
-    except Exception as e:
-        try:
-            plugin.log(f"LNPLUS: _lnplus_ignore_peer({peer_id}) failed: {e}", level="warn")
-        except Exception:
-            pass
-
-
 # =============================================================================
 # INITIALIZATION
 # =============================================================================
@@ -2428,7 +2317,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, boltz_manager, capex_engine, data_service, lnplus_client, lnplus_lifecycle, econ_shadow
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, capacity_planner, safe_plugin, policy_manager, boltz_manager, capex_engine, data_service, econ_shadow
     
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -2683,18 +2572,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             'revenue-ops-planner-min-annual-roi-pct',
             '1.0',
         ),
-        lnplus_swaps_enabled=options.get('revenue-ops-lnplus-swaps-enabled', 'true').lower() in ('true', '1', 'yes'),
-        lnplus_execute_applications=options.get('revenue-ops-lnplus-execute-applications', 'true').lower() in ('true', '1', 'yes'),
-        lnplus_swap_preference_margin=_safe_float_opt('revenue-ops-lnplus-swap-preference-margin', '0.2'),
-        lnplus_max_duration_months=_safe_int_opt('revenue-ops-lnplus-max-duration-months', '3'),
-        lnplus_min_peer_positive_ratings=_safe_int_opt('revenue-ops-lnplus-min-peer-positive-ratings', '5'),
-        lnplus_min_peer_rank=_safe_int_opt('revenue-ops-lnplus-min-peer-rank', '8'),
-        lnplus_max_participants=_safe_int_opt('revenue-ops-lnplus-max-participants', '4'),
-        lnplus_min_participants=_safe_int_opt('revenue-ops-lnplus-min-participants', '3'),
-        lnplus_apply_feerate_ceiling=_safe_int_opt('revenue-ops-lnplus-apply-feerate-ceiling', '5000'),
-        lnplus_pending_timeout_days=_safe_int_opt('revenue-ops-lnplus-pending-timeout-days', '7'),
-        lnplus_inbound_credit_factor=_safe_float_opt('revenue-ops-lnplus-inbound-credit-factor', '0.5'),
-        lnplus_watcher_interval=_safe_int_opt('revenue-ops-lnplus-watcher-interval', '3600'),
         rebalance_router='v3',
         askrene_layers=str(options.get('revenue-ops-askrene-layers', '') or '').strip() or 'standalone',
     )
@@ -3116,34 +2993,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if boltz_manager is not None:
         boltz_manager.set_capex_engine(capex_engine)
 
-    # LN+ liquidity swap automation.
-    # Constructed UNCONDITIONALLY (spec gate 12): lnplus_swaps_enabled=false only
-    # stops NEW applications (the evaluator checks it each cycle); the lifecycle
-    # watcher must keep honoring in-flight obligations even when disabled.
-    lnplus_client = LNPlusClient(safe_plugin, safe_plugin.rpc)
-    lnplus_lifecycle = SwapLifecycle(
-        safe_plugin, safe_plugin.rpc, database, config, lnplus_client,
-        policy_manager, ignore_peer_fn=_lnplus_ignore_peer,
-        estimate_open_cost_fn=(
-            capacity_planner._estimate_open_cost if capacity_planner is not None else None
-        ),
-        budget_params_fn=(
-            capacity_planner._unified_reserve_budget_params if capacity_planner is not None else None
-        ))
-    # Phase 2F: governor/ledger plumbing for LN+ swap-open reservations.
-    # Phase 3E: CLN-adapter routing for the swap-open flow.
-    try:
-        lnplus_lifecycle.econ_shadow = econ_shadow
-        lnplus_lifecycle.data_service = data_service
-    except Exception:
-        pass
-    if capacity_planner is not None:
-        capacity_planner.lnplus_evaluator = SwapEvaluator(
-            safe_plugin, safe_plugin.rpc, database, config, lnplus_client,
-            capacity_planner, lnplus_lifecycle,
-            policy_manager=policy_manager)
-    plugin.log("LN+ swap automation initialized")
-
     # Rebalance engine: unified actual-fee pipeline
     from modules.rebalance_engine_v2 import RebalanceEngine
     segment_observation_store = SegmentObservationStore()
@@ -3382,38 +3231,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
         _boltz_auto_cycle_mark_state(next_run_ts=None, running=False)
 
-    def lnplus_watcher_loop():
-        """Hourly LN+ obligations watcher (48h open deadlines cannot wait for the planner)."""
-        if lnplus_lifecycle is None:
-            return
-        if shutdown_event.wait(180):   # staggered startup
-            return
-        while not shutdown_event.is_set():
-            try:
-                configured_interval = int(getattr(config, 'lnplus_watcher_interval', 3600) or 3600)
-                interval = _clamp_lnplus_watcher_interval(configured_interval)
-                if interval != configured_interval:
-                    plugin.log(
-                        f"LNPLUS: watcher interval {configured_interval}s clamped to "
-                        f"{interval}s (bounds "
-                        f"{_LNPLUS_WATCHER_INTERVAL_MIN_SECONDS}-"
-                        f"{_LNPLUS_WATCHER_INTERVAL_MAX_SECONDS}s)", level='warn')
-                _record_loop_heartbeat("lnplus-watcher", interval_seconds=interval)
-                try:
-                    _refresh_dynamic_config()
-                    result = lnplus_lifecycle.run_watcher_once()
-                    if result:
-                        plugin.log(f"LNPLUS: watcher pass: {result}", level='debug')
-                except Exception as e:
-                    plugin.log(f"LNPLUS: watcher error: {e}", level='warn')
-                jitter = int(interval * 0.1)
-                if shutdown_event.wait(interval + random.randint(-jitter, jitter)):
-                    break
-            except Exception as e:
-                plugin.log(f"Unhandled error in lnplus-watcher loop: {e}", level='error')
-                if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
-                    break
-
     def capacity_planner_loop():
         """Background loop for automated capacity planning."""
         if not config.planner_enabled:
@@ -3615,7 +3432,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
     threading.Thread(target=boltz_auto_cycle_loop, daemon=True, name="boltz-auto-cycle").start()
     threading.Thread(target=capacity_planner_loop, daemon=True, name="capacity-planner").start()
-    threading.Thread(target=lnplus_watcher_loop, daemon=True, name="lnplus-watcher").start()
 
     plugin.log("cl-revenue-ops plugin initialized successfully!")
     return None
@@ -4738,78 +4554,6 @@ def revenue_planner_status(plugin: Plugin) -> Dict[str, Any]:
     """Deprecated alias for 'revenue-planner status' (removal 2026-09-05)."""
     return _deprecated_alias(_rpc_planner_status(plugin), "revenue-planner status")
 
-
-@plugin.method("revenue-lnplus-status")
-def revenue_lnplus_status(plugin: Plugin, **_unused: Any) -> Dict[str, Any]:
-    """LN+ swap automation status: breaker, in-flight, active contracts."""
-    if lnplus_lifecycle is None:
-        return {"enabled": False}
-    status = lnplus_lifecycle.get_status()
-    status["enabled"] = bool(getattr(config, "lnplus_swaps_enabled", False))
-    status["execute_applications"] = bool(getattr(config, "lnplus_execute_applications", False))
-    return status
-
-
-@plugin.method("revenue-lnplus-breaker-clear")
-def revenue_lnplus_breaker_clear(plugin: Plugin, **_unused: Any) -> Dict[str, Any]:
-    """Clear the LN+ circuit breaker (operator acknowledgment of the failure)."""
-    if lnplus_lifecycle is None:
-        return {"error": "LN+ automation not initialized"}
-    reason = lnplus_lifecycle.breaker_tripped()
-    if not reason:
-        return {"status": "not_tripped"}
-    lnplus_lifecycle.clear_breaker()
-    return {"status": "cleared", "was": reason}
-
-
-@plugin.method("revenue-lnplus-abandon")
-def revenue_lnplus_abandon(plugin: Plugin, swap_id: str = None, **_unused: Any) -> Dict[str, Any]:
-    """EMERGENCY: abandon an in-flight LN+ swap obligation (spec gate 12).
-
-    Marks the local row failed and trips the circuit breaker — abandoning a
-    commitment is a defection on our side and must never be silent.
-    """
-    if lnplus_lifecycle is None:
-        return {"error": "LN+ automation not initialized"}
-    if not swap_id or not isinstance(swap_id, str):
-        return {"error": "Usage: revenue-lnplus-abandon <swap_id>"}
-    row = database.lnplus_get_swap(swap_id)
-    if row is None:
-        return {"error": f"Unknown swap {swap_id}"}
-    if row["status"] not in ("applied", "opening", "opened"):
-        return {"error": f"Swap {swap_id} is not in flight (status {row['status']})"}
-    was_applied = row["status"] == "applied"
-    database.lnplus_update_swap(swap_id, status="failed",
-                                outcome="abandoned by operator")
-    lnplus_lifecycle.trip_breaker(f"operator abandoned swap {swap_id}")
-    # B5(a): an 'applied' row is still a LIVE application on LN+'s side —
-    # leaving it there would trip the breaker again next reconcile pass
-    # (pending ghost) forever. delete_application is only accepted by LN+
-    # while a swap is pending, so this is best-effort; a failure here is
-    # fine (the reconcile pending-ghost path retries it, see B5(b)).
-    if was_applied and lnplus_client is not None:
-        try:
-            lnplus_client.delete_application(swap_id)
-        except Exception as e:
-            plugin.log(
-                f"LNPLUS: delete_application failed for abandoned swap "
-                f"{swap_id} (best-effort): {e}", level="warn")
-    return {"status": "abandoned", "swap_id": swap_id,
-            "warning": "This defects on an LN+ commitment; expect a negative rating."}
-
-
-@plugin.method("revenue-lnplus-backfill")
-def revenue_lnplus_backfill(plugin: Plugin, **_unused: Any) -> Dict[str, Any]:
-    """Adopt pre-existing LN+ swaps into the local ledger.
-
-    Operator remedy for swaps applied/opened/settled manually on the LN+
-    website (before this automation existed, or afterward if the operator
-    deliberately did something manual). Safe to run repeatedly — existing
-    rows are never touched.
-    """
-    if lnplus_lifecycle is None:
-        return {"error": "LN+ automation not initialized"}
-    return lnplus_lifecycle.backfill_from_lnplus()
 
 
 def _rpc_planner_candidate_sources(plugin: Plugin):
@@ -6928,20 +6672,6 @@ def _parse_msat(msat_val: Any) -> int:
     return parse_msat(msat_val)
 
 
-_LNPLUS_WATCHER_INTERVAL_MIN_SECONDS = 300
-_LNPLUS_WATCHER_INTERVAL_MAX_SECONDS = 14400
-
-
-def _clamp_lnplus_watcher_interval(configured: int) -> int:
-    """B6(a): a watcher interval configured far too high (e.g. by a typo or
-    an over-eager operator) can otherwise starve a 48h open deadline of
-    retries. One pass per >=4h still gives >=12 retries inside a 48h
-    deadline, so clamp at that ceiling (and keep the existing >=300s floor
-    that already prevented hammering LN+)."""
-    return min(_LNPLUS_WATCHER_INTERVAL_MAX_SECONDS,
-               max(_LNPLUS_WATCHER_INTERVAL_MIN_SECONDS, int(configured)))
-
-
 def _refresh_dynamic_config():
     """Read dynamic option values from CLN and update in-memory objects.
 
@@ -6990,7 +6720,7 @@ def _refresh_dynamic_config():
                 pass
 
     if config:
-        # Same override-precedence rule as the lnplus loop below: an active
+        # Same override-precedence rule as other scoped loops: an active
         # revenue-config DB override wins over the listconfigs view. Without
         # this guard the refresh stomped a DB-overridden false back to true
         # every cycle on nexus-01 (lightningd's parsed config predated the
@@ -7013,18 +6743,6 @@ def _refresh_dynamic_config():
 
     if config:
         for _opt, _field, _cast in (
-            ("revenue-ops-lnplus-swaps-enabled", "lnplus_swaps_enabled", "bool"),
-            ("revenue-ops-lnplus-execute-applications", "lnplus_execute_applications", "bool"),
-            ("revenue-ops-lnplus-swap-preference-margin", "lnplus_swap_preference_margin", "float"),
-            ("revenue-ops-lnplus-max-duration-months", "lnplus_max_duration_months", "int"),
-            ("revenue-ops-lnplus-min-peer-positive-ratings", "lnplus_min_peer_positive_ratings", "int"),
-            ("revenue-ops-lnplus-min-peer-rank", "lnplus_min_peer_rank", "int"),
-            ("revenue-ops-lnplus-max-participants", "lnplus_max_participants", "int"),
-            ("revenue-ops-lnplus-min-participants", "lnplus_min_participants", "int"),
-            ("revenue-ops-lnplus-apply-feerate-ceiling", "lnplus_apply_feerate_ceiling", "int"),
-            ("revenue-ops-lnplus-pending-timeout-days", "lnplus_pending_timeout_days", "int"),
-            ("revenue-ops-lnplus-inbound-credit-factor", "lnplus_inbound_credit_factor", "float"),
-            ("revenue-ops-lnplus-watcher-interval", "lnplus_watcher_interval", "int"),
             # E-2 (2026-07 econ audit): class-aware saturated/source min-fee
             # floor, dynamic so fee-band decompression is tunable live.
             ("revenue-ops-min-fee-ppm-saturated", "min_fee_ppm_saturated", "int"),
@@ -9132,18 +8850,7 @@ def _get_confirmed_onchain_sats() -> Optional[int]:
         if str(o.get("status") or "") != "confirmed":
             continue
         total += _parse_msat(o.get("amount_msat", 0)) // 1000
-    # I6: on-chain capacity already committed (gate 7, apply time) to an
-    # in-flight LN+ swap open is not free for the Boltz auto-cycle to spend
-    # or plan around — mirrors capacity_planner's own
-    # `available_sats -= lnplus_reserved_sats` subtraction
-    # (capacity_planner.py ~515-519). This is the one place the auto-cycle
-    # (treasury deficit calc, status reporting) computes spendable on-chain
-    # sats, so the subtraction here covers every caller.
-    try:
-        lnplus_reserved = int(database.lnplus_reserved_sats()) if database is not None else 0
-    except Exception:
-        lnplus_reserved = 0
-    return max(0, int(total) - lnplus_reserved)
+    return int(total)
 
 
 def _filter_boltz_treasury_recommendations(

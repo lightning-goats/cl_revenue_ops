@@ -1,6 +1,6 @@
 """PR 9 (gap-closure Phase F): conformance-corpus integrity.
 
-- 40 scenario classes exist and every payload validates against the
+- 38 retained scenario classes exist and every payload validates against the
   schemas via the STANDALONE validator (no plugin imports there);
 - regenerating the corpus is byte-identical (the generator is
   deterministic — drift means the reference behavior changed and must
@@ -22,9 +22,9 @@ VALIDATOR = REPO / "tools" / "conformance" / "validate_fixtures.py"
 COVERAGE = REPO / "docs" / "refactor" / "phase0" / "conformance-coverage.md"
 
 
-def test_forty_scenario_classes_present():
+def test_retained_scenario_classes_present():
     dirs = sorted(d.name for d in SCENARIOS.iterdir() if d.is_dir())
-    assert len(dirs) == 40
+    assert len(dirs) == 38
     assert dirs[0].startswith("01-") and dirs[-1].startswith("40-")
 
 
@@ -53,7 +53,7 @@ def test_documented_gaps_are_explicit_not_silent():
             assert case.get("notes"), \
                 f"{case_path}: gap without explanation"
             assert case["expected"] == {"implemented": False}
-    # PR 10 closed both former gaps (open-vs-LN+, rebalance-vs-swap)
+    # The retained generic conflict rules have no documented gaps.
     # behind econ_conflict_rules_extended — no documented gaps remain.
     assert gaps == []
 

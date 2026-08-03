@@ -22,7 +22,6 @@ ECON_FLAGS = (
     "econ_shadow_enabled",
     "econ_governor_rebalance_enabled",
     "econ_governor_planner_enabled",
-    "econ_governor_lnplus_enabled",
     "econ_governor_boltz_enabled",
     "econ_governor_fees_enabled",
     "econ_arbiter_enabled",
@@ -100,7 +99,6 @@ class TestDefaultFlips:
         assert cfg.planner_max_channel_sats == 10_000_000
         assert cfg.planner_enabled is False
         assert cfg.boltz_auto_cycle_enabled is False
-        assert cfg.lnplus_swaps_enabled is True
 
     def test_new_min_fee_default_within_declared_range(self):
         from modules.config import CONFIG_FIELD_RANGES

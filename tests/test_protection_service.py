@@ -12,7 +12,6 @@ from modules.protection_service import (
     ChannelLifecycle,
     close_protections,
     derive_lifecycle,
-    lnplus_contract_protection,
     policy_close_block,
 )
 
@@ -61,20 +60,8 @@ class TestPolicyGate:
         assert policy_close_block(self._policy("dynamic")) is None
 
 
-class TestLnplusContract:
-    def test_window(self):
-        p = lnplus_contract_protection(NOW, 3, "24328")
-        assert p is not None
-        assert p.reason == "lnplus_contract" and p.owner == "lnplus"
-        assert p.expires_at.value == NOW + 3 * 30 * 86400
-
-    def test_garbage_returns_none(self):
-        assert lnplus_contract_protection(None, 3, "x") is None
-        assert lnplus_contract_protection(NOW, 0, "x") is None
-
-
 class TestAggregation:
-    def test_typed_protections_from_all_owners(self):
+    def test_typed_protections_from_retained_owners(self):
         policy = MagicMock()
         policy.strategy = MagicMock()
         policy.strategy.value = "dynamic"
@@ -86,13 +73,11 @@ class TestAggregation:
             flow_metrics=SimpleNamespace(confidence=0.9, forward_count=50),
             route_pair_channels=set(),
             policy=policy,
-            lnplus_obligation={"opened_at": NOW, "duration_months": 3,
-                               "swap_id": "24328"},
         )
         owners = [p.owner for p in result]
-        assert owners == ["close_protection", "operator_policy", "lnplus"]
+        assert owners == ["close_protection", "operator_policy"]
         assert result[0].reason == "INBOUND_GATEWAY"
-        assert result[2].expires_at is not None
+        assert result[1].expires_at is None
 
     def test_unprotected_channel_is_empty(self):
         result = close_protections(

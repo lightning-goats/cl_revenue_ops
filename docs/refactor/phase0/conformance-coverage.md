@@ -2,7 +2,7 @@
 
 Generator: `tools/conformance/generate_scenarios.py` (deterministic; regenerating must be byte-identical). Validation: `tools/conformance/validate_fixtures.py` — no plugin imports. Golden-derived cases copy fixture bytes verbatim; generated cases are produced BY the reference implementation.
 
-Scenario classes: 40/40. Documented gaps: 0 (listed last — these are honest holes with pointers, not silent omissions).
+Scenario classes: 38/40. Documented gaps: 0 (listed last — these are honest holes with pointers, not silent omissions).
 
 | # Scenario | Category | Requirement | Source | Files |
 |---|---|---|---|---|
@@ -25,7 +25,7 @@ Scenario classes: 40/40. Documented gaps: 0 (listed last — these are honest ho
 | `17-manual-diagnostic-rebalance` | rebalance_mode | F4 + contradiction #7: manual is operator-directed; diagnostic is a BOUNDED spend (evidence purchase), not free | generated | case.json |
 | `18-conflicting-close-rebalance` | arbitration | J3/spec conflict rule: rebalance into a channel scheduled for closure is rejected (CONFLICT_CLOSE_REBALANCE) | generated | case.json |
 | `19-protected-close-rejection` | authorization | F5: protection tags veto closure before any intent exists | tests/golden/fixtures/close_protection/allowed_protect_tag_blocks.json | case.json |
-| `20-open-vs-lnplus` | arbitration | Spec conflict rule: open vs LN+ — both paths emit OPEN_CHANNEL to the peer; CONFLICT_DUPLICATE_OPEN rejects the lower-priority one (the LN+ obligation at priority 80 wins) | generated | case.json |
+| `20-duplicate-open-priority` | arbitration | Duplicate OPEN_CHANNEL intents to one peer are deduplicated; the higher-priority intent wins | generated | case.json |
 | `21-circular-vs-boltz-structural` | arbitration | Spec conflict rule: rebalance vs structural swap — the structural SWAP_OUT outranks; CONFLICT_REBALANCE_SWAP rejects the circular rebalance (live registry blocks both directions) | generated | case.json |
 | `22-budget-exhaustion` | authorization | DoD 4/5: refused reservation -> BUDGET_EXHAUSTED, no spend | generated | case.json |
 | `23-concurrent-reservation-contention` | reservation | DoD 5: atomic reservations cannot jointly oversubscribe | generated | case.json |
@@ -33,8 +33,6 @@ Scenario classes: 40/40. Documented gaps: 0 (listed last — these are honest ho
 | `25-missing-execution-cost` | ledger | DoD 6: cost without reservation context is an ANOMALY, never silently absorbed | generated | case.json |
 | `26-unknown-execution-outcome` | ledger | Workstream E: unknown outcome is a TERMINAL state pending reconciliation; reservation state preserved for the sweep | generated | case.json |
 | `27-boltz-timeout-after-acceptance` | failure_mode | Reconciler spec: in-flight (started-without-terminal) keys are NEVER auto-zeroed; stale ones quarantine only | modules/econ_reconcile.py (TDD-pinned in tests/test_econ_reconcile.py) | case.json |
-| `28-lnplus-state-divergence` | failure_mode | Workstream G: LN+ platform-state divergence rejected at the gate chain; watcher reconciliation is preflight-gated | tests/golden/fixtures/lnplus/filter_dual_swap_rejected.json | case.json |
-| `29-lnplus-obligation-lower-authority` | authorization | Invariant 6 + Workstream I: accepted obligations complete under any authority level, still authorized and ledgered | generated | case.json |
 | `30-stale-intent` | authorization | DoD 4: stale envelopes rejected fail-closed (STALE) | generated | case.json |
 | `31-duplicate-idempotency-key` | arbitration | J3: identical five-field subsets share an idempotency key; duplicates superseded (INTENT_SUPERSEDED) | generated | case.json |
 | `32-numeric-overflow-underflow` | intent_semantics | Workstream J numeric rules: msat in [0, 2^63-1], checked — out-of-range raises, never wraps | generated | case.json |

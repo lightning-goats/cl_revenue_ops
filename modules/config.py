@@ -88,9 +88,6 @@ PUBLIC_RUNTIME_KEYS = (
     # Refactor Phase 2E: planner open/close reservations gated by the
     # governor facade (same reserve_spend accounting). Default off.
     'econ_governor_planner_enabled',
-    # Refactor Phase 2F: LN+ swap-open reservations gated by the governor
-    # facade. Obligation fulfillment carries no pause gate (invariant 6).
-    'econ_governor_lnplus_enabled',
     # Refactor Phase 2G: Boltz pre-create swap reservations gated by the
     # governor facade. Default off.
     'econ_governor_boltz_enabled',
@@ -128,23 +125,6 @@ PUBLIC_RUNTIME_KEYS = (
     # Non-custom bundles apply AT STARTUP to keys without explicit
     # overrides (precedence: explicit > profile > default).
     'risk_profile',
-    # LN+ liquidity swap automation (13 runtime controls)
-    'lnplus_swaps_enabled',
-    'lnplus_execute_applications',
-    'lnplus_swap_preference_margin',
-    'lnplus_max_duration_months',
-    'lnplus_min_peer_positive_ratings',
-    # D-2 (Revision 2, 2026-07-08 operator-directed): rank floor for
-    # non-fleet participants.
-    'lnplus_min_peer_rank',
-    'lnplus_max_participants',
-    # D-3 (Revision 2): minimum 3 participants, fewer preferred among
-    # equal-EV qualifiers.
-    'lnplus_min_participants',
-    'lnplus_apply_feerate_ceiling',
-    'lnplus_pending_timeout_days',
-    'lnplus_inbound_credit_factor',
-    'lnplus_watcher_interval',
 )
 
 # Type mapping for config fields (for validation)
@@ -196,7 +176,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'econ_shadow_enabled': bool,
     'econ_governor_rebalance_enabled': bool,
     'econ_governor_planner_enabled': bool,
-    'econ_governor_lnplus_enabled': bool,
     'econ_governor_boltz_enabled': bool,
     'econ_governor_fees_enabled': bool,
     'econ_arbiter_enabled': bool,
@@ -285,19 +264,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'capex_exploration_rate': float,
     'capex_tactical_rate': float,
     'capex_global_envelope_sats': int,
-    # LN+ liquidity swap automation
-    'lnplus_swaps_enabled': bool,
-    'lnplus_execute_applications': bool,
-    'lnplus_swap_preference_margin': float,
-    'lnplus_max_duration_months': int,
-    'lnplus_min_peer_positive_ratings': int,
-    'lnplus_min_peer_rank': int,
-    'lnplus_max_participants': int,
-    'lnplus_min_participants': int,
-    'lnplus_apply_feerate_ceiling': int,
-    'lnplus_pending_timeout_days': int,
-    'lnplus_inbound_credit_factor': float,
-    'lnplus_watcher_interval': int,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -326,19 +292,6 @@ SHADOWED_SETTING_GATES: Dict[str, tuple] = {
     'fee_market_boundary_enabled': (
         'fee_market_boundary_min_competitors',
         'fee_market_boundary_margin_ppm',
-    ),
-    'lnplus_swaps_enabled': (
-        'lnplus_execute_applications',
-        'lnplus_swap_preference_margin',
-        'lnplus_max_duration_months',
-        'lnplus_min_peer_positive_ratings',
-        'lnplus_min_peer_rank',
-        'lnplus_max_participants',
-        'lnplus_min_participants',
-        'lnplus_apply_feerate_ceiling',
-        'lnplus_pending_timeout_days',
-        'lnplus_inbound_credit_factor',
-        'lnplus_watcher_interval',
     ),
     'expansion_treasury_enabled': (
         'expansion_treasury_onchain_target_sats',
@@ -493,22 +446,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'capex_tactical_rate': (0.0, 1.0),
     'capex_probability_budget_bonus': (0.0, 1.0),
     'capex_global_envelope_sats': (0, 100_000_000),
-    # LN+ liquidity swap automation
-    'lnplus_swap_preference_margin': (0.0, 2.0),
-    'lnplus_inbound_credit_factor': (0.0, 1.0),
-    # C-2 (2026-07-08 audit): hard cap — contracts must never lock capital
-    # beyond a quarter. Default (3) stays inside the new [1, 3] range.
-    'lnplus_max_duration_months': (1, 3),
-    'lnplus_max_participants': (2, 5),
-    # D-3 (Revision 2, 2026-07-08 operator-directed): dual (2-party) swaps
-    # are rejected; must stay <= lnplus_max_participants in practice.
-    'lnplus_min_participants': (2, 5),
-    'lnplus_apply_feerate_ceiling': (253, 100000),
-    'lnplus_pending_timeout_days': (1, 30),
-    'lnplus_min_peer_positive_ratings': (0, 1000),
-    # D-2 (Revision 2): LN+ rank scale is 1-10 (higher is better); 8 = Gold.
-    'lnplus_min_peer_rank': (1, 10),
-    'lnplus_watcher_interval': (300, 14400),
 }
 
 # Valid values for string enum fields
@@ -598,8 +535,6 @@ class Config:
     econ_governor_rebalance_enabled: bool = True
     # Refactor Phase 2E: governor-gated planner open/close reservations.
     econ_governor_planner_enabled: bool = True
-    # Refactor Phase 2F: governor-gated LN+ swap-open reservations.
-    econ_governor_lnplus_enabled: bool = True
     # Refactor Phase 2G: governor-gated Boltz swap reservations.
     econ_governor_boltz_enabled: bool = True
     # Refactor Phase 2H: governor-gated automated fee broadcasts.
@@ -866,25 +801,6 @@ class Config:
     # fraction. Default 0.0 = disabled, preserving v2 behavior exactly.
     capex_probability_budget_bonus: float = 0.0
 
-    # ==========================================================================
-    # LN+ Liquidity Swap Automation
-    # ==========================================================================
-    lnplus_swaps_enabled: bool = True
-    lnplus_execute_applications: bool = True
-    lnplus_swap_preference_margin: float = 0.2
-    lnplus_max_duration_months: int = 3
-    lnplus_min_peer_positive_ratings: int = 5
-    # D-2 (Revision 2, 2026-07-08 operator-directed): rank floor for
-    # non-fleet participants; LN+ scale 1-10, higher better, 8 = "Gold".
-    lnplus_min_peer_rank: int = 8
-    lnplus_max_participants: int = 4
-    # D-3 (Revision 2): minimum 3 participants (dual swaps rejected);
-    # among equal-EV qualifiers, fewer participants win the tie-break.
-    lnplus_min_participants: int = 3
-    lnplus_apply_feerate_ceiling: int = 5000
-    lnplus_pending_timeout_days: int = 7
-    lnplus_inbound_credit_factor: float = 0.5
-    lnplus_watcher_interval: int = 3600
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -965,7 +881,7 @@ class Config:
         for key, value in overrides.items():
             if key.startswith('_'):
                 # Internal marker rows (e.g. _closure_sweep_tripped,
-                # _version_bump, _lnplus_backfill_done) share the override
+                # internal migration markers share the override
                 # table but are not config keys.
                 continue
             if hasattr(self, key) and key not in IMMUTABLE_CONFIG_KEYS:
@@ -973,7 +889,7 @@ class Config:
             elif not hasattr(self, key):
                 # Phase B (2026-08-01 surface reduction, section 5.5): a
                 # silently skipped unknown row rots invisibly — the
-                # production lnplus_fleet_pubkeys case dangled for months.
+                # stale production keys can otherwise dangle for months.
                 self._override_warnings.append(
                     f"config override '{key}' does not match any known key "
                     f"— ignored (stale after an upgrade?)")
@@ -1048,14 +964,6 @@ class Config:
                 f"({self.receivable_ratio_floor}) > receivable_ratio_target "
                 f"({self.receivable_ratio_target}); repaired floor to target")
             self.receivable_ratio_floor = self.receivable_ratio_target
-        # Repair a crossed LN+ ring-size band persisted before the
-        # update_runtime cross-check existed (min > max gates out every swap).
-        if self.lnplus_min_participants > self.lnplus_max_participants:
-            self._override_warnings.append(
-                f"Contradictory settings: lnplus_min_participants "
-                f"({self.lnplus_min_participants}) > lnplus_max_participants "
-                f"({self.lnplus_max_participants}); repaired max to min")
-            self.lnplus_max_participants = self.lnplus_min_participants
         # Phase B (2026-08-01 surface reduction, section 5.1): a crossed
         # budget pair is repaired UPWARD like the crossed fee rails
         # (fc4c76b) — the weekly ceiling rises to meet the operator's
@@ -1216,12 +1124,6 @@ class Config:
                 return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
             if key == 'high_liquidity_threshold' and typed_value <= self.low_liquidity_threshold:
                 return {"error": f"high_liquidity_threshold ({typed_value}) must be greater than low_liquidity_threshold ({self.low_liquidity_threshold})"}
-            # LN+ ring-size band: min > max would silently gate out every
-            # swap (feature-wide no-op), so reject crossed settings.
-            if key == 'lnplus_min_participants' and typed_value > self.lnplus_max_participants:
-                return {"error": f"lnplus_min_participants ({typed_value}) cannot exceed lnplus_max_participants ({self.lnplus_max_participants})"}
-            if key == 'lnplus_max_participants' and typed_value < self.lnplus_min_participants:
-                return {"error": f"lnplus_max_participants ({typed_value}) cannot be less than lnplus_min_participants ({self.lnplus_min_participants})"}
             # Utilization floor/ceiling: mirrors the low/high_liquidity_threshold
             # guard above. Without this, an inverted pair (e.g. floor=0.9,
             # ceiling=0.1) silently pins realized utilization to 0.9 for every
@@ -1489,7 +1391,6 @@ class ConfigSnapshot:
     econ_shadow_enabled: bool = True
     econ_governor_rebalance_enabled: bool = True
     econ_governor_planner_enabled: bool = True
-    econ_governor_lnplus_enabled: bool = True
     econ_governor_boltz_enabled: bool = True
     econ_governor_fees_enabled: bool = True
     econ_arbiter_enabled: bool = True
@@ -1504,23 +1405,6 @@ class ConfigSnapshot:
     # allow true cheap egress). Missing-from-snapshot kills the feature in
     # production (getattr fallback), so it MUST be mirrored here.
     min_fee_ppm_saturated: int = 0
-    # LN+ (lightningnetwork.plus) liquidity swap automation (C1 audit fix:
-    # these were missing from ConfigSnapshot entirely, so
-    # getattr(cfg, "lnplus_swaps_enabled", False) inside execute_cycle's
-    # snapshot always fell back to False in production — the evaluator was
-    # silently dead despite Config defaulting it on).
-    lnplus_swaps_enabled: bool = True
-    lnplus_execute_applications: bool = True
-    lnplus_swap_preference_margin: float = 0.2
-    lnplus_max_duration_months: int = 3
-    lnplus_min_peer_positive_ratings: int = 5
-    lnplus_min_peer_rank: int = 8
-    lnplus_max_participants: int = 4
-    lnplus_min_participants: int = 3
-    lnplus_apply_feerate_ceiling: int = 5000
-    lnplus_pending_timeout_days: int = 7
-    lnplus_inbound_credit_factor: float = 0.5
-    lnplus_watcher_interval: int = 3600
     # Version tracking
     version: int = 0
     

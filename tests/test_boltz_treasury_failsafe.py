@@ -40,62 +40,6 @@ def test_onchain_balance_sums_confirmed_outputs():
     assert mod._get_confirmed_onchain_sats() == 1_500_000
 
 
-def test_onchain_balance_subtracts_lnplus_reserved_sats():
-    """I6: on-chain capacity already committed (gate 7, apply time) to an
-    in-flight LN+ swap must not be counted as free for the Boltz auto-cycle
-    to spend/plan around — mirrors capacity_planner's own
-    available_sats -= lnplus_reserved_sats subtraction."""
-    mod = load_plugin_module()
-    mod.plugin.log = MagicMock()
-    ds = MagicMock()
-    ds.get_funds.return_value = {
-        "outputs": [
-            {"status": "confirmed", "amount_msat": 5_000_000_000},
-        ]
-    }
-    mod.data_service = ds
-    db = MagicMock()
-    db.lnplus_reserved_sats.return_value = 2_000_000
-    mod.database = db
-
-    assert mod._get_confirmed_onchain_sats() == 3_000_000
-
-
-def test_onchain_balance_lnplus_reserved_lookup_fails_open():
-    """A database error looking up the LN+ reservation must not corrupt the
-    onchain balance computation — fail open to 0 reserved."""
-    mod = load_plugin_module()
-    mod.plugin.log = MagicMock()
-    ds = MagicMock()
-    ds.get_funds.return_value = {
-        "outputs": [{"status": "confirmed", "amount_msat": 5_000_000_000}]
-    }
-    mod.data_service = ds
-    db = MagicMock()
-    db.lnplus_reserved_sats.side_effect = RuntimeError("db locked")
-    mod.database = db
-
-    assert mod._get_confirmed_onchain_sats() == 5_000_000
-
-
-def test_onchain_balance_lnplus_reserved_never_negative():
-    """A reservation figure larger than the confirmed balance (e.g. stale
-    reservation vs. a wallet drained by other spends) must clamp at 0, not
-    go negative."""
-    mod = load_plugin_module()
-    mod.plugin.log = MagicMock()
-    ds = MagicMock()
-    ds.get_funds.return_value = {
-        "outputs": [{"status": "confirmed", "amount_msat": 1_000_000_000}]
-    }
-    mod.data_service = ds
-    db = MagicMock()
-    db.lnplus_reserved_sats.return_value = 5_000_000
-    mod.database = db
-
-    assert mod._get_confirmed_onchain_sats() == 0
-
-
 def _plan_module():
     mod = load_plugin_module()
     mod.plugin.log = MagicMock()

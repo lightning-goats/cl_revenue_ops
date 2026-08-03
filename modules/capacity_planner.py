@@ -14,9 +14,6 @@ this module also:
   ceiling, constrained allow-list below it) ahead of every discovery/execution pass;
 - coordinates with the Boltz auto-cycle (loser SCIDs to avoid loop-out through, on-chain
   funding-deficit signal, preferred loop-out target) via `get_boltz_coordination`;
-- integrates the LN+ (lightningnetwork.plus) liquidity-swap evaluator as a second
-  capital-allocation channel that competes for the same per-cycle open slot and on-chain
-  funds as a regular channel open (see `docs/audit/contracts/lnplus_swaps.md`);
 - prices and reserves channel-close fees through a shared close-fee-gating subsystem
   (fixed cap or reserve-multiplier, optional CLN close feerange) rather than each close
   path deriving its own cap.
@@ -184,7 +181,6 @@ class CapacityPlanner:
         self.external_liquidity_cost_provider = None
         self._capex_engine = None
         self._capital_efficiency = None
-        self.lnplus_evaluator = None  # Injected by main plugin (Task 5)
         # Wave 2: (facade, arbitration_key) per in-flight governed
         # reservation, so the settle/release finish paths can free the
         # live-arbitration registry slot on a TERMINAL outcome
@@ -644,15 +640,6 @@ class CapacityPlanner:
             except Exception as e:
                 self.plugin.log(f"Cannot determine available funds: {e}", level='debug')
 
-            # LN+ swaps in flight reserve on-chain capacity for their opens —
-            # keep the regular-open sizer from double-spending it.
-            try:
-                _lnplus_reserved = self.profitability.database.lnplus_reserved_sats()
-            except Exception:
-                _lnplus_reserved = 0
-            if isinstance(_lnplus_reserved, (int, float)) and not isinstance(_lnplus_reserved, bool) and _lnplus_reserved:
-                available_sats = max(0, available_sats - _lnplus_reserved)
-
             # Detect funding deficit: best candidate needs more than available
             if candidates:
                 top = max(candidates, key=lambda c: c.get("score", 0))
@@ -736,35 +723,6 @@ class CapacityPlanner:
                 key=lambda c: (c.get("_planned_ev", 0), c.get("score", 0)),
                 reverse=True,
             )
-
-            # 7a. LN+ swap evaluation — swaps are preferred within the margin
-            # Wave2 F4: an applied LN+ swap is an irreversible open
-            # commitment, so it is blocked on unknown portfolio state too.
-            if self.lnplus_evaluator is not None and opens_this_cycle < max_opens \
-                    and portfolio_state != "unknown":
-                try:
-                    _best_regular_ev = (ranked_candidates[0].get("_planned_ev", 0.0)
-                                        if ranked_candidates else 0.0)
-                    _lnplus_summary = self.lnplus_evaluator.run_cycle(cfg, _best_regular_ev)
-                    summary["lnplus"] = _lnplus_summary
-                    if _lnplus_summary.get("applied"):
-                        opens_this_cycle += 1
-                        # The applied swap is an irreversible commitment of
-                        # on-chain funds (fundchannel within 48h of fill).
-                        # available_sats was computed BEFORE the application,
-                        # so debit the fresh reservation here or a same-cycle
-                        # regular open can spend the swap's capacity and force
-                        # a missed deadline (breaker trip + public defection).
-                        try:
-                            _fresh_reserved = self.profitability.database.lnplus_reserved_sats()
-                            if isinstance(_fresh_reserved, (int, float)) and not isinstance(_fresh_reserved, bool):
-                                available_sats = max(
-                                    0, available_sats - max(0, int(_fresh_reserved) - int(_lnplus_reserved or 0))
-                                )
-                        except Exception:
-                            pass
-                except Exception as e:
-                    self.plugin.log(f"LNPLUS: evaluator failed: {e}", level="warn")
 
             for candidate in ranked_candidates:
                 if opens_this_cycle >= max_opens:
@@ -2453,19 +2411,10 @@ class CapacityPlanner:
                 if o.get("status") == "confirmed"
             )
             min_reserve = getattr(cfg, 'min_wallet_reserve', 500000)
-            # On-chain capacity committed to in-flight LN+ swap opens is not
-            # spendable by regular opens (same rule as the sizing pass).
-            lnplus_reserved = 0
-            try:
-                _r = self.profitability.database.lnplus_reserved_sats()
-                if isinstance(_r, (int, float)) and not isinstance(_r, bool):
-                    lnplus_reserved = max(0, int(_r))
-            except Exception:
-                lnplus_reserved = 0
-            available = confirmed - min_reserve - lnplus_reserved
+            available = confirmed - min_reserve
             if available < required_sats:
-                return False, f"Insufficient funds: {available} available < {required_sats} required (reserve: {min_reserve}, lnplus_reserved: {lnplus_reserved})"
-            return True, f"Available: {available} sats (reserve: {min_reserve}, lnplus_reserved: {lnplus_reserved})"
+                return False, f"Insufficient funds: {available} available < {required_sats} required (reserve: {min_reserve})"
+            return True, f"Available: {available} sats (reserve: {min_reserve})"
         except Exception as e:
             return False, f"Cannot check funds: {e}"
 
@@ -3356,7 +3305,7 @@ class CapacityPlanner:
         # rebalance/boltz reserve and this open cannot jointly overshoot.
         eff_budget, budget_since = self._unified_reserve_budget_params()
         # Wave2 F6: uuid suffix makes the id unique even when two opens to
-        # the same peer land in the same second (mirrors the lnplus-open fix).
+        # the same peer land in the same second.
         reservation_id = (
             f"planner-open-{peer_id[:16]}-{int(time.time())}-"
             f"{uuid.uuid4().hex[:8]}"
@@ -3624,8 +3573,7 @@ class CapacityPlanner:
 
         A defibrillation FILLS the target channel; rebalance_mode disabled
         or source_only forbids filling it. no_close/protect tags do NOT
-        block defib (operator policy 2026-07-09: LN+ contract channels stay
-        diagnosable). Fails closed on policy errors.
+        block defib; operator-protected channels remain diagnosable. Fails closed on policy errors.
         """
         if not self.policy_manager:
             return False, "Policy manager unavailable — defib blocked (fail closed)"

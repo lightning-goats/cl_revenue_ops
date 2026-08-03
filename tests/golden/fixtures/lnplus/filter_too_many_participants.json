@@ -1,6 +1,0 @@
-{
-  "overrides": {
-    "participant_max_count": 9
-  },
-  "rejection": "terms:too many participants"
-}

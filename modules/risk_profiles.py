@@ -60,8 +60,6 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "reservation_timeout_hours": "operational_timing",
     "rpc_timeout_seconds": "operational_timing",
     "max_concurrent_jobs": "operational_timing",
-    "lnplus_watcher_interval": "operational_timing",
-    "lnplus_pending_timeout_days": "operational_timing",
     "capex_grace_days": "operational_timing",
     # --- authority controls --------------------------------------------
     "paused": "authority_control",
@@ -72,7 +70,6 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "econ_shadow_enabled": "authority_control",
     "econ_governor_rebalance_enabled": "authority_control",
     "econ_governor_planner_enabled": "authority_control",
-    "econ_governor_lnplus_enabled": "authority_control",
     "econ_governor_boltz_enabled": "authority_control",
     "econ_governor_fees_enabled": "authority_control",
     "econ_arbiter_enabled": "authority_control",
@@ -85,8 +82,6 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "planner_dry_run": "authority_control",
     "planner_execute_closes": "authority_control",
     "boltz_auto_cycle_enabled": "authority_control",
-    "lnplus_swaps_enabled": "authority_control",
-    "lnplus_execute_applications": "authority_control",
     "expansion_treasury_enabled": "authority_control",
     # --- safety invariants ---------------------------------------------
     "min_fee_ppm": "safety_invariant",
@@ -98,7 +93,6 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "planner_close_fee_reserve_multiplier": "safety_invariant",
     "planner_close_fee_cap_sats": "safety_invariant",
     "diagnostic_rebalance_max_fee_sats": "safety_invariant",
-    "lnplus_apply_feerate_ceiling": "safety_invariant",
     "receivable_ratio_floor": "safety_invariant",
     "expansion_treasury_min_source_local_pct": "safety_invariant",
     "expansion_treasury_exclude_protected": "safety_invariant",
@@ -118,8 +112,6 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "planner_min_channel_sats": "economic_risk",
     "planner_max_channel_sats": "economic_risk",
     "boltz_structural_budget_sats_per_day": "economic_risk",
-    "lnplus_swap_preference_margin": "economic_risk",
-    "lnplus_max_duration_months": "economic_risk",
     "capex_reinvestment_rate": "economic_risk",
     "capex_exploration_rate": "economic_risk",
     "capex_tactical_rate": "economic_risk",
@@ -187,11 +179,6 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "thompson_prior_std_fee": "advanced_expert",
     "capex_bootstrap_bps": "advanced_expert",
     "capex_bootstrap_max_sats": "advanced_expert",
-    "lnplus_min_peer_positive_ratings": "advanced_expert",
-    "lnplus_min_peer_rank": "advanced_expert",
-    "lnplus_max_participants": "advanced_expert",
-    "lnplus_min_participants": "advanced_expert",
-    "lnplus_inbound_credit_factor": "advanced_expert",
 }
 
 # Bundles touch ONLY economic_risk keys (pinned by test). `conservative`
@@ -212,7 +199,6 @@ PROFILE_BUNDLES: Dict[str, Dict[str, Any]] = {
         "planner_min_annual_roi_pct": 5.0,
         "planner_max_opens_per_cycle": 0,
         "planner_max_closes_per_cycle": 0,
-        "lnplus_swap_preference_margin": 0.5,
     },
     "conservative": {
         "daily_budget_sats": 5000,
@@ -225,7 +211,6 @@ PROFILE_BUNDLES: Dict[str, Dict[str, Any]] = {
         "planner_min_annual_roi_pct": 1.0,
         "planner_max_opens_per_cycle": 1,
         "planner_max_closes_per_cycle": 0,
-        "lnplus_swap_preference_margin": 0.2,
     },
     "balanced": {
         "daily_budget_sats": 8000,
@@ -238,7 +223,6 @@ PROFILE_BUNDLES: Dict[str, Dict[str, Any]] = {
         "planner_min_annual_roi_pct": 1.0,
         "planner_max_opens_per_cycle": 1,
         "planner_max_closes_per_cycle": 1,
-        "lnplus_swap_preference_margin": 0.2,
     },
     "growth": {
         "daily_budget_sats": 12000,
@@ -251,7 +235,6 @@ PROFILE_BUNDLES: Dict[str, Dict[str, Any]] = {
         "planner_min_annual_roi_pct": 0.5,
         "planner_max_opens_per_cycle": 2,
         "planner_max_closes_per_cycle": 1,
-        "lnplus_swap_preference_margin": 0.1,
     },
 }
 

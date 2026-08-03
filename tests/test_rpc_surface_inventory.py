@@ -15,8 +15,6 @@ EXPECTED_RPC_METHODS = frozenset({
     "revenue-fee-debug", "revenue-fee-cycle", "revenue-fee-authority-status",
     "revenue-analyze",
     "revenue-wake-all", "revenue-capacity-report", "revenue-planner-status",
-    "revenue-lnplus-status", "revenue-lnplus-breaker-clear",
-    "revenue-lnplus-abandon", "revenue-lnplus-backfill",
     "revenue-planner-candidate-sources", "revenue-planner-candidates",
     "revenue-planner-execute", "revenue-planner-history", "revenue-set-fee",
     "revenue-rebalance", "revenue-profitability", "revenue-history",
@@ -73,4 +71,4 @@ def test_expected_count():
     # revenue-boltz, revenue-cycle, revenue-planner, revenue-budget). The
     # merged old names remain registered as deprecated aliases until
     # 2026-09-05.
-    assert len(EXPECTED_RPC_METHODS) == 73
+    assert len(EXPECTED_RPC_METHODS) == 69

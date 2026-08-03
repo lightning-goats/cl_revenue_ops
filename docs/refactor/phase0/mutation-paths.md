@@ -23,10 +23,7 @@ adapter during Phase 3):
   (:2869), askrene-remove-layer (:316)
 - `modules/rebalance_router_v3.py` — askrene-create-layer (:615),
   askrene-update-channel (:631, :649), askrene-remove-layer (:668);
-  each has a data_service-preferred branch
-- `modules/lnplus_swaps.py` — connect (:1417), fundchannel (:1462),
-  signmessage (:130, LN+ auth)
-- `modules/capacity_planner.py` — fundchannel/close fallback paths when
+  each has a data_service-preferred branch- `modules/capacity_planner.py` — fundchannel/close fallback paths when
   no data_service is wired (:3138 open; close execution path)
 
 ## Wrapper callers (economic writers)
@@ -47,12 +44,6 @@ adapter during Phase 3):
   :2152–:2214), createswap loop-in (:1823/:1824), createchainswap
   (:2395/:2408), claimswaps (:2338), refund (:2312), withdraw/wallet
   send (:2429/:2471/:2477; also `cl-revenue-ops.py:7517`)
-- LN+ (`modules/lnplus_swaps.py`) — HTTP POST via urllib
-  (`LNPlusClient._request` :82, base https://lightningnetwork.plus/api/2):
-  create_application (:200), delete_application (:205),
-  complete_application (:210), create_rating (:229),
-  mark_read_notifications (:220)
-
 ## Autonomous initiators (background threads)
 
 All `threading.Thread` daemons started at `cl-revenue-ops.py:3428–3435`
@@ -65,7 +56,6 @@ All `threading.Thread` daemons started at `cl-revenue-ops.py:3428–3435`
 | rebalance-check | :3108 | rebalance_interval ≥60s | circular sendpay, askrene layers, budget reservations |
 | boltz-auto-cycle | :3148 | boltz_auto_cycle_interval_minutes (15m default) | Boltz loop-in/out/withdraw |
 | capacity-planner | :3239 | planner_interval ≥600s (default 6h) | fundchannel opens, closes, reservations |
-| lnplus-watcher | :3207 | lnplus_watcher_interval (1h default) | LN+ apply/complete/fundchannel/ratings |
 | financial-snapshot | :3331 | 24h | DB snapshot writes only |
 | startup-snapshot | :3431 | one-shot | peer snapshot to DB |
 
@@ -89,5 +79,5 @@ Four distinct implementations gate spending today:
 
 Gate call sites before spend: `rebalancer.py:1451`,
 `rebalance_engine_v2.py:1938`, `capacity_planner.py:3199/:3667`,
-`boltz_manager.py:1642`, `lnplus_swaps.py:1439`,
+`boltz_manager.py:1642`,
 `cl-revenue-ops.py:7321/:7351/:7396`.

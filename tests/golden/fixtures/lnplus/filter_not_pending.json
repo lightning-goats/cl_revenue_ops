@@ -1,6 +1,0 @@
-{
-  "overrides": {
-    "status": "completed"
-  },
-  "rejection": "fill_state:not pending"
-}

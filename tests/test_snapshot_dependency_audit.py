@@ -20,7 +20,6 @@ MODULES = {
     "rebalance": "modules/rebalance_engine_v2.py",
     "planner": "modules/capacity_planner.py",
     "boltz": "modules/boltz_manager.py",
-    "lnplus": "modules/lnplus_swaps.py",
     "admission": "modules/admission_policy.py",
     "protection": "modules/protection_service.py",
     "profitability": "modules/profitability_analyzer.py",
@@ -84,19 +83,6 @@ PINNED_COUNTS = {
     ("boltz", "live_rpc"): 7,
     ("boltz", "database"): 0,
     ("boltz", "wall_clock"): 5,
-    ("lnplus", "analyzer_cache"): 0,
-    # 3d: 12 -> 13. Mid-decision reads MOVED, not multiplied: per-swap
-    # getinfo became the process-constant _our_id cache; the
-    # existing-channel gate consults a pass-entry capture
-    # (_capture_peers_with_channels, construction-class) with the old
-    # per-swap read kept only as the fail-open fallback.
-    ("lnplus", "live_rpc"): 13,
-    ("lnplus", "database"): 0,
-    # 12→13 (audit 2026-08-01 wave2 FIX 5): _activate's fallback ends_at
-    # derivation reads time.time() when LN+ supplies no parseable 'ends' —
-    # watcher/obligation-tracking class (execution — allowed), classified in
-    # docs/refactor/phase0/snapshot-dependency-audit.md.
-    ("lnplus", "wall_clock"): 13,
     ("admission", "analyzer_cache"): 0,
     ("admission", "live_rpc"): 0,
     ("admission", "database"): 0,
@@ -163,7 +149,6 @@ def test_synthetic_snapshot_ids_still_present_until_migrated():
         # 3c DONE: Boltz threads real snapshot refs; synthetic label
         # survives only as the fail-open fallback.
         "modules/boltz_manager.py": 'or f"boltz-swap-',
-        "modules/lnplus_swaps.py": 'snapshot_id=f"lnplus-swap-',
     }
     for rel, marker in expected.items():
         assert marker in (REPO / rel).read_text(), (

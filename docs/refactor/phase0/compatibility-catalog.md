@@ -60,14 +60,13 @@ dataclass is normative).
 
 ## External obligations
 
-- LN+ swaps in flight (`lnplus_swaps` table) — contractual; honored even
   when new-obligation creation is disabled (invariant 6)
 - Boltz swaps in flight (boltzcli journal) — reconciliation must complete
   across restart
 
 ---
 
-### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 62)
+### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 49)
 
 - `paused`
 - `daily_budget_sats`
@@ -108,7 +107,6 @@ dataclass is normative).
 - `econ_shadow_enabled` (added 2026-07-12, Phase 1 wiring)
 - `econ_governor_rebalance_enabled` (added 2026-07-12, Phase 2D)
 - `econ_governor_planner_enabled` (added 2026-07-12, Phase 2E)
-- `econ_governor_lnplus_enabled` (added 2026-07-12, Phase 2F)
 - `econ_governor_boltz_enabled` (added 2026-07-12, Phase 2G)
 - `econ_governor_fees_enabled` (added 2026-07-12, Phase 2H)
 - `econ_arbiter_enabled` (added 2026-07-13, Phase 3F)
@@ -119,20 +117,8 @@ dataclass is normative).
 - `econ_conflict_rules_extended` (added 2026-07-13, Phase G PR 10)
 - `authority_level` (added 2026-07-13, Phase 4 Workstream I; observe/fees/liquidity/capital, default `capital`)
 - `risk_profile` (added 2026-07-13, Phase D PR 7; default `custom`)
-- `lnplus_swaps_enabled`
-- `lnplus_execute_applications`
-- `lnplus_swap_preference_margin`
-- `lnplus_max_duration_months`
-- `lnplus_min_peer_positive_ratings`
-- `lnplus_min_peer_rank`
-- `lnplus_max_participants`
-- `lnplus_min_participants`
-- `lnplus_apply_feerate_ceiling`
-- `lnplus_pending_timeout_days`
-- `lnplus_inbound_credit_factor`
-- `lnplus_watcher_interval`
 
-### Full Config dataclass surface (147 fields with defaults)
+### Full Config dataclass surface (134 fields with defaults)
 
 | Field | Default | Runtime-settable |
 |---|---|---|
@@ -166,7 +152,6 @@ dataclass is normative).
 | `econ_shadow_enabled` | `True` | yes |
 | `econ_governor_rebalance_enabled` | `True` | yes |
 | `econ_governor_planner_enabled` | `True` | yes |
-| `econ_governor_lnplus_enabled` | `True` | yes |
 | `econ_governor_boltz_enabled` | `True` | yes |
 | `econ_governor_fees_enabled` | `True` | yes |
 | `econ_arbiter_enabled` | `True` | yes |
@@ -268,18 +253,6 @@ dataclass is normative).
 | `capex_tactical_rate` | `0.15` |  |
 | `capex_global_envelope_sats` | `0` |  |
 | `capex_probability_budget_bonus` | `0.0` | yes |
-| `lnplus_swaps_enabled` | `True` | yes |
-| `lnplus_execute_applications` | `True` | yes |
-| `lnplus_swap_preference_margin` | `0.2` | yes |
-| `lnplus_max_duration_months` | `3` | yes |
-| `lnplus_min_peer_positive_ratings` | `5` | yes |
-| `lnplus_min_peer_rank` | `8` | yes |
-| `lnplus_max_participants` | `4` | yes |
-| `lnplus_min_participants` | `3` | yes |
-| `lnplus_apply_feerate_ceiling` | `5000` | yes |
-| `lnplus_pending_timeout_days` | `7` | yes |
-| `lnplus_inbound_credit_factor` | `0.5` | yes |
-| `lnplus_watcher_interval` | `3600` | yes |
 | `_version` | `0` |  |
 | `_lock` | `factory:allocate_lock` |  |
 | `_override_warnings` | `factory:list` |  |

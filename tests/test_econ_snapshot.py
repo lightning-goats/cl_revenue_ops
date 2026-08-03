@@ -54,7 +54,7 @@ def _chan(cid="123x456x0", **over):
         sourced_forward_count=96,
         role="ROUTER",
         lifecycle="PRODUCTIVE",
-        protections=(Protection("lnplus_contract", "lnplus",
+        protections=(Protection("operator_no_close", "operator_policy",
                                 UnixTime(1_755_000_000)),),
         confidence_micro=Micro(850_000),
     )

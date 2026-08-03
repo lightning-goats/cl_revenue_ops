@@ -303,22 +303,21 @@ def s19():
 
 
 def s20():
-    lnplus = _env("OPEN_CHANNEL", target="02" + "b" * 64,
+    higher = _env("OPEN_CHANNEL", target="02" + "b" * 64,
                   amount=2_000_000, priority=80, bucket="channel_open",
-                  policy="lnplus_lifecycle_governed")
-    planner = _env("OPEN_CHANNEL", target="02" + "b" * 64,
-                   amount=1_000_000, priority=50, bucket="channel_open",
-                   policy="planner")
-    result = arbitrate([planner, lnplus], now=NOW, extended_rules=True)
+                  policy="operator_contract")
+    lower = _env("OPEN_CHANNEL", target="02" + "b" * 64,
+                 amount=1_000_000, priority=50, bucket="channel_open",
+                 policy="automated_growth")
+    result = arbitrate([lower, higher], now=NOW, extended_rules=True)
     return {"case.json": _case(
-        "open-vs-lnplus-conflict", "arbitration",
-        {"intents": [to_wire(planner), to_wire(lnplus)],
+        "duplicate-open-priority-conflict", "arbitration",
+        {"intents": [to_wire(lower), to_wire(higher)],
          "extended_rules": True},
         _arb_wire(result),
-        "Spec conflict rule: open vs LN+ — both paths emit OPEN_CHANNEL "
-        "to the peer; CONFLICT_DUPLICATE_OPEN rejects the lower-priority "
-        "one (the LN+ obligation at priority 80 wins)",
-        notes=["Gated by econ_conflict_rules_extended (PR 10)."])}
+        "Duplicate OPEN_CHANNEL intents to one peer are deduplicated; "
+        "the higher-priority intent wins",
+        notes=["Gated by econ_conflict_rules_extended."])}
 
 
 def s21():
@@ -443,37 +442,6 @@ def s27():
         "NEVER auto-zeroed; stale ones quarantine only",
         source="modules/econ_reconcile.py (TDD-pinned in "
                "tests/test_econ_reconcile.py)")}
-
-
-def s28():
-    return {"case.json": _from_golden(
-        "lnplus-state-divergence-gate", "failure_mode",
-        "lnplus/filter_dual_swap_rejected.json",
-        "Workstream G: LN+ platform-state divergence rejected at the "
-        "gate chain; watcher reconciliation is preflight-gated",
-        notes=["Full watcher divergence handling is exercised by "
-               "tests/test_lnplus_swaps.py::reconcile paths."])}
-
-
-def s29():
-    obligation = _env(intent_type="OPEN_CHANNEL", target="02" + "b" * 64,
-                      amount=0, max_cost=214, capital=2_000_000,
-                      bucket="channel_open", priority=80,
-                      reason_codes=("CONTRACT_OBLIGATION",))
-    blocked = _facade(authority_check=lambda: authority_allows(
-        "observe", "capital")).authorize(obligation, NOW,
-                                         reservation_id="lnplus-1")
-    ungated = _facade(authority_check=None).authorize(
-        obligation, NOW, reservation_id="lnplus-1")
-    return {"case.json": _case(
-        "lnplus-obligation-under-lower-authority", "authorization",
-        {"intent": to_wire(obligation), "authority_level": "observe"},
-        {"if_authority_gated": _decision_wire(blocked),
-         "lnplus_path_is_ungated": _decision_wire(ungated),
-         "invariant": "obligation fulfillment is EXEMPT from "
-                      "authority_level but NEVER from the governor"},
-        "Invariant 6 + Workstream I: accepted obligations complete "
-        "under any authority level, still authorized and ledgered")}
 
 
 def s30():
@@ -692,7 +660,7 @@ SCENARIOS = {
     "17-manual-diagnostic-rebalance": s17,
     "18-conflicting-close-rebalance": s18,
     "19-protected-close-rejection": s19,
-    "20-open-vs-lnplus": s20,
+    "20-duplicate-open-priority": s20,
     "21-circular-vs-boltz-structural": s21,
     "22-budget-exhaustion": s22,
     "23-concurrent-reservation-contention": s23,
@@ -700,8 +668,6 @@ SCENARIOS = {
     "25-missing-execution-cost": s25,
     "26-unknown-execution-outcome": s26,
     "27-boltz-timeout-after-acceptance": s27,
-    "28-lnplus-state-divergence": s28,
-    "29-lnplus-obligation-lower-authority": s29,
     "30-stale-intent": s30,
     "31-duplicate-idempotency-key": s31,
     "32-numeric-overflow-underflow": s32,

@@ -40,15 +40,15 @@ def _env(intent_type="REBALANCE", target="111x222x0", amount=400_000,
 
 class TestBatchDuplicateOpen:
     def test_second_open_to_same_peer_rejected(self):
-        lnplus = _env("OPEN_CHANNEL", target="02" + "b" * 64,
+        higher = _env("OPEN_CHANNEL", target="02" + "b" * 64,
                       amount=2_000_000, priority=80,
-                      bucket="channel_open", policy="lnplus")
+                      bucket="channel_open", policy="operator_contract")
         planner = _env("OPEN_CHANNEL", target="02" + "b" * 64,
                        amount=1_000_000, priority=50,
                        bucket="channel_open", policy="planner")
-        result = arbitrate([planner, lnplus], now=NOW,
+        result = arbitrate([planner, higher], now=NOW,
                            extended_rules=True)
-        assert [e.origin_policy for e in result.ordered] == ["lnplus"]
+        assert [e.origin_policy for e in result.ordered] == ["operator_contract"]
         assert result.rejected[0][1] == "CONFLICT_DUPLICATE_OPEN"
 
     def test_different_peers_both_survive(self):

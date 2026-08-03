@@ -10,7 +10,7 @@ Six verified defects around the half-adopted live-arbitration registry:
 3. the REBALANCE conflict identity omits the source leg, colliding two
    distinct pairs that share dest+amount;
 4. first-registered OPEN_CHANNEL wins over a later higher-precedence
-   LN+ obligation open (spec precedence inversion);
+   contract obligation open (spec precedence inversion);
 5. unlocked lazy registry init can hand two authorizations different
    registries;
 6. batch arbitration fails open for the WHOLE cycle when one candidate
@@ -186,32 +186,32 @@ class TestOpenPreemption:
         return _intent(intent_type="OPEN_CHANNEL", target=self.PEER,
                        snapshot_id="planner-cycle-1", priority=50)
 
-    def _lnplus_open(self):
+    def _higher_priority_open(self):
         return _intent(intent_type="OPEN_CHANNEL", target=self.PEER,
-                       snapshot_id="lnplus-swap-42", priority=80,
+                       snapshot_id="operator-contract-42", priority=80,
                        reason_codes=("CONTRACT_OBLIGATION",))
 
     def test_obligation_preempts_planner_open(self):
         registry = self._registry()
         assert registry.check_and_register(self._planner_open(), NOW) is None
-        # The LN+ obligation outranks per the batch J3 ladder — it must
+        # The contract obligation outranks per the batch J3 ladder — it must
         # preempt, not be rejected.
-        assert registry.check_and_register(self._lnplus_open(), NOW) is None
-        # The LN+ entry now holds the slot: the planner open is blocked.
+        assert registry.check_and_register(self._higher_priority_open(), NOW) is None
+        # The higher-priority entry now holds the slot.
         assert registry.check_and_register(self._planner_open(), NOW) == \
             "CONFLICT_DUPLICATE_OPEN"
         assert registry.active_count(NOW) == 1
 
     def test_lower_priority_incoming_still_blocked(self):
         registry = self._registry()
-        assert registry.check_and_register(self._lnplus_open(), NOW) is None
+        assert registry.check_and_register(self._higher_priority_open(), NOW) is None
         assert registry.check_and_register(self._planner_open(), NOW) == \
             "CONFLICT_DUPLICATE_OPEN"
 
     def test_mirrors_batch_ordering(self):
         """The live preemption must agree with batch arbitration's
         winner for the same pair of intents."""
-        batch = arbitrate([self._planner_open(), self._lnplus_open()],
+        batch = arbitrate([self._planner_open(), self._higher_priority_open()],
                           now=NOW, extended_rules=True)
         assert [e.priority for e in batch.ordered] == [80]
 
@@ -357,51 +357,9 @@ class TestEngineTerminalCompletion:
 
 
 # ---------------------------------------------------------------------------
-# Defect 1 (caller side) — LN+ / planner / boltz terminal hooks
+# Defect 1 (caller side) — contract / planner / boltz terminal hooks
 # ---------------------------------------------------------------------------
 PEER = "02" + "b" * 64
-
-
-class TestLnplusTerminalCompletion:
-    def _lifecycle(self, registry):
-        from modules.lnplus_swaps import SwapLifecycle
-        db = MagicMock()
-        db.reserve_spend.return_value = True
-        db.release_spend_reservation.return_value = True
-        db.mark_spend_reservation_spent.return_value = True
-        cfg = MagicMock()
-        cfg.snapshot.return_value = SimpleNamespace(
-            econ_governor_lnplus_enabled=True, paused=False)
-        lifecycle = SwapLifecycle(
-            MagicMock(), MagicMock(), db, cfg, MagicMock(), MagicMock())
-        shadow = MagicMock()
-        shadow.ledger_for_reconciliation.return_value = None
-        shadow.arbitration_registry.return_value = registry
-        shadow.snapshot_ref.return_value = None
-        lifecycle.econ_shadow = shadow
-        return lifecycle
-
-    def _reserve(self, lifecycle, reservation_id):
-        return lifecycle._governed_reserve_spend(
-            reservation_id=reservation_id, amount_sats=214,
-            metadata={"swap_id": 42, "peer_id": PEER},
-            effective_budget_sats=1000, since_timestamp=NOW,
-            swap_id=42, peer_id=PEER, capacity_sats=2_000_000)
-
-    def test_release_frees_slot_for_retry(self):
-        registry = ActiveIntentRegistry()
-        lifecycle = self._lifecycle(registry)
-        assert self._reserve(lifecycle, "rid-1") is True
-        assert self._reserve(lifecycle, "rid-2") is False  # in flight
-        lifecycle._release_swap_open_reservation("rid-1", 42)
-        assert self._reserve(lifecycle, "rid-3") is True
-
-    def test_settle_frees_slot(self):
-        registry = ActiveIntentRegistry()
-        lifecycle = self._lifecycle(registry)
-        assert self._reserve(lifecycle, "rid-1") is True
-        lifecycle._settle_swap_open_reservation("rid-1", 214, 42)
-        assert registry.active_count(NOW) == 0
 
 
 class TestBoltzTerminalCompletion:

@@ -1,5 +1,5 @@
 {
- "case": "open-vs-lnplus-conflict",
+ "case": "duplicate-open-priority-conflict",
  "category": "arbitration",
  "expected": {
   "ordered_intent_ids": [
@@ -37,7 +37,7 @@
     "intent_id": "int-7a1a535688437c94",
     "intent_type": "OPEN_CHANNEL",
     "max_cost_msat": 3000000,
-    "origin_policy": "planner",
+    "origin_policy": "automated_growth",
     "preconditions": [],
     "priority": 50,
     "reason_codes": [],
@@ -68,7 +68,7 @@
     "intent_id": "int-3d0c93c3b4d98c38",
     "intent_type": "OPEN_CHANNEL",
     "max_cost_msat": 3000000,
-    "origin_policy": "lnplus_lifecycle_governed",
+    "origin_policy": "operator_contract",
     "preconditions": [],
     "priority": 80,
     "reason_codes": [],
@@ -81,9 +81,9 @@
   ]
  },
  "notes": [
-  "Gated by econ_conflict_rules_extended (PR 10)."
+  "Gated by econ_conflict_rules_extended."
  ],
- "requirement": "Spec conflict rule: open vs LN+ \u2014 both paths emit OPEN_CHANNEL to the peer; CONFLICT_DUPLICATE_OPEN rejects the lower-priority one (the LN+ obligation at priority 80 wins)",
+ "requirement": "Duplicate OPEN_CHANNEL intents to one peer are deduplicated; the higher-priority intent wins",
  "schema_name": "conformance_case",
  "schema_version": 0
 }

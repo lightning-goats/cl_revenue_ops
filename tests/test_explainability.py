@@ -173,7 +173,6 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "econ_shadow_enabled",
         "econ_governor_rebalance_enabled",
         "econ_governor_planner_enabled",
-        "econ_governor_lnplus_enabled",
         "econ_governor_boltz_enabled",
         "econ_governor_fees_enabled",
         "econ_arbiter_enabled",
@@ -185,18 +184,6 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "authority_level",
         "risk_profile",
         # LN+ liquidity swap automation
-        "lnplus_swaps_enabled",
-        "lnplus_execute_applications",
-        "lnplus_swap_preference_margin",
-        "lnplus_max_duration_months",
-        "lnplus_min_peer_positive_ratings",
-        "lnplus_min_peer_rank",
-        "lnplus_max_participants",
-        "lnplus_min_participants",
-        "lnplus_apply_feerate_ceiling",
-        "lnplus_pending_timeout_days",
-        "lnplus_inbound_credit_factor",
-        "lnplus_watcher_interval",
     ]
     assert result["operator_controls"]["values"] == {
         "paused": False,
@@ -238,7 +225,6 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "econ_shadow_enabled": True,
         "econ_governor_rebalance_enabled": True,
         "econ_governor_planner_enabled": True,
-        "econ_governor_lnplus_enabled": True,
         "econ_governor_boltz_enabled": True,
         "econ_governor_fees_enabled": True,
         "econ_arbiter_enabled": True,
@@ -249,18 +235,6 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "econ_conflict_rules_extended": True,
         "authority_level": "capital",
         "risk_profile": "custom",
-        "lnplus_swaps_enabled": True,
-        "lnplus_execute_applications": True,
-        "lnplus_swap_preference_margin": 0.2,
-        "lnplus_max_duration_months": 3,
-        "lnplus_min_peer_positive_ratings": 5,
-        "lnplus_min_peer_rank": 8,
-        "lnplus_max_participants": 4,
-        "lnplus_min_participants": 3,
-        "lnplus_apply_feerate_ceiling": 5000,
-        "lnplus_pending_timeout_days": 7,
-        "lnplus_inbound_credit_factor": 0.5,
-        "lnplus_watcher_interval": 3600,
     }
     assert "config" not in result
 

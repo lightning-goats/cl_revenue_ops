@@ -4,7 +4,7 @@ One owner for "may this channel be closed, and why not": the policy
 gate (operator tags/strategies), the economic close-protection gates
 (kalman-confidence, 30d inbound-gateway role, 30d sourced fees,
 revenue-route pairs — semantics fixed at baseline commit 5e8f747), and
-the LN+ contract window. Consumers (the capacity planner today) ask
+operator no_close policy. Consumers (the capacity planner today) ask
 this service; they do not embed the rules.
 
 Decisions are pure and evidence-injected (no plugin/rpc/DB/clock); the
@@ -170,48 +170,12 @@ def policy_close_block(policy: Any) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# LN+ contract window
-# ---------------------------------------------------------------------------
-
-
-def lnplus_contract_protection(opened_at: Any, duration_months: Any,
-                               swap_id: Any,
-                               now: Any = None) -> Optional[Protection]:
-    """An accepted LN+ swap obligates the channel to stay open for the
-    swap's duration: an owned, expiring Protection (invariant 6).
-
-    Wave2 F7: the computed expires_at is compared against the injected
-    evaluation time `now` — an expired contract yields NO protection. This
-    module is pure (no clock), so callers must pass `now`; with now=None the
-    expiry cannot be evaluated and the protection is kept, which errs on the
-    side of blocking closes (the conservative direction for a close gate).
-    """
-    try:
-        start = int(opened_at)
-        months = int(duration_months)
-    except (TypeError, ValueError):
-        return None
-    if start <= 0 or months <= 0:
-        return None
-    expires = start + months * 30 * 86400
-    if now is not None:
-        try:
-            if int(now) >= expires:
-                return None  # contract window elapsed: no protection
-        except (TypeError, ValueError):
-            pass  # unusable clock: keep the protection (blocks closes)
-    return Protection(reason="lnplus_contract", owner="lnplus",
-                      expires_at=UnixTime(expires))
-
-
-# ---------------------------------------------------------------------------
 # Aggregation + lifecycle derivation (v0)
 # ---------------------------------------------------------------------------
 
 
 def close_protections(*, scid_display: str, prof: Any, flow_metrics: Any,
                       route_pair_channels, policy: Any = None,
-                      lnplus_obligation: Optional[dict] = None,
                       flow_window_days: int = 7,
                       now: Any = None) -> Tuple[Protection, ...]:
     """Every protection currently blocking closure, as owned typed data."""
@@ -227,14 +191,6 @@ def close_protections(*, scid_display: str, prof: Any, flow_metrics: Any,
         if blocked:
             protections.append(Protection(
                 reason=blocked, owner="operator_policy", expires_at=None))
-    if lnplus_obligation:
-        contract = lnplus_contract_protection(
-            lnplus_obligation.get("opened_at"),
-            lnplus_obligation.get("duration_months"),
-            lnplus_obligation.get("swap_id"),
-            now=now)
-        if contract is not None:
-            protections.append(contract)
     return tuple(protections)
 
 

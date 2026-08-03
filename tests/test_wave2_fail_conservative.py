@@ -192,7 +192,6 @@ def _make_cycle_planner():
         'count': 0, 'marginal_roi_proxy': 0,
     }
     prof_analyzer.database.record_planner_action.return_value = 1
-    prof_analyzer.database.lnplus_reserved_sats.return_value = 0
     prof_analyzer.identify_bleeders_v2.return_value = []
 
     planner = CapacityPlanner(plugin, prof_analyzer, flow_analyzer)
@@ -544,35 +543,6 @@ class TestProtectionService:
         reason = close_protection_reason(SCID, prof, flow, set())
 
         assert reason == "KALMAN_LOW_CONFIDENCE"
-
-    def test_expired_lnplus_contract_is_not_protected(self):
-        from modules.protection_service import lnplus_contract_protection
-        start = 1_752_400_000
-        expiry = start + 3 * 30 * 86400
-        assert lnplus_contract_protection(start, 3, "x", now=expiry + 1) is None
-        active = lnplus_contract_protection(start, 3, "x", now=expiry - 1)
-        assert active is not None
-        assert active.reason == "lnplus_contract"
-
-    def test_close_protections_threads_now_for_expiry(self):
-        from types import SimpleNamespace
-        from modules.protection_service import close_protections
-        start = 1_752_400_000
-        result = close_protections(
-            scid_display=SCID,
-            prof=SimpleNamespace(
-                role_30d=None, channel_role=None, marginal_roi_percent=0.0,
-                window_30d_available=True, sourced_fee_30d_msat=0,
-                days_open=100,
-                revenue=SimpleNamespace(sourced_fee_contribution_sats=0),
-            ),
-            flow_metrics=SimpleNamespace(confidence=0.9, forward_count=50),
-            route_pair_channels=set(),
-            lnplus_obligation={"opened_at": start, "duration_months": 3,
-                               "swap_id": "x"},
-            now=start + 4 * 30 * 86400,  # past expiry
-        )
-        assert all(p.owner != "lnplus" for p in result)
 
 
 # ---------------------------------------------------------------------------
