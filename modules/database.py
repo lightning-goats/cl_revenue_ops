@@ -5721,7 +5721,7 @@ class Database:
         """Return top revenue-generating (in_channel, out_channel) pairs.
 
         Each row contains the channel IDs, total fees, forward count, and
-        average fee per forward.  Used by capacity planner, and rebalancer for route-aware decision-making.
+        average fee per forward.  Used by retained route-aware rebalance analysis.
         """
         conn = self._get_connection()
         cutoff = int(time.time()) - (days * 86400)

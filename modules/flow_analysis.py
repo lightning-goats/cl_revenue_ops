@@ -769,7 +769,7 @@ class FlowAnalyzer:
         self._analyze_all_running: bool = False
 
         # Result cache for analyze_all_channels (mirrors profitability analyzer).
-        # Capital-efficiency consumers (capacity planner, capex budget,
+        # Capital-efficiency and rebalance budget consumers (capex budget,
         # rebalancer) re-run analyze_all_channels several times per cycle;
         # without a cache each run repeats the full RPC fetch + bulk DB reads
         # + per-channel Kalman updates + state writes.

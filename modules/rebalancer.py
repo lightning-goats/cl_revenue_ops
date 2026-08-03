@@ -321,16 +321,12 @@ class EVRebalancer:
         engine updates that row in place instead of inserting its own
         'pending' row, so each rebalance produces exactly one history row.
 
-        ``reserve_budget`` (P4-020): forwarded to the engine so the
-        defibrillation diagnostic shock reserves its fee cap atomically on the
-        unified cross-category rail (the auto cycle's path). Manual/explicit
-        callers leave it False and own their own accounting.
+        ``reserve_budget``: forwarded to the engine for callers that delegate
+        reservation accounting. Explicit manual callers normally leave it False
+        and own their accounting.
 
-        ``account_costs`` (P4-025): when True the engine records the settled
-        fee into rebalance_costs BEFORE it marks the reservation spent (the
-        auto-cycle ordering), closing the transient window where a shock fee is
-        counted by neither the reservation nor rebalance_costs. The caller must
-        then NOT record the cost itself (double count).
+        ``account_costs``: when True the engine records the settled fee before
+        marking the reservation spent. The caller must not record that cost again.
         """
         if self.rebalance_engine_v2 is None:
             raise RuntimeError("no rebalance engine available")

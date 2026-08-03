@@ -8,7 +8,7 @@ Covers:
    amount instead of keeping the full pair budget.
 3. Probability-bonus effective budget flows through to execution and budget
    reservation (and stays identical when the bonus is 0).
-4. Manual/diagnostic rebalances produce exactly one rebalance_history row
+4. Manual rebalances produce exactly one rebalance_history row
    (the rebalancer's row is reused by the engine instead of inserting a
    second 'pending' row).
 5. execute_rebalance success path records status='success' (not 'completed').

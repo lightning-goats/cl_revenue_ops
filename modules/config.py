@@ -204,7 +204,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'estimated_open_cost_sats': int,
     'source_threshold': float,
     'sink_threshold': float,
-    # Capacity Planner
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': float,
     'capex_bootstrap_bps': int,
@@ -285,9 +284,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'growth_budget_experiment_fraction': (0.0, 1.0),
     'growth_budget_max_extra_sats': (0, 1_000_000),
     'growth_budget_hard_ceiling_sats': (0, 10_000_000),
-    # Operator ruling D4: diagnostic fee cap must stay a small, bounded
-    # diagnostic spend — never 0 (would disable the defibrillator envelope)
-    # and never above 10k sats (a typo must not authorize huge spend).
     'weekly_budget_sats': (0, 70_000_000),
     'receivable_ratio_target': (0.0, 1.0),
     'receivable_ratio_floor': (0.0, 1.0),
@@ -349,7 +345,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_size_reference_percentile': (0.0, 1.0),
     'rebalance_small_channel_band_half_width': (0.0, 0.5),
     'estimated_open_cost_sats': (0, 1000000),
-    # Capacity Planner
     # Z-2 (2026-07-08): 0 disables the grace fallback entirely (immediate
     # release on hint staleness); ceiling is 30 days.
     # Unified Capex Budget Engine
@@ -547,9 +542,7 @@ class Config:
     # Default 1000 ppm = 0.1% of rebalance amount. 0 disables the layer
     # and keeps the Phase 5 capex-only behavior.
     pair_fee_cap_ppm: int = 1000
-    # Upstream rebalancer patterns (flow-facts / EV / planner tuning).
-    # Consumed by ChannelFlowFacts (activity + utilization knobs) and by
-    # the rebalance engine EV / capacity planner (size-tiering knobs).
+    # Rebalance flow-fact, EV, utilization, and size-tier tuning.
     # Window over which recent forwarding activity is measured for the
     # activity-recency penalty (seconds). Default 3600 = 1 hour.
     rebalance_activity_window_seconds: int = 3600
@@ -594,12 +587,6 @@ class Config:
     growth_budget_hard_ceiling_sats: int = 10_000
     allow_zero_cost_auto_rebalance_when_budget_zero: bool = False
     weekly_budget_sats: int = 35000        # Max rebalancing fees per 7-day window (hard ceiling)
-    # Operator ruling D4 (2026-07-01): fee cap (sats) for the diagnostic
-    # ("defibrillator") shock rebalance. The shock's ppm ceiling is DERIVED
-    # from this cap (ceil(cap/amount*1e6)), so this is the single binding
-    # knob. Default 400 covers observed market route prices (118-363 sats)
-    # that the old hardcoded 100-sat envelope rejected route_over_budget.
-    # At use it is clamped to [1, min(daily_budget_sats, 10_000)].
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
 
     # RPC Hardening
@@ -1190,9 +1177,6 @@ class ConfigSnapshot:
     # Weekly budget cap (hard ceiling over daily burst)
     weekly_budget_sats: int = 35000
 
-    # Diagnostic (defibrillator) shock fee cap — operator ruling D4
-
-    # Capacity Planner
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50
     capex_bootstrap_bps: int = 10
@@ -1200,7 +1184,7 @@ class ConfigSnapshot:
     capex_grace_days: int = 14
     capex_global_envelope_sats: int = 0
     capex_probability_budget_bonus: float = 0.0
-    # Structural loop-out / drain-demand fields
+    # Receivable-ratio and fee drain-bias fields
     receivable_ratio_target: float = 0.30
     receivable_ratio_floor: float = 0.20
     drain_fee_discount_max: float = 0.0

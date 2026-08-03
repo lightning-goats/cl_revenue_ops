@@ -9,14 +9,6 @@ shocks (every attempt recorded as ``native_route_invalid: missing_route``):
    real getroutes error (askrene 206 "excessive delays"), burning a budget
    reservation, and misclassifying the failure for futility/cooldown logic.
    Fix: return the pricing error immediately; the executor must never run.
-
-2. ``diagnostic_rebalance`` (defibrillator) picked its shock source purely by
-   highest spendable sats with no fallback. When that single source is
-   unroutable (Tallship advertises 600/1201/2016 CLTV deltas, so askrene can
-   never build a route from it), every daily shock failed forever.
-   Fix: on a route-availability failure, retry with the next-best source
-   (bounded number of attempts). Non-route failures must NOT retry — a
-   payment that may have gone out must never be repeated blindly.
 """
 
 import os

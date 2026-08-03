@@ -3704,13 +3704,9 @@ class RebalanceEngine:
         ``rebalance_id``: optional existing rebalance_history row id owned by
         the caller; see _execute_pair.
 
-        ``reserve_budget`` (P4-020): manual callers (revenue-rebalance) default
-        False and own their own accounting. The defibrillation diagnostic shock
-        passes True so it reserves its fee cap atomically through the SAME
-        cross-category rail as the auto cycle (``_reserve_execution_budget`` ->
-        ``reserve_budget`` inside ``_reserve_budget_atomic``'s BEGIN IMMEDIATE);
-        a shock is then rejected when the unified budget is exhausted by other
-        categories' reservations, closing the last autonomous-spender hole.
+        ``reserve_budget``: explicit manual callers default False and own their
+        accounting. Automatic retained rebalances pass True and reserve atomically
+        through the unified cross-category rail.
         """
         if not self._cycle_lock.acquire(blocking=False):
             self._log(

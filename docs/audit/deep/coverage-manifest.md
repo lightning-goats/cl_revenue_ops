@@ -6,13 +6,13 @@ Do not hand-edit chunk rows; regenerate. Owner/status columns are the one place 
 ## Summary
 
 - Total tracked source files: **81**
-- Total tracked source lines: **64796**
+- Total tracked source lines: **64772**
 - Total chunks: **179**
 
 | Tier | Chunk size | Files | Lines | Chunks |
 | --- | --- | --- | --- | --- |
-| 1 | 400 | 10 | 32765 | 88 |
-| 2 | 700 | 8 | 8444 | 17 |
+| 1 | 400 | 10 | 32757 | 88 |
+| 2 | 700 | 8 | 8428 | 17 |
 | 3 | 700 | 63 | 23587 | 74 |
 
 ## Chunks
@@ -43,30 +43,30 @@ Do not hand-edit chunk rows; regenerate. Owner/status columns are the one place 
 | modules/capex_budget.py#2 | modules/capex_budget.py | 401 | 575 | 1 | c4daebab78c7c52585694eacbe0205fe54371375 |  | UNASSIGNED |
 | modules/capital_efficiency.py#1 | modules/capital_efficiency.py | 1 | 218 | 3 | cc31c785899e9945a6076ebe8a174d4be0a78508 |  | UNASSIGNED |
 | modules/classification.py#1 | modules/classification.py | 1 | 180 | 3 | ee8a9b7e9af0fb8e8068eb91edd8421152d98c02 |  | UNASSIGNED |
-| modules/config.py#1 | modules/config.py | 1 | 700 | 2 | f0167645951c34de6b975034db72378170b304ac |  | UNASSIGNED |
-| modules/config.py#2 | modules/config.py | 701 | 1370 | 2 | f0167645951c34de6b975034db72378170b304ac |  | UNASSIGNED |
+| modules/config.py#1 | modules/config.py | 1 | 700 | 2 | 47ff46bc03f5893f39f628e039ad5ba0ba5f9cd6 |  | UNASSIGNED |
+| modules/config.py#2 | modules/config.py | 701 | 1354 | 2 | 47ff46bc03f5893f39f628e039ad5ba0ba5f9cd6 |  | UNASSIGNED |
 | modules/cycle_context.py#1 | modules/cycle_context.py | 1 | 54 | 3 | 8be0a45e7f5c13c726d9d534f76ce9f4c27e95b7 |  | UNASSIGNED |
 | modules/data_service.py#1 | modules/data_service.py | 1 | 458 | 3 | ea9712d478a9b7167fba914da005a293c573f718 |  | UNASSIGNED |
-| modules/database.py#1 | modules/database.py | 1 | 400 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#2 | modules/database.py | 401 | 800 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#3 | modules/database.py | 801 | 1200 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#4 | modules/database.py | 1201 | 1600 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#5 | modules/database.py | 1601 | 2000 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#6 | modules/database.py | 2001 | 2400 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#7 | modules/database.py | 2401 | 2800 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#8 | modules/database.py | 2801 | 3200 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#9 | modules/database.py | 3201 | 3600 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#10 | modules/database.py | 3601 | 4000 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#11 | modules/database.py | 4001 | 4400 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#12 | modules/database.py | 4401 | 4800 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#13 | modules/database.py | 4801 | 5200 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#14 | modules/database.py | 5201 | 5600 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#15 | modules/database.py | 5601 | 6000 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#16 | modules/database.py | 6001 | 6400 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#17 | modules/database.py | 6401 | 6800 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#18 | modules/database.py | 6801 | 7200 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#19 | modules/database.py | 7201 | 7600 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
-| modules/database.py#20 | modules/database.py | 7601 | 7739 | 1 | f9481ece7e5dadaeaaff6dbcf98d0f1b3acf47b8 |  | UNASSIGNED |
+| modules/database.py#1 | modules/database.py | 1 | 400 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#2 | modules/database.py | 401 | 800 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#3 | modules/database.py | 801 | 1200 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#4 | modules/database.py | 1201 | 1600 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#5 | modules/database.py | 1601 | 2000 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#6 | modules/database.py | 2001 | 2400 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#7 | modules/database.py | 2401 | 2800 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#8 | modules/database.py | 2801 | 3200 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#9 | modules/database.py | 3201 | 3600 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#10 | modules/database.py | 3601 | 4000 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#11 | modules/database.py | 4001 | 4400 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#12 | modules/database.py | 4401 | 4800 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#13 | modules/database.py | 4801 | 5200 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#14 | modules/database.py | 5201 | 5600 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#15 | modules/database.py | 5601 | 6000 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#16 | modules/database.py | 6001 | 6400 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#17 | modules/database.py | 6401 | 6800 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#18 | modules/database.py | 6801 | 7200 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#19 | modules/database.py | 7201 | 7600 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
+| modules/database.py#20 | modules/database.py | 7601 | 7739 | 1 | 7c0f81161a86f721cf443d1a429ec4506f62bc19 |  | UNASSIGNED |
 | modules/econ_arbiter.py#1 | modules/econ_arbiter.py | 1 | 316 | 3 | a4a0a4bfcfa5d9a369b2d097c18af5f8200d6eb6 |  | UNASSIGNED |
 | modules/econ_cycle.py#1 | modules/econ_cycle.py | 1 | 185 | 3 | 1acfd33611fe493ea934719742f5782ed488826b |  | UNASSIGNED |
 | modules/econ_ev.py#1 | modules/econ_ev.py | 1 | 66 | 3 | da8c882f6df25464ef03d7a0deec97003d1eda86 |  | UNASSIGNED |
@@ -104,10 +104,10 @@ Do not hand-edit chunk rows; regenerate. Owner/status columns are the one place 
 | modules/fee_cycle_capture.py#1 | modules/fee_cycle_capture.py | 1 | 700 | 3 | 68f99e3e9d19773b6d2f422e1568277b7041595b |  | UNASSIGNED |
 | modules/fee_cycle_capture.py#2 | modules/fee_cycle_capture.py | 701 | 1075 | 3 | 68f99e3e9d19773b6d2f422e1568277b7041595b |  | UNASSIGNED |
 | modules/fee_cycle_replay_wire.py#1 | modules/fee_cycle_replay_wire.py | 1 | 66 | 3 | 6692da2243e3390c8771ce35e0cd6f7ccf4c25fa |  | UNASSIGNED |
-| modules/flow_analysis.py#1 | modules/flow_analysis.py | 1 | 700 | 2 | acdf56fc07a29a37c6dfe49053b261266de07bee |  | UNASSIGNED |
-| modules/flow_analysis.py#2 | modules/flow_analysis.py | 701 | 1400 | 2 | acdf56fc07a29a37c6dfe49053b261266de07bee |  | UNASSIGNED |
-| modules/flow_analysis.py#3 | modules/flow_analysis.py | 1401 | 2100 | 2 | acdf56fc07a29a37c6dfe49053b261266de07bee |  | UNASSIGNED |
-| modules/flow_analysis.py#4 | modules/flow_analysis.py | 2101 | 2161 | 2 | acdf56fc07a29a37c6dfe49053b261266de07bee |  | UNASSIGNED |
+| modules/flow_analysis.py#1 | modules/flow_analysis.py | 1 | 700 | 2 | b07e1d483104c36a37340e1485c121f827267ed5 |  | UNASSIGNED |
+| modules/flow_analysis.py#2 | modules/flow_analysis.py | 701 | 1400 | 2 | b07e1d483104c36a37340e1485c121f827267ed5 |  | UNASSIGNED |
+| modules/flow_analysis.py#3 | modules/flow_analysis.py | 1401 | 2100 | 2 | b07e1d483104c36a37340e1485c121f827267ed5 |  | UNASSIGNED |
+| modules/flow_analysis.py#4 | modules/flow_analysis.py | 2101 | 2161 | 2 | b07e1d483104c36a37340e1485c121f827267ed5 |  | UNASSIGNED |
 | modules/governor_facade.py#1 | modules/governor_facade.py | 1 | 261 | 3 | 20d338af23bf1319a87128bd3fddea96c67a7eda |  | UNASSIGNED |
 | modules/growth_budget.py#1 | modules/growth_budget.py | 1 | 160 | 3 | 5f9fbd1e993f96c9a9615b94a6603686194f58bc |  | UNASSIGNED |
 | modules/policy_manager.py#1 | modules/policy_manager.py | 1 | 400 | 1 | d77c4b6ef759665f5a87ee13d736ea215df7316f |  | UNASSIGNED |
@@ -121,17 +121,17 @@ Do not hand-edit chunk rows; regenerate. Owner/status columns are the one place 
 | modules/profitability_analyzer.py#5 | modules/profitability_analyzer.py | 2801 | 2815 | 2 | 9c6e416d152da41bb43b14355960ef98e7a53b14 |  | UNASSIGNED |
 | modules/reason_codes.py#1 | modules/reason_codes.py | 1 | 52 | 3 | b6f578ac192517091a3903cdf9f2d230299a19e3 |  | UNASSIGNED |
 | modules/rebalance_audit_v2.py#1 | modules/rebalance_audit_v2.py | 1 | 236 | 3 | 77e07d21318fd0ee70c6ff388ecabb67b1805d92 |  | UNASSIGNED |
-| modules/rebalance_engine_v2.py#1 | modules/rebalance_engine_v2.py | 1 | 400 | 1 | 5f0e861e82549d3479332c4a39407f8b7bd35b47 |  | UNASSIGNED |
-| modules/rebalance_engine_v2.py#2 | modules/rebalance_engine_v2.py | 401 | 800 | 1 | 5f0e861e82549d3479332c4a39407f8b7bd35b47 |  | UNASSIGNED |
-| modules/rebalance_engine_v2.py#3 | modules/rebalance_engine_v2.py | 801 | 1200 | 1 | 5f0e861e82549d3479332c4a39407f8b7bd35b47 |  | UNASSIGNED |
-| modules/rebalance_engine_v2.py#4 | modules/rebalance_engine_v2.py | 1201 | 1600 | 1 | 5f0e861e82549d3479332c4a39407f8b7bd35b47 |  | UNASSIGNED |
-| modules/rebalance_engine_v2.py#5 | modules/rebalance_engine_v2.py | 1601 | 2000 | 1 | 5f0e861e82549d3479332c4a39407f8b7bd35b47 |  | UNASSIGNED |
-| modules/rebalance_engine_v2.py#6 | modules/rebalance_engine_v2.py | 2001 | 2400 | 1 | 5f0e861e82549d3479332c4a39407f8b7bd35b47 |  | UNASSIGNED |
-| modules/rebalance_engine_v2.py#7 | modules/rebalance_engine_v2.py | 2401 | 2800 | 1 | 5f0e861e82549d3479332c4a39407f8b7bd35b47 |  | UNASSIGNED |
-| modules/rebalance_engine_v2.py#8 | modules/rebalance_engine_v2.py | 2801 | 3200 | 1 | 5f0e861e82549d3479332c4a39407f8b7bd35b47 |  | UNASSIGNED |
-| modules/rebalance_engine_v2.py#9 | modules/rebalance_engine_v2.py | 3201 | 3600 | 1 | 5f0e861e82549d3479332c4a39407f8b7bd35b47 |  | UNASSIGNED |
-| modules/rebalance_engine_v2.py#10 | modules/rebalance_engine_v2.py | 3601 | 4000 | 1 | 5f0e861e82549d3479332c4a39407f8b7bd35b47 |  | UNASSIGNED |
-| modules/rebalance_engine_v2.py#11 | modules/rebalance_engine_v2.py | 4001 | 4120 | 1 | 5f0e861e82549d3479332c4a39407f8b7bd35b47 |  | UNASSIGNED |
+| modules/rebalance_engine_v2.py#1 | modules/rebalance_engine_v2.py | 1 | 400 | 1 | a317bc332644f94e3b0bd4d37d66f12d35815d67 |  | UNASSIGNED |
+| modules/rebalance_engine_v2.py#2 | modules/rebalance_engine_v2.py | 401 | 800 | 1 | a317bc332644f94e3b0bd4d37d66f12d35815d67 |  | UNASSIGNED |
+| modules/rebalance_engine_v2.py#3 | modules/rebalance_engine_v2.py | 801 | 1200 | 1 | a317bc332644f94e3b0bd4d37d66f12d35815d67 |  | UNASSIGNED |
+| modules/rebalance_engine_v2.py#4 | modules/rebalance_engine_v2.py | 1201 | 1600 | 1 | a317bc332644f94e3b0bd4d37d66f12d35815d67 |  | UNASSIGNED |
+| modules/rebalance_engine_v2.py#5 | modules/rebalance_engine_v2.py | 1601 | 2000 | 1 | a317bc332644f94e3b0bd4d37d66f12d35815d67 |  | UNASSIGNED |
+| modules/rebalance_engine_v2.py#6 | modules/rebalance_engine_v2.py | 2001 | 2400 | 1 | a317bc332644f94e3b0bd4d37d66f12d35815d67 |  | UNASSIGNED |
+| modules/rebalance_engine_v2.py#7 | modules/rebalance_engine_v2.py | 2401 | 2800 | 1 | a317bc332644f94e3b0bd4d37d66f12d35815d67 |  | UNASSIGNED |
+| modules/rebalance_engine_v2.py#8 | modules/rebalance_engine_v2.py | 2801 | 3200 | 1 | a317bc332644f94e3b0bd4d37d66f12d35815d67 |  | UNASSIGNED |
+| modules/rebalance_engine_v2.py#9 | modules/rebalance_engine_v2.py | 3201 | 3600 | 1 | a317bc332644f94e3b0bd4d37d66f12d35815d67 |  | UNASSIGNED |
+| modules/rebalance_engine_v2.py#10 | modules/rebalance_engine_v2.py | 3601 | 4000 | 1 | a317bc332644f94e3b0bd4d37d66f12d35815d67 |  | UNASSIGNED |
+| modules/rebalance_engine_v2.py#11 | modules/rebalance_engine_v2.py | 4001 | 4116 | 1 | a317bc332644f94e3b0bd4d37d66f12d35815d67 |  | UNASSIGNED |
 | modules/rebalance_execution.py#1 | modules/rebalance_execution.py | 1 | 25 | 1 | f65b613a757e83efcfbcb4b10053fc72a338f07f |  | UNASSIGNED |
 | modules/rebalance_executor_v2.py#1 | modules/rebalance_executor_v2.py | 1 | 13 | 1 | b20abdecdc5caa00d75c938efeb2fdcf010db678 |  | UNASSIGNED |
 | modules/rebalance_flow_facts.py#1 | modules/rebalance_flow_facts.py | 1 | 93 | 3 | 849afedd159b096f945c482888efb63d67c29105 |  | UNASSIGNED |
@@ -145,11 +145,11 @@ Do not hand-edit chunk rows; regenerate. Owner/status columns are the one place 
 | modules/rebalance_router_v3.py#2 | modules/rebalance_router_v3.py | 701 | 739 | 2 | 0c0d3da271546d6b1e0afcbe6e7a3721f493307f |  | UNASSIGNED |
 | modules/rebalance_state_v2.py#1 | modules/rebalance_state_v2.py | 1 | 424 | 2 | c13f73c787f347e7fb5f41e27b29a11d843974a4 |  | UNASSIGNED |
 | modules/rebalance_types_v2.py#1 | modules/rebalance_types_v2.py | 1 | 97 | 3 | eae28df9fa8d23e3b88d0ba26387604483150140 |  | UNASSIGNED |
-| modules/rebalancer.py#1 | modules/rebalancer.py | 1 | 400 | 1 | ee5d2bdbfb71a2380e4d6c97f894e95fe255677d |  | UNASSIGNED |
-| modules/rebalancer.py#2 | modules/rebalancer.py | 401 | 800 | 1 | ee5d2bdbfb71a2380e4d6c97f894e95fe255677d |  | UNASSIGNED |
-| modules/rebalancer.py#3 | modules/rebalancer.py | 801 | 1200 | 1 | ee5d2bdbfb71a2380e4d6c97f894e95fe255677d |  | UNASSIGNED |
-| modules/rebalancer.py#4 | modules/rebalancer.py | 1201 | 1600 | 1 | ee5d2bdbfb71a2380e4d6c97f894e95fe255677d |  | UNASSIGNED |
-| modules/rebalancer.py#5 | modules/rebalancer.py | 1601 | 1905 | 1 | ee5d2bdbfb71a2380e4d6c97f894e95fe255677d |  | UNASSIGNED |
+| modules/rebalancer.py#1 | modules/rebalancer.py | 1 | 400 | 1 | 173a739014ab0836ee90e8f89e519f4cc6f343cb |  | UNASSIGNED |
+| modules/rebalancer.py#2 | modules/rebalancer.py | 401 | 800 | 1 | 173a739014ab0836ee90e8f89e519f4cc6f343cb |  | UNASSIGNED |
+| modules/rebalancer.py#3 | modules/rebalancer.py | 801 | 1200 | 1 | 173a739014ab0836ee90e8f89e519f4cc6f343cb |  | UNASSIGNED |
+| modules/rebalancer.py#4 | modules/rebalancer.py | 1201 | 1600 | 1 | 173a739014ab0836ee90e8f89e519f4cc6f343cb |  | UNASSIGNED |
+| modules/rebalancer.py#5 | modules/rebalancer.py | 1601 | 1901 | 1 | 173a739014ab0836ee90e8f89e519f4cc6f343cb |  | UNASSIGNED |
 | modules/risk_profiles.py#1 | modules/risk_profiles.py | 1 | 269 | 3 | 499e1b7d3c98526c4cf02e17e8fe4a45268d4865 |  | UNASSIGNED |
 | modules/segment_observations.py#1 | modules/segment_observations.py | 1 | 173 | 3 | b58b532295c6ed6542f461a67b96d7ee04b0996f |  | UNASSIGNED |
 | modules/utils.py#1 | modules/utils.py | 1 | 114 | 3 | e96115ef457c35700b65329422a01584c43ff6ba |  | UNASSIGNED |
