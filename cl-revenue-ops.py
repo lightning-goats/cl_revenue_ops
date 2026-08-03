@@ -1653,7 +1653,7 @@ plugin.add_option(
 def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin, **kwargs):
     """
     Initialize the Revenue Operations plugin.
-    
+
     This is called once when the plugin starts. We:
     1. Parse and validate options
     2. Initialize the database
@@ -1661,7 +1661,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     4. Set up timers for periodic execution
     """
     global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, safe_plugin, policy_manager, capex_engine, data_service, econ_shadow
-    
+
     plugin.log("Initializing cl-revenue-ops plugin...")
 
     # M-10: Register SIGTERM handler early, before component initialization.
