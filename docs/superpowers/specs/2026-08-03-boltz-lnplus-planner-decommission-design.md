@@ -2,7 +2,7 @@
 
 Date: 2026-08-03
 
-Status: operator-approved design; implementation plan pending written-spec review
+Status: operator-approved design; implementation planning approved 2026-08-03
 
 ## 1. Objective
 
