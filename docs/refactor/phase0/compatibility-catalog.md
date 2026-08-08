@@ -1,7 +1,7 @@
-# Public compatibility catalog (baseline 5e8f747)
+# Public compatibility catalog (liquidity executors retired)
 
 What the refactor MUST keep working (refactor invariants 2 and 3).
-Pin test: `tests/test_rpc_surface_inventory.py` (73 methods; 64 at baseline + econ-shadow diagnostics `revenue-econ-snapshot`, `revenue-econ-reconcile`, `revenue-econ-cycle` + risk-profile diagnostic `revenue-profile-preview` (PR 8, read-only) + Python fee-authority diagnostic `revenue-fee-authority-status` + the 4 Phase C dispatchers added 2026-08-01 (`revenue-boltz`, `revenue-cycle`, `revenue-planner`, `revenue-budget`) — the merged old names remain registered as deprecated aliases until 2026-09-05 per `docs/audits/OPERATOR_SURFACE_REDUCTION_2026-08-01.md`).
+Pin test: `tests/test_rpc_surface_inventory.py` (39 retained methods).
 
 ## RPC surface
 
@@ -10,37 +10,29 @@ refactor.md Workstream I these become facades over projections):
 `revenue-status`, `revenue-fee-authority-status`, `revenue-fee-debug`,
 `revenue-rebalance-debug`,
 `revenue-config get|set`, `revenue-profitability`, `revenue-analyze`,
-`revenue-wake-all`, `revenue-dashboard`, `revenue-health`,
-planner/Boltz/LN+ diagnostics.
+`revenue-wake-all`, `revenue-dashboard`, `revenue-health`.
 
 Action/mutation RPCs (AGENTS.md list; execution-gated): see AGENTS.md
-"Action RPC warning" — that list plus every `revenue-boltz-*` action.
+"Action RPC warning".
 Classification per method: `docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md`
-(header refreshed 2026-07-09; body dated 2026-05-20 — refresh during
-Workstream I).
+(current v3 inventory, refreshed 2026-08-03).
 
-Full 73-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
+Full 39-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
 
-Phase C (2026-08-01, operator-surface reduction): `revenue-boltz <verb>`,
-`revenue-cycle <subsystem>`, `revenue-planner <view>`, `revenue-budget
-[section]`, and the `revenue-policy ban|unban|list-banned` actions are the
-primary operator names. Every merged old name keeps working as a thin
-forwarding alias whose dict response carries an additive `deprecation`
-field; the alias window ends 2026-09-05 (announcement:
-`docs/refactor/phase0/contract-compatibility-policy.md`, 2026-08-01).
+Phase C retained operator-surface dispatchers: `revenue-cycle <subsystem>`, `revenue-budget [section]`, and the `revenue-policy ban|unban|list-banned` actions are the
+primary operator names.
 
 ## Config surface
 
-Owner: `modules/config.py` — a single `Config` dataclass (147 fields)
+Owner: `modules/config.py` — a single `Config` dataclass (102 fields)
 plus the `config_overrides` table (`revenue-config set` persists
 overrides; precedence documented in README.md §revenue-config).
 
-- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (62, listed below).
+- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (37, listed below).
 - Immutable at runtime: `db_path`, `dry_run` (`IMMUTABLE_CONFIG_KEYS` —
   dry_run is immutable so enabling it cannot HIDE actions).
-- The refactor's Workstream I risk-profile work must preserve every
-  currently-accepted key until the deprecation window defined in
-  refactor.md Phase 5.
+- Version 3.0.0 intentionally removes the planner, Boltz, and LN+ option
+  families; retained keys remain governed by the compatibility policy.
 
 The full generated field table below is the baseline enumeration
 (regenerate with `dataclasses.fields(Config)` if it drifts; the
@@ -60,14 +52,13 @@ dataclass is normative).
 
 ## External obligations
 
-- LN+ swaps in flight (`lnplus_swaps` table) — contractual; honored even
-  when new-obligation creation is disabled (invariant 6)
-- Boltz swaps in flight (boltzcli journal) — reconciliation must complete
-  across restart
+The v3 plugin creates no external swap or channel-lifecycle obligation.
+Historical planner and LN+ rows survive restart for audit compatibility but
+cannot schedule work or authorize action.
 
 ---
 
-### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 62)
+### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 37)
 
 - `paused`
 - `daily_budget_sats`
@@ -87,15 +78,7 @@ dataclass is normative).
 - `fee_market_boundary_margin_ratio`
 - `fee_market_boundary_max_downshift_ratio`
 - `fee_market_boundary_cache_seconds`
-- `planner_enabled`
-- `planner_dry_run`
-- `planner_execute_closes`
-- `planner_max_opens_per_cycle`
-- `planner_max_closes_per_cycle`
-- `planner_min_annual_roi_pct`
 - `capex_probability_budget_bonus`
-- `boltz_auto_cycle_enabled`
-- `boltz_structural_budget_sats_per_day`
 - `receivable_ratio_target`
 - `receivable_ratio_floor`
 - `drain_fee_discount_max`
@@ -107,32 +90,15 @@ dataclass is normative).
 - `htlcmax_balanced_pct`
 - `econ_shadow_enabled` (added 2026-07-12, Phase 1 wiring)
 - `econ_governor_rebalance_enabled` (added 2026-07-12, Phase 2D)
-- `econ_governor_planner_enabled` (added 2026-07-12, Phase 2E)
-- `econ_governor_lnplus_enabled` (added 2026-07-12, Phase 2F)
-- `econ_governor_boltz_enabled` (added 2026-07-12, Phase 2G)
 - `econ_governor_fees_enabled` (added 2026-07-12, Phase 2H)
 - `econ_arbiter_enabled` (added 2026-07-13, Phase 3F)
 - `econ_cycle_rebalance_enabled` (added 2026-07-13, Workstream H cutover)
-- `econ_cycle_planner_enabled` (added 2026-07-13, Workstream H cutover)
-- `econ_cycle_boltz_enabled` (added 2026-07-13, Workstream H cutover)
 - `econ_ev_populated` (added 2026-07-13, Phase E PR 6)
 - `econ_conflict_rules_extended` (added 2026-07-13, Phase G PR 10)
 - `authority_level` (added 2026-07-13, Phase 4 Workstream I; observe/fees/liquidity/capital, default `capital`)
 - `risk_profile` (added 2026-07-13, Phase D PR 7; default `custom`)
-- `lnplus_swaps_enabled`
-- `lnplus_execute_applications`
-- `lnplus_swap_preference_margin`
-- `lnplus_max_duration_months`
-- `lnplus_min_peer_positive_ratings`
-- `lnplus_min_peer_rank`
-- `lnplus_max_participants`
-- `lnplus_min_participants`
-- `lnplus_apply_feerate_ceiling`
-- `lnplus_pending_timeout_days`
-- `lnplus_inbound_credit_factor`
-- `lnplus_watcher_interval`
 
-### Full Config dataclass surface (147 fields with defaults)
+### Full Config dataclass surface (102 fields with defaults)
 
 | Field | Default | Runtime-settable |
 |---|---|---|
@@ -149,13 +115,8 @@ dataclass is normative).
 | `hot_channel_protection_profit_budget_pct` | `0.75` |  |
 | `hot_channel_protection_max_chunk_multiplier` | `4.0` |  |
 | `hot_channel_protection_min_cooldown_hours` | `1.0` |  |
-| `boltz_auto_cycle_enabled` | `False` | yes |
-| `boltz_auto_cycle_interval_minutes` | `15` |  |
-| `boltz_auto_cycle_max_actions` | `1` |  |
-| `boltz_auto_cycle_startup_delay_seconds` | `120` |  |
 | `receivable_ratio_target` | `0.3` | yes |
 | `receivable_ratio_floor` | `0.2` | yes |
-| `boltz_structural_budget_sats_per_day` | `0` | yes |
 | `drain_fee_discount_max` | `0.0` | yes |
 | `node_drain_bias_enabled` | `False` | yes |
 | `node_drain_bias_max` | `0.3` | yes |
@@ -165,25 +126,13 @@ dataclass is normative).
 | `htlcmax_balanced_pct` | `0.45` | yes |
 | `econ_shadow_enabled` | `True` | yes |
 | `econ_governor_rebalance_enabled` | `True` | yes |
-| `econ_governor_planner_enabled` | `True` | yes |
-| `econ_governor_lnplus_enabled` | `True` | yes |
-| `econ_governor_boltz_enabled` | `True` | yes |
 | `econ_governor_fees_enabled` | `True` | yes |
 | `econ_arbiter_enabled` | `True` | yes |
 | `econ_cycle_rebalance_enabled` | `True` | yes |
-| `econ_cycle_planner_enabled` | `True` | yes |
-| `econ_cycle_boltz_enabled` | `True` | yes |
 | `econ_ev_populated` | `True` | yes |
 | `econ_conflict_rules_extended` | `True` | yes |
 | `authority_level` | `'capital'` | yes |
 | `risk_profile` | `'custom'` | yes |
-| `expansion_treasury_enabled` | `False` |  |
-| `expansion_treasury_onchain_target_sats` | `5000000` |  |
-| `expansion_treasury_min_deficit_sats` | `250000` |  |
-| `expansion_treasury_preferred_currency` | `'BTC'` |  |
-| `expansion_treasury_max_actions` | `1` |  |
-| `expansion_treasury_min_source_local_pct` | `80.0` |  |
-| `expansion_treasury_exclude_protected` | `True` |  |
 | `flow_window_days` | `7` |  |
 | `source_threshold` | `0.05` |  |
 | `sink_threshold` | `-0.05` |  |
@@ -230,7 +179,6 @@ dataclass is normative).
 | `growth_budget_hard_ceiling_sats` | `10000` | yes |
 | `allow_zero_cost_auto_rebalance_when_budget_zero` | `False` |  |
 | `weekly_budget_sats` | `35000` | yes |
-| `diagnostic_rebalance_max_fee_sats` | `400` |  |
 | `min_wallet_reserve` | `1000000` |  |
 | `rpc_timeout_seconds` | `15` |  |
 | `reservation_timeout_hours` | `4` |  |
@@ -247,39 +195,12 @@ dataclass is normative).
 | `enable_vegas_reflex` | `True` |  |
 | `vegas_decay_rate` | `0.85` |  |
 | `thompson_prior_std_fee` | `100` |  |
-| `planner_enabled` | `False` | yes |
-| `planner_interval` | `21600` |  |
-| `planner_dry_run` | `False` | yes |
-| `planner_execute_closes` | `False` | yes |
-| `planner_max_opens_per_cycle` | `1` | yes |
-| `planner_max_closes_per_cycle` | `0` | yes |
-| `planner_close_fee_reserve_multiplier` | `2.0` |  |
-| `planner_close_fee_cap_sats` | `0` |  |
-| `planner_close_feerange_enabled` | `False` |  |
-| `planner_min_channel_sats` | `1000000` |  |
-| `planner_max_channel_sats` | `10000000` |  |
-| `planner_max_fee_rate_sat_vb` | `50.0` |  |
-| `planner_min_annual_roi_pct` | `1.0` | yes |
 | `capex_reinvestment_rate` | `0.5` |  |
 | `capex_bootstrap_bps` | `10` |  |
 | `capex_bootstrap_max_sats` | `200` |  |
 | `capex_grace_days` | `14` |  |
-| `capex_exploration_rate` | `0.1` |  |
-| `capex_tactical_rate` | `0.15` |  |
 | `capex_global_envelope_sats` | `0` |  |
 | `capex_probability_budget_bonus` | `0.0` | yes |
-| `lnplus_swaps_enabled` | `True` | yes |
-| `lnplus_execute_applications` | `True` | yes |
-| `lnplus_swap_preference_margin` | `0.2` | yes |
-| `lnplus_max_duration_months` | `3` | yes |
-| `lnplus_min_peer_positive_ratings` | `5` | yes |
-| `lnplus_min_peer_rank` | `8` | yes |
-| `lnplus_max_participants` | `4` | yes |
-| `lnplus_min_participants` | `3` | yes |
-| `lnplus_apply_feerate_ceiling` | `5000` | yes |
-| `lnplus_pending_timeout_days` | `7` | yes |
-| `lnplus_inbound_credit_factor` | `0.5` | yes |
-| `lnplus_watcher_interval` | `3600` | yes |
 | `_version` | `0` |  |
 | `_lock` | `factory:allocate_lock` |  |
 | `_override_warnings` | `factory:list` |  |

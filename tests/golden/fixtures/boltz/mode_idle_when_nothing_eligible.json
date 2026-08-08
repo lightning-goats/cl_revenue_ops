@@ -1,8 +1,0 @@
-{
-  "balance_candidate_count": 0,
-  "mode": "idle",
-  "reason": "no_eligible_boltz_actions",
-  "reserve_deficit_sats": 0,
-  "treasury_candidate_count": 0,
-  "treasury_executable_count": 0
-}

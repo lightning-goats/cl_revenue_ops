@@ -1,0 +1,19 @@
+{
+ "case": "manual-rebalance-mode",
+ "category": "rebalance_mode",
+ "expected": {
+  "manual": {
+   "accounting_owner": "caller",
+   "operator_directed": true,
+   "priority": 100
+  }
+ },
+ "inputs": {
+  "modes": [
+   "manual"
+  ]
+ },
+ "requirement": "F4: manual rebalance remains operator-directed and caller-accounted",
+ "schema_name": "conformance_case",
+ "schema_version": 0
+}

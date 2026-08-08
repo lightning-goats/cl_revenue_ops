@@ -164,27 +164,17 @@ def sample_channel_opened_payload(sample_peer_ids, sample_channel_id):
 
 
 
-# Lazy-eval audit F4/F6: policy gates fail closed when policy_manager is
-# None. Production constructs it unconditionally; tests that build bare
-# planners get a permissive stand-in so unrelated tests keep passing. Tests
-# exercising the gates set planner.policy_manager themselves afterwards.
+# Policy gates fail closed when policy_manager is None. Production constructs it
+# unconditionally; tests that build bare rebalance engines get a permissive
+# stand-in so unrelated tests keep passing.
 import pytest as _pytest
 
 
 @_pytest.fixture(autouse=True)
-def _default_planner_policy_manager(monkeypatch):
+def _default_rebalance_policy_manager(monkeypatch):
     import functools
-    from modules.capacity_planner import CapacityPlanner
     from modules.rebalance_engine_v2 import RebalanceEngine
     from tests.plugin_test_utils import PermissivePolicyManager
-
-    planner_init = CapacityPlanner.__init__
-
-    @functools.wraps(planner_init)
-    def planner_patched(self, *args, **kwargs):
-        planner_init(self, *args, **kwargs)
-        if getattr(self, "policy_manager", None) is None:
-            self.policy_manager = PermissivePolicyManager()
 
     engine_init = RebalanceEngine.__init__
 
@@ -194,6 +184,5 @@ def _default_planner_policy_manager(monkeypatch):
         if getattr(self, "_policy_manager", None) is None:
             self._policy_manager = PermissivePolicyManager()
 
-    monkeypatch.setattr(CapacityPlanner, "__init__", planner_patched)
     monkeypatch.setattr(RebalanceEngine, "__init__", engine_patched)
     yield

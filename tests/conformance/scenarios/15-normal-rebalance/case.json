@@ -2,12 +2,6 @@
  "case": "normal-rebalance-plan",
  "category": "rebalance_mode",
  "expected": {
-  "drain_demand": {
-   "entries": [],
-   "over_local_count": 1,
-   "paired_count": 1,
-   "total_excess_sats": 0
-  },
   "selected": [
    {
     "amount_sats": 2000000,

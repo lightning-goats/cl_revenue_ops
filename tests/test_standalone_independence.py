@@ -98,9 +98,6 @@ def _load_standalone_rpc_module():
             "reserved_by_category": {},
         }
     )
-    mod._boltz_liquidity_cost_components = MagicMock(
-        return_value={"spent_24h_sats": 0, "reserved_24h_sats": 0}
-    )
     return mod
 
 

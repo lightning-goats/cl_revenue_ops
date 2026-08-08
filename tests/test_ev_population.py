@@ -3,7 +3,7 @@ envelopes (econ_ev_populated, default OFF = the pre-population zeros).
 
 Populated sites (per the coverage matrix): rebalance batch arbitration
 + governed rebalance reservations (pair.score_decomposition:
-final_score_sats / p_success) and the Boltz batch
+final_score_sats / p_success)
 (economics.risk_adjusted_net_sats). Planner, LN+, and fee envelopes
 deliberately stay zero (closes need a definition pass; LN+ obligation
 and fees are exception classes).
@@ -134,55 +134,3 @@ class TestGovernedReservePopulation:
             _pair(ev_sats=7.0), reservation_id="r-1", max_fee_sats=100,
             cfg=cfg, budget_limit=1000, since_ts=NOW - 86400, now=NOW)
         assert seen["expected_benefit_msat"].value == 0
-
-
-def _rec(channel="100x1x0", net=340):
-    return {"channel_id": channel, "direction": "loop_out",
-            "amount_sats": 250_000,
-            "economics": {"passes_profit_guard": True,
-                          "estimated_swap_fee_sats": 100,
-                          "risk_adjusted_net_sats": net}}
-
-
-class TestBoltzBatchPopulation:
-    def _mod(self, ev_on):
-        from tests.plugin_test_utils import load_plugin_module
-        mod = load_plugin_module()
-        mod.plugin.log = MagicMock()
-        mod.config = MagicMock()
-        mod.config.snapshot.return_value = SimpleNamespace(
-            econ_cycle_boltz_enabled=True, econ_ev_populated=ev_on)
-        mod.econ_shadow = None
-        return mod
-
-    def _ids(self, mod, recs, monkeypatch):
-        import modules.econ_intents as econ_intents
-        seen = []
-        real = econ_intents.make_intent
-
-        def spy(**kwargs):
-            seen.append(kwargs)
-            return real(**kwargs)
-
-        monkeypatch.setattr(econ_intents, "make_intent", spy)
-        mod._arbitrate_boltz_recommendations(recs)
-        return seen
-
-    def test_populated_when_flag_on(self, monkeypatch):
-        seen = self._ids(self._mod(True), [_rec(net=340)], monkeypatch)
-        assert seen[0]["expected_benefit_msat"].value == 340_000
-
-    def test_zero_when_flag_off(self, monkeypatch):
-        seen = self._ids(self._mod(False), [_rec(net=340)], monkeypatch)
-        assert seen[0]["expected_benefit_msat"].value == 0
-
-    def test_legacy_order_still_preserved_with_evs(self):
-        """The Boltz stage deliberately keeps legacy plan order among
-        survivors — EV population is evidence, not a reordering, here.
-        (Only the rebalance loop consumes J3 output order; adopting J3
-        order for Boltz/planner is a separate, explicit decision.)"""
-        mod = self._mod(True)
-        survivors = mod._arbitrate_boltz_recommendations(
-            [_rec("100x1x0", net=5), _rec("900x1x0", net=500)])
-        assert [r["channel_id"] for r in survivors] == \
-            ["100x1x0", "900x1x0"]

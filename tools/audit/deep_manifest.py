@@ -59,7 +59,6 @@ TIER1_BASENAMES = {
     "cl-revenue-ops.py",
     "fee_controller.py",
     "database.py",
-    "boltz_manager.py",
     "rebalance_engine_v2.py",
     "rebalancer.py",
     "rebalance_native_executor_v2.py",
@@ -69,7 +68,6 @@ TIER1_BASENAMES = {
     "capex_budget.py",
 }
 TIER2_BASENAMES = {
-    "capacity_planner.py",
     "profitability_analyzer.py",
     "hive_hints.py",
     "flow_analysis.py",

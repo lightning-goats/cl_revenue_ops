@@ -1,0 +1,115 @@
+"""Characterize the executor roots approved for retirement."""
+
+from pathlib import Path
+import re
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PLUGIN = ROOT / "cl-revenue-ops.py"
+RETIRED_MODULES = {
+    "lnplus": ROOT / "modules/lnplus_swaps.py",
+    "boltz": ROOT / "modules/boltz_manager.py",
+    "planner": ROOT / "modules/capacity_planner.py",
+    "demand_flow": ROOT / "modules/demand_flow.py",
+    "protection": ROOT / "modules/protection_service.py",
+}
+
+
+def _registered_rpcs(prefix: str) -> set[str]:
+    source = PLUGIN.read_text(encoding="utf-8")
+    return {
+        name
+        for name in re.findall(r'@plugin\.method\(\s*"([a-z-]+)"', source)
+        if name.startswith(prefix)
+    }
+
+
+def _option_literals(prefix: str) -> set[str]:
+    sources = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8")
+        for path in ("cl-revenue-ops.py", "modules/config.py")
+    )
+    return set(re.findall(rf'["\']({re.escape(prefix)}[a-z0-9-]+)["\']', sources))
+
+
+def test_all_retired_module_roots_are_absent():
+    assert not {name for name, path in RETIRED_MODULES.items() if path.exists()}
+
+
+def test_lnplus_module_and_import_are_absent():
+    assert not RETIRED_MODULES["lnplus"].exists()
+    assert "modules.lnplus_swaps" not in PLUGIN.read_text(encoding="utf-8")
+
+
+def test_planner_rpc_and_option_families_are_absent():
+    assert not _registered_rpcs("revenue-planner-")
+    assert not _option_literals("revenue-ops-planner-")
+
+
+def test_lnplus_rpc_and_option_families_are_absent():
+    assert not _registered_rpcs("revenue-lnplus-")
+    assert not _option_literals("revenue-ops-lnplus-")
+
+
+def test_planner_channel_mutation_symbols_are_absent_from_live_sources():
+    sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in [PLUGIN, *sorted((ROOT / "modules").glob("*.py"))]
+    )
+    for symbol in (
+        "CapacityPlanner", "revenue-planner-", "revenue-ops-planner-",
+        "diagnostic_rebalance", "def fund_channel(", "def close_channel(",
+        'rpc.call("fundchannel"', 'rpc.call("close"',
+    ):
+        assert symbol not in sources
+
+
+def test_boltz_module_rpc_options_and_writers_are_absent():
+    assert not RETIRED_MODULES["boltz"].exists()
+    assert not _registered_rpcs("revenue-boltz-")
+    assert not _option_literals("revenue-ops-boltz-")
+    sources = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8")
+        for path in ("cl-revenue-ops.py", "modules/config.py",
+                     "modules/database.py", "modules/data_service.py")
+    )
+    for symbol in (
+        "BoltzCliManager", "BoltzManager", "boltzcli", "boltzd",
+        "revenue-boltz-", "boltz_record_swap", "boltz_update_swap",
+        "def pay(",
+    ):
+        assert symbol not in sources
+
+
+def test_lnplus_network_signing_and_state_writers_are_absent():
+    sources = {
+        "plugin": PLUGIN.read_text(encoding="utf-8"),
+        "database": (ROOT / "modules/database.py").read_text(encoding="utf-8"),
+        "data_service": (ROOT / "modules/data_service.py").read_text(encoding="utf-8"),
+    }
+    for symbol in (
+        "LNPlusClient", "SwapEvaluator", "SwapLifecycle",
+        "revenue-lnplus-", "lnplus_record_swap", "lnplus_update_swap",
+        "lnplus_bump_peer", "lnplus_prune_terminal",
+    ):
+        assert all(symbol not in source for source in sources.values())
+    assert "def connect_peer(" not in sources["data_service"]
+    assert "def sign_message(" not in sources["data_service"]
+
+
+def test_historical_schema_and_generic_ledger_policy_helpers_are_present():
+    source = (ROOT / "modules/database.py").read_text(encoding="utf-8")
+    for ddl in (
+        "CREATE TABLE IF NOT EXISTS lnplus_swaps",
+        "CREATE TABLE IF NOT EXISTS lnplus_peers",
+        "CREATE TABLE IF NOT EXISTS planner_actions",
+        "CREATE TABLE IF NOT EXISTS spend_reservations",
+        "CREATE TABLE IF NOT EXISTS spend_events",
+        "CREATE TABLE IF NOT EXISTS peer_policies",
+    ):
+        assert ddl in source
+    for helper in (
+        "def reserve_spend(", "def release_spend_reservation(",
+        "def get_spend_ledger_summary(", "def get_policy(", "def upsert_policy(",
+    ):
+        assert helper in source

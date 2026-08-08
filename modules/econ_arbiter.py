@@ -159,10 +159,10 @@ class ActiveIntentRegistry:
                         return "CONFLICT_CLOSE_REBALANCE"
             if self._extended():
                 # PR 10: duplicate opens to one peer (covers the spec's
-                # open-vs-LN+ rule — both paths emit OPEN_CHANNEL to the
+                # duplicate-open rule — both paths emit OPEN_CHANNEL to the
                 # peer). Wave 2: an incoming open that outranks the armed
-                # one per the batch J3 ladder PREEMPTS it — an LN+
-                # contractual-obligation open (priority 80) must not be
+                # one per the batch J3 ladder PREEMPTS it — a higher-priority
+                # contractual open (priority 80) must not be
                 # blocked by an earlier-registered planner growth open
                 # (spec precedence: contractual obligation wins).
                 if env.intent_type == "OPEN_CHANNEL":
@@ -279,7 +279,7 @@ def arbitrate(intents: List[IntentEnvelope], now: int,
 
     if extended_rules:
         # 5. Duplicate opens to one peer — best-sorted (higher priority,
-        # e.g. an LN+ obligation at 80) wins; covers open-vs-LN+.
+        # e.g. a contractual intent at 80) wins; covers duplicate-open contention.
         open_winner: Dict[str, IntentEnvelope] = {}
         step5 = []
         for env in final:

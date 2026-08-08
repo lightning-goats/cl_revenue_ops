@@ -345,7 +345,7 @@ class NativeRouteExecutor:
         pipe, bare OSError on the socket): the request may have reached
         lightningd before the transport died, so the real outcome is UNKNOWN.
         Structured RPC failures (RpcError and friends) are not OSErrors and
-        stay definite. Mirrors capacity_planner._outcome_unknown_exception
+        stay definite. Uses the same fail-closed unknown-outcome rule as the rebalance engine
         (repo rule from 51491da: never record a definite failure after a
         broadcast-capable RPC dies unresolved)."""
         if isinstance(exc, (TimeoutError, ConnectionError, OSError)):

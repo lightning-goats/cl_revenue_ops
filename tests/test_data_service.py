@@ -393,36 +393,6 @@ class TestNeverCachedTier:
         ds.get_peer_channels()  # should re-fetch
         assert plugin.rpc.listpeerchannels.call_count == 2
 
-    def test_fund_channel_invalidates_funds_and_channels(self):
-        from modules.data_service import DataService
-        plugin = _make_mock_plugin()
-        plugin.rpc.listfunds.return_value = {"channels": []}
-        plugin.rpc.listpeerchannels.return_value = {"channels": []}
-        plugin.rpc.call.return_value = {"tx": "abc", "txid": "def"}
-        ds = DataService(plugin)
-        ds.get_funds()
-        ds.get_peer_channels()
-        ds.fund_channel(id="abc123", amount=1000000)
-        ds.get_funds()
-        ds.get_peer_channels()
-        assert plugin.rpc.listfunds.call_count == 2
-        assert plugin.rpc.listpeerchannels.call_count == 2
-
-    def test_close_channel_invalidates_funds_and_channels(self):
-        from modules.data_service import DataService
-        plugin = _make_mock_plugin()
-        plugin.rpc.listfunds.return_value = {"channels": []}
-        plugin.rpc.listpeerchannels.return_value = {"channels": []}
-        plugin.rpc.call.return_value = {"type": "mutual"}
-        ds = DataService(plugin)
-        ds.get_funds()
-        ds.get_peer_channels()
-        ds.close_channel(id="100x1x0")
-        ds.get_funds()
-        ds.get_peer_channels()
-        assert plugin.rpc.listfunds.call_count == 2
-        assert plugin.rpc.listpeerchannels.call_count == 2
-
     def test_get_route_never_cached(self):
         from modules.data_service import DataService
         plugin = _make_mock_plugin()
@@ -503,29 +473,6 @@ class TestNeverCachedTier:
         ds.delete_invoice("label123", "unpaid")
         plugin.rpc.delinvoice.assert_called_once_with("label123", "unpaid")
 
-    def test_pay(self):
-        from modules.data_service import DataService
-        plugin = _make_mock_plugin()
-        plugin.rpc.call.return_value = {"status": "complete"}
-        ds = DataService(plugin)
-        result = ds.pay(bolt11="lnbc...")
-        assert result["status"] == "complete"
-
-    def test_list_pays(self):
-        from modules.data_service import DataService
-        plugin = _make_mock_plugin()
-        plugin.rpc.call.return_value = {"pays": []}
-        ds = DataService(plugin)
-        result = ds.list_pays()
-        assert "pays" in result
-
-    def test_decode(self):
-        from modules.data_service import DataService
-        plugin = _make_mock_plugin()
-        plugin.rpc.call.return_value = {"type": "bolt11"}
-        ds = DataService(plugin)
-        result = ds.decode("lnbc...")
-        assert result["type"] == "bolt11"
 
 
 class TestAskrenePassthrough:

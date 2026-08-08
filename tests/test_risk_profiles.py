@@ -188,7 +188,6 @@ class TestNonCustomApplication:
 
     def test_preserve_tightens(self):
         cfg, _ = _load({"risk_profile": "preserve"})
-        assert cfg.planner_max_opens_per_cycle == 0
         assert cfg.rebalance_hold_margin == 5.0
 
     def test_derived_values_face_contradiction_detection(self):
@@ -218,8 +217,7 @@ def test_no_profile_name_conditionals_in_policies():
     import pathlib
     repo = pathlib.Path(__file__).resolve().parent.parent
     for module in ("fee_controller", "rebalance_engine_v2",
-                   "capacity_planner", "boltz_manager", "lnplus_swaps",
-                   "admission_policy", "protection_service"):
+                   "admission_policy"):
         source = (repo / "modules" / f"{module}.py").read_text()
         assert "risk_profile" not in source, \
             f"{module} branches on risk_profile"

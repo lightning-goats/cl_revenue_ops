@@ -19,7 +19,6 @@ the refactor can prove semantic parity.
 | Profitability class/role | `test_golden_profitability.py` |
 | Close protection | `test_golden_close_protection.py` |
 | Boltz auto-cycle plan | `test_golden_boltz_cycle.py` |
-| LN+ qualification | `test_golden_lnplus_gates.py` |
 
 Deliberately NOT goldened in Phase 0: the unclamped DTS/PID fee target
 (`_adjust_channel_fee`) — it samples a Thompson posterior with unseeded

@@ -95,7 +95,7 @@ if TYPE_CHECKING:
 # =============================================================================
 # Node-wide receivable-ratio / drain-pressure helpers for the node-liquidity-aware
 # auto-drain-bias feature. These mirror the aggregate-liquidity pattern used in
-# capacity_planner.py (_check_portfolio_balance_gate, ~lines 312-325) but expressed
+# the retired capacity planner portfolio gate, expressed
 # as the REMOTE/receivable fraction rather than local percentage. Kept pure and
 # side-effect free so later wiring into _drain_fee_multiplier stays unit-testable
 # in isolation. Per the design's no-double-count invariant, these must never read
@@ -4083,7 +4083,7 @@ class FeeController:
             # nested fee_state payload and fall back to flat for rows written
             # before this change (_extract_fee_state_payload, plus the
             # external readers in flow_analysis / profitability_analyzer /
-            # capacity_planner).
+            # the retired capacity planner).
             # TODO(other-agent): cl-revenue-ops.py:~3303 still reads the flat
             # v2_state["thompson_state"]; migrate it to nested-first
             # (v2_state.get("fee_state", {}).get("thompson_state")) with flat
@@ -5579,11 +5579,11 @@ class FeeController:
     DTS_SUMMARY_LOCK_TIMEOUT_SECONDS = 1.0
 
     def get_dts_summary(self, channel_id: str) -> Optional[Dict[str, Any]]:
-        """Return DTS posterior and cycle state summary for external consumers (e.g. Boltz planner).
+        """Return DTS posterior and cycle state summary for diagnostics.
 
         Returns None if no state exists for the channel.
 
-        Called from Boltz plan builds on another thread while the fee cycle
+        May be called from diagnostics on another thread while the fee cycle
         may hold _state_lock for the whole channel loop. Reads shared state
         under the lock (7caf3dd discipline) but with a bounded acquire: on
         contention the last-known snapshot is returned (None if there has
@@ -8150,7 +8150,7 @@ class FeeController:
                                "explanation": env.explanation.render()}
                     # PR 3e: canonical-snapshot linkage as EVIDENCE only —
                     # the timestamped label keeps its identity semantics
-                    # (same rationale as LN+; the idempotency key hashes
+                    # (stable retry identity; the idempotency key hashes
                     # snapshot_id).
                     try:
                         shadow = getattr(self, "econ_shadow", None)

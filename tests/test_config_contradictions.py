@@ -98,11 +98,14 @@ class TestContradictoryPairs:
         assert _matching(warnings, "Contradictory",
                          "receivable_ratio_floor")
 
-    def test_crossed_lnplus_ring_band_warns(self):
-        _, warnings = _load({"lnplus_min_participants": "5",
-                             "lnplus_max_participants": "2"})
-        assert _matching(warnings, "Contradictory",
+    def test_retired_lnplus_ring_keys_are_inert_stale_overrides(self):
+        cfg, warnings = _load({"lnplus_min_participants": "5",
+                               "lnplus_max_participants": "2"})
+        assert not hasattr(cfg, "lnplus_min_participants")
+        assert _matching(warnings, "does not match any known key",
                          "lnplus_min_participants")
+        assert _matching(warnings, "does not match any known key",
+                         "lnplus_max_participants")
 
     def test_daily_budget_above_weekly_warns_and_repairs_upward(self):
         cfg, warnings = _load({"daily_budget_sats": "5000",
@@ -137,14 +140,14 @@ class TestShadowedSettings:
         assert _matching(warnings, "Shadowed",
                          "fee_market_boundary_margin_ppm")
 
-    def test_lnplus_param_with_gate_off_warns(self):
-        # lnplus_swaps_enabled defaults TRUE — must be turned off
-        # explicitly for its params to be shadowed.
-        _, warnings = _load({"lnplus_swaps_enabled": "false",
-                             "lnplus_max_duration_months": "2"})
-        assert _matching(warnings, "Shadowed",
-                         "lnplus_max_duration_months",
+    def test_retired_lnplus_gate_and_parameter_are_inert(self):
+        cfg, warnings = _load({"lnplus_swaps_enabled": "false",
+                               "lnplus_max_duration_months": "2"})
+        assert not hasattr(cfg, "lnplus_swaps_enabled")
+        assert _matching(warnings, "does not match any known key",
                          "lnplus_swaps_enabled")
+        assert _matching(warnings, "does not match any known key",
+                         "lnplus_max_duration_months")
 
     def test_default_values_never_flagged(self):
         # Shadow detection only fires for EXPLICIT overrides — the

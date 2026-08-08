@@ -11,11 +11,9 @@ most modules are imported directly by cl-revenue-ops.py. Module families:
   rebalance_router_v2/v3, rebalance_route_policy, rebalance_state_v2,
   rebalance_types_v2, rebalance_flow_facts, rebalance_audit_v2, rebalance_coordination_overlay,
   rebalance_execution
-- Capital allocation: capacity_planner (channel opens/closes/defibrillation),
-  capex_budget (budget/reservation engine), capital_efficiency (dead-capital analysis)
-- On-/off-chain swaps: boltz_manager (submarine swap integration),
-  lnplus_swaps (lightningnetwork.plus liquidity-swap automation)
-- Analysis & reporting: profitability_analyzer, demand_flow, segment_observations
+- Capital allocation: capex_budget (rebalance budget/reservation engine),
+  capital_efficiency (read-only capital analysis)
+- Analysis & reporting: profitability_analyzer, segment_observations
 - Infrastructure: config (configuration and constants), database (SQLite storage layer),
   data_service, policy_manager (peer-level policy management, v1.4), utils
 """

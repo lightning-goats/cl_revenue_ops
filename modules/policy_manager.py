@@ -55,7 +55,7 @@ READ_ONLY_POLICY_ACTIONS = frozenset({"list", "get", "find", "changes"})
 TACTICAL_POLICY_ACTIONS = frozenset({"set", "delete", "tag", "untag", "batch"})
 
 # Operator ban (revenue-ban): durable tag consulted by the capacity
-# planner's open gate and the LN+ swap evaluator's participant gate.
+# planner's open gate.
 BANNED_TAG = "banned"
 
 
@@ -832,15 +832,10 @@ class PolicyManager:
 
     def ban_peer(self, peer_id: str, reason: str = "") -> PeerPolicy:
         """
-        Operator ban: never open channels to, or enter LN+ swaps with, this
-        peer. Implemented as passive strategy + disabled rebalancing (the
-        canonical 'unmanaged' state) plus the durable BANNED_TAG that the
-        planner open gate and LN+ gate 5 enforce. Existing tags (e.g.
-        no_close) are preserved; any policy expiry is cleared — bans are
-        permanent until unban_peer.
-
-        Existing channels are NOT closed and in-flight swap obligations are
-        NOT abandoned: the ban only gates new capital commitments.
+        Operator ban implemented as passive fee strategy plus disabled
+        rebalancing and the durable BANNED_TAG. Existing tags such as no_close
+        are preserved and policy expiry is cleared, so the ban remains until
+        unban_peer. Existing channels are untouched.
         """
         self._validate_peer_id(peer_id)
         existing = self.get_policy(peer_id)

@@ -1,3 +1,7 @@
+# HISTORICAL CONTRACT - RETIRED IN VERSION 3.0.0
+
+This document records the removed implementation at its cited commit. The module, RPCs, options, threads, and execution authority described below are absent from the current plugin. It is not an operator guide.
+
 # Intent Contract: modules/lnplus_swaps.py
 
 Authored 2026-07-08 from code at commit 7eadaf9. Structure follows the capacity_planner.md

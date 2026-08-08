@@ -5,9 +5,6 @@ The adapter set is now EXPLICIT:
   plus its execution arm modules/rebalance_native_executor_v2.py (the
   timeout-managed sendpay pipeline — part of the adapter boundary, not
   a bypass).
-- Boltz adapter: modules/boltz_manager.py (boltzcli subprocess).
-- LN+ adapter: LNPlusClient in modules/lnplus_swaps.py (HTTP), with the
-  lifecycle's CLN calls routed through data_service (3E).
 
 Policy/decision modules must stay pure of the execution surface. The
 mutating-verb inventory itself is pinned by
@@ -21,7 +18,6 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 PURE_POLICY_MODULES = [
     "modules/classification.py",
     "modules/admission_policy.py",
-    "modules/protection_service.py",
     "modules/rebalance_modes.py",
     "modules/rebalance_planner_v2.py",
     "modules/rebalance_state_v2.py",
@@ -45,25 +41,16 @@ def test_policy_modules_never_touch_execution_surfaces():
             assert forbidden not in source, f"{module}: {forbidden}"
 
 
-def test_lnplus_lifecycle_prefers_the_cln_adapter():
-    source = (REPO / "modules" / "lnplus_swaps.py").read_text()
-    assert "self.data_service.connect_peer(target)" in source
-    assert "self.data_service.fund_channel(**fund_params)" in source
-    # Raw fallbacks remain for un-wired construction (tests/tools).
-    assert "self.rpc.connect(target)" in source
-    assert "self.rpc.fundchannel(" in source
-
-
-def test_cln_adapter_owns_the_new_surfaces():
+def test_cln_adapter_does_not_retain_lnplus_only_surfaces():
     source = (REPO / "modules" / "data_service.py").read_text()
-    assert "def connect_peer(" in source
-    assert "def sign_message(" in source
+    assert "def connect_peer(" not in source
+    assert "def sign_message(" not in source
+    assert not (REPO / "modules" / "lnplus_swaps.py").exists()
 
 
 def test_external_adapters_do_not_leak_wire_formats():
-    """The Boltz manager may parse boltzcli output; nothing OUTSIDE the
-    adapter set may invoke boltzcli or the LN+ HTTP base URL."""
-    adapter_files = {"boltz_manager.py", "lnplus_swaps.py"}
+    """Retired external liquidity adapters must not reappear in runtime modules."""
+    adapter_files = set()
     for path in sorted((REPO / "modules").glob("*.py")):
         if path.name in adapter_files:
             continue

@@ -235,8 +235,6 @@ class TestUnifiedBehavior:
             total_cost_budget_window_hours=24,
             growth_budget_enabled=False, paused=False)
         mod.config = cfg
-        mod.boltz_manager = None
-        mod.capacity_planner = None
         db.reserve_budget(reservation_id="reb-1", amount_sats=70,
                           channel_id="c", budget_limit=1000,
                           since_timestamp=SINCE)

@@ -2,7 +2,7 @@
 
 Pins the additive half of Phase C:
 
-1. The new dispatchers (revenue-boltz / revenue-cycle / revenue-planner /
+1. The new dispatchers (revenue-cycle /
    revenue-budget, plus revenue-policy ban actions) route each subcommand
    onto the SAME shared helper the old standalone method calls — same
    underlying calls, same argument names, same result.
@@ -63,155 +63,6 @@ def plugin(mod):
     return mod.plugin
 
 
-# ---------------------------------------------------------------------------
-# revenue-boltz <verb>
-# ---------------------------------------------------------------------------
-
-class TestBoltzDispatcher:
-    def test_quote_reaches_same_helper(self, mod, plugin, monkeypatch):
-        mgr = MagicMock()
-        mgr.quote.return_value = {"pair": "BTC/BTC", "fee_sats": 12}
-        monkeypatch.setattr(mod, "_require_boltz_manager", lambda: mgr)
-
-        new = mod.revenue_boltz(plugin, "quote", amount_sats=250_000,
-                                swap_type="reverse")
-        old = mod.revenue_boltz_quote(plugin, 250_000, swap_type="reverse")
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old)
-        assert mgr.quote.call_count == 2
-        for call in mgr.quote.call_args_list:
-            assert call.kwargs == {"amount_sats": 250_000,
-                                   "swap_type": "reverse", "currency": None}
-
-    def test_wallet_reaches_same_helper(self, mod, plugin, monkeypatch):
-        mgr = MagicMock()
-        mgr.wallet_balances.return_value = {"BTC": 5}
-        monkeypatch.setattr(mod, "_require_boltz_manager", lambda: mgr)
-
-        new = mod.revenue_boltz(plugin, "wallet")
-        old = mod.revenue_boltz_wallet(plugin)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"BTC": 5}
-
-    def test_history_passthrough_kwargs(self, mod, plugin, monkeypatch):
-        mgr = MagicMock()
-        mgr.swap_history.return_value = {"swaps": [], "count": 0}
-        monkeypatch.setattr(mod, "_require_boltz_manager", lambda: mgr)
-
-        new = mod.revenue_boltz(plugin, "history", limit=5)
-        old = mod.revenue_boltz_history(plugin, limit=5)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old)
-        for call in mgr.swap_history.call_args_list:
-            assert call.kwargs == {"limit": 5}
-
-    def test_refund_reaches_same_helper(self, mod, plugin, monkeypatch):
-        mgr = MagicMock()
-        mgr.refund.return_value = {"status": "refunded"}
-        monkeypatch.setattr(mod, "_require_boltz_manager", lambda: mgr)
-
-        new = mod.revenue_boltz(plugin, "refund", swap_id="s1")
-        old = mod.revenue_boltz_refund(plugin, swap_id="s1")
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"status": "refunded"}
-
-    def test_refund_usage_guard_shared(self, mod, plugin):
-        new = mod.revenue_boltz(plugin, "refund")
-        old = mod.revenue_boltz_refund(plugin)
-        assert "usage" in new["error"]
-        assert new == _strip(old)
-
-    def test_balance_cycle_reaches_same_executor(self, mod, plugin, monkeypatch):
-        seen = []
-
-        def fake_exec(**kwargs):
-            seen.append(kwargs)
-            return {"status": "dry_run", "actions": []}
-
-        monkeypatch.setattr(mod, "_execute_boltz_balance_cycle", fake_exec)
-
-        new = mod.revenue_boltz(plugin, "balance-cycle", dry_run=True,
-                                max_actions=2)
-        old = mod.revenue_boltz_balance_cycle(plugin, dry_run=True,
-                                              max_actions=2)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old)
-        assert len(seen) == 2
-        assert seen[0] == seen[1]
-        assert seen[0]["max_actions"] == 2
-
-    def test_treasury_cycle_reaches_same_executor(self, mod, plugin, monkeypatch):
-        seen = []
-
-        def fake_exec(**kwargs):
-            seen.append(kwargs)
-            return {"status": "dry_run", "executed": []}
-
-        monkeypatch.setattr(mod, "_execute_boltz_expansion_treasury_cycle",
-                            fake_exec)
-
-        new = mod.revenue_boltz(plugin, "treasury-cycle", dry_run=True,
-                                max_actions=1)
-        old = mod.revenue_boltz_expansion_treasury_cycle(plugin, dry_run=True,
-                                                         max_actions=1)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old)
-        assert len(seen) == 2
-        assert seen[0] == seen[1]
-
-    def test_auto_cycle_run_now_reaches_same_helper(self, mod, plugin,
-                                                    monkeypatch):
-        runs = []
-
-        def fake_run(trigger, force, dry_run):
-            runs.append((trigger, force, dry_run))
-            return {"status": "ran"}
-
-        monkeypatch.setattr(
-            mod, "_run_boltz_auto_cycle_once",
-            lambda trigger, force, dry_run: fake_run(trigger, force, dry_run))
-        monkeypatch.setattr(mod, "_boltz_auto_cycle_mark_state",
-                            lambda **kwargs: None)
-
-        new = mod.revenue_boltz(plugin, "auto-cycle-run-now", dry_run=True)
-        old = mod.revenue_boltz_auto_cycle_run_now(plugin, dry_run=True)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"status": "ran"}
-        assert runs == [("manual", False, True), ("manual", False, True)]
-
-    def test_unknown_verb_lists_all_verbs(self, mod, plugin):
-        result = mod.revenue_boltz(plugin, "no-such-verb")
-        assert "error" in result
-        expected = {
-            "quote", "loop-out", "loop-in", "status", "history", "budget",
-            "wallet", "refund", "claim", "chainswap", "withdraw", "deposit",
-            "backup", "backup-verify", "external-pay-ignores",
-            "balance-recommendations", "balance-cycle", "auto-cycle-status",
-            "auto-cycle-run-now", "treasury-status",
-            "treasury-recommendations", "treasury-cycle",
-        }
-        assert set(result["valid_verbs"]) == expected
-
-    def test_missing_verb_lists_all_verbs(self, mod, plugin):
-        result = mod.revenue_boltz(plugin)
-        assert "error" in result and len(result["valid_verbs"]) == 22
-
-    def test_bad_kwarg_returns_error_dict(self, mod, plugin, monkeypatch):
-        monkeypatch.setattr(mod, "_require_boltz_manager", lambda: MagicMock())
-        result = mod.revenue_boltz(plugin, "wallet", bogus_arg=1)
-        assert "error" in result and "revenue-boltz wallet" in result["error"]
-
-
-# ---------------------------------------------------------------------------
-# revenue-cycle <subsystem>
-# ---------------------------------------------------------------------------
 
 class TestCycleDispatcher:
     def test_fees(self, mod, plugin, monkeypatch):
@@ -255,31 +106,6 @@ class TestCycleDispatcher:
         _assert_no_deprecation(new)
         assert new == _strip(old) == {"status": "Flow analysis triggered"}
 
-    def test_planner(self, mod, plugin, monkeypatch):
-        planner = MagicMock()
-        planner.execute_cycle.return_value = {"executed": True}
-        monkeypatch.setattr(mod, "capacity_planner", planner)
-
-        new = mod.revenue_cycle(plugin, "planner")
-        old = mod.revenue_planner_execute(plugin)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"executed": True}
-
-    def test_boltz(self, mod, plugin, monkeypatch):
-        monkeypatch.setattr(
-            mod, "_run_boltz_auto_cycle_once",
-            lambda trigger, force, dry_run: {"status": "ran",
-                                             "dry_run": dry_run})
-        monkeypatch.setattr(mod, "_boltz_auto_cycle_mark_state",
-                            lambda **kwargs: None)
-
-        new = mod.revenue_cycle(plugin, "boltz", dry_run=True)
-        old = mod.revenue_boltz_auto_cycle_run_now(plugin, dry_run=True)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"status": "ran", "dry_run": True}
-
     def test_all(self, mod, plugin, monkeypatch):
         monkeypatch.setattr(mod, "fee_authority_gate", _OpenGate())
         controller = MagicMock()
@@ -297,85 +123,13 @@ class TestCycleDispatcher:
         result = mod.revenue_cycle(plugin, "everything")
         assert "error" in result
         assert set(result["valid_subsystems"]) == {
-            "fees", "rebalance", "flow", "planner", "boltz", "all"}
+            "fees", "rebalance", "flow", "all"}
 
 
 # ---------------------------------------------------------------------------
 # revenue-planner <view>
 # ---------------------------------------------------------------------------
 
-class TestPlannerDispatcher:
-    def test_status(self, mod, plugin, monkeypatch):
-        planner = MagicMock()
-        planner.get_status.return_value = {"pending": 0}
-        monkeypatch.setattr(mod, "capacity_planner", planner)
-
-        new = mod.revenue_planner(plugin, "status")
-        old = mod.revenue_planner_status(plugin)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"pending": 0}
-        # status is also the default view
-        assert mod.revenue_planner(plugin) == new
-
-    def test_candidates(self, mod, plugin, monkeypatch):
-        monkeypatch.setattr(mod, "capacity_planner", MagicMock())
-        database = MagicMock()
-        database.get_planner_candidates.return_value = [{"peer_id": PEER}]
-        monkeypatch.setattr(mod, "database", database)
-
-        new = mod.revenue_planner(plugin, "candidates", limit=5)
-        old = mod.revenue_planner_candidates(plugin, limit=5)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old)
-        assert new["count"] == 1
-        for call in database.get_planner_candidates.call_args_list:
-            assert call.kwargs == {"limit": 5}
-
-    def test_sources(self, mod, plugin, monkeypatch):
-        planner = MagicMock()
-        planner.get_candidate_sources.return_value = {"sources": {}}
-        monkeypatch.setattr(mod, "capacity_planner", planner)
-
-        new = mod.revenue_planner(plugin, "sources")
-        old = mod.planner_candidate_sources(plugin)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"sources": {}}
-
-    def test_history(self, mod, plugin, monkeypatch):
-        monkeypatch.setattr(mod, "capacity_planner", MagicMock())
-        database = MagicMock()
-        database.get_planner_actions.return_value = [{"action": "open"}]
-        monkeypatch.setattr(mod, "database", database)
-
-        new = mod.revenue_planner(plugin, "history", limit=3)
-        old = mod.revenue_planner_history(plugin, limit=3)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old)
-        assert new["count"] == 1
-
-    def test_report(self, mod, plugin, monkeypatch):
-        planner = MagicMock()
-        planner.generate_report.return_value = {"winners": [], "losers": []}
-        monkeypatch.setattr(mod, "capacity_planner", planner)
-
-        new = mod.revenue_planner(plugin, "report")
-        old = mod.revenue_capacity_report(plugin)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old) == {"winners": [], "losers": []}
-
-    def test_unknown_view_lists_valid(self, mod, plugin):
-        result = mod.revenue_planner(plugin, "wat")
-        assert "error" in result
-        assert set(result["valid_views"]) == {
-            "status", "candidates", "sources", "history", "report"}
-
-
-# ---------------------------------------------------------------------------
 # revenue-budget
 # ---------------------------------------------------------------------------
 
@@ -388,16 +142,11 @@ def _wire_budget_sections(mod, monkeypatch):
         channel_budgets={},
         priority_class="growth",
         global_envelope_sats=100,
-        fleet_exploration_budget_sats=0,
-        tactical_budget_sats=25,
         total_fleet_contribution_sats=0,
         allocated_by_priority_sats={},
     )
     monkeypatch.setattr(mod, "capex_engine", capex_engine)
     monkeypatch.setattr(mod, "data_service", None)
-    mgr = MagicMock()
-    mgr.budget.return_value = {"remaining_sats": 500}
-    monkeypatch.setattr(mod, "_require_boltz_manager", lambda: mgr)
 
 
 def _drop_clock_fields(capex):
@@ -413,18 +162,16 @@ class TestBudgetDispatcher:
 
         new = mod.revenue_budget(plugin)
         _assert_no_deprecation(new)
-        assert set(new) == {"total_cost", "capex", "boltz"}
+        assert set(new) == {"total_cost", "capex"}
         for section in new.values():
             _assert_no_deprecation(section)
 
         old_total = mod.revenue_total_cost_budget(plugin)
         old_capex = mod.revenue_capex_status(plugin)
-        old_boltz = mod.revenue_boltz_budget(plugin)
 
         assert new["total_cost"] == _strip(old_total)
         assert (_drop_clock_fields(new["capex"])
                 == _drop_clock_fields(_strip(old_capex)))
-        assert new["boltz"] == _strip(old_boltz) == {"remaining_sats": 500}
 
     def test_combined_window_hours_passthrough(self, mod, plugin, monkeypatch):
         _wire_budget_sections(mod, monkeypatch)
@@ -518,18 +265,6 @@ class TestPolicyBanActions:
 # ---------------------------------------------------------------------------
 
 class TestDeprecationNotices:
-    def test_alias_notice_format(self, mod, plugin, monkeypatch):
-        mgr = MagicMock()
-        mgr.wallet_balances.return_value = {"BTC": 1}
-        monkeypatch.setattr(mod, "_require_boltz_manager", lambda: mgr)
-        old = mod.revenue_boltz_wallet(plugin)
-        assert old["deprecation"] == (
-            "renamed to 'revenue-boltz wallet' — this name is scheduled for "
-            "removal 2026-09-05; see "
-            "docs/audits/OPERATOR_SURFACE_REDUCTION_2026-08-01.md"
-        )
-        assert old["deprecation"] == mod._alias_deprecation_notice(
-            "revenue-boltz wallet")
 
     def test_family_notices_point_at_their_dispatcher(self, mod, plugin,
                                                       monkeypatch):
@@ -539,11 +274,6 @@ class TestDeprecationNotices:
         assert "revenue-cycle fees" in mod.revenue_fee_cycle(
             plugin)["deprecation"]
 
-        planner = MagicMock()
-        planner.get_status.return_value = {}
-        monkeypatch.setattr(mod, "capacity_planner", planner)
-        assert "revenue-planner status" in mod.revenue_planner_status(
-            plugin)["deprecation"]
 
         monkeypatch.setattr(mod, "_total_cost_budget_status",
                             lambda window_hours=None: {})
@@ -578,11 +308,3 @@ class TestDeprecationNotices:
         unignored = mod.revenue_unignore(plugin, PEER)
         assert "error" in unignored
         assert "no replacement" in unignored["deprecation"]
-
-    def test_error_paths_of_aliases_carry_notice(self, mod, plugin,
-                                                 monkeypatch):
-        monkeypatch.setattr(mod, "capacity_planner", None)
-        old = mod.revenue_planner_status(plugin)
-        assert "error" in old and "deprecation" in old
-        new = mod.revenue_planner(plugin, "status")
-        assert "error" in new and "deprecation" not in new

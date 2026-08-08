@@ -1,7 +1,7 @@
 """Unified rebalance-mode descriptors (refactor Phase 3D, Workstream F4).
 
 The heavy F4 unification already exists in this repo: every rebalance —
-auto cycle, hot-channel protection, structural drain, manual, diagnostic
+auto cycle, hot-channel protection, structural drain, and manual
 — prices and executes through the ONE v2 engine pipeline
 (planner → router → executor → rebalance_history), and hot-channel
 protection is already a pair-level priority/budget modifier inside the
@@ -14,13 +14,6 @@ scattered boolean kwargs (`reserve_budget`, `account_costs`,
 `enforce_budget`). This module is that table; call sites route their
 engine kwargs through it so a mode's semantics live in exactly one
 place.
-
-DOCUMENTED SPEC CONTRADICTION (per the refactor protocol): the spec's
-F4 table lists Diagnostic as "No spend". The repo's diagnostic mode
-(defibrillation shock) is deliberately a BOUNDED spend — a small real
-probe fee under `diagnostic_rebalance_max_fee_sats`, reserved on the
-unified rail (P4-020), because a free probe cannot prove routability.
-Repo reality wins; recorded in docs/refactor/phase0/README.md.
 """
 from __future__ import annotations
 
@@ -71,14 +64,6 @@ MODES: Dict[str, RebalanceMode] = {
         name="manual", priority=100, budget_bucket="operator_explicit",
         reserve_on_rail=False, account_costs=False, deadline="immediate",
         accounting_owner="caller",
-    ),
-    # Defibrillation shock: bounded diagnostic spend (see module
-    # docstring for the spec contradiction), atomically reserved so an
-    # exhausted unified budget rejects the shock (P4-020/P4-025).
-    "diagnostic": RebalanceMode(
-        name="diagnostic", priority=10, budget_bucket="diagnostic",
-        reserve_on_rail=True, account_costs=True, deadline="none",
-        accounting_owner="engine",
     ),
 }
 

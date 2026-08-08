@@ -984,7 +984,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_budget_reservations_status ON budget_reservations(status, reserved_at)")
 
         # Generic spend reservations/events for unified total-cost budget gating.
-        # Used by actions outside the rebalance engine (e.g. channel open/close proposals)
+        # Preserved for generic and historical non-rebalance accounting
         # to reserve and optionally record spend against the same budget envelope.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS spend_reservations (
@@ -1312,7 +1312,7 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
-        # Capacity Planner tables
+        # Historical channel-planner tables retained for read-only audit compatibility
         conn.execute("""
             CREATE TABLE IF NOT EXISTS planner_candidates (
                 peer_id TEXT PRIMARY KEY,
@@ -1354,7 +1354,7 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_planner_actions_peer_time ON planner_actions(peer_id, created_at)")
         conn.execute("DROP INDEX IF EXISTS idx_planner_actions_peer")
 
-        # LN+ liquidity swap terms ledger (one row per swap we've touched)
+        # Historical LN+ liquidity swap terms ledger retained for read-only audit compatibility (one row per swap we've touched)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS lnplus_swaps (
                 swap_id TEXT PRIMARY KEY,
@@ -1388,15 +1388,14 @@ class Database:
             self.plugin.log("Added tag_added column to lnplus_swaps")
         except sqlite3.OperationalError:
             pass  # Column already exists
-        # Incoming-side contract protection (2026-07-08): the counterparty's
-        # channel to us is bound by the same LN+ agreement.
+        # Historical incoming-side contract marker retained for schema compatibility.
         try:
             conn.execute("ALTER TABLE lnplus_swaps ADD COLUMN incoming_tag_added INTEGER")
             self.plugin.log("Added incoming_tag_added column to lnplus_swaps")
         except sqlite3.OperationalError:
             pass  # Column already exists
 
-        # LN+ counterparty history
+        # Historical LN+ counterparty history retained for read-only audit compatibility
         conn.execute("""
             CREATE TABLE IF NOT EXISTS lnplus_peers (
                 pubkey TEXT PRIMARY KEY,
@@ -2809,33 +2808,6 @@ class Database:
         except Exception:
             return None
 
-    def get_diagnostic_rebalance_stats(self, channel_id: str, days: int = 14) -> Dict[str, Any]:
-        """
-        Get stats for diagnostic rebalance attempts for a channel.
-        
-        Args:
-            channel_id: The destination channel SCID
-            days: Lookback window in days
-            
-        Returns:
-            Dict with count and last_success_time
-        """
-        conn = self._get_connection()
-        since = int(time.time()) - (days * 86400)
-        
-        row = conn.execute("""
-            SELECT 
-                COUNT(*) as attempt_count,
-                MAX(CASE WHEN status = 'success' THEN timestamp ELSE 0 END) as last_success
-            FROM rebalance_history 
-            WHERE to_channel = ? AND rebalance_type = 'diagnostic' AND timestamp >= ?
-        """, (channel_id, since)).fetchone()
-        
-        return {
-            "attempt_count": int(row['attempt_count']) if row else 0,
-            "last_success_time": int(row['last_success']) if row and row['last_success'] and row['last_success'] > 0 else None
-        }
-    
     def get_total_rebalance_fees(self, since_timestamp: int) -> int:
         """
         Get the total rebalancing fees spent since a given timestamp.
@@ -4398,7 +4370,7 @@ class Database:
                                 since_timestamp: int = 0) -> int:
         """Sum of spend_events sats for a category (optionally subcategory)."""
         conn = self._get_connection()
-        # Normalize identically to record_spend_event so "Boltz"/" boltz" match.
+        # Normalize identically to record_spend_event for historical category compatibility.
         cat = str(category or "").strip().lower()
         if subcategory is None:
             row = conn.execute(
@@ -4414,29 +4386,10 @@ class Database:
             ).fetchone()
         return int(row['total'])
 
-    # P4-021: categories whose reservation represents a COMMITTED on-chain spend
-    # (a channel open/close). These are settled explicitly
-    # (mark_spend_reservation_spent) or released on RPC failure by the planner —
-    # they must NEVER be blind-released by the stale timeout sweep.
-    # NOTE (2026-07-10 audit): actual open/close SPEND is counted on the
-    # unified rail from the canonical cost tables (channel_costs /
-    # channel_closure_costs via get_opening_costs_since /
-    # get_closure_costs_since) — which also captures closes performed
-    # OUTSIDE the plugin — while spend_events rows in these categories are
-    # EXCLUDED from the generic-ledger bucket
-    # (_normalize_generic_ledger_for_total_cost_budget) precisely to avoid
-    # double-counting. The RESERVATION half below still matters: while a
-    # planner open/close is in flight, only the reservation holds the
-    # committed fee against the budget, so if the settle's spend-event write
-    # persistently fails the reservation legitimately stays 'active';
-    # blind-releasing it would make that committed cost vanish in the
-    # overspend-permitting direction.
-    # Mirrors P4-015's protection of pending_settlement budget reservations.
-    # P4-022: "boltz" is included — a boltz reservation held active by the
-    # P4-019 loud-write path represents a real committed swap cost that the rail
-    # counts only via spend_events; the journal re-settle is not guaranteed
-    # within the 4h blind-sweep window, so the blind sweep must not release it.
-    _COMMITTED_ONCHAIN_SPEND_CATEGORIES = ("channel_open", "channel_close", "boltz")
+    # Historical open/close reservations represent potentially committed on-chain
+    # spend. They remain excluded from blind stale cleanup and require explicit
+    # operator reconciliation. No v3 runtime path creates or executes them.
+    _COMMITTED_ONCHAIN_SPEND_CATEGORIES = ("channel_open", "channel_close")
 
     def cleanup_stale_spend_reservations(self, max_age_seconds: int = 86400, category: Optional[str] = None) -> int:
         conn = self._get_connection()
@@ -5768,8 +5721,7 @@ class Database:
         """Return top revenue-generating (in_channel, out_channel) pairs.
 
         Each row contains the channel IDs, total fees, forward count, and
-        average fee per forward.  Used by capacity planner, rebalancer, and
-        Boltz planner for route-aware decision-making.
+        average fee per forward.  Used by retained route-aware rebalance analysis.
         """
         conn = self._get_connection()
         cutoff = int(time.time()) - (days * 86400)
@@ -7542,127 +7494,6 @@ class Database:
             raise
     
     # =========================================================================
-    # Capacity Planner
-    # =========================================================================
-
-    def record_planner_candidate(self, peer_id: str, score: float, source: str,
-                                  capacity_recommendation_sats: int = None,
-                                  metadata: dict = None) -> None:
-        """Record or update a planner candidate peer."""
-        conn = self._get_connection()
-        conn.execute("""
-            INSERT OR REPLACE INTO planner_candidates
-            (peer_id, score, source, last_evaluated, capacity_recommendation_sats, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (peer_id, score, source, int(time.time()),
-              capacity_recommendation_sats,
-              json.dumps(metadata) if metadata else None))
-
-    def get_planner_candidates(self, min_score: float = -999.0, source: str = None,
-                                limit: int = 32) -> List[Dict[str, Any]]:
-        """Get planner candidates, optionally filtered by score and source."""
-        conn = self._get_connection()
-        if source:
-            rows = conn.execute("""
-                SELECT * FROM planner_candidates
-                WHERE score >= ? AND source = ?
-                ORDER BY score DESC LIMIT ?
-            """, (min_score, source, limit)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT * FROM planner_candidates
-                WHERE score >= ?
-                ORDER BY score DESC LIMIT ?
-            """, (min_score, limit)).fetchall()
-        return [dict(row) for row in rows]
-
-    def update_candidate_score(self, peer_id: str, delta: float) -> None:
-        """Increment a candidate's score by delta."""
-        conn = self._get_connection()
-        conn.execute("""
-            UPDATE planner_candidates SET score = score + ?, last_evaluated = ?
-            WHERE peer_id = ?
-        """, (delta, int(time.time()), peer_id))
-
-    def delete_planner_candidate(self, peer_id: str) -> None:
-        """Remove a candidate from the pool."""
-        conn = self._get_connection()
-        conn.execute("DELETE FROM planner_candidates WHERE peer_id = ?", (peer_id,))
-
-    def record_planner_action(self, action_type: str, peer_id: str,
-                               amount_sats: int = None, estimated_cost_sats: int = None,
-                               reason: str = None, channel_id: str = None,
-                               metadata: dict = None) -> int:
-        """Record a planner action and return its id."""
-        conn = self._get_connection()
-        cursor = conn.execute("""
-            INSERT INTO planner_actions
-            (action_type, peer_id, channel_id, amount_sats, estimated_cost_sats,
-             status, created_at, reason, metadata_json)
-            VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?)
-        """, (action_type, peer_id, channel_id, amount_sats, estimated_cost_sats,
-              int(time.time()), reason,
-              json.dumps(metadata) if metadata else None))
-        return cursor.lastrowid
-
-    def update_planner_action(self, action_id: int, status: str = None,
-                               actual_cost_sats: int = None, channel_id: str = None,
-                               completed_at: int = None) -> None:
-        """Update a planner action's status and/or cost."""
-        conn = self._get_connection()
-        updates = []
-        params = []
-        if status is not None:
-            updates.append("status = ?")
-            params.append(status)
-        if actual_cost_sats is not None:
-            updates.append("actual_cost_sats = ?")
-            params.append(actual_cost_sats)
-        if channel_id is not None:
-            updates.append("channel_id = ?")
-            params.append(channel_id)
-        if completed_at is not None:
-            updates.append("completed_at = ?")
-            params.append(completed_at)
-        elif status in ("completed", "failed"):
-            updates.append("completed_at = ?")
-            params.append(int(time.time()))
-        if updates:
-            params.append(action_id)
-            conn.execute(f"UPDATE planner_actions SET {', '.join(updates)} WHERE id = ?", params)
-
-    def get_planner_action(self, action_id: int) -> Optional[Dict[str, Any]]:
-        """Get a single planner action by id."""
-        conn = self._get_connection()
-        row = conn.execute("SELECT * FROM planner_actions WHERE id = ?", (action_id,)).fetchone()
-        return dict(row) if row else None
-
-    def get_planner_actions(self, status: str = None, limit: int = 20) -> List[Dict[str, Any]]:
-        """Get planner actions, optionally filtered by status."""
-        conn = self._get_connection()
-        if status:
-            rows = conn.execute("""
-                SELECT * FROM planner_actions WHERE status = ?
-                ORDER BY created_at DESC LIMIT ?
-            """, (status, limit)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT * FROM planner_actions
-                ORDER BY created_at DESC LIMIT ?
-            """, (limit,)).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_recent_planner_actions(self, peer_id: str, hours: int = 24) -> List[Dict[str, Any]]:
-        """Get recent planner actions for a peer (for cooldown checks)."""
-        conn = self._get_connection()
-        since = int(time.time()) - (hours * 3600)
-        rows = conn.execute("""
-            SELECT * FROM planner_actions
-            WHERE peer_id = ? AND created_at >= ?
-            ORDER BY created_at DESC
-        """, (peer_id, since)).fetchall()
-        return [dict(row) for row in rows]
-
     def get_dead_capital_stages(self) -> Dict[str, Dict[str, Any]]:
         """Return dead-capital stage rows keyed by channel id."""
         conn = self._get_connection()
@@ -7677,137 +7508,6 @@ class Database:
             }
             for row in rows
         }
-
-    def upsert_dead_capital_stage(self, channel_id: str, stage: str, entered_at: int) -> None:
-        """Insert or update dead-capital stage state for a channel."""
-        conn = self._get_connection()
-        conn.execute("""
-            INSERT INTO dead_capital_stage (channel_id, stage, entered_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(channel_id) DO UPDATE SET
-                stage = excluded.stage,
-                entered_at = excluded.entered_at
-        """, (channel_id, stage, entered_at))
-
-    def delete_dead_capital_stage(self, channel_id: str) -> None:
-        """Delete dead-capital stage state for a channel."""
-        conn = self._get_connection()
-        conn.execute("DELETE FROM dead_capital_stage WHERE channel_id = ?", (channel_id,))
-
-    # =========================================================================
-    # LN+ Liquidity Swap Ledger
-    # =========================================================================
-
-    _LNPLUS_INFLIGHT_STATUSES = ("applied", "opening", "opened")
-    _LNPLUS_UPDATABLE_FIELDS = frozenset((
-        "status", "ends_at", "outbound_peer", "incoming_peer",
-        "our_identifier", "opened_at", "completed_at",
-        "channel_funding_txid", "deadline_at", "outcome", "tag_added",
-        "incoming_tag_added",
-    ))
-
-    def lnplus_record_swap(self, swap_id: str, status: str, capacity_sats: int,
-                           duration_months: int, outbound_peer: str = None,
-                           incoming_peer: str = None, our_identifier: str = None,
-                           planner_action_id: int = None, metadata: dict = None) -> None:
-        """Record an LN+ swap we are participating in (intent-first ledger row)."""
-        conn = self._get_connection()
-        conn.execute("""
-            INSERT OR REPLACE INTO lnplus_swaps
-            (swap_id, status, capacity_sats, duration_months, outbound_peer,
-             incoming_peer, our_identifier, applied_at, planner_action_id, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (swap_id, status, capacity_sats, duration_months, outbound_peer,
-              incoming_peer, our_identifier, int(time.time()), planner_action_id,
-              json.dumps(metadata) if metadata else None))
-
-    def lnplus_update_swap(self, swap_id: str, **fields) -> None:
-        bad = set(fields) - self._LNPLUS_UPDATABLE_FIELDS
-        if bad:
-            raise ValueError(f"lnplus_update_swap: unknown fields {sorted(bad)}")
-        if not fields:
-            return
-        sets = ", ".join(f"{k} = ?" for k in fields)
-        conn = self._get_connection()
-        conn.execute(f"UPDATE lnplus_swaps SET {sets} WHERE swap_id = ?",
-                     (*fields.values(), swap_id))
-
-    def _lnplus_row_to_dict(self, row, cursor) -> dict:
-        return {desc[0]: row[i] for i, desc in enumerate(cursor.description)}
-
-    def lnplus_get_swap(self, swap_id: str):
-        conn = self._get_connection()
-        cur = conn.execute("SELECT * FROM lnplus_swaps WHERE swap_id = ?", (swap_id,))
-        row = cur.fetchone()
-        return self._lnplus_row_to_dict(row, cur) if row else None
-
-    def lnplus_get_swaps_by_status(self, statuses) -> list:
-        if not statuses:
-            return []
-        marks = ",".join("?" for _ in statuses)
-        conn = self._get_connection()
-        cur = conn.execute(
-            f"SELECT * FROM lnplus_swaps WHERE status IN ({marks}) ORDER BY applied_at",
-            tuple(statuses))
-        return [self._lnplus_row_to_dict(r, cur) for r in cur.fetchall()]
-
-    def lnplus_inflight_swaps(self) -> list:
-        return self.lnplus_get_swaps_by_status(list(self._LNPLUS_INFLIGHT_STATUSES))
-
-    def lnplus_reserved_sats(self) -> int:
-        # B8: once a row's channel is funded (channel_funding_txid set),
-        # the capacity has already left listfunds — counting it again here
-        # double-reserves it against the planner's available_sats.
-        marks = ",".join("?" for _ in self._LNPLUS_INFLIGHT_STATUSES)
-        conn = self._get_connection()
-        cur = conn.execute(
-            f"SELECT COALESCE(SUM(capacity_sats), 0) FROM lnplus_swaps "
-            f"WHERE status IN ({marks}) AND channel_funding_txid IS NULL",
-            self._LNPLUS_INFLIGHT_STATUSES)
-        return int(cur.fetchone()[0])
-
-    def lnplus_bump_peer(self, pubkey: str, defection: bool = False, rating: str = None) -> None:
-        conn = self._get_connection()
-        conn.execute("""
-            INSERT INTO lnplus_peers (pubkey, swaps_count, defections,
-                ratings_given_positive, ratings_given_negative, last_swap_at)
-            VALUES (?, 1, ?, ?, ?, ?)
-            ON CONFLICT(pubkey) DO UPDATE SET
-                swaps_count = swaps_count + 1,
-                defections = defections + excluded.defections,
-                ratings_given_positive = ratings_given_positive + excluded.ratings_given_positive,
-                ratings_given_negative = ratings_given_negative + excluded.ratings_given_negative,
-                last_swap_at = excluded.last_swap_at
-        """, (pubkey, 1 if defection else 0,
-              1 if rating == "positive" else 0,
-              1 if rating == "negative" else 0,
-              int(time.time())))
-
-    def lnplus_get_peer(self, pubkey: str):
-        conn = self._get_connection()
-        cur = conn.execute("SELECT * FROM lnplus_peers WHERE pubkey = ?", (pubkey,))
-        row = cur.fetchone()
-        return self._lnplus_row_to_dict(row, cur) if row else None
-
-    _LNPLUS_TERMINAL_STATUSES = ("ended", "failed", "withdrawn", "cancelled_remote")
-
-    def lnplus_prune_terminal(self, older_than_days: int = 180) -> int:
-        """C-6 (2026-07-08 audit): delete terminal-status lnplus_swaps rows
-        old enough to be pure history. A row qualifies only when BOTH:
-          - applied_at is older than the cutoff, AND
-          - ends_at is NULL (never reached a contract) or also older than
-            the cutoff (a still-recent contract end must not be pruned
-            just because the application itself was long ago).
-        Returns the number of rows deleted."""
-        cutoff = int(time.time()) - max(0, int(older_than_days)) * 86400
-        marks = ",".join("?" for _ in self._LNPLUS_TERMINAL_STATUSES)
-        conn = self._get_connection()
-        cur = conn.execute(
-            f"DELETE FROM lnplus_swaps WHERE status IN ({marks}) "
-            f"AND applied_at < ? AND (ends_at IS NULL OR ends_at < ?)",
-            (*self._LNPLUS_TERMINAL_STATUSES, cutoff, cutoff))
-        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-
 
     # =========================================================================
     # Mempool Fee History Methods (Vegas Reflex)
@@ -7849,67 +7549,6 @@ class Database:
         ).fetchone()
         return row['avg_fee'] if row and row['avg_fee'] else 1.0
     
-    def create_recycle_op(self, close_scid: str, close_peer_id: str,
-                          open_peer_id: str, open_amount_sats: int,
-                          recycle_ev_sats: int, funding_source: str = "close") -> int:
-        """Create a new recycle operation. Returns the operation ID."""
-        conn = self._get_connection()
-        cursor = conn.execute(
-            """INSERT INTO planner_recycle_ops
-               (close_scid, close_peer_id, open_peer_id, open_amount_sats,
-                recycle_ev_sats, funding_source, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending_close', ?)""",
-            (close_scid, close_peer_id, open_peer_id, open_amount_sats,
-             recycle_ev_sats, funding_source, int(time.time())),
-        )
-        return cursor.lastrowid
-
-    def get_pending_recycle_op(self) -> dict | None:
-        """Get the active (non-terminal) recycle operation, if any."""
-        conn = self._get_connection()
-        row = conn.execute(
-            """SELECT * FROM planner_recycle_ops
-               WHERE status IN ('pending_close', 'pending_open')
-               ORDER BY created_at DESC LIMIT 1"""
-        ).fetchone()
-        if row:
-            return dict(row)
-        return None
-
-    def update_recycle_op(self, op_id: int, status: str = None,
-                          close_action_id: int = None,
-                          open_action_id: int = None):
-        """Update a recycle operation's status and action IDs."""
-        conn = self._get_connection()
-        updates = []
-        params = []
-        if status:
-            updates.append("status = ?")
-            params.append(status)
-            if status in ("completed", "failed", "expired"):
-                updates.append("completed_at = ?")
-                params.append(int(time.time()))
-        if close_action_id is not None:
-            updates.append("close_action_id = ?")
-            params.append(close_action_id)
-        if open_action_id is not None:
-            updates.append("open_action_id = ?")
-            params.append(open_action_id)
-        if updates:
-            params.append(op_id)
-            conn.execute(
-                f"UPDATE planner_recycle_ops SET {', '.join(updates)} WHERE id = ?",
-                params,
-            )
-
-    def increment_recycle_cycles_waited(self, op_id: int):
-        """Increment the cycles_waited counter for a recycle operation."""
-        conn = self._get_connection()
-        conn.execute(
-            "UPDATE planner_recycle_ops SET cycles_waited = cycles_waited + 1 WHERE id = ?",
-            (op_id,),
-        )
-
     # ------------------------------------------------------------------
     # Policy CRUD (replaces direct SQL in policy_manager.py)
     # ------------------------------------------------------------------

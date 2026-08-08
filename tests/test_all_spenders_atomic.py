@@ -97,7 +97,6 @@ _CALLEE_MARKERS = {
     "reserve_spend": "reserve_spend",                  # generic ledger atomic reserve
     "reserve_budget": "reserve_budget",                # rebalance atomic reserve
     "execute_candidate": "execute_candidate",          # rebalance execution dispatch
-    "_open_swap_budget_reservation": "boltz_swap_reserve",  # boltz atomic pre-create reserve
     "_rpc_fundchannel": "fundchannel_rpc",             # planner channel-open wrapper call
     "fund_channel": "fund_channel",                    # data_service fundchannel wrapper
     "_rpc_close": "close_rpc",                          # planner channel-close wrapper call
@@ -293,30 +292,7 @@ ALLOWLIST = {
         "+ (ok, remaining) via _return_remaining) — one atomic reservation "
         "implementation; the legacy budget_reservations insert no longer runs.",
     ),
-    ("lnplus_swaps.py", "_execute_swap_open", "fund_channel"): (
-        ATOMIC_RESERVE, 1,
-        "Phase 3E (2026-07-13): the LN+ swap-open now prefers the CLN "
-        "adapter (data_service.fund_channel) over raw rpc.fundchannel — "
-        "same reservation-gated flow, adapter-owned cache invalidation; "
-        "the raw fallback remains for un-wired construction.",
-    ),
-    ("lnplus_swaps.py", "_lnplus_reserve_delegate", "reserve_spend"): (
-        ATOMIC_RESERVE, 1,
-        "Phase 2F governed entry (2026-07-12): GovernorFacade delegate closure "
-        "inside SwapLifecycle._governed_reserve_spend — the SAME atomic "
-        "reserve_spend call as the legacy _execute_swap_open site, same "
-        "reservation_id/kwargs; active only when econ_governor_lnplus_enabled "
-        "is true. Obligation fulfillment: no pause gate (invariant 6).",
-    ),
-    ("capacity_planner.py", "_planner_reserve_delegate", "reserve_spend"): (
-        ATOMIC_RESERVE, 1,
-        "Phase 2E governed entry (2026-07-12): GovernorFacade delegate closure "
-        "inside _governed_reserve_spend — the SAME atomic reserve_spend call "
-        "as the legacy _execute_open/_execute_close sites, same "
-        "reservation_id/kwargs; active only when "
-        "econ_governor_planner_enabled is true.",
-    ),
-    # --- Daemon spender 5/6: defibrillation diagnostic shock (T7) -----------
+    # --- Shared rebalance dispatch ------------------------------------------
     ("rebalancer.py", "_execute_candidate_v2", "execute_candidate"): (
         ATOMIC_RESERVE, 1,
         "Dispatches one candidate to the engine. The defibrillation daemon path "
@@ -325,127 +301,12 @@ ALLOWLIST = {
         "recorded before the reservation is marked spent (P4-025); manual/explicit "
         "callers pass False and own their own accounting (operator-only).",
     ),
-    # --- Daemon spender 2/6: boltz auto-cycle (T6) --------------------------
-    ("capex_budget.py", "reserve_boltz_swap_budget", "reserve_spend"): (
-        ATOMIC_RESERVE, 1,
-        "Boltz swap pre-create reserve (T6 auto-cycle + manual), category='boltz', "
-        "effective_budget passed -> atomic cross-category rejection (P4-014/DD1). "
-        "Reached from every boltz swap-create path incl. chainswap (P4-023).",
-    ),
-    # boltz atomic pre-create reserves (loop_in / loop_out / chainswap) -------
-    ("boltz_manager.py", "loop_in", "boltz_swap_reserve"): (
-        ATOMIC_RESERVE, 1,
-        "loop_in (createswap) reserves the swap fee atomically via "
-        "_open_swap_budget_reservation BEFORE creation (P4-014/DD1).",
-    ),
-    ("boltz_manager.py", "_loop_out_locked", "boltz_swap_reserve"): (
-        ATOMIC_RESERVE, 1,
-        "loop_out (createreverseswap) reserves the swap fee atomically via "
-        "_open_swap_budget_reservation BEFORE creation (P4-014/DD1).",
-    ),
-    ("boltz_manager.py", "chainswap", "boltz_swap_reserve"): (
-        ATOMIC_RESERVE, 1,
-        "chainswap (createchainswap) NEW atomic pre-create reserve via "
-        "_open_swap_budget_reservation BEFORE createchainswap; rejects the swap "
-        "when the unified budget would be exceeded (P4-023/DD1).",
-    ),
-    # boltz swap-create argv lists (the committing CLI action) ----------------
-    ("boltz_manager.py", "loop_in", "boltz_swap_create"): (
-        RAIL_COUNTED_COST, 1,
-        "boltzcli 'createswap' (submarine/loop-in). Reserved atomically by "
-        "_open_swap_budget_reservation BEFORE creation (P4-014), settled "
-        "loud/retry (P4-019); the CLI call itself commits the reserved cost.",
-    ),
-    ("boltz_manager.py", "_loop_out_locked", "boltz_swap_create"): (
-        RAIL_COUNTED_COST, 1,
-        "boltzcli 'createreverseswap --external-pay' (loop-out). Reserved "
-        "atomically (P4-014), settled loud/retry (P4-019).",
-    ),
-    ("boltz_manager.py", "_build_args", "boltz_swap_create"): (
-        RAIL_COUNTED_COST, 1,
-        "Nested arg-builder for 'createreverseswap' inside _loop_out_locked; same "
-        "boltz reserve/settle rail (P4-014/P4-019).",
-    ),
-    ("boltz_manager.py", "chainswap", "boltz_swap_create"): (
-        RAIL_COUNTED_COST, 1,
-        "boltzcli 'createchainswap' (the 6th swap-create). Now reserved "
-        "atomically by _open_swap_budget_reservation BEFORE creation and settled "
-        "loud/retry on the boltz rail (P4-023/DD1).",
-    ),
-    # boltz loop-out first-hop invoice payment (rail-counted) -----------------
-    ("boltz_manager.py", "_pay_invoice_via_first_hop", "rpc_pay"): (
-        RAIL_COUNTED_COST, 1,
-        "rpc.call('pay') fallback that settles the reverse-swap invoice inside "
-        "_loop_out_locked. The swap fee is reserved atomically by "
-        "_open_swap_budget_reservation BEFORE the swap is created (P4-014); this "
-        "pay commits the reserved cost.",
-    ),
-    # --- Daemon spender 3/6: capacity-planner channel OPEN (T7) -------------
-    ("capacity_planner.py", "_execute_open", "reserve_spend"): (
-        ATOMIC_RESERVE, 1,
-        "Planner open reserve (T7), category='channel_open', effective_budget passed "
-        "-> atomic cross-category rejection before fundchannel (P4-018/DD1).",
-    ),
-    ("capacity_planner.py", "_execute_open", "fundchannel_rpc"): (
-        RAIL_COUNTED_COST, 1,
-        "The on-chain channel open. Its fee is reserved atomically by the "
-        "reserve_spend in the same method (P4-018) and settled loud/retry + "
-        "protected from the stale sweep (P4-021).",
-    ),
-    # --- Daemon spender 4/6: capacity-planner channel CLOSE (T7) ------------
-    ("capacity_planner.py", "_execute_close", "reserve_spend"): (
-        ATOMIC_RESERVE, 1,
-        "Planner close reserve (T7), category='channel_close', reserved BEFORE the "
-        "on-chain close, effective_budget passed (P4-018/DD1).",
-    ),
-    ("capacity_planner.py", "_execute_close", "close_rpc"): (
-        RAIL_COUNTED_COST, 1,
-        "The on-chain channel close. Fee reserved atomically by the reserve_spend in "
-        "the same method (P4-018), settled loud/retry + sweep-protected (P4-021).",
-    ),
     # --- Operator-only RPC spender (T0 dispatch; other plugins / operator) --
     ("cl-revenue-ops.py", "revenue_spend_reserve", "reserve_spend"): (
         OPERATOR_ONLY, 1,
         "revenue-spend-reserve RPC (T0 pyln dispatch). Atomic (effective_budget "
         "passed, force_fresh gate, P2-011/DD1). Reachable only by an operator / "
         "sibling plugin, not an autonomous daemon.",
-    ),
-    # --- Pure RPC transport wrappers (no independent budget decision) -------
-    ("capacity_planner.py", "_rpc_fundchannel", "fund_channel"): (
-        NOT_A_SPEND, 1,
-        "Transport wrapper: forwards to data_service.fund_channel. Only "
-        "daemon-reachable via _execute_open, which reserves atomically first (P4-018).",
-    ),
-    ("capacity_planner.py", "_rpc_fundchannel", "rpc_fundchannel"): (
-        NOT_A_SPEND, 1,
-        "rpc.call('fundchannel') fallback inside the _rpc_fundchannel transport "
-        "wrapper; reserving caller is _execute_open (P4-018).",
-    ),
-    ("capacity_planner.py", "_rpc_close", "close_channel"): (
-        NOT_A_SPEND, 1,
-        "Transport wrapper: forwards to data_service.close_channel. Reserving caller "
-        "is _execute_close (P4-018).",
-    ),
-    ("capacity_planner.py", "_rpc_close", "rpc_close"): (
-        NOT_A_SPEND, 1,
-        "rpc.call('close') fallback inside the _rpc_close transport wrapper; "
-        "reserving caller is _execute_close (P4-018).",
-    ),
-    ("data_service.py", "fund_channel", "rpc_fundchannel"): (
-        NOT_A_SPEND, 1,
-        "DataService RPC transport (rpc.call('fundchannel')). Reached only via the "
-        "planner open path, which reserves atomically first (P4-018).",
-    ),
-    ("data_service.py", "close_channel", "rpc_close"): (
-        NOT_A_SPEND, 1,
-        "DataService RPC transport (rpc.call('close')). Reached only via the planner "
-        "close path, which reserves atomically first (P4-018).",
-    ),
-    ("data_service.py", "pay", "rpc_pay"): (
-        NOT_A_SPEND, 1,
-        "DataService RPC transport (rpc.call('pay')). Only production caller is the "
-        "boltz loop-out first-hop pay, whose swap fee is reserved atomically on the "
-        "boltz rail first (P4-014).",
     ),
     # --- Attribute-style money RPC dispatch (rpc.<method>(...), P4-026) -----
     ("data_service.py", "send_pay", "rpc_attr_sendpay"): (
@@ -479,66 +340,6 @@ ALLOWLIST = {
         "transport (rpc.call(method_name, ...)). Not a spend decision: the money "
         "decision and its atomic reservation are owned by the calling site that "
         "names the concrete method; this proxy only forwards it off-thread.",
-    ),
-    # --- Daemon spender: LN+ liquidity-swap channel OPEN (Task 6, hardened) --
-    ("lnplus_swaps.py", "_execute_swap_open", "reserve_spend"): (
-        ATOMIC_RESERVE, 1,
-        "SwapLifecycle._execute_swap_open reserves atomically (category="
-        "'channel_open', subcategory='lnplus_swap') via db.reserve_spend "
-        "BEGIN IMMEDIATE, IMMEDIATELY before self.rpc.fundchannel, mirroring "
-        "capacity_planner._execute_open/_execute_close (P4-018/DD1 parity). "
-        "The reservation_id is unique per attempt (swap_id + int(time.time())) "
-        "so reserve_spend's terminal-state guard (refusing to resurrect a "
-        "spent/released id) can never block a retry after a failed attempt. "
-        "When the caller wires estimate_open_cost_fn/budget_params_fn (the "
-        "capacity planner's _estimate_open_cost / _unified_reserve_budget_"
-        "params) this is a real cross-category-enforced reserve identical to "
-        "the planner's own opens; absent that wiring it falls back to a fixed "
-        "_DEFAULT_OPEN_COST_SATS best-effort reservation (effective_budget_"
-        "sats=None -> reserve_spend skips enforcement but the amount is still "
-        "counted on the rail at settle). A reservation failure (False or "
-        "raise) aborts BEFORE fundchannel is called and logs a warning for "
-        "the hourly watcher to retry.",
-    ),
-    ("lnplus_swaps.py", "_execute_swap_open", "rpc_attr_fundchannel"): (
-        RAIL_COUNTED_COST, 1,
-        "SwapLifecycle._execute_swap_open's self.rpc.fundchannel(...) -- the "
-        "on-chain channel open that fulfils an LN+ liquidity-swap application. "
-        "Reserved atomically by the reserve_spend call in the same method "
-        "IMMEDIATELY before this call (see the paired allowlist entry above), "
-        "mirroring capacity_planner._execute_open's reserve-then-fundchannel "
-        "pairing (P4-018 parity). On success the reservation is settled loud/ "
-        "bounded-retry via _settle_swap_open_reservation (mirrors "
-        "capacity_planner._settle_capex_reservation: 3 attempts calling "
-        "mark_spend_reservation_spent, and on persistent failure the "
-        "reservation is left active and logged at error rather than released, "
-        "so a committed fee always stays counted on the unified rail). On a "
-        "fundchannel exception or a missing txid the reservation is released "
-        "best-effort via _release_swap_open_reservation and the attempt is "
-        "retried next watcher pass. Independently, capacity is also reserved "
-        "intent-first at the ledger level: SwapEvaluator._select_and_apply "
-        "writes the lnplus_swaps row (status='applied', capacity_sats) BEFORE "
-        "create_application is even sent, and capacity_planner.py subtracts "
-        "db.lnplus_reserved_sats() (sum of capacity across applied/opening/"
-        "opened rows) from its own available on-chain funds before its "
-        "reserve_spend-gated opens (capacity_planner.py ~line 515) -- "
-        "cross-category protection against the planner double spending the "
-        "same coins. SwapEvaluator additionally serializes to AT MOST ONE "
-        "swap in flight (has_inflight() gate) and re-checks confirmed "
-        "on-chain funds >= capacity+fees at apply time (gate 7), so this rail "
-        "never carries more than one reserved capacity at once. The "
-        "fundchannel call itself is ALSO idempotency-guarded: a "
-        "channel_funding_txid already on the row short-circuits to a "
-        "complete_application retry, and a listpeerchannels existing-channel "
-        "check (OPENINGD/CHANNELD_AWAITING_LOCKIN/CHANNELD_NORMAL/DUALOPEND_*) "
-        "skips a duplicate fundchannel on retry. run_watcher_once holds a "
-        "non-blocking single-flight lock so two watcher passes can never race "
-        "this call. Row-level settlement is loud too: the row is written "
-        "status='opening'/outcome='fundchannel attempt' BEFORE the call "
-        "(intent) and channel_funding_txid/opened_at AFTER it returns "
-        "(outcome); a miss of the 48h deadline trips the circuit breaker and "
-        "records a failed swap_open planner action, blocking further LN+ "
-        "applications until an operator clears it.",
     ),
 }
 
@@ -597,23 +398,15 @@ def _guard_failures(extra_sources=None):
 # ---------------------------------------------------------------------------
 # Guard tests.
 # ---------------------------------------------------------------------------
-def test_scanner_finds_the_known_six_daemon_spenders():
-    """Sanity guard for the scanner itself: the six known autonomous daemon
-    spenders (and the operator RPC reserve) must all be seen, including the
-    chainswap atomic reserve + createchainswap surfaced in pass 4 and the
-    attribute-dispatch sendpay surfaced by P4-026."""
+def test_scanner_finds_the_retained_daemon_spenders():
+    """Sanity guard for retained autonomous spenders and the operator reserve."""
     sites = collect_spend_sites()
     required = {
         ("rebalancer.py", "execute_rebalance", "reserve_budget"),                 # rebalance auto
-        ("rebalance_engine_v2.py", "_reserve_execution_budget", "reserve_budget"),  # engine/defib reserve
-        ("rebalancer.py", "_execute_candidate_v2", "execute_candidate"),          # defibrillation dispatch
-        ("capex_budget.py", "reserve_boltz_swap_budget", "reserve_spend"),        # boltz
-        ("capacity_planner.py", "_execute_open", "reserve_spend"),                # capex open
-        ("capacity_planner.py", "_execute_close", "reserve_spend"),               # capex close
+        ("rebalance_engine_v2.py", "_reserve_execution_budget", "reserve_budget"),  # engine reserve
+        ("rebalancer.py", "_execute_candidate_v2", "execute_candidate"),          # shared rebalance dispatch
         ("cl-revenue-ops.py", "revenue_spend_reserve", "reserve_spend"),          # operator RPC
-        # pass-4 surfaced sites:
-        ("boltz_manager.py", "chainswap", "boltz_swap_create"),                   # createchainswap
-        ("boltz_manager.py", "chainswap", "boltz_swap_reserve"),                  # chainswap atomic reserve
+        # dynamic native executor site:
         ("rebalance_native_executor_v2.py", "_rpc_call", _DYNAMIC_METHOD_MARKER),  # computed sendpay
         # P4-026 surfaced site (pyln attribute dispatch):
         ("data_service.py", "send_pay", "rpc_attr_sendpay"),                      # self._plugin.rpc.sendpay
@@ -819,18 +612,18 @@ def test_the_test_detects_a_duplicate_same_marker_call():
     allowlisted function raises the scanned occurrence count above the declared
     count and trips the guard on the count axis -- the exact absorption the old
     set-collapse allowed. Here two extra reserve_spend calls are injected into
-    capacity_planner._execute_open (declared count 1); the guard must report a
+    database.reserve_budget (declared count 1); the guard must report a
     count mismatch for that key."""
     rogue = (
         "class Dup:\n"
-        "    def _execute_open(self, db, amt):\n"
+        "    def reserve_budget(self, db, amt):\n"
         "        db.reserve_spend(reservation_id='a', amount_sats=amt, category='x')\n"
         "        db.reserve_spend(reservation_id='b', amount_sats=amt, category='x')\n"
     )
     unaccounted, stale, count_mismatch = _guard_failures(
-        extra_sources=[("capacity_planner.py", rogue)]
+        extra_sources=[("database.py", rogue)]
     )
-    key = ("capacity_planner.py", "_execute_open", "reserve_spend")
+    key = ("database.py", "reserve_budget", "reserve_spend")
     assert key in count_mismatch, (
         "a SECOND same-marker call in an allowlisted function was absorbed -- the "
         f"guard did not surface a count mismatch (mismatches={count_mismatch})"
@@ -1034,7 +827,7 @@ def test_alias_lint_allowlists_only_the_known_generic_proxy():
 def test_alias_lint_ignores_canonical_rpc_rebind():
     """A canonical rebind (``self.rpc = rpc`` -- target is itself a canonical
     handle) is NOT an evasion and must not be flagged: the scanner still sees
-    money calls on ``self.rpc``. (BoltzCliManager.__init__ does exactly this.)"""
+    money calls on ``self.rpc``. (This remains a valid scanner property.)"""
     rebind = (
         "class Mgr:\n"
         "    def __init__(self, plugin, rpc):\n"

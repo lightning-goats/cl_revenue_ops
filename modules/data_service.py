@@ -10,7 +10,7 @@ Cache Tiers:
     LONG     — 5-10 minute TTL (listnodes, feerates)
     MEDIUM   — 30 second TTL (listpeerchannels, listfunds, listpeers)
     NEVER    — Transactional or shared mutable state, always live
-               (sendpay, fundchannel, setchannel, askrene-listlayers)
+               (sendpay, setchannel, askrene-listlayers)
 
 Thread-safe: uses threading.Lock for all cache operations.
 """
@@ -276,33 +276,7 @@ class DataService:
         self.invalidate("listpeerchannels")
         return result
 
-    def fund_channel(self, **kwargs) -> Dict:
-        """Open a new channel. Invalidates funds + peer channels cache."""
-        result = self._plugin.rpc.call("fundchannel", kwargs)
-        self.invalidate("listfunds")
-        self.invalidate("listpeerchannels")
-        return result
 
-    def close_channel(self, **kwargs) -> Dict:
-        """Close a channel. Invalidates funds + peer channels cache."""
-        result = self._plugin.rpc.call("close", kwargs)
-        self.invalidate("listfunds")
-        self.invalidate("listpeerchannels")
-        return result
-
-    def connect_peer(self, target: str) -> Dict:
-        """Connect to a peer (Phase 3E: adapter surface for the LN+
-        swap-open flow). Invalidates the peers cache."""
-        result = self._plugin.rpc.connect(target)
-        self.invalidate("listpeers")
-        return result
-
-    def sign_message(self, message: str) -> Dict:
-        """Sign a message with the node key (Phase 3E: adapter surface
-        for LN+ API authentication)."""
-        return self._plugin.rpc.signmessage(message)
-
-    # --- Route discovery ---
 
     def get_route(self, node_id: str, amount_msat: int, **kwargs) -> Dict:
         """Discover route to node. Never cached (amount-dependent)."""
@@ -342,19 +316,6 @@ class DataService:
     def delete_invoice(self, label: str, status: str) -> Dict:
         """Delete an invoice."""
         return self._plugin.rpc.delinvoice(label, status)
-
-    def pay(self, bolt11: str, **kwargs) -> Dict:
-        """Pay a bolt11 invoice."""
-        params = {"bolt11": bolt11, **kwargs}
-        return self._plugin.rpc.call("pay", params)
-
-    def list_pays(self, **kwargs) -> Dict:
-        """List payment attempts."""
-        return self._plugin.rpc.call("listpays", kwargs if kwargs else {})
-
-    def decode(self, string: str) -> Dict:
-        """Decode a bolt11/bolt12 invoice or rune."""
-        return self._plugin.rpc.call("decode", {"string": string})
 
     # --- Bookkeeper ---
 

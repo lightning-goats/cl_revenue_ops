@@ -48,12 +48,6 @@ PUBLIC_RUNTIME_KEYS = (
     'fee_market_boundary_margin_ratio',
     'fee_market_boundary_max_downshift_ratio',
     'fee_market_boundary_cache_seconds',
-    'planner_enabled',
-    'planner_dry_run',
-    'planner_execute_closes',
-    'planner_max_opens_per_cycle',
-    'planner_max_closes_per_cycle',
-    'planner_min_annual_roi_pct',
     # V3 router probability-aware budget relaxation (default 0.0 = off).
     # Exposed so operators running the askrene router can enable the
     # reliability-weighted budget bonus without editing code or the database.
@@ -62,8 +56,6 @@ PUBLIC_RUNTIME_KEYS = (
     # only load at lightningd startup; these are exposed at runtime so the
     # drain can be enabled and tuned via revenue-config without a daemon
     # restart. All default to off/neutral.
-    'boltz_auto_cycle_enabled',
-    'boltz_structural_budget_sats_per_day',
     'receivable_ratio_target',
     'receivable_ratio_floor',
     'drain_fee_discount_max',
@@ -85,38 +77,23 @@ PUBLIC_RUNTIME_KEYS = (
     # facade (same reserve_budget accounting, new authorization
     # boundary). Instant rollback by setting false. Default off.
     'econ_governor_rebalance_enabled',
-    # Refactor Phase 2E: planner open/close reservations gated by the
-    # governor facade (same reserve_spend accounting). Default off.
-    'econ_governor_planner_enabled',
-    # Refactor Phase 2F: LN+ swap-open reservations gated by the governor
-    # facade. Obligation fulfillment carries no pause gate (invariant 6).
-    'econ_governor_lnplus_enabled',
-    # Refactor Phase 2G: Boltz pre-create swap reservations gated by the
-    # governor facade. Default off.
-    'econ_governor_boltz_enabled',
     # Refactor Phase 2H: automated fee broadcasts gated by the governor
     # (paused/stale + audit trail; zero-cost, no reservation). Manual
     # revenue-set-fee stays operator-direct. Default off.
     'econ_governor_fees_enabled',
     # Refactor Phase 3F: live conflict arbitration at the governor
-    # (duplicate suppression + close-vs-rebalance). Default off.
+    # (duplicate suppression for retained intents). Default off.
     'econ_arbiter_enabled',
     # Workstream H cutover: the rebalance loop's execution list passes
     # through cycle intent generation + batch arbitration. Default off.
     'econ_cycle_rebalance_enabled',
-    # Workstream H cutover: planner close list passes through batch
-    # arbitration (dedup + selection-time conflict arming). Default off.
-    'econ_cycle_planner_enabled',
-    # Workstream H cutover: Boltz balance-cycle recommendations pass
-    # through batch arbitration (dedup, ledgered). Default off.
-    'econ_cycle_boltz_enabled',
     # PR 6 (gap-closure Phase E): populate real EV/confidence in intent
     # envelopes. CAUTION: flipping changes J3 batch-arbitration ORDER in
     # the cutover loops (EV sorts before target). Default off = zeros.
     'econ_ev_populated',
     # PR 10 (gap-closure Phase G): extra arbiter conflict rules —
-    # duplicate opens per peer (covers open-vs-LN+), rebalance vs
-    # structural swap. Default off = the three original rules only.
+    # retained extended intent-conflict rules. Default off preserves the
+    # original arbitration set.
     'econ_conflict_rules_extended',
     # Phase 4 (Workstream I): global authority level — observe < fees <
     # liquidity < capital. Governed actions above the level are blocked
@@ -128,23 +105,6 @@ PUBLIC_RUNTIME_KEYS = (
     # Non-custom bundles apply AT STARTUP to keys without explicit
     # overrides (precedence: explicit > profile > default).
     'risk_profile',
-    # LN+ liquidity swap automation (13 runtime controls)
-    'lnplus_swaps_enabled',
-    'lnplus_execute_applications',
-    'lnplus_swap_preference_margin',
-    'lnplus_max_duration_months',
-    'lnplus_min_peer_positive_ratings',
-    # D-2 (Revision 2, 2026-07-08 operator-directed): rank floor for
-    # non-fleet participants.
-    'lnplus_min_peer_rank',
-    'lnplus_max_participants',
-    # D-3 (Revision 2): minimum 3 participants, fewer preferred among
-    # equal-EV qualifiers.
-    'lnplus_min_participants',
-    'lnplus_apply_feerate_ceiling',
-    'lnplus_pending_timeout_days',
-    'lnplus_inbound_credit_factor',
-    'lnplus_watcher_interval',
 )
 
 # Type mapping for config fields (for validation)
@@ -169,7 +129,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'growth_budget_experiment_fraction': float,
     'growth_budget_max_extra_sats': int,
     'growth_budget_hard_ceiling_sats': int,
-    'diagnostic_rebalance_max_fee_sats': int,
     'allow_zero_cost_auto_rebalance_when_budget_zero': bool,
     'weekly_budget_sats': int,
     'hot_channel_protection_enabled': bool,
@@ -179,13 +138,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'hot_channel_protection_profit_budget_pct': float,
     'hot_channel_protection_max_chunk_multiplier': float,
     'hot_channel_protection_min_cooldown_hours': float,
-    'boltz_auto_cycle_enabled': bool,
-    'boltz_auto_cycle_interval_minutes': int,
-    'boltz_auto_cycle_max_actions': int,
-    'boltz_auto_cycle_startup_delay_seconds': int,
     'receivable_ratio_target': float,
     'receivable_ratio_floor': float,
-    'boltz_structural_budget_sats_per_day': int,
     'drain_fee_discount_max': float,
     'node_drain_bias_enabled': bool,
     'node_drain_bias_max': float,
@@ -195,25 +149,13 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'htlcmax_balanced_pct': float,
     'econ_shadow_enabled': bool,
     'econ_governor_rebalance_enabled': bool,
-    'econ_governor_planner_enabled': bool,
-    'econ_governor_lnplus_enabled': bool,
-    'econ_governor_boltz_enabled': bool,
     'econ_governor_fees_enabled': bool,
     'econ_arbiter_enabled': bool,
     'econ_cycle_rebalance_enabled': bool,
-    'econ_cycle_planner_enabled': bool,
-    'econ_cycle_boltz_enabled': bool,
     'econ_ev_populated': bool,
     'econ_conflict_rules_extended': bool,
     'authority_level': str,
     'risk_profile': str,
-    'expansion_treasury_enabled': bool,
-    'expansion_treasury_onchain_target_sats': int,
-    'expansion_treasury_min_deficit_sats': int,
-    'expansion_treasury_preferred_currency': str,
-    'expansion_treasury_max_actions': int,
-    'expansion_treasury_min_source_local_pct': float,
-    'expansion_treasury_exclude_protected': bool,
     'min_wallet_reserve': int,
     'low_liquidity_threshold': float,
     'high_liquidity_threshold': float,
@@ -262,42 +204,13 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'estimated_open_cost_sats': int,
     'source_threshold': float,
     'sink_threshold': float,
-    # Capacity Planner
-    'planner_enabled': bool,
-    'planner_interval': int,
-    'planner_dry_run': bool,
-    'planner_execute_closes': bool,
-    'planner_max_opens_per_cycle': int,
-    'planner_max_closes_per_cycle': int,
-    'planner_close_fee_reserve_multiplier': float,
-    'planner_close_fee_cap_sats': int,
-    'planner_close_feerange_enabled': bool,
-    'planner_min_channel_sats': int,
-    'planner_max_channel_sats': int,
-    'planner_max_fee_rate_sat_vb': float,
-    'planner_min_annual_roi_pct': float,
     # Unified Capex Budget Engine
     'capex_reinvestment_rate': float,
     'capex_bootstrap_bps': int,
     'capex_bootstrap_max_sats': int,
     'capex_grace_days': int,
     'capex_probability_budget_bonus': float,
-    'capex_exploration_rate': float,
-    'capex_tactical_rate': float,
     'capex_global_envelope_sats': int,
-    # LN+ liquidity swap automation
-    'lnplus_swaps_enabled': bool,
-    'lnplus_execute_applications': bool,
-    'lnplus_swap_preference_margin': float,
-    'lnplus_max_duration_months': int,
-    'lnplus_min_peer_positive_ratings': int,
-    'lnplus_min_peer_rank': int,
-    'lnplus_max_participants': int,
-    'lnplus_min_participants': int,
-    'lnplus_apply_feerate_ceiling': int,
-    'lnplus_pending_timeout_days': int,
-    'lnplus_inbound_credit_factor': float,
-    'lnplus_watcher_interval': int,
 }
 
 # Explicit migration shims only. Non-public keys remain internal until they are
@@ -327,39 +240,9 @@ SHADOWED_SETTING_GATES: Dict[str, tuple] = {
         'fee_market_boundary_min_competitors',
         'fee_market_boundary_margin_ppm',
     ),
-    'lnplus_swaps_enabled': (
-        'lnplus_execute_applications',
-        'lnplus_swap_preference_margin',
-        'lnplus_max_duration_months',
-        'lnplus_min_peer_positive_ratings',
-        'lnplus_min_peer_rank',
-        'lnplus_max_participants',
-        'lnplus_min_participants',
-        'lnplus_apply_feerate_ceiling',
-        'lnplus_pending_timeout_days',
-        'lnplus_inbound_credit_factor',
-        'lnplus_watcher_interval',
-    ),
-    'expansion_treasury_enabled': (
-        'expansion_treasury_onchain_target_sats',
-        'expansion_treasury_min_deficit_sats',
-        'expansion_treasury_preferred_currency',
-        'expansion_treasury_max_actions',
-        'expansion_treasury_min_source_local_pct',
-        'expansion_treasury_exclude_protected',
-    ),
     # Phase B (2026-08-01 surface reduction, section 5.4): the structural
-    # loop-out envelope only spends inside the Boltz auto-cycle's balance
     # cycle — the exact shadow found in production.
-    'boltz_auto_cycle_enabled': (
-        'boltz_structural_budget_sats_per_day',
-    ),
-    # capacity_planner.run_cycle bails when planner_enabled is false, so the
     # per-cycle open/close limits are inert until the planner is on.
-    'planner_enabled': (
-        'planner_max_opens_per_cycle',
-        'planner_max_closes_per_cycle',
-    ),
 }
 
 # Reverse map for set-time shadowed-gate warnings on revenue-config set:
@@ -401,17 +284,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'growth_budget_experiment_fraction': (0.0, 1.0),
     'growth_budget_max_extra_sats': (0, 1_000_000),
     'growth_budget_hard_ceiling_sats': (0, 10_000_000),
-    # Operator ruling D4: diagnostic fee cap must stay a small, bounded
-    # diagnostic spend — never 0 (would disable the defibrillator envelope)
-    # and never above 10k sats (a typo must not authorize huge spend).
-    'diagnostic_rebalance_max_fee_sats': (1, 10_000),
     'weekly_budget_sats': (0, 70_000_000),
-    'boltz_auto_cycle_interval_minutes': (1, 1440),
-    'boltz_auto_cycle_max_actions': (1, 10),
-    'boltz_auto_cycle_startup_delay_seconds': (0, 3600),
     'receivable_ratio_target': (0.0, 1.0),
     'receivable_ratio_floor': (0.0, 1.0),
-    'boltz_structural_budget_sats_per_day': (0, 1_000_000),
     'drain_fee_discount_max': (0.0, 0.5),
     'node_drain_bias_max': (0.0, 0.5),
     'htlcmax_source_pct': (0.01, 1.0),
@@ -445,7 +320,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     # beyond ~±0.2 are effectively dead for typical daily turnover.
     'source_threshold': (-1.0, 1.0),
     'sink_threshold': (-1.0, 1.0),
-    'expansion_treasury_min_source_local_pct': (0.0, 100.0),
     'hot_channel_protection_max_chunk_multiplier': (1.0, 20.0),
     'hot_channel_protection_min_cooldown_hours': (0.0, 168.0),
     'hot_channel_protection_min_marginal_roi': (0.0, 10.0),
@@ -471,17 +345,6 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'rebalance_size_reference_percentile': (0.0, 1.0),
     'rebalance_small_channel_band_half_width': (0.0, 0.5),
     'estimated_open_cost_sats': (0, 1000000),
-    'expansion_treasury_max_actions': (1, 10),
-    'expansion_treasury_min_deficit_sats': (0, 100000000),
-    'expansion_treasury_onchain_target_sats': (0, 1000000000),
-    # Capacity Planner
-    'planner_interval': (600, 604800),
-    'planner_max_opens_per_cycle': (0, 10),
-    'planner_max_closes_per_cycle': (0, 10),
-    'planner_min_channel_sats': (100000, 100000000),
-    'planner_max_channel_sats': (500000, 1677721500),
-    'planner_max_fee_rate_sat_vb': (1.0, 1000.0),
-    'planner_min_annual_roi_pct': (0.0, 100.0),
     # Z-2 (2026-07-08): 0 disables the grace fallback entirely (immediate
     # release on hint staleness); ceiling is 30 days.
     # Unified Capex Budget Engine
@@ -489,31 +352,12 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'capex_bootstrap_bps': (0, 100),
     'capex_bootstrap_max_sats': (0, 10000),
     'capex_grace_days': (0, 90),
-    'capex_exploration_rate': (0.0, 1.0),
-    'capex_tactical_rate': (0.0, 1.0),
     'capex_probability_budget_bonus': (0.0, 1.0),
     'capex_global_envelope_sats': (0, 100_000_000),
-    # LN+ liquidity swap automation
-    'lnplus_swap_preference_margin': (0.0, 2.0),
-    'lnplus_inbound_credit_factor': (0.0, 1.0),
-    # C-2 (2026-07-08 audit): hard cap — contracts must never lock capital
-    # beyond a quarter. Default (3) stays inside the new [1, 3] range.
-    'lnplus_max_duration_months': (1, 3),
-    'lnplus_max_participants': (2, 5),
-    # D-3 (Revision 2, 2026-07-08 operator-directed): dual (2-party) swaps
-    # are rejected; must stay <= lnplus_max_participants in practice.
-    'lnplus_min_participants': (2, 5),
-    'lnplus_apply_feerate_ceiling': (253, 100000),
-    'lnplus_pending_timeout_days': (1, 30),
-    'lnplus_min_peer_positive_ratings': (0, 1000),
-    # D-2 (Revision 2): LN+ rank scale is 1-10 (higher is better); 8 = Gold.
-    'lnplus_min_peer_rank': (1, 10),
-    'lnplus_watcher_interval': (300, 14400),
 }
 
 # Valid values for string enum fields
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
-    'expansion_treasury_preferred_currency': ('BTC', 'LBTC', 'L-BTC', 'btc', 'lbtc', 'l-btc'),
     'fee_profile': ('active', 'conservative'),
     'rebalance_router': ('v3',),
     'market_fee_mode': ('undercut', 'match', 'premium', 'competition_aware'),
@@ -550,17 +394,12 @@ class Config:
     hot_channel_protection_profit_budget_pct: float = 0.75
     hot_channel_protection_max_chunk_multiplier: float = 4.0
     hot_channel_protection_min_cooldown_hours: float = 1.0
-    boltz_auto_cycle_enabled: bool = False  # Run profit-gated Boltz auto-balance cycle in background (opt-in)
-    boltz_auto_cycle_interval_minutes: int = 15  # Scheduler cadence for Boltz auto-cycle
-    boltz_auto_cycle_max_actions: int = 1   # Max actions per scheduled cycle
-    boltz_auto_cycle_startup_delay_seconds: int = 120  # Delay before first Boltz auto-cycle
     # Source-heavy drain: node-level receivable objective and envelopes.
     # receivable_ratio = total receivable / total capacity across channels.
     receivable_ratio_target: float = 0.30   # structural credit scales to 0 here
     receivable_ratio_floor: float = 0.20    # below this the node is "starved"
     # Daily cap (sats of swap fees) for loop-outs that only pass the profit
     # guard via the structural credit. 0 = structural loop-outs disabled.
-    boltz_structural_budget_sats_per_day: int = 0
     # Max bounded fee discount applied to stagnant over-local channels.
     # 0.0 = disabled. 0.10 means fees may be biased down by at most 10%.
     drain_fee_discount_max: float = 0.0
@@ -585,8 +424,6 @@ class Config:
     htlcmax_balanced_pct: float = 0.45
     # econ_* rollout flags — Phase B (2026-08-01 surface reduction, section
     # 2e/3): all 12 default TRUE so fresh nodes run the governed paths that
-    # production actually tests (10 stable-True for months; the two Boltz
-    # flags were False only because Boltz automation was off). The flags are
     # scheduled for removal (with the legacy branches) after one stable
     # default-True release (Phase D).
     # Refactor Phase 1 shadow: observe-mode intent recording into
@@ -596,36 +433,17 @@ class Config:
     # Refactor Phase 2D: governor-gated rebalance reservations (see
     # docs/planning/2026-07-12-refactor-phase2-governed-rebalance.md).
     econ_governor_rebalance_enabled: bool = True
-    # Refactor Phase 2E: governor-gated planner open/close reservations.
-    econ_governor_planner_enabled: bool = True
-    # Refactor Phase 2F: governor-gated LN+ swap-open reservations.
-    econ_governor_lnplus_enabled: bool = True
-    # Refactor Phase 2G: governor-gated Boltz swap reservations.
-    econ_governor_boltz_enabled: bool = True
     # Refactor Phase 2H: governor-gated automated fee broadcasts.
     econ_governor_fees_enabled: bool = True
     # Refactor Phase 3F: live governor-boundary arbitration.
     econ_arbiter_enabled: bool = True
     # Workstream H: cycle-arbitrated rebalance execution list.
     econ_cycle_rebalance_enabled: bool = True
-    # Workstream H: cycle-arbitrated planner close list.
-    econ_cycle_planner_enabled: bool = True
-    # Workstream H: cycle-arbitrated Boltz recommendations.
-    econ_cycle_boltz_enabled: bool = True
     econ_ev_populated: bool = True
     econ_conflict_rules_extended: bool = True
     # Phase 4: global authority level (observe|fees|liquidity|capital).
     authority_level: str = "capital"
     risk_profile: str = "custom"
-    # Expansion treasury mode (reverse swaps to build on-chain funds for channel opens)
-    expansion_treasury_enabled: bool = False
-    expansion_treasury_onchain_target_sats: int = 5_000_000
-    expansion_treasury_min_deficit_sats: int = 250_000
-    expansion_treasury_preferred_currency: str = 'BTC'
-    expansion_treasury_max_actions: int = 1
-    expansion_treasury_min_source_local_pct: float = 80.0  # I-7: 0-100 scale (not 0-1)
-    expansion_treasury_exclude_protected: bool = True
-    
     # Flow analysis parameters
     flow_window_days: int = 7      # Days to analyze for flow calculation
     
@@ -724,9 +542,7 @@ class Config:
     # Default 1000 ppm = 0.1% of rebalance amount. 0 disables the layer
     # and keeps the Phase 5 capex-only behavior.
     pair_fee_cap_ppm: int = 1000
-    # Upstream rebalancer patterns (flow-facts / EV / planner tuning).
-    # Consumed by ChannelFlowFacts (activity + utilization knobs) and by
-    # the rebalance engine EV / capacity planner (size-tiering knobs).
+    # Rebalance flow-fact, EV, utilization, and size-tier tuning.
     # Window over which recent forwarding activity is measured for the
     # activity-recency penalty (seconds). Default 3600 = 1 hour.
     rebalance_activity_window_seconds: int = 3600
@@ -771,13 +587,6 @@ class Config:
     growth_budget_hard_ceiling_sats: int = 10_000
     allow_zero_cost_auto_rebalance_when_budget_zero: bool = False
     weekly_budget_sats: int = 35000        # Max rebalancing fees per 7-day window (hard ceiling)
-    # Operator ruling D4 (2026-07-01): fee cap (sats) for the diagnostic
-    # ("defibrillator") shock rebalance. The shock's ppm ceiling is DERIVED
-    # from this cap (ceil(cap/amount*1e6)), so this is the single binding
-    # knob. Default 400 covers observed market route prices (118-363 sats)
-    # that the old hardcoded 100-sat envelope rejected route_over_budget.
-    # At use it is clamped to [1, min(daily_budget_sats, 10_000)].
-    diagnostic_rebalance_max_fee_sats: int = 400
     min_wallet_reserve: int = 1_000_000    # Min sats (confirmed on-chain + channel spendable) before ABORT
 
     # RPC Hardening
@@ -834,31 +643,11 @@ class Config:
     # Routing Intelligence Integration
     # ==========================================================================
 
-    # Capacity Planner
-    planner_enabled: bool = False
-    planner_interval: int = 21600               # 6 hours
-    planner_dry_run: bool = False
-    planner_execute_closes: bool = False
-    planner_max_opens_per_cycle: int = 1
-    planner_max_closes_per_cycle: int = 0
-    planner_close_fee_reserve_multiplier: float = 2.0
-    planner_close_fee_cap_sats: int = 0
-    planner_close_feerange_enabled: bool = False
-    # Phase B (2026-08-01 surface reduction): 500k -> 1M. Sub-1M opens
-    # rarely clear chain-cost ROI; production runs 2M. The CLN option
-    # revenue-ops-planner-min-channel-sats feeds this at plugin init and
-    # shares this default.
-    planner_min_channel_sats: int = 1000000     # 1M sats
-    planner_max_channel_sats: int = 10000000    # 10M sats
-    planner_max_fee_rate_sat_vb: float = 50.0
-    planner_min_annual_roi_pct: float = 1.0
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50       # Fraction of channel contribution for all capex
     capex_bootstrap_bps: int = 10               # Bootstrap: basis points of capacity per 30d
     capex_bootstrap_max_sats: int = 200         # Bootstrap cap per channel per 30d
     capex_grace_days: int = 14                  # Days before bootstrap activates
-    capex_exploration_rate: float = 0.10        # Fleet contribution fraction for opens/growth
-    capex_tactical_rate: float = 0.15           # Fleet contribution fraction for Boltz treasury
     capex_global_envelope_sats: int = 0         # Global cap (0 = auto-computed)
     # Probability-aware budget relaxation. When a router reports a route
     # probability (v3/askrene does; v2/getroute returns 0), the engine allows
@@ -866,25 +655,6 @@ class Config:
     # fraction. Default 0.0 = disabled, preserving v2 behavior exactly.
     capex_probability_budget_bonus: float = 0.0
 
-    # ==========================================================================
-    # LN+ Liquidity Swap Automation
-    # ==========================================================================
-    lnplus_swaps_enabled: bool = True
-    lnplus_execute_applications: bool = True
-    lnplus_swap_preference_margin: float = 0.2
-    lnplus_max_duration_months: int = 3
-    lnplus_min_peer_positive_ratings: int = 5
-    # D-2 (Revision 2, 2026-07-08 operator-directed): rank floor for
-    # non-fleet participants; LN+ scale 1-10, higher better, 8 = "Gold".
-    lnplus_min_peer_rank: int = 8
-    lnplus_max_participants: int = 4
-    # D-3 (Revision 2): minimum 3 participants (dual swaps rejected);
-    # among equal-EV qualifiers, fewer participants win the tie-break.
-    lnplus_min_participants: int = 3
-    lnplus_apply_feerate_ceiling: int = 5000
-    lnplus_pending_timeout_days: int = 7
-    lnplus_inbound_credit_factor: float = 0.5
-    lnplus_watcher_interval: int = 3600
 
     # Internal version tracking (not a user-configurable option)
     _version: int = field(default=0, repr=False, compare=False)
@@ -898,7 +668,6 @@ class Config:
         for _key in (
             'receivable_ratio_target',
             'receivable_ratio_floor',
-            'boltz_structural_budget_sats_per_day',
             'drain_fee_discount_max',
             'node_drain_bias_max',
         ):
@@ -965,7 +734,7 @@ class Config:
         for key, value in overrides.items():
             if key.startswith('_'):
                 # Internal marker rows (e.g. _closure_sweep_tripped,
-                # _version_bump, _lnplus_backfill_done) share the override
+                # internal migration markers share the override
                 # table but are not config keys.
                 continue
             if hasattr(self, key) and key not in IMMUTABLE_CONFIG_KEYS:
@@ -973,7 +742,7 @@ class Config:
             elif not hasattr(self, key):
                 # Phase B (2026-08-01 surface reduction, section 5.5): a
                 # silently skipped unknown row rots invisibly — the
-                # production lnplus_fleet_pubkeys case dangled for months.
+                # stale production keys can otherwise dangle for months.
                 self._override_warnings.append(
                     f"config override '{key}' does not match any known key "
                     f"— ignored (stale after an upgrade?)")
@@ -1048,14 +817,6 @@ class Config:
                 f"({self.receivable_ratio_floor}) > receivable_ratio_target "
                 f"({self.receivable_ratio_target}); repaired floor to target")
             self.receivable_ratio_floor = self.receivable_ratio_target
-        # Repair a crossed LN+ ring-size band persisted before the
-        # update_runtime cross-check existed (min > max gates out every swap).
-        if self.lnplus_min_participants > self.lnplus_max_participants:
-            self._override_warnings.append(
-                f"Contradictory settings: lnplus_min_participants "
-                f"({self.lnplus_min_participants}) > lnplus_max_participants "
-                f"({self.lnplus_max_participants}); repaired max to min")
-            self.lnplus_max_participants = self.lnplus_min_participants
         # Phase B (2026-08-01 surface reduction, section 5.1): a crossed
         # budget pair is repaired UPWARD like the crossed fee rails
         # (fc4c76b) — the weekly ceiling rises to meet the operator's
@@ -1073,14 +834,6 @@ class Config:
         # silently disables ALL automated opens. Repair upward (max rises
         # to min) for the same reason as the fee rails: the operator's
         # stated minimum viable size is honored and only the cap widens.
-        if self.planner_min_channel_sats > self.planner_max_channel_sats:
-            self._override_warnings.append(
-                f"Contradictory settings: planner_min_channel_sats "
-                f"({self.planner_min_channel_sats}) > "
-                f"planner_max_channel_sats "
-                f"({self.planner_max_channel_sats}); repaired "
-                f"planner_max_channel_sats to {self.planner_min_channel_sats}")
-            self.planner_max_channel_sats = self.planner_min_channel_sats
         return list(self._override_warnings)
 
     def _detect_shadowed_and_deprecated(self, explicit_keys: set) -> None:
@@ -1216,12 +969,6 @@ class Config:
                 return {"error": f"low_liquidity_threshold ({typed_value}) must be less than high_liquidity_threshold ({self.high_liquidity_threshold})"}
             if key == 'high_liquidity_threshold' and typed_value <= self.low_liquidity_threshold:
                 return {"error": f"high_liquidity_threshold ({typed_value}) must be greater than low_liquidity_threshold ({self.low_liquidity_threshold})"}
-            # LN+ ring-size band: min > max would silently gate out every
-            # swap (feature-wide no-op), so reject crossed settings.
-            if key == 'lnplus_min_participants' and typed_value > self.lnplus_max_participants:
-                return {"error": f"lnplus_min_participants ({typed_value}) cannot exceed lnplus_max_participants ({self.lnplus_max_participants})"}
-            if key == 'lnplus_max_participants' and typed_value < self.lnplus_min_participants:
-                return {"error": f"lnplus_max_participants ({typed_value}) cannot be less than lnplus_min_participants ({self.lnplus_min_participants})"}
             # Utilization floor/ceiling: mirrors the low/high_liquidity_threshold
             # guard above. Without this, an inverted pair (e.g. floor=0.9,
             # ceiling=0.1) silently pins realized utilization to 0.9 for every
@@ -1250,10 +997,6 @@ class Config:
                 return {"error": f"weekly_budget_sats ({typed_value}) cannot be less than current daily_budget_sats ({self.daily_budget_sats})"}
             # Phase B (section 5.2): a crossed planner channel-size band
             # silently disables all automated opens — reject it at set-time.
-            if key == 'planner_min_channel_sats' and typed_value > self.planner_max_channel_sats:
-                return {"error": f"planner_min_channel_sats ({typed_value}) cannot exceed current planner_max_channel_sats ({self.planner_max_channel_sats})"}
-            if key == 'planner_max_channel_sats' and typed_value < self.planner_min_channel_sats:
-                return {"error": f"planner_max_channel_sats ({typed_value}) cannot be less than current planner_min_channel_sats ({self.planner_min_channel_sats})"}
 
             old_value = getattr(self, key)
 
@@ -1326,17 +1069,6 @@ class ConfigSnapshot:
     hot_channel_protection_profit_budget_pct: float
     hot_channel_protection_max_chunk_multiplier: float
     hot_channel_protection_min_cooldown_hours: float
-    boltz_auto_cycle_enabled: bool
-    boltz_auto_cycle_interval_minutes: int
-    boltz_auto_cycle_max_actions: int
-    boltz_auto_cycle_startup_delay_seconds: int
-    expansion_treasury_enabled: bool
-    expansion_treasury_onchain_target_sats: int
-    expansion_treasury_min_deficit_sats: int
-    expansion_treasury_preferred_currency: str
-    expansion_treasury_max_actions: int
-    expansion_treasury_min_source_local_pct: float
-    expansion_treasury_exclude_protected: bool
     
     # Flow analysis parameters
     flow_window_days: int
@@ -1445,36 +1177,16 @@ class ConfigSnapshot:
     # Weekly budget cap (hard ceiling over daily burst)
     weekly_budget_sats: int = 35000
 
-    # Diagnostic (defibrillator) shock fee cap — operator ruling D4
-    diagnostic_rebalance_max_fee_sats: int = 400
-
-    # Capacity Planner
-    planner_enabled: bool = False
-    planner_interval: int = 21600
-    planner_dry_run: bool = False
-    planner_execute_closes: bool = False
-    planner_max_opens_per_cycle: int = 1
-    planner_max_closes_per_cycle: int = 0
-    planner_close_fee_reserve_multiplier: float = 2.0
-    planner_close_fee_cap_sats: int = 0
-    planner_close_feerange_enabled: bool = False
-    planner_min_channel_sats: int = 1000000
-    planner_max_channel_sats: int = 10000000
-    planner_max_fee_rate_sat_vb: float = 50.0
-    planner_min_annual_roi_pct: float = 1.0
     # Unified Capex Budget Engine
     capex_reinvestment_rate: float = 0.50
     capex_bootstrap_bps: int = 10
     capex_bootstrap_max_sats: int = 200
     capex_grace_days: int = 14
-    capex_exploration_rate: float = 0.10
-    capex_tactical_rate: float = 0.15
     capex_global_envelope_sats: int = 0
     capex_probability_budget_bonus: float = 0.0
-    # Structural loop-out / drain-demand fields
+    # Receivable-ratio and fee drain-bias fields
     receivable_ratio_target: float = 0.30
     receivable_ratio_floor: float = 0.20
-    boltz_structural_budget_sats_per_day: int = 0
     drain_fee_discount_max: float = 0.0
     node_drain_bias_enabled: bool = False
     node_drain_bias_max: float = 0.3
@@ -1488,14 +1200,9 @@ class ConfigSnapshot:
     # snapshot reads as absent in production). Phase B: default TRUE.
     econ_shadow_enabled: bool = True
     econ_governor_rebalance_enabled: bool = True
-    econ_governor_planner_enabled: bool = True
-    econ_governor_lnplus_enabled: bool = True
-    econ_governor_boltz_enabled: bool = True
     econ_governor_fees_enabled: bool = True
     econ_arbiter_enabled: bool = True
     econ_cycle_rebalance_enabled: bool = True
-    econ_cycle_planner_enabled: bool = True
-    econ_cycle_boltz_enabled: bool = True
     econ_ev_populated: bool = True
     econ_conflict_rules_extended: bool = True
     authority_level: str = "capital"
@@ -1504,23 +1211,6 @@ class ConfigSnapshot:
     # allow true cheap egress). Missing-from-snapshot kills the feature in
     # production (getattr fallback), so it MUST be mirrored here.
     min_fee_ppm_saturated: int = 0
-    # LN+ (lightningnetwork.plus) liquidity swap automation (C1 audit fix:
-    # these were missing from ConfigSnapshot entirely, so
-    # getattr(cfg, "lnplus_swaps_enabled", False) inside execute_cycle's
-    # snapshot always fell back to False in production — the evaluator was
-    # silently dead despite Config defaulting it on).
-    lnplus_swaps_enabled: bool = True
-    lnplus_execute_applications: bool = True
-    lnplus_swap_preference_margin: float = 0.2
-    lnplus_max_duration_months: int = 3
-    lnplus_min_peer_positive_ratings: int = 5
-    lnplus_min_peer_rank: int = 8
-    lnplus_max_participants: int = 4
-    lnplus_min_participants: int = 3
-    lnplus_apply_feerate_ceiling: int = 5000
-    lnplus_pending_timeout_days: int = 7
-    lnplus_inbound_credit_factor: float = 0.5
-    lnplus_watcher_interval: int = 3600
     # Version tracking
     version: int = 0
     

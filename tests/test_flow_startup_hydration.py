@@ -93,27 +93,11 @@ def test_startup_hydration_uses_helper_window_for_empty_table():
         def set_profitability_analyzer(self, *args, **kwargs):
             return None
 
-        def set_capacity_planner(self, *args, **kwargs):
-            return None
-
-        def set_capex_engine(self, *args, **kwargs):
-            return None
-
-    class _FakeCapacityPlanner(_FakeComponent):
-        def set_capital_efficiency(self, *args, **kwargs):
-            return None
-
         def set_capex_engine(self, *args, **kwargs):
             return None
 
     class _FakeCapexEngine(_FakeComponent):
         pass
-
-    class _FakeBoltzManager(_FakeComponent):
-        enabled = False
-
-        def set_capex_engine(self, *args, **kwargs):
-            return None
 
     options = {}
     for name, spec in mod.plugin.options.items():
@@ -122,7 +106,6 @@ def test_startup_hydration_uses_helper_window_for_empty_table():
 
     options["revenue-ops-flow-window-days"] = "7"
     options["revenue-ops-db-path"] = ":memory:"
-    options["revenue-ops-boltz-enabled"] = "false"
 
     with (
         patch.object(mod, "Database", return_value=fake_db),
@@ -130,12 +113,10 @@ def test_startup_hydration_uses_helper_window_for_empty_table():
         patch.object(mod, "PolicyManager", return_value=_FakeComponent()),
         patch.object(mod, "ChannelProfitabilityAnalyzer", return_value=_FakeComponent()),
         patch.object(mod, "FlowAnalyzer", return_value=_FakeComponent()),
-        patch.object(mod, "CapacityPlanner", return_value=_FakeCapacityPlanner()),
         patch.object(mod, "FeeController", return_value=_FakeComponent()),
         patch.object(mod, "EVRebalancer", return_value=_FakeRebalancer()),
         patch.object(mod, "CapitalEfficiencyAnalyzer", return_value=_FakeComponent()),
         patch.object(mod, "CapexBudgetEngine", return_value=_FakeCapexEngine()),
-        patch.object(mod, "BoltzCliManager", return_value=_FakeBoltzManager()),
         patch.object(mod.Config, "load_overrides", return_value=[]),
         patch.object(mod, "_start_background_tasks", return_value=None, create=True),
         patch.object(data_service_module, "DataService", return_value=fake_data_service),
