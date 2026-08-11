@@ -48,7 +48,6 @@ from modules.policy_manager import (
     PeerPolicy,
     READ_ONLY_POLICY_ACTIONS,
     TACTICAL_POLICY_ACTIONS,
-    BANNED_TAG,
 )
 from modules.capex_budget import CapexBudgetEngine
 from modules.capital_efficiency import CapitalEfficiencyAnalyzer
@@ -2692,8 +2691,8 @@ def run_rebalance_check():
 # =============================================================================
 # Phase C (operator-surface reduction 2026-08-01): deprecated-alias plumbing.
 #
-# revenue-budget, plus the ban actions on revenue-policy) are the primary
-# operator names. Every pre-existing name keeps working as a thin forwarding
+# The retained dispatcher names are the primary operator names. Every
+# pre-existing name keeps working as a thin forwarding
 # alias whose dict response gains ONLY an additive `deprecation` field; the
 # alias window ends 2026-09-05. See
 # docs/audits/OPERATOR_SURFACE_REDUCTION_2026-08-01.md (§1, §4) and the
@@ -4091,92 +4090,6 @@ def revenue_list_ignored(plugin: Plugin) -> Dict[str, Any]:
     return _deprecated_removal(_rpc_list_ignored(plugin))
 
 
-def _rpc_ban(plugin: Plugin, peer_id: str, reason: str = "operator", **kwargs) -> Dict[str, Any]:
-    """
-    Ban a peer: fee and rebalance management stops (passive strategy, rebalancing disabled).
-
-    Existing channels are not closed; the ban is a retained local policy gate.
-
-    Usage: lightning-cli revenue-ban peer_id [reason]
-    """
-    if policy_manager is None:
-        return {"error": "Plugin not initialized"}
-    if not re.match(r'^[0-9a-fA-F]{66}$', str(peer_id or "")):
-        return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
-    try:
-        policy = policy_manager.ban_peer(peer_id, reason=reason)
-    except (ValueError, RuntimeError) as e:
-        return {"status": "error", "error": str(e)}
-    plugin.log(f"OPERATOR BAN: {peer_id} — {reason}", level="info")
-    return {
-        "status": "success",
-        "action": "ban",
-        "peer_id": peer_id,
-        "reason": reason,
-        "tags": policy.tags,
-        "message": (
-            "Peer banned from fee and rebalance management. Existing channels are untouched."
-        ),
-    }
-
-
-@plugin.method("revenue-ban")
-def revenue_ban(plugin: Plugin, peer_id: str, reason: str = "operator", **kwargs) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-policy ban' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_ban(plugin, peer_id, reason=reason, **kwargs), "revenue-policy ban"
-    )
-
-
-def _rpc_unban(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
-    """
-    Lift an operator ban set by revenue-ban. The peer returns to dynamic
-    fee management with rebalancing enabled; other tags are preserved.
-
-    Usage: lightning-cli revenue-unban peer_id
-    """
-    if policy_manager is None:
-        return {"error": "Plugin not initialized"}
-    if not re.match(r'^[0-9a-fA-F]{66}$', str(peer_id or "")):
-        return {"error": "Invalid peer_id format: expected 66-character hex pubkey"}
-    try:
-        policy = policy_manager.unban_peer(peer_id)
-    except (ValueError, RuntimeError) as e:
-        return {"status": "error", "error": str(e)}
-    plugin.log(f"OPERATOR UNBAN: {peer_id}", level="info")
-    return {
-        "status": "success",
-        "action": "unban",
-        "peer_id": peer_id,
-        "tags": policy.tags,
-    }
-
-
-@plugin.method("revenue-unban")
-def revenue_unban(plugin: Plugin, peer_id: str, **kwargs) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-policy unban' (removal 2026-09-05)."""
-    return _deprecated_alias(
-        _rpc_unban(plugin, peer_id, **kwargs), "revenue-policy unban"
-    )
-
-
-def _rpc_list_banned(plugin: Plugin) -> Dict[str, Any]:
-    """List all operator-banned peers."""
-    if policy_manager is None:
-        return {"error": "Plugin not initialized"}
-    banned = [
-        {"peer_id": p.peer_id, "tags": p.tags, "banned_at": p.updated_at}
-        for p in policy_manager.get_peers_by_tag(BANNED_TAG)
-    ]
-    return {"banned_peers": banned, "count": len(banned)}
-
-
-@plugin.method("revenue-list-banned")
-def revenue_list_banned(plugin: Plugin) -> Dict[str, Any]:
-    """Deprecated alias for 'revenue-policy list-banned' (removal 2026-09-05)."""
-    return _deprecated_alias(_rpc_list_banned(plugin), "revenue-policy list-banned")
-
-
 
 # =============================================================================
 # POLICY MANAGEMENT (v1.4: Policy-Driven Architecture)
@@ -4201,9 +4114,6 @@ def revenue_policy(plugin: Plugin, action: str = "list", peer_id: str = None,
       lightning-cli revenue-policy get <peer_id>                  # Get policy for peer
       lightning-cli revenue-policy find <tag>                     # Find peers by tag
       lightning-cli revenue-policy changes [since=<timestamp>]    # Get policy changes
-      lightning-cli revenue-policy ban <peer_id> [reason=X]       # Ban peer (was revenue-ban)
-      lightning-cli revenue-policy unban <peer_id>                # Lift ban (was revenue-unban)
-      lightning-cli revenue-policy list-banned                    # List bans (was revenue-list-banned)
       lightning-cli revenue-policy set <peer_id> [options]        # Deprecated for normal operator use
       lightning-cli revenue-policy delete <peer_id>               # Deprecated for normal operator use
       lightning-cli revenue-policy tag <peer_id> <tag>            # Deprecated for normal operator use
@@ -4372,24 +4282,6 @@ def revenue_policy(plugin: Plugin, action: str = "list", peer_id: str = None,
                 "tags": policy.tags
             }
         
-        elif action == "ban":
-            # Phase C (2026-08-01): primary home of the former revenue-ban.
-            if not peer_id:
-                return {"error": "Usage: revenue-policy ban <peer_id> [reason=X]"}
-            return _rpc_ban(
-                plugin, peer_id, reason=str(kwargs.get("reason", "operator"))
-            )
-
-        elif action == "unban":
-            # Phase C (2026-08-01): primary home of the former revenue-unban.
-            if not peer_id:
-                return {"error": "Usage: revenue-policy unban <peer_id>"}
-            return _rpc_unban(plugin, peer_id)
-
-        elif action == "list-banned":
-            # Phase C (2026-08-01): primary home of revenue-list-banned.
-            return _rpc_list_banned(plugin)
-
         elif action == "find":
             if not tag:
                 return {"error": "Usage: revenue-policy find <tag>"}
@@ -4449,10 +4341,7 @@ def revenue_policy(plugin: Plugin, action: str = "list", peer_id: str = None,
                 return {"status": "error", "error": str(e)}
 
         else:
-            allowed = sorted(
-                READ_ONLY_POLICY_ACTIONS | TACTICAL_POLICY_ACTIONS
-                | {"ban", "unban", "list-banned"}
-            )
+            allowed = sorted(READ_ONLY_POLICY_ACTIONS | TACTICAL_POLICY_ACTIONS)
             allowed_text = ", ".join(f"'{name}'" for name in allowed)
             return {"error": f"Unknown action: {action}. Use {allowed_text}"}
     

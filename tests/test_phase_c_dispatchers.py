@@ -3,12 +3,14 @@
 Pins the additive half of Phase C:
 
 1. The new dispatchers (revenue-cycle /
-   revenue-budget, plus revenue-policy ban actions) route each subcommand
+   revenue-budget) route each subcommand
    onto the SAME shared helper the old standalone method calls — same
    underlying calls, same argument names, same result.
-2. Old names keep working and their dict responses gain ONLY an additive
+2. Removed peer-ban policy actions are rejected without touching
+   PolicyManager.
+3. Old names keep working and their dict responses gain ONLY an additive
    `deprecation` field; dispatcher responses never carry it.
-3. Unknown subcommands return an error dict that lists the valid ones.
+4. Unknown subcommands return an error dict that lists the valid ones.
 
 See docs/audits/OPERATOR_SURFACE_REDUCTION_2026-08-01.md (§1, §4) and the
 2026-08-01 announcement in
@@ -203,61 +205,28 @@ class TestBudgetDispatcher:
 
 
 # ---------------------------------------------------------------------------
-# revenue-policy ban / unban / list-banned
+# Removed peer-ban dispatcher regression
 # ---------------------------------------------------------------------------
 
-class TestPolicyBanActions:
-    def test_ban(self, mod, plugin, monkeypatch):
+class TestRemovedPolicyBanActions:
+    @pytest.mark.parametrize(
+        ("action_input", "normalized_action"),
+        [("ban", "ban"), ("BAN", "ban"), (" unban ", "unban"),
+         ("list-banned", "list-banned")],
+    )
+    def test_removed_action_is_unknown_and_does_not_touch_policy_manager(
+        self, mod, plugin, monkeypatch, action_input, normalized_action
+    ):
         pm = MagicMock()
-        pm.ban_peer.return_value = SimpleNamespace(tags=["banned"])
         monkeypatch.setattr(mod, "policy_manager", pm)
 
-        new = mod.revenue_policy(plugin, action="ban", peer_id=PEER,
-                                 reason="abuse")
-        old = mod.revenue_ban(plugin, PEER, "abuse")
+        result = mod.revenue_policy(plugin, action=action_input, peer_id=PEER)
 
-        _assert_no_deprecation(new)
-        assert new == _strip(old)
-        assert new["status"] == "success" and new["action"] == "ban"
-        assert pm.ban_peer.call_count == 2
-        for call in pm.ban_peer.call_args_list:
-            assert call.args == (PEER,) and call.kwargs == {"reason": "abuse"}
-
-    def test_ban_requires_peer_id(self, mod, plugin, monkeypatch):
-        monkeypatch.setattr(mod, "policy_manager", MagicMock())
-        result = mod.revenue_policy(plugin, action="ban")
-        assert "error" in result and "ban" in result["error"]
-
-    def test_unban(self, mod, plugin, monkeypatch):
-        pm = MagicMock()
-        pm.unban_peer.return_value = SimpleNamespace(tags=[])
-        monkeypatch.setattr(mod, "policy_manager", pm)
-
-        new = mod.revenue_policy(plugin, action="unban", peer_id=PEER)
-        old = mod.revenue_unban(plugin, PEER)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old)
-        assert new["action"] == "unban"
-
-    def test_list_banned(self, mod, plugin, monkeypatch):
-        pm = MagicMock()
-        pm.get_peers_by_tag.return_value = [
-            SimpleNamespace(peer_id=PEER, tags=["banned"], updated_at=123)]
-        monkeypatch.setattr(mod, "policy_manager", pm)
-
-        new = mod.revenue_policy(plugin, action="list-banned")
-        old = mod.revenue_list_banned(plugin)
-
-        _assert_no_deprecation(new)
-        assert new == _strip(old)
-        assert new["count"] == 1 and new["banned_peers"][0]["peer_id"] == PEER
-
-    def test_unknown_action_lists_ban_actions(self, mod, plugin, monkeypatch):
-        monkeypatch.setattr(mod, "policy_manager", MagicMock())
-        result = mod.revenue_policy(plugin, action="nonsense")
-        for name in ("'ban'", "'unban'", "'list-banned'"):
-            assert name in result["error"]
+        assert result["error"].startswith(f"Unknown action: {normalized_action}.")
+        assert "'ban'" not in result["error"]
+        assert "'unban'" not in result["error"]
+        assert "'list-banned'" not in result["error"]
+        assert pm.mock_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -284,12 +253,6 @@ class TestDeprecationNotices:
         database.get_spend_ledger_summary.return_value = {}
         monkeypatch.setattr(mod, "database", database)
         assert "revenue-budget ledger" in mod.revenue_spend_ledger(
-            plugin)["deprecation"]
-
-        pm = MagicMock()
-        pm.get_peers_by_tag.return_value = []
-        monkeypatch.setattr(mod, "policy_manager", pm)
-        assert "revenue-policy list-banned" in mod.revenue_list_banned(
             plugin)["deprecation"]
 
     def test_ignore_trio_removal_notice(self, mod, plugin, monkeypatch):

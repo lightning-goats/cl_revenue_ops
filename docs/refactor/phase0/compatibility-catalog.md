@@ -1,7 +1,7 @@
 # Public compatibility catalog (liquidity executors retired)
 
 What the refactor MUST keep working (refactor invariants 2 and 3).
-Pin test: `tests/test_rpc_surface_inventory.py` (39 retained methods).
+Pin test: `tests/test_rpc_surface_inventory.py` (36 retained methods).
 
 ## RPC surface
 
@@ -17,9 +17,10 @@ Action/mutation RPCs (AGENTS.md list; execution-gated): see AGENTS.md
 Classification per method: `docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md`
 (current v3 inventory, refreshed 2026-08-03).
 
-Full 39-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
+Full 36-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
 
-Phase C retained operator-surface dispatchers: `revenue-cycle <subsystem>`, `revenue-budget [section]`, and the `revenue-policy ban|unban|list-banned` actions are the
+Phase C retained operator-surface dispatchers: `revenue-cycle <subsystem>`,
+`revenue-budget [section]`, and the diagnostic `revenue-policy` actions are the
 primary operator names.
 
 ## Config surface

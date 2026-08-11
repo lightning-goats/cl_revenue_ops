@@ -1,10 +1,10 @@
 # cl_revenue_ops action RPC inventory
 
-Current contract: plugin version 3.0.0, 2026-08-03.
+Current contract: plugin version 3.0.0, 2026-08-11.
 
 This inventory describes the registered runtime surface after removal of
 CapacityPlanner, automatic channel open/close, planner defibrillation, Boltz,
-and LN+. The plugin registers 39 methods. Removed method families are not
+and LN+. The plugin registers 36 methods. Removed method families are not
 deprecated aliases and are not safe to probe by invoking them.
 
 ## Classification
@@ -33,8 +33,6 @@ must not be whitelisted wholesale:
 - `revenue-analyze`
 - `revenue-ignore`
 - `revenue-unignore`
-- `revenue-ban`
-- `revenue-unban`
 - `revenue-policy`
 - `revenue-config`
 - `revenue-hot-channel-protection-peers`
@@ -61,7 +59,6 @@ lifecycle action, swap, or local policy mutation:
 - `revenue-profitability`
 - `revenue-history`
 - `revenue-list-ignored`
-- `revenue-list-banned`
 - `revenue-report`
 - `revenue-dashboard`
 - `revenue-health`
