@@ -2691,8 +2691,8 @@ def run_rebalance_check():
 # =============================================================================
 # Phase C (operator-surface reduction 2026-08-01): deprecated-alias plumbing.
 #
-# revenue-budget, plus the ban actions on revenue-policy) are the primary
-# operator names. Every pre-existing name keeps working as a thin forwarding
+# The retained dispatcher names are the primary operator names. Every
+# pre-existing name keeps working as a thin forwarding
 # alias whose dict response gains ONLY an additive `deprecation` field; the
 # alias window ends 2026-09-05. See
 # docs/audits/OPERATOR_SURFACE_REDUCTION_2026-08-01.md (§1, §4) and the
