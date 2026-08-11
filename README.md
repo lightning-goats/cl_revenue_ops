@@ -1,6 +1,6 @@
 # cl-revenue-ops
 
-`cl_revenue_ops` is the independent local execution layer for Core Lightning routing economics. It owns fee control, rebalance decisioning/execution, planner/capex, profitability analysis, and budget enforcement. It watches channel economics, adjusts fees, and executes rebalancing while keeping the normal operator surface intentionally small.
+`cl_revenue_ops` is the independent local execution layer for Core Lightning routing economics. It owns fee control, budget-constrained rebalance decisioning/execution, profitability analysis, revenue reporting, and budget enforcement. It does not open or close channels and it does not execute swaps.
 
 It is fully standalone: every decision runs on local evidence only (own forwards, gossip, node state). The former cl-mycelium/cl-hive fleet-hint integration was retired and removed in 2026-07 (see [docs/audit/HIVE_REMOVAL_PLAN.md](docs/audit/HIVE_REMOVAL_PLAN.md)).
 
@@ -15,37 +15,34 @@ Core Lightning owns node runtime.
 
 ## Economic Governance
 
-Every economic mutation — fee broadcasts (including `htlc_max`), rebalances, channel opens/closes, Boltz swaps, LN+ obligations — flows through one governed core:
+Every retained economic mutation -- fee broadcasts and rebalances -- flows through one governed core:
 
 ```text
 canonical EconomicSnapshot -> typed intents -> arbiter -> governor -> execution -> append-only ledger
 ```
 
-- **Typed intents**: each action is an idempotent envelope carrying its EV, confidence, cost cap, and snapshot reference.
-- **Arbiter**: duplicate, stale, and conflicting intents (close-vs-rebalance, duplicate opens, rebalance-vs-structural-swap, contradictory fee changes) are rejected with stable reason codes, both in batch and live via a shared registry.
-- **Governor**: fail-closed authorization on every path — pause gate, `authority_level` gate, conflict registry, staleness, then atomic budget reservation. LN+ obligation fulfillment is exempt from pause/authority (an accepted swap is a debt) but never from authorization or the ledger.
-- **Ledger**: an append-only event log (`econ_ledger.db`) with hourly self-reconciliation against the reservation store; replay reconstructs state.
-- All of it is flag-gated (`econ_*` runtime keys, `revenue-config list-mutable` shows them) with instant per-capability rollback.
+- **Typed intents** carry EV, confidence, cost cap, and a snapshot reference.
+- **Arbitration** rejects duplicate, stale, and conflicting fee or rebalance intents with stable reason codes.
+- **Governance** applies pause, authority, staleness, policy, and atomic budget gates before execution.
+- **Ledger** records governed decisions and spend for reporting and reconciliation.
+- Runtime governance remains flag-gated through the public `revenue-config` controls.
 
-The wire contracts are versioned and language-neutral: see [`schemas/`](schemas/) (economic_snapshot, intent, ledger_event, ledger_projection, conformance_case), the conformance corpus under `tests/conformance/scenarios/` (40 scenario classes, validated by the standalone `tools/conformance/validate_fixtures.py`), and [ADR-001](docs/refactor/adr/ADR-001-dts-pid-fee-controller.md) for the fee-controller contract (DTS+PID is authoritative; rails -> rate-limit -> deadband -> cooldown).
+The wire contracts are versioned and language-neutral: see [`schemas/`](schemas/), the conformance corpus under `tests/conformance/scenarios/`, and [ADR-001](docs/refactor/adr/ADR-001-dts-pid-fee-controller.md).
 
 ## What Operators Need To Know
 
-- This is the executor. It owns local fee execution, rebalance execution, planner/capex decisions, profitability analysis, and budgets.
-- All spending decisions are local and bounded by this plugin's controls.
-- Live rebalances execute through `RebalanceEngineV2` using native explicit-route execution; route discovery is pinned to the `v3`/askrene router path.
+- The plugin owns local fee execution, circular rebalance execution, profitability analysis, revenue reporting, and rebalance budget enforcement.
+- It has no automatic channel-open, channel-close, Boltz, or LN+ execution path.
+- Live rebalances use `RebalanceEngineV2` with native explicit-route execution and the `v3`/askrene router path.
 - There is no Sling dependency.
-- The normal runtime controls are `paused`, `daily_budget_sats`, fee rails, `authority_level` (what the node MAY do: `observe` < `fees` < `liquidity` < `capital`), `risk_profile` (coherent economic-risk defaults: `preserve`/`conservative`/`balanced`/`growth`/`custom`; preview any change with `revenue-profile-preview` before activating), and planner execution caps. (`fee_market_boundary_*` and `rebalance_min_profit` are deprecated no-ops scheduled for removal after the announced 2026-08-12 compatibility window — see `docs/refactor/phase0/contract-compatibility-policy.md`.)
-- `paused` is the kill-switch for discretionary spending: fee and rebalance execution honor it, governed reservations reject with `PAUSED`, and every Boltz swap path (auto-cycle, balance cycle, treasury cycle) is gated before any swap executes. Planning and dry-run previews still run while paused. The sole exemption is LN+ obligation fulfillment: an accepted swap is a contractual debt and its channel open proceeds regardless of `paused`.
-- Python fee authority is default-on and is controlled through Core Lightning's dynamic `revenue-ops-fee-authority-enabled` option, not `revenue-config`. Inspect it with `revenue-fee-authority-status`; follow the [Python fee-authority handoff runbook](docs/runbooks/python-fee-authority-handoff.md) for transient checks, a separately approved manual cutover, and rollback.
+- The main controls are `paused`, daily and weekly rebalance budgets, fee rails, `authority_level`, and `risk_profile`.
+- `paused` is the kill switch for discretionary fee and rebalance execution. Read-only analysis and reporting remain available.
+- Python fee authority is controlled through the dynamic `revenue-ops-fee-authority-enabled` option. Inspect it with `revenue-fee-authority-status` and use the [fee-authority handoff runbook](docs/runbooks/python-fee-authority-handoff.md) for a separately approved cutover.
 - The primary operator surfaces are `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug`.
 - The normal workflow is decision explainability first, knob tuning second.
-- Auto fee bands are enabled by default. Manual policy bands are fallback only when an auto band is not yet available.
-- `revenue-policy list|get|find|changes` are diagnostic surfaces. Write actions such as `set` and `delete` remain internal or debug workflows, not the normal operator path.
-- Planner closes are recommendation-only by default.
-- To allow live close RPCs, set `revenue-ops-planner-execute-closes=true` and `revenue-ops-planner-max-closes-per-cycle` to a positive value.
-- Source-heavy drain: `revenue-ops-receivable-ratio-target`/`-floor` define the node-level inbound objective shown in `revenue-status.receivable`. The circular rebalancer always keeps first claim on internal redistribution; only the residual it cannot place (`revenue-rebalance-debug.drain_demand`) may earn the Boltz structural credit, capped by `revenue-ops-boltz-structural-budget-sats` per day (default 0 = off). `revenue-ops-drain-fee-discount-max` optionally biases fees down on stagnant over-local channels (default 0.0 = off).
-- Rebalancing and Boltz swaps remain separate tools with separate budgets: rebalancing redistributes at routing-fee cost; loop-outs change the node's aggregate balance at swap+chain cost. Note: the structural envelope is enforced from recorded spend — a swap whose fee fails to record does not deplete it, so keep the envelope small relative to the unified daily budget.
+- Auto fee bands are enabled by default; manual policy bands are fallback only.
+- `revenue-policy list|get|find|changes` are diagnostic surfaces. Policy writes are explicit operator actions.
+- The generic `no_close` policy remains stored for existing channels and external/manual workflows, but this plugin has no close executor.
 
 ## Rebalance Execution
 
@@ -61,9 +58,9 @@ The profitability analyzer tracks channel economics using **millisatoshi-native 
 Key concepts:
 - **Channel valuation** uses `max(exit_fees, sourced_fees)` — channels are credited for their most valuable role (routing exit traffic *or* sourcing inbound traffic).
 - **Fleet revenue** sums exit fees only across all channels — no double-counting of inbound sourcing.
-- **Inbound gateways** (channels that primarily source traffic for the fleet) receive enhanced protection from closure and are never misclassified as stagnant or zombie based on exit-side metrics alone.
+- **Inbound gateways** are classified from sourced traffic so reporting and rebalance decisions do not misclassify them from exit-side metrics alone.
 - **Classification** uses total forward count (exit + sourced) for ZOMBIE, STAGNANT, and fleet member protection decisions.
-- **Rebalance fee persistence** is msat-native: successful automatic, coordinated, manual, and diagnostic rebalances persist `actual_fee_msat` in `rebalance_history` and `cost_msat` in `rebalance_costs`, with sat fields derived once at write time for compatibility.
+- **Rebalance fee persistence** is msat-native: successful automatic and manual rebalances persist `actual_fee_msat` in `rebalance_history` and `cost_msat` in `rebalance_costs`, with sat fields derived once at write time for compatibility.
 - **Conversion rules** are explicit at reporting boundaries: balances and capacity floor to sats, revenue ceils to sats (so sub-satoshi earnings stay visible), costs and budgets ceil to sats, and signed net deltas round toward zero so `-1msat` does not become a fabricated `-1sat` loss.
 
 Use `revenue-profitability` to see per-channel analysis including sourced metrics, flow profiles, and total contribution.
@@ -92,83 +89,23 @@ Payload shape:
 
 Consumers must treat stale, missing, or malformed payloads as unknown confidence, not zero value or an action command.
 
-## Channel Opening Intelligence
+## Retired Liquidity Executors
 
-The capacity planner uses a multi-strategy candidate pipeline with portfolio-aware governance:
+Version 3.0.0 removes the CapacityPlanner, automatic channel opening and closing, planner defibrillation, Boltz swaps, and LN+ integration. These features increased code and external-API attack surface without producing operator value on this node; channel lifecycle and swap decisions remain manual operator work outside the plugin.
 
-- **Portfolio balance governor** — hard gate at >95% local blocks outbound opens, constrained at 85-95% allows only sink-adjacent or dual-fund
-- **Multi-strategy discovery** — winner (proven revenue), demand-flow (gossip heuristics), route-pair, graph, and neighbor strategies
-- **Score normalization** — within-strategy 0-1 normalization with configurable weights; pool slot quotas prevent strategy monoculture
-- **Demand-flow classifier** — classifies peers as source/sink/router using FlowMetrics aggregation and gossip heuristics (exchange, LSP, sink keyword matching)
-- **Capital hurdle** — open EV subtracts a configurable annualized return hurdle (`planner_min_annual_roi_pct`, default 1%) so low-yield channel opens do not pass on tiny absolute-profit edges
-- **Capital recycling** — evaluates underperformers for close-and-reopen when recycle EV exceeds threshold; coordinates with Boltz for on-chain fund management
-- **Dual-fund support** — uses `fundchannel request_amt` when peers advertise `option_will_fund`
+Historical database schemas and rows are intentionally preserved so old accounting and audit records remain readable. They are inert: historical planner, open/close, Boltz, and LN+ records cannot schedule work or authorize an action. The generic `no_close` policy remains available for existing channel metadata.
 
-## Boltz Automation
-
-- The in-plugin Boltz auto-cycle is treasury mode first when confirmed on-chain funds are below the configured reserve target.
-- It maintains a standing on-chain reserve for reserve maintenance, and that reserve maintenance is independent of pending planner opens.
-- When the reserve is healthy, it falls back to the existing balance cycle.
+Use the [liquidity executor decommission runbook](docs/operations/LIQUIDITY_EXECUTOR_DECOMMISSION_RUNBOOK.md) for deployment, removed-surface checks, rollback gates, and evidence collection.
 
 ## Additional Runtime Subsystems
 
-These subsystems are off by default and each has more knobs than fit in a table here — see [config/cl-revenue-ops.conf.full](config/cl-revenue-ops.conf.full) for every option, default, and comment.
+These retained subsystems are documented in [config/cl-revenue-ops.conf.full](config/cl-revenue-ops.conf.full):
 
-- **Hot-channel protection** (`revenue-ops-hot-channel-protection-*`, 8 options) — gives fast-draining, high-profit channels a wider rebalance budget and shorter cooldown than normal channels get, so they don't starve mid-burst. Gated on minimum velocity and marginal ROI, capped by a fraction of the channel's own daily contribution, with an operator override-peer list to force protection regardless of the velocity/ROI gate.
-- **Growth budget** (`revenue-ops-growth-budget-*`, 5 options) — an optional dynamic uplift on top of `daily_budget_sats`: a fraction of trailing net profit (`growth-budget-earned-fraction`) plus a smaller experiment fraction (`growth-budget-experiment-fraction`), bounded per-window by `growth-budget-max-extra-sats` and by a local hard ceiling (`growth-budget-hard-ceiling-sats`). Disabled by default.
-- **Dynamic htlcmax** (`revenue-ops-enable-dynamic-htlcmax` + 3 flow-class pct options) — scales each channel's advertised `htlc_max` by its flow classification (source/sink/balanced), tightest on sinks. As of the 2026-07 econ audit it is also **live-depletion-keyed**: regardless of flow class, `htlc_max` is additionally capped to a fraction of the channel's current spendable balance (clamped to a 10k-sat floor), so a channel that has drained to near-zero local balance stops advertising an `htlc_max` large enough to invite doomed HTLCs. A gossip-churn deadband limits how often the resulting change actually triggers a `setchannel` broadcast.
-- **Fee replay capture** (`revenue-ops-fee-replay-capture-enabled`) — internal observational instrumentation for offline Rust parity replay. It is disabled by default, writes private local artifacts under `revenue_ops_fee_replay/` beside the expanded revenue database path, and enabling it does not start a fee cycle; the next naturally scheduled cycle is observed.
-- **Expansion treasury** (`revenue-ops-expansion-treasury-*`, 7 options) — reverse-swaps excess Lightning balance from over-local channels to on-chain funds via Boltz, to build the on-chain reserve the capacity planner needs for new opens. Runs only when the confirmed on-chain reserve is below `expansion-treasury-onchain-target-sats` by at least `expansion-treasury-min-deficit-sats`; protected/hot channels are excluded from harvesting by default.
-- **Drain-bias / receivable-ratio** (`revenue-ops-node-drain-bias-*`, `revenue-ops-receivable-ratio-*`, `revenue-ops-drain-fee-discount-max`, `revenue-ops-boltz-structural-budget-sats`) — the node-level inbound-liquidity objective described above under "What Operators Need To Know": biases fees down on stagnant over-local channels and can earn a capped Boltz structural credit for demand the circular rebalancer can't place internally. All off by default (0 / false).
-- **Boltz** (`revenue-ops-boltz-*`, 17 options / 22 RPCs) — Lightning⇄on-chain swap integration behind the balance cycle and expansion treasury. On-chain capacity already committed to an in-flight LN+ swap open (`lnplus_reserved_sats`) is subtracted before Boltz's confirmed-on-chain-sats calculation, so LN+ is effectively a third consumer of the same on-chain reserve pool. Too large to table here; see [docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md) for the full RPC inventory and `config/cl-revenue-ops.conf.full` for every option.
-
-## LN+ Liquidity Swaps
-
-`cl_revenue_ops` can autonomously join [lightningnetwork.plus](https://lightningnetwork.plus) (LN+) liquidity swaps — a ring of nodes where each participant opens one channel to the next and receives one in return, so an outbound open buys an equal-capacity inbound channel. This is join-only: the plugin applies to swaps other operators posted, it never creates them.
-
-- Each applicable swap is scored with the same EV machinery the capacity planner uses for regular opens (`_calculate_open_ev`, capex budget, ROI hurdle) plus an inbound-liquidity credit and a lockup haircut for the capital committed over the contract term. The swap only proceeds if its EV beats the best regular-open EV by `revenue-ops-lnplus-swap-preference-margin` — ties and near-ties favor the regular open, since a swap locks capital for the contract term and a regular open does not.
-- **One swap in flight per node at a time.** No new application is submitted while a prior one is applied, opening, or awaiting completion (checked before every LN+ API call, so an outage or a tripped breaker can never queue up a second commitment).
-- Applying to a filled swap slot is an irreversible commitment: once the last slot fills, a 48-hour clock starts to open the assigned channel. The obligations watcher (`revenue-ops-lnplus-watcher-interval`, default hourly) drives every step after application — connect, `fundchannel` (feerate escalates as the deadline approaches), `complete_application`, activation (tags the channel `no_close` so nothing else can close it mid-contract), and finally release + rating once the contract's `ends_at` passes.
-
-**Rank floor (gold or better).** Every participant must clear `revenue-ops-lnplus-min-peer-rank` (default `8`, LN+'s own 1-10 scale where higher is better and 8 = "Gold" in their docs). A missing or zero rank is treated as below the floor (fail-closed), not a pass. This is in addition to the existing positive-ratings and negative-ratio floors.
-
-**Minimum participants.** Dual (2-party) swaps are rejected by default (`revenue-ops-lnplus-min-participants`, default `3`) — LN+'s smallest useful ring for this automation is a triangle. Among multiple qualifying swaps with equal EV, the smaller ring wins the tie-break (triangle beats square beats pentagon); EV still decides primarily.
-
-### Options
-
-| Option | Default | Meaning |
-|---|---|---|
-| `revenue-ops-lnplus-swaps-enabled` | `true` | Master switch for LN+ automation. |
-| `revenue-ops-lnplus-execute-applications` | `true` | `false` = recommendation-only; gates are still evaluated and logged, but no live `create_application` call is made. |
-| `revenue-ops-lnplus-swap-preference-margin` | `0.2` | Fraction by which a regular open's EV must beat the best swap's EV to win the slot instead. |
-| `revenue-ops-lnplus-max-duration-months` | `3` | Longest contract duration we'll apply to. |
-| `revenue-ops-lnplus-min-peer-positive-ratings` | `5` | Minimum LN+ positive-rating floor for every participant in the swap (one under-rated peer vetoes the whole swap). |
-| `revenue-ops-lnplus-min-peer-rank` | `8` | Minimum LN+ rank (1-10, higher better; 8 = "Gold") for every participant. Missing/zero rank fails closed. |
-| `revenue-ops-lnplus-max-participants` | `4` | Maximum ring size we'll join. |
-| `revenue-ops-lnplus-min-participants` | `3` | Minimum ring size we'll join (dual swaps rejected); among equal-EV qualifiers, fewer participants win the tie-break. |
-| `revenue-ops-lnplus-apply-feerate-ceiling` | `5000` | No applications while the current opening feerate (perkw) exceeds this. |
-| `revenue-ops-lnplus-pending-timeout-days` | `7` | Withdraw an application still stuck `pending` (unfilled) after this many days. |
-| `revenue-ops-lnplus-inbound-credit-factor` | `0.5` | Damping applied to the inbound-liquidity EV credit (the value of the channel we receive) — conservative by default since inbound value is harder to realize than outbound. |
-| `revenue-ops-lnplus-watcher-interval` | `3600` | Obligations watcher poll interval, in seconds. |
-
-### RPCs
-
-| Command | Use |
-|---|---|
-| `revenue-lnplus-status` | Circuit-breaker state, in-flight swap, and active/recently-ended contracts. |
-| `revenue-lnplus-breaker-clear` | Operator acknowledgment that clears a tripped breaker so new applications can resume. |
-| `revenue-lnplus-abandon <swap_id>` | Emergency abandon of an in-flight obligation — marks the local row failed and trips the breaker, since abandoning a commitment is a defection on our side and must never happen silently. |
-| `revenue-lnplus-backfill` | Operator remedy that adopts pre-existing LN+ swaps (applied/opened/settled manually on the LN+ website, before or after this automation existed) into the local ledger. Idempotent — existing rows are never touched, so it is safe to run repeatedly. |
-
-### Circuit breaker
-
-The breaker is a one-strike mechanism: a missed 48-hour open deadline, or the local ledger diverging from what LN+ reports for an in-flight swap, trips it immediately and blocks all new applications. Obligations already in flight (an open in progress, an active contract) are still driven to completion — the breaker only stops new commitments, it does not abandon existing ones. Clearing it is always an explicit operator action via `revenue-lnplus-breaker-clear`; it never clears itself.
-
-Note the distinction between disabling and abandoning: setting `revenue-ops-lnplus-swaps-enabled=false` stops new applications, but any swap already applied, opening, or active is still honored to completion (fundchannel executed, contract protected with `no_close`, rated and released at term end) — disabling is not the same as walking away from a commitment. Use `revenue-lnplus-abandon` only as a last resort, since it deliberately defects on an LN+ commitment and will draw a negative rating.
-
-### Contract lifecycle and the 3-month cap
-
-Swap contracts are capped at `revenue-ops-lnplus-max-duration-months` (default 3, configurable 1-3 (hard cap: never lock capital beyond a quarter)). While a contract is active the outbound channel is tagged `no_close` so the planner's capital-recycling logic cannot touch it. Once the contract's `ends_at` passes, the watcher rates the counterparty (positive if their channel to us is still open, negative — plus an ignore — if they defected), removes the `no_close` tag, and marks the swap `ended`. From that point the channel reverts to normal planner management like any other channel: it is eligible for fee optimization, rebalancing, and capital recycling on the same footing as a channel opened the regular way. A well-performing swap channel is expected to naturally stay open past the contract; the cap only bounds the *protected, locked* period.
+- **Hot-channel protection** widens a profitable, fast-draining channel rebalance budget within its configured caps.
+- **Growth budget** can add a bounded, profit-funded uplift to the base rebalance budget; it is disabled by default.
+- **Dynamic htlcmax** adjusts advertised `htlc_max` from local flow and spendable-balance evidence with a gossip-churn deadband.
+- **Fee replay capture** is default-off observational instrumentation for offline Rust parity work. It never starts a fee cycle.
+- **Drain-bias / receivable-ratio** may bias fees on over-local channels; circular rebalancing remains the only liquidity execution mechanism.
 
 ## Architecture
 
@@ -270,41 +207,25 @@ lightning-cli revenue-config set daily_budget_sats 10000
 
 | Command | Use |
 |---|---|
-| `revenue-status` | Health, operator controls, and latest fee/rebalance decisions |
+| `revenue-status` | Health, controls, and latest fee/rebalance decisions |
 | `revenue-fee-debug` | Why a fee moved, held, or was clamped |
 | `revenue-rebalance-debug` | Why a rebalance was selected, skipped, or blocked |
 | `revenue-config get` | Inspect current runtime controls |
-| `revenue-config set <key> <value>` | Change one of the supported runtime controls |
-| `revenue-profitability [channel_id]` | Per-channel profitability with sourced metrics and flow profiles |
-| `revenue-cycle <subsystem>` | Run one manual cycle: `fees`, `rebalance`, `flow`, `planner`, `boltz`, or `all` (wake everything) |
-| `revenue-planner <view>` | Planner reads: `status` (default), `candidates`, `sources`, `history`, `report` |
-| `revenue-budget [section]` | Unified budget view (total_cost + capex + boltz sections); `revenue-budget ledger` for the spend ledger |
-| `revenue-boltz <verb>` | All Boltz swap operations (`quote`, `loop-out`, `wallet`, `treasury-status`, ... — 22 verbs, 1:1 with the old `revenue-boltz-*` names) |
-| `revenue-policy ban\|unban\|list-banned <peer_id>` | Operator peer bans (was `revenue-ban`/`revenue-unban`/`revenue-list-banned`) |
-| `revenue-profile-preview [name]` | Diagnostic: risk-profile diff/comparison before activation |
-| `revenue-econ-snapshot` | Diagnostic: the canonical economic snapshot (governance core) |
-| `revenue-econ-reconcile` | Diagnostic: ledger-vs-reservations reconciliation state |
-| `revenue-econ-cycle` | Diagnostic: deterministic shadow economic cycle |
+| `revenue-config set <key> <value>` | Change a supported runtime control |
+| `revenue-profitability [channel_id]` | Per-channel profitability and flow analysis |
+| `revenue-cycle <subsystem>` | Run `fees`, `rebalance`, `flow`, or `all` |
+| `revenue-budget [section]` | Read total-cost, rebalance-capex, or spend-ledger state |
+| `revenue-policy ban|unban|list-banned <peer_id>` | Manage peer policy |
+| `revenue-profile-preview [name]` | Preview a risk-profile change |
+| `revenue-econ-snapshot` | Read the canonical economic snapshot |
+| `revenue-econ-reconcile` | Read ledger/reservation reconciliation |
+| `revenue-econ-cycle` | Run the deterministic shadow economic cycle |
 
-See [docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md) for the full action/mutation RPC inventory across all subsystems (fees, rebalancing, planner, Boltz, LN+).
+The complete 39-method contract and mutation classification is in [the action RPC inventory](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md).
 
-### Deprecated RPC aliases (window ends 2026-09-05)
+### Retained compatibility aliases
 
-The dispatcher commands above (`revenue-cycle`, `revenue-planner`,
-`revenue-budget`, `revenue-boltz`, and the `revenue-policy
-ban|unban|list-banned` actions) are the primary names as of 2026-08-01
-([operator-surface reduction](docs/audits/OPERATOR_SURFACE_REDUCTION_2026-08-01.md)).
-The old standalone names — every `revenue-boltz-*` method,
-`revenue-fee-cycle`, `revenue-rebalance-cycle`, `revenue-analyze`,
-`revenue-wake-all`, `revenue-planner-execute`, `revenue-planner-status`,
-`revenue-planner-candidates`, `revenue-planner-candidate-sources`,
-`revenue-planner-history`, `revenue-capacity-report`,
-`revenue-total-cost-budget`, `revenue-capex-status`, `revenue-spend-ledger`,
-`revenue-ban`, `revenue-unban`, `revenue-list-banned` — keep working as
-deprecated aliases until **2026-09-05**; each alias response carries a
-`deprecation` field naming its replacement. Migrate scripts to the
-dispatcher forms before that date (announcement:
-[contract-compatibility-policy.md](docs/refactor/phase0/contract-compatibility-policy.md)).
+The primary dispatchers are `revenue-cycle`, `revenue-budget`, and `revenue-policy`. Retained standalone aliases cover fee/rebalance cycles, analysis/wake, total-cost/capex/spend-ledger reads, and peer ban operations. Removed planner, Boltz, and LN+ names are not compatibility aliases and must return method-not-found.
 
 ### revenue-config: actions and override precedence
 
@@ -318,7 +239,7 @@ dispatcher forms before that date (announcement:
 
 `cl_revenue_ops` is a fully independent local executor. The former cl-hive/cl-mycelium hint integration was removed entirely in 2026-07 (`docs/audit/HIVE_REMOVAL_PLAN.md`); `tests/test_architecture_guard.py` pins that no hive/fleet coordination code returns.
 
-The read-only operator surfaces `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug` must keep returning JSON with no external plugins present, and read-only surfaces must never call fee, rebalance, planner, Boltz, or CLN mutation RPCs.
+The read-only operator surfaces `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug` must keep returning JSON with no external plugins present, and read-only surfaces must never call fee, rebalance, spend, or CLN mutation RPCs. Removed planner, Boltz, and LN+ method names must remain absent.
 
 ## Public Contract Docs
 

@@ -1,3 +1,7 @@
+# HISTORICAL CONTRACT - RETIRED IN VERSION 3.0.0
+
+This document records the removed implementation at its cited commit. The module and discovery authority described below are absent from the current plugin. It is not an operator guide.
+
 # Intent Contract: modules/demand_flow.py
 
 Tier 2 — medium treatment. Audited 2026-06-12 against commit 9f8f219.

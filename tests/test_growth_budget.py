@@ -190,19 +190,16 @@ def test_total_cost_budget_status_uses_dynamic_growth_budget_when_enabled():
     mod._rebalance_liquidity_cost_components = MagicMock(
         return_value={"spent_24h_sats": 200, "reserved_24h_sats": 50}
     )
-    mod._boltz_liquidity_cost_components = MagicMock(
-        return_value={"spent_24h_sats": 100, "reserved_24h_sats": 25}
-    )
 
     status = mod._compute_total_cost_budget_status(24)
 
-    # actual_total = 200 rebalance + 100 boltz + 10 open + 20 close
-    # net_profit = 6000 revenue - 330 costs = 5670; earned credit at 25% = 1417.
+    # actual_total = 200 rebalance + 10 open + 20 close
+    # net_profit = 6000 revenue - 230 costs = 5770; earned credit at 25% = 1442.
     assert status["mode"] == "dynamic_growth"
     assert status["daily_budget_sats"] == 1_000
-    assert status["effective_budget_sats"] == 2_417
-    assert status["remaining_sats"] == 2_012
-    assert status["growth_budget"]["earned_credit_sats"] == 1_417
+    assert status["effective_budget_sats"] == 2_442
+    assert status["remaining_sats"] == 2_162
+    assert status["growth_budget"]["earned_credit_sats"] == 1_442
     assert status["growth_budget"]["growth_credit_sats"] == 0
     assert status["growth_budget"]["authority"] == "local"
     assert status["growth_budget"]["fleet_prior_budget_authority"] is False

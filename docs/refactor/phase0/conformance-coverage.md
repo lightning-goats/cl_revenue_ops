@@ -2,17 +2,16 @@
 
 Generator: `tools/conformance/generate_scenarios.py` (deterministic; regenerating must be byte-identical). Validation: `tools/conformance/validate_fixtures.py` — no plugin imports. Golden-derived cases copy fixture bytes verbatim; generated cases are produced BY the reference implementation.
 
-Scenario classes: 40/40. Documented gaps: 0 (listed last — these are honest holes with pointers, not silent omissions).
+Scenario classes: 31/40. Documented gaps: 0 (listed last — these are honest holes with pointers, not silent omissions).
 
 | # Scenario | Category | Requirement | Source | Files |
 |---|---|---|---|---|
 | `01-ordinary-profitable-channel` | classification | DoD 1/9: profitable classification from routing evidence | tests/golden/fixtures/profitability/classify_young_profitable.json | case.json |
-| `02-source-gateway-protection` | classification | F5: inbound-gateway channels protected from closure | tests/golden/fixtures/close_protection/gateway_30d_protected.json | case.json |
+| `02-source-gateway-classification` | classification | Retained reporting: inbound-gateway role derives from 30d sourced flow | tests/golden/fixtures/profitability/role30d_gateway_30d_dominant_sourced.json | case.json |
 | `03-sink-depletion` | rebalance_mode | F4: depleted profitable destinations preferred for refill | tests/golden/fixtures/rebalance/plan_profitable_dest_preferred.json | case.json |
 | `04-balanced-channel` | classification | Workstream A: BALANCED role from 30d flow evidence | tests/golden/fixtures/profitability/role30d_balanced_30d.json | case.json |
 | `05-underwater-classification` | classification | Workstream A: negative marginal ROI (underwater) | tests/golden/fixtures/profitability/marginal_roi_negative_profit.json | case.json |
 | `06-stagnant-candidate` | classification | Workstream A: stagnant classification | tests/golden/fixtures/profitability/classify_old_loser_stagnant.json | case.json |
-| `07-zombie-classification` | classification | Workstream A: zombie after failed defibrillation | tests/golden/fixtures/profitability/classify_zombie_after_failed_defib.json | case.json |
 | `08-fee-rail` | fee_stage | ADR-001 stage 1 (rails): fee floor | tests/golden/fixtures/fee/floor_defaults_no_chain_costs.json | case.json |
 | `09-fee-rate-limit` | fee_stage | ADR-001 stage 2 (rate_limit): per-cycle delta cap | tests/golden/fixtures/fee/damping_large_raise_clamped.json | case.json |
 | `10-fee-deadband` | fee_stage | ADR-001 stage 3 (deadband): no-op suppression | tests/golden/fixtures/fee/damping_no_change.json | case.json |
@@ -21,20 +20,12 @@ Scenario classes: 40/40. Documented gaps: 0 (listed last — these are honest ho
 | `13-dynamic-htlcmax` | admission | F3: dynamic htlc_max admission control | tests/golden/fixtures/htlcmax/balanced_mid_share.json | case.json |
 | `14-hot-channel-priority` | rebalance_mode | F4 table: hot-channel protection outranks normal redistribution as priority data, not a separate path | generated | case.json |
 | `15-normal-rebalance` | rebalance_mode | F4: one planner; chunk-bounded amounts | tests/golden/fixtures/rebalance/plan_amount_bounded_by_chunk.json | case.json |
-| `16-structural-drain` | rebalance_mode | F4/G: structural drain via Boltz balance plan (dry-run) | tests/golden/fixtures/boltz/cycle_dry_run_executable_balance_plan.json | case.json |
-| `17-manual-diagnostic-rebalance` | rebalance_mode | F4 + contradiction #7: manual is operator-directed; diagnostic is a BOUNDED spend (evidence purchase), not free | generated | case.json |
-| `18-conflicting-close-rebalance` | arbitration | J3/spec conflict rule: rebalance into a channel scheduled for closure is rejected (CONFLICT_CLOSE_REBALANCE) | generated | case.json |
-| `19-protected-close-rejection` | authorization | F5: protection tags veto closure before any intent exists | tests/golden/fixtures/close_protection/allowed_protect_tag_blocks.json | case.json |
-| `20-open-vs-lnplus` | arbitration | Spec conflict rule: open vs LN+ — both paths emit OPEN_CHANNEL to the peer; CONFLICT_DUPLICATE_OPEN rejects the lower-priority one (the LN+ obligation at priority 80 wins) | generated | case.json |
-| `21-circular-vs-boltz-structural` | arbitration | Spec conflict rule: rebalance vs structural swap — the structural SWAP_OUT outranks; CONFLICT_REBALANCE_SWAP rejects the circular rebalance (live registry blocks both directions) | generated | case.json |
+| `17-manual-rebalance` | rebalance_mode | F4: manual rebalance remains operator-directed and caller-accounted | generated | case.json |
 | `22-budget-exhaustion` | authorization | DoD 4/5: refused reservation -> BUDGET_EXHAUSTED, no spend | generated | case.json |
 | `23-concurrent-reservation-contention` | reservation | DoD 5: atomic reservations cannot jointly oversubscribe | generated | case.json |
 | `24-restart-outstanding-reservation` | reservation | DoD 5: reservations survive restart (durable store) | generated | case.json |
 | `25-missing-execution-cost` | ledger | DoD 6: cost without reservation context is an ANOMALY, never silently absorbed | generated | case.json |
 | `26-unknown-execution-outcome` | ledger | Workstream E: unknown outcome is a TERMINAL state pending reconciliation; reservation state preserved for the sweep | generated | case.json |
-| `27-boltz-timeout-after-acceptance` | failure_mode | Reconciler spec: in-flight (started-without-terminal) keys are NEVER auto-zeroed; stale ones quarantine only | modules/econ_reconcile.py (TDD-pinned in tests/test_econ_reconcile.py) | case.json |
-| `28-lnplus-state-divergence` | failure_mode | Workstream G: LN+ platform-state divergence rejected at the gate chain; watcher reconciliation is preflight-gated | tests/golden/fixtures/lnplus/filter_dual_swap_rejected.json | case.json |
-| `29-lnplus-obligation-lower-authority` | authorization | Invariant 6 + Workstream I: accepted obligations complete under any authority level, still authorized and ledgered | generated | case.json |
 | `30-stale-intent` | authorization | DoD 4: stale envelopes rejected fail-closed (STALE) | generated | case.json |
 | `31-duplicate-idempotency-key` | arbitration | J3: identical five-field subsets share an idempotency key; duplicates superseded (INTENT_SUPERSEDED) | generated | case.json |
 | `32-numeric-overflow-underflow` | intent_semantics | Workstream J numeric rules: msat in [0, 2^63-1], checked — out-of-range raises, never wraps | generated | case.json |

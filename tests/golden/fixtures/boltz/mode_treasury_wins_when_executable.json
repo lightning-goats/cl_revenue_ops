@@ -1,8 +1,0 @@
-{
-  "balance_candidate_count": 1,
-  "mode": "treasury",
-  "reason": "standing_onchain_reserve_below_target",
-  "reserve_deficit_sats": 400000,
-  "treasury_candidate_count": 1,
-  "treasury_executable_count": 1
-}

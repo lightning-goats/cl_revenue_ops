@@ -1,6 +1,6 @@
 """P1-026: validate enum-style string options at init.
 
-market_fee_mode / base_fee_policy / fee_profile / preferred_currency are
+market_fee_mode / base_fee_policy / fee_profile are
 checked against their valid sets; an unknown value warns and falls back to
 the documented default instead of silently mis-behaving.
 """
@@ -41,11 +41,3 @@ def test_fee_profile_typo_defaulted(mod):
 
 def test_fee_profile_valid_unchanged(mod):
     assert _val(mod, fee_profile="conservative")["fee_profile"] == "conservative"
-
-
-def test_preferred_currency_typo_defaulted(mod):
-    assert _val(mod, expansion_treasury_preferred_currency="XYZ")["expansion_treasury_preferred_currency"] == "BTC"
-
-
-def test_preferred_currency_lbtc_unchanged(mod):
-    assert _val(mod, expansion_treasury_preferred_currency="LBTC")["expansion_treasury_preferred_currency"] == "LBTC"

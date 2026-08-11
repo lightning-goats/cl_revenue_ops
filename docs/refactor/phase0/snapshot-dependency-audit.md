@@ -28,25 +28,20 @@ read during decision generation — must migrate).
 | Module | analyzer | live_rpc | db | clock | Improper decision reads |
 |---|---|---|---|---|---|
 | admission_policy | 0 | 0 | 0 | 0 | **none — already pure** |
-| protection_service | 0 | 0 | 0 | 0 | **none — already pure** |
-| treasury (capex_budget) | 0 | 0 | 4 | 1 | none (budget-state reads = historical/state) |
-| boltz_manager | 0 | 7 | 0 | 5 | none in decision path (all execution-side) |
-| rebalance_engine_v2 | 0 | 14 | 18 | 10 | none in decision path (planner input is pre-collected; RPC/db reads are execution/reconciliation) |
+| treasury (capex_budget) | 0 | 0 | 3 | 0 | none (budget-state reads = historical/state) |
+| rebalance_engine_v2 | 0 | 14 | 20 | 13 | none in decision path (planning input is pre-collected; RPC/db reads are execution/reconciliation) |
 | fee_controller | 1 | 9 | 27 | 37 | **market/gossip + chain-cost reads mid-decision** |
-| capacity_planner | 6 | 24 | 11 | 11 | **analyzer cache + live peer-state reads mid-decision** |
-| lnplus_swaps | 0 | 12 | 0 | 12 | **live gate-check reads mid-decision** |
-| profitability_analyzer | 0 | 5 | 28 | 24 | n/a — it IS a construction source |
+| profitability_analyzer | 0 | 5 | 27 | 23 | n/a — it IS a construction source |
 
 ## Per-module classification
 
-### admission_policy.py, protection_service.py — CLEAN
+### admission_policy.py — CLEAN
 
-Zero external reads. Both already receive their inputs as arguments
-(3B/3C extractions). These are the model the migration drives toward.
+Zero external reads. It receives decision inputs as arguments and remains the pure admission boundary.
 
 ### profitability_analyzer.py — construction source
 
-All 57 read sites are the analyzer doing its job: building the
+All 55 read sites are the analyzer doing its job: building the
 profitability view from bookkeeper/DB/RPC. Under the target
 architecture this module becomes an input to the EconomicSnapshot
 builder; its cache becomes the material for an immutable projection.
@@ -54,20 +49,9 @@ No migration inside this module; the migration is at its CONSUMERS.
 
 ### treasury (capex_budget.py) — historical/state
 
-Four DB reads (`_compute_channel_budget`, `_get_confirmed_onchain_sats`,
-`_get_total_capex_by_channel`, `_get_spend_ledger_summary`) read budget
-and capex state — the governor-side accounting the spec treats as
+Three DB reads consume retained rebalance budget and spend-ledger state — the governor-side accounting the spec treats as
 reservation/ledger state, not cycle observations. No migration.
 
-### boltz_manager.py — execution-side only
-
-All seven live-RPC sites are execution mechanics after a decision
-(invoice resolution `_lookup_pays_for_invoice`:750, first-hop routing
-`_pay_invoice_via_first_hop`:789, `_resolve_peer_channel_ids`:589).
-Recommendation ECONOMICS (`get_boltz_cost_components`) read external
-quotes — construction-class observation of an external system. The
-balance-cycle recommendation inputs arrive pre-collected from the
-caller. No improper decision reads.
 
 ### rebalance_engine_v2.py — decision path already isolated
 
@@ -96,33 +80,9 @@ Decision-generation reads of mutable sources:
 | `set_initial_fee`:7893 | live channel lookup | event-driven (new-channel hook), outside the cycle — document as event-path exception, evaluate against latest snapshot + freshness gate |
 | 37 effective wall-clock sites (DTS sampling, posterior updates, cache TTLs) | `decision_now()` for 27 decision/state reads; `time.time()` for 10 cache/observation reads | replay clock seam complete for effective decision and mutating-state reads; cache TTL clocks remain construction mechanics whose materialized evidence is captured. One dead contextual cross-pollination read was removed (38→37). |
 
-### capacity_planner.py — IMPROPER sites (PR 3b)
 
-| Site | Read | Class |
-|---|---|---|
-| `_identify_losers`:922 | `profitability.identify_bleeders_v2()` mid-decision | IMPROPER — recomputes from mutable state during selection |
-| `_observed_node_daily_ppm`:2831 | `profitability.analyze_all_channels()` mid-decision | IMPROPER — mutable cache read inside scoring |
-| `generate_report`:217 / `execute_cycle`:370 | analyzer warm-up + full read at cycle entry | construction — becomes the snapshot/projection handoff |
-| `_is_peer_connected`:1909, `_has_direct_peer_channel`:1889, `_peer_exposure_cap_reason`:2486 | live peer state inside candidate scoring | IMPROPER — peer connectivity/exposure belongs in the snapshot channel/peer state |
-| `_discover_from_neighbors`:1475, `_discover_from_graph`:1740, `_discover_from_route_pairs`:1791, `_get_mempool_recommendation`:766 | graph/mempool observation gathering | construction (candidate discovery inputs) |
-| `_score_candidate`:2122, `_identify_winners`:809, `_calculate_open_ev`:2880 DB reads | forwards/cost history | historical — allowed |
-| `execute_cycle`:493/:520 live reads | pre-execution re-verification | execution-side safety recheck — allowed, document as explicit staleness guard |
 
-### lnplus_swaps.py — IMPROPER sites (PR 3d)
-
-Event-driven policy (offers arrive asynchronously), so "cycle" means
-the evaluation moment; the remedy is evaluate-against-latest-snapshot
-with a freshness gate rather than per-cycle injection:
-
-| Site | Read | Class |
-|---|---|---|
-| `_feerate_ok`:302 | `rpc.feerates` live | IMPROPER — feerate belongs in snapshot.node |
-| `_check_participants`:349 | `rpc.getinfo` live | IMPROPER (node identity — trivially snapshot-able) |
-| `_check_existing_channel`:431 | `rpc.listpeerchannels` live | IMPROPER — channel-existence check from snapshot channel set |
-| `_execute_swap_open`:1489, `_derive_outbound_for_import`:1127, watcher/reconcile paths | live reads during execution/obligation tracking | execution — allowed |
-| `_activate` fallback ends_at (audit 2026-08-01 wave2 FIX 5) | `time.time()` when LN+ supplies no parseable `ends` (derives a local contract-end estimate so the row cannot wedge at `active`) | execution/obligation tracking — allowed (wall_clock pin 12→13) |
-
-## Migration work list (feeds PRs 3a–3e)
+## Migration work list (retained snapshot migrations)
 
 1. **3a rebalance — DONE (2026-07-13)**: the shadow hub serves
    TTL-cached canonical-snapshot refs (`EconShadow.snapshot_ref`,
@@ -132,43 +92,11 @@ with a freshness gate rather than per-cycle injection:
    per cycle for intra-cycle consistency with a 600s age bound. The
    synthetic labels remain ONLY as the fail-open fallback (hub absent /
    shadow disabled / provider error → exact pre-adoption behavior).
-2. **3b planner — DONE (2026-07-13)**, with three audit corrections
-   found during implementation: (a) `_has_direct_peer_channel` /
-   `_is_peer_connected` (:1889/:1909) had NO callers — dead live-RPC
-   paths, now REMOVED (planner live_rpc pin 24→20); (b)
-   `_peer_exposure_cap_reason` (:2486) already freezes per cycle via
-   `_cycle_peer_channels` (primed by execute_cycle:494) — the live read
-   is only its unprimed fallback; (c) `_observed_node_daily_ppm`
-   (:2831) is already primed at cycle entry by `_seed_revenue_anchor`
-   (execute_cycle:372, generate_report:219) — the live read is only the
-   unprimed fallback. Implemented: bleeder classification (:922) frozen
-   per cycle (`_cycle_bleeders`, cleared by `_init_cycle_cache`); close
-   intents and governed planner reservations carry real snapshot ids
-   from the hub (stash per arbitration, 600s age bound, synthetic
-   labels as fail-open fallback).
-3. **3c Boltz — DONE (2026-07-13)**: snapshot_id threading only (no
-   read migration needed). Both sites — the balance-cycle batch
-   arbitration in cl-revenue-ops.py and the manager's governed swap
-   reservation — carry real snapshot ids from the hub; the hub's TTL
-   cache keeps a cycle's arbitration and its per-recommendation
-   reservations on the same ref. Synthetic labels remain as the
-   fail-open fallback.
-4. **3d LN+ — DONE (2026-07-13)**, with two audit corrections and one
-   deliberate exception: (a) `_feerate_ok` (:302) was ALREADY a single
-   pass-entry observation (run_cycle calls it once before the swap
-   loop) — reclassified construction, no change; (b) the per-swap
-   `getinfo` (:349) read a process CONSTANT — now cached
-   (`_our_id`); (c) the per-swap existing-channel read (:431) now
-   consults ONE pass-entry capture (`_capture_peers_with_channels`,
-   any-state semantics preserved) with the live per-peer read as the
-   fail-open fallback. EXCEPTION — snapshot_id threading (:734) is
-   deliberately NOT applied: the swap-scoped `lnplus-swap-{id}` label
-   carries the obligation's cross-attempt idempotency (the idempotency
-   key hashes snapshot_id, not created_at); replacing it would break
-   retry dedup for contractual opens. The canonical-snapshot linkage is
-   recorded as ledger EVIDENCE (`canonical_snapshot_id` in the
-   intent_proposed details) instead.
-5. **3e fees — DONE (2026-07-13)**: per-cycle observation freeze. The
+2. **Retired planner boundary (2026-08-03)**: CapacityPlanner and its
+   channel-open, channel-close, and defibrillation paths were removed in v3.0.0.
+   Historical planner tables remain inert and readable.
+
+3. **3e fees — DONE (2026-07-13)**: per-cycle observation freeze. The
    six flagged reads (market prior, neighbor median/percentile TTL
    caches, inbound gossip, chain feerates, channel state) are wrapped
    by `_frozen_observation` — a memo active only around
@@ -179,8 +107,7 @@ with a freshness gate rather than per-cycle injection:
    passthrough; the first in-cycle computation is byte-identical to
    legacy (all 88 goldens unchanged). DTS+PID controller state
    deliberately excluded (Phase C: `controller_state` is a distinct
-   input). Fee intents keep timestamped identity labels (LN+
-   rationale); `canonical_snapshot_id` recorded as ledger evidence in
+   input). Fee intents keep timestamped identity labels; `canonical_snapshot_id` recorded as ledger evidence in
    `intent_proposed` details.
 
 Staleness: the governor already rejects stale envelopes (`STALE`);
@@ -194,17 +121,6 @@ per-(module, category) counts. Any new mutable-source read in a policy
 module trips the pin and must be classified here first. Counts for
 IMPROPER-bearing categories must only decrease as PRs 3a–3e land.
 
-### Task 26 addendum (2026-08-01): post-exception outcome probe
-
-`capacity_planner._probe_peer_channels` adds 2 `listpeerchannels` read
-sites (planner live_rpc pin 20→22). Classification: **PROPER live read.**
-The probe runs only after a broadcast-capable RPC (`fundchannel`/`close`)
-died with an unknown outcome, and its purpose is to measure the node's
-CURRENT channel set to decide settle-vs-release-vs-hold. A snapshot taken
-before the exception is by definition unable to answer "did the broadcast
-happen"; pinning this to a snapshot would reintroduce the guess the guard
-exists to remove. The read is bounded (one call per failed execute) and
-never feeds a fee/policy decision — only reservation disposition.
 
 ### Task 26/78 addendum (2026-08-01): stale-hold age read
 

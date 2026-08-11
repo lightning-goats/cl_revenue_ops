@@ -20,9 +20,7 @@ def test_cl_revenue_ops_starts_and_serves_status(node_factory, tmp_path):
             "revenue-ops-flow-interval": "3600",
             "revenue-ops-fee-interval": "3600",
             "revenue-ops-rebalance-interval": "3600",
-            "revenue-ops-boltz-auto-cycle-enabled": "false",
             "revenue-ops-hive-hints-enabled": "false",
-            "revenue-ops-planner-enabled": "false",
         }
     )
 

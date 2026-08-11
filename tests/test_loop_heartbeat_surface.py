@@ -20,8 +20,6 @@ def test_revenue_health_includes_loops_section():
     mod.profitability_analyzer = None
     mod.fee_controller = None
     mod.rebalancer = None
-    mod.capacity_planner = None
-    mod.boltz_manager = None
     mod.database = None
     mod._loop_heartbeats.clear()
     mod._record_loop_heartbeat("fee-adjustment")

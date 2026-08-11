@@ -1,10 +1,4 @@
 {
-  "drain_demand": {
-    "entries": [],
-    "over_local_count": 0,
-    "paired_count": 0,
-    "total_excess_sats": 0
-  },
   "selected": [],
   "skipped": [
     {

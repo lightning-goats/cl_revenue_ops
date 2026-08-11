@@ -8,7 +8,7 @@ Covers:
    amount instead of keeping the full pair budget.
 3. Probability-bonus effective budget flows through to execution and budget
    reservation (and stays identical when the bonus is 0).
-4. Manual/diagnostic rebalances produce exactly one rebalance_history row
+4. Manual rebalances produce exactly one rebalance_history row
    (the rebalancer's row is reused by the engine instead of inserting a
    second 'pending' row).
 5. execute_rebalance success path records status='success' (not 'completed').
@@ -487,61 +487,6 @@ def test_manual_rebalance_records_exactly_one_history_row(
     for call in mock_database.update_rebalance_result.call_args_list:
         assert call.args[0] == 55
 
-
-def test_diagnostic_rebalance_records_exactly_one_history_row(
-    mock_plugin, mock_database
-):
-    from modules.config import Config
-    from modules.rebalancer import EVRebalancer
-    from modules.rebalance_execution import ExecutionResult
-
-    cfg = Config(dry_run=False)
-    mock_database.cleanup_stale_reservations.return_value = 0
-    r = EVRebalancer(mock_plugin, cfg, mock_database)
-
-    engine = _make_engine(mock_plugin, mock_database)
-    engine.router_v3 = MagicMock()
-    engine.router_v3.price_pair.return_value = SimpleNamespace(
-        success=True,
-        route_cost_sats=3,
-        route=[{"channel": "333x444x0", "id": "02" + "c" * 64,
-                "amount_msat": 50_003_000, "delay": 30}],
-        probability_ppm=0,
-        error="",
-    )
-    executor = MagicMock()
-    executor.execute.return_value = ExecutionResult(
-        success=True, fee_sats=3, fee_msat=3000, amount_sats=50_000
-    )
-    engine._make_executor = MagicMock(return_value=executor)
-    r.rebalance_engine_v2 = engine
-
-    channel_id = "111x222x0"
-    r._get_channels_with_balances = MagicMock(return_value={
-        channel_id: {"capacity": 1_000_000, "spendable_sats": 50_000,
-                     "peer_id": "02" + "b" * 64, "fee_ppm": 100},
-        "333x444x0": {"capacity": 2_000_000, "spendable_sats": 1_500_000,
-                      "peer_id": "02" + "c" * 64, "fee_ppm": 200},
-    })
-    r._estimate_inbound_fee = MagicMock(return_value=50)
-    r._check_capital_controls = MagicMock(return_value=True)
-
-    mock_database.record_rebalance.reset_mock()
-    mock_database.record_rebalance.return_value = 99
-    mock_database.update_rebalance_result.reset_mock()
-
-    result = r.diagnostic_rebalance(channel_id)
-
-    assert result["success"] is True
-    assert mock_database.record_rebalance.call_count == 1
-    assert mock_database.record_rebalance.call_args.kwargs["rebalance_type"] == "diagnostic"
-    for call in mock_database.update_rebalance_result.call_args_list:
-        assert call.args[0] == 99
-
-
-# =========================================================================
-# 5. execute_rebalance success path writes status='success'
-# =========================================================================
 
 def test_execute_rebalance_success_records_status_success(
     mock_plugin, mock_database

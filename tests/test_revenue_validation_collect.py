@@ -12,10 +12,10 @@ def test_collect_node_day_writes_expected_snapshot_files(tmp_path: Path, monkeyp
         "revenue-status": {
             "operator_controls": {
                 "values": {
-                    "planner_enabled": True,
-                    "planner_execute_closes": True,
-                    "planner_max_opens_per_cycle": 1,
-                    "planner_max_closes_per_cycle": 1,
+                    "paused": False,
+                    "daily_budget_sats": 5000,
+                    "weekly_budget_sats": 35000,
+                    "risk_profile": "conservative",
                 }
             }
         },
@@ -68,10 +68,10 @@ def test_collect_all_nodes_writes_manifest_and_trend_row(tmp_path: Path, monkeyp
                 "opex_sats_30d": 5993,
                 "forward_count_30d": 466,
                 "volume_sats_30d": 68602516,
-                "planner_enabled": True,
-                "planner_execute_closes": True,
-                "planner_max_opens_per_cycle": 1,
-                "planner_max_closes_per_cycle": 1,
+                "paused": False,
+                "daily_budget_sats": 5000,
+                "weekly_budget_sats": 35000,
+                "risk_profile": "conservative",
             },
         }
 

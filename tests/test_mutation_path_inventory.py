@@ -35,19 +35,14 @@ PAT_CALL = re.compile(
 # The complete inventory at baseline commit 5e8f747. Keys are repo-relative
 # paths; values are the sorted set of mutating verbs the file may invoke.
 MUTATING_CALL_SITES = {
-    "modules/boltz_manager.py": ["pay"],
-    "modules/capacity_planner.py": ["close", "fundchannel"],
     "modules/data_service.py": [
-        # Phase 3E (2026-07-13): +connect, +signmessage — adapter grows
-        # to absorb the LN+ lifecycle's direct CLN calls (Workstream G).
         "askrene-age", "askrene-bias-channel", "askrene-bias-node",
         "askrene-create-layer", "askrene-disable-node",
         "askrene-inform-channel", "askrene-remove-layer", "askrene-reserve",
-        "askrene-unreserve", "askrene-update-channel", "close", "connect",
-        "datastore", "delinvoice", "delpay", "fundchannel", "invoice",
-        "pay", "sendpay", "setchannel", "signmessage", "waitsendpay",
+        "askrene-unreserve", "askrene-update-channel",
+        "datastore", "delinvoice", "delpay", "invoice",
+        "sendpay", "setchannel", "waitsendpay",
     ],
-    "modules/lnplus_swaps.py": ["connect", "fundchannel", "signmessage"],
     "modules/rebalance_engine_v2.py": [
         "askrene-remove-layer", "datastore", "delpay",
     ],

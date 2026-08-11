@@ -337,63 +337,6 @@ class TestWindowedDecisionInputs:
 # Fix 4: Zombie False-Positive Guard
 # ============================================================
 
-class TestZombieFalsePositive:
-    """Verify active channels with failed diagnostics aren't ZOMBIE."""
-
-    def test_failed_diag_inactive_7d_is_zombie(self):
-        """Channel inactive >= 7d with failed diagnostics -> ZOMBIE."""
-        analyzer = _make_analyzer()
-        analyzer.database.get_diagnostic_rebalance_stats.return_value = {
-            "attempt_count": 3,
-            "last_success_time": 0,
-        }
-        now = int(time.time())
-        last_routed = now - 86400 * 10  # 10 days ago
-        result = analyzer._classify_channel(
-            roi=-0.20, net_profit=-5000,
-            last_routed=last_routed, days_open=60,
-            channel_id="111x222x0"
-        )
-        assert result == ProfitabilityClass.ZOMBIE
-
-    def test_failed_diag_active_recently_not_zombie(self):
-        """Channel that routed 2 days ago with failed diagnostics -> NOT ZOMBIE."""
-        analyzer = _make_analyzer()
-        analyzer.database.get_diagnostic_rebalance_stats.return_value = {
-            "attempt_count": 3,
-            "last_success_time": 0,
-        }
-        now = int(time.time())
-        last_routed = now - 86400 * 2  # 2 days ago
-        result = analyzer._classify_channel(
-            roi=-0.20, net_profit=-5000,
-            last_routed=last_routed, days_open=60,
-            channel_id="111x222x0"
-        )
-        # Should be UNDERWATER (or STAGNANT_CANDIDATE), NOT ZOMBIE
-        assert result != ProfitabilityClass.ZOMBIE
-
-    def test_failed_diag_exactly_7d_is_zombie(self):
-        """Channel inactive exactly 7 days with failed diag -> ZOMBIE."""
-        analyzer = _make_analyzer()
-        analyzer.database.get_diagnostic_rebalance_stats.return_value = {
-            "attempt_count": 2,
-            "last_success_time": 0,
-        }
-        now = int(time.time())
-        last_routed = now - 86400 * 7  # exactly 7 days
-        result = analyzer._classify_channel(
-            roi=-0.20, net_profit=-5000,
-            last_routed=last_routed, days_open=60,
-            channel_id="111x222x0"
-        )
-        assert result == ProfitabilityClass.ZOMBIE
-
-
-# ============================================================
-# Audit F3: lifetime-ROI classification blind spot
-# ============================================================
-
 class TestProfitableCorpseClassification:
     """A historically-profitable channel that has been dead for months must
     become STAGNANT_CANDIDATE regardless of its lifetime ROI sign."""
@@ -484,7 +427,7 @@ class TestProfitableCorpseClassification:
         """D2 (audit): structural hive signals must NOT rewrite the class.
         A corridor owner with underwater ROI is classified UNDERWATER —
         close protection is expressed downstream via explicit protection
-        reasons (capacity_planner), never by falsifying profitability."""
+        explicit downstream policy reasons, never by falsifying profitability."""
         analyzer = self._analyzer()
         mock_hints = MagicMock()
         mock_hints.is_hive_member.return_value = True
@@ -536,7 +479,7 @@ class TestD2FleetLossVisibility:
     """Operator decision D2: the UNDERWATER -> BREAK_EVEN reclassification
     for hive members / corridor owners / high-centrality peers hid real
     losses on fleet channels. Losses must be visible; close protection is
-    an explicit reason in capacity_planner, never a class rewrite."""
+    an explicit downstream policy reason, never a class rewrite."""
 
     def _analyzer_with_hints(self, is_member=False, centrality=0.0,
                              corridor_role=None):

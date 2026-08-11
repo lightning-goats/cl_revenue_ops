@@ -63,17 +63,6 @@ def test_revenue_unignore_rejects_malformed_peer_id():
     mod.policy_manager.delete_policy.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# Boltz auto-cycle must not default on at the plugin option layer
-# ---------------------------------------------------------------------------
-
-
-def test_boltz_auto_cycle_option_defaults_false():
-    mod = load_plugin_module()
-    opt = mod.plugin.options.get("revenue-ops-boltz-auto-cycle-enabled")
-    assert opt is not None
-    assert str(opt.get("default", "")).lower() == "false"
-
 
 # ---------------------------------------------------------------------------
 # Static policy without a fee target must be rejected at write time

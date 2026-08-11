@@ -159,39 +159,8 @@
 # Half-width (fraction) of the "small channel" band around the reference percentile.
 #revenue-ops-rebalance-small-channel-band-half-width=0.15
 
-# Fee cap in sats for the diagnostic (defibrillator) shock rebalance; the
-# shock ppm ceiling is derived from this cap. Clamped to
-# [1, min(daily budget, 10000)].
-#revenue-ops-diagnostic-rebalance-max-fee-sats=400
-
 # Allow automatic zero-fee rebalances when daily_budget_sats is zero.
 #revenue-ops-allow-zero-cost-auto-rebalance-when-budget-zero=false
-
-# ============================================================================
-# CAPACITY PLANNER
-# ============================================================================
-
-# Once enabled, planner evaluates opens/closes, but close execution stays off by default.
-# Set revenue-ops-planner-execute-closes=true and planner-max-closes-per-cycle>0 only for explicit live close RPCs.
-#revenue-ops-planner-enabled=false
-#revenue-ops-planner-dry-run=false
-#revenue-ops-planner-execute-closes=false
-#revenue-ops-planner-interval=21600
-#revenue-ops-planner-max-opens-per-cycle=1
-#revenue-ops-planner-max-closes-per-cycle=0
-#revenue-ops-planner-min-channel-sats=500000
-#revenue-ops-planner-max-channel-sats=10000000
-#revenue-ops-planner-max-fee-rate=50.0
-#revenue-ops-planner-min-annual-roi-pct=1.0
-
-# --- Planner close-fee reservation ---
-# Multiplier applied to estimated close fee for the planner close budget
-# reservation.
-#revenue-ops-planner-close-fee-reserve-multiplier=2.0
-# Fixed planner close fee cap/reservation in sats; 0 uses the reserve multiplier.
-#revenue-ops-planner-close-fee-cap-sats=0
-# Pass a CLN close feerange cap derived from the planner close fee reservation.
-#revenue-ops-planner-close-feerange-enabled=false
 
 # ============================================================================
 # HOT-CHANNEL PROTECTION
@@ -266,58 +235,10 @@
 #revenue-ops-htlcmax-balanced-pct=0.45
 
 # ============================================================================
-# EXPANSION TREASURY
-# ============================================================================
-# Reverse-swaps excess Lightning balance from over-local channels to
-# on-chain funds via Boltz, to build the on-chain reserve the capacity
-# planner needs for new opens.
-
-# Enable expansion treasury mode.
-#revenue-ops-expansion-treasury-enabled=false
-
-# Target confirmed on-chain reserve in sats for expansion treasury mode.
-#revenue-ops-expansion-treasury-onchain-target-sats=5000000
-
-# Minimum on-chain reserve deficit before treasury swaps are attempted.
-#revenue-ops-expansion-treasury-min-deficit-sats=250000
-
-# Preferred Boltz reverse-swap output currency (BTC or LBTC).
-#revenue-ops-expansion-treasury-preferred-currency=BTC
-
-# Max treasury reverse swaps per treasury cycle.
-#revenue-ops-expansion-treasury-max-actions=1
-
-# Minimum local balance percent to consider a channel as treasury harvest source.
-#revenue-ops-expansion-treasury-min-source-local-pct=80.0
-
-# Exclude hot/protected channels from treasury harvesting.
-#revenue-ops-expansion-treasury-exclude-protected=true
-
-# ============================================================================
-# LN+ LIQUIDITY SWAPS (lightningnetwork.plus)
-# ============================================================================
-
-# Autonomous by default. One swap in flight at a time; circuit breaker trips on any
-# missed obligation and blocks new applications until revenue-lnplus-breaker-clear.
-#revenue-ops-lnplus-swaps-enabled=true
-#revenue-ops-lnplus-execute-applications=true
-#revenue-ops-lnplus-swap-preference-margin=0.2
-#revenue-ops-lnplus-max-duration-months=3
-#revenue-ops-lnplus-min-peer-positive-ratings=5
-#revenue-ops-lnplus-min-peer-rank=8
-#revenue-ops-lnplus-max-participants=4
-#revenue-ops-lnplus-min-participants=3
-#revenue-ops-lnplus-apply-feerate-ceiling=5000
-#revenue-ops-lnplus-pending-timeout-days=7
-#revenue-ops-lnplus-inbound-credit-factor=0.5
-#revenue-ops-lnplus-watcher-interval=3600
-
-# ============================================================================
 # DRAIN BIAS / RECEIVABLE RATIO
 # ============================================================================
 # Node-level inbound-liquidity objective: bias fees down on stagnant
-# over-local channels and, for demand the circular rebalancer can't place
-# internally, allow a capped Boltz structural credit. All off/neutral by default.
+# over-local channels. All off/neutral by default.
 
 # Node receivable/capacity ratio at which structural drain pressure reaches zero.
 #revenue-ops-receivable-ratio-target=0.30
@@ -334,64 +255,6 @@
 
 # Max node-scaled fee discount applied to over-local channels (0.0-0.5).
 #revenue-ops-node-drain-bias-max=0.3
-
-# Daily swap-fee budget (sats) for scarcity-credited Boltz loop-outs the
-# circular rebalancer cannot place internally (0 = disabled).
-#revenue-ops-boltz-structural-budget-sats=0
-
-# ============================================================================
-# BOLTZ (Lightning <-> On-Chain Swaps)
-# ============================================================================
-# Backs the balance cycle and expansion treasury above. Disabled by default;
-# see docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md for the RPC surface.
-
-# Enable Boltz CLI integration for revenue-boltz-* RPCs.
-#revenue-ops-boltz-enabled=false
-
-# Path to boltzcli binary.
-#revenue-ops-boltz-cli-path=/usr/local/bin/boltzcli
-
-# Boltz data dir for boltzd client auth.
-#revenue-ops-boltz-datadir=/var/lib/boltz
-
-# Run boltzcli via sudo -n -u <user>.
-#revenue-ops-boltz-use-sudo=false
-
-# User for sudo boltzcli execution when enabled.
-#revenue-ops-boltz-sudo-user=boltz
-
-# boltzcli command timeout in seconds.
-#revenue-ops-boltz-timeout-seconds=60
-
-# Daily Boltz swap fee budget used by revenue-boltz loop methods.
-#revenue-ops-boltz-daily-budget-sats=3000
-
-# If true, reject Boltz swaps when estimated fee exceeds remaining daily budget.
-#revenue-ops-boltz-enforce-budget=true
-
-# Preferred boltzd BTC / LBTC wallet names.
-#revenue-ops-boltz-btc-wallet=CLN
-#revenue-ops-boltz-lbtc-wallet=LOOP-LBTC
-
-# Max routing fee in PPM for reverse swaps (0 = no limit, boltzcli default).
-#revenue-ops-boltz-routing-fee-limit-ppm=0
-
-# Hard cap on a single Boltz on-chain withdraw in sats (0 disables). A sweep
-# withdraw bypasses this cap and requires confirm_sweep=true.
-#revenue-ops-boltz-max-withdraw-sats=10000000
-
-# Enable in-plugin periodic profit-gated Boltz balance cycles. Automated
-# spending must be opted into explicitly.
-#revenue-ops-boltz-auto-cycle-enabled=false
-
-# Minutes between scheduled Boltz auto-balance cycles.
-#revenue-ops-boltz-auto-cycle-interval-minutes=15
-
-# Maximum Boltz actions per scheduled auto-cycle.
-#revenue-ops-boltz-auto-cycle-max-actions=1
-
-# Startup delay before first Boltz auto-cycle run, in seconds.
-#revenue-ops-boltz-auto-cycle-startup-delay-seconds=120
 
 # ============================================================================
 # CAPITAL SAFETY (Global Capital Controls)

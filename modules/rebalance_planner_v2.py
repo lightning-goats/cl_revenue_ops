@@ -12,8 +12,6 @@ from typing import List
 
 from .rebalance_state_v2 import ChannelState, StateSnapshot
 from .rebalance_types_v2 import (
-    DrainDemand,
-    DrainDemandEntry,
     PairCandidate,
     PlanResult,
     SkipRecord,
@@ -202,34 +200,7 @@ class RebalancePlanner:
                     detail=detail,
                 ))
 
-        # Phase 4: publish the residual the circular path cannot place.
-        # Boltz structural loop-outs may ONLY act on this residual — the
-        # rebalancer keeps first claim on internally placeable excess.
-        demand_entries = [
-            DrainDemandEntry(
-                channel_id=ch.channel_id,
-                peer_id=ch.peer_id,
-                excess_sats=_sats_from_ratio_delta(
-                    ch.local_ratio
-                    - getattr(ch, "target_band_high", self.target_band_high),
-                    ch.capacity_sats,
-                ),
-                drain_score=float(ch.source_drain_score),
-                value_class=ch.value_class,
-            )
-            for ch in over_local
-            if ch.channel_id not in paired_sources
-        ]
-        demand_entries.sort(key=lambda e: e.drain_score, reverse=True)
-        drain_demand = DrainDemand(
-            entries=demand_entries,
-            total_excess_sats=sum(e.excess_sats for e in demand_entries),
-            over_local_count=len(over_local),
-            paired_count=len(paired_sources),
-        )
-
-        return PlanResult(selected=candidates, skipped=skipped,
-                          drain_demand=drain_demand)
+        return PlanResult(selected=candidates, skipped=skipped)
 
     def _generate_pairs(
         self,

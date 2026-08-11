@@ -1,18 +1,4 @@
 {
-  "drain_demand": {
-    "entries": [
-      {
-        "channel_id": "aaa",
-        "drain_score": 0.0,
-        "excess_sats": 500000,
-        "peer_id": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "value_class": "active"
-      }
-    ],
-    "over_local_count": 1,
-    "paired_count": 0,
-    "total_excess_sats": 500000
-  },
   "selected": [],
   "skipped": [
     {
