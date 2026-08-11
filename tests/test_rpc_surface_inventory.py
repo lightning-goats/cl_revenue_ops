@@ -17,7 +17,7 @@ EXPECTED_RPC_METHODS = frozenset({
     "revenue-wake-all", "revenue-set-fee",
     "revenue-rebalance", "revenue-profitability", "revenue-history",
     "revenue-ignore", "revenue-unignore", "revenue-list-ignored",
-    "revenue-ban", "revenue-unban", "revenue-list-banned", "revenue-policy",
+    "revenue-policy",
     "revenue-report", "revenue-hot-channel-protection-peers",
     "revenue-config", "revenue-dashboard", "revenue-health",
     "revenue-econ-snapshot", "revenue-econ-reconcile",
@@ -47,5 +47,5 @@ def test_rpc_surface_matches():
 
 
 def test_expected_count():
-    # Post-liquidity-executor retained RPC surface.
-    assert len(EXPECTED_RPC_METHODS) == 39
+    # Post-peer-ban-removal retained RPC surface.
+    assert len(EXPECTED_RPC_METHODS) == 36

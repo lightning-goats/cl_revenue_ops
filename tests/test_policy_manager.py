@@ -14,6 +14,8 @@ import sys
 import os
 from unittest.mock import MagicMock
 
+import modules.policy_manager as policy_manager_module
+
 # Mock pyln.client before importing modules
 mock_pyln = MagicMock()
 mock_pyln.Plugin = MagicMock
@@ -29,7 +31,6 @@ from modules.policy_manager import (
     FeeStrategy,
     RebalanceMode,
     MAX_POLICY_CHANGES_PER_MINUTE,
-    BANNED_TAG,
 )
 
 
@@ -536,56 +537,30 @@ class TestValidation:
             assert policy.peer_id == valid_id
 
 
-class TestPeerBanning:
-    """Operator pubkey bans (revenue-ban): passive strategy + disabled
-    rebalancing + a durable 'banned' tag enforced by the planner open gate
-    and LN+ gate 5."""
+class TestRemovedPeerBanAPI:
+    """Peer banning is removed; historical tags remain inert metadata."""
 
     PK = "02" + "e" * 64
 
-    def test_ban_sets_passive_disabled_and_tag(self, mock_database, mock_plugin):
+    def test_ban_specific_api_is_absent(self):
+        assert not hasattr(policy_manager_module, "BANNED_TAG")
+        assert not hasattr(PolicyManager, "ban_peer")
+        assert not hasattr(PolicyManager, "unban_peer")
+        assert not hasattr(PolicyManager, "is_peer_banned")
+
+    def test_historical_banned_tag_is_generic_inert_metadata(
+        self, mock_database, mock_plugin
+    ):
         pm = PolicyManager(mock_database, mock_plugin)
-        policy = pm.ban_peer(self.PK, reason="irrational operator")
+        policy = pm.set_policy(
+            self.PK,
+            strategy="passive",
+            rebalance_mode="disabled",
+            tags=["banned"],
+        )
+
+        assert policy.tags == ["banned"]
         assert policy.strategy == FeeStrategy.PASSIVE
         assert policy.rebalance_mode == RebalanceMode.DISABLED
-        assert policy.has_tag(BANNED_TAG)
-        assert pm.is_peer_banned(self.PK) is True
-
-    def test_ban_preserves_existing_tags(self, mock_database, mock_plugin):
-        pm = PolicyManager(mock_database, mock_plugin)
-        pm.add_tag(self.PK, "no_close")
-        policy = pm.ban_peer(self.PK)
-        assert policy.has_tag("no_close")
-        assert policy.has_tag(BANNED_TAG)
-
-    def test_ban_is_idempotent(self, mock_database, mock_plugin):
-        pm = PolicyManager(mock_database, mock_plugin)
-        pm.ban_peer(self.PK)
-        policy = pm.ban_peer(self.PK)
-        assert policy.tags.count(BANNED_TAG) == 1
-
-    def test_unban_restores_management(self, mock_database, mock_plugin):
-        pm = PolicyManager(mock_database, mock_plugin)
-        pm.ban_peer(self.PK)
-        policy = pm.unban_peer(self.PK)
-        assert not policy.has_tag(BANNED_TAG)
-        assert policy.strategy == FeeStrategy.DYNAMIC
-        assert policy.rebalance_mode == RebalanceMode.ENABLED
-        assert pm.is_peer_banned(self.PK) is False
-
-    def test_unban_preserves_other_tags(self, mock_database, mock_plugin):
-        pm = PolicyManager(mock_database, mock_plugin)
-        pm.add_tag(self.PK, "no_close")
-        pm.ban_peer(self.PK)
-        policy = pm.unban_peer(self.PK)
-        assert policy.has_tag("no_close")
-
-    def test_not_banned_by_default(self, mock_database, mock_plugin):
-        pm = PolicyManager(mock_database, mock_plugin)
-        assert pm.is_peer_banned(self.PK) is False
-
-    def test_banned_peers_listed_by_tag(self, mock_database, mock_plugin):
-        pm = PolicyManager(mock_database, mock_plugin)
-        pm.ban_peer(self.PK)
-        banned = pm.get_peers_by_tag(BANNED_TAG)
-        assert [p.peer_id for p in banned] == [self.PK]
+        assert pm.should_manage_fees(self.PK) is False
+        assert pm.should_rebalance(self.PK) is False
