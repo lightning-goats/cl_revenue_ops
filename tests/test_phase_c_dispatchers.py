@@ -3,12 +3,14 @@
 Pins the additive half of Phase C:
 
 1. The new dispatchers (revenue-cycle /
-   revenue-budget, plus revenue-policy ban actions) route each subcommand
+   revenue-budget) route each subcommand
    onto the SAME shared helper the old standalone method calls — same
    underlying calls, same argument names, same result.
-2. Old names keep working and their dict responses gain ONLY an additive
+2. Removed peer-ban policy actions are rejected without touching
+   PolicyManager.
+3. Old names keep working and their dict responses gain ONLY an additive
    `deprecation` field; dispatcher responses never carry it.
-3. Unknown subcommands return an error dict that lists the valid ones.
+4. Unknown subcommands return an error dict that lists the valid ones.
 
 See docs/audits/OPERATOR_SURFACE_REDUCTION_2026-08-01.md (§1, §4) and the
 2026-08-01 announcement in
@@ -203,7 +205,7 @@ class TestBudgetDispatcher:
 
 
 # ---------------------------------------------------------------------------
-# revenue-policy ban / unban / list-banned
+# Removed peer-ban dispatcher regression
 # ---------------------------------------------------------------------------
 
 class TestRemovedPolicyBanActions:
