@@ -215,17 +215,20 @@ lightning-cli revenue-config set daily_budget_sats 10000
 | `revenue-profitability [channel_id]` | Per-channel profitability and flow analysis |
 | `revenue-cycle <subsystem>` | Run `fees`, `rebalance`, `flow`, or `all` |
 | `revenue-budget [section]` | Read total-cost, rebalance-capex, or spend-ledger state |
-| `revenue-policy ban|unban|list-banned <peer_id>` | Manage peer policy |
 | `revenue-profile-preview [name]` | Preview a risk-profile change |
 | `revenue-econ-snapshot` | Read the canonical economic snapshot |
 | `revenue-econ-reconcile` | Read ledger/reservation reconciliation |
 | `revenue-econ-cycle` | Run the deterministic shadow economic cycle |
 
-The complete 39-method contract and mutation classification is in [the action RPC inventory](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md).
+The complete 36-method contract and mutation classification is in [the action RPC inventory](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md).
 
 ### Retained compatibility aliases
 
-The primary dispatchers are `revenue-cycle`, `revenue-budget`, and `revenue-policy`. Retained standalone aliases cover fee/rebalance cycles, analysis/wake, total-cost/capex/spend-ledger reads, and peer ban operations. Removed planner, Boltz, and LN+ names are not compatibility aliases and must return method-not-found.
+The primary dispatchers are `revenue-cycle`, `revenue-budget`, and
+`revenue-policy`. Retained standalone aliases cover fee/rebalance cycles,
+analysis/wake, and total-cost/capex/spend-ledger reads. Removed peer-ban,
+planner, Boltz, and LN+ names are not compatibility aliases and must return
+method-not-found.
 
 ### revenue-config: actions and override precedence
 

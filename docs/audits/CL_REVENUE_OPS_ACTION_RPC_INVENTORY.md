@@ -33,8 +33,6 @@ must not be whitelisted wholesale:
 - `revenue-analyze`
 - `revenue-ignore`
 - `revenue-unignore`
-- `revenue-ban`
-- `revenue-unban`
 - `revenue-policy`
 - `revenue-config`
 - `revenue-hot-channel-protection-peers`
@@ -61,7 +59,6 @@ lifecycle action, swap, or local policy mutation:
 - `revenue-profitability`
 - `revenue-history`
 - `revenue-list-ignored`
-- `revenue-list-banned`
 - `revenue-report`
 - `revenue-dashboard`
 - `revenue-health`
