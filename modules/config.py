@@ -817,23 +817,16 @@ class Config:
                 f"({self.receivable_ratio_floor}) > receivable_ratio_target "
                 f"({self.receivable_ratio_target}); repaired floor to target")
             self.receivable_ratio_floor = self.receivable_ratio_target
-        # Phase B (2026-08-01 surface reduction, section 5.1): a crossed
-        # budget pair is repaired UPWARD like the crossed fee rails
-        # (fc4c76b) — the weekly ceiling rises to meet the operator's
-        # stated daily figure. Repairing downward would silently discard
-        # the daily intent; without repair the weekly cap binds first and
-        # the daily figure can never be spent in a single day.
+        # A crossed persisted budget pair must fail closed. The weekly
+        # value is the longer-window hard ceiling, so startup preserves it
+        # and lowers the daily cap instead of expanding spend authority.
         if self.daily_budget_sats > self.weekly_budget_sats:
             self._override_warnings.append(
                 f"Contradictory settings: daily_budget_sats "
                 f"({self.daily_budget_sats}) > weekly_budget_sats "
-                f"({self.weekly_budget_sats}); repaired weekly_budget_sats "
-                f"to {self.daily_budget_sats}")
-            self.weekly_budget_sats = self.daily_budget_sats
-        # Phase B (section 5.2): a crossed planner channel-size band
-        # silently disables ALL automated opens. Repair upward (max rises
-        # to min) for the same reason as the fee rails: the operator's
-        # stated minimum viable size is honored and only the cap widens.
+                f"({self.weekly_budget_sats}); repaired daily_budget_sats "
+                f"to {self.weekly_budget_sats}")
+            self.daily_budget_sats = self.weekly_budget_sats
         return list(self._override_warnings)
 
     def _detect_shadowed_and_deprecated(self, explicit_keys: set) -> None:
@@ -988,15 +981,12 @@ class Config:
                 return {"error": f"receivable_ratio_floor ({typed_value}) cannot exceed receivable_ratio_target ({self.receivable_ratio_target})"}
             if key == 'receivable_ratio_target' and typed_value < self.receivable_ratio_floor:
                 return {"error": f"receivable_ratio_target ({typed_value}) cannot be less than receivable_ratio_floor ({self.receivable_ratio_floor})"}
-            # Phase B (2026-08-01 surface reduction, section 5.1): the budget
-            # pair is rejected at set-time when crossed (the profile preview
-            # already treats it as a contradiction; boot repairs upward).
+            # Reject crossed budget pairs at set-time; startup also
+            # preserves the weekly ceiling by clamping daily down.
             if key == 'daily_budget_sats' and typed_value > self.weekly_budget_sats:
                 return {"error": f"daily_budget_sats ({typed_value}) cannot exceed current weekly_budget_sats ({self.weekly_budget_sats})"}
             if key == 'weekly_budget_sats' and typed_value < self.daily_budget_sats:
                 return {"error": f"weekly_budget_sats ({typed_value}) cannot be less than current daily_budget_sats ({self.daily_budget_sats})"}
-            # Phase B (section 5.2): a crossed planner channel-size band
-            # silently disables all automated opens — reject it at set-time.
 
             old_value = getattr(self, key)
 
