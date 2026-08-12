@@ -1,11 +1,13 @@
 """Workstream I: startup detection of contradictory, shadowed, and
 deprecated settings. Detection WARNS (via load_overrides' warning list,
 logged at startup); the pre-existing cross-field repairs still repair."""
+import time
 from unittest.mock import MagicMock
 
 import pytest
 
 from modules.config import CONFIG_FIELD_RANGES, Config
+from modules.database import Database
 
 
 def _load(overrides):
@@ -107,15 +109,48 @@ class TestContradictoryPairs:
         assert _matching(warnings, "does not match any known key",
                          "lnplus_max_participants")
 
-    def test_daily_budget_above_weekly_warns_and_repairs_upward(self):
+    def test_daily_budget_above_weekly_clamps_daily_to_weekly(self):
         cfg, warnings = _load({"daily_budget_sats": "5000",
                                "weekly_budget_sats": "1000"})
         assert _matching(warnings, "Contradictory", "daily_budget_sats",
-                         "weekly_budget_sats")
-        # Phase B (2026-08 surface reduction): repaired upward like the
-        # crossed fee rails — the weekly ceiling rises to the stated daily.
-        assert cfg.daily_budget_sats == 5000
-        assert cfg.weekly_budget_sats == 5000
+                         "weekly_budget_sats", "repaired daily_budget_sats")
+        assert cfg.daily_budget_sats == 1000
+        assert cfg.weekly_budget_sats == 1000
+
+    def test_zero_weekly_cap_clamps_daily_to_zero(self):
+        cfg, _ = _load({"daily_budget_sats": "5000",
+                        "weekly_budget_sats": "0"})
+        assert (cfg.daily_budget_sats, cfg.weekly_budget_sats) == (0, 0)
+
+    def test_malformed_daily_override_cannot_bypass_weekly_cap(self):
+        cfg, warnings = _load({"daily_budget_sats": "not-an-int",
+                               "weekly_budget_sats": "1000"})
+        assert _matching(warnings, "Override conversion failed",
+                         "daily_budget_sats")
+        assert (cfg.daily_budget_sats, cfg.weekly_budget_sats) == (1000, 1000)
+
+
+def test_startup_crossed_budget_never_widens_reservation_authority(tmp_path):
+    db = Database(str(tmp_path / "crossed-budget.db"), MagicMock())
+    db.initialize()
+    db.set_config_override("daily_budget_sats", "9000")
+    db.set_config_override("weekly_budget_sats", "1000")
+
+    cfg = Config()
+    cfg.load_overrides(db)
+    now = int(time.time())
+    ok, remaining = db.reserve_budget(
+        reservation_id="startup-cap-regression",
+        amount_sats=5000,
+        channel_id="test-channel",
+        budget_limit=cfg.daily_budget_sats,
+        since_timestamp=now - 86400,
+        weekly_budget_limit=cfg.weekly_budget_sats,
+        weekly_since_timestamp=now - 7 * 86400,
+    )
+
+    assert ok is False
+    assert remaining == 1000
 
 
 class TestShadowedSettings:

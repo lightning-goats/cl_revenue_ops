@@ -147,15 +147,15 @@ class TestBudgetPairCrossField:
         assert cfg.update_runtime(
             db, "weekly_budget_sats", "56000").get("status") == "success"
 
-    def test_boot_repairs_crossed_budgets_upward_with_warning(self):
-        # Pre-existing crossed persisted pair: warn AND repair weekly up to
-        # daily (mirrors the fc4c76b crossed fee-rails upward repair).
+    def test_boot_clamps_crossed_daily_budget_to_weekly_with_warning(self):
+        # Pre-existing crossed persisted pair: preserve the lower weekly
+        # ceiling and clamp daily down so startup never widens spend authority.
         cfg, warnings = _load({"daily_budget_sats": "9000",
                                "weekly_budget_sats": "1000"})
         assert _matching(warnings, "Contradictory", "daily_budget_sats",
-                         "weekly_budget_sats")
-        assert cfg.daily_budget_sats == 9000
-        assert cfg.weekly_budget_sats == 9000
+                         "weekly_budget_sats", "repaired daily_budget_sats")
+        assert cfg.daily_budget_sats == 1000
+        assert cfg.weekly_budget_sats == 1000
 
     def test_boot_ordered_budgets_untouched(self):
         cfg, warnings = _load({"daily_budget_sats": "1000",
