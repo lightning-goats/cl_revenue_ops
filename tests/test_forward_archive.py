@@ -527,6 +527,33 @@ def test_closed_days_needing_rebuild_is_bounded_and_excludes_current_day():
     assert store.closed_days_needing_rebuild(current_day) == ()
 
 
+@pytest.mark.parametrize(
+    "column, value",
+    [
+        ("created_sync_complete", 0),
+        ("updated_sync_complete", 0),
+        ("aggregate_complete", 0),
+        ("reconciliation_status", "incomplete"),
+        ("reasons_json", '["aggregate_mismatch"]'),
+    ],
+)
+def test_closed_days_needing_rebuild_selects_existing_incomplete_coverage(
+    column,
+    value,
+):
+    store, connection = _memory_store()
+    day = 1699920000
+    checked_at = _seed_complete_day(store, day)
+    store.rebuild_days([day], checked_at)
+    connection.execute(
+        f"UPDATE forward_archive_coverage_v1 SET {column} = ? "
+        "WHERE archive_generation = ? AND date_utc = ?",
+        (value, ARCHIVE_GENERATION, day),
+    )
+
+    assert store.closed_days_needing_rebuild(day + 86400) == (day,)
+
+
 def test_closed_days_needing_rebuild_rejects_invalid_bounds():
     store, _connection = _memory_store()
 

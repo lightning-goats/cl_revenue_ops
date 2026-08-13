@@ -188,6 +188,10 @@ def test_page_limit_returns_checkpointed_backlog_without_sync_error(store):
     sync = ForwardArchiveSynchronizer(rpc, store, _log)
     sync.PAGE_LIMIT = 1
     sync.MAX_PAGES_PER_FAMILY = 1
+    store.closed_days_needing_rebuild = MagicMock(
+        wraps=store.closed_days_needing_rebuild
+    )
+    store.rebuild_days = MagicMock(wraps=store.rebuild_days)
 
     result = sync.sync_once(now_ns=10)
 
@@ -199,6 +203,8 @@ def test_page_limit_returns_checkpointed_backlog_without_sync_error(store):
     assert store.get_sync_state("created")["next_index"] == 2
     assert store.get_sync_state("created")["last_error"] is None
     assert rpc.listforwards.call_count == 1
+    store.closed_days_needing_rebuild.assert_not_called()
+    store.rebuild_days.assert_not_called()
 
 
 def test_next_cycle_resumes_checkpoint_and_reaches_catch_up(store):
@@ -267,6 +273,10 @@ def test_updated_backlog_preserves_dates_from_all_committed_records(store):
     sync = ForwardArchiveSynchronizer(rpc, store, _log)
     sync.PAGE_LIMIT = 1
     sync.MAX_PAGES_PER_FAMILY = 1
+    store.closed_days_needing_rebuild = MagicMock(
+        wraps=store.closed_days_needing_rebuild
+    )
+    store.rebuild_days = MagicMock(wraps=store.rebuild_days)
 
     result = sync.sync_once(now_ns=10)
 
@@ -277,6 +287,8 @@ def test_updated_backlog_preserves_dates_from_all_committed_records(store):
     assert result.touched_dates == (1699920000, 1700006400)
     assert store.get_sync_state("updated")["next_index"] == 2
     assert store.get_sync_state("updated")["last_error"] is None
+    store.closed_days_needing_rebuild.assert_not_called()
+    store.rebuild_days.assert_not_called()
 
 
 
