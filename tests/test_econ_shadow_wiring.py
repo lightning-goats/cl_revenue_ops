@@ -66,25 +66,45 @@ def test_absent_shadow_is_harmless():
     mod.fee_controller.adjust_all_fees.assert_called_once()
 
 
-def test_fee_cycle_triggers_reconciliation_sweep():
+def test_fee_cycle_does_not_own_reconciliation_schedule():
     shadow = MagicMock()
     shadow.enabled.return_value = True
     mod = _fee_module(shadow)
     mod.database = MagicMock()
     mod.run_fee_adjustment()
-    shadow.maybe_run_reconciliation.assert_called_once()
-    args = shadow.maybe_run_reconciliation.call_args.args
-    assert args[0] is mod.database
+    shadow.maybe_run_reconciliation.assert_not_called()
 
 
-def test_raising_sweep_never_breaks_fee_cycle():
+def test_scheduled_reconciliation_runs_without_fee_authority():
+    shadow = MagicMock()
+    shadow.enabled.return_value = True
+    mod = _fee_module(shadow)
+    mod.database = MagicMock()
+    mod.fee_authority_gate = MagicMock()
+    mod._run_scheduled_reconciliation(now=1_754_006_401)
+    shadow.maybe_run_reconciliation.assert_called_once_with(
+        mod.database, 1_754_006_401)
+
+
+def test_scheduled_reconciliation_passes_missing_database_for_skip_evidence():
+    shadow = MagicMock()
+    shadow.enabled.return_value = True
+    mod = _fee_module(shadow)
+    mod.database = None
+    mod._run_scheduled_reconciliation(now=1_754_006_401)
+    shadow.maybe_run_reconciliation.assert_called_once_with(
+        None, 1_754_006_401)
+
+
+def test_raising_scheduled_sweep_is_contained():
     shadow = MagicMock()
     shadow.enabled.return_value = True
     shadow.maybe_run_reconciliation.side_effect = RuntimeError("boom")
     mod = _fee_module(shadow)
     mod.database = MagicMock()
-    mod.run_fee_adjustment()  # must not raise
-    mod.fee_controller.adjust_all_fees.assert_called_once()
+    assert mod._run_scheduled_reconciliation(now=1_754_006_401) is None
+    mod.plugin.log.assert_called_with(
+        "reconciliation sweep skipped: boom", level="debug")
 
 
 class TestSnapshotRpc:

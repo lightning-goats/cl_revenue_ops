@@ -45,6 +45,8 @@ EVENT_TYPES = (
     "cost_recorded",
     "reservation_released",
     "reconciliation_completed",
+    "reconciliation_run_started",
+    "reconciliation_run_completed",
     # PR 3a: a canonical snapshot was built and served to policies;
     # intent snapshot_ids resolve against these. Ignored by replay.
     "snapshot_created",
@@ -53,6 +55,10 @@ EVENT_TYPES = (
 _TERMINAL_EVENTS = frozenset({
     "intent_rejected", "intent_deferred", "execution_succeeded",
     "execution_failed", "execution_outcome_unknown",
+})
+
+RECONCILIATION_RESULTS = frozenset({
+    "clean", "divergence_found", "failed", "skipped",
 })
 
 
@@ -90,6 +96,23 @@ class EconLedger:
                     details_json TEXT NOT NULL
                 )
                 """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_econ_ledger_event_type_at "
+                "ON econ_ledger_events(event_type, at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_econ_ledger_type_idempotency "
+                "ON econ_ledger_events(event_type, idempotency_key)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_econ_reconciliation_event_once "
+                "ON econ_ledger_events(event_type, idempotency_key) "
+                "WHERE event_type IN "
+                "('reconciliation_run_started', "
+                "'reconciliation_run_completed')"
             )
             conn.commit()
 
@@ -160,6 +183,225 @@ class EconLedger:
             }
             for r in rows
         ]
+
+    def start_reconciliation_run(
+            self, *, slot_started_at: int, started_at: int,
+            snapshot_id: str | None,
+            state_reference: str) -> str:
+        """Append the durable start marker for one due reconciliation.
+
+        A matching completion is deliberately a separate event: if the
+        process exits between them, historical reporting exposes the run as
+        incomplete instead of silently losing it.
+        """
+        if isinstance(slot_started_at, bool) \
+                or not isinstance(slot_started_at, int) \
+                or slot_started_at < 0 or slot_started_at % 3600:
+            raise EconArithmeticError(
+                "slot_started_at must be a UTC-hour unix timestamp")
+        if isinstance(started_at, bool) or not isinstance(started_at, int) \
+                or started_at < slot_started_at:
+            raise EconArithmeticError(
+                "started_at must be unix seconds >= slot_started_at")
+        reference = str(state_reference or "").strip()
+        if not reference:
+            raise EconArithmeticError("state_reference required")
+        reconciliation_id = f"reconcile-hour-{slot_started_at}"
+        details = {
+            "reconciliation_id": reconciliation_id,
+            "slot_started_at": slot_started_at,
+            "started_at": started_at,
+            "snapshot_id": str(snapshot_id) if snapshot_id else None,
+            "state_reference": reference,
+        }
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO econ_ledger_events "
+                "(event_type, intent_id, idempotency_key, cycle_id, at, "
+                " amounts_json, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("reconciliation_run_started", reconciliation_id,
+                 reconciliation_id, reconciliation_id, slot_started_at,
+                 "{}", json.dumps(details, sort_keys=True)),
+            )
+            conn.commit()
+        return reconciliation_id
+
+    def complete_reconciliation_run(
+            self, *, reconciliation_id: str, started_at: int,
+            completed_at: int, result: str, divergence_count: int | None,
+            unexplained_divergence_count: int | None,
+            reservation_count: int | None,
+            ledger_projection_status: str, applied_count: int | None,
+            fee_intent_completeness: str,
+            error: str | None = None) -> int:
+        """Append the immutable terminal marker for a reconciliation run."""
+        run_id = str(reconciliation_id or "").strip()
+        if not run_id:
+            raise EconArithmeticError("reconciliation_id required")
+        result_value = str(result or "").strip()
+        if result_value not in RECONCILIATION_RESULTS:
+            raise EconArithmeticError(
+                f"invalid reconciliation result: {result!r}")
+        if isinstance(started_at, bool) or not isinstance(started_at, int) \
+                or started_at < 0:
+            raise EconArithmeticError("started_at must be unix seconds")
+        if isinstance(completed_at, bool) or not isinstance(completed_at, int) \
+                or completed_at < started_at:
+            raise EconArithmeticError(
+                "completed_at must be unix seconds >= started_at")
+        counts = {
+            "divergence_count": divergence_count,
+            "unexplained_divergence_count": unexplained_divergence_count,
+            "reservation_count": reservation_count,
+            "applied_count": applied_count,
+        }
+        for name, value in counts.items():
+            if value is not None and (
+                    isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0):
+                raise EconArithmeticError(
+                    f"{name} must be a non-negative integer or null")
+        projection = str(ledger_projection_status or "").strip()
+        completeness = str(fee_intent_completeness or "").strip()
+        if not projection or not completeness:
+            raise EconArithmeticError(
+                "ledger projection and fee completeness statuses required")
+        details = {
+            "reconciliation_id": run_id,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "result": result_value,
+            **counts,
+            "ledger_projection_status": projection,
+            "fee_intent_completeness": completeness,
+            "error": str(error) if error else None,
+        }
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO econ_ledger_events "
+                "(event_type, intent_id, idempotency_key, cycle_id, at, "
+                " amounts_json, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("reconciliation_run_completed", run_id, run_id, run_id,
+                 completed_at, "{}", json.dumps(details, sort_keys=True)),
+            )
+            if cur.rowcount:
+                event_id = int(cur.lastrowid)
+            else:
+                row = conn.execute(
+                    "SELECT event_id FROM econ_ledger_events "
+                    "WHERE event_type = 'reconciliation_run_completed' "
+                    "AND idempotency_key = ?", (run_id,),
+                ).fetchone()
+                event_id = int(row[0])
+            conn.commit()
+            return event_id
+
+    def reconciliation_runs(self, *, since_at: int, until_at: int,
+                            limit: int = 1000) -> dict:
+        """Return paired run lifecycle records for a half-open time range.
+
+        The first completion for an ID is authoritative. A start without a
+        terminal marker is returned as incomplete; missing evidence is never
+        converted to a zero or clean result.
+        """
+        if isinstance(since_at, bool) or not isinstance(since_at, int) \
+                or since_at < 0:
+            raise EconArithmeticError("since_at must be unix seconds")
+        if isinstance(until_at, bool) or not isinstance(until_at, int) \
+                or until_at <= since_at:
+            raise EconArithmeticError("until_at must be greater than since_at")
+        if isinstance(limit, bool) or not isinstance(limit, int) \
+                or not (1 <= limit <= 10_000):
+            raise EconArithmeticError("limit must be between 1 and 10000")
+
+        with self._connect() as conn:
+            start_rows = conn.execute(
+                "SELECT idempotency_key, at, details_json "
+                "FROM econ_ledger_events "
+                "WHERE event_type = 'reconciliation_run_started' "
+                "AND at >= ? AND at < ? ORDER BY at, event_id LIMIT ?",
+                (since_at, until_at, limit + 1),
+            ).fetchall()
+            truncated = len(start_rows) > limit
+            start_rows = start_rows[:limit]
+            run_ids = [str(row[0]) for row in start_rows]
+            completion_rows = []
+            for offset in range(0, len(run_ids), 500):
+                batch = run_ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                completion_rows.extend(conn.execute(
+                    "SELECT idempotency_key, details_json "
+                    "FROM econ_ledger_events "
+                    "WHERE event_type = 'reconciliation_run_completed' "
+                    f"AND idempotency_key IN ({placeholders})",
+                    batch).fetchall())
+
+        starts = {}
+        for run_id, slot_started_at, details_json in start_rows:
+            try:
+                details = json.loads(details_json) or {}
+            except (TypeError, ValueError):
+                details = {}
+            details.setdefault("slot_started_at", int(slot_started_at))
+            details.setdefault("started_at", int(slot_started_at))
+            starts.setdefault(str(run_id), details)
+        completions = {}
+        for run_id, details_json in completion_rows:
+            try:
+                details = json.loads(details_json) or {}
+            except (TypeError, ValueError):
+                continue
+            completions.setdefault(str(run_id), details)
+
+        records = []
+        for run_id, started in sorted(
+                starts.items(),
+                key=lambda item: (int(item[1].get("started_at", 0)),
+                                  item[0])):
+            completed = completions.get(run_id)
+            if completed is None:
+                record = {
+                    "reconciliation_id": run_id,
+                    "slot_started_at": int(
+                        started["slot_started_at"]),
+                    "started_at": int(started["started_at"]),
+                    "completed_at": None,
+                    "snapshot_id": started.get("snapshot_id"),
+                    "state_reference": started.get("state_reference"),
+                    "result": "incomplete",
+                    "divergence_count": None,
+                    "unexplained_divergence_count": None,
+                    "reservation_count": None,
+                    "ledger_projection_status": "unknown",
+                    "applied_count": None,
+                    "fee_intent_completeness": "unknown",
+                    "error": None,
+                }
+            else:
+                record = {
+                    "reconciliation_id": run_id,
+                    "slot_started_at": int(
+                        started["slot_started_at"]),
+                    "started_at": int(started["started_at"]),
+                    "completed_at": int(completed["completed_at"]),
+                    "snapshot_id": started.get("snapshot_id"),
+                    "state_reference": started.get("state_reference"),
+                    "result": str(completed["result"]),
+                    "divergence_count": completed.get(
+                        "divergence_count"),
+                    "unexplained_divergence_count": completed.get(
+                        "unexplained_divergence_count"),
+                    "reservation_count": completed.get(
+                        "reservation_count"),
+                    "ledger_projection_status": str(
+                        completed["ledger_projection_status"]),
+                    "applied_count": completed.get("applied_count"),
+                    "fee_intent_completeness": str(
+                        completed["fee_intent_completeness"]),
+                    "error": completed.get("error"),
+                }
+            records.append(record)
+        return {"runs": records, "truncated": truncated}
 
     def replay(self) -> LedgerState:
         reserved: Dict[str, int] = {}

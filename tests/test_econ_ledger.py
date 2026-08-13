@@ -1,4 +1,6 @@
 """Phase 1: append-only economic action ledger with replay."""
+from unittest.mock import MagicMock
+
 import pytest
 
 from modules.econ_ledger import EVENT_TYPES, EconLedger
@@ -6,6 +8,7 @@ from modules.econ_types import EconArithmeticError
 
 KEY = "a" * 64
 KEY2 = "b" * 64
+NOW = 1_752_400_000
 
 
 @pytest.fixture
@@ -28,6 +31,7 @@ def test_vocabulary_is_exactly_the_spec():
         "execution_succeeded", "execution_failed",
         "execution_outcome_unknown", "cost_recorded",
         "reservation_released", "reconciliation_completed",
+        "reconciliation_run_started", "reconciliation_run_completed",
         "snapshot_created",
     }
 
@@ -186,3 +190,215 @@ class TestReconciliationReplay:
                 amounts={"reserved_msat": 0}, details={"terminal": True})
         state = ledger.replay()
         assert state.terminal == {KEY: "execution_succeeded"}
+
+class TestReconciliationRunEvidence:
+    @staticmethod
+    def _slot():
+        return NOW - (NOW % 3600)
+
+    def test_completed_clean_run_round_trips_mandatory_fields(self, ledger):
+        slot = self._slot()
+        run_id = ledger.start_reconciliation_run(
+            slot_started_at=slot,
+            started_at=NOW,
+            snapshot_id="snapshot-1",
+            state_reference=f"spend_reservations@{slot}",
+        )
+        ledger.complete_reconciliation_run(
+            reconciliation_id=run_id,
+            started_at=NOW,
+            completed_at=NOW + 2,
+            result="clean",
+            divergence_count=0,
+            unexplained_divergence_count=0,
+            reservation_count=3,
+            ledger_projection_status="aligned",
+            applied_count=0,
+            fee_intent_completeness="ok",
+        )
+
+        history = ledger.reconciliation_runs(
+            since_at=slot, until_at=slot + 3600,
+        )
+        assert history["truncated"] is False
+        assert history["runs"] == [{
+            "reconciliation_id": run_id,
+            "slot_started_at": slot,
+            "started_at": NOW,
+            "completed_at": NOW + 2,
+            "snapshot_id": "snapshot-1",
+            "state_reference": f"spend_reservations@{slot}",
+            "result": "clean",
+            "divergence_count": 0,
+            "unexplained_divergence_count": 0,
+            "reservation_count": 3,
+            "ledger_projection_status": "aligned",
+            "applied_count": 0,
+            "fee_intent_completeness": "ok",
+            "error": None,
+        }]
+
+    def test_started_without_completion_is_incomplete(self, ledger):
+        slot = self._slot()
+        run_id = ledger.start_reconciliation_run(
+            slot_started_at=slot,
+            started_at=NOW,
+            snapshot_id=None,
+            state_reference=f"spend_reservations@{slot}",
+        )
+
+        history = ledger.reconciliation_runs(
+            since_at=slot, until_at=slot + 3600,
+        )
+        assert history["runs"] == [{
+            "reconciliation_id": run_id,
+            "slot_started_at": slot,
+            "started_at": NOW,
+            "completed_at": None,
+            "snapshot_id": None,
+            "state_reference": f"spend_reservations@{slot}",
+            "result": "incomplete",
+            "divergence_count": None,
+            "unexplained_divergence_count": None,
+            "reservation_count": None,
+            "ledger_projection_status": "unknown",
+            "applied_count": None,
+            "fee_intent_completeness": "unknown",
+            "error": None,
+        }]
+
+    def test_skipped_run_preserves_unknown_measurements(self, ledger):
+        slot = self._slot()
+        run_id = ledger.start_reconciliation_run(
+            slot_started_at=slot,
+            started_at=NOW,
+            snapshot_id=None,
+            state_reference=f"spend_reservations@{slot}",
+        )
+        ledger.complete_reconciliation_run(
+            reconciliation_id=run_id,
+            started_at=NOW,
+            completed_at=NOW + 1,
+            result="skipped",
+            divergence_count=None,
+            unexplained_divergence_count=None,
+            reservation_count=None,
+            ledger_projection_status="unknown",
+            applied_count=None,
+            fee_intent_completeness="unknown",
+            error="database unavailable",
+        )
+
+        run = ledger.reconciliation_runs(
+            since_at=slot, until_at=slot + 3600,
+        )["runs"][0]
+        assert run["result"] == "skipped"
+        assert run["divergence_count"] is None
+        assert run["reservation_count"] is None
+        assert ledger.replay().anomalies == ()
+
+    def test_history_bounds_are_slot_start_inclusive_end_exclusive(
+            self, ledger):
+        base_slot = self._slot()
+        for slot in (
+                base_slot - 3600, base_slot, base_slot + 3600):
+            ledger.start_reconciliation_run(
+                slot_started_at=slot,
+                started_at=slot + 1,
+                snapshot_id=None,
+                state_reference=f"spend_reservations@{slot}",
+            )
+
+        history = ledger.reconciliation_runs(
+            since_at=base_slot, until_at=base_slot + 3600,
+        )
+        assert [run["slot_started_at"]
+                for run in history["runs"]] == [base_slot]
+
+    def test_same_hour_start_is_idempotent(self, ledger):
+        slot = self._slot()
+        ids = [ledger.start_reconciliation_run(
+            slot_started_at=slot,
+            started_at=NOW + offset,
+            snapshot_id=None,
+            state_reference=f"spend_reservations@{slot}",
+        ) for offset in range(24)]
+
+        history = ledger.reconciliation_runs(
+            since_at=slot, until_at=slot + 3600,
+        )
+        assert len(set(ids)) == 1
+        assert len(history["runs"]) == 1
+
+    def test_history_reports_truncation(self, ledger):
+        slot = self._slot()
+        for offset in range(3):
+            current = slot + offset * 3600
+            ledger.start_reconciliation_run(
+                slot_started_at=current,
+                started_at=current,
+                snapshot_id=None,
+                state_reference=f"spend_reservations@{current}",
+            )
+
+        history = ledger.reconciliation_runs(
+            since_at=slot, until_at=slot + 3 * 3600, limit=2,
+        )
+        assert history["truncated"] is True
+        assert len(history["runs"]) == 2
+
+    def test_history_does_not_scan_unrelated_ledger_events(self, ledger):
+        slot = self._slot()
+        ledger.start_reconciliation_run(
+            slot_started_at=slot,
+            started_at=NOW,
+            snapshot_id=None,
+            state_reference=f"spend_reservations@{slot}",
+        )
+        ledger.events = MagicMock(
+            side_effect=AssertionError("full event scan is forbidden"))
+
+        history = ledger.reconciliation_runs(
+            since_at=slot, until_at=slot + 3600,
+        )
+
+        assert len(history["runs"]) == 1
+        ledger.events.assert_not_called()
+
+    def test_completion_pairing_uses_idempotency_lookup_index(self, ledger):
+        with ledger._connect() as conn:
+            plan = conn.execute(
+                "EXPLAIN QUERY PLAN "
+                "SELECT idempotency_key, details_json "
+                "FROM econ_ledger_events "
+                "WHERE event_type = 'reconciliation_run_completed' "
+                "AND idempotency_key IN (?)",
+                ("reconcile-hour-0",),
+            ).fetchall()
+
+        assert any(
+            "idx_econ_ledger_type_idempotency" in str(row)
+            for row in plan
+        ), plan
+
+    def test_invalid_terminal_result_is_rejected(self, ledger):
+        slot = self._slot()
+        run_id = ledger.start_reconciliation_run(
+            slot_started_at=slot,
+            started_at=NOW,
+            snapshot_id=None,
+            state_reference=f"spend_reservations@{slot}",
+        )
+        with pytest.raises(EconArithmeticError):
+            ledger.complete_reconciliation_run(
+                reconciliation_id=run_id,
+                started_at=NOW,
+                completed_at=NOW,
+                result="looks_clean",
+                divergence_count=0,
+                unexplained_divergence_count=0,
+                reservation_count=0,
+                ledger_projection_status="unknown",
+                applied_count=0,
+                fee_intent_completeness="unknown",
+            )

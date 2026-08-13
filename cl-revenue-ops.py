@@ -2319,6 +2319,46 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     pass
                 if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
                     break
+
+    def reconciliation_loop():
+        """Run reconciliation once per UTC hour, independent of fee authority."""
+        while not shutdown_event.is_set():
+            try:
+                _record_loop_heartbeat(
+                    "econ-reconciliation", interval_seconds=3600)
+                current = int(time.time())
+                slot_started_at = current - (current % 3600)
+                try:
+                    _run_scheduled_reconciliation(now=current)
+                except Exception as e:
+                    plugin.log(
+                        f"Error in scheduled reconciliation: {e}",
+                        level="error",
+                    )
+
+                # Anchor sleep to the slot just attempted. If the sweep
+                # crosses the next boundary, iterate immediately so that new
+                # UTC-hour slot is not silently skipped.
+                sleep_time = max(
+                    0, slot_started_at + 3600 - int(time.time()))
+                if sleep_time == 0:
+                    continue
+                if shutdown_event.wait(sleep_time):
+                    plugin.log(
+                        "Reconciliation loop stopping due to shutdown signal")
+                    break
+            except Exception as e:
+                plugin.log(
+                    f"Unhandled error in reconciliation loop iteration: {e}",
+                    level="error",
+                )
+                try:
+                    plugin.log(
+                        f"Traceback: {traceback.format_exc()}", level="debug")
+                except Exception:
+                    pass
+                if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
+                    break
     
     def rebalance_check_loop():
         """Background loop for rebalance checks."""
@@ -2484,6 +2524,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         daemon=True,
         name="fee-adjustment",
     ).start()
+    threading.Thread(
+        target=reconciliation_loop,
+        daemon=True,
+        name="econ-reconciliation",
+    ).start()
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()
@@ -2539,6 +2584,18 @@ def _run_scheduled_fee_adjustment():
     return run_fee_adjustment()
 
 
+def _run_scheduled_reconciliation(now=None):
+    """Run the read/ledger-only sweep without fee authority coupling."""
+    if econ_shadow is None or not econ_shadow.enabled():
+        return None
+    current = int(time.time()) if now is None else int(now)
+    try:
+        return econ_shadow.maybe_run_reconciliation(database, current)
+    except Exception as e:
+        plugin.log(f"reconciliation sweep skipped: {e}", level="debug")
+        return None
+
+
 def run_fee_adjustment():
     """Run one complete Python fee cycle under the shared authority lease."""
     with fee_authority_gate.execution_lease(
@@ -2577,16 +2634,6 @@ def _run_fee_adjustment_authorized():
                 econ_shadow.record_fee_intents(adjustments, int(time.time()))
         except Exception as _shadow_err:
             plugin.log(f"econ shadow skipped: {_shadow_err}", level='debug')
-
-        # Phase 2I: hourly self-throttled reconciliation sweep (ledger
-        # corrections + quarantine/completeness alerts). Fail-open.
-        try:
-            if econ_shadow is not None and database is not None:
-                econ_shadow.maybe_run_reconciliation(
-                    database, int(time.time()))
-        except Exception as _sweep_err:
-            plugin.log(f"reconciliation sweep skipped: {_sweep_err}",
-                       level='debug')
 
         # Push status + profitability to datastore for external consumers.
         # This keeps local reporting cheap and consistent.
@@ -4871,51 +4918,175 @@ def revenue_econ_snapshot(plugin: Plugin) -> Dict[str, Any]:
 
 @plugin.method("revenue-econ-reconcile")
 def revenue_econ_reconcile(plugin: Plugin, apply: bool = False,
-                           stale_after_seconds: int = 3600) -> Dict[str, Any]:
+                           stale_after_seconds: int = 3600,
+                           history_since: int = 0,
+                           history_until: int = 0,
+                           history_limit: int = 1000) -> Dict[str, Any]:
     """Reconcile the econ ledger against spend_reservations truth
     (Phase 2 pilot B). Dry-run by default; apply=true appends
     reconciliation_completed events to econ_ledger.db. NEVER writes
-    revenue_ops.db. Requires econ_shadow_enabled."""
+    revenue_ops.db. Explicit history bounds add durable scheduled-run
+    evidence for the half-open UTC epoch range. Requires
+    econ_shadow_enabled."""
     try:
         from modules import econ_reconcile
         if econ_shadow is None or not econ_shadow.enabled():
             return {"enabled": False,
                     "hint": "revenue-config set econ_shadow_enabled true"}
         ledger = econ_shadow.ledger_for_reconciliation()
-        if ledger is None or database is None:
-            return {"enabled": True, "error": "ledger or database unavailable"}
-        db_states = database.get_spend_reservation_states()
-        report = econ_reconcile.reconcile(
-            ledger, db_states, now=int(time.time()),
-            stale_after_seconds=max(60, int(stale_after_seconds)))
-        result = {
-            "enabled": True,
-            "checked": report.checked,
-            "matched": report.matched,
-            "divergences": [
-                {
-                    "kind": d.kind,
-                    "key": d.key,
-                    "ledger_reserved_msat": d.ledger_reserved_msat,
-                    "db_status": d.db_status,
-                    "db_reserved_sats": d.db_reserved_sats,
-                    "quarantined": d.resolution is None,
-                    "details": d.details,
-                }
-                for d in report.divergences
-            ],
-        }
-        try:
-            recent_changes = database.get_recent_fee_changes(limit=500)
-            result["fee_intent_completeness"] = (
-                econ_reconcile.fee_intent_completeness(
-                    ledger, recent_changes, now=int(time.time())))
-        except Exception as completeness_err:
-            result["fee_intent_completeness"] = {
-                "status": "error", "error": str(completeness_err)}
-        if apply:
-            result["applied"] = econ_reconcile.apply(
-                ledger, report, now=int(time.time()))
+        if ledger is None:
+            return {"enabled": True, "error": "ledger unavailable"}
+        since_value = int(history_since)
+        until_value = int(history_until)
+        limit_value = int(history_limit)
+        history_requested = bool(since_value or until_value)
+        if history_requested and not (since_value and until_value):
+            return {
+                "enabled": True,
+                "error": "history_since and history_until are both required",
+            }
+        if history_requested and until_value <= since_value:
+            return {
+                "enabled": True,
+                "error": "history_until must be greater than history_since",
+            }
+        if not (1 <= limit_value <= 10_000):
+            return {
+                "enabled": True,
+                "error": "history_limit must be between 1 and 10000",
+            }
+        if history_requested and (
+                since_value % 3600 or until_value % 3600):
+            return {
+                "enabled": True,
+                "error": "history bounds must align to UTC-hour epochs",
+            }
+        if history_requested \
+                and (until_value - since_value) // 3600 > 10_000:
+            return {
+                "enabled": True,
+                "error": (
+                    "history range cannot exceed 10000 UTC-hour slots"),
+            }
+        result = {"enabled": True}
+        if database is None:
+            result["error"] = "database unavailable"
+        else:
+            db_states = database.get_spend_reservation_states()
+            report = econ_reconcile.reconcile(
+                ledger, db_states, now=int(time.time()),
+                stale_after_seconds=max(60, int(stale_after_seconds)))
+            result.update({
+                "checked": report.checked,
+                "matched": report.matched,
+                "divergences": [
+                    {
+                        "kind": d.kind,
+                        "key": d.key,
+                        "ledger_reserved_msat": d.ledger_reserved_msat,
+                        "db_status": d.db_status,
+                        "db_reserved_sats": d.db_reserved_sats,
+                        "quarantined": d.resolution is None,
+                        "details": d.details,
+                    }
+                    for d in report.divergences
+                ],
+            })
+            try:
+                recent_changes = database.get_recent_fee_changes(limit=500)
+                result["fee_intent_completeness"] = (
+                    econ_reconcile.fee_intent_completeness(
+                        ledger, recent_changes, now=int(time.time())))
+            except Exception as completeness_err:
+                result["fee_intent_completeness"] = {
+                    "status": "error", "error": str(completeness_err)}
+            if apply:
+                result["applied"] = econ_reconcile.apply(
+                    ledger, report, now=int(time.time()))
+        if history_requested:
+            history_data = ledger.reconciliation_runs(
+                since_at=since_value,
+                until_at=until_value,
+                limit=limit_value,
+            )
+            runs = history_data["runs"]
+            result_counts = {
+                name: sum(1 for run in runs if run["result"] == name)
+                for name in (
+                    "clean", "divergence_found", "failed", "skipped",
+                    "incomplete",
+                )
+            }
+            expected_slots = list(range(
+                since_value, until_value, 3600))
+            expected_runs = len(expected_slots)
+            started = len(runs)
+            completed = sum(
+                1 for run in runs if run["completed_at"] is not None)
+            slot_counts = {}
+            for run in runs:
+                slot = int(run["slot_started_at"])
+                slot_counts[slot] = slot_counts.get(slot, 0) + 1
+            covered_slots = sorted(
+                slot for slot in slot_counts if slot in expected_slots)
+            missing_slots = [
+                slot for slot in expected_slots if slot not in slot_counts]
+            duplicate_slots = sorted(
+                slot for slot, count in slot_counts.items() if count > 1)
+            unexplained_values = [
+                run.get("unexplained_divergence_count") for run in runs]
+            unexplained_unknown = any(
+                value is None for value in unexplained_values)
+            unexplained = (
+                None if unexplained_unknown
+                else sum(int(value) for value in unexplained_values)
+            )
+            fee_intent_complete = (
+                started == expected_runs
+                and all(run.get("fee_intent_completeness") == "ok"
+                        for run in runs)
+            )
+            truncated = bool(history_data["truncated"])
+            complete = (
+                not truncated
+                and not missing_slots
+                and not duplicate_slots
+                and started == expected_runs
+                and completed == expected_runs
+                and result_counts["failed"] == 0
+                and result_counts["skipped"] == 0
+                and result_counts["incomplete"] == 0
+            )
+            all_clean = (
+                complete
+                and result_counts["clean"] == expected_runs
+                and result_counts["divergence_found"] == 0
+                and fee_intent_complete
+                and unexplained_unknown is False
+                and unexplained == 0
+            )
+            result["history"] = {
+                "runs": runs,
+                "truncated": truncated,
+                "summary": {
+                    "since": since_value,
+                    "until": until_value,
+                    "expected_runs": expected_runs,
+                    "started": started,
+                    "completed": completed,
+                    "covered_slots": len(covered_slots),
+                    "missing_slots": missing_slots,
+                    "duplicate_slots": duplicate_slots,
+                    **result_counts,
+                    "unexplained_divergence_count": unexplained,
+                    "unexplained_divergence_count_unknown": (
+                        unexplained_unknown),
+                    "fee_intent_complete": fee_intent_complete,
+                    "truncated": truncated,
+                    "complete": complete,
+                    "all_clean": all_clean,
+                },
+            }
         return result
     except Exception as e:
         return {"enabled": True, "error": str(e)}

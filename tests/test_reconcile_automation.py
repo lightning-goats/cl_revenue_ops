@@ -3,16 +3,17 @@ ledger-writes-only). Quarantined unknowns alert every sweep; resolvable
 divergences auto-apply."""
 import os
 import tempfile
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from modules.database import Database
-from modules.econ_ledger import EconLedger
 from modules.econ_shadow import EconShadow
 
 NOW = 1_752_400_000
+SLOT = NOW - (NOW % 3600)
 
 
 @pytest.fixture
@@ -45,12 +46,59 @@ def test_clean_sweep_and_throttle(stack):
     shadow, db, _ = stack
     result = shadow.maybe_run_reconciliation(db, NOW)
     assert result is not None
+    assert result["result"] == "clean"
     assert result["divergences"] == 0
     assert result["applied"] == 0
+    runs = shadow.ledger_for_reconciliation().reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 7200)
+    assert len(runs["runs"]) == 1
+    assert runs["runs"][0]["result"] == "clean"
+    assert runs["runs"][0]["ledger_projection_status"] == "aligned"
     # Throttled: within the hour returns None without re-running.
     assert shadow.maybe_run_reconciliation(db, NOW + 600) is None
+    history = shadow.ledger_for_reconciliation().reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 7200)
+    assert len(history["runs"]) == 1
     # After the interval it runs again.
     assert shadow.maybe_run_reconciliation(db, NOW + 3601) is not None
+    history = shadow.ledger_for_reconciliation().reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 7200)
+    assert len(history["runs"]) == 2
+
+
+def test_concurrent_same_slot_executes_reconciliation_once(stack):
+    shadow, db, _ = stack
+    entered = threading.Event()
+    release = threading.Event()
+    original = db.get_spend_reservation_states
+    calls = []
+
+    def blocked_states():
+        calls.append(1)
+        entered.set()
+        assert release.wait(timeout=2)
+        return original()
+
+    db.get_spend_reservation_states = blocked_states
+    results = []
+    first = threading.Thread(
+        target=lambda: results.append(
+            shadow.maybe_run_reconciliation(db, NOW)))
+    first.start()
+    assert entered.wait(timeout=2)
+
+    second_result = shadow.maybe_run_reconciliation(db, NOW)
+    release.set()
+    first.join(timeout=2)
+
+    assert first.is_alive() is False
+    assert second_result is None
+    assert len(calls) == 1
+    assert len(results) == 1
+    history = shadow.ledger_for_reconciliation().reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 3600)
+    assert len(history["runs"]) == 1
+    assert history["runs"][0]["result"] == "clean"
 
 
 def test_auto_applies_resolvable_divergence(stack):
@@ -65,8 +113,13 @@ def test_auto_applies_resolvable_divergence(stack):
         econ_shadow_enabled=True)
 
     result = shadow.maybe_run_reconciliation(db, NOW)
+    assert result["result"] == "divergence_found"
     assert result["divergences"] == 1
     assert result["applied"] == 1
+    run = shadow.ledger_for_reconciliation().reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 3600)["runs"][0]
+    assert run["result"] == "divergence_found"
+    assert run["ledger_projection_status"] == "corrected"
     # Next sweep (past throttle) is clean.
     result2 = shadow.maybe_run_reconciliation(db, NOW + 3601)
     assert result2["divergences"] == 0
@@ -82,8 +135,13 @@ def test_quarantined_unknowns_warn_every_sweep(stack):
                   idempotency_key="q" * 64, cycle_id="spend-test",
                   at=NOW - 7200)
     result = shadow.maybe_run_reconciliation(db, NOW)
+    assert result["result"] == "divergence_found"
     assert result["quarantined"] == 1
     assert result["applied"] == 0  # never auto-resolved
+    run = shadow.ledger_for_reconciliation().reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 3600)["runs"][0]
+    assert run["unexplained_divergence_count"] == 1
+    assert run["ledger_projection_status"] == "unresolved"
     warns = [c for c in plugin.log.call_args_list
              if c.kwargs.get("level") == "warn"
              and "EXTERNAL_OUTCOME_UNKNOWN" in str(c)]
@@ -111,8 +169,28 @@ def test_completeness_gap_warns(stack):
     assert warns
 
 
-def test_fail_open_on_database_error(stack):
+def test_database_error_persists_failed_run(stack):
     shadow, _, _ = stack
     broken = MagicMock()
     broken.get_spend_reservation_states.side_effect = RuntimeError("boom")
-    assert shadow.maybe_run_reconciliation(broken, NOW) is None
+    result = shadow.maybe_run_reconciliation(broken, NOW)
+    assert result["result"] == "failed"
+    run = shadow.ledger_for_reconciliation().reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 3600)["runs"][0]
+    assert run["result"] == "failed"
+    assert run["ledger_projection_status"] == "unknown"
+    assert run["divergence_count"] is None
+    assert run["reservation_count"] is None
+    assert "RuntimeError: boom" in run["error"]
+
+
+def test_database_unavailable_persists_skipped_run(stack):
+    shadow, _, _ = stack
+    result = shadow.maybe_run_reconciliation(None, NOW)
+    assert result["result"] == "skipped"
+    run = shadow.ledger_for_reconciliation().reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 3600)["runs"][0]
+    assert run["result"] == "skipped"
+    assert run["divergence_count"] is None
+    assert run["reservation_count"] is None
+    assert run["error"] == "database unavailable"

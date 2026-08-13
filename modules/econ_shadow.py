@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .econ_intents import Explanation, make_intent
@@ -53,6 +54,11 @@ class EconShadow:
         # authorizations DIFFERENT registries (one-shot conflict-check
         # bypass).
         self._intent_registry_lock = threading.Lock()
+        # Only one reconciliation body may run per plugin process. The durable
+        # slot key prevents duplicate evidence across restarts; this lock also
+        # prevents concurrent callers from applying the same corrections twice
+        # before either has appended the terminal marker.
+        self._reconciliation_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # plumbing
@@ -401,34 +407,128 @@ class EconShadow:
     # ------------------------------------------------------------------
     # automated reconciliation sweep (Phase 2I)
     # ------------------------------------------------------------------
-    _last_reconcile_at = 0
-
     def maybe_run_reconciliation(self, database, now: int,
                                  min_interval_seconds: int = 3600):
-        """Hourly self-throttled sweep: auto-applies resolvable ledger
-        divergences (append-only corrections toward DB truth), WARNS on
-        quarantined unknown outcomes every sweep until reconciled, and
-        WARNS on fee-intent completeness gaps. Writes only the econ
-        ledger; never revenue_ops.db. Fail-open: returns None on any
-        failure, disablement, or throttle."""
+        if not self._reconciliation_lock.acquire(blocking=False):
+            return None
         try:
-            if not self.enabled() or database is None:
-                return None
-            if int(now) - int(self._last_reconcile_at) < int(
-                    min_interval_seconds):
-                return None
-            ledger = self._get_ledger()
-            if ledger is None:
-                return None
+            return self._run_reconciliation_slot(
+                database, now, min_interval_seconds)
+        finally:
+            self._reconciliation_lock.release()
 
+    def _run_reconciliation_slot(self, database, now: int,
+                                 min_interval_seconds: int = 3600):
+        """Run one due reconciliation and persist its complete lifecycle.
+
+        Exactly one run is eligible per UTC-hour slot. Slot identity is
+        durable, so plugin restarts cannot create duplicate coverage evidence.
+        Reconciliation writes no production database state: resolvable
+        corrections are append-only ledger events.
+        """
+        if not self.enabled():
+            return None
+        started_at = int(now)
+        slot_started_at = started_at - (started_at % 3600)
+
+        ledger = self._get_ledger()
+        if ledger is None:
+            return None
+
+        # The interval argument remains accepted for internal compatibility,
+        # but UTC-hour slot identity is the authoritative throttle.
+        del min_interval_seconds
+        existing = ledger.reconciliation_runs(
+            since_at=slot_started_at,
+            until_at=slot_started_at + 3600,
+            limit=2,
+        )["runs"]
+        if existing and existing[0]["completed_at"] is not None:
+            return None
+        evidence_started_at = (
+            int(existing[0]["started_at"]) if existing else started_at
+        )
+
+        snapshot_id = None
+        cached_snapshot = self._snapshot_ref_cache
+        if cached_snapshot is not None \
+                and started_at - int(cached_snapshot[1]) <= 300:
+            snapshot_id = cached_snapshot[0].get("snapshot_id")
+        state_reference = f"spend_reservations@{slot_started_at}"
+
+        try:
+            reconciliation_id = ledger.start_reconciliation_run(
+                slot_started_at=slot_started_at,
+                started_at=evidence_started_at,
+                snapshot_id=snapshot_id,
+                state_reference=state_reference,
+            )
+        except Exception as e:
+            self._log(f"reconciliation start evidence failed: {e}",
+                      level="warn")
+            return None
+
+        if database is None:
+            error = "database unavailable"
+            completed_at = max(evidence_started_at, int(time.time()))
+            try:
+                ledger.complete_reconciliation_run(
+                    reconciliation_id=reconciliation_id,
+                    started_at=evidence_started_at,
+                    completed_at=completed_at,
+                    result="skipped",
+                    divergence_count=None,
+                    unexplained_divergence_count=None,
+                    reservation_count=None,
+                    ledger_projection_status="unknown",
+                    applied_count=None,
+                    fee_intent_completeness="unknown",
+                    error=error,
+                )
+            except Exception as evidence_error:
+                self._log(
+                    f"reconciliation skipped evidence failed: "
+                    f"{evidence_error}", level="warn")
+                return None
+            summary = {
+                "reconciliation_id": reconciliation_id,
+                "slot_started_at": slot_started_at,
+                "started_at": evidence_started_at,
+                "completed_at": completed_at,
+                "result": "skipped",
+                "checked": None,
+                "divergences": None,
+                "applied": None,
+                "quarantined": None,
+                "completeness_ok": None,
+                "ledger_projection_status": "unknown",
+                "error": error,
+            }
+            self._log(f"reconciliation sweep: {summary}", level="warn")
+            return summary
+
+        reservation_count = None
+        divergence_count = None
+        unexplained_count = None
+        applied_count = None
+        completeness_status = "unknown"
+        projection_status = "unknown"
+        try:
             from . import econ_reconcile
 
             db_states = database.get_spend_reservation_states()
-            report = econ_reconcile.reconcile(ledger, db_states,
-                                              now=int(now))
-            applied = econ_reconcile.apply(ledger, report, now=int(now))
-            quarantined = [d for d in report.divergences
-                           if d.resolution is None]
+            reservation_count = len(db_states)
+            report = econ_reconcile.reconcile(
+                ledger, db_states, now=started_at)
+            divergence_count = len(report.divergences)
+            applied = econ_reconcile.apply(
+                ledger, report, now=started_at)
+            applied_count = applied
+            quarantined = [
+                divergence for divergence in report.divergences
+                if divergence.resolution is None
+            ]
+            unexplained_count = len(quarantined)
             for divergence in quarantined:
                 self._log(
                     f"quarantined unknown outcome awaiting reconciliation "
@@ -440,31 +540,107 @@ class EconShadow:
             try:
                 changes = database.get_recent_fee_changes(limit=500)
                 completeness = econ_reconcile.fee_intent_completeness(
-                    ledger, changes, now=int(now))
-                if completeness.get("status") == "ok":
+                    ledger, changes, now=started_at)
+                raw_status = str(completeness.get("status", "unknown"))
+                completeness_status = raw_status
+                if raw_status == "ok":
                     completeness_ok = bool(completeness.get("complete"))
+                    completeness_status = (
+                        "ok" if completeness_ok else "mismatch"
+                    )
                     if not completeness_ok:
                         self._log(
                             f"fee-intent completeness gap: "
                             f"{completeness.get('mismatched_cycles')}",
                             level="warn")
-            except Exception as e:
-                self._log(f"completeness check skipped: {e}")
+            except Exception as completeness_error:
+                completeness_status = "error"
+                self._log(
+                    f"completeness check skipped: {completeness_error}")
 
-            self._last_reconcile_at = int(now)
+            result = (
+                "divergence_found" if report.divergences else "clean"
+            )
+            if quarantined:
+                projection_status = "unresolved"
+            elif report.divergences:
+                projection_status = (
+                    "corrected"
+                    if applied == len(report.divergences)
+                    else "incomplete"
+                )
+            else:
+                projection_status = "aligned"
+
+            completed_at = max(evidence_started_at, int(time.time()))
+            ledger.complete_reconciliation_run(
+                reconciliation_id=reconciliation_id,
+                started_at=evidence_started_at,
+                completed_at=completed_at,
+                result=result,
+                divergence_count=divergence_count,
+                unexplained_divergence_count=unexplained_count,
+                reservation_count=reservation_count,
+                ledger_projection_status=projection_status,
+                applied_count=applied_count,
+                fee_intent_completeness=completeness_status,
+            )
             summary = {
+                "reconciliation_id": reconciliation_id,
+                "slot_started_at": slot_started_at,
+                "started_at": evidence_started_at,
+                "completed_at": completed_at,
+                "result": result,
                 "checked": report.checked,
                 "divergences": len(report.divergences),
                 "applied": applied,
                 "quarantined": len(quarantined),
                 "completeness_ok": completeness_ok,
+                "ledger_projection_status": projection_status,
             }
             level = "info" if (report.divergences or applied) else "debug"
             self._log(f"reconciliation sweep: {summary}", level=level)
             return summary
         except Exception as e:
-            self._log(f"reconciliation sweep failed open: {e}")
-            return None
+            error = f"{type(e).__name__}: {e}"[:500]
+            completed_at = max(evidence_started_at, int(time.time()))
+            try:
+                ledger.complete_reconciliation_run(
+                    reconciliation_id=reconciliation_id,
+                    started_at=evidence_started_at,
+                    completed_at=completed_at,
+                    result="failed",
+                    divergence_count=divergence_count,
+                    unexplained_divergence_count=unexplained_count,
+                    reservation_count=reservation_count,
+                    ledger_projection_status=projection_status,
+                    applied_count=applied_count,
+                    fee_intent_completeness=completeness_status,
+                    error=error,
+                )
+            except Exception as evidence_error:
+                self._log(
+                    f"reconciliation failure evidence failed: "
+                    f"{evidence_error}", level="warn")
+                return None
+            summary = {
+                "reconciliation_id": reconciliation_id,
+                "slot_started_at": slot_started_at,
+                "started_at": evidence_started_at,
+                "completed_at": completed_at,
+                "result": "failed",
+                "checked": None,
+                "divergences": divergence_count,
+                "applied": applied_count,
+                "quarantined": unexplained_count,
+                "completeness_ok": None,
+                "ledger_projection_status": projection_status,
+                "error": error,
+            }
+            self._log(
+                f"reconciliation sweep failed open: {error}",
+                level="warn")
+            return summary
 
     # ------------------------------------------------------------------
     # on-demand snapshot preview

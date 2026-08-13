@@ -82,6 +82,7 @@ class InjectedTailError(RuntimeError):
 LOOP_SPECS = {
     "flow_analysis_loop":     {"thread": "flow-analysis",      "work": "run_flow_analysis",         "has_while": True},
     "fee_adjustment_loop":    {"thread": "fee-adjustment",     "work": "run_fee_adjustment",        "has_while": True},
+    "reconciliation_loop":   {"thread": "econ-reconciliation", "work": "_run_scheduled_reconciliation", "has_while": True},
     "rebalance_check_loop":   {"thread": "rebalance-check",    "work": "run_rebalance_check",       "has_while": True},
     "financial_snapshot_loop":{"thread": "financial-snapshot", "work": "_take_financial_snapshot",  "has_while": True},
     "snapshot_peers_delayed": {"thread": "startup-snapshot",   "work": "_snapshot_peers_once",      "has_while": False},
@@ -369,6 +370,31 @@ def test_body_exception_startup_snapshot_is_now_guarded():
         f"(captured {exc!r}); DD5 guards the single run."
     )
     assert work.called, "the one-shot work should still have been invoked once"
+
+
+def test_reconciliation_crossing_hour_boundary_runs_new_slot_immediately():
+    event = FakeShutdownEvent(auto_set_after=None)
+    observed = []
+
+    def work(*, now):
+        observed.append(now)
+        if len(observed) == 2:
+            event.set()
+
+    ns = _build_namespace(
+        event, "_run_scheduled_reconciliation", work,
+        MagicMock(return_value=1),
+    )
+    ns["time"] = types.SimpleNamespace(
+        time=MagicMock(side_effect=[3599, 3601, 3601, 3601]))
+    loop_fn = _extract_callable("reconciliation_loop", ns)
+
+    alive, exc = _run_loop_thread(loop_fn)
+
+    assert not alive
+    assert exc is None
+    assert observed == [3599, 3601]
+    assert event.wait_calls == 1
 
 
 # ===========================================================================
