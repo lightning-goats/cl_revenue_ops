@@ -1,11 +1,13 @@
 """Read-only overlap verification for canonical forward evidence."""
 
+import json
 import sqlite3
 
 import pytest
 
 from tools.audit.verify_forward_archive import (
     VerificationError,
+    main,
     verify_database,
 )
 
@@ -203,6 +205,7 @@ def test_verifier_matches_archive_to_raw_plus_rollup(snapshot_db):
     assert result["operational"]["settled_forward_count"] == 2
     assert result["overlap_equal"] is True
     assert result["legacy_projection_equal"] is True
+    assert result["legacy_identity_consistent"] is True
     assert result["legacy_loss_consistent"] is True
     assert result["overlap_status"] == "equal"
     assert result["warnings"] == []
@@ -211,6 +214,10 @@ def test_verifier_matches_archive_to_raw_plus_rollup(snapshot_db):
     assert any(
         "idx_forward_archive_v1_status_received" in detail
         for detail in result["query_plans"]["legacy_projection"]
+    )
+    assert any(
+        "idx_forward_archive_v1_status_received" in detail
+        for detail in result["query_plans"]["legacy_projection_keys"]
     )
     assert result["reasons"] == []
 
@@ -231,10 +238,84 @@ def test_verifier_accepts_only_exact_legacy_dedup_projection(snapshot_db):
     }
     assert result["overlap_equal"] is False
     assert result["legacy_projection_equal"] is True
+    assert result["legacy_identity_consistent"] is True
     assert result["legacy_loss_consistent"] is True
     assert result["overlap_status"] == "legacy_dedup_explained"
     assert result["reasons"] == []
     assert result["warnings"] == ["legacy_operational_dedup_loss"]
+
+
+def test_verifier_reports_raw_identity_separately_from_projected_totals(
+    snapshot_db,
+):
+    _add_exact_archive_duplicate(snapshot_db)
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute("UPDATE forwards SET in_channel = '9x9x9' WHERE id = 1")
+    connection.commit()
+    connection.close()
+
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    assert result["legacy_projected_archive"] == {
+        field: result["operational"][field]
+        for field in (
+            "settled_forward_count",
+            "forwarded_in_msat",
+            "forwarded_out_msat",
+            "fee_msat",
+        )
+    }
+    assert result["legacy_projection_equal"] is True
+    assert result["legacy_identity_consistent"] is False
+    assert result["overlap_status"] == "unexplained"
+    assert "archive_operational_mismatch" in result["reasons"]
+    assert result["warnings"] == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "in_channel",
+        "out_channel",
+        "in_msat",
+        "out_msat",
+        "fee_msat",
+        "received_time_ns",
+        "resolved_time_ns",
+    ],
+)
+def test_verifier_rejects_null_settled_legacy_key(
+    snapshot_db,
+    capsys,
+    field,
+):
+    _add_exact_archive_duplicate(snapshot_db)
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(
+        f"UPDATE forward_archive_v1 SET {field} = NULL "
+        "WHERE created_index IN (1, 3)"
+    )
+    if field == "resolved_time_ns":
+        connection.execute("UPDATE forwards SET resolved_time = 0 WHERE id = 1")
+    connection.commit()
+    connection.close()
+
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    assert result["legacy_identity_consistent"] is False
+    assert result["overlap_status"] == "unexplained"
+    assert "malformed_settled_record" in result["reasons"]
+    assert "archive_operational_mismatch" in result["reasons"]
+    assert result["warnings"] == []
+
+    exit_code = main([
+        "--database", str(snapshot_db),
+        "--history-since", str(DAY_START),
+        "--history-until", str(DAY_END),
+    ])
+    cli_result = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert "malformed_settled_record" in cli_result["reasons"]
 
 
 @pytest.mark.parametrize(

@@ -86,6 +86,23 @@ _LEGACY_PROJECTED_KEYS_SQL = """
              timestamp, resolved_time
 """
 
+_MALFORMED_SETTLED_LEGACY_KEY_SQL = """
+    SELECT COUNT(*) AS malformed_settled_count
+    FROM forward_archive_v1
+    WHERE archive_generation = ? AND status = 'settled'
+      AND (
+          received_time_ns IS NULL
+          OR (
+              received_time_ns >= ? AND received_time_ns < ?
+              AND (
+                  in_channel IS NULL OR out_channel IS NULL
+                  OR in_msat IS NULL OR out_msat IS NULL
+                  OR fee_msat IS NULL OR resolved_time_ns IS NULL
+              )
+          )
+      )
+"""
+
 _ARCHIVE_HISTORY_SQL = """
     SELECT * FROM forward_daily_channel_v1
     WHERE archive_generation = ?
@@ -257,6 +274,12 @@ def verify_database(
             start * 1_000_000_000,
             end * 1_000_000_000,
         )
+        malformed_settled_count = int(
+            connection.execute(
+                _MALFORMED_SETTLED_LEGACY_KEY_SQL,
+                archive_params,
+            ).fetchone()["malformed_settled_count"] or 0
+        )
         archive_row = connection.execute(
             _ARCHIVE_TOTAL_SQL,
             archive_params,
@@ -281,9 +304,13 @@ def verify_database(
         raw_key_counts = _legacy_key_counts(
             connection.execute(_RAW_LEGACY_KEYS_SQL, (start, end))
         )
-        legacy_identity_consistent = all(
+        raw_identity_consistent = all(
             count <= projected_key_counts[key]
             for key, count in raw_key_counts.items()
+        )
+        legacy_identity_consistent = (
+            malformed_settled_count == 0
+            and raw_identity_consistent
         )
 
         raw = _int_row(
@@ -348,12 +375,9 @@ def verify_database(
             for field in total_fields
         )
         overlap_equal = canonical_equal
-        legacy_projection_equal = (
-            all(
-                legacy_projected_archive[field] == operational[field]
-                for field in total_fields
-            )
-            and legacy_identity_consistent
+        legacy_projection_equal = all(
+            legacy_projected_archive[field] == operational[field]
+            for field in total_fields
         )
         legacy_dedup_loss = {
             field: archive[field] - operational[field]
@@ -364,7 +388,11 @@ def verify_database(
         )
         if canonical_equal and legacy_identity_consistent:
             overlap_status = "equal"
-        elif legacy_projection_equal and legacy_loss_consistent:
+        elif (
+            legacy_projection_equal
+            and legacy_identity_consistent
+            and legacy_loss_consistent
+        ):
             overlap_status = "legacy_dedup_explained"
         else:
             overlap_status = "unexplained"
@@ -387,6 +415,12 @@ def verify_database(
             "legacy_projection": _query_plan(
                 connection, _LEGACY_PROJECTED_ARCHIVE_SQL, archive_params
             ),
+            "legacy_projection_keys": _query_plan(
+                connection, _LEGACY_PROJECTED_KEYS_SQL, archive_params
+            ),
+            "malformed_legacy_identity": _query_plan(
+                connection, _MALFORMED_SETTLED_LEGACY_KEY_SQL, archive_params
+            ),
             "archive_history": _query_plan(
                 connection,
                 _ARCHIVE_HISTORY_SQL,
@@ -408,6 +442,10 @@ def verify_database(
         expected_indexes = {
             "archive": "idx_forward_archive_v1_status_received",
             "legacy_projection": "idx_forward_archive_v1_status_received",
+            "legacy_projection_keys": (
+                "idx_forward_archive_v1_status_received"
+            ),
+            "malformed_legacy_identity": "idx_forward_archive_v1_status_received",
             "archive_history": "idx_forward_daily_channel_v1_date",
             "operational_raw": "idx_forwards_time",
             "operational_raw_identity": "idx_forwards_time",
@@ -424,6 +462,8 @@ def verify_database(
         reasons = []
         if len(generations) > 1:
             reasons.append("multiple_archive_generations")
+        if malformed_settled_count:
+            reasons.append("malformed_settled_record")
         if overlap_status == "unexplained":
             reasons.append("archive_operational_mismatch")
         if not direct_sourced_equal:
@@ -446,6 +486,7 @@ def verify_database(
             "legacy_dedup_loss": legacy_dedup_loss,
             "overlap_equal": overlap_equal,
             "legacy_projection_equal": legacy_projection_equal,
+            "legacy_identity_consistent": legacy_identity_consistent,
             "legacy_loss_consistent": legacy_loss_consistent,
             "overlap_status": overlap_status,
             "warnings": warnings,
