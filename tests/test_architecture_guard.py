@@ -8,6 +8,7 @@ absent from the codebase.  The current architecture is DTS+PID only.
 import ast
 import inspect
 import os
+import re
 from pathlib import Path
 import subprocess
 import pytest
@@ -35,6 +36,12 @@ REBALANCE_BOUNDARY_FILES = [
     ROOT / "modules" / "rebalance_router_v2.py",
     ROOT / "modules" / "rebalance_router_v3.py",
 ]
+
+
+def _is_forbidden_coordinator_import(module_name):
+    """Match retired coordinator names as import-path components."""
+    components = re.split(r"[._-]+", str(module_name or "").lower())
+    return bool({"hive", "mycelium", "sling"}.intersection(components))
 
 
 class TestNoHiveReintroduction:
@@ -252,8 +259,13 @@ class TestNoSlingDependency:
 
 
 class TestFinalRuntimeAuthorityBoundary:
+    def test_forbidden_import_match_uses_module_components_not_word_substrings(self):
+        assert _is_forbidden_coordinator_import("modules.hive_router") is True
+        assert _is_forbidden_coordinator_import("modules.mycelium_runtime") is True
+        assert _is_forbidden_coordinator_import("modules.sling") is True
+        assert _is_forbidden_coordinator_import("modules.forward_archive") is False
+
     def test_no_sling_or_coordinator_imports_in_post_removal_source_set(self):
-        forbidden = ("hive", "mycelium", "sling")
         for path in FINAL_RUNTIME_FILES:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             imported = []
@@ -263,6 +275,6 @@ class TestFinalRuntimeAuthorityBoundary:
                 elif isinstance(node, ast.ImportFrom):
                     imported.append(str(node.module or "").lower())
             for module_name in imported:
-                assert not any(token in module_name for token in forbidden), (
+                assert not _is_forbidden_coordinator_import(module_name), (
                     f"forbidden runtime import {module_name} returned in {path}"
                 )

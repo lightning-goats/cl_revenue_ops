@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
+from .forward_archive import ForwardArchiveStore
 from .utils import (
     normalize_scid,
     base_to_sats_floor,
@@ -307,6 +308,12 @@ class Database:
         """
         self.db_path = os.path.expanduser(db_path)
         self.plugin = plugin
+        # Phase 0.6: observational CLN forward evidence.  This store owns only
+        # additive archive tables and is not consumed by economic decisions.
+        self.forward_archive = ForwardArchiveStore(
+            self._get_connection,
+            self.plugin.log,
+        )
         # Phase 2 pilot (docs/planning/2026-07-12-refactor-phase2-pilot.md):
         # optional spend-lifecycle journal (EconShadow). None = no journaling.
         # Hooks fire only AFTER successful state changes and are guarded —
@@ -969,6 +976,11 @@ class Database:
         """)
         # Symmetric date index for the inbound table.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_fwd_stats_inbound_date ON daily_forwarding_stats_inbound(date)")
+
+        # Phase 0.6 measurement integrity: additive, evidence-only archive.
+        # Existing operational forward tables and all decision queries remain
+        # unchanged; older plugin versions safely ignore these tables.
+        self.forward_archive.initialize_schema(conn)
         
         # Budget reservations table for atomic budget management (CRITICAL-01 fix)
         # Prevents race conditions where multiple concurrent jobs can overspend

@@ -17,7 +17,7 @@ Path: CLN lightning-dir `revenue_ops.db`; owner `modules/database.py`
 on version mismatch. Any refactor migration tooling must not assume a
 version gate exists.
 
-### Tables (35) and writers
+### Tables (39) and writers
 
 | Table | Written by (domain) |
 |---|---|
@@ -35,6 +35,10 @@ version gate exists.
 | fee_changes | fee broadcast history (fee controller; 90d retention) |
 | fee_strategy_state | DTS/PID strategy state (fee controller) |
 | financial_snapshots | 24h financial snapshots (snapshot thread) |
+| forward_archive_v1 | canonical CLN `listforwards` evidence (observational archive; 400d raw retention after verified aggregation) |
+| forward_archive_sync_state_v1 | independent created/updated cursor watermarks (observational archive) |
+| forward_daily_channel_v1 | replacement daily/channel aggregates derived from the canonical archive (retained indefinitely) |
+| forward_archive_coverage_v1 | per-UTC-day archive completeness and reconciliation evidence (retained indefinitely) |
 | forwards | forward event ledger (flow/profitability source) |
 | hot_channel_protection_overrides | hot-channel protection (fee/rebalance) |
 | ignored_peers | `revenue-ignore` operator list |
@@ -61,6 +65,14 @@ Retention/growth classification per table: see
 `docs/audit/deep/resource-growth.md` (23 bounded with retention
 mechanisms; corrects the earlier "fee_changes unbounded" claim — it is
 90d-bounded).
+
+The four `forward_*_v1` archive tables are additive Phase 0.6 measurement
+infrastructure owned by `modules/forward_archive.py`. They are deliberately
+not read by fee, flow, profitability, planner, or rebalance decision paths.
+The raw archive has a 400-day retention floor and can be pruned only after the
+affected day has a complete reconciled aggregate; daily aggregates and
+coverage are indefinite evidence. Older plugin code ignores the tables, so
+code rollback does not require a destructive schema rollback.
 
 ## Restart-recovery state (Workstream D/E input)
 
