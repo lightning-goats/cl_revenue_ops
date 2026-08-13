@@ -2356,12 +2356,21 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 )
                 try:
                     result = forward_archive_sync.sync_once()
-                    plugin.log(
-                        "Forward archive synchronized: "
-                        f"created_pages={result.created_pages} "
-                        f"updated_pages={result.updated_pages}",
-                        level="debug",
-                    )
+                    if result.caught_up:
+                        plugin.log(
+                            "Forward archive synchronized: "
+                            f"created_pages={result.created_pages} "
+                            f"updated_pages={result.updated_pages}",
+                            level="debug",
+                        )
+                    else:
+                        plugin.log(
+                            "Forward archive backlog checkpointed: "
+                            f"family={result.backlog_family} "
+                            f"created_pages={result.created_pages} "
+                            f"updated_pages={result.updated_pages}",
+                            level="info",
+                        )
                 except (RPCTimeoutError, RPCBreakerOpen) as e:
                     plugin.log(
                         f"RPC degraded in forward archive sync: {e}. "

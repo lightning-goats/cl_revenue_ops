@@ -328,6 +328,48 @@ def test_forward_archive_daemon_isolates_cycle_failure(monkeypatch):
     )
 
 
+def test_forward_archive_daemon_logs_checkpointed_backlog_without_error(
+    monkeypatch,
+):
+    mod = load_plugin_module()
+    fake_sync = MagicMock()
+    fake_sync.sync_once.return_value = SimpleNamespace(
+        caught_up=False,
+        backlog_family="updated",
+        created_pages=0,
+        updated_pages=200,
+    )
+    monkeypatch.setattr(
+        mod,
+        "ForwardArchiveSynchronizer",
+        MagicMock(return_value=fake_sync),
+        raising=False,
+    )
+    fake_shutdown = MagicMock()
+    fake_shutdown.is_set.return_value = False
+    fake_shutdown.wait.side_effect = [False, True]
+    monkeypatch.setattr(mod, "shutdown_event", fake_shutdown)
+    _run_init_with_stubbed_dependencies(mod, monkeypatch)
+    archive_thread = next(
+        thread for thread in mod._test_threads
+        if thread.kwargs.get("name") == "forward-archive"
+    )
+
+    archive_thread.kwargs["target"]()
+
+    backlog_logs = [
+        call for call in mod.plugin.log.call_args_list
+        if call.args and "backlog checkpointed" in call.args[0]
+    ]
+    assert len(backlog_logs) == 1
+    assert backlog_logs[0].kwargs.get("level") == "info"
+    assert not any(
+        call.kwargs.get("level") == "error"
+        for call in mod.plugin.log.call_args_list
+        if call.args and "page limit" in call.args[0]
+    )
+
+
 def test_init_keeps_plugin_available_when_forward_archive_sync_is_unavailable(
     monkeypatch,
 ):
