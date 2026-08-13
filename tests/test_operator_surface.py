@@ -363,6 +363,9 @@ def test_forward_archive_daemon_logs_checkpointed_backlog_without_error(
     ]
     assert len(backlog_logs) == 1
     assert backlog_logs[0].kwargs.get("level") == "info"
+    assert "family=updated" in backlog_logs[0].args[0]
+    assert "created_pages=0" in backlog_logs[0].args[0]
+    assert "updated_pages=200" in backlog_logs[0].args[0]
     assert not any(
         call.kwargs.get("level") == "error"
         for call in mod.plugin.log.call_args_list
