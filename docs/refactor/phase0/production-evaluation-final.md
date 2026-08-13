@@ -1,5 +1,13 @@
 # Production Economic Evaluation — Final
 
+> **Evidence correction - 2026-08-13 19:15 UTC:** The original report inspected
+> the retained raw `forwards` rows but overlooked the transactionally disjoint
+> `daily_forwarding_stats` and `daily_forwarding_stats_inbound` rollups.
+> Raw-event replay before 2026-08-05 remains unavailable, but exact aggregate
+> forward count, inbound/outbound volume, and routing fees are reconstructable
+> for the full formal window. The corrected traffic metrics and diagnosis below
+> do not change the formal YELLOW verdict.
+
 ## Executive verdict
 
 FORMAL VERDICT: YELLOW
@@ -15,7 +23,10 @@ Observed economics were not the blocker. The blocker was measurement integrity.
 
 Observed headline economics for the closed window were still useful:
 
-- exact gross routing revenue over the formal UTC boundary: 19,994 sats
+- exact gross routing revenue over the formal UTC boundary: 19,993.272 sats, reported as 19,994 sats under the existing whole-sat accounting convention
+- settled forwards over the formal UTC boundary: 1,559
+- outbound routed volume over the formal UTC boundary: 180,034,807.224 sats
+- realized routing yield: 111.05 sats per 1M sats routed
 - baseline-compatible observed net over the formal UTC boundary: 19,606 sats
 - observed baseline-compatible net/day across the 31 UTC calendar days in the formal window: 632.45 sats/day
 - frozen baseline net/day: 591.83 sats/day
@@ -109,13 +120,16 @@ Frozen anchors from `production-evaluation-interim-2026-07-13.md`:
 
 Frozen baseline caveat preserved:
 
-- the interim report explicitly declared that month-scale baselines were bookkeeper-backed because forwards-table history was incomplete
-- the current active `forwards` table is worse than that frozen limitation: it now begins at 2026-08-05 in the active production DB
+- the interim report explicitly declared that month-scale baselines were bookkeeper-backed because raw forwards-table history was incomplete
+- the current raw `forwards` table begins at 2026-08-05, but pruning had transactionally preserved older exit-side and entry-side daily aggregates; combining those disjoint sources reconstructs full-window aggregate traffic without changing the frozen baseline
 
 Baseline arithmetic used for comparable daily values:
 
 - frozen baseline net/day = 17,755 / 30 = 591.83 sats/day
 - frozen baseline gross/day = 22,703 / 30 = 756.77 sats/day
+- evaluation forward count/day = 1,559 / 31 = 50.29
+- evaluation outbound volume/day = 180,034,807.224 / 31 = 5,807,574.43 sats/day
+- evaluation realized yield = 19,993.272 / 180,034,807.224 x 1,000,000 = 111.05 sats per 1M sats routed
 
 ## Data completeness
 
@@ -148,7 +162,7 @@ Collector/tooling gaps that materially affected completeness:
 | Daily validation collector still called `hive-members` after standalone cutover | All watch/manifests after cutover read red for irrelevant collection failure |
 | Daily payloads did not include historical `revenue-budget` or `revenue-econ-reconcile` JSON | Budget/reconciliation gates were not preserved directly |
 | Trend file still used stale `t0=2026-04-23T16:31:01Z` | Trend rows were not a formal source for this evaluation |
-| Active `forwards` table only retains rows from 2026-08-05 onward | exact full-window forward count/volume cannot be reconstructed from the active DB alone |
+| Raw `forwards` rows begin on 2026-08-05; daily rollups were initially overlooked | full-window aggregates are reconstructable, but raw event/route-pair replay before that date is not |
 
 ## Included/excluded days
 
@@ -215,9 +229,9 @@ Two parallel views are necessary:
 | Gross routing revenue/day | 756.77 | 645.00 | -14.8% | Gross routing revenue trailed the frozen anchor |
 | Net revenue/day | 591.83 | 632.45 | +6.9% | Baseline-compatible net/day cleared the GREEN threshold economically |
 | Net vs baseline | 100% | 106.9% | +6.9 pts | Economics were acceptable; completeness was not |
-| Forward count/day | 79.07 | N/A | N/A | Exact full-window count cannot be reconstructed from current active forwards history |
-| Forward volume/day | 8,349,185 | N/A | N/A | Same limitation |
-| Revenue per 1M sats routed | 90.64 | N/A | N/A | Exact full-window routed volume unavailable |
+| Forward count/day | 79.07 | 50.29 | -36.4% | Settled-forward frequency fell materially |
+| Forward volume/day | 8,349,185 | 5,807,574 | -30.4% | Lower routed volume was the clearest top-line constraint |
+| Revenue per 1M sats routed | 90.64 | 111.05 | +22.5% | Realized fee yield improved despite lower traffic |
 | Revenue per 1M sats deployed | 4.04 gross/day/M | 3.44 gross/day/M | -14.9% | Gross productivity per deployed sat fell with lower gross revenue |
 | Rebalance expense/day | 0.00 | 0.00 | 0.00 | No rebalance spend recorded |
 | Automatic rebalances | N/A | 207 selected; 108 attempted; 0 succeeded | N/A | Selection occurred, execution did not |
@@ -242,6 +256,20 @@ Exact formal-window economics from direct boundary-bounded production evidence:
 | Channel-open capital costs | 1,139 | capital deployment cost; not charged to operating net |
 | Baseline-compatible net (`gross - closure`) | 19,606 | used for comparable ratio against frozen baseline |
 | Spec-normalized operating net (`gross - rebalance - swap - chain`) | 19,994 | closure excluded from operating net per frozen rule |
+
+Traffic reconstruction from the transactionally disjoint raw and rollup sources:
+
+| Component | Raw retained rows | Daily exit rollups | Combined formal window |
+| --- | ---: | ---: | ---: |
+| Settled forward count | 461 | 1,098 | 1,559 |
+| Inbound amount | 63,519,380.967 sats | 116,535,419.529 sats | 180,054,800.496 sats |
+| Outbound amount | 63,511,750.490 sats | 116,523,056.734 sats | 180,034,807.224 sats |
+| Routing fee | 7,630.477 sats | 12,362.795 sats | 19,993.272 sats |
+
+The fee total independently agrees with the rounded 19,994-sat gross-revenue
+figure. Exit and inbound rollups both contain 1,098 settled forwards, providing
+a second count reconciliation. These are exact aggregates under the current
+cleanup transaction; they do not restore pre-August-5 raw route-pair events.
 
 Observed full-window averages over the explicit 31 UTC days:
 
@@ -277,19 +305,19 @@ FORMAL VERDICT: YELLOW
 
 What can be said confidently:
 
-- exact gross routing revenue was 19,994 sats over the formal window
+- exact aggregate gross routing revenue was 19,993.272 sats over the formal window, rounded to 19,994 sats in whole-sat accounting
+- settled-forward count was 1,559, or 50.29/day, 36.4% below the frozen baseline rate
+- outbound routed volume was 180,034,807.224 sats, or 5,807,574 sats/day, 30.4% below the frozen baseline rate
+- realized yield was 111.05 sats per 1M sats routed, 22.5% above the frozen 90.64-sat yield
 - gross routing revenue was 11.9% below the frozen baseline total of 22,703 sats
-- the full-window forward count/volume cannot be reconstructed exactly from the active production `forwards` table because the table now begins at 2026-08-05
-
-What can still be inferred:
-
-- the current rolling snapshots suggest traffic was not catastrophically weak, but gross revenue still trailed the frozen baseline
-- the formal-window net result stayed healthy only because closure costs collapsed from the frozen baseline's 4,948 sats to 388 sats
+- raw route-pair replay before 2026-08-05 remains unavailable even though aggregate count, volume, and fees are preserved
 
 Interpretation:
 
-- the main top-line economic drag was lower gross routed revenue, not excessive operating spend
-- that makes traffic quality, fee positioning, and liquidity placement more important than budget leakage in explaining the month
+- lower traffic frequency and volume were the clearest top-line constraints
+- improved realized fee yield partially offset the traffic decline
+- the formal-window net result stayed healthy because yield improved and closure costs collapsed from the frozen baseline's 4,948 sats to 388 sats
+- budget leakage was not the explanation for lower gross revenue
 
 ## Fee-controller performance
 
@@ -596,7 +624,7 @@ Attribution conclusion:
 
 ### Limitations affecting causal interpretation
 
-- active `forwards` table history now begins 2026-08-05, so exact full-window forward count/volume cannot be reconstructed from the current DB alone
+- raw `forwards` history begins 2026-08-05, so pre-cutoff route-pair, amount-bucket, and event-level replay cannot be reconstructed even though daily/channel aggregate count, volume, and fees survive in rollups
 - persisted telemetry does not preserve full rebalance candidate sets, pre-price ordering, or counterfactual smaller-size quotes
 
 ### Limitations affecting future optimization only
@@ -616,7 +644,7 @@ Attribution conclusion:
 ### B. What worsened?
 
 1. Formal measurement quality regressed enough to block GREEN.
-2. Exact full-window forward count/volume is not reproducible from the active DB because forward-history retention regressed.
+2. Raw event-level forward history and route-pair replay are not reproducible before 2026-08-05, although aggregate count/volume/fees are preserved.
 3. Automatic rebalancing achieved zero successful executions.
 4. The stagnant tail widened as new capacity arrived faster than it became productive.
 
@@ -624,10 +652,14 @@ Attribution conclusion:
 
 Ranked constraints:
 
-1. lower gross routed revenue than the frozen baseline
+1. lower routed demand/volume: forward frequency fell 36.4% and outbound volume/day fell 30.4%
 2. inability to execute automatic rebalances successfully after selection
 3. early-window budget starvation before the August 1 budget increase
 4. channel-set expansion that added inactive/stagnant inventory faster than optimization evidence matured
+
+The 22.5% increase in realized revenue per routed sat is evidence against poor
+aggregate fee yield being the primary constraint, although it cannot prove that
+every channel was optimally priced.
 
 ### D. What prevented more economically useful rebalancing?
 
@@ -645,12 +677,12 @@ Why:
 
 - the formal verdict is YELLOW because measurement integrity is inadequate
 - the active validation stack cannot prove counted days
-- forward-history retention regressed relative to the interim limitation
+- raw forward-event retention remains insufficient for deterministic replay even though aggregate traffic retention is intact
 
 Required foundational fixes before algorithm work should be trusted:
 
 1. persist or collect clean hourly reconciliation results durably
-2. preserve exact full-window forward count/volume history
+2. add canonical created-index forward archival, explicit coverage, and bounded read-only aggregate history
 3. update validation collection to standalone-only surfaces (`revenue-budget`, `revenue-econ-reconcile`, no `hive-members`)
 
 After those fixes, the strongest algorithmic order suggested by production evidence is:
@@ -690,7 +722,9 @@ Reason:
 
 Analysis workspace:
 
-- local analysis repo SHA: `a50ef85` (working tree clean before this report)
+- local analysis repo SHA: `a50ef85` (working tree clean before the original report)
+- correction analysis base SHA: `871b4e9`
+- correction evidence captured on analysis host and `lnnode`: 2026-08-13 19:15 UTC
 - production repo SHA: `5a45a91753556ce096291e03a9417519b92e8144`
 
 Primary evidence locations:
@@ -746,6 +780,38 @@ SELECT event_type, COUNT(*), MIN(at), MAX(at)
 FROM econ_ledger_events
 WHERE at >= 1783900800 AND at < 1786579200
 GROUP BY event_type;
+
+-- Corrected formal-window traffic reconstruction. cleanup_old_data() makes
+-- forwards and daily_forwarding_stats disjoint by aggregating and deleting
+-- each batch in the same transaction.
+WITH parts AS (
+    SELECT 'raw' AS source,
+           COUNT(*) AS forward_count,
+           COALESCE(SUM(in_msat), 0) AS in_msat,
+           COALESCE(SUM(out_msat), 0) AS out_msat,
+           COALESCE(SUM(fee_msat), 0) AS fee_msat
+    FROM forwards
+    WHERE timestamp >= 1783900800 AND timestamp < 1786579200
+    UNION ALL
+    SELECT 'exit_rollup',
+           COALESCE(SUM(forward_count), 0),
+           COALESCE(SUM(total_in_msat), 0),
+           COALESCE(SUM(total_out_msat), 0),
+           COALESCE(SUM(total_fee_msat), 0)
+    FROM daily_forwarding_stats
+    WHERE date >= 1783900800 AND date < 1786579200
+)
+SELECT * FROM parts
+UNION ALL
+SELECT 'combined', SUM(forward_count), SUM(in_msat),
+       SUM(out_msat), SUM(fee_msat)
+FROM parts;
+
+SELECT COALESCE(SUM(forward_count), 0) AS sourced_forward_count,
+       COALESCE(SUM(total_in_msat), 0) AS sourced_volume_msat,
+       COALESCE(SUM(total_fee_msat), 0) AS sourced_fee_msat
+FROM daily_forwarding_stats_inbound
+WHERE date >= 1783900800 AND date < 1786579200;
 ```
 
 Key reproducibility notes:

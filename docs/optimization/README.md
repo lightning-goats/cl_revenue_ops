@@ -58,6 +58,7 @@ See [validation/baseline.md](validation/baseline.md) and the historical
 | 0.3 Daily collector repair | implementation | shadow evidence | [phase0-daily-collector.md](findings/phase0-daily-collector.md) |
 | 0.4 Validator failure semantics | implementation | shadow evidence | [phase0-validator-failure-semantics.md](findings/phase0-validator-failure-semantics.md) |
 | 0.5 Versioned evaluation identity | implementation | preflight only | [phase0-evaluation-identity.md](findings/phase0-evaluation-identity.md) |
+| 0.6 Canonical forward archive | approved design | implementation blocked on spec review | [ADR-002](adr/ADR-002-canonical-forward-archive.md) |
 | 0B. Refactor closure | queued | inactive | future finding |
 | 1. Deterministic replay and traces | blocked by Phase 0 | inactive | future finding |
 | 2. Route-liquidity evidence | blocked by Phase 1 | inactive | future finding |
