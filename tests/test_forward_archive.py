@@ -449,3 +449,181 @@ def test_sync_error_is_bounded_and_does_not_advance_cursor():
     assert state["last_success_at"] == 10
     assert state["last_page_at"] == 11
     assert state["last_error"] == "x" * 512
+
+
+def _settled_page_record(
+    created_index,
+    updated_index,
+    in_channel,
+    out_channel,
+    in_msat,
+    out_msat,
+    fee_msat,
+    received_time,
+):
+    return {
+        "created_index": created_index,
+        "updated_index": updated_index,
+        "status": "settled",
+        "in_channel": in_channel,
+        "out_channel": out_channel,
+        "in_msat": in_msat,
+        "out_msat": out_msat,
+        "fee_msat": fee_msat,
+        "received_time": received_time,
+        "resolved_time": str(Decimal(received_time) + Decimal("1")),
+    }
+
+
+def _seed_complete_day(store, day=1699920000):
+    records = [
+        _settled_page_record(
+            1, 11, "1x1x1", "2x2x2", 2000, 1900, 100, "1700000000"
+        ),
+        _settled_page_record(
+            2, 12, "1x1x1", "3x3x3", 3000, 2800, 200, "1700000100"
+        ),
+    ]
+    observed = (day + 86400 + 1) * 1_000_000_000
+    store.apply_page("created", records, observed, live_max_index=2)
+    store.apply_page("updated", records, observed, live_max_index=12)
+    return observed
+
+
+def test_rebuild_day_is_replacement_based_and_idempotent():
+    store, _connection = _memory_store()
+    checked_at = _seed_complete_day(store)
+
+    store.rebuild_days([1699920000], checked_at)
+    first = store.history(1699920000, 1700006400, None, 100)
+    store.rebuild_days([1699920000], checked_at + 1)
+    second = store.history(1699920000, 1700006400, None, 100)
+
+    def without_rebuilt_at(rows):
+        return [
+            {key: value for key, value in row.items() if key != "rebuilt_at"}
+            for row in rows
+        ]
+
+    assert without_rebuilt_at(second["rows"]) == without_rebuilt_at(first["rows"])
+    assert all(
+        second_row["rebuilt_at"] > first_row["rebuilt_at"]
+        for first_row, second_row in zip(first["rows"], second["rows"])
+    )
+    assert second["totals"]["settled_forward_count"] == 2
+    assert second["totals"]["sourced_forward_count"] == 2
+    assert second["totals"]["forwarded_in_msat"] == 5000
+    assert second["totals"]["forwarded_out_msat"] == 4700
+    assert second["totals"]["fee_msat"] == 300
+
+
+def test_incomplete_updated_cursor_cannot_mark_day_complete():
+    store, _connection = _memory_store()
+    day = 1699920000
+    record = _settled_page_record(
+        1, 11, "1x1x1", "2x2x2", 2000, 1900, 100, "1700000000"
+    )
+    checked_at = (day + 86400 + 1) * 1_000_000_000
+    store.apply_page("created", [record], checked_at, live_max_index=1)
+
+    store.rebuild_days([day], checked_at)
+    store.refresh_coverage([day], checked_at)
+    result = store.history(day, day + 86400, None, 100)
+
+    assert result["complete"] is False
+    assert result["totals"]["settled_forward_count"] is None
+    assert result["coverage"][0]["reconciliation_status"] == "incomplete"
+    assert "updated_sync_incomplete" in result["coverage"][0]["reasons"]
+
+
+def test_complete_cursors_and_matching_aggregate_mark_day_complete():
+    store, _connection = _memory_store()
+    day = 1699920000
+    checked_at = _seed_complete_day(store, day)
+
+    store.rebuild_days([day], checked_at)
+    store.refresh_coverage([day], checked_at)
+    result = store.history(day, day + 86400, None, 100)
+
+    assert result["complete"] is True
+    assert result["truncated"] is False
+    assert result["coverage"][0]["reconciliation_status"] == "complete"
+    assert result["coverage"][0]["reasons"] == []
+    assert result["totals"]["settled_forward_count"] == 2
+    assert result["totals"]["sourced_forward_count"] == 2
+
+
+def test_missing_coverage_is_null_and_incomplete_not_green_zero():
+    store, _connection = _memory_store()
+
+    result = store.history(1699920000, 1700006400, None, 100)
+
+    assert result["complete"] is False
+    assert result["coverage"][0]["reconciliation_status"] == "missing"
+    assert result["coverage"][0]["settled_forward_count"] is None
+    assert result["totals"]["settled_forward_count"] is None
+
+
+@pytest.mark.parametrize(
+    "history_since, history_until, limit, error",
+    [
+        (1699920001, 1700006400, 100, "UTC-midnight"),
+        (1699920000, 1699920000, 100, "greater"),
+        (1699920000, 1700006400, 0, "limit"),
+        (1699920000, 1700006400, 5001, "limit"),
+        (1699920000, 1699920000 + 401 * 86400, 100, "400 days"),
+    ],
+)
+def test_history_rejects_unbounded_or_unaligned_requests(
+    history_since, history_until, limit, error
+):
+    store, _connection = _memory_store()
+
+    with pytest.raises(ForwardArchiveError, match=error):
+        store.history(history_since, history_until, None, limit)
+
+
+def test_prune_requires_complete_reconciled_coverage():
+    store, connection = _memory_store()
+    day = 1699920000
+    checked_at = _seed_complete_day(store, day)
+    store.rebuild_days([day], checked_at)
+    connection.execute(
+        "DELETE FROM forward_archive_coverage_v1 WHERE date_utc = ?",
+        (day,),
+    )
+
+    now_ns = (day + 401 * 86400) * 1_000_000_000
+    assert store.prune_raw(now_ns=now_ns, retention_days=400) == 0
+
+    store.refresh_coverage([day], checked_at)
+    assert store.prune_raw(now_ns=now_ns, retention_days=400) == 2
+    assert connection.execute(
+        "SELECT COUNT(*) FROM forward_archive_v1"
+    ).fetchone()[0] == 0
+
+
+def test_history_query_plan_uses_bounded_date_index():
+    store, _connection = _memory_store()
+
+    plan = store.explain_history_query(1699920000, 1700006400, None)
+
+    assert "idx_forward_daily_channel_v1_date" in plan
+    assert "SCAN forward_daily_channel_v1" not in plan
+
+
+def test_channel_filtered_history_returns_channel_filtered_totals():
+    store, _connection = _memory_store()
+    day = 1699920000
+    checked_at = _seed_complete_day(store, day)
+    store.rebuild_days([day], checked_at)
+
+    result = store.history(day, day + 86400, "2x2x2", 100)
+
+    assert result["complete"] is True
+    assert len(result["rows"]) == 1
+    assert result["totals"]["settled_forward_count"] == 1
+    assert result["totals"]["sourced_forward_count"] == 0
+    assert result["totals"]["forwarded_in_msat"] == 2000
+    assert result["totals"]["forwarded_out_msat"] == 1900
+    assert result["totals"]["fee_msat"] == 100

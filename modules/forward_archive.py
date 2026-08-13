@@ -7,6 +7,7 @@ decision path.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
@@ -693,6 +694,529 @@ class ForwardArchiveStore:
                 next_index=next_index,
                 touched_dates=tuple(sorted(touched_dates)),
             )
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+
+
+    @staticmethod
+    def _validate_day(date_utc: int) -> int:
+        day = _nonnegative_int(date_utc, "date_utc", optional=False)
+        if day % 86400:
+            raise ForwardArchiveError("date_utc must be UTC-midnight aligned")
+        return day
+
+    def rebuild_days(
+        self,
+        date_epochs: Sequence[int],
+        checked_at_ns: int,
+    ) -> None:
+        """Replace daily/channel aggregates from canonical archive rows."""
+        checked_at = _nonnegative_int(
+            checked_at_ns, "checked_at_ns", optional=False
+        )
+        days = sorted({self._validate_day(day) for day in date_epochs})
+        connection = self._connection_provider()
+        for day in days:
+            start_ns = day * 1_000_000_000
+            end_ns = (day + 86400) * 1_000_000_000
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """
+                    DELETE FROM forward_daily_channel_v1
+                    WHERE archive_generation = ? AND date_utc = ?
+                    """,
+                    (ARCHIVE_GENERATION, day),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO forward_daily_channel_v1 (
+                        archive_generation, date_utc, channel_id,
+                        schema_version, settled_forward_count,
+                        forwarded_in_msat, forwarded_out_msat, fee_msat,
+                        sourced_forward_count, sourced_volume_msat,
+                        sourced_fee_msat, source_min_created_index,
+                        source_max_created_index, rebuilt_at
+                    )
+                    SELECT archive_generation, ?, out_channel, ?,
+                           COUNT(*), COALESCE(SUM(in_msat), 0),
+                           COALESCE(SUM(out_msat), 0),
+                           COALESCE(SUM(fee_msat), 0),
+                           0, 0, 0, MIN(created_index), MAX(created_index), ?
+                    FROM forward_archive_v1
+                    WHERE archive_generation = ? AND status = 'settled'
+                      AND received_time_ns >= ? AND received_time_ns < ?
+                      AND out_channel IS NOT NULL
+                    GROUP BY archive_generation, out_channel
+                    """,
+                    (
+                        day,
+                        ARCHIVE_SCHEMA_VERSION,
+                        checked_at,
+                        ARCHIVE_GENERATION,
+                        start_ns,
+                        end_ns,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO forward_daily_channel_v1 (
+                        archive_generation, date_utc, channel_id,
+                        schema_version, settled_forward_count,
+                        forwarded_in_msat, forwarded_out_msat, fee_msat,
+                        sourced_forward_count, sourced_volume_msat,
+                        sourced_fee_msat, source_min_created_index,
+                        source_max_created_index, rebuilt_at
+                    )
+                    SELECT archive_generation, ?, in_channel, ?,
+                           0, 0, 0, 0, COUNT(*),
+                           COALESCE(SUM(in_msat), 0),
+                           COALESCE(SUM(fee_msat), 0),
+                           MIN(created_index), MAX(created_index), ?
+                    FROM forward_archive_v1
+                    WHERE archive_generation = ? AND status = 'settled'
+                      AND received_time_ns >= ? AND received_time_ns < ?
+                      AND in_channel IS NOT NULL
+                    GROUP BY archive_generation, in_channel
+                    ON CONFLICT(archive_generation, date_utc, channel_id)
+                    DO UPDATE SET
+                        sourced_forward_count =
+                            excluded.sourced_forward_count,
+                        sourced_volume_msat = excluded.sourced_volume_msat,
+                        sourced_fee_msat = excluded.sourced_fee_msat,
+                        source_min_created_index = MIN(
+                            forward_daily_channel_v1.source_min_created_index,
+                            excluded.source_min_created_index
+                        ),
+                        source_max_created_index = MAX(
+                            forward_daily_channel_v1.source_max_created_index,
+                            excluded.source_max_created_index
+                        ),
+                        rebuilt_at = excluded.rebuilt_at
+                    """,
+                    (
+                        day,
+                        ARCHIVE_SCHEMA_VERSION,
+                        checked_at,
+                        ARCHIVE_GENERATION,
+                        start_ns,
+                        end_ns,
+                    ),
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        self.refresh_coverage(days, checked_at)
+
+    def refresh_coverage(
+        self,
+        date_epochs: Sequence[int],
+        checked_at_ns: int,
+    ) -> None:
+        """Reconcile archive, aggregate, and cursor evidence for UTC days."""
+        checked_at = _nonnegative_int(
+            checked_at_ns, "checked_at_ns", optional=False
+        )
+        days = sorted({self._validate_day(day) for day in date_epochs})
+        connection = self._connection_provider()
+        created_state = self.get_sync_state("created")
+        updated_state = self.get_sync_state("updated")
+        oldest = connection.execute(
+            """
+            SELECT MIN(received_time_ns) FROM forward_archive_v1
+            WHERE archive_generation = ? AND received_time_ns IS NOT NULL
+            """,
+            (ARCHIVE_GENERATION,),
+        ).fetchone()[0]
+        for day in days:
+            start_ns = day * 1_000_000_000
+            end_ns = (day + 86400) * 1_000_000_000
+            raw = connection.execute(
+                """
+                SELECT COUNT(*) AS settled_forward_count,
+                       COALESCE(SUM(in_msat), 0) AS forwarded_in_msat,
+                       COALESCE(SUM(out_msat), 0) AS forwarded_out_msat,
+                       COALESCE(SUM(fee_msat), 0) AS fee_msat,
+                       MAX(created_index) AS max_created_index,
+                       MAX(updated_index) AS max_updated_index,
+                       SUM(CASE WHEN status = 'offered' THEN 1 ELSE 0 END)
+                           AS unresolved_offered,
+                       SUM(CASE WHEN status = 'settled' AND (
+                           in_msat IS NULL OR out_msat IS NULL
+                           OR fee_msat IS NULL OR in_channel IS NULL
+                           OR out_channel IS NULL
+                       ) THEN 1 ELSE 0 END) AS malformed_settled
+                FROM forward_archive_v1
+                WHERE archive_generation = ?
+                  AND received_time_ns >= ? AND received_time_ns < ?
+                """,
+                (ARCHIVE_GENERATION, start_ns, end_ns),
+            ).fetchone()
+            aggregate = connection.execute(
+                """
+                SELECT COALESCE(SUM(settled_forward_count), 0)
+                           AS settled_forward_count,
+                       COALESCE(SUM(forwarded_in_msat), 0)
+                           AS forwarded_in_msat,
+                       COALESCE(SUM(forwarded_out_msat), 0)
+                           AS forwarded_out_msat,
+                       COALESCE(SUM(fee_msat), 0) AS fee_msat,
+                       COALESCE(SUM(sourced_forward_count), 0)
+                           AS sourced_forward_count
+                FROM forward_daily_channel_v1
+                WHERE archive_generation = ? AND date_utc = ?
+                """,
+                (ARCHIVE_GENERATION, day),
+            ).fetchone()
+            reasons = []
+            if checked_at < end_ns:
+                reasons.append("day_not_closed")
+            if oldest is None or end_ns <= int(oldest):
+                reasons.append("before_source_history")
+
+            def cursor_complete(state, maximum):
+                if state["last_success_at"] is None:
+                    return False
+                if int(state["last_success_at"]) < end_ns:
+                    return False
+                if maximum is None:
+                    return state["complete_through_index"] is not None
+                complete_through = state["complete_through_index"]
+                return (
+                    complete_through is not None
+                    and int(complete_through) >= int(maximum)
+                )
+
+            created_complete = cursor_complete(
+                created_state, raw["max_created_index"]
+            )
+            updated_complete = cursor_complete(
+                updated_state, raw["max_updated_index"]
+            )
+            if not created_complete:
+                reasons.append("created_sync_incomplete")
+            if not updated_complete:
+                reasons.append("updated_sync_incomplete")
+            if int(raw["unresolved_offered"] or 0):
+                reasons.append("unresolved_offered")
+            if int(raw["malformed_settled"] or 0):
+                reasons.append("malformed_settled_record")
+
+            aggregate_matches = all(
+                int(raw[name] or 0) == int(aggregate[name] or 0)
+                for name in (
+                    "settled_forward_count",
+                    "forwarded_in_msat",
+                    "forwarded_out_msat",
+                    "fee_msat",
+                )
+            )
+            direct_sourced_match = (
+                int(aggregate["settled_forward_count"] or 0)
+                == int(aggregate["sourced_forward_count"] or 0)
+            )
+            if not aggregate_matches:
+                reasons.append("aggregate_mismatch")
+            if not direct_sourced_match:
+                reasons.append("direct_sourced_count_mismatch")
+            aggregate_complete = (
+                aggregate_matches
+                and direct_sourced_match
+                and not int(raw["malformed_settled"] or 0)
+            )
+            complete = (
+                created_complete
+                and updated_complete
+                and aggregate_complete
+                and not reasons
+            )
+            connection.execute(
+                """
+                INSERT INTO forward_archive_coverage_v1 (
+                    archive_generation, date_utc,
+                    created_sync_complete, updated_sync_complete,
+                    aggregate_complete, settled_forward_count,
+                    forwarded_in_msat, forwarded_out_msat, fee_msat,
+                    sourced_forward_count, reconciliation_status,
+                    reasons_json, checked_at, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(archive_generation, date_utc) DO UPDATE SET
+                    created_sync_complete = excluded.created_sync_complete,
+                    updated_sync_complete = excluded.updated_sync_complete,
+                    aggregate_complete = excluded.aggregate_complete,
+                    settled_forward_count = excluded.settled_forward_count,
+                    forwarded_in_msat = excluded.forwarded_in_msat,
+                    forwarded_out_msat = excluded.forwarded_out_msat,
+                    fee_msat = excluded.fee_msat,
+                    sourced_forward_count = excluded.sourced_forward_count,
+                    reconciliation_status = excluded.reconciliation_status,
+                    reasons_json = excluded.reasons_json,
+                    checked_at = excluded.checked_at,
+                    schema_version = excluded.schema_version
+                """,
+                (
+                    ARCHIVE_GENERATION,
+                    day,
+                    int(created_complete),
+                    int(updated_complete),
+                    int(aggregate_complete),
+                    int(raw["settled_forward_count"] or 0),
+                    int(raw["forwarded_in_msat"] or 0),
+                    int(raw["forwarded_out_msat"] or 0),
+                    int(raw["fee_msat"] or 0),
+                    int(aggregate["sourced_forward_count"] or 0),
+                    "complete" if complete else "incomplete",
+                    json.dumps(reasons, sort_keys=True),
+                    checked_at,
+                    ARCHIVE_SCHEMA_VERSION,
+                ),
+            )
+
+    @staticmethod
+    def _validate_history_bounds(
+        history_since: int,
+        history_until: int,
+        limit: int,
+    ) -> tuple[int, int, int]:
+        start = _nonnegative_int(
+            history_since, "history_since", optional=False
+        )
+        end = _nonnegative_int(
+            history_until, "history_until", optional=False
+        )
+        bounded_limit = _nonnegative_int(limit, "limit", optional=False)
+        if start % 86400 or end % 86400:
+            raise ForwardArchiveError(
+                "history bounds must be UTC-midnight aligned"
+            )
+        if end <= start:
+            raise ForwardArchiveError(
+                "history_until must be greater than history_since"
+            )
+        if end - start > 400 * 86400:
+            raise ForwardArchiveError("history window exceeds 400 days")
+        if not 1 <= bounded_limit <= 5000:
+            raise ForwardArchiveError("limit must be between 1 and 5000")
+        return start, end, bounded_limit
+
+    def _history_query(
+        self,
+        history_since: int,
+        history_until: int,
+        channel_id: Optional[str],
+        limit: int,
+        *,
+        explain: bool = False,
+    ):
+        prefix = "EXPLAIN QUERY PLAN " if explain else ""
+        sql = (
+            prefix
+            + """
+            SELECT * FROM forward_daily_channel_v1
+            WHERE archive_generation = ?
+              AND date_utc >= ? AND date_utc < ?
+            """
+        )
+        params = [ARCHIVE_GENERATION, history_since, history_until]
+        if channel_id is not None:
+            sql += " AND channel_id = ?"
+            params.append(channel_id)
+        sql += " ORDER BY date_utc, channel_id"
+        if not explain:
+            sql += " LIMIT ?"
+            params.append(limit + 1)
+        return self._connection_provider().execute(sql, params)
+
+    def history(
+        self,
+        history_since: int,
+        history_until: int,
+        channel_id: Optional[str],
+        limit: int,
+    ) -> dict[str, Any]:
+        """Return bounded daily/channel evidence without side effects."""
+        start, end, bounded_limit = self._validate_history_bounds(
+            history_since, history_until, limit
+        )
+        connection = self._connection_provider()
+        coverage_by_day = {
+            int(row["date_utc"]): dict(row)
+            for row in connection.execute(
+                """
+                SELECT * FROM forward_archive_coverage_v1
+                WHERE archive_generation = ?
+                  AND date_utc >= ? AND date_utc < ?
+                ORDER BY date_utc
+                """,
+                (ARCHIVE_GENERATION, start, end),
+            )
+        }
+        coverage = []
+        for day in range(start, end, 86400):
+            item = coverage_by_day.get(day)
+            if item is None:
+                item = {
+                    "archive_generation": ARCHIVE_GENERATION,
+                    "date_utc": day,
+                    "created_sync_complete": False,
+                    "updated_sync_complete": False,
+                    "aggregate_complete": False,
+                    "settled_forward_count": None,
+                    "forwarded_in_msat": None,
+                    "forwarded_out_msat": None,
+                    "fee_msat": None,
+                    "sourced_forward_count": None,
+                    "reconciliation_status": "missing",
+                    "reasons": ["coverage_missing"],
+                    "checked_at": None,
+                    "schema_version": ARCHIVE_SCHEMA_VERSION,
+                }
+            else:
+                item["created_sync_complete"] = bool(
+                    item["created_sync_complete"]
+                )
+                item["updated_sync_complete"] = bool(
+                    item["updated_sync_complete"]
+                )
+                item["aggregate_complete"] = bool(
+                    item["aggregate_complete"]
+                )
+                item["reasons"] = json.loads(item.pop("reasons_json"))
+            coverage.append(item)
+
+        fetched = [
+            dict(row)
+            for row in self._history_query(
+                start, end, channel_id, bounded_limit
+            ).fetchall()
+        ]
+        truncated = len(fetched) > bounded_limit
+        rows = fetched[:bounded_limit]
+        complete = (
+            not truncated
+            and all(
+                item["reconciliation_status"] == "complete"
+                for item in coverage
+            )
+        )
+        total_fields = (
+            "settled_forward_count",
+            "forwarded_in_msat",
+            "forwarded_out_msat",
+            "fee_msat",
+            "sourced_forward_count",
+        )
+        if complete and channel_id is not None:
+            totals = {
+                name: sum(int(row[name]) for row in rows)
+                for name in total_fields
+            }
+        else:
+            totals = {
+                name: (
+                    sum(int(item[name]) for item in coverage)
+                    if complete
+                    else None
+                )
+                for name in total_fields
+            }
+        return {
+            "archive_generation": ARCHIVE_GENERATION,
+            "schema_version": ARCHIVE_SCHEMA_VERSION,
+            "history_since": start,
+            "history_until": end,
+            "channel_id": channel_id,
+            "coverage": coverage,
+            "totals": totals,
+            "rows": rows,
+            "truncated": truncated,
+            "complete": complete,
+        }
+
+    def explain_history_query(
+        self,
+        history_since: int,
+        history_until: int,
+        channel_id: Optional[str],
+    ) -> str:
+        start, end, _limit = self._validate_history_bounds(
+            history_since, history_until, 1
+        )
+        return " ".join(
+            str(row[3])
+            for row in self._history_query(
+                start, end, channel_id, 1, explain=True
+            ).fetchall()
+        )
+
+    def prune_raw(
+        self,
+        now_ns: int,
+        retention_days: int = 400,
+        batch_size: int = 2000,
+    ) -> int:
+        """Delete only terminal rows backed by complete reconciled days."""
+        now = _nonnegative_int(now_ns, "now_ns", optional=False)
+        retention = _nonnegative_int(
+            retention_days, "retention_days", optional=False
+        )
+        bounded_batch = _nonnegative_int(
+            batch_size, "batch_size", optional=False
+        )
+        if retention < 400:
+            raise ForwardArchiveError("retention_days cannot be less than 400")
+        if not 1 <= bounded_batch <= 2000:
+            raise ForwardArchiveError("batch_size must be between 1 and 2000")
+        cutoff_ns = now - retention * 86400 * 1_000_000_000
+        if cutoff_ns <= 0:
+            return 0
+        connection = self._connection_provider()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            candidates = connection.execute(
+                """
+                SELECT created_index, received_time_ns
+                FROM forward_archive_v1
+                WHERE archive_generation = ?
+                  AND status IN ('settled', 'failed', 'local_failed')
+                  AND received_time_ns IS NOT NULL
+                  AND received_time_ns < ?
+                ORDER BY received_time_ns, created_index
+                LIMIT ?
+                """,
+                (ARCHIVE_GENERATION, cutoff_ns, bounded_batch),
+            ).fetchall()
+            deletable = []
+            for row in candidates:
+                seconds = int(row["received_time_ns"]) // 1_000_000_000
+                day = seconds - (seconds % 86400)
+                covered = connection.execute(
+                    """
+                    SELECT 1 FROM forward_archive_coverage_v1
+                    WHERE archive_generation = ? AND date_utc = ?
+                      AND created_sync_complete = 1
+                      AND updated_sync_complete = 1
+                      AND aggregate_complete = 1
+                      AND reconciliation_status = 'complete'
+                    """,
+                    (ARCHIVE_GENERATION, day),
+                ).fetchone()
+                if covered is not None:
+                    deletable.append(int(row["created_index"]))
+            connection.executemany(
+                """
+                DELETE FROM forward_archive_v1
+                WHERE archive_generation = ? AND created_index = ?
+                """,
+                [
+                    (ARCHIVE_GENERATION, created_index)
+                    for created_index in deletable
+                ],
+            )
+            connection.execute("COMMIT")
+            return len(deletable)
         except Exception:
             connection.execute("ROLLBACK")
             raise
