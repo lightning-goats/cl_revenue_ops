@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 
 ARCHIVE_SCHEMA_VERSION = 1
@@ -49,6 +49,45 @@ class ForwardArchiveRecord:
     def as_db_dict(self) -> dict[str, Any]:
         """Return a name-stable mapping suitable for parameterized SQLite I/O."""
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class PageApplyResult:
+    """Outcome of one atomically applied created/updated cursor page."""
+
+    index_family: str
+    inserted: int
+    updated: int
+    unchanged: int
+    next_index: int
+    touched_dates: tuple[int, ...]
+
+
+_TERMINAL_STATUSES = frozenset({"settled", "failed", "local_failed"})
+_PAYLOAD_COLUMNS = (
+    "status",
+    "in_channel",
+    "out_channel",
+    "in_htlc_id",
+    "out_htlc_id",
+    "in_msat",
+    "out_msat",
+    "fee_msat",
+    "received_time_ns",
+    "resolved_time_ns",
+    "style",
+    "failcode",
+    "failreason",
+)
+_RECORD_COLUMNS = (
+    "archive_generation",
+    "created_index",
+    "updated_index",
+    *_PAYLOAD_COLUMNS,
+    "first_observed_at",
+    "last_observed_at",
+    "schema_version",
+)
 
 
 def _decimal(value: Any, field: str) -> Decimal:
@@ -318,3 +357,342 @@ class ForwardArchiveStore:
             ON forward_archive_coverage_v1(archive_generation, date_utc)
             """
         )
+
+
+    @staticmethod
+    def _validate_index_family(index_family: str) -> str:
+        family = str(index_family or "").lower()
+        if family not in {"created", "updated"}:
+            raise ForwardArchiveError(
+                "index_family must be 'created' or 'updated'"
+            )
+        return family
+
+    @staticmethod
+    def _default_sync_state(index_family: str) -> dict[str, Any]:
+        return {
+            "archive_generation": ARCHIVE_GENERATION,
+            "index_family": index_family,
+            "next_index": 0,
+            "source_first_index": None,
+            "source_last_index": None,
+            "complete_through_index": None,
+            "last_page_at": None,
+            "last_success_at": None,
+            "last_error": None,
+            "schema_version": ARCHIVE_SCHEMA_VERSION,
+        }
+
+    def get_sync_state(self, index_family: str) -> dict[str, Any]:
+        """Return one cursor family without creating mutable state on reads."""
+        family = self._validate_index_family(index_family)
+        row = self._connection_provider().execute(
+            """
+            SELECT * FROM forward_archive_sync_state_v1
+            WHERE archive_generation = ? AND index_family = ?
+            """,
+            (ARCHIVE_GENERATION, family),
+        ).fetchone()
+        return dict(row) if row is not None else self._default_sync_state(family)
+
+    @staticmethod
+    def _row_payload_matches(
+        row: sqlite3.Row,
+        record: ForwardArchiveRecord,
+    ) -> bool:
+        return all(
+            row[column] == getattr(record, column)
+            for column in _PAYLOAD_COLUMNS
+        )
+
+    @staticmethod
+    def _insert_record(
+        connection: sqlite3.Connection,
+        record: ForwardArchiveRecord,
+    ) -> None:
+        values = record.as_db_dict()
+        columns = ", ".join(_RECORD_COLUMNS)
+        placeholders = ", ".join(f":{column}" for column in _RECORD_COLUMNS)
+        connection.execute(
+            f"INSERT INTO forward_archive_v1 ({columns}) VALUES ({placeholders})",
+            values,
+        )
+
+    @staticmethod
+    def _update_record(
+        connection: sqlite3.Connection,
+        record: ForwardArchiveRecord,
+    ) -> None:
+        values = record.as_db_dict()
+        assignments = ", ".join(
+            f"{column} = :{column}"
+            for column in ("updated_index", *_PAYLOAD_COLUMNS, "last_observed_at")
+        )
+        connection.execute(
+            f"""
+            UPDATE forward_archive_v1
+            SET {assignments}
+            WHERE archive_generation = :archive_generation
+              AND created_index = :created_index
+            """,
+            values,
+        )
+
+    def record_sync_error(
+        self,
+        index_family: str,
+        message: str,
+        observed_at_ns: int,
+    ) -> None:
+        """Persist a bounded sync error without moving either cursor."""
+        family = self._validate_index_family(index_family)
+        observed = _nonnegative_int(
+            observed_at_ns, "observed_at_ns", optional=False
+        )
+        bounded_message = str(message or "forward archive sync error")[:512]
+        self._connection_provider().execute(
+            """
+            INSERT INTO forward_archive_sync_state_v1 (
+                archive_generation, index_family, next_index,
+                last_page_at, last_error, schema_version
+            ) VALUES (?, ?, 0, ?, ?, ?)
+            ON CONFLICT(archive_generation, index_family) DO UPDATE SET
+                last_page_at = excluded.last_page_at,
+                last_error = excluded.last_error
+            """,
+            (
+                ARCHIVE_GENERATION,
+                family,
+                observed,
+                bounded_message,
+                ARCHIVE_SCHEMA_VERSION,
+            ),
+        )
+
+    def apply_page(
+        self,
+        index_family: str,
+        records: Sequence[Mapping[str, Any]],
+        observed_at_ns: int,
+        live_max_index: int,
+    ) -> PageApplyResult:
+        """Atomically apply one independently indexed listforwards page."""
+        family = self._validate_index_family(index_family)
+        observed = _nonnegative_int(
+            observed_at_ns, "observed_at_ns", optional=False
+        )
+        live_max = _nonnegative_int(
+            live_max_index, "live_max_index", optional=False
+        )
+        if isinstance(records, (str, bytes, Mapping)) or not isinstance(
+            records, Sequence
+        ):
+            raise ForwardArchiveError("forward page: expected list")
+
+        normalized = [
+            normalize_forward_record(record, observed)
+            for record in records
+        ]
+        indexed_records = []
+        for record in normalized:
+            family_index = (
+                record.created_index
+                if family == "created"
+                else record.updated_index
+            )
+            if family_index is None:
+                raise ForwardArchiveError(
+                    "updated page record missing updated_index"
+                )
+            indexed_records.append((family_index, record))
+        indexed_records.sort(key=lambda item: item[0])
+        indexes = [item[0] for item in indexed_records]
+        if len(indexes) != len(set(indexes)):
+            raise ForwardArchiveError(
+                f"{family} page contains duplicate family index"
+            )
+        if indexes and indexes[-1] > live_max:
+            raise ForwardArchiveError(
+                f"{family} page index {indexes[-1]} exceeds live maximum "
+                f"{live_max}"
+            )
+
+        connection = self._connection_provider()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            state_row = connection.execute(
+                """
+                SELECT * FROM forward_archive_sync_state_v1
+                WHERE archive_generation = ? AND index_family = ?
+                """,
+                (ARCHIVE_GENERATION, family),
+            ).fetchone()
+            state = (
+                dict(state_row)
+                if state_row is not None
+                else self._default_sync_state(family)
+            )
+            current_next = int(state["next_index"])
+            if current_next > live_max + 1:
+                raise ForwardArchiveError(
+                    f"{family} cursor {current_next} exceeds live maximum "
+                    f"{live_max}"
+                )
+            if (
+                not indexes
+                and current_next <= live_max
+                and not (current_next == 0 and live_max == 0)
+            ):
+                raise ForwardArchiveError(
+                    f"{family} empty page before live maximum {live_max}"
+                )
+
+            inserted = 0
+            updated = 0
+            unchanged = 0
+            touched_dates: set[int] = set()
+            for _family_index, record in indexed_records:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM forward_archive_v1
+                    WHERE archive_generation = ? AND created_index = ?
+                    """,
+                    (ARCHIVE_GENERATION, record.created_index),
+                ).fetchone()
+                if existing is None:
+                    self._insert_record(connection, record)
+                    inserted += 1
+                    changed = True
+                else:
+                    stored_updated = existing["updated_index"]
+                    incoming_updated = record.updated_index
+                    first_terminal = (
+                        stored_updated is None
+                        and incoming_updated is None
+                        and existing["status"] == "offered"
+                        and record.status in _TERMINAL_STATUSES
+                    )
+                    newer_update = (
+                        incoming_updated is not None
+                        and (
+                            stored_updated is None
+                            or incoming_updated > stored_updated
+                        )
+                    )
+                    same_version = incoming_updated == stored_updated
+                    stale_created_view = (
+                        stored_updated is not None
+                        and incoming_updated is None
+                    )
+                    stale_update = (
+                        stored_updated is not None
+                        and incoming_updated is not None
+                        and incoming_updated < stored_updated
+                    )
+                    if first_terminal or newer_update:
+                        self._update_record(connection, record)
+                        updated += 1
+                        changed = True
+                    elif stale_created_view or stale_update:
+                        unchanged += 1
+                        changed = False
+                    elif (
+                        same_version
+                        and self._row_payload_matches(existing, record)
+                    ):
+                        unchanged += 1
+                        changed = False
+                    else:
+                        raise ForwardArchiveError(
+                            "conflicting payload for created_index "
+                            f"{record.created_index} at updated_index "
+                            f"{record.updated_index}"
+                        )
+                if changed and record.received_time_ns is not None:
+                    received_seconds = (
+                        record.received_time_ns // 1_000_000_000
+                    )
+                    touched_dates.add(
+                        received_seconds - (received_seconds % 86400)
+                    )
+
+            terminal_index = indexes[-1] if indexes else None
+            if terminal_index is not None and terminal_index < current_next:
+                if inserted:
+                    raise ForwardArchiveError(
+                        f"{family} page did not advance cursor {current_next}"
+                    )
+                next_index = current_next
+            elif terminal_index is None:
+                next_index = current_next
+            else:
+                next_index = max(current_next, terminal_index + 1)
+
+            page_first = indexes[0] if indexes else None
+            page_last = indexes[-1] if indexes else None
+            source_first = state["source_first_index"]
+            if page_first is not None:
+                source_first = (
+                    page_first
+                    if source_first is None
+                    else min(int(source_first), page_first)
+                )
+            source_last = state["source_last_index"]
+            if page_last is not None:
+                source_last = (
+                    page_last
+                    if source_last is None
+                    else max(int(source_last), page_last)
+                )
+            complete_through = state["complete_through_index"]
+            if page_last is not None:
+                complete_through = (
+                    page_last
+                    if complete_through is None
+                    else max(int(complete_through), page_last)
+                )
+            if not indexes:
+                complete_through = live_max
+
+            connection.execute(
+                """
+                INSERT INTO forward_archive_sync_state_v1 (
+                    archive_generation, index_family, next_index,
+                    source_first_index, source_last_index,
+                    complete_through_index, last_page_at, last_success_at,
+                    last_error, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                ON CONFLICT(archive_generation, index_family) DO UPDATE SET
+                    next_index = excluded.next_index,
+                    source_first_index = excluded.source_first_index,
+                    source_last_index = excluded.source_last_index,
+                    complete_through_index = excluded.complete_through_index,
+                    last_page_at = excluded.last_page_at,
+                    last_success_at = excluded.last_success_at,
+                    last_error = NULL,
+                    schema_version = excluded.schema_version
+                """,
+                (
+                    ARCHIVE_GENERATION,
+                    family,
+                    next_index,
+                    source_first,
+                    source_last,
+                    complete_through,
+                    observed,
+                    observed,
+                    ARCHIVE_SCHEMA_VERSION,
+                ),
+            )
+            connection.execute("COMMIT")
+            return PageApplyResult(
+                index_family=family,
+                inserted=inserted,
+                updated=updated,
+                unchanged=unchanged,
+                next_index=next_index,
+                touched_dates=tuple(sorted(touched_dates)),
+            )
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
