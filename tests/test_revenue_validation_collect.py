@@ -1,7 +1,118 @@
 import json
+from datetime import date
 from pathlib import Path
 
+import pytest
+
 from tools import revenue_validation_collect as mod
+
+
+def test_forward_history_command_uses_exact_closed_utc_day():
+    command = mod._forward_history_command(date(2026, 8, 12))
+
+    assert command == (
+        "-k revenue-forward-history "
+        "history_since=1786492800 history_until=1786579200 limit=5000"
+    )
+    assert "apply=" not in command
+    assert "sync" not in command
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {
+            "coverage": [],
+            "rows": [],
+            "truncated": False,
+        },
+        {
+            "archive_generation": 1,
+            "schema_version": 1,
+            "history_since": 1786492800,
+            "history_until": 1786579200,
+            "coverage": [{
+                "date_utc": 1786492800,
+                "reconciliation_status": "incomplete",
+            }],
+            "rows": [],
+            "totals": {
+                "settled_forward_count": 0,
+                "forwarded_in_msat": 0,
+                "forwarded_out_msat": 0,
+                "fee_msat": 0,
+                "sourced_forward_count": 0,
+            },
+            "truncated": False,
+            "complete": False,
+        },
+        {
+            "archive_generation": 1,
+            "schema_version": 1,
+            "history_since": 1786492800,
+            "history_until": 1786579200,
+            "coverage": [{
+                "date_utc": 1786492800,
+                "reconciliation_status": "complete",
+            }],
+            "rows": [],
+            "totals": {
+                "settled_forward_count": 0,
+                "forwarded_in_msat": 0,
+                "forwarded_out_msat": 0,
+                "fee_msat": 0,
+                "sourced_forward_count": 0,
+            },
+            "truncated": True,
+            "complete": True,
+        },
+    ],
+)
+def test_forward_history_payload_never_synthesizes_complete(payload):
+    assert (
+        mod._forward_history_payload_error(
+            payload,
+            date(2026, 8, 12),
+        )
+        is not None
+    )
+
+
+def test_forward_history_payload_accepts_complete_zero_forward_day():
+    command = mod._forward_history_command(date(2026, 8, 12))
+    payload = _valid_forward_history_payload(command)
+
+    assert (
+        mod._forward_history_payload_error(
+            payload,
+            date(2026, 8, 12),
+        )
+        is None
+    )
+
+
+def test_forward_history_payload_rejects_negative_row_amount():
+    command = mod._forward_history_command(date(2026, 8, 12))
+    payload = _valid_forward_history_payload(command)
+    payload["rows"] = [{
+        "date_utc": 1786492800,
+        "channel_id": "1x2x3",
+        "settled_forward_count": 1,
+        "forwarded_in_msat": 1000,
+        "forwarded_out_msat": 900,
+        "fee_msat": -1,
+        "sourced_forward_count": 0,
+        "sourced_volume_msat": 0,
+        "sourced_fee_msat": 0,
+    }]
+
+    error = mod._forward_history_payload_error(
+        payload,
+        date(2026, 8, 12),
+    )
+
+    assert error == "rows[0].fee_msat: expected nonnegative int"
 
 
 def test_collect_node_day_writes_expected_snapshot_files(tmp_path: Path, monkeypatch) -> None:
@@ -149,7 +260,55 @@ def test_collect_all_nodes_writes_manifest_and_trend_row(tmp_path: Path, monkeyp
     assert json.loads(trend_path.read_text(encoding="utf-8").splitlines()[0])["node"] == "lnnode"
 
 
+def _valid_forward_history_payload(command: str) -> dict:
+    values = {
+        key: int(value)
+        for key, value in (
+            token.split("=", 1)
+            for token in command.split()
+            if "=" in token
+        )
+    }
+    start = values["history_since"]
+    end = values["history_until"]
+    return {
+        "archive_generation": 1,
+        "schema_version": 1,
+        "history_since": start,
+        "history_until": end,
+        "channel_id": None,
+        "coverage": [{
+            "archive_generation": 1,
+            "date_utc": start,
+            "created_sync_complete": True,
+            "updated_sync_complete": True,
+            "aggregate_complete": True,
+            "settled_forward_count": 0,
+            "forwarded_in_msat": 0,
+            "forwarded_out_msat": 0,
+            "fee_msat": 0,
+            "sourced_forward_count": 0,
+            "reconciliation_status": "complete",
+            "reasons": [],
+            "checked_at": end * 1_000_000_000,
+            "schema_version": 1,
+        }],
+        "totals": {
+            "settled_forward_count": 0,
+            "forwarded_in_msat": 0,
+            "forwarded_out_msat": 0,
+            "fee_msat": 0,
+            "sourced_forward_count": 0,
+        },
+        "rows": [],
+        "truncated": False,
+        "complete": True,
+    }
+
+
 def _valid_payload(command: str) -> dict:
+    if command.startswith("-k revenue-forward-history "):
+        return _valid_forward_history_payload(command)
     if command == "revenue-dashboard 30":
         return {
             "financial_health": {"net_profit_sats": 100},
@@ -224,6 +383,19 @@ def _collect_with_failure(tmp_path, monkeypatch, failed_command: str, payload=No
         tmp_path,
         "2026-04-23",
     )
+
+
+def test_collector_marks_missing_forward_history_incomplete(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    command = mod._forward_history_command(date(2026, 4, 23))
+    result = _collect_with_failure(tmp_path, monkeypatch, command)
+
+    error = result["errors"]["revenue-forward-history.json"]
+    assert error["role"] == mod.REQUIRED_FOR_ECONOMIC_METRICS
+    assert result["status"] == "incomplete"
+    assert not (tmp_path / "revenue-forward-history.json").exists()
 
 
 def test_optional_diagnostic_failure_is_collection_warning(tmp_path: Path, monkeypatch) -> None:

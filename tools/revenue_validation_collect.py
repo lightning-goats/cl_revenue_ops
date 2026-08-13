@@ -183,6 +183,20 @@ def _reconciliation_command(run_day: date) -> str:
     )
 
 
+def _forward_history_command(run_day: date) -> str:
+    start = datetime.combine(
+        run_day,
+        datetime.min.time(),
+        tzinfo=timezone.utc,
+    )
+    since = int(start.timestamp())
+    until = int((start + timedelta(days=1)).timestamp())
+    return (
+        "-k revenue-forward-history "
+        f"history_since={since} history_until={until} limit=5000"
+    )
+
+
 def _parse_t0(timestamp: str) -> datetime:
     normalized = timestamp.replace("Z", "+00:00")
     parsed = datetime.fromisoformat(normalized)
@@ -363,6 +377,115 @@ def _payload_error(
     return None
 
 
+def _forward_history_payload_error(
+    payload: Any,
+    run_day: date,
+) -> str | None:
+    required_paths = (
+        ("archive_generation",),
+        ("schema_version",),
+        ("history_since",),
+        ("history_until",),
+        ("coverage",),
+        ("rows",),
+        ("totals",),
+        ("truncated",),
+        ("complete",),
+    )
+    required_types = (
+        (("archive_generation",), int),
+        (("schema_version",), int),
+        (("history_since",), int),
+        (("history_until",), int),
+        (("coverage",), list),
+        (("rows",), list),
+        (("totals",), Mapping),
+        (("truncated",), bool),
+        (("complete",), bool),
+    )
+    error = _payload_error(payload, required_paths, required_types)
+    if error is not None:
+        return error
+
+    start = datetime.combine(
+        run_day,
+        datetime.min.time(),
+        tzinfo=timezone.utc,
+    )
+    expected_since = int(start.timestamp())
+    expected_until = int((start + timedelta(days=1)).timestamp())
+    if payload["history_since"] != expected_since:
+        return "history_since does not match requested UTC day"
+    if payload["history_until"] != expected_until:
+        return "history_until does not match requested UTC day"
+    if payload["archive_generation"] <= 0 or payload["schema_version"] <= 0:
+        return "archive generation and schema version must be positive"
+    if payload["truncated"] is not False:
+        return "forward history is truncated"
+    if payload["complete"] is not True:
+        return "forward history is incomplete"
+
+    coverage = payload["coverage"]
+    if len(coverage) != 1 or not isinstance(coverage[0], Mapping):
+        return "expected exactly one forward coverage row"
+    coverage_row = coverage[0]
+    if coverage_row.get("date_utc") != expected_since:
+        return "forward coverage date does not match requested UTC day"
+    if coverage_row.get("reconciliation_status") != "complete":
+        return "forward coverage reconciliation is incomplete"
+    for key in (
+        "created_sync_complete",
+        "updated_sync_complete",
+        "aggregate_complete",
+    ):
+        if coverage_row.get(key) is not True:
+            return f"forward coverage {key} is not true"
+
+    total_fields = (
+        "settled_forward_count",
+        "forwarded_in_msat",
+        "forwarded_out_msat",
+        "fee_msat",
+        "sourced_forward_count",
+    )
+    totals = payload["totals"]
+    for field in total_fields:
+        value = totals.get(field)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            return f"totals.{field}: expected nonnegative int"
+
+    row_amount_fields = (
+        "settled_forward_count",
+        "forwarded_in_msat",
+        "forwarded_out_msat",
+        "fee_msat",
+        "sourced_forward_count",
+        "sourced_volume_msat",
+        "sourced_fee_msat",
+    )
+    for index, row in enumerate(payload["rows"]):
+        prefix = f"rows[{index}]"
+        if not isinstance(row, Mapping):
+            return f"{prefix}: expected object"
+        if row.get("date_utc") != expected_since:
+            return f"{prefix}.date_utc: expected requested UTC day"
+        if not isinstance(row.get("channel_id"), str):
+            return f"{prefix}.channel_id: expected string"
+        for field in row_amount_fields:
+            value = row.get(field)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                return f"{prefix}.{field}: expected nonnegative int"
+    return None
+
+
 def _list_record_error(filename: str, payload: Mapping[str, Any]) -> str | None:
     list_key = {
         "listforwards.json": "forwards",
@@ -460,6 +583,39 @@ def collect_node_day(
             continue
         snapshots[spec.filename] = result.stdout_json
         common.write_json(out_dir / spec.filename, result.stdout_json)
+
+    forward_history_command = _forward_history_command(run_day)
+    forward_history_result = run_json_rpc(
+        node_cfg,
+        forward_history_command,
+    )
+    forward_history_error = (
+        None
+        if not forward_history_result.ok
+        else _forward_history_payload_error(
+            forward_history_result.stdout_json,
+            run_day,
+        )
+    )
+    if not forward_history_result.ok or forward_history_error:
+        errors["revenue-forward-history.json"] = {
+            "command": forward_history_command,
+            "role": REQUIRED_FOR_ECONOMIC_METRICS,
+            "stderr": (
+                forward_history_result.stderr
+                if not forward_history_result.ok
+                else forward_history_error
+            ),
+            "returncode": forward_history_result.returncode,
+        }
+    else:
+        snapshots["revenue-forward-history.json"] = (
+            forward_history_result.stdout_json
+        )
+        common.write_json(
+            out_dir / "revenue-forward-history.json",
+            forward_history_result.stdout_json,
+        )
 
     reconciliation_command = _reconciliation_command(run_day)
     reconciliation_result = run_json_rpc(node_cfg, reconciliation_command)

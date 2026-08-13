@@ -316,6 +316,35 @@ def test_incomplete_collection_remains_fail_closed() -> None:
     assert result["highest_severity"] == "red"
 
 
+def test_missing_forward_history_is_unknown_not_green_zero() -> None:
+    result = mod.evaluate_node_day(
+        node_name="lnnode",
+        node_cfg={"t0": "2026-04-23T00:00:00Z"},
+        day_dir="unused",
+        manifest_status={
+            "status": "incomplete",
+            "errors": {
+                "revenue-forward-history.json": {
+                    "role": "required_for_economic_metrics",
+                    "stderr": "coverage incomplete",
+                }
+            },
+        },
+        thresholds={},
+        run_date="2026-04-24",
+    )
+
+    assert result["status"] == "collection_failed"
+    assert result["highest_severity"] == "red"
+    assert [finding["rule"] for finding in result["findings"]] == [
+        "collection_failure"
+    ]
+    assert not any(
+        finding["rule"] == "revenue_drop"
+        for finding in result["findings"]
+    )
+
+
 def test_explicit_evaluation_rejects_manifest_from_other_identity(tmp_path: Path) -> None:
     (tmp_path / "manifests").mkdir()
     (tmp_path / "manifests" / "2026-08-13.json").write_text(
