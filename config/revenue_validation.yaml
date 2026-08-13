@@ -7,8 +7,14 @@ paths:
 nodes:
   # Single production node since 2026-07-11 (hive-nexus-02 retired).
   lnnode:
-    # Inferred from the first observed plugin initialization after 2026-04-23 deploy activity.
-    t0: "2026-04-23T16:31:01Z"
+    # Measurement preflight identity only. The formal successor window is inactive
+    # until every activation precondition in production-validation-spec-v2.md is met.
+    evaluation:
+      id: optimization-phase0-measurement-preflight-v1
+      version: 1
+      state: preflight
+      formal_window_active: false
+      t0: "2026-08-13T00:00:00Z"
     transport: ["ssh", "lnnode"]
     lightning_cli_prefix: "lightning-cli --lightning-dir=/data/lightningd"
     log_extract_command: "grep -aE 'FEE:|REBALANCE_FLOOR|competition_aware|INITIAL_FEE|Hive member|Traceback|TypeError|AttributeError|KeyError|Error|plugin-cl-revenue-ops.py|cl-revenue-ops.py|estimated_closure_cost|_estimate_close_cost|coordination_reserved_slots|rebalance_coordination|undercut explore' /data/lightningd/cln.log | tail -100000"

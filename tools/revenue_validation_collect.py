@@ -255,11 +255,16 @@ def build_trend_record(
     revenue_status: Mapping[str, Any],
 ) -> dict[str, Any]:
     controls = _nested_value(revenue_status, "operator_controls", "values") or {}
+    evaluation = common.evaluation_identity(node_cfg)
     return {
+        "evaluation_id": evaluation["id"],
+        "evaluation_version": evaluation["version"],
+        "evaluation_state": evaluation["state"],
+        "formal_window_active": evaluation["formal_window_active"],
         "date": str(run_date),
         "node": node_name,
-        "t0": node_cfg["t0"],
-        "days_since_t0": _days_since_t0(run_date, node_cfg["t0"]),
+        "t0": evaluation["t0"],
+        "days_since_t0": _days_since_t0(run_date, evaluation["t0"]),
         "gross_revenue_sats_30d": _extract_first(
             dashboard,
             [
@@ -428,6 +433,7 @@ def collect_node_day(
     run_date: str | date,
 ) -> dict[str, Any]:
     run_day = _parse_run_date(run_date)
+    evaluation = common.evaluation_identity(node_cfg)
     out_dir = Path(day_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -529,6 +535,7 @@ def collect_node_day(
 
     return {
         "status": _manifest_status(errors),
+        "evaluation": evaluation,
         "errors": errors,
         "trend_record": trend_record,
     }
@@ -580,6 +587,7 @@ def collect_all_nodes(config: Mapping[str, Any], run_date: str | date) -> dict[s
                 }
         manifest["nodes"][node_name] = {
             "status": result["status"],
+            "evaluation": result.get("evaluation"),
             "errors": result.get("errors", {}),
         }
 

@@ -16,8 +16,10 @@ shadow, measured evaluation, and explicit activation.
 **Phase 0 — measurement and evidence integrity.** The current implementation
 increment runs reconciliation independently once per UTC-hour slot, persists
 every run lifecycle, exposes indexed and bounded history, and classifies daily
-collection failures by evidence role. Optional diagnostic loss is a warning;
-required evidence loss remains fail closed. Economic behavior is unchanged.
+collection failures by evidence role. The current measurement preflight also
+has an explicit versioned identity, isolated from historical trend rows.
+Optional diagnostic loss is a warning; required evidence loss remains fail
+closed. Economic behavior is unchanged.
 
 Live algorithm changes remain blocked until the Phase 0 production gate proves
 at least 72 consecutive hours of reconstructable completeness from durable
@@ -55,6 +57,7 @@ See [validation/baseline.md](validation/baseline.md) and the historical
 | 0. Measurement integrity | implementation | active work | `findings/phase0-measurement-hardening.md` |
 | 0.3 Daily collector repair | implementation | shadow evidence | [phase0-daily-collector.md](findings/phase0-daily-collector.md) |
 | 0.4 Validator failure semantics | implementation | shadow evidence | [phase0-validator-failure-semantics.md](findings/phase0-validator-failure-semantics.md) |
+| 0.5 Versioned evaluation identity | implementation | preflight only | [phase0-evaluation-identity.md](findings/phase0-evaluation-identity.md) |
 | 0B. Refactor closure | queued | inactive | future finding |
 | 1. Deterministic replay and traces | blocked by Phase 0 | inactive | future finding |
 | 2. Route-liquidity evidence | blocked by Phase 1 | inactive | future finding |

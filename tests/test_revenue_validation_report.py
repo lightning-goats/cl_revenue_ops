@@ -203,3 +203,142 @@ def test_t28_missing_profit_is_investigate_not_ship() -> None:
     )
 
     assert decision == "investigate"
+
+
+def test_latest_trend_rows_do_not_reinterpret_legacy_identity(tmp_path: Path) -> None:
+    trends = tmp_path / "trends"
+    trends.mkdir()
+    (trends / "lnnode.jsonl").write_text(
+        "\n".join([
+            json.dumps({
+                "date": "2026-08-14", "node": "lnnode",
+                "t0": "2026-04-23T16:31:01Z", "days_since_t0": 111,
+                "net_profit_sats_30d": 999,
+            }),
+            json.dumps({
+                "date": "2026-08-13", "node": "lnnode",
+                "evaluation_id": "optimization-phase0-measurement-preflight-v1",
+                "evaluation_version": 1,
+                "t0": "2026-08-13T00:00:00Z", "days_since_t0": 0,
+                "net_profit_sats_30d": 100,
+            }),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    nodes = {
+        "lnnode": {
+            "evaluation": {
+                "id": "optimization-phase0-measurement-preflight-v1",
+                "version": 1,
+                "state": "preflight",
+                "formal_window_active": False,
+                "t0": "2026-08-13T00:00:00Z",
+            }
+        }
+    }
+
+    rows = mod._latest_trend_rows(tmp_path, nodes, "2026-08-14")
+
+    assert rows["lnnode"]["net_profit_sats_30d"] == 100
+    assert rows["lnnode"]["days_since_t0"] == 0
+
+
+def test_explicit_evaluation_gets_identity_scoped_report_name() -> None:
+    config = {
+        "nodes": {"lnnode": {"evaluation": {
+            "id": "optimization-phase0-measurement-preflight-v1",
+            "version": 1,
+            "state": "preflight",
+            "formal_window_active": False,
+            "t0": "2026-08-13T00:00:00Z",
+        }}}
+    }
+
+    assert mod._evaluation_report_slug(config) == (
+        "optimization-phase0-measurement-preflight-v1-v1"
+    )
+
+
+def test_watch_history_rejects_mismatched_explicit_identity(tmp_path: Path) -> None:
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    (watch_dir / "2026-08-13.json").write_text(
+        json.dumps({
+            "date": "2026-08-13",
+            "nodes": {"lnnode": {
+                "evaluation": {
+                    "id": "old-evaluation", "version": 1,
+                    "state": "closed", "formal_window_active": False,
+                    "t0": "2026-07-13T00:00:00Z",
+                },
+                "highest_severity": "red",
+                "findings": [{"rule": "old_evaluation_red", "severity": "red"}],
+            }},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    expected = {
+        "id": "new-evaluation", "version": 1,
+        "state": "active", "formal_window_active": True,
+        "t0": "2026-08-13T00:00:00Z",
+    }
+
+    history = mod._watch_history(
+        tmp_path, "lnnode", mod.date(2026, 8, 13), mod.date(2026, 8, 13),
+        expected,
+    )
+
+    assert history[0]["highest_severity"] == "red"
+    assert history[0]["findings"][0]["rule"] == "evaluation_identity"
+    assert "old_evaluation_red" not in json.dumps(history)
+
+
+def test_watch_history_fails_closed_when_explicit_identity_is_missing(tmp_path: Path) -> None:
+    expected = {
+        "id": "new-evaluation", "version": 1,
+        "state": "active", "formal_window_active": True,
+        "t0": "2026-08-13T00:00:00Z",
+    }
+
+    history = mod._watch_history(
+        tmp_path, "lnnode", mod.date(2026, 8, 13), mod.date(2026, 8, 13),
+        expected,
+    )
+
+    assert history[0]["highest_severity"] == "red"
+    assert history[0]["findings"][0]["rule"] == "evaluation_identity"
+
+
+def test_preflight_identity_cannot_generate_formal_checkpoint_report(tmp_path: Path) -> None:
+    results_root = tmp_path / "results"
+    reports_root = tmp_path / "reports"
+    trends = results_root / "trends"
+    trends.mkdir(parents=True)
+    evaluation = {
+        "id": "optimization-phase0-measurement-preflight-v1",
+        "version": 1,
+        "state": "preflight",
+        "formal_window_active": False,
+        "t0": "2026-08-13T00:00:00Z",
+    }
+    (trends / "lnnode.jsonl").write_text(
+        json.dumps({
+            "date": "2026-09-10", "node": "lnnode",
+            "evaluation_id": evaluation["id"], "evaluation_version": 1,
+            "t0": evaluation["t0"], "days_since_t0": 28,
+            "net_profit_sats_30d": 100,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    config = {
+        "paths": {
+            "results_root": str(results_root),
+            "reports_root": str(reports_root),
+        },
+        "nodes": {"lnnode": {"evaluation": evaluation}},
+    }
+
+    generated = mod.generate_checkpoint_reports(config, "2026-09-10")
+
+    assert generated == []
+    assert list(reports_root.glob("*.md")) == []

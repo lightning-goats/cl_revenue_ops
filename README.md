@@ -157,9 +157,9 @@ lightning-cli plugin start ~/.lightning/plugins/cl_revenue_ops/cl-revenue-ops.py
 
 ## Production Validation Automation
 
-This repo includes a read-only daily validation pipeline for tracking the production effect of recent fee, capex, and rebalance changes on `lnnode` (single production node since 2026-07-11). It also feeds the running production economic evaluation (`docs/refactor/phase0/production-evaluation-spec.md`, window ending 2026-08-12).
+This repo includes a read-only daily validation pipeline for tracking the production effect of fee, capex, and rebalance behavior on `lnnode` (single production node since 2026-07-11). It preserved evidence for the closed refactor evaluation (`docs/refactor/phase0/production-evaluation-final.md`) and now supports the optimization measurement preflight.
 
-- Edit `config/revenue_validation.yaml` and replace each node `t0` placeholder with the actual deploy timestamp before enabling the timer.
+- Before enabling a formal validation window, set each node's `evaluation.id`, `evaluation.version`, `evaluation.state`, `evaluation.formal_window_active`, and `evaluation.t0`; preflight identities must keep the formal-window flag false.
 - The timer runs once per day at `06:00` in the control host's local timezone. The intended host timezone for this workflow is `America/Denver`.
 - The pipeline is read-only by design: it collects evidence, evaluates red/yellow rollout-watch checks, and refreshes draft T+14/T+28 reports.
 

@@ -314,3 +314,45 @@ def test_incomplete_collection_remains_fail_closed() -> None:
 
     assert result["status"] == "collection_failed"
     assert result["highest_severity"] == "red"
+
+
+def test_explicit_evaluation_rejects_manifest_from_other_identity(tmp_path: Path) -> None:
+    (tmp_path / "manifests").mkdir()
+    (tmp_path / "manifests" / "2026-08-13.json").write_text(
+        json.dumps({
+            "nodes": {
+                "lnnode": {
+                    "status": "complete",
+                    "evaluation": {
+                        "id": "old-evaluation", "version": 1,
+                        "state": "closed", "formal_window_active": False,
+                        "t0": "2026-07-13T00:00:00Z",
+                    },
+                    "errors": {},
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    config = {
+        "paths": {"results_root": str(tmp_path)},
+        "thresholds": {"rollback": {
+            "plugin_restart_limit_24h": 3,
+            "revenue_drop_pct": 25,
+            "rebalance_success_floor_pct": 50,
+        }},
+        "nodes": {"lnnode": {"evaluation": {
+            "id": "optimization-phase0-measurement-preflight-v1",
+            "version": 1,
+            "state": "preflight",
+            "formal_window_active": False,
+            "t0": "2026-08-13T00:00:00Z",
+        }}},
+    }
+
+    result = mod.evaluate_all_nodes(config, run_date="2026-08-13")
+
+    node = result["nodes"]["lnnode"]
+    assert node["status"] == "collection_failed"
+    assert node["highest_severity"] == "red"
+    assert "evaluation identity mismatch" in node["findings"][0]["message"]

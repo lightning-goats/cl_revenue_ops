@@ -78,3 +78,68 @@ def test_run_result_records_command_status() -> None:
     assert result.command[0] == "ssh"
     assert result.ok is False
     assert result.returncode == 1
+
+
+def test_evaluation_identity_is_explicit_and_versioned() -> None:
+    node = {
+        "evaluation": {
+            "id": "optimization-phase0-measurement-preflight-v1",
+            "version": 1,
+            "state": "preflight",
+            "formal_window_active": False,
+            "t0": "2026-08-13T00:00:00Z",
+        }
+    }
+
+    identity = mod.evaluation_identity(node)
+
+    assert identity["id"] == "optimization-phase0-measurement-preflight-v1"
+    assert identity["version"] == 1
+    assert identity["t0"] == "2026-08-13T00:00:00Z"
+    assert identity["formal_window_active"] is False
+
+
+def test_evaluation_identity_rejects_naive_or_unversioned_new_identity() -> None:
+    for evaluation in (
+        {"id": "new", "state": "preflight", "formal_window_active": False, "t0": "2026-08-13T00:00:00Z"},
+        {"id": "new", "version": 1, "state": "preflight", "formal_window_active": False, "t0": "2026-08-13T00:00:00"},
+    ):
+        try:
+            mod.evaluation_identity({"evaluation": evaluation})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid evaluation identity must fail closed")
+
+
+def test_evaluation_identity_rejects_noncanonical_ids() -> None:
+    for evaluation_id in ("alpha/beta", "alpha?beta", " alpha"):
+        try:
+            mod.evaluation_identity({
+                "evaluation": {
+                    "id": evaluation_id,
+                    "version": 1,
+                    "state": "preflight",
+                    "formal_window_active": False,
+                    "t0": "2026-08-13T00:00:00Z",
+                }
+            })
+        except ValueError as exc:
+            assert "filename-safe" in str(exc)
+        else:
+            raise AssertionError("noncanonical evaluation id must fail closed")
+
+
+def test_repository_validation_config_uses_current_nonformal_preflight_identity() -> None:
+    config = mod.load_config("config/revenue_validation.yaml")
+
+    identity = mod.evaluation_identity(config["nodes"]["lnnode"])
+
+    assert identity == {
+        "id": "optimization-phase0-measurement-preflight-v1",
+        "version": 1,
+        "state": "preflight",
+        "formal_window_active": False,
+        "t0": "2026-08-13T00:00:00Z",
+    }
+    assert identity["t0"] != "2026-04-23T16:31:01Z"

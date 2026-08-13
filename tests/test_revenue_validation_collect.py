@@ -352,3 +352,41 @@ def test_rebalance_pay_missing_fee_evidence_is_incomplete(tmp_path: Path, monkey
 
     assert result["status"] == "incomplete"
     assert "fee evidence" in result["errors"]["listpays.json"]["stderr"]
+
+
+def test_trend_and_manifest_preserve_versioned_evaluation_identity(tmp_path: Path, monkeypatch) -> None:
+    evaluation = {
+        "id": "optimization-phase0-measurement-preflight-v1",
+        "version": 1,
+        "state": "preflight",
+        "formal_window_active": False,
+        "t0": "2026-08-13T00:00:00Z",
+    }
+
+    def fake_run_json_rpc(node_cfg, command):
+        return mod.CommandResult(True, _valid_payload(command), "", 0)
+
+    monkeypatch.setattr(mod, "run_json_rpc", fake_run_json_rpc)
+    monkeypatch.setattr(
+        mod,
+        "run_text_command",
+        lambda node_cfg, command: mod.common.RunResult([], True, "log", "", 0),
+    )
+    config = {
+        "paths": {"results_root": str(tmp_path)},
+        "nodes": {
+            "lnnode": {
+                "evaluation": evaluation,
+                "lightning_cli_prefix": "lightning-cli",
+                "log_extract_command": "read-only-log-query",
+            }
+        },
+    }
+
+    manifest = mod.collect_all_nodes(config, run_date="2026-08-13")
+    trend = json.loads((tmp_path / "trends" / "lnnode.jsonl").read_text())
+
+    assert manifest["nodes"]["lnnode"]["evaluation"] == evaluation
+    assert trend["evaluation_id"] == evaluation["id"]
+    assert trend["evaluation_version"] == 1
+    assert trend["t0"] == "2026-08-13T00:00:00Z"

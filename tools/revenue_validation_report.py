@@ -72,24 +72,55 @@ def _render_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join([header_row, divider, body])
 
 
-def _latest_trend_rows(results_root: str | Path, node_names: Iterable[str], run_date: str | date) -> dict[str, dict[str, Any]]:
+def _latest_trend_rows(
+    results_root: str | Path,
+    nodes: Mapping[str, Mapping[str, Any]],
+    run_date: str | date,
+) -> dict[str, dict[str, Any]]:
     target_date = str(run_date)
     latest: dict[str, dict[str, Any]] = {}
-    for node_name in node_names:
+    for node_name, node_cfg in nodes.items():
+        identity = common.evaluation_identity(node_cfg)
         rows = _read_jsonl(Path(results_root) / "trends" / f"{node_name}.jsonl")
-        filtered = [row for row in rows if str(row.get("date")) <= target_date]
+        filtered = [
+            row for row in rows
+            if str(row.get("date")) <= target_date
+            and row.get("evaluation_id") == identity["id"]
+            and row.get("evaluation_version") == identity["version"]
+        ]
         if filtered:
             latest[node_name] = filtered[-1]
     return latest
 
 
-def _watch_day_node(results_root: str | Path, run_date: str | date, node_name: str) -> dict[str, Any]:
+def _watch_day_node(
+    results_root: str | Path,
+    run_date: str | date,
+    node_name: str,
+    expected_evaluation: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     payload = _read_json(Path(results_root) / "watch" / f"{run_date}.json")
     nodes = payload.get("nodes")
-    if not isinstance(nodes, Mapping):
-        return {}
-    node_payload = nodes.get(node_name)
-    return node_payload if isinstance(node_payload, Mapping) else {}
+    node_payload = nodes.get(node_name) if isinstance(nodes, Mapping) else None
+    observed = node_payload if isinstance(node_payload, Mapping) else {}
+    if (
+        expected_evaluation is not None
+        and expected_evaluation.get("id") is not None
+        and observed.get("evaluation") != expected_evaluation
+    ):
+        return {
+            "status": "collection_failed",
+            "evaluation": dict(expected_evaluation),
+            "highest_severity": "red",
+            "findings": [{
+                "rule": "evaluation_identity",
+                "severity": "red",
+                "message": "watch evidence evaluation identity is missing or mismatched",
+                "expected": dict(expected_evaluation),
+                "observed": observed.get("evaluation"),
+            }],
+        }
+    return dict(observed)
 
 
 def _date_strings(start_date: date, end_date: date) -> list[str]:
@@ -143,10 +174,18 @@ def _activation_summary(results_root: str | Path, node_name: str, start_date: da
     return counts
 
 
-def _watch_history(results_root: str | Path, node_name: str, start_date: date, end_date: date) -> list[dict[str, Any]]:
+def _watch_history(
+    results_root: str | Path,
+    node_name: str,
+    start_date: date,
+    end_date: date,
+    expected_evaluation: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     history = []
     for day in _date_strings(start_date, end_date):
-        node_payload = _watch_day_node(results_root, day, node_name)
+        node_payload = _watch_day_node(
+            results_root, day, node_name, expected_evaluation
+        )
         if node_payload:
             history.append({"date": day, **node_payload})
     return history
@@ -236,8 +275,48 @@ def _due_for_checkpoint(latest_rows: Mapping[str, Mapping[str, Any]], checkpoint
     return any(int(row.get("days_since_t0", -1)) >= checkpoint_days for row in latest_rows.values())
 
 
-def _report_exists(reports_root: str | Path, checkpoint_label: str) -> bool:
-    return any(Path(reports_root).glob(f"*-production-{checkpoint_label}-findings.md"))
+def _formal_checkpoint_reporting_enabled(config: Mapping[str, Any]) -> bool:
+    identities = [
+        common.evaluation_identity(node_cfg)
+        for node_cfg in config["nodes"].values()
+    ]
+    if all(identity["id"] is None for identity in identities):
+        return True
+    return bool(identities) and all(
+        identity["id"] is not None
+        and identity["state"] == "active"
+        and identity["formal_window_active"] is True
+        for identity in identities
+    )
+
+
+def _evaluation_report_slug(config: Mapping[str, Any]) -> str | None:
+    identities = [
+        common.evaluation_identity(node_cfg)
+        for node_cfg in config["nodes"].values()
+    ]
+    explicit = {
+        (identity["id"], identity["version"])
+        for identity in identities if identity["id"] is not None
+    }
+    if not explicit:
+        return None
+    if len(explicit) != 1 or len(explicit) != len({
+        (identity["id"], identity["version"]) for identity in identities
+    }):
+        raise ValueError("all nodes must share one explicit evaluation identity")
+    evaluation_id, version = next(iter(explicit))
+    return f"{evaluation_id}-v{version}"
+
+
+def _report_exists(
+    reports_root: str | Path, checkpoint_label: str, evaluation_slug: str | None,
+) -> bool:
+    if evaluation_slug is None:
+        pattern = f"*-production-{checkpoint_label}-findings.md"
+    else:
+        pattern = f"*-{evaluation_slug}-production-{checkpoint_label}-findings.md"
+    return any(Path(reports_root).glob(pattern))
 
 
 def _t14_recommendation(history: list[dict[str, Any]]) -> str:
@@ -290,10 +369,15 @@ def _render_t14_report(
 
     for node_name, node_cfg in config["nodes"].items():
         latest = latest_rows.get(node_name, {})
-        t0_date = _parse_timestamp(node_cfg["t0"]).date()
+        t0_date = _parse_timestamp(common.evaluation_t0(node_cfg)).date()
         window_end = min(run_day, t0_date + timedelta(days=14))
-        history = _watch_history(results_root, node_name, t0_date, window_end)
-        latest_watch = _watch_day_node(results_root, run_date, node_name)
+        identity = common.evaluation_identity(node_cfg)
+        history = _watch_history(
+            results_root, node_name, t0_date, window_end, identity
+        )
+        latest_watch = _watch_day_node(
+            results_root, run_date, node_name, identity
+        )
         rebalance = _find_rule(latest_watch.get("findings", []), "rebalance_success_rate") or {}
         rows.append(
             [
@@ -333,10 +417,16 @@ def _render_t14_report(
         elif node_recommendation != "continue" and recommendation == "continue":
             recommendation = node_recommendation
 
-    deploy_lines = [
-        f"- `{node_name}`: T0 `{node_cfg['t0']}`, checkpoint state `{watch.checkpoint_state(node_cfg['t0'], run_date)}`."
-        for node_name, node_cfg in config["nodes"].items()
-    ]
+    deploy_lines = []
+    for node_name, node_cfg in config["nodes"].items():
+        identity = common.evaluation_identity(node_cfg)
+        deploy_lines.append(
+            f"- `{node_name}`: evaluation `{identity['id']}` "
+            f"v{identity['version']} state `{identity['state']}`, "
+            f"formal window `{identity['formal_window_active']}`, "
+            f"T0 `{identity['t0']}`, checkpoint state "
+            f"`{watch.checkpoint_state(identity['t0'], run_date)}`."
+        )
 
     return "\n".join(
         [
@@ -398,7 +488,7 @@ def _render_t28_report(
 
     for node_name, node_cfg in config["nodes"].items():
         latest = latest_rows.get(node_name, {})
-        t0_dt = _parse_timestamp(node_cfg["t0"])
+        t0_dt = _parse_timestamp(common.evaluation_t0(node_cfg))
         checkpoint_end = min(
             datetime.combine(run_day, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1),
             t0_dt + timedelta(days=28),
@@ -413,9 +503,15 @@ def _render_t28_report(
         post_fees = _window_fee_sats(listforwards, post_start, checkpoint_end)
         post_rebalance_cost = _window_rebalance_cost_sats(listpays, post_start, checkpoint_end)
 
-        history = _watch_history(results_root, node_name, t0_dt.date(), checkpoint_end.date())
+        identity = common.evaluation_identity(node_cfg)
+        history = _watch_history(
+            results_root, node_name, t0_dt.date(), checkpoint_end.date(),
+            identity,
+        )
         histories[node_name] = history
-        latest_watch = _watch_day_node(results_root, run_date, node_name)
+        latest_watch = _watch_day_node(
+            results_root, run_date, node_name, identity
+        )
         comparison_rows.append(
             [
                 node_name,
@@ -502,20 +598,33 @@ def generate_checkpoint_reports(config: Mapping[str, Any], run_date: str | date)
     results_root = Path(config["paths"]["results_root"])
     reports_root = Path(config["paths"]["reports_root"])
     reports_root.mkdir(parents=True, exist_ok=True)
+    if not _formal_checkpoint_reporting_enabled(config):
+        return []
 
-    latest_rows = _latest_trend_rows(results_root, config["nodes"].keys(), run_date)
+    latest_rows = _latest_trend_rows(results_root, config["nodes"], run_date)
+    evaluation_slug = _evaluation_report_slug(config)
     generated: list[Path] = []
 
-    if _due_for_checkpoint(latest_rows, 14) and not _report_exists(reports_root, "t14"):
-        t14_path = reports_root / f"{run_date}-production-t14-findings.md"
+    if _due_for_checkpoint(latest_rows, 14) and not _report_exists(
+        reports_root, "t14", evaluation_slug
+    ):
+        identity_part = f"{evaluation_slug}-" if evaluation_slug else ""
+        t14_path = reports_root / (
+            f"{run_date}-{identity_part}production-t14-findings.md"
+        )
         t14_path.write_text(
             _render_t14_report(run_date, results_root, config, latest_rows),
             encoding="utf-8",
         )
         generated.append(t14_path)
 
-    if _due_for_checkpoint(latest_rows, 28) and not _report_exists(reports_root, "t28"):
-        t28_path = reports_root / f"{run_date}-production-t28-findings.md"
+    if _due_for_checkpoint(latest_rows, 28) and not _report_exists(
+        reports_root, "t28", evaluation_slug
+    ):
+        identity_part = f"{evaluation_slug}-" if evaluation_slug else ""
+        t28_path = reports_root / (
+            f"{run_date}-{identity_part}production-t28-findings.md"
+        )
         t28_path.write_text(
             _render_t28_report(run_date, results_root, config, latest_rows),
             encoding="utf-8",

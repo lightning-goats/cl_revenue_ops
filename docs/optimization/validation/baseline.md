@@ -69,8 +69,14 @@ inventory, caveats, and channel-level analysis.
 
 ## Successor baseline state
 
-No successor validation window is active. Before one can start, an operator
-must commit an activation record to this file containing:
+No successor validation window is active. The configured
+`optimization-phase0-measurement-preflight-v1` identity begins at
+`2026-08-13 00:00:00 UTC`, has state `preflight`, and explicitly sets
+`formal_window_active=false`. It identifies measurement-hardening evidence only;
+it is not a successor-window activation record.
+
+Before a successor window can start, an operator must commit an activation
+record to this file containing:
 
 - evaluation identity;
 - exact inclusive UTC start and end rules;

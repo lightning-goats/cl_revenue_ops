@@ -389,6 +389,7 @@ def evaluate_node_day(
     run_date: str | date,
 ) -> dict[str, Any]:
     manifest_collection_status = manifest_status.get("status")
+    evaluation = common.evaluation_identity(node_cfg)
     if manifest_collection_status not in {"ok", "complete", "collection_warning"}:
         findings = [
             {
@@ -399,7 +400,8 @@ def evaluate_node_day(
         ]
         return {
             "status": "collection_failed",
-            "checkpoint_state": checkpoint_state(node_cfg["t0"], run_date),
+            "evaluation": evaluation,
+            "checkpoint_state": checkpoint_state(common.evaluation_t0(node_cfg), run_date),
             "highest_severity": "red",
             "findings": findings,
         }
@@ -416,7 +418,7 @@ def evaluate_node_day(
     daily_log_lines = _daily_log_lines(log_lines, run_date)
 
     restart_finding = check_plugin_restart_count(daily_log_lines, int(thresholds["plugin_restart_limit_24h"]))
-    if _parse_run_date(run_date) == _parse_timestamp(node_cfg["t0"]).date():
+    if _parse_run_date(run_date) == _parse_timestamp(common.evaluation_t0(node_cfg)).date():
         restart_finding["severity"] = "green"
         restart_finding["message"] = "deploy-day restart check suppressed on T0"
 
@@ -425,7 +427,7 @@ def evaluate_node_day(
         check_zero_ppm_non_hive(peerchannels, hive_members),
         check_ceiling_pricing(peerchannels, hive_members, revenue_config),
         check_rebalance_success_rate(listpays, run_date, int(thresholds["rebalance_success_floor_pct"])),
-        check_revenue_drop(listforwards, node_cfg["t0"], run_date, int(thresholds["revenue_drop_pct"])),
+        check_revenue_drop(listforwards, common.evaluation_t0(node_cfg), run_date, int(thresholds["revenue_drop_pct"])),
         check_traceback_volume(daily_log_lines),
         check_rebalance_floor_volume(daily_log_lines),
         check_competition_aware_oscillation(daily_log_lines),
@@ -433,7 +435,8 @@ def evaluate_node_day(
 
     return {
         "status": "ok",
-        "checkpoint_state": checkpoint_state(node_cfg["t0"], run_date),
+        "evaluation": evaluation,
+        "checkpoint_state": checkpoint_state(common.evaluation_t0(node_cfg), run_date),
         "highest_severity": _severity_max(findings),
         "findings": findings,
     }
@@ -452,7 +455,25 @@ def evaluate_all_nodes(config: Mapping[str, Any], run_date: str | date) -> dict[
     }
 
     for node_name, node_cfg in config["nodes"].items():
-        node_manifest = (manifest.get("nodes") or {}).get(node_name, {"status": "missing"})
+        node_manifest = (manifest.get("nodes") or {}).get(
+            node_name, {"status": "missing"}
+        )
+        expected_evaluation = common.evaluation_identity(node_cfg)
+        if (
+            expected_evaluation["id"] is not None
+            and node_manifest.get("evaluation") != expected_evaluation
+        ):
+            node_manifest = {
+                "status": "incomplete",
+                "errors": {
+                    "evaluation": {
+                        "role": "required_for_completeness",
+                        "stderr": "evaluation identity mismatch",
+                        "expected": expected_evaluation,
+                        "observed": node_manifest.get("evaluation"),
+                    }
+                },
+            }
         node_result = evaluate_node_day(
             node_name=node_name,
             node_cfg=node_cfg,
