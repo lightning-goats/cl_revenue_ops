@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 from pathlib import Path
 from types import SimpleNamespace
 from modules.config import Config
@@ -178,6 +178,7 @@ def _run_init_with_stubbed_dependencies(
         options.update(option_overrides)
 
     fake_db = MagicMock()
+    fake_db.forward_archive = MagicMock()
     fake_db.initialize.return_value = None
     fake_db.cleanup_stale_reservations.return_value = 0
     fake_db.get_latest_forward_timestamp.return_value = None
@@ -201,11 +202,15 @@ def _run_init_with_stubbed_dependencies(
     fake_proxy._executor = MagicMock()
     fake_proxy._async_executor = MagicMock()
     mod._test_fake_rpc = fake_rpc
+    mod._test_fake_db = fake_db
+    mod._test_fake_proxy = fake_proxy
+    mod._test_threads = []
 
     class DummyThread:
         def __init__(self, *args, **kwargs):
             self.args = args
             self.kwargs = kwargs
+            mod._test_threads.append(self)
 
         def start(self):
             return None
@@ -249,6 +254,104 @@ def test_init_logs_native_route_rebalancing(monkeypatch):
 
     assert any("native route execution" in message.lower() for message in messages)
     assert not any("getroute + sendpay" in message for message in messages)
+
+
+def test_init_starts_fail_isolated_forward_archive_daemon(monkeypatch):
+    mod = load_plugin_module()
+    fake_sync = MagicMock()
+    factory = MagicMock(return_value=fake_sync)
+    monkeypatch.setattr(
+        mod,
+        "ForwardArchiveSynchronizer",
+        factory,
+        raising=False,
+    )
+
+    _run_init_with_stubbed_dependencies(mod, monkeypatch)
+
+    factory.assert_called_once_with(
+        mod._test_fake_rpc,
+        mod._test_fake_db.forward_archive,
+        mod._test_fake_proxy.log,
+    )
+    assert mod.forward_archive_sync is fake_sync
+    archive_thread = next(
+        thread
+        for thread in mod._test_threads
+        if thread.kwargs.get("name") == "forward-archive"
+    )
+    assert archive_thread.kwargs["daemon"] is True
+    assert callable(archive_thread.kwargs["target"])
+    fake_sync.sync_once.assert_not_called()
+
+
+def test_forward_archive_daemon_isolates_cycle_failure(monkeypatch):
+    mod = load_plugin_module()
+    fake_sync = MagicMock()
+    fake_sync.sync_once.side_effect = RuntimeError("temporary archive failure")
+    monkeypatch.setattr(
+        mod,
+        "ForwardArchiveSynchronizer",
+        MagicMock(return_value=fake_sync),
+        raising=False,
+    )
+    fake_shutdown = MagicMock()
+    fake_shutdown.is_set.return_value = False
+    fake_shutdown.wait.side_effect = [False, True]
+    monkeypatch.setattr(mod, "shutdown_event", fake_shutdown)
+
+    _run_init_with_stubbed_dependencies(mod, monkeypatch)
+    heartbeat = MagicMock()
+    monkeypatch.setattr(mod, "_record_loop_heartbeat", heartbeat)
+    archive_thread = next(
+        thread
+        for thread in mod._test_threads
+        if thread.kwargs.get("name") == "forward-archive"
+    )
+
+    archive_thread.kwargs["target"]()
+
+    fake_sync.sync_once.assert_called_once_with()
+    heartbeat.assert_called_once_with(
+        "forward-archive",
+        interval_seconds=900,
+    )
+    assert fake_shutdown.wait.call_args_list[-2:] == [call(60), call(900)]
+    messages = [
+        logged.args[0]
+        for logged in mod.plugin.log.call_args_list
+        if logged.args
+    ]
+    assert any(
+        "Error in forward archive sync: temporary archive failure" in message
+        for message in messages
+    )
+
+
+def test_init_keeps_plugin_available_when_forward_archive_sync_is_unavailable(
+    monkeypatch,
+):
+    mod = load_plugin_module()
+    monkeypatch.setattr(
+        mod,
+        "ForwardArchiveSynchronizer",
+        MagicMock(side_effect=RuntimeError("archive schema unavailable")),
+        raising=False,
+    )
+
+    _run_init_with_stubbed_dependencies(mod, monkeypatch)
+
+    assert mod.forward_archive_sync is None
+    messages = [
+        call.args[0]
+        for call in mod.plugin.log.call_args_list
+        if call.args
+    ]
+    assert any(
+        "Forward archive synchronization unavailable" in message
+        and "archive schema unavailable" in message
+        for message in messages
+    )
 
 
 def test_revenue_rebalance_debug_includes_last_cycle_score_breakdown():

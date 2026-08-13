@@ -54,6 +54,7 @@ from modules.capital_efficiency import CapitalEfficiencyAnalyzer
 from modules.segment_observations import SegmentObservationStore
 from modules.utils import normalize_scid, parse_msat
 from modules.econ_shadow import EconShadow
+from modules.forward_archive_sync import ForwardArchiveSynchronizer
 
 
 # =============================================================================
@@ -1000,6 +1001,7 @@ data_service = None  # Unified data service (DataService instance)
 policy_manager: Optional[PolicyManager] = None  # v1.4: Peer policy management
 capex_engine: Optional[CapexBudgetEngine] = None  # Unified capex budget engine
 econ_shadow: Optional[EconShadow] = None  # Phase 1 shadow: observe-mode intents + snapshot preview (fail-open)
+forward_archive_sync: Optional[ForwardArchiveSynchronizer] = None
 
 # SCID to Peer ID cache for reputation tracking
 # Maps short_channel_id -> peer_id for quick lookups
@@ -1659,7 +1661,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     3. Create instances of our analysis modules
     4. Set up timers for periodic execution
     """
-    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, safe_plugin, policy_manager, capex_engine, data_service, econ_shadow
+    global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, safe_plugin, policy_manager, capex_engine, data_service, econ_shadow, forward_archive_sync
 
     plugin.log("Initializing cl-revenue-ops plugin...")
 
@@ -1993,6 +1995,22 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     database = Database(config.db_path, safe_plugin)
     database.initialize()
 
+    # Canonical forward evidence is synchronized independently from the legacy
+    # operational forwards table. Construction is fail-isolated so an archive
+    # schema problem cannot prevent the revenue plugin from starting.
+    try:
+        forward_archive_sync = ForwardArchiveSynchronizer(
+            safe_plugin.rpc,
+            database.forward_archive,
+            safe_plugin.log,
+        )
+    except Exception as e:
+        forward_archive_sync = None
+        plugin.log(
+            f"Forward archive synchronization unavailable: {e}",
+            level="warn",
+        )
+
     # Issue #24: Clean up stale budget reservations on startup
     # Reservations from crashed jobs should be released immediately
     timeout_seconds = config.reservation_timeout_hours * 3600
@@ -2320,6 +2338,61 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
                     break
 
+    def forward_archive_loop():
+        # Synchronize canonical CLN forward evidence without taking action.
+        interval_seconds = 15 * 60
+        if shutdown_event.wait(60):
+            plugin.log(
+                "Forward archive loop cancelled during startup delay"
+            )
+            return
+
+        while not shutdown_event.is_set():
+            try:
+                _record_loop_heartbeat(
+                    "forward-archive",
+                    interval_seconds=interval_seconds,
+                )
+                try:
+                    result = forward_archive_sync.sync_once()
+                    plugin.log(
+                        "Forward archive synchronized: "
+                        f"created_pages={result.created_pages} "
+                        f"updated_pages={result.updated_pages}",
+                        level="debug",
+                    )
+                except (RPCTimeoutError, RPCBreakerOpen) as e:
+                    plugin.log(
+                        f"RPC degraded in forward archive sync: {e}. "
+                        "Skipping this cycle.",
+                        level="warn",
+                    )
+                except Exception as e:
+                    plugin.log(
+                        f"Error in forward archive sync: {e}",
+                        level="error",
+                    )
+
+                if shutdown_event.wait(interval_seconds):
+                    plugin.log(
+                        "Forward archive loop stopping due to shutdown signal"
+                    )
+                    break
+            except Exception as e:
+                plugin.log(
+                    f"Unhandled error in forward-archive loop iteration: {e}",
+                    level="error",
+                )
+                try:
+                    plugin.log(
+                        f"Traceback: {traceback.format_exc()}",
+                        level="debug",
+                    )
+                except Exception:
+                    pass
+                if shutdown_event.wait(_LOOP_BACKOFF_SECONDS):
+                    break
+
     def reconciliation_loop():
         """Run reconciliation once per UTC hour, independent of fee authority."""
         while not shutdown_event.is_set():
@@ -2529,6 +2602,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         daemon=True,
         name="econ-reconciliation",
     ).start()
+    if forward_archive_sync is not None:
+        threading.Thread(
+            target=forward_archive_loop,
+            daemon=True,
+            name="forward-archive",
+        ).start()
     threading.Thread(target=rebalance_check_loop, daemon=True, name="rebalance-check").start()
     threading.Thread(target=snapshot_peers_delayed, daemon=True, name="startup-snapshot").start()
     threading.Thread(target=financial_snapshot_loop, daemon=True, name="financial-snapshot").start()

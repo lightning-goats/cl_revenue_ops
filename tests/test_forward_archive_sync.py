@@ -1,0 +1,250 @@
+"""Read-only Core Lightning synchronization for canonical forward evidence."""
+
+import sqlite3
+from unittest.mock import MagicMock, call
+
+import pytest
+
+from modules.forward_archive import ForwardArchiveStore
+from modules.forward_archive_sync import (
+    ForwardArchiveSyncError,
+    ForwardArchiveSynchronizer,
+)
+
+
+def _log(*_args, **_kwargs):
+    return None
+
+
+@pytest.fixture
+def store(tmp_path):
+    connection = sqlite3.connect(
+        tmp_path / "forward-archive.db",
+        isolation_level=None,
+    )
+    connection.row_factory = sqlite3.Row
+    archive = ForwardArchiveStore(lambda: connection, _log)
+    archive.initialize_schema(connection)
+    archive._test_connection = connection
+    return archive
+
+
+def _record(
+    *,
+    created_index,
+    updated_index=None,
+    status="offered",
+    received_time="1700000000",
+):
+    record = {
+        "created_index": created_index,
+        "status": status,
+        "received_time": received_time,
+    }
+    if updated_index is not None:
+        record["updated_index"] = updated_index
+    if status == "settled":
+        record.update({
+            "in_channel": "1x1x1",
+            "out_channel": "2x2x2",
+            "in_msat": 2000,
+            "out_msat": 1900,
+            "fee_msat": 100,
+            "resolved_time": "1700000001",
+        })
+    return record
+
+
+def test_sync_probes_and_pages_cursor_families_independently(store):
+    rpc = MagicMock()
+    rpc.wait.side_effect = [
+        {"forwards": {"created": 2}},
+        {"forwards": {"updated": 12}},
+    ]
+    rpc.listforwards.side_effect = [
+        {"forwards": [
+            _record(created_index=1, updated_index=11, status="settled"),
+            _record(created_index=2, updated_index=12, status="settled"),
+        ]},
+        {"forwards": [
+            _record(created_index=1, updated_index=11, status="settled"),
+            _record(created_index=2, updated_index=12, status="settled"),
+        ]},
+    ]
+
+    result = ForwardArchiveSynchronizer(rpc, store, _log).sync_once(
+        now_ns=1_700_006_401_000_000_000
+    )
+
+    assert result.created_live_max == 2
+    assert result.updated_live_max == 12
+    assert result.created_pages == 1
+    assert result.updated_pages == 1
+    assert store.get_sync_state("created")["next_index"] == 3
+    assert store.get_sync_state("updated")["next_index"] == 13
+    assert rpc.wait.call_args_list == [
+        call(subsystem="forwards", indexname="created", nextvalue=0),
+        call(subsystem="forwards", indexname="updated", nextvalue=0),
+    ]
+    assert rpc.listforwards.call_args_list == [
+        call(index="created", start=0, limit=500),
+        call(index="updated", start=0, limit=500),
+    ]
+
+
+def test_sync_rejects_stored_cursor_ahead_of_its_own_live_max(store):
+    store.apply_page(
+        "updated",
+        [_record(created_index=1, updated_index=8, status="settled")],
+        observed_at_ns=10,
+        live_max_index=8,
+    )
+    rpc = MagicMock()
+    rpc.wait.side_effect = [
+        {"forwards": {"created": 20}},
+        {"forwards": {"updated": 4}},
+    ]
+
+    with pytest.raises(
+        ForwardArchiveSyncError,
+        match="updated cursor 9 exceeds live maximum 4",
+    ):
+        ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=11)
+
+    rpc.listforwards.assert_not_called()
+
+
+def test_malformed_first_page_preserves_both_last_successful_cursors(store):
+    store.apply_page(
+        "created", [_record(created_index=4)], 10, live_max_index=4
+    )
+    store.apply_page(
+        "updated",
+        [_record(created_index=4, updated_index=2, status="settled")],
+        10,
+        live_max_index=2,
+    )
+    rpc = MagicMock()
+    rpc.wait.side_effect = [
+        {"forwards": {"created": 6}},
+        {"forwards": {"updated": 4}},
+    ]
+    rpc.listforwards.return_value = {"forwards": [0]}
+
+    with pytest.raises(ForwardArchiveSyncError, match="expected object"):
+        ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=11)
+
+    assert store.get_sync_state("created")["next_index"] == 5
+    assert store.get_sync_state("updated")["next_index"] == 3
+
+
+@pytest.mark.parametrize(
+    "payload, error",
+    [
+        ({}, "malformed payload"),
+        ({"forwards": {"created": True}}, "invalid index"),
+        ({"forwards": {"created": -1}}, "invalid index"),
+    ],
+)
+def test_live_max_payload_fails_closed(store, payload, error):
+    rpc = MagicMock()
+    rpc.wait.return_value = payload
+
+    with pytest.raises(ForwardArchiveSyncError, match=error):
+        ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=10)
+
+    rpc.listforwards.assert_not_called()
+
+
+def test_unknown_archive_schema_version_disables_sync_before_rpc(store):
+    store.apply_page(
+        "created", [_record(created_index=1)], 10, live_max_index=1
+    )
+    store._test_connection.execute(
+        "UPDATE forward_archive_sync_state_v1 SET schema_version = 2"
+    )
+    rpc = MagicMock()
+
+    with pytest.raises(
+        ForwardArchiveSyncError,
+        match="unsupported archive schema version 2",
+    ):
+        ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=11)
+
+    rpc.wait.assert_not_called()
+    rpc.listforwards.assert_not_called()
+
+
+def test_page_limit_fails_bounded_after_committed_page(store):
+    rpc = MagicMock()
+    rpc.wait.side_effect = [
+        {"forwards": {"created": 2}},
+        {"forwards": {"updated": 0}},
+    ]
+    rpc.listforwards.return_value = {
+        "forwards": [_record(created_index=1)]
+    }
+    sync = ForwardArchiveSynchronizer(rpc, store, _log)
+    sync.PAGE_LIMIT = 1
+    sync.MAX_PAGES_PER_FAMILY = 1
+
+    with pytest.raises(ForwardArchiveSyncError, match="page limit"):
+        sync.sync_once(now_ns=10)
+
+    assert store.get_sync_state("created")["next_index"] == 2
+    assert rpc.listforwards.call_count == 1
+
+
+def test_caught_up_empty_source_calls_no_listforwards(store):
+    rpc = MagicMock()
+    rpc.wait.side_effect = [
+        {"forwards": {"created": 0}},
+        {"forwards": {"updated": 0}},
+    ]
+
+    result = ForwardArchiveSynchronizer(rpc, store, _log).sync_once(
+        now_ns=1_700_006_401_000_000_000
+    )
+
+    assert result.created_pages == 0
+    assert result.updated_pages == 0
+    rpc.listforwards.assert_not_called()
+    assert store.get_sync_state("created")["last_success_at"] == result.observed_at_ns
+    assert store.get_sync_state("updated")["last_success_at"] == result.observed_at_ns
+
+
+def test_sync_ignores_records_newer_than_probed_snapshot(store):
+    rpc = MagicMock()
+    rpc.wait.side_effect = [
+        {"forwards": {"created": 2}},
+        {"forwards": {"updated": 0}},
+    ]
+    rpc.listforwards.return_value = {
+        "forwards": [
+            _record(created_index=1),
+            _record(created_index=2),
+            _record(created_index=3),
+        ]
+    }
+
+    result = ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=10)
+
+    assert result.created_pages == 1
+    assert store.get_sync_state("created")["next_index"] == 3
+    row = store._test_connection.execute("SELECT COUNT(*) FROM forward_archive_v1").fetchone()
+    assert row[0] == 2
+
+
+def test_sync_rpc_allowlist_is_wait_and_listforwards_only(store):
+    rpc = MagicMock()
+    rpc.wait.side_effect = [
+        {"forwards": {"created": 0}},
+        {"forwards": {"updated": 0}},
+    ]
+
+    ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=10)
+
+    assert {method[0] for method in rpc.method_calls} <= {
+        "wait",
+        "listforwards",
+    }
