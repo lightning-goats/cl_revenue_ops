@@ -212,6 +212,11 @@ partial cycles were lost when the exception unwound before rebuild_days();
 only two coverage rows remained after the initial catch-up. These are the
 corrections recorded in the approved design and implementation plan.
 
+The `cf0cf49` archive/preflight evidence above was deployed and observed in
+production. The backlog, coverage-recovery, and strict legacy-projection
+corrective implementation on this branch is local only: it is not deployed or
+production-verified, and the 72-hour durable-evidence gate has not started.
+
 Copied-database verification of the frozen 2026-07-13 through 2026-08-13 UTC
 overlap found:
 
