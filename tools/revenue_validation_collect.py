@@ -15,18 +15,88 @@ if __package__ in {None, ""}:
 
 from tools import revenue_validation_common as common
 
-JSON_COMMANDS: list[tuple[str, str]] = [
-    ("revenue-dashboard 30", "revenue-dashboard-30.json"),
-    ("revenue-report summary", "revenue-report-summary.json"),
-    ("revenue-profitability", "revenue-profitability.json"),
-    ("revenue-status", "revenue-status.json"),
-    ("revenue-config get", "revenue-config.json"),
-    ("listforwards", "listforwards.json"),
-    ("listpays", "listpays.json"),
-    ("listpeerchannels", "listpeerchannels.json"),
-    ("-k revenue-budget section=total_cost window_hours=24", "revenue-budget.json"),
-    ("feerates perkb", "feerates.json"),
-]
+REQUIRED_FOR_COMPLETENESS = "required_for_completeness"
+REQUIRED_FOR_ECONOMIC_METRICS = "required_for_economic_metrics"
+OPTIONAL_DIAGNOSTIC = "optional_diagnostic"
+
+
+@dataclass(frozen=True, slots=True)
+class CollectionSpec:
+    command: str
+    filename: str
+    role: str
+    required_paths: tuple[tuple[str, ...], ...]
+    required_types: tuple[tuple[tuple[str, ...], type], ...] = ()
+
+
+JSON_COMMANDS: tuple[CollectionSpec, ...] = (
+    CollectionSpec(
+        "revenue-dashboard 30", "revenue-dashboard-30.json",
+        REQUIRED_FOR_ECONOMIC_METRICS,
+        (("financial_health", "net_profit_sats"),
+         ("period", "gross_revenue_sats"), ("period", "opex_sats"),
+         ("period", "forward_count"), ("period", "volume_sats")),
+        ((("financial_health", "net_profit_sats"), int),
+         (("period", "gross_revenue_sats"), int),
+         (("period", "opex_sats"), int),
+         (("period", "forward_count"), int),
+         (("period", "volume_sats"), int)),
+    ),
+    CollectionSpec(
+        "revenue-report summary", "revenue-report-summary.json",
+        OPTIONAL_DIAGNOSTIC, (("type",), ("policies",)),
+    ),
+    CollectionSpec(
+        "revenue-profitability", "revenue-profitability.json",
+        REQUIRED_FOR_ECONOMIC_METRICS, (("summary",), ("channels_by_class",)),
+        ((("summary",), Mapping), (("channels_by_class",), Mapping)),
+    ),
+    CollectionSpec(
+        "revenue-status", "revenue-status.json", REQUIRED_FOR_COMPLETENESS,
+        (("status",), ("operator_controls", "values", "paused"),
+         ("operator_controls", "values", "daily_budget_sats"),
+         ("operator_controls", "values", "weekly_budget_sats"),
+         ("operator_controls", "values", "risk_profile"),
+         ("operator_controls", "values", "authority_level")),
+        ((("status",), str),
+         (("operator_controls", "values", "paused"), bool),
+         (("operator_controls", "values", "daily_budget_sats"), int),
+         (("operator_controls", "values", "weekly_budget_sats"), int),
+         (("operator_controls", "values", "risk_profile"), str),
+         (("operator_controls", "values", "authority_level"), str)),
+    ),
+    CollectionSpec(
+        "revenue-config get", "revenue-config.json", REQUIRED_FOR_COMPLETENESS,
+        (("config", "daily_budget_sats"), ("config", "weekly_budget_sats"),
+         ("config", "authority_level"), ("version",)),
+        ((("config", "daily_budget_sats"), int),
+         (("config", "weekly_budget_sats"), int),
+         (("config", "authority_level"), str), (("version",), int)),
+    ),
+    CollectionSpec(
+        "listforwards", "listforwards.json", REQUIRED_FOR_ECONOMIC_METRICS,
+        (("forwards",),), ((("forwards",), list),),
+    ),
+    CollectionSpec(
+        "listpays", "listpays.json", REQUIRED_FOR_ECONOMIC_METRICS,
+        (("pays",),), ((("pays",), list),),
+    ),
+    CollectionSpec(
+        "listpeerchannels", "listpeerchannels.json",
+        REQUIRED_FOR_ECONOMIC_METRICS, (("channels",),),
+        ((("channels",), list),),
+    ),
+    CollectionSpec(
+        "-k revenue-budget section=total_cost window_hours=24",
+        "revenue-budget.json", REQUIRED_FOR_COMPLETENESS,
+        (("coverage_status",), ("actual_spent_by_category",)),
+        ((("coverage_status",), str), (("actual_spent_by_category",), Mapping)),
+    ),
+    CollectionSpec(
+        "feerates perkb", "feerates.json", OPTIONAL_DIAGNOSTIC, (("perkb",),),
+    ),
+)
+
 
 INT_RE = re.compile(r"-?\d+")
 
@@ -255,6 +325,102 @@ def append_trend_record(results_root: str | Path, node_name: str, trend_record: 
         f.write(json.dumps(trend_record, sort_keys=True) + "\n")
 
 
+def _payload_error(
+    payload: Any,
+    required_paths: tuple[tuple[str, ...], ...],
+    required_types: tuple[tuple[tuple[str, ...], type], ...] = (),
+) -> str | None:
+    if not isinstance(payload, Mapping):
+        return "expected object payload"
+    missing = []
+    for path in required_paths:
+        current: Any = payload
+        for key in path:
+            if not isinstance(current, Mapping) or key not in current:
+                missing.append(".".join(path))
+                break
+            current = current[key]
+    if missing:
+        return "missing required keys: " + ", ".join(missing)
+    for path, expected_type in required_types:
+        current = payload
+        for key in path:
+            current = current[key]
+        if (
+            not isinstance(current, expected_type)
+            or (expected_type is int and isinstance(current, bool))
+        ):
+            return (
+                "invalid type for " + ".".join(path)
+                + ": expected "
+                + getattr(expected_type, "__name__", str(expected_type))
+            )
+    return None
+
+
+def _list_record_error(filename: str, payload: Mapping[str, Any]) -> str | None:
+    list_key = {
+        "listforwards.json": "forwards",
+        "listpays.json": "pays",
+        "listpeerchannels.json": "channels",
+    }.get(filename)
+    if list_key is None:
+        return None
+    records = payload[list_key]
+    for index, record in enumerate(records):
+        prefix = f"{list_key}[{index}]"
+        if not isinstance(record, Mapping):
+            return f"{prefix}: expected object"
+        if filename in {"listforwards.json", "listpays.json"}:
+            if not isinstance(record.get("status"), str):
+                return f"{prefix}.status: expected string"
+        if filename == "listforwards.json" and record.get("status", "").lower() == "settled":
+            if _coerce_int(record.get("fee_msat")) is None:
+                return f"{prefix}.fee_msat: expected amount"
+            forward_time = next(
+                (record.get(key) for key in ("received_time", "resolved_time")
+                 if record.get(key) is not None),
+                None,
+            )
+            if _coerce_int(forward_time) is None:
+                return f"{prefix}: missing or invalid forward timestamp"
+        if filename == "listpays.json":
+            values = (record.get(key) for key in ("label", "description", "bolt11"))
+            is_rebalance = any(
+                isinstance(value, str) and "rebalance" in value.lower()
+                for value in values
+            )
+            if is_rebalance:
+                pay_time = next(
+                    (record.get(key) for key in
+                     ("created_at", "created_time", "completed_at")
+                     if record.get(key) is not None),
+                    None,
+                )
+                if _coerce_int(pay_time) is None:
+                    return f"{prefix}: missing or invalid rebalance timestamp"
+                fee = _coerce_int(record.get("fee_msat"))
+                sent = _coerce_int(record.get("amount_sent_msat"))
+                amount = _coerce_int(record.get("amount_msat"))
+                if fee is None and (sent is None or amount is None):
+                    return f"{prefix}: missing rebalance fee evidence"
+        if filename == "listpeerchannels.json":
+            if not isinstance(record.get("peer_id"), str):
+                return f"{prefix}.peer_id: expected string"
+            fee_ppm = record.get("fee_proportional_millionths")
+            if not isinstance(fee_ppm, int) or isinstance(fee_ppm, bool):
+                return f"{prefix}.fee_proportional_millionths: expected int"
+    return None
+
+
+def _manifest_status(errors: Mapping[str, Mapping[str, Any]]) -> str:
+    if not errors:
+        return "complete"
+    if all(error.get("role") == OPTIONAL_DIAGNOSTIC for error in errors.values()):
+        return "collection_warning"
+    return "incomplete"
+
+
 def collect_node_day(
     node_name: str,
     node_cfg: Mapping[str, Any],
@@ -268,24 +434,56 @@ def collect_node_day(
     snapshots: dict[str, Any] = {}
     errors: dict[str, dict[str, Any]] = {}
 
-    for command, filename in JSON_COMMANDS:
-        result = run_json_rpc(node_cfg, command)
-        if not result.ok:
-            errors[filename] = {
-                "command": command,
-                "stderr": result.stderr,
+    for spec in JSON_COMMANDS:
+        result = run_json_rpc(node_cfg, spec.command)
+        payload_error = (
+            None if not result.ok
+            else _payload_error(
+                result.stdout_json, spec.required_paths, spec.required_types
+            )
+        )
+        if not payload_error and result.ok:
+            payload_error = _list_record_error(spec.filename, result.stdout_json)
+        if not result.ok or payload_error:
+            errors[spec.filename] = {
+                "command": spec.command,
+                "role": spec.role,
+                "stderr": result.stderr if not result.ok else payload_error,
                 "returncode": result.returncode,
             }
             continue
-        snapshots[filename] = result.stdout_json
-        common.write_json(out_dir / filename, result.stdout_json)
+        snapshots[spec.filename] = result.stdout_json
+        common.write_json(out_dir / spec.filename, result.stdout_json)
 
     reconciliation_command = _reconciliation_command(run_day)
     reconciliation_result = run_json_rpc(node_cfg, reconciliation_command)
-    if not reconciliation_result.ok:
+    reconciliation_payload_error = (
+        None if not reconciliation_result.ok
+        else _payload_error(
+            reconciliation_result.stdout_json,
+            (("history", "runs"),
+             ("history", "summary", "expected_runs"),
+             ("history", "summary", "complete"),
+             ("history", "summary", "all_clean"),
+             ("history", "summary", "fee_intent_complete")),
+            (
+                (("history", "runs"), list),
+                (("history", "summary", "expected_runs"), int),
+                (("history", "summary", "complete"), bool),
+                (("history", "summary", "all_clean"), bool),
+                (("history", "summary", "fee_intent_complete"), bool),
+            ),
+        )
+    )
+    if not reconciliation_result.ok or reconciliation_payload_error:
         errors["revenue-econ-reconcile.json"] = {
             "command": reconciliation_command,
-            "stderr": reconciliation_result.stderr,
+            "role": REQUIRED_FOR_COMPLETENESS,
+            "stderr": (
+                reconciliation_result.stderr
+                if not reconciliation_result.ok
+                else reconciliation_payload_error
+            ),
             "returncode": reconciliation_result.returncode,
         }
     else:
@@ -303,20 +501,34 @@ def collect_node_day(
         else:
             errors["rollback-watch.log"] = {
                 "command": str(log_command),
+                "role": REQUIRED_FOR_COMPLETENESS,
                 "stderr": log_result.stderr,
                 "returncode": log_result.returncode,
             }
 
-    trend_record = build_trend_record(
-        node_name=node_name,
-        node_cfg=node_cfg,
-        run_date=run_day,
-        dashboard=snapshots.get("revenue-dashboard-30.json", {}),
-        revenue_status=snapshots.get("revenue-status.json", {}),
-    )
+    else:
+        errors["rollback-watch.log"] = {
+            "command": None,
+            "role": REQUIRED_FOR_COMPLETENESS,
+            "stderr": "log_extract_command is not configured",
+            "returncode": None,
+        }
+
+    trend_record = None
+    if (
+        "revenue-dashboard-30.json" in snapshots
+        and "revenue-status.json" in snapshots
+    ):
+        trend_record = build_trend_record(
+            node_name=node_name,
+            node_cfg=node_cfg,
+            run_date=run_day,
+            dashboard=snapshots["revenue-dashboard-30.json"],
+            revenue_status=snapshots["revenue-status.json"],
+        )
 
     return {
-        "status": "ok" if not errors else "error",
+        "status": _manifest_status(errors),
         "errors": errors,
         "trend_record": trend_record,
     }
@@ -331,16 +543,45 @@ def collect_all_nodes(config: Mapping[str, Any], run_date: str | date) -> dict[s
     }
 
     for node_name, node_cfg in config["nodes"].items():
-        day_dir = common.node_day_dir(config, run_date, node_name)
-        day_dir.mkdir(parents=True, exist_ok=True)
-        result = collect_node_day(node_name, node_cfg, day_dir, run_date)
+        try:
+            day_dir = common.node_day_dir(config, run_date, node_name)
+            day_dir.mkdir(parents=True, exist_ok=True)
+            result = collect_node_day(node_name, node_cfg, day_dir, run_date)
+        except Exception as exc:
+            result = {
+                "status": "collection_failure",
+                "errors": {
+                    "collector": {
+                        "command": None,
+                        "role": REQUIRED_FOR_COMPLETENESS,
+                        "stderr": f"{type(exc).__name__}: {exc}",
+                        "returncode": None,
+                    }
+                },
+            }
+        trend_record = result.get("trend_record")
+        if trend_record:
+            try:
+                append_trend_record(results_root, node_name, trend_record)
+            except Exception as exc:
+                result = {
+                    "status": "collection_failure",
+                    "errors": {
+                        "collector": {
+                            "command": None,
+                            "role": REQUIRED_FOR_COMPLETENESS,
+                            "stderr": (
+                                "trend persistence failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                            "returncode": None,
+                        }
+                    },
+                }
         manifest["nodes"][node_name] = {
             "status": result["status"],
             "errors": result.get("errors", {}),
         }
-        trend_record = result.get("trend_record")
-        if trend_record:
-            append_trend_record(results_root, node_name, trend_record)
 
     common.write_json(results_root / "manifests" / f"{run_date}.json", manifest)
     return manifest
@@ -365,7 +606,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     config = common.load_config(args.config)
     manifest = collect_all_nodes(config, args.date)
-    return 0 if all(node["status"] == "ok" for node in manifest["nodes"].values()) else 1
+    return 0 if all(
+        node["status"] in {"complete", "collection_warning"}
+        for node in manifest["nodes"].values()
+    ) else 1
 
 
 if __name__ == "__main__":

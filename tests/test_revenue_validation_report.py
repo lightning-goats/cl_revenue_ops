@@ -194,3 +194,12 @@ def test_generates_t28_report_when_checkpoint_reached(tmp_path: Path) -> None:
     report_text = report_path.read_text(encoding="utf-8")
     assert "Executive summary" in report_text
     assert "Per-PR hypothesis status" in report_text
+
+
+def test_t28_missing_profit_is_investigate_not_ship() -> None:
+    decision = mod._t28_decision(
+        {"lnnode": {"net_profit_sats_30d": None}},
+        {"lnnode": []},
+    )
+
+    assert decision == "investigate"

@@ -252,7 +252,12 @@ def _t14_recommendation(history: list[dict[str, Any]]) -> str:
 def _t28_decision(latest_rows: Mapping[str, Mapping[str, Any]], histories: Mapping[str, list[dict[str, Any]]]) -> str:
     if any(_highest_history_severity(history) == "red" for history in histories.values()):
         return "rollback"
-    if latest_rows and all((row.get("net_profit_sats_30d") or 0) >= 0 for row in latest_rows.values()):
+    if latest_rows and all(
+        isinstance(row.get("net_profit_sats_30d"), (int, float))
+        and not isinstance(row.get("net_profit_sats_30d"), bool)
+        and row["net_profit_sats_30d"] >= 0
+        for row in latest_rows.values()
+    ):
         silent_paths = 0
         for history in histories.values():
             if _highest_history_severity(history) != "green":

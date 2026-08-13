@@ -388,7 +388,8 @@ def evaluate_node_day(
     thresholds: Mapping[str, Any],
     run_date: str | date,
 ) -> dict[str, Any]:
-    if manifest_status.get("status") != "ok":
+    manifest_collection_status = manifest_status.get("status")
+    if manifest_collection_status not in {"ok", "complete", "collection_warning"}:
         findings = [
             {
                 "rule": "collection_failure",

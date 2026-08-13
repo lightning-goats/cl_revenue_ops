@@ -253,3 +253,64 @@ def test_evaluate_all_nodes_writes_watch_file_and_marks_red(tmp_path: Path) -> N
     assert result["status"] == "red"
     assert result["nodes"]["lnnode"]["highest_severity"] == "red"
     assert (results_root / "watch" / "2026-04-23.json").exists()
+
+
+def test_optional_collection_warning_does_not_become_false_red(tmp_path: Path) -> None:
+    results_root = tmp_path
+    day_dir = results_root / "2026-04-24" / "lnnode"
+    day_dir.mkdir(parents=True)
+    (results_root / "manifests").mkdir(parents=True)
+    (results_root / "manifests" / "2026-04-24.json").write_text(
+        json.dumps({
+            "date": "2026-04-24",
+            "nodes": {"lnnode": {
+                "status": "collection_warning",
+                "errors": {"revenue-report-summary.json": {
+                    "role": "optional_diagnostic",
+                    "stderr": "unavailable",
+                }},
+            }},
+        }),
+        encoding="utf-8",
+    )
+    for filename, payload in {
+        "listpeerchannels.json": {"channels": []},
+        "listpays.json": {"pays": []},
+        "listforwards.json": {"forwards": []},
+        "revenue-config.json": {"config": {"max_fee_ppm": 5000}},
+    }.items():
+        (day_dir / filename).write_text(json.dumps(payload), encoding="utf-8")
+    (day_dir / "rollback-watch.log").write_text("", encoding="utf-8")
+
+    config = {
+        "paths": {"results_root": str(results_root)},
+        "thresholds": {"rollback": {
+            "plugin_restart_limit_24h": 3,
+            "revenue_drop_pct": 25,
+            "rebalance_success_floor_pct": 50,
+        }},
+        "nodes": {"lnnode": {"t0": "2026-04-23T00:00:00Z"}},
+    }
+
+    result = mod.evaluate_all_nodes(config, run_date="2026-04-24")
+
+    assert result["status"] != "red"
+    assert result["nodes"]["lnnode"]["status"] == "ok"
+    assert not any(
+        finding["rule"] == "collection_failure"
+        for finding in result["nodes"]["lnnode"]["findings"]
+    )
+
+
+def test_incomplete_collection_remains_fail_closed() -> None:
+    result = mod.evaluate_node_day(
+        node_name="lnnode",
+        node_cfg={"t0": "2026-04-23T00:00:00Z"},
+        day_dir="unused",
+        manifest_status={"status": "incomplete", "errors": {"listforwards.json": {}}},
+        thresholds={},
+        run_date="2026-04-24",
+    )
+
+    assert result["status"] == "collection_failed"
+    assert result["highest_severity"] == "red"
