@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -24,7 +24,7 @@ JSON_COMMANDS: list[tuple[str, str]] = [
     ("listforwards", "listforwards.json"),
     ("listpays", "listpays.json"),
     ("listpeerchannels", "listpeerchannels.json"),
-    ("hive-members", "hive-members.json"),
+    ("-k revenue-budget section=total_cost window_hours=24", "revenue-budget.json"),
     ("feerates perkb", "feerates.json"),
 ]
 
@@ -94,6 +94,25 @@ def run_text_command(node_cfg: Mapping[str, Any], remote_cmd: str) -> common.Run
     return _run_remote_command(node_cfg, remote_cmd)
 
 
+def _parse_run_date(run_date: str | date) -> date:
+    if isinstance(run_date, date):
+        return run_date
+    try:
+        return date.fromisoformat(str(run_date))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("run_date must be an ISO UTC calendar date (YYYY-MM-DD)") from exc
+
+
+def _reconciliation_command(run_day: date) -> str:
+    start = datetime.combine(run_day, datetime.min.time(), tzinfo=timezone.utc)
+    since = int(start.timestamp())
+    until = int((start + timedelta(days=1)).timestamp())
+    return (
+        "-k revenue-econ-reconcile "
+        f"history_since={since} history_until={until} history_limit=24"
+    )
+
+
 def _parse_t0(timestamp: str) -> datetime:
     normalized = timestamp.replace("Z", "+00:00")
     parsed = datetime.fromisoformat(normalized)
@@ -106,7 +125,7 @@ def _days_since_t0(run_date: str | date, t0: str) -> int:
     if isinstance(run_date, date):
         run_day = run_date
     else:
-        run_day = date.fromisoformat(str(run_date))
+        run_day = _parse_run_date(run_date)
     return (run_day - _parse_t0(t0).date()).days
 
 
@@ -242,6 +261,7 @@ def collect_node_day(
     day_dir: str | Path,
     run_date: str | date,
 ) -> dict[str, Any]:
+    run_day = _parse_run_date(run_date)
     out_dir = Path(day_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -260,6 +280,21 @@ def collect_node_day(
         snapshots[filename] = result.stdout_json
         common.write_json(out_dir / filename, result.stdout_json)
 
+    reconciliation_command = _reconciliation_command(run_day)
+    reconciliation_result = run_json_rpc(node_cfg, reconciliation_command)
+    if not reconciliation_result.ok:
+        errors["revenue-econ-reconcile.json"] = {
+            "command": reconciliation_command,
+            "stderr": reconciliation_result.stderr,
+            "returncode": reconciliation_result.returncode,
+        }
+    else:
+        snapshots["revenue-econ-reconcile.json"] = reconciliation_result.stdout_json
+        common.write_json(
+            out_dir / "revenue-econ-reconcile.json",
+            reconciliation_result.stdout_json,
+        )
+
     log_command = node_cfg.get("log_extract_command")
     if log_command:
         log_result = run_text_command(node_cfg, str(log_command))
@@ -275,7 +310,7 @@ def collect_node_day(
     trend_record = build_trend_record(
         node_name=node_name,
         node_cfg=node_cfg,
-        run_date=run_date,
+        run_date=run_day,
         dashboard=snapshots.get("revenue-dashboard-30.json", {}),
         revenue_status=snapshots.get("revenue-status.json", {}),
     )

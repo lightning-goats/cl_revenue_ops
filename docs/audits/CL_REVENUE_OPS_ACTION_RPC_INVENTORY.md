@@ -66,6 +66,7 @@ lifecycle action, swap, or local policy mutation:
 - `revenue-profile-preview`
 - `revenue-total-cost-budget`
 - `revenue-spend-ledger`
+- `revenue-budget section=total_cost`
 - `revenue-budget section=ledger`
 
 Collectors should still use a deny-by-default allowlist and pin the method

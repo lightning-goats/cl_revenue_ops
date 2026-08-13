@@ -52,6 +52,7 @@ See [validation/baseline.md](validation/baseline.md) and the historical
 | Phase | Mode | Activation state | Evidence location |
 | --- | --- | --- | --- |
 | 0. Measurement integrity | implementation | active work | `findings/phase0-measurement-hardening.md` |
+| 0.3 Daily collector repair | implementation | shadow evidence | [phase0-daily-collector.md](findings/phase0-daily-collector.md) |
 | 0B. Refactor closure | queued | inactive | future finding |
 | 1. Deterministic replay and traces | blocked by Phase 0 | inactive | future finding |
 | 2. Route-liquidity evidence | blocked by Phase 1 | inactive | future finding |

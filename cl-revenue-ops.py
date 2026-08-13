@@ -7174,6 +7174,8 @@ def revenue_budget(plugin: Plugin, section: str = None, **kwargs) -> Dict[str, A
       lightning-cli revenue-budget
           One response with sections: total_cost (was
           revenue-total-cost-budget) and capex (revenue-capex-status).
+      lightning-cli -k revenue-budget section=total_cost [window_hours=N]
+          Read-only total-cost budget status (was revenue-total-cost-budget).
       lightning-cli -k revenue-budget section=ledger [window_hours=N]
           [include_reservations=true] [reservation_limit=N]
           Forwards to the spend ledger (was revenue-spend-ledger).
@@ -7193,7 +7195,7 @@ def revenue_budget(plugin: Plugin, section: str = None, **kwargs) -> Dict[str, A
             "total_cost": _section(_rpc_total_cost_budget, **total_cost_kwargs),
             "capex": _section(_rpc_capex_status),
         }
-    table = {"ledger": _rpc_spend_ledger}
+    table = {"total_cost": _rpc_total_cost_budget, "ledger": _rpc_spend_ledger}
     return _dispatch_subcommand(
         plugin, "revenue-budget", "section", table, section, kwargs
     )

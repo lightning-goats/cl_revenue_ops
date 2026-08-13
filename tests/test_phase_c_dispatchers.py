@@ -180,6 +180,26 @@ class TestBudgetDispatcher:
         new = mod.revenue_budget(plugin, window_hours=48)
         assert new["total_cost"]["window_hours"] == 48
 
+    def test_total_cost_section_is_read_only(self, mod, plugin, monkeypatch):
+        observed_windows = []
+
+        def total_cost_status(window_hours=None):
+            observed_windows.append(window_hours)
+            return {"spent_sats": 10, "window_hours": window_hours}
+
+        capex_engine = MagicMock()
+        data_service = MagicMock()
+        monkeypatch.setattr(mod, "_total_cost_budget_status", total_cost_status)
+        monkeypatch.setattr(mod, "capex_engine", capex_engine)
+        monkeypatch.setattr(mod, "data_service", data_service)
+
+        result = mod.revenue_budget(plugin, "total_cost", window_hours=24)
+
+        assert result == {"spent_sats": 10, "window_hours": 24}
+        assert observed_windows == [24]
+        capex_engine.compute_allocations.assert_not_called()
+        data_service.datastore_push.assert_not_called()
+
     def test_ledger_forwards_filters(self, mod, plugin, monkeypatch):
         database = MagicMock()
         database.get_spend_ledger_summary.return_value = {"events": [],
@@ -201,7 +221,7 @@ class TestBudgetDispatcher:
     def test_unknown_section_lists_valid(self, mod, plugin):
         result = mod.revenue_budget(plugin, "capital")
         assert "error" in result
-        assert result["valid_sections"] == ["ledger"]
+        assert result["valid_sections"] == ["ledger", "total_cost"]
 
 
 # ---------------------------------------------------------------------------
