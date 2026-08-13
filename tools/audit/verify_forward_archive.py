@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import sqlite3
 import sys
@@ -18,8 +19,9 @@ class VerificationError(RuntimeError):
 
 _REQUIRED_COLUMNS = {
     "forward_archive_v1": {
-        "archive_generation", "created_index", "status", "in_msat",
-        "out_msat", "fee_msat", "received_time_ns",
+        "archive_generation", "created_index", "status",
+        "in_channel", "out_channel", "in_msat", "out_msat", "fee_msat",
+        "received_time_ns", "resolved_time_ns",
     },
     "forward_archive_coverage_v1": {
         "archive_generation", "date_utc", "created_sync_complete",
@@ -33,7 +35,7 @@ _REQUIRED_COLUMNS = {
     },
     "forwards": {
         "in_channel", "out_channel", "in_msat", "out_msat",
-        "fee_msat", "timestamp",
+        "fee_msat", "timestamp", "resolved_time",
     },
     "daily_forwarding_stats": {
         "channel_id", "date", "total_in_msat", "total_out_msat",
@@ -55,6 +57,35 @@ _ARCHIVE_TOTAL_SQL = """
       AND received_time_ns >= ? AND received_time_ns < ?
 """
 
+_LEGACY_PROJECTED_ARCHIVE_SQL = """
+    WITH legacy_rows AS (
+        SELECT in_channel, out_channel, in_msat, out_msat, fee_msat,
+               received_time_ns / 1000000000 AS timestamp,
+               COALESCE(resolved_time_ns / 1000000000, 0) AS resolved_time
+        FROM forward_archive_v1
+        WHERE archive_generation = ? AND status = 'settled'
+          AND received_time_ns >= ? AND received_time_ns < ?
+        GROUP BY in_channel, out_channel, in_msat, out_msat, fee_msat,
+                 timestamp, resolved_time
+    )
+    SELECT COUNT(*) AS settled_forward_count,
+           COALESCE(SUM(in_msat), 0) AS forwarded_in_msat,
+           COALESCE(SUM(out_msat), 0) AS forwarded_out_msat,
+           COALESCE(SUM(fee_msat), 0) AS fee_msat
+    FROM legacy_rows
+"""
+
+_LEGACY_PROJECTED_KEYS_SQL = """
+    SELECT in_channel, out_channel, in_msat, out_msat, fee_msat,
+           received_time_ns / 1000000000 AS timestamp,
+           COALESCE(resolved_time_ns / 1000000000, 0) AS resolved_time
+    FROM forward_archive_v1
+    WHERE archive_generation = ? AND status = 'settled'
+      AND received_time_ns >= ? AND received_time_ns < ?
+    GROUP BY in_channel, out_channel, in_msat, out_msat, fee_msat,
+             timestamp, resolved_time
+"""
+
 _ARCHIVE_HISTORY_SQL = """
     SELECT * FROM forward_daily_channel_v1
     WHERE archive_generation = ?
@@ -67,6 +98,13 @@ _RAW_TOTAL_SQL = """
            COALESCE(SUM(in_msat), 0) AS forwarded_in_msat,
            COALESCE(SUM(out_msat), 0) AS forwarded_out_msat,
            COALESCE(SUM(fee_msat), 0) AS fee_msat
+    FROM forwards
+    WHERE timestamp >= ? AND timestamp < ?
+"""
+
+_RAW_LEGACY_KEYS_SQL = """
+    SELECT in_channel, out_channel, in_msat, out_msat, fee_msat,
+           timestamp, COALESCE(resolved_time, 0) AS resolved_time
     FROM forwards
     WHERE timestamp >= ? AND timestamp < ?
 """
@@ -155,6 +193,20 @@ def _int_row(row: Mapping[str, Any], fields: Iterable[str]) -> dict[str, int]:
     return {field: int(row[field] or 0) for field in fields}
 
 
+_LEGACY_KEY_FIELDS = (
+    "in_channel", "out_channel", "in_msat", "out_msat", "fee_msat",
+    "timestamp", "resolved_time",
+)
+
+
+def _legacy_key_counts(
+    rows: Iterable[Mapping[str, Any]],
+) -> Counter[tuple[Any, ...]]:
+    return Counter(
+        tuple(row[field] for field in _LEGACY_KEY_FIELDS) for row in rows
+    )
+
+
 def _query_plan(
     connection: sqlite3.Connection,
     sql: str,
@@ -200,9 +252,14 @@ def verify_database(
             ).fetchone()
             generation = int(row[0]) if row and row[0] is not None else 1
 
+        archive_params = (
+            generation,
+            start * 1_000_000_000,
+            end * 1_000_000_000,
+        )
         archive_row = connection.execute(
             _ARCHIVE_TOTAL_SQL,
-            (generation, start * 1_000_000_000, end * 1_000_000_000),
+            archive_params,
         ).fetchone()
         total_fields = (
             "settled_forward_count",
@@ -211,6 +268,23 @@ def verify_database(
             "fee_msat",
         )
         archive = _int_row(archive_row, total_fields)
+        legacy_projected_archive = _int_row(
+            connection.execute(
+                _LEGACY_PROJECTED_ARCHIVE_SQL,
+                archive_params,
+            ).fetchone(),
+            total_fields,
+        )
+        projected_key_counts = _legacy_key_counts(
+            connection.execute(_LEGACY_PROJECTED_KEYS_SQL, archive_params)
+        )
+        raw_key_counts = _legacy_key_counts(
+            connection.execute(_RAW_LEGACY_KEYS_SQL, (start, end))
+        )
+        legacy_identity_consistent = all(
+            count <= projected_key_counts[key]
+            for key, count in raw_key_counts.items()
+        )
 
         raw = _int_row(
             connection.execute(_RAW_TOTAL_SQL, (start, end)).fetchone(),
@@ -269,9 +343,35 @@ def verify_database(
                 for index, row in enumerate(coverage_rows)
             )
         )
-        overlap_equal = all(
+        canonical_equal = all(
             archive[field] == operational[field]
             for field in total_fields
+        )
+        overlap_equal = canonical_equal
+        legacy_projection_equal = (
+            all(
+                legacy_projected_archive[field] == operational[field]
+                for field in total_fields
+            )
+            and legacy_identity_consistent
+        )
+        legacy_dedup_loss = {
+            field: archive[field] - operational[field]
+            for field in total_fields
+        }
+        legacy_loss_consistent = all(
+            value >= 0 for value in legacy_dedup_loss.values()
+        )
+        if canonical_equal and legacy_identity_consistent:
+            overlap_status = "equal"
+        elif legacy_projection_equal and legacy_loss_consistent:
+            overlap_status = "legacy_dedup_explained"
+        else:
+            overlap_status = "unexplained"
+        warnings = (
+            ["legacy_operational_dedup_loss"]
+            if overlap_status == "legacy_dedup_explained"
+            else []
         )
         direct_sourced_equal = (
             operational["settled_forward_count"]
@@ -282,7 +382,10 @@ def verify_database(
             "archive": _query_plan(
                 connection,
                 _ARCHIVE_TOTAL_SQL,
-                (generation, start * 1_000_000_000, end * 1_000_000_000),
+                archive_params,
+            ),
+            "legacy_projection": _query_plan(
+                connection, _LEGACY_PROJECTED_ARCHIVE_SQL, archive_params
             ),
             "archive_history": _query_plan(
                 connection,
@@ -291,6 +394,9 @@ def verify_database(
             ),
             "operational_raw": _query_plan(
                 connection, _RAW_TOTAL_SQL, (start, end)
+            ),
+            "operational_raw_identity": _query_plan(
+                connection, _RAW_LEGACY_KEYS_SQL, (start, end)
             ),
             "operational_rollup": _query_plan(
                 connection, _ROLLED_TOTAL_SQL, (start, end)
@@ -301,8 +407,10 @@ def verify_database(
         }
         expected_indexes = {
             "archive": "idx_forward_archive_v1_status_received",
+            "legacy_projection": "idx_forward_archive_v1_status_received",
             "archive_history": "idx_forward_daily_channel_v1_date",
             "operational_raw": "idx_forwards_time",
+            "operational_raw_identity": "idx_forwards_time",
             "operational_rollup": "idx_daily_fwd_stats_date",
             "operational_inbound_rollup": (
                 "idx_daily_fwd_stats_inbound_date"
@@ -316,7 +424,7 @@ def verify_database(
         reasons = []
         if len(generations) > 1:
             reasons.append("multiple_archive_generations")
-        if not overlap_equal:
+        if overlap_status == "unexplained":
             reasons.append("archive_operational_mismatch")
         if not direct_sourced_equal:
             reasons.append("operational_direct_sourced_count_mismatch")
@@ -333,8 +441,14 @@ def verify_database(
             "archive_generation": generation,
             "tables": tables,
             "archive": archive,
+            "legacy_projected_archive": legacy_projected_archive,
             "operational": operational,
+            "legacy_dedup_loss": legacy_dedup_loss,
             "overlap_equal": overlap_equal,
+            "legacy_projection_equal": legacy_projection_equal,
+            "legacy_loss_consistent": legacy_loss_consistent,
+            "overlap_status": overlap_status,
+            "warnings": warnings,
             "direct_sourced_equal": direct_sourced_equal,
             "coverage_complete": coverage_complete,
             "query_plan_bounded": query_plan_bounded,

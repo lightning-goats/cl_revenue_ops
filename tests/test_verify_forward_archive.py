@@ -24,10 +24,13 @@ def snapshot_db(tmp_path):
             archive_generation INTEGER NOT NULL,
             created_index INTEGER NOT NULL,
             status TEXT NOT NULL,
+            in_channel TEXT,
+            out_channel TEXT,
             in_msat INTEGER,
             out_msat INTEGER,
             fee_msat INTEGER,
             received_time_ns INTEGER,
+            resolved_time_ns INTEGER,
             PRIMARY KEY (archive_generation, created_index)
         );
         CREATE INDEX idx_forward_archive_v1_status_received
@@ -68,7 +71,8 @@ def snapshot_db(tmp_path):
             in_msat INTEGER NOT NULL,
             out_msat INTEGER NOT NULL,
             fee_msat INTEGER NOT NULL,
-            timestamp INTEGER NOT NULL
+            timestamp INTEGER NOT NULL,
+            resolved_time INTEGER NOT NULL
         );
         CREATE INDEX idx_forwards_time ON forwards(timestamp);
         CREATE TABLE daily_forwarding_stats (
@@ -96,42 +100,95 @@ def snapshot_db(tmp_path):
     )
     connection.executemany(
         """
-        INSERT INTO forward_archive_v1 VALUES (?, ?, 'settled', ?, ?, ?, ?)
+        INSERT INTO forward_archive_v1 (
+            archive_generation, created_index, status,
+            in_channel, out_channel, in_msat, out_msat, fee_msat,
+            received_time_ns, resolved_time_ns
+        ) VALUES (?, ?, 'settled', ?, ?, ?, ?, ?, ?, ?)
         """,
         [
-            (1, 1, 2000, 1900, 100, (DAY_START + 3600) * 1_000_000_000),
-            (1, 2, 3000, 2800, 200, (DAY_START + 7200) * 1_000_000_000),
+            (
+                1, 1, "1x1x1", "2x2x2", 2000, 1900, 100,
+                (DAY_START + 3600) * 1_000_000_000,
+                (DAY_START + 3605) * 1_000_000_000,
+            ),
+            (
+                1, 2, "4x4x4", "3x3x3", 3000, 2800, 200,
+                (DAY_START + 7200) * 1_000_000_000,
+                (DAY_START + 7208) * 1_000_000_000,
+            ),
         ],
     )
     connection.execute(
-        "INSERT INTO forward_archive_coverage_v1 VALUES "
+        "INSERT INTO forward_archive_coverage_v1 ("
+        "archive_generation, date_utc, created_sync_complete, "
+        "updated_sync_complete, aggregate_complete, reconciliation_status, "
+        "reasons_json) VALUES "
         "(1, ?, 1, 1, 1, 'complete', '[]')",
         (DAY_START,),
     )
     connection.executemany(
-        "INSERT INTO forward_daily_channel_v1 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO forward_daily_channel_v1 ("
+        "archive_generation, date_utc, channel_id, settled_forward_count, "
+        "forwarded_in_msat, forwarded_out_msat, fee_msat, "
+        "sourced_forward_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (1, DAY_START, "2x2x2", 1, 2000, 1900, 100, 1),
             (1, DAY_START, "3x3x3", 1, 3000, 2800, 200, 1),
         ],
     )
     connection.execute(
-        "INSERT INTO forwards VALUES (1, '1x1x1', '2x2x2', 2000, 1900, 100, ?)",
-        (DAY_START + 3600,),
+        "INSERT INTO forwards ("
+        "id, in_channel, out_channel, in_msat, out_msat, fee_msat, "
+        "timestamp, resolved_time) "
+        "VALUES (1, '1x1x1', '2x2x2', 2000, 1900, 100, ?, ?)",
+        (DAY_START + 3600, DAY_START + 3605),
     )
     connection.execute(
-        "INSERT INTO daily_forwarding_stats VALUES "
+        "INSERT INTO daily_forwarding_stats ("
+        "channel_id, date, total_in_msat, total_out_msat, total_fee_msat, "
+        "forward_count) VALUES "
         "('3x3x3', ?, 3000, 2800, 200, 1)",
         (DAY_START,),
     )
     connection.execute(
-        "INSERT INTO daily_forwarding_stats_inbound VALUES "
+        "INSERT INTO daily_forwarding_stats_inbound ("
+        "channel_id, date, total_in_msat, total_fee_msat, forward_count) "
+        "VALUES "
         "('1x1x1', ?, 3000, 200, 1)",
         (DAY_START,),
     )
     connection.commit()
     connection.close()
     return path
+
+
+def _add_exact_archive_duplicate(snapshot_db):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(
+        """
+        INSERT INTO forward_archive_v1 (
+            archive_generation, created_index, status,
+            in_channel, out_channel, in_msat, out_msat, fee_msat,
+            received_time_ns, resolved_time_ns
+        )
+        SELECT archive_generation, 3, status,
+               in_channel, out_channel, in_msat, out_msat, fee_msat,
+               received_time_ns, resolved_time_ns
+        FROM forward_archive_v1 WHERE created_index = 1
+        """
+    )
+    connection.execute(
+        "UPDATE forward_daily_channel_v1 "
+        "SET settled_forward_count = settled_forward_count + 1, "
+        "forwarded_in_msat = forwarded_in_msat + 2000, "
+        "forwarded_out_msat = forwarded_out_msat + 1900, "
+        "fee_msat = fee_msat + 100, "
+        "sourced_forward_count = sourced_forward_count + 1 "
+        "WHERE channel_id = '2x2x2'"
+    )
+    connection.commit()
+    connection.close()
 
 
 def test_verifier_matches_archive_to_raw_plus_rollup(snapshot_db):
@@ -142,11 +199,77 @@ def test_verifier_matches_archive_to_raw_plus_rollup(snapshot_db):
     )
 
     assert result["archive"]["settled_forward_count"] == 2
+    assert result["legacy_projected_archive"] == result["archive"]
     assert result["operational"]["settled_forward_count"] == 2
     assert result["overlap_equal"] is True
+    assert result["legacy_projection_equal"] is True
+    assert result["legacy_loss_consistent"] is True
+    assert result["overlap_status"] == "equal"
+    assert result["warnings"] == []
     assert result["coverage_complete"] is True
     assert result["query_plan_bounded"] is True
+    assert any(
+        "idx_forward_archive_v1_status_received" in detail
+        for detail in result["query_plans"]["legacy_projection"]
+    )
     assert result["reasons"] == []
+
+
+def test_verifier_accepts_only_exact_legacy_dedup_projection(snapshot_db):
+    _add_exact_archive_duplicate(snapshot_db)
+
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    assert result["archive"]["settled_forward_count"] == 3
+    assert result["legacy_projected_archive"]["settled_forward_count"] == 2
+    assert result["operational"]["settled_forward_count"] == 2
+    assert result["legacy_dedup_loss"] == {
+        "settled_forward_count": 1,
+        "forwarded_in_msat": 2000,
+        "forwarded_out_msat": 1900,
+        "fee_msat": 100,
+    }
+    assert result["overlap_equal"] is False
+    assert result["legacy_projection_equal"] is True
+    assert result["legacy_loss_consistent"] is True
+    assert result["overlap_status"] == "legacy_dedup_explained"
+    assert result["reasons"] == []
+    assert result["warnings"] == ["legacy_operational_dedup_loss"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE forwards SET in_channel = '9x9x9' WHERE id = 1",
+        "UPDATE forwards SET out_channel = '9x9x9' WHERE id = 1",
+        "UPDATE forwards SET in_msat = in_msat + 1 WHERE id = 1",
+        "UPDATE forwards SET out_msat = out_msat + 1 WHERE id = 1",
+        "UPDATE forwards SET fee_msat = fee_msat + 1 WHERE id = 1",
+        "UPDATE forwards SET timestamp = timestamp + 1 WHERE id = 1",
+        "UPDATE forwards SET resolved_time = resolved_time + 1 WHERE id = 1",
+    ],
+    ids=(
+        "in_channel",
+        "out_channel",
+        "in_msat",
+        "out_msat",
+        "fee_msat",
+        "timestamp",
+        "resolved_time",
+    ),
+)
+def test_verifier_rejects_nonexact_legacy_identity(snapshot_db, mutation):
+    _add_exact_archive_duplicate(snapshot_db)
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(mutation)
+    connection.commit()
+    connection.close()
+
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    assert result["overlap_status"] == "unexplained"
+    assert "archive_operational_mismatch" in result["reasons"]
+    assert result["warnings"] == []
 
 
 def test_verifier_opens_sqlite_read_only(snapshot_db):
@@ -166,6 +289,47 @@ def test_verifier_reports_overlap_mismatch(snapshot_db):
     result = verify_database(snapshot_db, DAY_START, DAY_END)
 
     assert result["overlap_equal"] is False
+    assert result["legacy_dedup_loss"]["fee_msat"] == -1
+    assert result["legacy_loss_consistent"] is False
+    assert result["overlap_status"] == "unexplained"
+    assert "archive_operational_mismatch" in result["reasons"]
+
+
+def test_verifier_rejects_operational_count_above_canonical(snapshot_db):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(
+        "INSERT INTO forwards ("
+        "id, in_channel, out_channel, in_msat, out_msat, fee_msat, "
+        "timestamp, resolved_time) "
+        "VALUES (2, '7x7x7', '8x8x8', 0, 0, 0, ?, ?)",
+        (DAY_START + 8000, DAY_START + 8001),
+    )
+    connection.commit()
+    connection.close()
+
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    assert result["legacy_dedup_loss"]["settled_forward_count"] == -1
+    assert result["legacy_loss_consistent"] is False
+    assert result["overlap_status"] == "unexplained"
+    assert "archive_operational_mismatch" in result["reasons"]
+
+
+def test_verifier_rejects_residual_total_with_matching_projected_count(
+    snapshot_db,
+):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute("UPDATE forwards SET in_msat = in_msat - 1 WHERE id = 1")
+    connection.commit()
+    connection.close()
+
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    assert result["legacy_projected_archive"]["settled_forward_count"] == 2
+    assert result["operational"]["settled_forward_count"] == 2
+    assert result["legacy_projection_equal"] is False
+    assert result["legacy_loss_consistent"] is True
+    assert result["overlap_status"] == "unexplained"
     assert "archive_operational_mismatch" in result["reasons"]
 
 
@@ -191,6 +355,32 @@ def test_verifier_rejects_missing_tables(tmp_path):
 
     with pytest.raises(VerificationError, match="missing required tables"):
         verify_database(path, DAY_START, DAY_END)
+
+
+def test_verifier_rejects_missing_legacy_identity_column(snapshot_db):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute("ALTER TABLE forwards RENAME TO forwards_old")
+    connection.execute(
+        """
+        CREATE TABLE forwards (
+            id INTEGER PRIMARY KEY,
+            in_channel TEXT NOT NULL,
+            out_channel TEXT NOT NULL,
+            in_msat INTEGER NOT NULL,
+            out_msat INTEGER NOT NULL,
+            fee_msat INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(
+        VerificationError,
+        match="table forwards missing required columns: resolved_time",
+    ):
+        verify_database(snapshot_db, DAY_START, DAY_END)
 
 
 def test_verifier_requires_aligned_half_open_bounds(snapshot_db):
