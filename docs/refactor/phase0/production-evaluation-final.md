@@ -626,9 +626,21 @@ coverage/reconciliation artifacts required to count 2026-07-13 through
 The implementation adds independent created/updated CLN cursor capture,
 versioned raw forward evidence, replacement daily/channel aggregates, explicit
 coverage, a bounded read-only `revenue-forward-history` RPC, exact-day validator
-collection, and a read-only raw-plus-rollup overlap verifier. Production
-bootstrap, overlap equality, and the successor 72-hour evidence gate remain
-activation requirements; none is evidence for rebasing this closed report.
+collection, and a read-only raw-plus-rollup overlap verifier.
+
+A read-only production compatibility probe at 2026-08-13 20:32:53 UTC found
+that Core Lightning returns `wait` cursor values at the top level and that
+`listforwards index=updated start=0` includes never-updated rows without an
+`updated_index`. The local synchronizer was corrected before deployment to
+consume the documented top-level payload and begin both one-based cursor
+families at `start=1`; bounded tail probes reached
+`created=170990` and `updated=153049`. These are post-window compatibility
+observations only. No production archive synchronization or database mutation
+was performed, and none of these values enters the closed-window economics.
+
+Production bootstrap, overlap equality, and the successor 72-hour evidence
+gate remain activation requirements; none is evidence for rebasing this closed
+report.
 
 ### Limitations affecting the formal verdict
 
@@ -741,6 +753,7 @@ Analysis workspace:
 - local analysis repo SHA: `a50ef85` (working tree clean before the original report)
 - correction analysis base SHA: `871b4e9`
 - correction evidence captured on analysis host and `lnnode`: 2026-08-13 19:15 UTC
+- read-only CLN cursor-contract probe: 2026-08-13 20:32:53 UTC
 - production repo SHA: `5a45a91753556ce096291e03a9417519b92e8144`
 
 Primary evidence locations:
@@ -784,6 +797,10 @@ ssh lnnode "lightning-cli revenue-dashboard 30"
 ssh lnnode "lightning-cli revenue-profitability"
 ssh lnnode "lightning-cli revenue-econ-reconcile"
 ssh lnnode "lightning-cli listfunds"
+ssh lnnode "lightning-cli wait subsystem=forwards indexname=created nextvalue=0"
+ssh lnnode "lightning-cli wait subsystem=forwards indexname=updated nextvalue=0"
+ssh lnnode "lightning-cli listforwards index=created start=170986 limit=5"
+ssh lnnode "lightning-cli listforwards index=updated start=153045 limit=5"
 ssh lnnode "systemctl list-units --type=service --all | grep -i 'revenue\\|lightning\\|econ'"
 ```
 

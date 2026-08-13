@@ -53,12 +53,15 @@ class ForwardArchiveSynchronizer:
             indexname=family,
             nextvalue=0,
         )
-        try:
-            value = payload["forwards"][family]
-        except (KeyError, TypeError) as exc:
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("subsystem") != "forwards"
+            or family not in payload
+        ):
             raise ForwardArchiveSyncError(
                 f"wait forwards/{family} returned malformed payload"
-            ) from exc
+            )
+        value = payload[family]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ForwardArchiveSyncError(
                 f"wait forwards/{family} returned invalid index"
@@ -125,9 +128,13 @@ class ForwardArchiveSynchronizer:
                 raise ForwardArchiveSyncError(
                     f"{family} page limit {self.MAX_PAGES_PER_FAMILY} exceeded"
                 )
+            # CLN indices are one-based.  start=0 is a special full view; for
+            # updated ordering it includes records that were never updated and
+            # therefore have no updated_index.  Begin both cursor families at 1.
+            request_index = max(1, next_index)
             payload = self.rpc.listforwards(
                 index=family,
-                start=next_index,
+                start=request_index,
                 limit=self.PAGE_LIMIT,
             )
             if not isinstance(payload, Mapping):

@@ -540,8 +540,8 @@ git commit -m "feat: reconcile forward archive daily evidence"
 ```python
 def test_sync_probes_and_pages_cursor_families_independently(store, rpc):
     rpc.wait.side_effect = [
-        {"forwards": {"created": 5}},
-        {"forwards": {"updated": 3}},
+        {"subsystem": "forwards", "created": 5},
+        {"subsystem": "forwards", "updated": 3},
     ]
     rpc.listforwards.side_effect = [
         {"forwards": [_record(created_index=5)]},
@@ -554,15 +554,15 @@ def test_sync_probes_and_pages_cursor_families_independently(store, rpc):
         call(subsystem="forwards", indexname="created", nextvalue=0),
         call(subsystem="forwards", indexname="updated", nextvalue=0),
     ]
-    assert rpc.listforwards.call_args_list[0] == call(index="created", start=0, limit=500)
-    assert rpc.listforwards.call_args_list[1] == call(index="updated", start=0, limit=500)
+    assert rpc.listforwards.call_args_list[0] == call(index="created", start=1, limit=500)
+    assert rpc.listforwards.call_args_list[1] == call(index="updated", start=1, limit=500)
 
 
 def test_sync_rejects_stored_cursor_ahead_of_its_own_live_max(store, rpc):
     store.seed_sync_state("updated", next_index=9)
     rpc.wait.side_effect = [
-        {"forwards": {"created": 20}},
-        {"forwards": {"updated": 4}},
+        {"subsystem": "forwards", "created": 20},
+        {"subsystem": "forwards", "updated": 4},
     ]
     with pytest.raises(ForwardArchiveSyncError, match="updated cursor 9 exceeds live maximum 4"):
         ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=10)
@@ -572,7 +572,10 @@ def test_sync_rejects_stored_cursor_ahead_of_its_own_live_max(store, rpc):
 def test_rpc_or_malformed_page_failure_preserves_both_last_successful_cursors(store, rpc):
     store.seed_sync_state("created", next_index=5)
     store.seed_sync_state("updated", next_index=3)
-    rpc.wait.side_effect = [{"forwards": {"created": 6}}, {"forwards": {"updated": 4}}]
+    rpc.wait.side_effect = [
+        {"subsystem": "forwards", "created": 6},
+        {"subsystem": "forwards", "updated": 4},
+    ]
     rpc.listforwards.return_value = {"forwards": [0]}
     with pytest.raises(ForwardArchiveSyncError):
         ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=10)
@@ -582,7 +585,8 @@ def test_rpc_or_malformed_page_failure_preserves_both_last_successful_cursors(st
 
 def test_sync_calls_only_wait_and_listforwards(store, rpc):
     rpc.wait.side_effect = [
-        {"forwards": {"created": 0}}, {"forwards": {"updated": 0}},
+        {"subsystem": "forwards", "created": 0},
+        {"subsystem": "forwards", "updated": 0},
     ]
     ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=10)
     assert {call[0] for call in rpc.method_calls} <= {"wait", "listforwards"}
@@ -621,12 +625,15 @@ class ForwardArchiveSynchronizer:
         payload = self.rpc.wait(
             subsystem="forwards", indexname=family, nextvalue=0,
         )
-        try:
-            value = payload["forwards"][family]
-        except (KeyError, TypeError) as exc:
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("subsystem") != "forwards"
+            or family not in payload
+        ):
             raise ForwardArchiveSyncError(
                 f"wait forwards/{family} returned malformed payload"
-            ) from exc
+            )
+        value = payload[family]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ForwardArchiveSyncError(
                 f"wait forwards/{family} returned invalid index"
@@ -634,7 +641,7 @@ class ForwardArchiveSynchronizer:
         return value
 ```
 
-Probe both live maxima before applying either family so a regression cannot partially advance a cycle. Page each family from its own stored `next_index`; accept shaped empty pages only when the stored cursor is already beyond the probed maximum. Bound every cycle by `MAX_PAGES_PER_FAMILY`, persist bounded errors, then rebuild/refresh only the touched days after both families complete.
+Probe both live maxima before applying either family so a regression cannot partially advance a cycle. CLN indices are one-based: when persisted `next_index` is the initial zero sentinel, request `start=1`. Never page updated history from `start=0`, because that special full view can include never-updated records without `updated_index`. Page each family from its own stored cursor; accept shaped empty pages only when the stored cursor is already beyond the probed maximum. Bound every cycle by `MAX_PAGES_PER_FAMILY`, persist bounded errors, then rebuild/refresh only the touched days after both families complete.
 
 Wire one `forward_archive_sync` global during `init()` and add an independent `forward_archive_loop()` with a 60-second startup delay, 15-minute fixed interval, `shutdown_event.wait`, heartbeat `forward-archive`, and error isolation. Start it as a daemon thread. The loop must not run through fee authority or rebalance scheduling.
 
@@ -983,11 +990,12 @@ Run only these read-only commands against `lnnode`:
 ```bash
 ssh lnnode "lightning-cli wait subsystem=forwards indexname=created nextvalue=0"
 ssh lnnode "lightning-cli wait subsystem=forwards indexname=updated nextvalue=0"
-ssh lnnode "lightning-cli listforwards index=created start=0 limit=1"
+ssh lnnode "lightning-cli listforwards index=created start=1 limit=1"
+ssh lnnode "lightning-cli listforwards index=updated start=1 limit=1"
 ssh lnnode "lightning-cli listforwards index=updated start=0 limit=1"
 ```
 
-Expected: shaped cursor maxima and records compatible with the parser. Do not deploy, restart, synchronize, mutate configuration, or call any action RPC in this task.
+Expected: top-level cursor maxima, one-based indexed records compatible with the parser, and confirmation that updated `start=0` may return a record without `updated_index`. Do not deploy, restart, synchronize, mutate configuration, or call any action RPC in this task.
 
 - [ ] **Step 5: Review activation gates and commit verification notes**
 

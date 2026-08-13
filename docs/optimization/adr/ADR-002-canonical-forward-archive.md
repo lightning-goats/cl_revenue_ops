@@ -105,10 +105,15 @@ last_error
 schema_version
 ```
 
-Created and updated cursors are never derived from each other. Initial
-bootstrap pages `index=created` from zero. A separate `index=updated` pass
-captures offered-to-terminal transitions. Both loops require monotonic paging
-and must reject a page whose terminal index does not advance.
+Created and updated cursors are never derived from each other. Both CLN
+indices are one-based, so initial bootstrap pages begin at `start=1`.
+`start=0` is not used: in updated ordering it is a special full view that can
+include never-updated records for which `updated_index` is legitimately absent.
+The read-only `wait` response is validated in its documented top-level form
+(`subsystem` plus the requested `created` or `updated` field). A separate
+`index=updated` pass captures offered-to-terminal transitions. Both loops
+require monotonic paging and reject a page whose terminal index does not
+advance.
 
 Numeric gaps are recorded but are not automatically treated as missing rows:
 CLN may omit historical entries. Coverage is expressed as observed source

@@ -76,6 +76,26 @@ forward-retention path:
   the disjoint raw-plus-rollup operational history, checks direct/sourced
   counts and coverage, and records bounded query-plan evidence.
 
+### Read-only production contract probe
+
+A post-window read-only probe on `lnnode` at 2026-08-13 20:32:53 UTC verified
+the Core Lightning cursor contract before activation:
+
+- `wait subsystem=forwards indexname=created nextvalue=0` returned the
+  top-level `created=170990`;
+- the independent updated probe returned top-level `updated=153049`;
+- `listforwards index=updated start=0` returned never-updated rows without an
+  `updated_index`, as permitted by the RPC schema;
+- `listforwards index=updated start=1` returned the first actual update with
+  `updated_index=1`;
+- bounded tail pages for both families returned the probed terminal indices.
+
+The synchronizer was corrected before deployment to validate the top-level
+`wait` shape and bootstrap both one-based cursor families at `start=1`.
+No archive synchronization was run on production, no production database was
+written, and these post-window indices are not part of the closed evaluation
+metrics.
+
 ## Safety and compatibility
 
 - Economic decisions, fee control, candidate ranking, governance, budget
@@ -123,24 +143,25 @@ Focused verification after review fixes:
 Canonical-forward implementation verification:
 
 ```text
-135 passed - archive, synchronizer, RPC, operator, architecture, inventory,
-             listing, parameter, and query-plan coverage
-57 passed  - daily collector, fail-closed watch, and architecture coverage
-47 passed  - read-only verifier, archive, and performance regression coverage
+194 passed - final affected archive, synchronizer, verifier, RPC, collector,
+             watch, operator, architecture, inventory, and compatibility scope
 ```
 
-Full repository functional verification:
+Final repository functional verification:
 
 ```text
-2986 passed, 5 skipped, 2 xfailed
+3092 passed, 5 skipped, 1 deselected, 2 xfailed in 45.30s
 ```
 
-The installed-environment pin assertion is reported separately because the
-shared development virtualenv has dependency drift from `requirements.txt`;
-the functional suite is green when that environment assertion is excluded.
-The five skips require unavailable live/pyln integration infrastructure. The
-two expected failures are the already-staged post-August-12
-compatibility-removal tests and are unrelated to this increment.
+The one deselected assertion was run separately and failed only because the
+shared development virtualenv does not match `requirements.txt`:
+`pyln-client` is 26.4 versus 25.12.1, `PyYAML` is 6.0.3 versus 6.0.1, and
+`numpy` is 2.4.2 versus 1.26.4. This is environment drift, not a functional
+test bypass. The five skips require unavailable live/pyln integration
+infrastructure. The two expected failures are the already-staged
+post-August-12 compatibility-removal tests and are unrelated to this increment.
+Syntax compilation, Pyflakes on changed Python modules, and `git diff --check`
+all exited zero.
 
 ## Performance and persistence impact
 

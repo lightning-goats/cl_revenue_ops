@@ -58,8 +58,8 @@ def _record(
 def test_sync_probes_and_pages_cursor_families_independently(store):
     rpc = MagicMock()
     rpc.wait.side_effect = [
-        {"forwards": {"created": 2}},
-        {"forwards": {"updated": 12}},
+        {"subsystem": "forwards", "created": 2},
+        {"subsystem": "forwards", "updated": 12},
     ]
     rpc.listforwards.side_effect = [
         {"forwards": [
@@ -87,8 +87,8 @@ def test_sync_probes_and_pages_cursor_families_independently(store):
         call(subsystem="forwards", indexname="updated", nextvalue=0),
     ]
     assert rpc.listforwards.call_args_list == [
-        call(index="created", start=0, limit=500),
-        call(index="updated", start=0, limit=500),
+        call(index="created", start=1, limit=500),
+        call(index="updated", start=1, limit=500),
     ]
 
 
@@ -101,8 +101,8 @@ def test_sync_rejects_stored_cursor_ahead_of_its_own_live_max(store):
     )
     rpc = MagicMock()
     rpc.wait.side_effect = [
-        {"forwards": {"created": 20}},
-        {"forwards": {"updated": 4}},
+        {"subsystem": "forwards", "created": 20},
+        {"subsystem": "forwards", "updated": 4},
     ]
 
     with pytest.raises(
@@ -126,8 +126,8 @@ def test_malformed_first_page_preserves_both_last_successful_cursors(store):
     )
     rpc = MagicMock()
     rpc.wait.side_effect = [
-        {"forwards": {"created": 6}},
-        {"forwards": {"updated": 4}},
+        {"subsystem": "forwards", "created": 6},
+        {"subsystem": "forwards", "updated": 4},
     ]
     rpc.listforwards.return_value = {"forwards": [0]}
 
@@ -142,8 +142,9 @@ def test_malformed_first_page_preserves_both_last_successful_cursors(store):
     "payload, error",
     [
         ({}, "malformed payload"),
-        ({"forwards": {"created": True}}, "invalid index"),
-        ({"forwards": {"created": -1}}, "invalid index"),
+        ({"subsystem": "forwards", "created": True}, "invalid index"),
+        ({"subsystem": "forwards", "created": -1}, "invalid index"),
+        ({"subsystem": "invoices", "created": 1}, "malformed payload"),
     ],
 )
 def test_live_max_payload_fails_closed(store, payload, error):
@@ -178,8 +179,8 @@ def test_unknown_archive_schema_version_disables_sync_before_rpc(store):
 def test_page_limit_fails_bounded_after_committed_page(store):
     rpc = MagicMock()
     rpc.wait.side_effect = [
-        {"forwards": {"created": 2}},
-        {"forwards": {"updated": 0}},
+        {"subsystem": "forwards", "created": 2},
+        {"subsystem": "forwards", "updated": 0},
     ]
     rpc.listforwards.return_value = {
         "forwards": [_record(created_index=1)]
@@ -198,8 +199,8 @@ def test_page_limit_fails_bounded_after_committed_page(store):
 def test_caught_up_empty_source_calls_no_listforwards(store):
     rpc = MagicMock()
     rpc.wait.side_effect = [
-        {"forwards": {"created": 0}},
-        {"forwards": {"updated": 0}},
+        {"subsystem": "forwards", "created": 0},
+        {"subsystem": "forwards", "updated": 0},
     ]
 
     result = ForwardArchiveSynchronizer(rpc, store, _log).sync_once(
@@ -216,8 +217,8 @@ def test_caught_up_empty_source_calls_no_listforwards(store):
 def test_sync_ignores_records_newer_than_probed_snapshot(store):
     rpc = MagicMock()
     rpc.wait.side_effect = [
-        {"forwards": {"created": 2}},
-        {"forwards": {"updated": 0}},
+        {"subsystem": "forwards", "created": 2},
+        {"subsystem": "forwards", "updated": 0},
     ]
     rpc.listforwards.return_value = {
         "forwards": [
@@ -238,8 +239,8 @@ def test_sync_ignores_records_newer_than_probed_snapshot(store):
 def test_sync_rpc_allowlist_is_wait_and_listforwards_only(store):
     rpc = MagicMock()
     rpc.wait.side_effect = [
-        {"forwards": {"created": 0}},
-        {"forwards": {"updated": 0}},
+        {"subsystem": "forwards", "created": 0},
+        {"subsystem": "forwards", "updated": 0},
     ]
 
     ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=10)
