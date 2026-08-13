@@ -11,7 +11,6 @@ import os
 import re
 from pathlib import Path
 import subprocess
-import pytest
 
 
 def _source_files():
@@ -242,6 +241,40 @@ class TestRebalanceDataServiceBoundary:
             raise AssertionError("RebalanceEngine call missing data_service=...")
 
         raise AssertionError("RebalanceEngine call not found in cl-revenue-ops.py")
+
+
+class TestForwardArchiveReadOnlyBoundary:
+    def test_forward_history_rpc_only_calls_archive_history(self):
+        source = (ROOT / "cl-revenue-ops.py").read_text()
+        tree = ast.parse(source, filename="cl-revenue-ops.py")
+        function = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "revenue_forward_history"
+            ),
+            None,
+        )
+        assert function is not None
+        assert function.args.kwarg is None
+
+        def dotted_name(node):
+            parts = []
+            while isinstance(node, ast.Attribute):
+                parts.append(node.attr)
+                node = node.value
+            if isinstance(node, ast.Name):
+                parts.append(node.id)
+            return ".".join(reversed(parts))
+
+        database_calls = sorted(
+            dotted_name(node.func)
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and dotted_name(node.func).startswith("database.")
+        )
+        assert database_calls == ["database.forward_archive.history"]
 
 
 class TestNoSlingDependency:

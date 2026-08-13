@@ -152,7 +152,7 @@ Repeat the retained preflight RPCs. Also confirm:
   rebalance state without planner, Boltz, or LN+ scheduler state;
 - `revenue-rebalance-debug` is available and budgets show daily, weekly,
   global, and per-channel constraints;
-- `lightning-cli help` lists exactly the reviewed 36-method plugin surface;
+- `lightning-cli help` lists exactly the reviewed 37-method plugin surface;
 - no `revenue-planner*`, `revenue-boltz*`, or `revenue-lnplus*` method is
   registered;
 - `revenue-cycle` accepts only `fees`, `rebalance`, `flow`, and `all`;

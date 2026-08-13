@@ -126,6 +126,7 @@ def test_plugin_listing_rpc_and_safe_default_contract():
         "revenue-fee-debug",
         "revenue-rebalance-debug",
         "revenue-profitability",
+        "revenue-forward-history",
     }.issubset(methods)
 
     assert options["revenue-ops-fee-market-boundary-enabled"]["default"] == "false"

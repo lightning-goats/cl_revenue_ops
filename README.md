@@ -218,9 +218,10 @@ lightning-cli revenue-config set daily_budget_sats 10000
 | `revenue-profile-preview [name]` | Preview a risk-profile change |
 | `revenue-econ-snapshot` | Read the canonical economic snapshot |
 | `revenue-econ-reconcile` | Read ledger/reservation reconciliation |
+| `revenue-forward-history <since> <until> [channel_id] [limit]` | Read bounded canonical forward evidence for UTC-midnight bounds |
 | `revenue-econ-cycle` | Run the deterministic shadow economic cycle |
 
-The complete 36-method contract and mutation classification is in [the action RPC inventory](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md).
+The complete 37-method contract and mutation classification is in [the action RPC inventory](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md).
 
 ### Retained compatibility aliases
 
@@ -242,7 +243,7 @@ method-not-found.
 
 `cl_revenue_ops` is a fully independent local executor. The former cl-hive/cl-mycelium hint integration was removed entirely in 2026-07 (`docs/audit/HIVE_REMOVAL_PLAN.md`); `tests/test_architecture_guard.py` pins that no hive/fleet coordination code returns.
 
-The read-only operator surfaces `revenue-status`, `revenue-fee-debug`, and `revenue-rebalance-debug` must keep returning JSON with no external plugins present, and read-only surfaces must never call fee, rebalance, spend, or CLN mutation RPCs. Removed planner, Boltz, and LN+ method names must remain absent.
+The read-only operator surfaces `revenue-status`, `revenue-fee-debug`, `revenue-rebalance-debug`, and `revenue-forward-history` must keep returning JSON with no external plugins present, and read-only surfaces must never call fee, rebalance, spend, or CLN mutation RPCs. Removed planner, Boltz, and LN+ method names must remain absent.
 
 ## Public Contract Docs
 

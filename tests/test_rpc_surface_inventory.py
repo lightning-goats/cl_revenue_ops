@@ -16,6 +16,7 @@ EXPECTED_RPC_METHODS = frozenset({
     "revenue-analyze",
     "revenue-wake-all", "revenue-set-fee",
     "revenue-rebalance", "revenue-profitability", "revenue-history",
+    "revenue-forward-history",
     "revenue-ignore", "revenue-unignore", "revenue-list-ignored",
     "revenue-policy",
     "revenue-report", "revenue-hot-channel-protection-peers",
@@ -48,4 +49,4 @@ def test_rpc_surface_matches():
 
 def test_expected_count():
     # Post-peer-ban-removal retained RPC surface.
-    assert len(EXPECTED_RPC_METHODS) == 36
+    assert len(EXPECTED_RPC_METHODS) == 37

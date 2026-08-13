@@ -54,6 +54,7 @@ from modules.capital_efficiency import CapitalEfficiencyAnalyzer
 from modules.segment_observations import SegmentObservationStore
 from modules.utils import normalize_scid, parse_msat
 from modules.econ_shadow import EconShadow
+from modules.forward_archive import ForwardArchiveError
 from modules.forward_archive_sync import ForwardArchiveSynchronizer
 
 
@@ -4036,6 +4037,52 @@ def revenue_profitability(plugin: Plugin, channel_id: Optional[str] = None, refr
             }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+@plugin.method("revenue-forward-history")
+def revenue_forward_history(
+    plugin: Plugin,
+    history_since: int,
+    history_until: int,
+    channel_id: Optional[str] = None,
+    limit: int = 1000,
+) -> Dict[str, Any]:
+    """Return bounded canonical forward evidence for UTC-midnight bounds."""
+    if database is None or not hasattr(database, "forward_archive"):
+        return {"error": "Forward archive not initialized"}
+    try:
+        if any(isinstance(value, bool) for value in (
+            history_since, history_until, limit
+        )):
+            raise ValueError("history bounds and limit must be integers")
+        if channel_id is not None and not isinstance(channel_id, str):
+            raise ValueError("channel_id must be a string")
+        start = int(history_since)
+        end = int(history_until)
+        bounded_limit = int(limit)
+        if start % 86400 or end % 86400:
+            raise ValueError(
+                "history bounds must be UTC-midnight aligned"
+            )
+        if end <= start:
+            raise ValueError(
+                "history_until must be greater than history_since"
+            )
+        if end - start > 400 * 86400:
+            raise ValueError("history window exceeds 400 days")
+        if not 1 <= bounded_limit <= 5000:
+            raise ValueError("limit must be between 1 and 5000")
+        normalized_channel = (
+            normalize_scid(channel_id) if channel_id else None
+        )
+        return database.forward_archive.history(
+            start,
+            end,
+            normalized_channel,
+            bounded_limit,
+        )
+    except (TypeError, ValueError, ForwardArchiveError) as exc:
+        return {"error": str(exc)}
 
 
 @plugin.method("revenue-history")

@@ -354,6 +354,96 @@ def test_init_keeps_plugin_available_when_forward_archive_sync_is_unavailable(
     )
 
 
+def test_revenue_forward_history_is_bounded_read_only_delegate():
+    mod = _load_operator_surface_module()
+    expected = {"coverage": [], "rows": []}
+    mod.database.forward_archive.history.return_value = expected
+
+    result = mod.revenue_forward_history(
+        mod.plugin,
+        history_since=1786492800,
+        history_until=1786579200,
+        channel_id="1:2:3",
+        limit=50,
+    )
+
+    mod.database.forward_archive.history.assert_called_once_with(
+        1786492800,
+        1786579200,
+        "1x2x3",
+        50,
+    )
+    assert result == expected
+    calls = str(mod.database.method_calls).lower()
+    assert not any(
+        name in calls
+        for name in (
+            "sync",
+            "apply",
+            "repair",
+            "fee",
+            "rebalance",
+            "reserve",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {
+            "history_since": 1786492801,
+            "history_until": 1786579200,
+        },
+        {
+            "history_since": 1786492800,
+            "history_until": 1786492800,
+        },
+        {
+            "history_since": 1786492800,
+            "history_until": 1786579200,
+            "limit": 5001,
+        },
+        {
+            "history_since": 1786492800,
+            "history_until": 1786492800 + 401 * 86400,
+        },
+        {
+            "history_since": 1786492800,
+            "history_until": 1786579200,
+            "limit": True,
+        },
+        {
+            "history_since": 1786492800,
+            "history_until": 1786579200,
+            "channel_id": 123,
+        },
+    ],
+)
+def test_revenue_forward_history_rejects_unbounded_or_unaligned_requests(
+    kwargs,
+):
+    mod = _load_operator_surface_module()
+
+    result = mod.revenue_forward_history(mod.plugin, **kwargs)
+
+    assert "error" in result
+    mod.database.forward_archive.history.assert_not_called()
+
+
+def test_revenue_forward_history_is_neutral_when_archive_is_absent():
+    mod = _load_operator_surface_module()
+    mod.database = SimpleNamespace()
+
+    result = mod.revenue_forward_history(
+        mod.plugin,
+        history_since=1786492800,
+        history_until=1786579200,
+    )
+
+    assert result == {"error": "Forward archive not initialized"}
+
+
 def test_revenue_rebalance_debug_includes_last_cycle_score_breakdown():
     mod = load_plugin_module()
     mod.config = Config()

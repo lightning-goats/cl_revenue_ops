@@ -1,23 +1,23 @@
 # Public compatibility catalog (liquidity executors retired)
 
 What the refactor MUST keep working (refactor invariants 2 and 3).
-Pin test: `tests/test_rpc_surface_inventory.py` (36 retained methods).
+Pin test: `tests/test_rpc_surface_inventory.py` (37 retained methods).
 
 ## RPC surface
 
 Primary operator surfaces (must remain schema-compatible; per
 refactor.md Workstream I these become facades over projections):
 `revenue-status`, `revenue-fee-authority-status`, `revenue-fee-debug`,
-`revenue-rebalance-debug`,
+`revenue-rebalance-debug`, `revenue-forward-history`,
 `revenue-config get|set`, `revenue-profitability`, `revenue-analyze`,
 `revenue-wake-all`, `revenue-dashboard`, `revenue-health`.
 
 Action/mutation RPCs (AGENTS.md list; execution-gated): see AGENTS.md
 "Action RPC warning".
 Classification per method: `docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md`
-(current v3 inventory, refreshed 2026-08-03).
+(current v3 inventory, refreshed 2026-08-13).
 
-Full 36-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
+Full 37-method list: `EXPECTED_RPC_METHODS` in the pin test is normative.
 
 Phase C retained operator-surface dispatchers: `revenue-cycle <subsystem>`,
 `revenue-budget [section]`, and the diagnostic `revenue-policy` actions are the
