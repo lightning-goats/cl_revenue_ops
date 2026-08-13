@@ -176,7 +176,7 @@ def test_unknown_archive_schema_version_disables_sync_before_rpc(store):
     rpc.listforwards.assert_not_called()
 
 
-def test_page_limit_fails_bounded_after_committed_page(store):
+def test_page_limit_returns_checkpointed_backlog_without_sync_error(store):
     rpc = MagicMock()
     rpc.wait.side_effect = [
         {"subsystem": "forwards", "created": 2},
@@ -189,11 +189,45 @@ def test_page_limit_fails_bounded_after_committed_page(store):
     sync.PAGE_LIMIT = 1
     sync.MAX_PAGES_PER_FAMILY = 1
 
-    with pytest.raises(ForwardArchiveSyncError, match="page limit"):
-        sync.sync_once(now_ns=10)
+    result = sync.sync_once(now_ns=10)
 
+    assert result.caught_up is False
+    assert result.backlog_family == "created"
+    assert result.created_pages == 1
+    assert result.updated_pages == 0
+    assert result.touched_dates == (1699920000,)
     assert store.get_sync_state("created")["next_index"] == 2
+    assert store.get_sync_state("created")["last_error"] is None
     assert rpc.listforwards.call_count == 1
+
+
+def test_next_cycle_resumes_checkpoint_and_reaches_catch_up(store):
+    rpc = MagicMock()
+    rpc.wait.side_effect = [
+        {"subsystem": "forwards", "created": 2},
+        {"subsystem": "forwards", "updated": 0},
+        {"subsystem": "forwards", "created": 2},
+        {"subsystem": "forwards", "updated": 0},
+    ]
+    rpc.listforwards.side_effect = [
+        {"forwards": [_record(created_index=1)]},
+        {"forwards": [_record(created_index=2)]},
+    ]
+    sync = ForwardArchiveSynchronizer(rpc, store, _log)
+    sync.PAGE_LIMIT = 1
+    sync.MAX_PAGES_PER_FAMILY = 1
+
+    first = sync.sync_once(now_ns=10)
+    second = sync.sync_once(now_ns=11)
+
+    assert first.caught_up is False
+    assert second.caught_up is True
+    assert second.backlog_family is None
+    assert rpc.listforwards.call_args_list == [
+        call(index="created", start=1, limit=1),
+        call(index="created", start=2, limit=1),
+    ]
+    assert store.get_sync_state("created")["next_index"] == 3
 
 
 def test_caught_up_empty_source_calls_no_listforwards(store):
@@ -212,6 +246,39 @@ def test_caught_up_empty_source_calls_no_listforwards(store):
     rpc.listforwards.assert_not_called()
     assert store.get_sync_state("created")["last_success_at"] == result.observed_at_ns
     assert store.get_sync_state("updated")["last_success_at"] == result.observed_at_ns
+
+
+def test_updated_backlog_preserves_dates_from_all_committed_records(store):
+    rpc = MagicMock()
+    rpc.wait.side_effect = [
+        {"subsystem": "forwards", "created": 1},
+        {"subsystem": "forwards", "updated": 2},
+    ]
+    rpc.listforwards.side_effect = [
+        {"forwards": [_record(created_index=1)]},
+        {"forwards": [
+            _record(
+                created_index=2,
+                updated_index=1,
+                received_time="1700086400",
+            )
+        ]},
+    ]
+    sync = ForwardArchiveSynchronizer(rpc, store, _log)
+    sync.PAGE_LIMIT = 1
+    sync.MAX_PAGES_PER_FAMILY = 1
+
+    result = sync.sync_once(now_ns=10)
+
+    assert result.caught_up is False
+    assert result.backlog_family == "updated"
+    assert result.created_pages == 1
+    assert result.updated_pages == 1
+    assert result.touched_dates == (1699920000, 1700006400)
+    assert store.get_sync_state("updated")["next_index"] == 2
+    assert store.get_sync_state("updated")["last_error"] is None
+
+
 
 
 def test_sync_ignores_records_newer_than_probed_snapshot(store):

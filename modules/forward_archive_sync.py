@@ -27,6 +27,8 @@ class SyncResult:
     updated_pages: int
     touched_dates: tuple[int, ...]
 
+    caught_up: bool
+    backlog_family: Optional[str]
 
 class ForwardArchiveSynchronizer:
     """Synchronize independent CLN created/updated cursor families."""
@@ -109,7 +111,7 @@ class ForwardArchiveSynchronizer:
         family: str,
         live_max: int,
         observed_at_ns: int,
-    ) -> tuple[int, set[int]]:
+    ) -> tuple[int, set[int], bool]:
         pages = 0
         touched_dates: set[int] = set()
         next_index = int(self.store.get_sync_state(family)["next_index"])
@@ -121,13 +123,11 @@ class ForwardArchiveSynchronizer:
                 live_max_index=live_max,
             )
             touched_dates.update(result.touched_dates)
-            return pages, touched_dates
+            return pages, touched_dates, True
 
         while next_index <= live_max:
             if pages >= self.MAX_PAGES_PER_FAMILY:
-                raise ForwardArchiveSyncError(
-                    f"{family} page limit {self.MAX_PAGES_PER_FAMILY} exceeded"
-                )
+                return pages, touched_dates, False
             # CLN indices are one-based.  start=0 is a special full view; for
             # updated ordering it includes records that were never updated and
             # therefore have no updated_index.  Begin both cursor families at 1.
@@ -167,7 +167,7 @@ class ForwardArchiveSynchronizer:
                     f"{family} page did not advance cursor {next_index}"
                 )
             next_index = result.next_index
-        return pages, touched_dates
+        return pages, touched_dates, True
 
     def sync_once(self, now_ns: Optional[int] = None) -> SyncResult:
         """Run one bounded cycle using only ``wait`` and ``listforwards``."""
@@ -183,14 +183,36 @@ class ForwardArchiveSynchronizer:
             self._validate_live_cursor("updated", updated_live_max)
 
             error_families = ("created",)
-            created_pages, created_dates = self._page_family(
+            created_pages, created_dates, created_caught_up = self._page_family(
                 "created", created_live_max, observed_at_ns
             )
             error_families = ("updated",)
-            updated_pages, updated_dates = self._page_family(
+            if not created_caught_up:
+                return SyncResult(
+                    observed_at_ns=observed_at_ns,
+                    created_live_max=created_live_max,
+                    updated_live_max=updated_live_max,
+                    created_pages=created_pages,
+                    updated_pages=0,
+                    touched_dates=tuple(sorted(created_dates)),
+                    caught_up=False,
+                    backlog_family="created",
+                )
+            updated_pages, updated_dates, updated_caught_up = self._page_family(
                 "updated", updated_live_max, observed_at_ns
             )
             touched_dates = created_dates | updated_dates
+            if not updated_caught_up:
+                return SyncResult(
+                    observed_at_ns=observed_at_ns,
+                    created_live_max=created_live_max,
+                    updated_live_max=updated_live_max,
+                    created_pages=created_pages,
+                    updated_pages=updated_pages,
+                    touched_dates=tuple(sorted(touched_dates)),
+                    caught_up=False,
+                    backlog_family="updated",
+                )
             observed_seconds = observed_at_ns // 1_000_000_000
             current_day = observed_seconds - (observed_seconds % 86400)
             if current_day >= 86400:
@@ -207,6 +229,8 @@ class ForwardArchiveSynchronizer:
                 updated_live_max=updated_live_max,
                 created_pages=created_pages,
                 updated_pages=updated_pages,
+                caught_up=True,
+                backlog_family=None,
                 touched_dates=tuple(sorted(touched_dates)),
             )
         except Exception as exc:
