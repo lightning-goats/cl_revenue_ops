@@ -1,8 +1,8 @@
 # Phase 0 Measurement Hardening — Reconciliation Evidence
 
 **Date:** 2026-08-13
-**Scope:** Phase 0.1–0.2
-**Status:** Implemented locally; production gate not started
+**Scope:** Phase 0.1–0.6
+**Status:** Implemented locally; production activation and gate not started
 **Recommendation:** **CONTINUE SHADOW**
 
 ## Hypothesis
@@ -50,7 +50,31 @@ response. Callers may optionally supply explicit `history_since` and
 includes paired runs and a mechanical expected/completed/clean/failure summary.
 The summary is based on unique expected UTC-hour slots, exposes missing,
 duplicate, and truncated evidence, and cannot report all-clean when fee-intent
-completeness is unknown or mismatched. No new RPC surface was added.
+completeness is unknown or mismatched. No new reconciliation RPC surface was
+added.
+
+### Canonical forward evidence
+
+Phase 0.6 adds evidence infrastructure independent of the legacy operational
+forward-retention path:
+
+- `forward_archive_v1` stores losslessly normalized CLN forward records keyed
+  by `created_index`;
+- separate persisted `created` and `updated` cursors prevent one index family
+  from masking incomplete coverage in the other;
+- a bounded 15-minute daemon uses only read-only `wait` and `listforwards`
+  calls and is isolated from fee authority, rebalancing, and plugin startup;
+- replacement-based daily/channel aggregates and per-day coverage cannot mark
+  missing, unresolved, malformed, mismatched, or truncated evidence complete;
+- `revenue-forward-history` requires explicit UTC-midnight bounds, caps the
+  window and row limit, and delegates only to the archive history reader;
+- the daily validator requests exactly one closed UTC day and classifies any
+  missing, mismatched, truncated, or incomplete response as required economic
+  evidence loss;
+- `tools/audit/verify_forward_archive.py` opens only a copied/local database in
+  SQLite `mode=ro`, discovers the current schema, compares archive totals with
+  the disjoint raw-plus-rollup operational history, checks direct/sourced
+  counts and coverage, and records bounded query-plan evidence.
 
 ## Safety and compatibility
 
@@ -67,6 +91,12 @@ completeness is unknown or mismatched. No new RPC surface was added.
 - Default `revenue-econ-reconcile` calls do not include history and retain their
   prior fields.
 - The new audit events are ignored by economic ledger replay.
+- The forward archive is evidence-only. Existing fee, profitability, and
+  rebalance decisions continue to read their existing operational sources.
+- Archive migration is additive; construction and cycle failures do not block
+  the revenue plugin or authorize fallback behavior.
+- Archive collection and verification call no payment, fee, policy, config,
+  channel, wallet, or rebalance action RPC.
 - No Sling, Hive, mycelium, fleet, LN+, Boltz, planner, or peer-ban execution
   dependency was introduced.
 
@@ -88,6 +118,15 @@ Focused verification after review fixes:
 
 ```text
 63 passed
+```
+
+Canonical-forward implementation verification:
+
+```text
+135 passed - archive, synchronizer, RPC, operator, architecture, inventory,
+             listing, parameter, and query-plan coverage
+57 passed  - daily collector, fail-closed watch, and architecture coverage
+47 passed  - read-only verifier, archive, and performance regression coverage
 ```
 
 Full repository functional verification:
@@ -120,11 +159,12 @@ reconstruct history or completion pairing by scanning the full ledger.
 - A failure that prevents the economic ledger itself from opening cannot be
   recorded in that same ledger. The missing expected start remains a
   completeness failure and the plugin still emits a warning.
-- This increment does not repair the daily collector, manifest classifications,
-  stale `t0`, forward-history retention, or daily completeness ledger. Those
-  remain separate Phase 0 changes.
+- The archive cannot recreate raw route-pair or amount-bucket events already
+  pruned before its first successful production bootstrap. It improves the
+  successor window; it does not retroactively repair the closed evaluation.
 - The 2026-08-08 fee-intent mismatch remains uninvestigated.
-- No production deployment or 72-hour evidence run occurred in this increment.
+- No production archive deployment, stable bootstrap, overlap proof, or
+  72-hour evidence run occurred in this increment.
 
 ## Economic impact
 
@@ -135,7 +175,7 @@ but does not change routing revenue, fees, liquidity, or spend.
 ## Activation recommendation
 
 **CONTINUE SHADOW.** Merge and deploy this measurement-only increment through
-the normal release process, then complete the collector/daily-completeness work.
-The Phase 0 gate requires at least 72 consecutive hours reconstructed solely
-from durable evidence before any live algorithm optimization is eligible for
-activation.
+the normal release process, allow both cursor families to reach stable
+watermarks, run the read-only overlap verifier on a copied database, and then
+start the 72-hour durable-evidence gate. No live algorithm optimization is
+eligible for activation until that gate passes.

@@ -616,6 +616,20 @@ Attribution conclusion:
 
 ## Data limitations
 
+### Post-window measurement-hardening amendment (2026-08-13)
+
+The canonical archive was implemented after the evaluation window closed. It
+improves successor-window evidence but does not retroactively create the hourly
+coverage/reconciliation artifacts required to count 2026-07-13 through
+2026-08-12; the formal YELLOW verdict and 0/31 counted-day result are unchanged.
+
+The implementation adds independent created/updated CLN cursor capture,
+versioned raw forward evidence, replacement daily/channel aggregates, explicit
+coverage, a bounded read-only `revenue-forward-history` RPC, exact-day validator
+collection, and a read-only raw-plus-rollup overlap verifier. Production
+bootstrap, overlap equality, and the successor 72-hour evidence gate remain
+activation requirements; none is evidence for rebasing this closed report.
+
 ### Limitations affecting the formal verdict
 
 - historical clean reconciliation sweeps were not durably captured
@@ -681,9 +695,11 @@ Why:
 
 Required foundational fixes before algorithm work should be trusted:
 
-1. persist or collect clean hourly reconciliation results durably
-2. add canonical created-index forward archival, explicit coverage, and bounded read-only aggregate history
-3. update validation collection to standalone-only surfaces (`revenue-budget`, `revenue-econ-reconcile`, no `hive-members`)
+1. deploy and prove the locally implemented durable hourly reconciliation
+2. deploy the locally implemented canonical created-index forward archive,
+   explicit coverage, and bounded read-only aggregate history
+3. run the corrected standalone-only validation collector and pass the
+   successor 72-hour durable-evidence gate
 
 After those fixes, the strongest algorithmic order suggested by production evidence is:
 
@@ -736,6 +752,26 @@ Primary evidence locations:
 - live node DBs:
   - `/data/lightningd/.lightning/revenue_ops.db`
   - `/data/lightningd/.lightning/econ_ledger.db`
+
+Post-window canonical-forward implementation evidence:
+
+- `modules/forward_archive.py`
+- `modules/forward_archive_sync.py`
+- `tools/audit/verify_forward_archive.py`
+- `tests/test_forward_archive.py`
+- `tests/test_forward_archive_sync.py`
+- `tests/test_verify_forward_archive.py`
+- `docs/optimization/adr/ADR-002-canonical-forward-archive.md`
+
+The verifier is intentionally run against a copied/local database, not a live
+writable production database:
+
+```bash
+.venv/bin/python tools/audit/verify_forward_archive.py \
+  --database /path/to/copied-revenue_ops.db \
+  --history-since 1786492800 \
+  --history-until 1786579200
+```
 
 Representative live commands used:
 

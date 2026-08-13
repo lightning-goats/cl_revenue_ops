@@ -1,6 +1,6 @@
 # ADR-002: Canonical Forward Archive and Auditable Daily Aggregates
 
-**Status:** Approved approach; written-spec review pending
+**Status:** Accepted; implementation complete, production activation pending
 **Date:** 2026-08-13
 **Scope:** Phase 0.6 measurement integrity only
 
