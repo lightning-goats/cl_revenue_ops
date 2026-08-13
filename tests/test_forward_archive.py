@@ -490,6 +490,52 @@ def _seed_complete_day(store, day=1699920000):
     return observed
 
 
+def test_closed_days_needing_rebuild_is_bounded_and_excludes_current_day():
+    store, _connection = _memory_store()
+    current_day = 1700006400
+    missing_day = current_day - 86400
+    complete_day = current_day - 2 * 86400
+    checked_at = (current_day + 60) * 1_000_000_000
+    records = [
+        _settled_page_record(
+            1, 11, "1x1x1", "2x2x2", 2000, 1900, 100,
+            str(complete_day + 3600),
+        ),
+        _settled_page_record(
+            2, 12, "1x1x1", "2x2x2", 3000, 2800, 200,
+            str(missing_day + 3600),
+        ),
+        _settled_page_record(
+            3, 13, "1x1x1", "2x2x2", 4000, 3700, 300,
+            str(current_day + 3600),
+        ),
+    ]
+    store.apply_page("created", records, checked_at, live_max_index=3)
+    store.apply_page("updated", records, checked_at, live_max_index=13)
+    store.rebuild_days([complete_day], checked_at)
+
+    result = store.closed_days_needing_rebuild(current_day)
+
+    assert result == (missing_day,)
+    assert current_day not in result
+    assert "idx_forward_archive_v1_received" in (
+        store.explain_closed_days_needing_rebuild(current_day)
+    )
+
+    store.rebuild_days(result, checked_at)
+
+    assert store.closed_days_needing_rebuild(current_day) == ()
+
+
+def test_closed_days_needing_rebuild_rejects_invalid_bounds():
+    store, _connection = _memory_store()
+
+    with pytest.raises(ForwardArchiveError, match="UTC-midnight"):
+        store.closed_days_needing_rebuild(1700006401)
+    with pytest.raises(ForwardArchiveError, match="retention_days"):
+        store.closed_days_needing_rebuild(1700006400, retention_days=401)
+
+
 def test_rebuild_day_is_replacement_based_and_idempotent():
     store, _connection = _memory_store()
     checked_at = _seed_complete_day(store)

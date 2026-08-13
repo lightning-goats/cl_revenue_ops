@@ -303,6 +303,32 @@ def test_sync_ignores_records_newer_than_probed_snapshot(store):
     assert row[0] == 2
 
 
+def test_caught_up_cycle_recovers_missing_closed_day_coverage(store):
+    day = 1699920000
+    observed = (day + 2 * 86400) * 1_000_000_000
+    record = _record(
+        created_index=1,
+        updated_index=1,
+        status="settled",
+        received_time=str(day + 3600),
+    )
+    store.apply_page("created", [record], observed, live_max_index=1)
+    store.apply_page("updated", [record], observed, live_max_index=1)
+    rpc = MagicMock()
+    rpc.wait.side_effect = [
+        {"subsystem": "forwards", "created": 1},
+        {"subsystem": "forwards", "updated": 1},
+    ]
+
+    result = ForwardArchiveSynchronizer(rpc, store, _log).sync_once(
+        now_ns=observed
+    )
+
+    assert result.caught_up is True
+    assert day in result.touched_dates
+    assert store.history(day, day + 86400, None, 100)["complete"] is True
+
+
 def test_sync_rpc_allowlist_is_wait_and_listforwards_only(store):
     rpc = MagicMock()
     rpc.wait.side_effect = [

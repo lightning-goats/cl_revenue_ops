@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 ARCHIVE_SCHEMA_VERSION = 1
 ARCHIVE_GENERATION = 1
+MAX_ARCHIVE_RETENTION_DAYS = 400
 _NS_PER_SECOND = Decimal(1_000_000_000)
 
 
@@ -705,6 +706,92 @@ class ForwardArchiveStore:
         if day % 86400:
             raise ForwardArchiveError("date_utc must be UTC-midnight aligned")
         return day
+
+    def _validate_closed_day_recovery_bounds(
+        self,
+        current_day_utc: int,
+        retention_days: int,
+    ) -> tuple[int, int]:
+        current_day = self._validate_day(current_day_utc)
+        retention = _nonnegative_int(
+            retention_days, "retention_days", optional=False
+        )
+        if not 1 <= retention <= MAX_ARCHIVE_RETENTION_DAYS:
+            raise ForwardArchiveError(
+                "retention_days must be between 1 and "
+                f"{MAX_ARCHIVE_RETENTION_DAYS}"
+            )
+        return current_day, retention
+
+    def _closed_days_needing_rebuild_query(
+        self,
+        current_day_utc: int,
+        retention_days: int,
+        *,
+        explain: bool = False,
+    ):
+        current_day, retention = self._validate_closed_day_recovery_bounds(
+            current_day_utc, retention_days
+        )
+        prefix = "EXPLAIN QUERY PLAN " if explain else ""
+        sql = prefix + """
+            WITH archive_days AS (
+                SELECT DISTINCT
+                    (received_time_ns / 86400000000000) * 86400 AS date_utc
+                FROM forward_archive_v1
+                    INDEXED BY idx_forward_archive_v1_received
+                WHERE archive_generation = ?
+                  AND received_time_ns >= ?
+                  AND received_time_ns < ?
+            )
+            SELECT archive_days.date_utc
+            FROM archive_days
+            LEFT JOIN forward_archive_coverage_v1 AS coverage
+              ON coverage.archive_generation = ?
+             AND coverage.date_utc = archive_days.date_utc
+            WHERE coverage.date_utc IS NULL
+               OR coverage.created_sync_complete != 1
+               OR coverage.updated_sync_complete != 1
+               OR coverage.aggregate_complete != 1
+               OR coverage.reconciliation_status != 'complete'
+               OR coverage.reasons_json != '[]'
+            ORDER BY archive_days.date_utc
+            LIMIT 401
+        """
+        start_ns = (current_day - retention * 86400) * 1_000_000_000
+        end_ns = current_day * 1_000_000_000
+        return self._connection_provider().execute(
+            sql,
+            (ARCHIVE_GENERATION, start_ns, end_ns, ARCHIVE_GENERATION),
+        )
+
+    def closed_days_needing_rebuild(
+        self,
+        current_day_utc: int,
+        retention_days: int = MAX_ARCHIVE_RETENTION_DAYS,
+    ) -> tuple[int, ...]:
+        """Return retained closed archive days lacking complete coverage."""
+        rows = self._closed_days_needing_rebuild_query(
+            current_day_utc, retention_days
+        ).fetchall()
+        if len(rows) > MAX_ARCHIVE_RETENTION_DAYS:
+            raise ForwardArchiveError(
+                "closed-day recovery exceeds 400-day bound"
+            )
+        return tuple(int(row[0]) for row in rows)
+
+    def explain_closed_days_needing_rebuild(
+        self,
+        current_day_utc: int,
+        retention_days: int = MAX_ARCHIVE_RETENTION_DAYS,
+    ) -> str:
+        """Explain the bounded closed-day recovery query plan."""
+        return " ".join(
+            str(row[3])
+            for row in self._closed_days_needing_rebuild_query(
+                current_day_utc, retention_days, explain=True
+            ).fetchall()
+        )
 
     def rebuild_days(
         self,

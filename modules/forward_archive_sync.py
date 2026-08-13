@@ -215,6 +215,10 @@ class ForwardArchiveSynchronizer:
                 )
             observed_seconds = observed_at_ns // 1_000_000_000
             current_day = observed_seconds - (observed_seconds % 86400)
+            recovery_dates = set(
+                self.store.closed_days_needing_rebuild(current_day)
+            )
+            touched_dates |= recovery_dates
             if current_day >= 86400:
                 touched_dates.add(current_day - 86400)
             if touched_dates:
