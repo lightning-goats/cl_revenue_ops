@@ -191,8 +191,13 @@ A day is `complete` only when:
 Missing data is null/incomplete, never zero/complete.
 
 The first implementation also cross-checks overlapping history against the
-existing operational raw-plus-rollup totals. A mismatch is a deployment blocker,
-not an automatic rewrite of historical evidence.
+existing operational raw-plus-rollup totals. Canonical archive totals remain
+authoritative. Production overlap passes when either canonical totals equal
+operational raw-plus-rollup totals, or the archive projected through the exact
+legacy operational unique key equals all four operational totals and every
+canonical delta is nonnegative. Explained legacy loss is quantified as a
+warning. Any residual difference fails closed. This projection is an
+offline/read-only comparison and never rewrites historical evidence.
 
 ### Synchronization lifecycle
 
@@ -236,6 +241,18 @@ The daily validator collects this RPC as
 `required_for_economic_metrics`. A missing, mismatched, truncated, or
 incomplete requested day makes economic evidence incomplete without changing
 production behavior.
+
+### Bounded bootstrap and closed-day recovery
+
+The configured page bound is a checkpointed partial result, not a plugin
+failure: committed pages, the next cursor, sampled watermark, backlog family,
+and touched UTC dates remain durable. The synchronizer reports incomplete
+coverage until both cursor families catch up. Once caught up, missing or
+incomplete retained closed days are rebuilt through the deterministic
+rebuild_days() path, bounded by the existing 400-day retention contract.
+Current-day coverage is excluded. Recovery is idempotent, so restart or
+repetition produces the same aggregates and coverage rows; exceeding the
+bound fails explicitly rather than truncating silently.
 
 ## Retention and bounded growth
 
@@ -307,7 +324,9 @@ Production activation requires:
 
 1. schema migration succeeds;
 2. historical bootstrap reaches a stable created/updated watermark;
-3. overlapping archive totals equal operational raw-plus-rollup totals;
+3. canonical totals either equal operational raw-plus-rollup totals, or the
+   exact legacy-key projection equals all four operational totals with
+   nonnegative canonical deltas and quantified legacy loss;
 4. at least 72 consecutive UTC hours show complete coverage;
 5. independent review finds no action path or decision-path dependency.
 

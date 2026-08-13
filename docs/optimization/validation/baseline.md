@@ -75,6 +75,14 @@ No successor validation window is active. The configured
 `formal_window_active=false`. It identifies measurement-hardening evidence only;
 it is not a successor-window activation record.
 
+state: preflight
+formal_window_active: false
+72-hour durable-evidence gate: not started
+
+The forward-archive preflight correction is documented in the [design](../plans/2026-08-13-forward-archive-preflight-corrections-design.md),
+[implementation plan](../plans/2026-08-13-forward-archive-preflight-corrections.md),
+and [measurement-hardening finding](../findings/phase0-measurement-hardening.md).
+
 Before a successor window can start, an operator must commit an activation
 record to this file containing:
 

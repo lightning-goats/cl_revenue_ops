@@ -25,6 +25,10 @@ closed UTC day through a bounded read-only RPC. Optional diagnostic loss is a
 warning; required evidence loss remains fail closed. Economic behavior is
 unchanged. Production activation and the 72-hour evidence gate remain pending.
 
+state: preflight
+formal_window_active=false
+72-hour durable-evidence gate: not started
+
 Live algorithm changes remain blocked until the Phase 0 production gate proves
 at least 72 consecutive hours of reconstructable completeness from durable
 evidence.
@@ -81,3 +85,7 @@ and a separately approved production rollout.
 - [Frozen baseline and boundary register](validation/baseline.md)
 - [Architecture decisions](adr/)
 - [Phase evidence and findings](findings/)
+
+Forward archive preflight references: [correction design](plans/2026-08-13-forward-archive-preflight-corrections-design.md),
+[implementation plan](plans/2026-08-13-forward-archive-preflight-corrections.md),
+and [measurement-hardening finding](findings/phase0-measurement-hardening.md).

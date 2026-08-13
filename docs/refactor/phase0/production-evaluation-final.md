@@ -876,4 +876,27 @@ Key reproducibility notes:
 
 ## Summary judgment
 
+### Post-window canonical archive amendment (2026-08-13)
+
+After the original report was frozen, copied-database verification discovered
+that the legacy operational forwards table undercounts legitimate same-second
+duplicate forwards because its uniqueness key collapses distinct CLN
+created_index records. The canonical archive measured 1,592 settled forwards
+and 20,264.370 sats in fees over the overlap, versus 1,559 forwards and
+19,993.272 sats in the operational raw-plus-rollup view. Projecting the
+canonical rows through the exact legacy key reproduces all four operational
+totals, so the difference is explained legacy loss rather than archive
+duplication.
+
+This post-window canonical measurement discovery does not change the frozen
+report arithmetic, headline metric tables, counted-day adjudication, or
+FORMAL VERDICT: YELLOW. The original operational evidence remains the
+historical basis of this report; the canonical archive is successor-window
+evidence only. The [correction design](../../optimization/plans/2026-08-13-forward-archive-preflight-corrections-design.md),
+[implementation plan](../../optimization/plans/2026-08-13-forward-archive-preflight-corrections.md),
+and [measurement-hardening finding](../../optimization/findings/phase0-measurement-hardening.md)
+document the preflight state. No successor window is active
+and the 72-hour durable-evidence gate has not started.
+
+
 The refactor did not fail economically in production. It failed to earn a formally trustworthy GREEN because the production evidence pipeline was not hardened enough to satisfy its own frozen counted-day standard. The optimization program should not treat this as a clean economic pass; it should treat it as a telemetry-qualified economic pass with a mandatory measurement hardening step before algorithm claims are trusted.

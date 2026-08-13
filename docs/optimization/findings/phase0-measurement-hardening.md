@@ -200,3 +200,30 @@ the normal release process, allow both cursor families to reach stable
 watermarks, run the read-only overlap verifier on a copied database, and then
 start the 72-hour durable-evidence gate. No live algorithm optimization is
 eligible for activation until that gate passes.
+
+## Forward archive production preflight amendment (2026-08-13)
+
+The production preflight was loaded at deployment SHA
+`cf0cf49d847e656d27c8abc54acccbdec89300f5`. The bounded bootstrap caught up
+the sampled cursor watermarks at created=171047 and updated=153095, but
+page-limit continuations were logged at error severity and rendered by Core
+Lightning as false **BROKEN** messages. Dates accumulated during those
+partial cycles were lost when the exception unwound before rebuild_days();
+only two coverage rows remained after the initial catch-up. These are the
+corrections recorded in the approved design and implementation plan.
+
+Copied-database verification of the frozen 2026-07-13 through 2026-08-13 UTC
+overlap found:
+
+| Source | Settled forwards | Inbound | Outbound | Fees |
+| --- | ---: | ---: | ---: | ---: |
+| Canonical archive | 1,592 | authoritative canonical total | authoritative canonical total | 20,264.370 sats |
+| Operational raw plus rollup | 1,559 | 180,054,800.496 sats | 180,034,807.224 sats | 19,993.272 sats |
+
+The exact legacy operational uniqueness-key projection is 1,559 forwards,
+180,054,800.496 sats inbound, 180,034,807.224 sats outbound, and 19,993.272
+sats in fees: it equals all four operational totals. The 33-forward, 271.098-sat
+canonical delta is therefore quantified as explained legacy deduplication loss,
+not archive duplication; canonical totals remain authoritative. The successor
+window remains inactive: state is preflight, formal_window_active=false,
+and the 72-hour durable-evidence gate has not started.
