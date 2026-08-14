@@ -2414,6 +2414,26 @@ class Database:
         """, (channel_id, peer_id, old_fee_ppm, new_fee_ppm, reason, 1 if manual else 0, now,
               reason_code, heuristic_modifiers))
     
+    def get_fee_changes_between(
+        self, since_timestamp: int, until_timestamp: int
+    ) -> List[Dict[str, Any]]:
+        """Return every fee change in a deterministic half-open interval."""
+        for name, value in (
+            ("since_timestamp", since_timestamp),
+            ("until_timestamp", until_timestamp),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if until_timestamp < since_timestamp:
+            raise ValueError("until_timestamp cannot precede since_timestamp")
+        rows = self._get_connection().execute(
+            "SELECT * FROM fee_changes "
+            "WHERE timestamp >= ? AND timestamp < ? "
+            "ORDER BY timestamp, id",
+            (since_timestamp, until_timestamp),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_recent_fee_changes(self, limit: int = 10, channel_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get recent fee changes, optionally filtered by channel."""
         limit = max(1, min(int(limit), 10000))  # SEC-10: Clamp limit

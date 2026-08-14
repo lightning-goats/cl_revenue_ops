@@ -62,6 +62,47 @@ def _index_names(conn, table):
     return {r[1] for r in conn.execute(f"PRAGMA index_list({table})").fetchall()}
 
 
+def test_get_fee_changes_between_is_complete_stable_and_read_only(tmp_path):
+    db = _make_db(tmp_path)
+    conn = db._get_connection()
+    cycle = NOW - 3600
+    rows = [("1x1x0", "02" + "a" * 64, 1, 2, "test", 0, cycle - 1,
+             "test", None)]
+    rows += [(f"2x{i}x0", "02" + "b" * 64, 2, 3, "test", 0,
+              cycle + 1 + i, "test", None) for i in range(493)]
+    rows += [(f"3x{i}x0", "02" + "c" * 64, 3, 4, "test", 0, cycle,
+              "test", None) for i in range(9)]
+    rows += [("4x1x0", "02" + "d" * 64, 4, 5, "test", 0,
+              cycle + 600, "test", None)]
+    conn.executemany(
+        "INSERT INTO fee_changes "
+        "(channel_id,peer_id,old_fee_ppm,new_fee_ppm,reason,manual,"
+        "timestamp,reason_code,heuristic_modifiers) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    before = conn.total_changes
+
+    result = db.get_fee_changes_between(cycle, cycle + 600)
+
+    assert conn.total_changes == before
+    assert len(result) == 502
+    tied = [row for row in result if row["timestamp"] == cycle]
+    assert len(tied) == 9
+    assert [row["id"] for row in tied] == sorted(row["id"] for row in tied)
+    assert all(cycle <= row["timestamp"] < cycle + 600 for row in result)
+
+
+@pytest.mark.parametrize("since,until", [
+    (True, NOW), (NOW, False), ("1", NOW), (NOW, None), (-1, NOW),
+    (NOW, NOW - 1),
+])
+def test_get_fee_changes_between_rejects_invalid_bounds(tmp_path, since, until):
+    db = _make_db(tmp_path)
+    with pytest.raises(ValueError):
+        db.get_fee_changes_between(since, until)
+
+
 # =============================================================================
 # 1. Indexes & PRAGMAs
 # =============================================================================
@@ -97,6 +138,18 @@ class TestIndexes:
             (NOW - 90 * 86400,),
         )
         assert "idx_fee_changes_time" in plan
+
+    def test_fee_changes_between_uses_bounded_time_search(self, tmp_path):
+        db = _make_db(tmp_path)
+        plan = _plan(
+            db._get_connection(),
+            "SELECT * FROM fee_changes WHERE timestamp >= ? AND timestamp < ? "
+            "ORDER BY timestamp, id",
+            (NOW - 86400, NOW + 1),
+        )
+        assert "SEARCH fee_changes" in plan
+        assert "idx_fee_changes_time" in plan
+        assert "SCAN fee_changes" not in plan
 
     def test_forwards_channels_index_dropped(self, tmp_path):
         """idx_forwards_channels is a strict prefix of idx_forwards_unique and
