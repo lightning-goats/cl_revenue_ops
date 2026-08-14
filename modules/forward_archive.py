@@ -92,6 +92,40 @@ _RECORD_COLUMNS = (
 )
 
 
+_HISTORY_ARCHIVE_DAILY_TOTALS_SQL = """
+    SELECT (received_time_ns / 86400000000000) * 86400 AS date_utc,
+           COUNT(*) AS settled_forward_count,
+           COALESCE(SUM(in_msat), 0) AS forwarded_in_msat,
+           COALESCE(SUM(out_msat), 0) AS forwarded_out_msat,
+           COALESCE(SUM(fee_msat), 0) AS fee_msat
+    FROM forward_archive_v1
+        INDEXED BY idx_forward_archive_v1_status_received
+    WHERE archive_generation = ? AND status = 'settled'
+      AND received_time_ns >= ? AND received_time_ns < ?
+    GROUP BY date_utc
+    ORDER BY date_utc
+"""
+
+_HISTORY_DAILY_CHANNEL_TOTALS_SQL = """
+    SELECT date_utc,
+           COALESCE(SUM(settled_forward_count), 0)
+               AS settled_forward_count,
+           COALESCE(SUM(forwarded_in_msat), 0) AS forwarded_in_msat,
+           COALESCE(SUM(forwarded_out_msat), 0) AS forwarded_out_msat,
+           COALESCE(SUM(fee_msat), 0) AS fee_msat,
+           COALESCE(SUM(sourced_forward_count), 0)
+               AS sourced_forward_count,
+           COALESCE(SUM(sourced_volume_msat), 0) AS sourced_volume_msat,
+           COALESCE(SUM(sourced_fee_msat), 0) AS sourced_fee_msat
+    FROM forward_daily_channel_v1
+        INDEXED BY idx_forward_daily_channel_v1_date
+    WHERE archive_generation = ?
+      AND date_utc >= ? AND date_utc < ?
+    GROUP BY date_utc
+    ORDER BY date_utc
+"""
+
+
 def _decimal(value: Any, field: str) -> Decimal:
     if isinstance(value, bool):
         raise ForwardArchiveError(f"{field}: expected numeric value")
@@ -1244,44 +1278,11 @@ class ForwardArchiveStore:
         start_ns = start * 1_000_000_000
         end_ns = end * 1_000_000_000
         archive_daily_rows = connection.execute(
-            """
-            SELECT (received_time_ns / 86400000000000) * 86400 AS date_utc,
-                   COUNT(*) AS settled_forward_count,
-                   COALESCE(SUM(in_msat), 0) AS forwarded_in_msat,
-                   COALESCE(SUM(out_msat), 0) AS forwarded_out_msat,
-                   COALESCE(SUM(fee_msat), 0) AS fee_msat
-            FROM forward_archive_v1
-                INDEXED BY idx_forward_archive_v1_status_received
-            WHERE archive_generation = ? AND status = 'settled'
-              AND received_time_ns >= ? AND received_time_ns < ?
-            GROUP BY date_utc
-            ORDER BY date_utc
-            """,
+            _HISTORY_ARCHIVE_DAILY_TOTALS_SQL,
             (ARCHIVE_GENERATION, start_ns, end_ns),
         ).fetchall()
         aggregate_daily_rows = connection.execute(
-            """
-            SELECT date_utc,
-                   COALESCE(SUM(settled_forward_count), 0)
-                       AS settled_forward_count,
-                   COALESCE(SUM(forwarded_in_msat), 0)
-                       AS forwarded_in_msat,
-                   COALESCE(SUM(forwarded_out_msat), 0)
-                       AS forwarded_out_msat,
-                   COALESCE(SUM(fee_msat), 0) AS fee_msat,
-                   COALESCE(SUM(sourced_forward_count), 0)
-                       AS sourced_forward_count,
-                   COALESCE(SUM(sourced_volume_msat), 0)
-                       AS sourced_volume_msat,
-                   COALESCE(SUM(sourced_fee_msat), 0)
-                       AS sourced_fee_msat
-            FROM forward_daily_channel_v1
-                INDEXED BY idx_forward_daily_channel_v1_date
-            WHERE archive_generation = ?
-              AND date_utc >= ? AND date_utc < ?
-            GROUP BY date_utc
-            ORDER BY date_utc
-            """,
+            _HISTORY_DAILY_CHANNEL_TOTALS_SQL,
             (ARCHIVE_GENERATION, start, end),
         ).fetchall()
 
@@ -1469,6 +1470,40 @@ class ForwardArchiveStore:
                 start, end, channel_id, 1, explain=True
             ).fetchall()
         )
+
+    def explain_history_reconciliation_queries(
+        self,
+        history_since: int,
+        history_until: int,
+    ) -> dict[str, str]:
+        """Return plans for the exact bounded history consistency queries."""
+        start, end, _limit = self._validate_history_bounds(
+            history_since, history_until, 1
+        )
+        queries = {
+            "archive_daily_totals": (
+                _HISTORY_ARCHIVE_DAILY_TOTALS_SQL,
+                (
+                    ARCHIVE_GENERATION,
+                    start * 1_000_000_000,
+                    end * 1_000_000_000,
+                ),
+            ),
+            "daily_channel_totals": (
+                _HISTORY_DAILY_CHANNEL_TOTALS_SQL,
+                (ARCHIVE_GENERATION, start, end),
+            ),
+        }
+        connection = self._connection_provider()
+        return {
+            name: " ".join(
+                str(row[3])
+                for row in connection.execute(
+                    "EXPLAIN QUERY PLAN " + sql, params
+                ).fetchall()
+            )
+            for name, (sql, params) in queries.items()
+        }
 
     def prune_raw(
         self,

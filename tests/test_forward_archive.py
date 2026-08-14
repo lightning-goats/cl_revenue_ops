@@ -773,6 +773,24 @@ def test_history_query_plan_uses_bounded_date_index():
     assert "SCAN forward_daily_channel_v1" not in plan
 
 
+def test_history_reconciliation_query_plans_are_bounded_searches():
+    store, _connection = _memory_store()
+
+    plans = store.explain_history_reconciliation_queries(
+        1699920000, 1700006400
+    )
+
+    expected = {
+        "archive_daily_totals": "idx_forward_archive_v1_status_received",
+        "daily_channel_totals": "idx_forward_daily_channel_v1_date",
+    }
+    for name, index_name in expected.items():
+        plan = plans[name]
+        assert "SEARCH " in plan, (name, plan)
+        assert index_name in plan, (name, plan)
+        assert "SCAN " not in plan, (name, plan)
+
+
 def test_channel_filtered_history_returns_channel_filtered_totals():
     store, _connection = _memory_store()
     day = 1699920000
