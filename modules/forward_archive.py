@@ -92,20 +92,6 @@ _RECORD_COLUMNS = (
 )
 
 
-_HISTORY_ARCHIVE_DAILY_TOTALS_SQL = """
-    SELECT (received_time_ns / 86400000000000) * 86400 AS date_utc,
-           COUNT(*) AS settled_forward_count,
-           COALESCE(SUM(in_msat), 0) AS forwarded_in_msat,
-           COALESCE(SUM(out_msat), 0) AS forwarded_out_msat,
-           COALESCE(SUM(fee_msat), 0) AS fee_msat
-    FROM forward_archive_v1
-        INDEXED BY idx_forward_archive_v1_status_received
-    WHERE archive_generation = ? AND status = 'settled'
-      AND received_time_ns >= ? AND received_time_ns < ?
-    GROUP BY date_utc
-    ORDER BY date_utc
-"""
-
 _HISTORY_DAILY_CHANNEL_TOTALS_SQL = """
     SELECT date_utc,
            COALESCE(SUM(settled_forward_count), 0)
@@ -1275,12 +1261,6 @@ class ForwardArchiveStore:
             "sourced_volume_msat",
             "sourced_fee_msat",
         )
-        start_ns = start * 1_000_000_000
-        end_ns = end * 1_000_000_000
-        archive_daily_rows = connection.execute(
-            _HISTORY_ARCHIVE_DAILY_TOTALS_SQL,
-            (ARCHIVE_GENERATION, start_ns, end_ns),
-        ).fetchall()
         aggregate_daily_rows = connection.execute(
             _HISTORY_DAILY_CHANNEL_TOTALS_SQL,
             (ARCHIVE_GENERATION, start, end),
@@ -1305,13 +1285,9 @@ class ForwardArchiveStore:
                     result[day] = dict(row)
             return result, valid
 
-        archive_by_day, archive_evidence_valid = strict_daily_map(
-            archive_daily_rows, total_fields
-        )
         aggregate_by_day, aggregate_evidence_valid = strict_daily_map(
             aggregate_daily_rows, aggregate_fields
         )
-        zero_archive = {field: 0 for field in total_fields}
         zero_aggregate = {field: 0 for field in aggregate_fields}
         coverage = []
         coverage_day_complete = []
@@ -1413,27 +1389,21 @@ class ForwardArchiveStore:
                     and reasons == []
                     and item["reconciliation_status"] == "complete"
                 )
-                canonical = archive_by_day.get(day, zero_archive)
                 aggregate = aggregate_by_day.get(day, zero_aggregate)
                 reconciliation_matches = (
-                    archive_evidence_valid
-                    and aggregate_evidence_valid
+                    aggregate_evidence_valid
                     and all(
-                        item[field] == canonical[field]
+                        item[field] == aggregate[field]
                         for field in total_fields
                     )
                     and item["sourced_forward_count"]
-                    == canonical["settled_forward_count"]
-                    and all(
-                        aggregate[field] == canonical[field]
-                        for field in total_fields
-                    )
+                    == aggregate["sourced_forward_count"]
                     and aggregate["sourced_forward_count"]
-                    == canonical["settled_forward_count"]
+                    == aggregate["settled_forward_count"]
                     and aggregate["sourced_volume_msat"]
-                    == canonical["forwarded_in_msat"]
+                    == aggregate["forwarded_in_msat"]
                     and aggregate["sourced_fee_msat"]
-                    == canonical["fee_msat"]
+                    == aggregate["fee_msat"]
                 )
                 day_complete = (
                     storage_contract_valid and reconciliation_matches
@@ -1512,14 +1482,6 @@ class ForwardArchiveStore:
             history_since, history_until, 1
         )
         queries = {
-            "archive_daily_totals": (
-                _HISTORY_ARCHIVE_DAILY_TOTALS_SQL,
-                (
-                    ARCHIVE_GENERATION,
-                    start * 1_000_000_000,
-                    end * 1_000_000_000,
-                ),
-            ),
             "daily_channel_totals": (
                 _HISTORY_DAILY_CHANNEL_TOTALS_SQL,
                 (ARCHIVE_GENERATION, start, end),

@@ -862,6 +862,28 @@ def test_prune_requires_complete_reconciled_coverage():
     ).fetchone()[0] == 0
 
 
+def test_history_remains_complete_after_authorized_raw_pruning():
+    store, connection = _memory_store()
+    day = 1699920000
+    checked_at = _seed_complete_day(store, day)
+    store.rebuild_days([day], checked_at)
+    before = store.history(day, day + 86400, None, 100)
+
+    now_ns = (day + 401 * 86400) * 1_000_000_000
+    assert store.prune_raw(now_ns=now_ns, retention_days=400) == 2
+    changes_before_history = connection.total_changes
+    after = store.history(day, day + 86400, None, 100)
+
+    assert connection.total_changes == changes_before_history
+    assert connection.execute(
+        "SELECT COUNT(*) FROM forward_archive_v1"
+    ).fetchone()[0] == 0
+    assert before["complete"] is True
+    assert after["complete"] is True
+    assert after["coverage"][0]["reasons"] == []
+    assert after["totals"] == before["totals"]
+
+
 def test_history_query_plan_uses_bounded_date_index():
     store, _connection = _memory_store()
 
@@ -879,7 +901,6 @@ def test_history_reconciliation_query_plans_are_bounded_searches():
     )
 
     expected = {
-        "archive_daily_totals": "idx_forward_archive_v1_status_received",
         "daily_channel_totals": "idx_forward_daily_channel_v1_date",
     }
     for name, index_name in expected.items():
