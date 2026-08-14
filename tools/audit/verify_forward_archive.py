@@ -180,27 +180,24 @@ _MALFORMED_SETTLED_LEGACY_KEY_SQL = """
 _ARCHIVE_RECEIVED_NULL_SQL = """
     SELECT 1
     FROM forward_archive_v1
-        INDEXED BY idx_forward_archive_v1_status_received
-    WHERE archive_generation = ? AND status = 'settled'
-      AND received_time_ns IS NULL
+        INDEXED BY idx_forward_archive_v1_received_generation
+    WHERE received_time_ns IS NULL AND status = 'settled'
     LIMIT 1
 """
 
 _ARCHIVE_RECEIVED_NEGATIVE_SQL = """
     SELECT 1
     FROM forward_archive_v1
-        INDEXED BY idx_forward_archive_v1_status_received
-    WHERE archive_generation = ? AND status = 'settled'
-      AND received_time_ns < 0
+        INDEXED BY idx_forward_archive_v1_received_generation
+    WHERE received_time_ns < 0 AND status = 'settled'
     LIMIT 1
 """
 
 _ARCHIVE_RECEIVED_TYPE_DOMAIN_SQL = """
     SELECT 1
     FROM forward_archive_v1
-        INDEXED BY idx_forward_archive_v1_status_received
-    WHERE archive_generation = ? AND status = 'settled'
-      AND received_time_ns >= ''
+        INDEXED BY idx_forward_archive_v1_received_generation
+    WHERE received_time_ns >= '' AND status = 'settled'
       AND typeof(received_time_ns) IN ('text', 'blob')
     LIMIT 1
 """
@@ -507,15 +504,15 @@ def verify_database(
         ).fetchone()["malformed_settled_count"]
         malformed_settled_count += sum((
             _sentinel_found(
-                connection, _ARCHIVE_RECEIVED_NULL_SQL, (generation,)
+                connection, _ARCHIVE_RECEIVED_NULL_SQL, ()
             ),
             _sentinel_found(
-                connection, _ARCHIVE_RECEIVED_NEGATIVE_SQL, (generation,)
+                connection, _ARCHIVE_RECEIVED_NEGATIVE_SQL, ()
             ),
             _sentinel_found(
                 connection,
                 _ARCHIVE_RECEIVED_TYPE_DOMAIN_SQL,
-                (generation,),
+                (),
             ),
         ))
         malformed_operational_count = connection.execute(
@@ -733,15 +730,15 @@ def verify_database(
                 connection, _MALFORMED_SETTLED_LEGACY_KEY_SQL, archive_params
             ),
             "archive_received_null": _query_plan(
-                connection, _ARCHIVE_RECEIVED_NULL_SQL, (generation,)
+                connection, _ARCHIVE_RECEIVED_NULL_SQL, ()
             ),
             "archive_received_negative": _query_plan(
-                connection, _ARCHIVE_RECEIVED_NEGATIVE_SQL, (generation,)
+                connection, _ARCHIVE_RECEIVED_NEGATIVE_SQL, ()
             ),
             "archive_received_type_domain": _query_plan(
                 connection,
                 _ARCHIVE_RECEIVED_TYPE_DOMAIN_SQL,
-                (generation,),
+                (),
             ),
             "malformed_operational_identity": _query_plan(
                 connection, _MALFORMED_OPERATIONAL_KEY_SQL, (start, end)
@@ -806,13 +803,13 @@ def verify_database(
                 "idx_forward_archive_v1_status_received"
             ),
             "archive_received_null": (
-                "idx_forward_archive_v1_status_received"
+                "idx_forward_archive_v1_received_generation"
             ),
             "archive_received_negative": (
-                "idx_forward_archive_v1_status_received"
+                "idx_forward_archive_v1_received_generation"
             ),
             "archive_received_type_domain": (
-                "idx_forward_archive_v1_status_received"
+                "idx_forward_archive_v1_received_generation"
             ),
             "malformed_operational_identity": "idx_forwards_time",
             "operational_timestamp_null": "idx_forwards_time",

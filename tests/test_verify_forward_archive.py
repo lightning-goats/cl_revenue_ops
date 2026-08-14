@@ -473,6 +473,42 @@ def test_verifier_rejects_nonexact_legacy_identity(snapshot_db, mutation):
     assert result["warnings"] == []
 
 
+@pytest.mark.parametrize(
+    "received_time_sql",
+    [
+        "NULL",
+        "-1",
+        "'not-a-time'",
+        "X'01'",
+    ],
+    ids=("null", "negative", "text", "blob"),
+)
+def test_verifier_detects_invalid_archive_timestamp_in_undiscovered_generation(
+    snapshot_db, capsys, received_time_sql
+):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(
+        "INSERT INTO forward_archive_v1 ("
+        "archive_generation, created_index, status, in_channel, out_channel, "
+        "in_msat, out_msat, fee_msat, received_time_ns, resolved_time_ns) "
+        "VALUES (2, 1, 'settled', '1x1x1', '2x2x2', 2000, 1900, 100, "
+        f"{received_time_sql}, ?)",
+        ((DAY_START + 3605) * 1_000_000_000,),
+    )
+    connection.commit()
+    connection.close()
+
+    exit_code = main([
+        "--database", str(snapshot_db),
+        "--history-since", str(DAY_START),
+        "--history-until", str(DAY_END),
+    ])
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert "malformed_settled_record" in result["reasons"]
+
+
 def test_verifier_malformed_timestamp_plans_are_bounded_searches(
     snapshot_db,
 ):
@@ -492,6 +528,10 @@ def test_verifier_malformed_timestamp_plans_are_bounded_searches(
         plan = " ".join(result["query_plans"][name])
         assert "SEARCH " in plan, (name, plan)
         assert "SCAN " not in plan, (name, plan)
+        if name.startswith("archive_received_"):
+            assert (
+                "idx_forward_archive_v1_received_generation" in plan
+            ), (name, plan)
 
 
 def test_verifier_accepts_numeric_text_timestamp_via_integer_affinity(
