@@ -592,6 +592,15 @@ class ForwardArchiveStore:
                         and incoming_updated < stored_updated
                     )
                     if first_terminal or newer_update:
+                        old_received_time_ns = existing["received_time_ns"]
+                        if old_received_time_ns is not None:
+                            old_received_seconds = (
+                                int(old_received_time_ns) // 1_000_000_000
+                            )
+                            touched_dates.add(
+                                old_received_seconds
+                                - (old_received_seconds % 86400)
+                            )
                         self._update_record(connection, record)
                         updated += 1
                         changed = True
@@ -617,6 +626,34 @@ class ForwardArchiveStore:
                     touched_dates.add(
                         received_seconds - (received_seconds % 86400)
                     )
+
+            for day in touched_dates:
+                connection.execute(
+                    """
+                    UPDATE forward_archive_coverage_v1
+                    SET created_sync_complete = 0,
+                        updated_sync_complete = 0,
+                        aggregate_complete = 0,
+                        settled_forward_count = NULL,
+                        forwarded_in_msat = NULL,
+                        forwarded_out_msat = NULL,
+                        fee_msat = NULL,
+                        sourced_forward_count = NULL,
+                        reconciliation_status = ?,
+                        reasons_json = ?,
+                        checked_at = ?,
+                        schema_version = ?
+                    WHERE archive_generation = ? AND date_utc = ?
+                    """,
+                    (
+                        "incomplete",
+                        "[\"archive_page_changed\"]",
+                        observed,
+                        ARCHIVE_SCHEMA_VERSION,
+                        ARCHIVE_GENERATION,
+                        day,
+                    ),
+                )
 
             terminal_index = indexes[-1] if indexes else None
             if terminal_index is not None and terminal_index < current_next:
@@ -735,7 +772,7 @@ class ForwardArchiveStore:
         )
         prefix = "EXPLAIN QUERY PLAN " if explain else ""
         sql = prefix + """
-            WITH archive_days AS (
+            WITH candidate_days AS (
                 SELECT DISTINCT
                     (received_time_ns / 86400000000000) * 86400 AS date_utc
                 FROM forward_archive_v1
@@ -743,26 +780,40 @@ class ForwardArchiveStore:
                 WHERE archive_generation = ?
                   AND received_time_ns >= ?
                   AND received_time_ns < ?
+                UNION
+                SELECT date_utc
+                FROM forward_archive_coverage_v1
+                    INDEXED BY idx_forward_archive_coverage_v1_date
+                WHERE archive_generation = ?
+                  AND date_utc >= ? AND date_utc < ?
             )
-            SELECT archive_days.date_utc
-            FROM archive_days
+            SELECT candidate_days.date_utc
+            FROM candidate_days
             LEFT JOIN forward_archive_coverage_v1 AS coverage
               ON coverage.archive_generation = ?
-             AND coverage.date_utc = archive_days.date_utc
+             AND coverage.date_utc = candidate_days.date_utc
             WHERE coverage.date_utc IS NULL
                OR coverage.created_sync_complete != 1
                OR coverage.updated_sync_complete != 1
                OR coverage.aggregate_complete != 1
                OR coverage.reconciliation_status != 'complete'
                OR coverage.reasons_json != '[]'
-            ORDER BY archive_days.date_utc
+            ORDER BY candidate_days.date_utc
             LIMIT 401
         """
         start_ns = (current_day - retention * 86400) * 1_000_000_000
         end_ns = current_day * 1_000_000_000
         return self._connection_provider().execute(
             sql,
-            (ARCHIVE_GENERATION, start_ns, end_ns, ARCHIVE_GENERATION),
+            (
+                ARCHIVE_GENERATION,
+                start_ns,
+                end_ns,
+                ARCHIVE_GENERATION,
+                current_day - retention * 86400,
+                current_day,
+                ARCHIVE_GENERATION,
+            ),
         )
 
     def closed_days_needing_rebuild(

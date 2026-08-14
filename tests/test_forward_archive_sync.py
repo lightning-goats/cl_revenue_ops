@@ -236,6 +236,98 @@ def test_next_cycle_resumes_checkpoint_and_reaches_catch_up(store):
     assert store.get_sync_state("created")["next_index"] == 3
 
 
+def test_partial_update_invalidates_old_and_new_days_until_restart_catches_up(
+    store,
+):
+    old_day = 1699833600
+    new_day = old_day + 86400
+    current_day = new_day + 86400
+    observed = (current_day + 60) * 1_000_000_000
+    old_record = _record(
+        created_index=1,
+        updated_index=1,
+        status="settled",
+        received_time=str(old_day + 3600),
+    )
+    second_old_record = _record(
+        created_index=2,
+        updated_index=2,
+        status="settled",
+        received_time=str(old_day + 7200),
+    )
+    store.apply_page(
+        "created", [old_record, second_old_record], observed, live_max_index=2
+    )
+    store.apply_page(
+        "updated", [old_record, second_old_record], observed, live_max_index=2
+    )
+    store.rebuild_days([old_day, new_day], observed)
+    assert store.history(old_day, current_day, None, 100)["complete"] is True
+
+    partial_rpc = MagicMock()
+    partial_rpc.wait.side_effect = [
+        {"subsystem": "forwards", "created": 2},
+        {"subsystem": "forwards", "updated": 4},
+    ]
+    partial_rpc.listforwards.return_value = {
+        "forwards": [
+            _record(
+                created_index=1,
+                updated_index=3,
+                status="settled",
+                received_time=str(new_day + 7200),
+            )
+        ]
+    }
+    partial_sync = ForwardArchiveSynchronizer(partial_rpc, store, _log)
+    partial_sync.PAGE_LIMIT = 1
+    partial_sync.MAX_PAGES_PER_FAMILY = 1
+
+    partial = partial_sync.sync_once(now_ns=observed + 1)
+
+    assert partial.caught_up is False
+    assert partial.backlog_family == "updated"
+    assert partial.touched_dates == (old_day, new_day)
+    assert store.history(old_day, current_day, None, 100)["complete"] is False
+
+    database_path = store._test_connection.execute(
+        "PRAGMA database_list"
+    ).fetchone()[2]
+    store._test_connection.close()
+    restarted_connection = sqlite3.connect(database_path, isolation_level=None)
+    restarted_connection.row_factory = sqlite3.Row
+    restarted_store = ForwardArchiveStore(
+        lambda: restarted_connection, _log
+    )
+    restarted_store._test_connection = restarted_connection
+    restart_rpc = MagicMock()
+    restart_rpc.wait.side_effect = [
+        {"subsystem": "forwards", "created": 2},
+        {"subsystem": "forwards", "updated": 4},
+    ]
+    restart_rpc.listforwards.return_value = {
+        "forwards": [
+            _record(
+                created_index=2,
+                updated_index=4,
+                status="settled",
+                received_time=str(old_day + 7200),
+            )
+        ]
+    }
+
+    completed = ForwardArchiveSynchronizer(
+        restart_rpc, restarted_store, _log
+    ).sync_once(now_ns=observed + 2)
+
+    assert completed.caught_up is True
+    assert old_day in completed.touched_dates
+    assert new_day in completed.touched_dates
+    history = restarted_store.history(old_day, current_day, None, 100)
+    assert history["complete"] is True, history
+    assert history["totals"]["settled_forward_count"] == 2
+
+
 def test_caught_up_empty_source_calls_no_listforwards(store):
     rpc = MagicMock()
     rpc.wait.side_effect = [
