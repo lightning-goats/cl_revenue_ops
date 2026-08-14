@@ -223,8 +223,8 @@ def test_next_cycle_resumes_checkpoint_and_reaches_catch_up(store):
     sync.PAGE_LIMIT = 1
     sync.MAX_PAGES_PER_FAMILY = 1
 
-    first = sync.sync_once(now_ns=10)
-    second = sync.sync_once(now_ns=11)
+    first = sync.sync_once(now_ns=1_700_006_401_000_000_000)
+    second = sync.sync_once(now_ns=1_700_006_401_000_000_001)
 
     assert first.caught_up is False
     assert second.caught_up is True
@@ -399,7 +399,7 @@ def test_sync_ignores_records_newer_than_probed_snapshot(store):
         ]
     }
 
-    result = ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=10)
+    result = ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=1_700_006_401_000_000_000)
 
     assert result.created_pages == 1
     assert store.get_sync_state("created")["next_index"] == 3
