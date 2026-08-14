@@ -43,6 +43,8 @@ def snapshot_db(tmp_path):
         ON forward_archive_v1(
             archive_generation, received_time_ns, created_index
         );
+        CREATE INDEX idx_forward_archive_v1_received_generation
+        ON forward_archive_v1(received_time_ns, archive_generation);
         CREATE TABLE forward_archive_coverage_v1 (
             archive_generation INTEGER NOT NULL,
             date_utc INTEGER NOT NULL,
@@ -55,6 +57,8 @@ def snapshot_db(tmp_path):
         );
         CREATE INDEX idx_forward_archive_coverage_v1_date
         ON forward_archive_coverage_v1(archive_generation, date_utc);
+        CREATE INDEX idx_forward_archive_coverage_v1_date_generation
+        ON forward_archive_coverage_v1(date_utc, archive_generation);
         CREATE TABLE forward_daily_channel_v1 (
             archive_generation INTEGER NOT NULL,
             date_utc INTEGER NOT NULL,
@@ -531,8 +535,11 @@ def test_verifier_detects_in_window_archive_generation_without_coverage(
 
     assert "multiple_archive_generations" in result["reasons"]
     plan = " ".join(result["query_plans"]["generation_discovery"])
-    assert "idx_forward_archive_coverage_v1_date" in plan
-    assert "idx_forward_archive_v1_received" in plan
+    assert "idx_forward_archive_coverage_v1_date_generation" in plan
+    assert "idx_forward_archive_v1_received_generation" in plan
+    assert plan.count("SEARCH ") >= 2
+    assert "SCAN forward_archive_coverage_v1" not in plan
+    assert "SCAN forward_archive_v1" not in plan
     assert result["query_plan_bounded"] is True
 
 
@@ -631,6 +638,33 @@ def test_verifier_reports_incomplete_coverage(snapshot_db):
 
     assert result["coverage_complete"] is False
     assert "coverage_incomplete" in result["reasons"]
+
+
+@pytest.mark.parametrize(
+    "index_name",
+    [
+        "idx_forward_archive_v1_received_generation",
+        "idx_forward_archive_coverage_v1_date_generation",
+    ],
+)
+def test_verifier_fails_closed_when_observational_index_is_missing(
+    snapshot_db, capsys, index_name
+):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(f"DROP INDEX {index_name}")
+    connection.commit()
+    connection.close()
+
+    exit_code = main([
+        "--database", str(snapshot_db),
+        "--history-since", str(DAY_START),
+        "--history-until", str(DAY_END),
+    ])
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 2
+    assert "missing required observational indexes" in result["error"]
+    assert index_name in result["error"]
 
 
 def test_verifier_rejects_missing_tables(tmp_path):

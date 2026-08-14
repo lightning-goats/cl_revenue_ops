@@ -347,6 +347,13 @@ class ForwardArchiveStore:
         )
         conn.execute(
             """
+            CREATE INDEX IF NOT EXISTS
+                idx_forward_archive_v1_received_generation
+            ON forward_archive_v1(received_time_ns, archive_generation)
+            """
+        )
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_forward_daily_channel_v1_date
             ON forward_daily_channel_v1(
                 archive_generation, date_utc, channel_id
@@ -357,6 +364,13 @@ class ForwardArchiveStore:
             """
             CREATE INDEX IF NOT EXISTS idx_forward_archive_coverage_v1_date
             ON forward_archive_coverage_v1(archive_generation, date_utc)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                idx_forward_archive_coverage_v1_date_generation
+            ON forward_archive_coverage_v1(date_utc, archive_generation)
             """
         )
 

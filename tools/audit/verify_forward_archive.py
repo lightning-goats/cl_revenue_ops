@@ -47,16 +47,22 @@ _REQUIRED_COLUMNS = {
     },
 }
 
+_REQUIRED_INDEXES = {
+    "idx_forward_archive_v1_received_generation",
+    "idx_forward_archive_coverage_v1_date_generation",
+}
+
+
 _GENERATION_DISCOVERY_SQL = """
     WITH discovered_generations AS (
         SELECT archive_generation
         FROM forward_archive_coverage_v1
-            INDEXED BY idx_forward_archive_coverage_v1_date
+            INDEXED BY idx_forward_archive_coverage_v1_date_generation
         WHERE date_utc >= ? AND date_utc < ?
         UNION
         SELECT archive_generation
         FROM forward_archive_v1
-            INDEXED BY idx_forward_archive_v1_received
+            INDEXED BY idx_forward_archive_v1_received_generation
         WHERE received_time_ns >= ? AND received_time_ns < ?
     )
     SELECT archive_generation
@@ -288,6 +294,18 @@ def _discover_schema(connection: sqlite3.Connection) -> list[str]:
                 f"table {table} missing required columns: "
                 + ", ".join(absent)
             )
+    indexes = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        )
+    }
+    missing_indexes = sorted(_REQUIRED_INDEXES - indexes)
+    if missing_indexes:
+        raise VerificationError(
+            "missing required observational indexes: "
+            + ", ".join(missing_indexes)
+        )
     return sorted(tables)
 
 
@@ -355,13 +373,23 @@ def _query_plan(
     ]
 
 
-def _uses_index(plan: Iterable[str], index_name: str) -> bool:
-    return any(index_name in detail for detail in plan)
-
-
 def _uses_search_index(plan: Iterable[str], index_name: str) -> bool:
     return any(
         "SEARCH " in detail and index_name in detail
+        for detail in plan
+    )
+
+
+def _uses_search_range(
+    plan: Iterable[str],
+    index_name: str,
+    column_name: str,
+) -> bool:
+    return any(
+        "SEARCH " in detail
+        and index_name in detail
+        and f"{column_name}>?" in detail
+        and f"{column_name}<?" in detail
         for detail in plan
     )
 
@@ -686,18 +714,22 @@ def verify_database(
             for name, index_name in sentinel_indexes.items()
         )
         generation_plan_bounded = (
-            _uses_index(
-                generation_plan, "idx_forward_archive_coverage_v1_date"
+            _uses_search_range(
+                generation_plan,
+                "idx_forward_archive_coverage_v1_date_generation",
+                "date_utc",
             )
-            and _uses_index(
-                generation_plan, "idx_forward_archive_v1_received"
+            and _uses_search_range(
+                generation_plan,
+                "idx_forward_archive_v1_received_generation",
+                "received_time_ns",
             )
         )
         query_plan_bounded = (
             generation_plan_bounded
             and sentinel_plans_bounded
             and all(
-                _uses_index(plans[name], index_name)
+                _uses_search_index(plans[name], index_name)
                 for name, index_name in expected_indexes.items()
             )
         )

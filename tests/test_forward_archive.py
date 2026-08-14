@@ -164,7 +164,17 @@ def test_initialize_schema_creates_exact_versioned_tables_and_indexes():
         "idx_forward_archive_v1_status_received",
         "idx_forward_archive_v1_updated",
         "idx_forward_archive_v1_received",
+        "idx_forward_archive_v1_received_generation",
     } <= archive_indexes
+    coverage_indexes = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA index_list('forward_archive_coverage_v1')"
+        )
+    }
+    assert "idx_forward_archive_coverage_v1_date_generation" in (
+        coverage_indexes
+    )
 
 
 def test_initialize_schema_is_idempotent():
