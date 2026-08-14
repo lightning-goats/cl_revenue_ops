@@ -1314,8 +1314,20 @@ class ForwardArchiveStore:
         zero_archive = {field: 0 for field in total_fields}
         zero_aggregate = {field: 0 for field in aggregate_fields}
         coverage = []
+        coverage_day_complete = []
+
+        def append_bounded_reason(item, reason):
+            reasons = item["reasons"]
+            if reason in reasons:
+                return
+            if len(reasons) >= 16:
+                item["reasons"] = reasons[:15] + [reason]
+            else:
+                reasons.append(reason)
+
         for day in range(start, end, 86400):
             item = coverage_by_day.get(day)
+            day_complete = False
             if item is None:
                 item = {
                     "archive_generation": ARCHIVE_GENERATION,
@@ -1334,13 +1346,18 @@ class ForwardArchiveStore:
                     "schema_version": ARCHIVE_SCHEMA_VERSION,
                 }
             else:
+                flag_fields = (
+                    "created_sync_complete",
+                    "updated_sync_complete",
+                    "aggregate_complete",
+                )
+                raw_flags = {
+                    field: item[field] for field in flag_fields
+                }
                 flags_valid = all(
-                    type(item[field]) is int and item[field] in (0, 1)
-                    for field in (
-                        "created_sync_complete",
-                        "updated_sync_complete",
-                        "aggregate_complete",
-                    )
+                    type(raw_flags[field]) is int
+                    and raw_flags[field] == 1
+                    for field in flag_fields
                 )
                 totals_valid = all(
                     type(item[field]) is int and item[field] >= 0
@@ -1348,11 +1365,13 @@ class ForwardArchiveStore:
                 )
                 metadata_valid = (
                     type(item["archive_generation"]) is int
-                    and item["archive_generation"] > 0
+                    and item["archive_generation"] == ARCHIVE_GENERATION
+                    and type(item["date_utc"]) is int
+                    and item["date_utc"] == day
                     and type(item["checked_at"]) is int
                     and item["checked_at"] >= 0
                     and type(item["schema_version"]) is int
-                    and item["schema_version"] > 0
+                    and item["schema_version"] == ARCHIVE_SCHEMA_VERSION
                     and type(item["reconciliation_status"]) is str
                     and type(item["reasons_json"]) is str
                 )
@@ -1360,33 +1379,44 @@ class ForwardArchiveStore:
                     reasons = json.loads(item.pop("reasons_json"))
                 except (json.JSONDecodeError, TypeError):
                     reasons = ["coverage_malformed"]
-                    metadata_valid = False
-                if not isinstance(reasons, list):
-                    reasons = ["coverage_malformed"]
-                    metadata_valid = False
+                    reasons_valid = False
+                else:
+                    reasons_valid = (
+                        isinstance(reasons, list)
+                        and len(reasons) <= 16
+                        and all(
+                            isinstance(reason, str)
+                            and len(reason) <= 128
+                            for reason in reasons
+                        )
+                    )
+                    if not reasons_valid:
+                        reasons = ["coverage_malformed"]
                 item["created_sync_complete"] = (
-                    item["created_sync_complete"] == 1
+                    type(raw_flags["created_sync_complete"]) is int
+                    and raw_flags["created_sync_complete"] == 1
                 )
                 item["updated_sync_complete"] = (
-                    item["updated_sync_complete"] == 1
+                    type(raw_flags["updated_sync_complete"]) is int
+                    and raw_flags["updated_sync_complete"] == 1
                 )
                 item["aggregate_complete"] = (
-                    item["aggregate_complete"] == 1
+                    type(raw_flags["aggregate_complete"]) is int
+                    and raw_flags["aggregate_complete"] == 1
                 )
                 item["reasons"] = reasons
-                claims_complete = (
-                    item["created_sync_complete"]
-                    and item["updated_sync_complete"]
-                    and item["aggregate_complete"]
+                storage_contract_valid = (
+                    flags_valid
+                    and totals_valid
+                    and metadata_valid
+                    and reasons_valid
+                    and reasons == []
                     and item["reconciliation_status"] == "complete"
                 )
                 canonical = archive_by_day.get(day, zero_archive)
                 aggregate = aggregate_by_day.get(day, zero_aggregate)
-                coverage_matches = (
-                    flags_valid
-                    and totals_valid
-                    and metadata_valid
-                    and archive_evidence_valid
+                reconciliation_matches = (
+                    archive_evidence_valid
                     and aggregate_evidence_valid
                     and all(
                         item[field] == canonical[field]
@@ -1405,12 +1435,19 @@ class ForwardArchiveStore:
                     and aggregate["sourced_fee_msat"]
                     == canonical["fee_msat"]
                 )
-                if claims_complete and not coverage_matches:
-                    item["aggregate_complete"] = False
+                day_complete = (
+                    storage_contract_valid and reconciliation_matches
+                )
+                if not day_complete:
                     item["reconciliation_status"] = "incomplete"
-                    if "coverage_mismatch" not in item["reasons"]:
-                        item["reasons"].append("coverage_mismatch")
+                    if not storage_contract_valid:
+                        append_bounded_reason(
+                            item, "coverage_contract_invalid"
+                        )
+                    else:
+                        append_bounded_reason(item, "coverage_mismatch")
             coverage.append(item)
+            coverage_day_complete.append(day_complete)
 
         fetched = [
             dict(row)
@@ -1420,13 +1457,7 @@ class ForwardArchiveStore:
         ]
         truncated = len(fetched) > bounded_limit
         rows = fetched[:bounded_limit]
-        complete = (
-            not truncated
-            and all(
-                item["reconciliation_status"] == "complete"
-                for item in coverage
-            )
-        )
+        complete = not truncated and all(coverage_day_complete)
         output_total_fields = total_fields + ("sourced_forward_count",)
         if complete and channel_id is not None:
             totals = {

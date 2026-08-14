@@ -1,5 +1,6 @@
 """Canonical forward archive schema and normalization contracts."""
 
+from datetime import date
 from decimal import Decimal
 import sqlite3
 
@@ -676,6 +677,103 @@ def test_history_fails_closed_on_well_typed_coverage_total_mismatch():
     assert result["complete"] is False
     assert result["totals"]["fee_msat"] is None
     assert "coverage_mismatch" in result["coverage"][0]["reasons"]
+
+
+@pytest.mark.parametrize(
+    "column, value, expected_reason",
+    [
+        ("created_sync_complete", 0, "coverage_contract_invalid"),
+        ("updated_sync_complete", 0, "coverage_contract_invalid"),
+        ("aggregate_complete", 0, "coverage_contract_invalid"),
+        ("created_sync_complete", 1.5, "coverage_contract_invalid"),
+        ("updated_sync_complete", 1.5, "coverage_contract_invalid"),
+        ("aggregate_complete", 1.5, "coverage_contract_invalid"),
+        ("reasons_json", '["unexpected"]', "coverage_contract_invalid"),
+        ("reasons_json", "not-json", "coverage_malformed"),
+        ("archive_generation", 2, "coverage_missing"),
+        ("archive_generation", 1.5, "coverage_missing"),
+        ("date_utc", 1700006400, "coverage_missing"),
+        ("date_utc", 1699920000.5, "coverage_missing"),
+        ("checked_at", -1, "coverage_contract_invalid"),
+        ("checked_at", 1.5, "coverage_contract_invalid"),
+        ("schema_version", 2, "coverage_contract_invalid"),
+        ("schema_version", 1.5, "coverage_contract_invalid"),
+        ("reconciliation_status", "unexpected", "coverage_contract_invalid"),
+        ("reconciliation_status", b"unexpected", "coverage_contract_invalid"),
+        ("settled_forward_count", 2.5, "coverage_contract_invalid"),
+        ("forwarded_in_msat", 5000.5, "coverage_contract_invalid"),
+        ("forwarded_out_msat", 4700.5, "coverage_contract_invalid"),
+        ("fee_msat", 300.5, "coverage_contract_invalid"),
+        ("sourced_forward_count", 2.5, "coverage_contract_invalid"),
+        ("fee_msat", -1, "coverage_contract_invalid"),
+    ],
+    ids=(
+        "created-false",
+        "updated-false",
+        "aggregate-false",
+        "created-malformed",
+        "updated-malformed",
+        "aggregate-malformed",
+        "reasons-nonempty",
+        "reasons-invalid-json",
+        "generation-future",
+        "generation-malformed",
+        "date-wrong",
+        "date-malformed",
+        "checked-negative",
+        "checked-malformed",
+        "schema-future",
+        "schema-malformed",
+        "status-wrong",
+        "status-malformed",
+        "settled-count-malformed",
+        "forwarded-in-malformed",
+        "forwarded-out-malformed",
+        "fee-malformed",
+        "sourced-count-malformed",
+        "fee-negative",
+    ),
+)
+def test_history_requires_exact_complete_coverage_contract(
+    column, value, expected_reason
+):
+    store, connection = _memory_store()
+    day = 1699920000
+    checked_at = _seed_complete_day(store, day)
+    store.rebuild_days([day], checked_at)
+    connection.execute("PRAGMA ignore_check_constraints = ON")
+    connection.execute(
+        f"UPDATE forward_archive_coverage_v1 SET {column} = ? "
+        "WHERE archive_generation = ? AND date_utc = ?",
+        (value, ARCHIVE_GENERATION, day),
+    )
+
+    result = store.history(day, day + 86400, None, 100)
+
+    assert result["complete"] is False
+    assert all(value is None for value in result["totals"].values())
+    assert expected_reason in result["coverage"][0]["reasons"]
+
+
+def test_collector_rejects_runtime_history_with_false_complete_flag():
+    from tools.revenue_validation_collect import _forward_history_payload_error
+
+    store, connection = _memory_store()
+    day = 1699920000
+    checked_at = _seed_complete_day(store, day)
+    store.rebuild_days([day], checked_at)
+    connection.execute(
+        "UPDATE forward_archive_coverage_v1 "
+        "SET updated_sync_complete = 0 "
+        "WHERE archive_generation = ? AND date_utc = ?",
+        (ARCHIVE_GENERATION, day),
+    )
+
+    result = store.history(day, day + 86400, None, 100)
+
+    assert _forward_history_payload_error(result, date(2023, 11, 14)) == (
+        "forward history is incomplete"
+    )
 
 
 def test_incomplete_updated_cursor_cannot_mark_day_complete():
