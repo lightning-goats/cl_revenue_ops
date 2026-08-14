@@ -538,7 +538,11 @@ class EconShadow:
 
             completeness_ok = None
             try:
-                changes = database.get_recent_fee_changes(limit=500)
+                fee_since, fee_until = (
+                    econ_reconcile.fee_change_query_bounds(started_at)
+                )
+                changes = database.get_fee_changes_between(
+                    fee_since, fee_until)
                 completeness = econ_reconcile.fee_intent_completeness(
                     ledger, changes, now=started_at)
                 raw_status = str(completeness.get("status", "unknown"))

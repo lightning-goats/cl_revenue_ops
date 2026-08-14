@@ -18,10 +18,27 @@ def _module_with_history(tmp_path):
         MagicMock(), cfg, ledger_path=str(tmp_path / "econ_ledger.db"))
     database = MagicMock()
     database.get_spend_reservation_states.return_value = {}
-    database.get_recent_fee_changes.return_value = []
+    database.get_fee_changes_between.return_value = []
     mod.econ_shadow = shadow
     mod.database = database
     return mod, shadow, database
+
+
+def test_reconcile_uses_one_clock_for_bounded_fee_history(tmp_path):
+    mod, shadow, database = _module_with_history(tmp_path)
+    observed_now = DAY_START + 123
+    mod.time.time = MagicMock(return_value=observed_now)
+
+    result = mod.revenue_econ_reconcile(mod.plugin)
+
+    assert result["enabled"] is True
+    mod.time.time.assert_called_once_with()
+    database.get_fee_changes_between.assert_called_once_with(
+        observed_now - 86400, observed_now + 1
+    )
+    database.get_recent_fee_changes.assert_not_called()
+    assert shadow.ledger_for_reconciliation().count_events(
+        "reconciliation_completed") == 0
 
 
 def _record_run(ledger, started_at, result="clean", unexplained=0,

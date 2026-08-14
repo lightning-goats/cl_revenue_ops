@@ -157,16 +157,63 @@ def test_completeness_gap_warns(stack):
                   cycle_id=f"fee-cycle-{NOW - 3600}", at=NOW - 3600,
                   details={})
     # ...but fee_changes shows an additional unjournaled cycle.
-    db.record_fee_change = None  # not used; stub the getter instead
-    db.get_recent_fee_changes = lambda limit=500: [
+    db.get_fee_changes_between = MagicMock(return_value=[
         {"timestamp": NOW - 3600}, {"timestamp": NOW - 60},
-    ]
+    ])
     result = shadow.maybe_run_reconciliation(db, NOW)
+    db.get_fee_changes_between.assert_called_once_with(
+        NOW - 86400, NOW + 1)
     assert result["completeness_ok"] is False
     warns = [c for c in plugin.log.call_args_list
              if c.kwargs.get("level") == "warn"
              and "completeness" in str(c).lower()]
     assert warns
+
+
+def test_more_than_500_changes_do_not_split_a_fee_cycle(stack):
+    shadow, db, _ = stack
+    ledger = shadow.ledger_for_reconciliation()
+    cycle = NOW - 3600
+    newer = cycle + 300
+
+    def add_intents(at, count, prefix):
+        for index in range(count):
+            ledger.append(
+                event_type="intent_proposed",
+                intent_id=f"{prefix}-{index}",
+                idempotency_key=f"{at:016x}{index:048x}",
+                cycle_id=f"fee-broadcast-{at}",
+                at=at,
+                details={},
+            )
+
+    add_intents(cycle, 9, "cutoff")
+    add_intents(newer, 493, "newer")
+    conn = db._get_connection()
+    rows = []
+    for at, count, prefix in (
+        (cycle, 9, "1"), (newer, 493, "2"),
+    ):
+        rows.extend(
+            (f"{prefix}x{index}x0", "02" + "a" * 64, 1, 2,
+             "test", 0, at, "test", None)
+            for index in range(count)
+        )
+    conn.executemany(
+        "INSERT INTO fee_changes "
+        "(channel_id,peer_id,old_fee_ppm,new_fee_ppm,reason,manual,"
+        "timestamp,reason_code,heuristic_modifiers) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+
+    result = shadow.maybe_run_reconciliation(db, NOW)
+
+    assert result["completeness_ok"] is True
+    run = ledger.reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 3600
+    )["runs"][0]
+    assert run["fee_intent_completeness"] == "ok"
 
 
 def test_database_error_persists_failed_run(stack):

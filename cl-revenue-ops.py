@@ -5107,9 +5107,10 @@ def revenue_econ_reconcile(plugin: Plugin, apply: bool = False,
         if database is None:
             result["error"] = "database unavailable"
         else:
+            observed_now = int(time.time())
             db_states = database.get_spend_reservation_states()
             report = econ_reconcile.reconcile(
-                ledger, db_states, now=int(time.time()),
+                ledger, db_states, now=observed_now,
                 stale_after_seconds=max(60, int(stale_after_seconds)))
             result.update({
                 "checked": report.checked,
@@ -5128,16 +5129,20 @@ def revenue_econ_reconcile(plugin: Plugin, apply: bool = False,
                 ],
             })
             try:
-                recent_changes = database.get_recent_fee_changes(limit=500)
+                fee_since, fee_until = (
+                    econ_reconcile.fee_change_query_bounds(observed_now)
+                )
+                recent_changes = database.get_fee_changes_between(
+                    fee_since, fee_until)
                 result["fee_intent_completeness"] = (
                     econ_reconcile.fee_intent_completeness(
-                        ledger, recent_changes, now=int(time.time())))
+                        ledger, recent_changes, now=observed_now))
             except Exception as completeness_err:
                 result["fee_intent_completeness"] = {
                     "status": "error", "error": str(completeness_err)}
             if apply:
                 result["applied"] = econ_reconcile.apply(
-                    ledger, report, now=int(time.time()))
+                    ledger, report, now=observed_now)
         if history_requested:
             history_data = ledger.reconciliation_runs(
                 since_at=since_value,
