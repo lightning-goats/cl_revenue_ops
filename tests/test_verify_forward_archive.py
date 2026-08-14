@@ -77,7 +77,7 @@ def snapshot_db(tmp_path):
             in_msat INTEGER NOT NULL,
             out_msat INTEGER NOT NULL,
             fee_msat INTEGER NOT NULL,
-            timestamp INTEGER NOT NULL,
+            timestamp INTEGER,
             resolved_time INTEGER
         );
         CREATE INDEX idx_forwards_time ON forwards(timestamp);
@@ -351,6 +351,18 @@ def test_verifier_rejects_null_settled_legacy_key(
             "malformed_settled_record",
         ),
         (
+            "archive",
+            "UPDATE forward_archive_v1 SET received_time_ns = X'01' "
+            "WHERE created_index = 1",
+            "malformed_settled_record",
+        ),
+        (
+            "archive",
+            "UPDATE forward_archive_v1 SET received_time_ns = -1 "
+            "WHERE created_index = 1",
+            "malformed_settled_record",
+        ),
+        (
             "raw",
             "UPDATE forwards SET out_msat = 1900.5 WHERE id = 1",
             "malformed_operational_record",
@@ -373,6 +385,26 @@ def test_verifier_rejects_null_settled_legacy_key(
         (
             "raw",
             "UPDATE forwards SET timestamp = timestamp + 0.5 WHERE id = 1",
+            "malformed_operational_record",
+        ),
+        (
+            "raw",
+            "UPDATE forwards SET timestamp = NULL WHERE id = 1",
+            "malformed_operational_record",
+        ),
+        (
+            "raw",
+            "UPDATE forwards SET timestamp = 'not-a-number' WHERE id = 1",
+            "malformed_operational_record",
+        ),
+        (
+            "raw",
+            "UPDATE forwards SET timestamp = X'01' WHERE id = 1",
+            "malformed_operational_record",
+        ),
+        (
+            "raw",
+            "UPDATE forwards SET timestamp = -1 WHERE id = 1",
             "malformed_operational_record",
         ),
         (
@@ -435,6 +467,47 @@ def test_verifier_rejects_nonexact_legacy_identity(snapshot_db, mutation):
     assert result["overlap_status"] == "unexplained"
     assert "archive_operational_mismatch" in result["reasons"]
     assert result["warnings"] == []
+
+
+def test_verifier_malformed_timestamp_plans_are_bounded_searches(
+    snapshot_db,
+):
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    plan_names = (
+        "malformed_archive_identity",
+        "archive_received_null",
+        "archive_received_negative",
+        "archive_received_type_domain",
+        "malformed_operational_identity",
+        "operational_timestamp_null",
+        "operational_timestamp_negative",
+        "operational_timestamp_type_domain",
+    )
+    for name in plan_names:
+        plan = " ".join(result["query_plans"][name])
+        assert "SEARCH " in plan, (name, plan)
+        assert "SCAN " not in plan, (name, plan)
+
+
+def test_verifier_accepts_numeric_text_timestamp_via_integer_affinity(
+    snapshot_db,
+):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(
+        "UPDATE forwards SET timestamp = ? WHERE id = 1",
+        (str(DAY_START + 3600),),
+    )
+    stored_type = connection.execute(
+        "SELECT typeof(timestamp) FROM forwards WHERE id = 1"
+    ).fetchone()[0]
+    connection.commit()
+    connection.close()
+
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    assert stored_type == "integer"
+    assert "malformed_operational_record" not in result["reasons"]
 
 
 def test_verifier_detects_in_window_archive_generation_without_coverage(

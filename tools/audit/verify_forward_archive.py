@@ -109,22 +109,45 @@ _MALFORMED_SETTLED_LEGACY_KEY_SQL = """
     FROM forward_archive_v1
         INDEXED BY idx_forward_archive_v1_status_received
     WHERE archive_generation = ? AND status = 'settled'
+      AND received_time_ns >= ? AND received_time_ns < ?
       AND (
           typeof(received_time_ns) != 'integer'
-          OR received_time_ns < 0
-          OR (
-              received_time_ns >= ? AND received_time_ns < ?
-              AND (
-                  typeof(in_channel) != 'text'
-                  OR typeof(out_channel) != 'text'
-                  OR typeof(in_msat) != 'integer' OR in_msat < 0
-                  OR typeof(out_msat) != 'integer' OR out_msat < 0
-                  OR typeof(fee_msat) != 'integer' OR fee_msat < 0
-                  OR typeof(resolved_time_ns) != 'integer'
-                  OR resolved_time_ns < 0
-              )
-          )
+          OR typeof(in_channel) != 'text'
+          OR typeof(out_channel) != 'text'
+          OR typeof(in_msat) != 'integer' OR in_msat < 0
+          OR typeof(out_msat) != 'integer' OR out_msat < 0
+          OR typeof(fee_msat) != 'integer' OR fee_msat < 0
+          OR typeof(resolved_time_ns) != 'integer'
+          OR resolved_time_ns < 0
       )
+"""
+
+_ARCHIVE_RECEIVED_NULL_SQL = """
+    SELECT 1
+    FROM forward_archive_v1
+        INDEXED BY idx_forward_archive_v1_status_received
+    WHERE archive_generation = ? AND status = 'settled'
+      AND received_time_ns IS NULL
+    LIMIT 1
+"""
+
+_ARCHIVE_RECEIVED_NEGATIVE_SQL = """
+    SELECT 1
+    FROM forward_archive_v1
+        INDEXED BY idx_forward_archive_v1_status_received
+    WHERE archive_generation = ? AND status = 'settled'
+      AND received_time_ns < 0
+    LIMIT 1
+"""
+
+_ARCHIVE_RECEIVED_TYPE_DOMAIN_SQL = """
+    SELECT 1
+    FROM forward_archive_v1
+        INDEXED BY idx_forward_archive_v1_status_received
+    WHERE archive_generation = ? AND status = 'settled'
+      AND received_time_ns >= ''
+      AND typeof(received_time_ns) IN ('text', 'blob')
+    LIMIT 1
 """
 
 _MALFORMED_OPERATIONAL_KEY_SQL = """
@@ -137,10 +160,33 @@ _MALFORMED_OPERATIONAL_KEY_SQL = """
           OR typeof(in_msat) != 'integer' OR in_msat < 0
           OR typeof(out_msat) != 'integer' OR out_msat < 0
           OR typeof(fee_msat) != 'integer' OR fee_msat < 0
-          OR typeof(timestamp) != 'integer' OR timestamp < 0
+          OR typeof(timestamp) != 'integer'
           OR typeof(resolved_time) != 'integer' OR resolved_time < 0
       )
 """
+
+_OPERATIONAL_TIMESTAMP_NULL_SQL = """
+    SELECT 1
+    FROM forwards INDEXED BY idx_forwards_time
+    WHERE timestamp IS NULL
+    LIMIT 1
+"""
+
+_OPERATIONAL_TIMESTAMP_NEGATIVE_SQL = """
+    SELECT 1
+    FROM forwards INDEXED BY idx_forwards_time
+    WHERE timestamp < 0
+    LIMIT 1
+"""
+
+_OPERATIONAL_TIMESTAMP_TYPE_DOMAIN_SQL = """
+    SELECT 1
+    FROM forwards INDEXED BY idx_forwards_time
+    WHERE timestamp >= ''
+      AND typeof(timestamp) IN ('text', 'blob')
+    LIMIT 1
+"""
+
 
 _ARCHIVE_HISTORY_SQL = """
     SELECT * FROM forward_daily_channel_v1
@@ -290,6 +336,14 @@ def _legacy_key_counts(
     )
 
 
+def _sentinel_found(
+    connection: sqlite3.Connection,
+    sql: str,
+    params: tuple[Any, ...],
+) -> bool:
+    return connection.execute(sql, params).fetchone() is not None
+
+
 def _query_plan(
     connection: sqlite3.Connection,
     sql: str,
@@ -303,6 +357,13 @@ def _query_plan(
 
 def _uses_index(plan: Iterable[str], index_name: str) -> bool:
     return any(index_name in detail for detail in plan)
+
+
+def _uses_search_index(plan: Iterable[str], index_name: str) -> bool:
+    return any(
+        "SEARCH " in detail and index_name in detail
+        for detail in plan
+    )
 
 
 def verify_database(
@@ -347,10 +408,32 @@ def verify_database(
             _MALFORMED_SETTLED_LEGACY_KEY_SQL,
             archive_params,
         ).fetchone()["malformed_settled_count"]
+        malformed_settled_count += sum((
+            _sentinel_found(
+                connection, _ARCHIVE_RECEIVED_NULL_SQL, (generation,)
+            ),
+            _sentinel_found(
+                connection, _ARCHIVE_RECEIVED_NEGATIVE_SQL, (generation,)
+            ),
+            _sentinel_found(
+                connection,
+                _ARCHIVE_RECEIVED_TYPE_DOMAIN_SQL,
+                (generation,),
+            ),
+        ))
         malformed_operational_count = connection.execute(
             _MALFORMED_OPERATIONAL_KEY_SQL,
             (start, end),
         ).fetchone()["malformed_operational_count"]
+        malformed_operational_count += sum((
+            _sentinel_found(connection, _OPERATIONAL_TIMESTAMP_NULL_SQL, ()),
+            _sentinel_found(
+                connection, _OPERATIONAL_TIMESTAMP_NEGATIVE_SQL, ()
+            ),
+            _sentinel_found(
+                connection, _OPERATIONAL_TIMESTAMP_TYPE_DOMAIN_SQL, ()
+            ),
+        ))
         for name, count in (
             ("malformed_settled_count", malformed_settled_count),
             ("malformed_operational_count", malformed_operational_count),
@@ -520,11 +603,31 @@ def verify_database(
             "legacy_projection_keys": _query_plan(
                 connection, _LEGACY_PROJECTED_KEYS_SQL, archive_params
             ),
-            "malformed_legacy_identity": _query_plan(
+            "malformed_archive_identity": _query_plan(
                 connection, _MALFORMED_SETTLED_LEGACY_KEY_SQL, archive_params
+            ),
+            "archive_received_null": _query_plan(
+                connection, _ARCHIVE_RECEIVED_NULL_SQL, (generation,)
+            ),
+            "archive_received_negative": _query_plan(
+                connection, _ARCHIVE_RECEIVED_NEGATIVE_SQL, (generation,)
+            ),
+            "archive_received_type_domain": _query_plan(
+                connection,
+                _ARCHIVE_RECEIVED_TYPE_DOMAIN_SQL,
+                (generation,),
             ),
             "malformed_operational_identity": _query_plan(
                 connection, _MALFORMED_OPERATIONAL_KEY_SQL, (start, end)
+            ),
+            "operational_timestamp_null": _query_plan(
+                connection, _OPERATIONAL_TIMESTAMP_NULL_SQL, ()
+            ),
+            "operational_timestamp_negative": _query_plan(
+                connection, _OPERATIONAL_TIMESTAMP_NEGATIVE_SQL, ()
+            ),
+            "operational_timestamp_type_domain": _query_plan(
+                connection, _OPERATIONAL_TIMESTAMP_TYPE_DOMAIN_SQL, ()
             ),
             "archive_history": _query_plan(
                 connection,
@@ -550,7 +653,7 @@ def verify_database(
             "legacy_projection_keys": (
                 "idx_forward_archive_v1_status_received"
             ),
-            "malformed_legacy_identity": "idx_forward_archive_v1_status_received",
+            "malformed_archive_identity": "idx_forward_archive_v1_status_received",
             "malformed_operational_identity": "idx_forwards_time",
             "archive_history": "idx_forward_daily_channel_v1_date",
             "operational_raw": "idx_forwards_time",
@@ -560,6 +663,28 @@ def verify_database(
                 "idx_daily_fwd_stats_inbound_date"
             ),
         }
+        sentinel_indexes = {
+            "malformed_archive_identity": (
+                "idx_forward_archive_v1_status_received"
+            ),
+            "archive_received_null": (
+                "idx_forward_archive_v1_status_received"
+            ),
+            "archive_received_negative": (
+                "idx_forward_archive_v1_status_received"
+            ),
+            "archive_received_type_domain": (
+                "idx_forward_archive_v1_status_received"
+            ),
+            "malformed_operational_identity": "idx_forwards_time",
+            "operational_timestamp_null": "idx_forwards_time",
+            "operational_timestamp_negative": "idx_forwards_time",
+            "operational_timestamp_type_domain": "idx_forwards_time",
+        }
+        sentinel_plans_bounded = all(
+            _uses_search_index(plans[name], index_name)
+            for name, index_name in sentinel_indexes.items()
+        )
         generation_plan_bounded = (
             _uses_index(
                 generation_plan, "idx_forward_archive_coverage_v1_date"
@@ -570,6 +695,7 @@ def verify_database(
         )
         query_plan_bounded = (
             generation_plan_bounded
+            and sentinel_plans_bounded
             and all(
                 _uses_index(plans[name], index_name)
                 for name, index_name in expected_indexes.items()
