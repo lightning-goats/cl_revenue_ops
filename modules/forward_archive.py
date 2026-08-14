@@ -1211,8 +1211,8 @@ class ForwardArchiveStore:
             history_since, history_until, limit
         )
         connection = self._connection_provider()
-        coverage_by_day = {
-            int(row["date_utc"]): dict(row)
+        raw_coverage_rows = [
+            dict(row)
             for row in connection.execute(
                 """
                 SELECT * FROM forward_archive_coverage_v1
@@ -1222,7 +1222,96 @@ class ForwardArchiveStore:
                 """,
                 (ARCHIVE_GENERATION, start, end),
             )
+        ]
+        coverage_by_day = {
+            row["date_utc"]: row
+            for row in raw_coverage_rows
+            if type(row["date_utc"]) is int
+            and row["date_utc"] >= 0
+            and row["date_utc"] % 86400 == 0
         }
+        total_fields = (
+            "settled_forward_count",
+            "forwarded_in_msat",
+            "forwarded_out_msat",
+            "fee_msat",
+        )
+        aggregate_fields = total_fields + (
+            "sourced_forward_count",
+            "sourced_volume_msat",
+            "sourced_fee_msat",
+        )
+        start_ns = start * 1_000_000_000
+        end_ns = end * 1_000_000_000
+        archive_daily_rows = connection.execute(
+            """
+            SELECT (received_time_ns / 86400000000000) * 86400 AS date_utc,
+                   COUNT(*) AS settled_forward_count,
+                   COALESCE(SUM(in_msat), 0) AS forwarded_in_msat,
+                   COALESCE(SUM(out_msat), 0) AS forwarded_out_msat,
+                   COALESCE(SUM(fee_msat), 0) AS fee_msat
+            FROM forward_archive_v1
+                INDEXED BY idx_forward_archive_v1_status_received
+            WHERE archive_generation = ? AND status = 'settled'
+              AND received_time_ns >= ? AND received_time_ns < ?
+            GROUP BY date_utc
+            ORDER BY date_utc
+            """,
+            (ARCHIVE_GENERATION, start_ns, end_ns),
+        ).fetchall()
+        aggregate_daily_rows = connection.execute(
+            """
+            SELECT date_utc,
+                   COALESCE(SUM(settled_forward_count), 0)
+                       AS settled_forward_count,
+                   COALESCE(SUM(forwarded_in_msat), 0)
+                       AS forwarded_in_msat,
+                   COALESCE(SUM(forwarded_out_msat), 0)
+                       AS forwarded_out_msat,
+                   COALESCE(SUM(fee_msat), 0) AS fee_msat,
+                   COALESCE(SUM(sourced_forward_count), 0)
+                       AS sourced_forward_count,
+                   COALESCE(SUM(sourced_volume_msat), 0)
+                       AS sourced_volume_msat,
+                   COALESCE(SUM(sourced_fee_msat), 0)
+                       AS sourced_fee_msat
+            FROM forward_daily_channel_v1
+                INDEXED BY idx_forward_daily_channel_v1_date
+            WHERE archive_generation = ?
+              AND date_utc >= ? AND date_utc < ?
+            GROUP BY date_utc
+            ORDER BY date_utc
+            """,
+            (ARCHIVE_GENERATION, start, end),
+        ).fetchall()
+
+        def strict_daily_map(rows, fields):
+            valid = True
+            result = {}
+            for row in rows:
+                day = row["date_utc"]
+                values_valid = (
+                    type(day) is int
+                    and day >= 0
+                    and day % 86400 == 0
+                    and all(
+                        type(row[field]) is int and row[field] >= 0
+                        for field in fields
+                    )
+                )
+                valid = valid and values_valid
+                if values_valid:
+                    result[day] = dict(row)
+            return result, valid
+
+        archive_by_day, archive_evidence_valid = strict_daily_map(
+            archive_daily_rows, total_fields
+        )
+        aggregate_by_day, aggregate_evidence_valid = strict_daily_map(
+            aggregate_daily_rows, aggregate_fields
+        )
+        zero_archive = {field: 0 for field in total_fields}
+        zero_aggregate = {field: 0 for field in aggregate_fields}
         coverage = []
         for day in range(start, end, 86400):
             item = coverage_by_day.get(day)
@@ -1244,16 +1333,82 @@ class ForwardArchiveStore:
                     "schema_version": ARCHIVE_SCHEMA_VERSION,
                 }
             else:
-                item["created_sync_complete"] = bool(
+                flags_valid = all(
+                    type(item[field]) is int and item[field] in (0, 1)
+                    for field in (
+                        "created_sync_complete",
+                        "updated_sync_complete",
+                        "aggregate_complete",
+                    )
+                )
+                totals_valid = all(
+                    type(item[field]) is int and item[field] >= 0
+                    for field in total_fields + ("sourced_forward_count",)
+                )
+                metadata_valid = (
+                    type(item["archive_generation"]) is int
+                    and item["archive_generation"] > 0
+                    and type(item["checked_at"]) is int
+                    and item["checked_at"] >= 0
+                    and type(item["schema_version"]) is int
+                    and item["schema_version"] > 0
+                    and type(item["reconciliation_status"]) is str
+                    and type(item["reasons_json"]) is str
+                )
+                try:
+                    reasons = json.loads(item.pop("reasons_json"))
+                except (json.JSONDecodeError, TypeError):
+                    reasons = ["coverage_malformed"]
+                    metadata_valid = False
+                if not isinstance(reasons, list):
+                    reasons = ["coverage_malformed"]
+                    metadata_valid = False
+                item["created_sync_complete"] = (
+                    item["created_sync_complete"] == 1
+                )
+                item["updated_sync_complete"] = (
+                    item["updated_sync_complete"] == 1
+                )
+                item["aggregate_complete"] = (
+                    item["aggregate_complete"] == 1
+                )
+                item["reasons"] = reasons
+                claims_complete = (
                     item["created_sync_complete"]
+                    and item["updated_sync_complete"]
+                    and item["aggregate_complete"]
+                    and item["reconciliation_status"] == "complete"
                 )
-                item["updated_sync_complete"] = bool(
-                    item["updated_sync_complete"]
+                canonical = archive_by_day.get(day, zero_archive)
+                aggregate = aggregate_by_day.get(day, zero_aggregate)
+                coverage_matches = (
+                    flags_valid
+                    and totals_valid
+                    and metadata_valid
+                    and archive_evidence_valid
+                    and aggregate_evidence_valid
+                    and all(
+                        item[field] == canonical[field]
+                        for field in total_fields
+                    )
+                    and item["sourced_forward_count"]
+                    == canonical["settled_forward_count"]
+                    and all(
+                        aggregate[field] == canonical[field]
+                        for field in total_fields
+                    )
+                    and aggregate["sourced_forward_count"]
+                    == canonical["settled_forward_count"]
+                    and aggregate["sourced_volume_msat"]
+                    == canonical["forwarded_in_msat"]
+                    and aggregate["sourced_fee_msat"]
+                    == canonical["fee_msat"]
                 )
-                item["aggregate_complete"] = bool(
-                    item["aggregate_complete"]
-                )
-                item["reasons"] = json.loads(item.pop("reasons_json"))
+                if claims_complete and not coverage_matches:
+                    item["aggregate_complete"] = False
+                    item["reconciliation_status"] = "incomplete"
+                    if "coverage_mismatch" not in item["reasons"]:
+                        item["reasons"].append("coverage_mismatch")
             coverage.append(item)
 
         fetched = [
@@ -1271,17 +1426,11 @@ class ForwardArchiveStore:
                 for item in coverage
             )
         )
-        total_fields = (
-            "settled_forward_count",
-            "forwarded_in_msat",
-            "forwarded_out_msat",
-            "fee_msat",
-            "sourced_forward_count",
-        )
+        output_total_fields = total_fields + ("sourced_forward_count",)
         if complete and channel_id is not None:
             totals = {
                 name: sum(int(row[name]) for row in rows)
-                for name in total_fields
+                for name in output_total_fields
             }
         else:
             totals = {
@@ -1290,7 +1439,7 @@ class ForwardArchiveStore:
                     if complete
                     else None
                 )
-                for name in total_fields
+                for name in output_total_fields
             }
         return {
             "archive_generation": ARCHIVE_GENERATION,

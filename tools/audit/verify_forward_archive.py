@@ -26,12 +26,16 @@ _REQUIRED_COLUMNS = {
     "forward_archive_coverage_v1": {
         "archive_generation", "date_utc", "created_sync_complete",
         "updated_sync_complete", "aggregate_complete",
-        "reconciliation_status", "reasons_json",
+        "settled_forward_count", "forwarded_in_msat",
+        "forwarded_out_msat", "fee_msat", "sourced_forward_count",
+        "reconciliation_status", "reasons_json", "checked_at",
+        "schema_version",
     },
     "forward_daily_channel_v1": {
         "archive_generation", "date_utc", "channel_id",
         "settled_forward_count", "forwarded_in_msat",
         "forwarded_out_msat", "fee_msat", "sourced_forward_count",
+        "sourced_volume_msat", "sourced_fee_msat",
     },
     "forwards": {
         "in_channel", "out_channel", "in_msat", "out_msat",
@@ -89,8 +93,19 @@ _MALFORMED_COVERAGE_SQL = """
           OR updated_sync_complete NOT IN (0, 1)
           OR typeof(aggregate_complete) != 'integer'
           OR aggregate_complete NOT IN (0, 1)
+          OR typeof(settled_forward_count) != 'integer'
+          OR settled_forward_count < 0
+          OR typeof(forwarded_in_msat) != 'integer'
+          OR forwarded_in_msat < 0
+          OR typeof(forwarded_out_msat) != 'integer'
+          OR forwarded_out_msat < 0
+          OR typeof(fee_msat) != 'integer' OR fee_msat < 0
+          OR typeof(sourced_forward_count) != 'integer'
+          OR sourced_forward_count < 0
           OR typeof(reconciliation_status) != 'text'
           OR typeof(reasons_json) != 'text'
+          OR typeof(checked_at) != 'integer' OR checked_at < 0
+          OR typeof(schema_version) != 'integer' OR schema_version <= 0
       )
 """
 
@@ -128,6 +143,39 @@ _ARCHIVE_TOTAL_SQL = """
     FROM forward_archive_v1
     WHERE archive_generation = ? AND status = 'settled'
       AND received_time_ns >= ? AND received_time_ns < ?
+"""
+
+_ARCHIVE_DAILY_TOTALS_SQL = """
+    SELECT (received_time_ns / 86400000000000) * 86400 AS date_utc,
+           COUNT(*) AS settled_forward_count,
+           COALESCE(SUM(in_msat), 0) AS forwarded_in_msat,
+           COALESCE(SUM(out_msat), 0) AS forwarded_out_msat,
+           COALESCE(SUM(fee_msat), 0) AS fee_msat
+    FROM forward_archive_v1
+        INDEXED BY idx_forward_archive_v1_status_received
+    WHERE archive_generation = ? AND status = 'settled'
+      AND received_time_ns >= ? AND received_time_ns < ?
+    GROUP BY date_utc
+    ORDER BY date_utc
+"""
+
+_DAILY_CHANNEL_TOTALS_SQL = """
+    SELECT date_utc,
+           COALESCE(SUM(settled_forward_count), 0)
+               AS settled_forward_count,
+           COALESCE(SUM(forwarded_in_msat), 0) AS forwarded_in_msat,
+           COALESCE(SUM(forwarded_out_msat), 0) AS forwarded_out_msat,
+           COALESCE(SUM(fee_msat), 0) AS fee_msat,
+           COALESCE(SUM(sourced_forward_count), 0)
+               AS sourced_forward_count,
+           COALESCE(SUM(sourced_volume_msat), 0) AS sourced_volume_msat,
+           COALESCE(SUM(sourced_fee_msat), 0) AS sourced_fee_msat
+    FROM forward_daily_channel_v1
+        INDEXED BY idx_forward_daily_channel_v1_date
+    WHERE archive_generation = ?
+      AND date_utc >= ? AND date_utc < ?
+    GROUP BY date_utc
+    ORDER BY date_utc
 """
 
 _LEGACY_PROJECTED_ARCHIVE_SQL = """
@@ -371,6 +419,25 @@ def _strict_int_row(
     return result, valid
 
 
+def _strict_daily_rows(
+    rows: Iterable[Mapping[str, Any]],
+    fields: Iterable[str],
+) -> tuple[list[dict[str, int | None]], bool]:
+    result = []
+    valid = True
+    for row in rows:
+        date_utc = row["date_utc"]
+        totals, totals_valid = _strict_int_row(row, fields)
+        date_valid = (
+            type(date_utc) is int
+            and date_utc >= 0
+            and date_utc % 86400 == 0
+        )
+        result.append({"date_utc": date_utc, **totals})
+        valid = valid and date_valid and totals_valid
+    return result, valid
+
+
 def _sum_strict_fields(
     left: Mapping[str, int | None],
     right: Mapping[str, int | None],
@@ -596,6 +663,22 @@ def verify_database(
         operational.update(
             _sum_strict_fields(raw_inbound, rolled_inbound, inbound_fields)
         )
+        archive_daily_rows, archive_daily_valid = _strict_daily_rows(
+            connection.execute(_ARCHIVE_DAILY_TOTALS_SQL, archive_params),
+            total_fields,
+        )
+        daily_fields = total_fields + (
+            "sourced_forward_count",
+            "sourced_volume_msat",
+            "sourced_fee_msat",
+        )
+        daily_channel_params = (generation, start, end)
+        daily_channel_rows, daily_channel_valid = _strict_daily_rows(
+            connection.execute(
+                _DAILY_CHANNEL_TOTALS_SQL, daily_channel_params
+            ),
+            daily_fields,
+        )
         aggregate_results_valid = all((
             archive_totals_valid,
             projected_totals_valid,
@@ -603,6 +686,8 @@ def verify_database(
             rolled_totals_valid,
             raw_inbound_valid,
             rolled_inbound_valid,
+            archive_daily_valid,
+            daily_channel_valid,
         ))
 
         coverage_rows = [
@@ -611,8 +696,10 @@ def verify_database(
                 """
                 SELECT archive_generation, date_utc,
                        created_sync_complete, updated_sync_complete,
-                       aggregate_complete, reconciliation_status,
-                       reasons_json
+                       aggregate_complete, settled_forward_count,
+                       forwarded_in_msat, forwarded_out_msat, fee_msat,
+                       sourced_forward_count, reconciliation_status,
+                       reasons_json, checked_at, schema_version
                 FROM forward_archive_coverage_v1
                 WHERE archive_generation = ?
                   AND date_utc >= ? AND date_utc < ?
@@ -621,34 +708,94 @@ def verify_database(
                 (generation, start, end),
             )
         ]
+        coverage_total_fields = total_fields + ("sourced_forward_count",)
         expected_days = (end - start) // 86400
         coverage_rows_valid = all(
             type(row["archive_generation"]) is int
             and row["archive_generation"] > 0
             and type(row["date_utc"]) is int
             and row["date_utc"] >= 0
+            and row["date_utc"] % 86400 == 0
             and type(row["created_sync_complete"]) is int
             and row["created_sync_complete"] in (0, 1)
             and type(row["updated_sync_complete"]) is int
             and row["updated_sync_complete"] in (0, 1)
             and type(row["aggregate_complete"]) is int
             and row["aggregate_complete"] in (0, 1)
+            and all(
+                type(row[field]) is int and row[field] >= 0
+                for field in coverage_total_fields
+            )
             and type(row["reconciliation_status"]) is str
             and type(row["reasons_json"]) is str
+            and type(row["checked_at"]) is int
+            and row["checked_at"] >= 0
+            and type(row["schema_version"]) is int
+            and row["schema_version"] > 0
             for row in coverage_rows
         )
-        coverage_complete = (
-            malformed_coverage_count == 0
-            and coverage_rows_valid
+        coverage_shape_valid = (
+            coverage_rows_valid
             and len(coverage_rows) == expected_days
             and all(
                 row["date_utc"] == start + index * 86400
-                and row["created_sync_complete"] == 1
+                for index, row in enumerate(coverage_rows)
+            )
+        )
+        archive_daily_by_day = {
+            row["date_utc"]: row for row in archive_daily_rows
+        }
+        daily_channel_by_day = {
+            row["date_utc"]: row for row in daily_channel_rows
+        }
+        zero_archive_day = {field: 0 for field in total_fields}
+        zero_daily_day = {field: 0 for field in daily_fields}
+        coverage_day_mismatch = False
+        if (
+            coverage_shape_valid
+            and archive_daily_valid
+            and daily_channel_valid
+        ):
+            for coverage_row in coverage_rows:
+                day = coverage_row["date_utc"]
+                canonical = archive_daily_by_day.get(day, zero_archive_day)
+                aggregate = daily_channel_by_day.get(day, zero_daily_day)
+                coverage_matches = all(
+                    coverage_row[field] == canonical[field]
+                    for field in total_fields
+                ) and (
+                    coverage_row["sourced_forward_count"]
+                    == canonical["settled_forward_count"]
+                )
+                direct_matches = all(
+                    aggregate[field] == canonical[field]
+                    for field in total_fields
+                )
+                sourced_matches = (
+                    aggregate["sourced_forward_count"]
+                    == canonical["settled_forward_count"]
+                    and aggregate["sourced_volume_msat"]
+                    == canonical["forwarded_in_msat"]
+                    and aggregate["sourced_fee_msat"]
+                    == canonical["fee_msat"]
+                )
+                if not (
+                    coverage_matches and direct_matches and sourced_matches
+                ):
+                    coverage_day_mismatch = True
+                    break
+        coverage_complete = (
+            malformed_coverage_count == 0
+            and coverage_shape_valid
+            and aggregate_results_valid
+            and not coverage_day_mismatch
+            and all(
+                row["created_sync_complete"] == 1
                 and row["updated_sync_complete"] == 1
                 and row["aggregate_complete"] == 1
                 and row["reconciliation_status"] == "complete"
                 and json.loads(row["reasons_json"]) == []
-                for index, row in enumerate(coverage_rows)
+                for row in coverage_rows
             )
         )
         canonical_equal = (
@@ -720,6 +867,16 @@ def verify_database(
                 _ARCHIVE_TOTAL_SQL,
                 archive_params,
             ),
+            "archive_daily_totals": _query_plan(
+                connection,
+                _ARCHIVE_DAILY_TOTALS_SQL,
+                archive_params,
+            ),
+            "daily_channel_totals": _query_plan(
+                connection,
+                _DAILY_CHANNEL_TOTALS_SQL,
+                daily_channel_params,
+            ),
             "legacy_projection": _query_plan(
                 connection, _LEGACY_PROJECTED_ARCHIVE_SQL, archive_params
             ),
@@ -775,6 +932,10 @@ def verify_database(
                 "idx_forward_archive_coverage_v1_date_generation"
             ),
             "archive": "idx_forward_archive_v1_status_received",
+            "archive_daily_totals": (
+                "idx_forward_archive_v1_status_received"
+            ),
+            "daily_channel_totals": "idx_forward_daily_channel_v1_date",
             "legacy_projection": "idx_forward_archive_v1_status_received",
             "legacy_projection_keys": (
                 "idx_forward_archive_v1_status_received"
@@ -832,9 +993,22 @@ def verify_database(
                 "received_time_ns",
             )
         )
+        daily_plan_bounded = (
+            _uses_search_range(
+                plans["archive_daily_totals"],
+                "idx_forward_archive_v1_status_received",
+                "received_time_ns",
+            )
+            and _uses_search_range(
+                plans["daily_channel_totals"],
+                "idx_forward_daily_channel_v1_date",
+                "date_utc",
+            )
+        )
         query_plan_bounded = (
             generation_plan_bounded
             and sentinel_plans_bounded
+            and daily_plan_bounded
             and all(
                 _uses_search_index(plans[name], index_name)
                 for name, index_name in expected_indexes.items()
@@ -856,6 +1030,8 @@ def verify_database(
             reasons.append("archive_operational_mismatch")
         if not direct_sourced_equal:
             reasons.append("operational_direct_sourced_count_mismatch")
+        if coverage_day_mismatch:
+            reasons.append("coverage_day_mismatch")
         if not coverage_complete:
             reasons.append("coverage_incomplete")
         if not query_plan_bounded:
@@ -883,6 +1059,9 @@ def verify_database(
             "overlap_status": overlap_status,
             "warnings": warnings,
             "direct_sourced_equal": direct_sourced_equal,
+            "coverage_days": coverage_rows,
+            "archive_daily_totals": archive_daily_rows,
+            "daily_channel_totals": daily_channel_rows,
             "coverage_complete": coverage_complete,
             "query_plan_bounded": query_plan_bounded,
             "query_plans": plans,

@@ -51,8 +51,15 @@ def snapshot_db(tmp_path):
             created_sync_complete INTEGER,
             updated_sync_complete INTEGER,
             aggregate_complete INTEGER,
+            settled_forward_count INTEGER,
+            forwarded_in_msat INTEGER,
+            forwarded_out_msat INTEGER,
+            fee_msat INTEGER,
+            sourced_forward_count INTEGER,
             reconciliation_status TEXT,
             reasons_json TEXT,
+            checked_at INTEGER,
+            schema_version INTEGER,
             PRIMARY KEY (archive_generation, date_utc)
         );
         CREATE INDEX idx_forward_archive_coverage_v1_date
@@ -68,6 +75,8 @@ def snapshot_db(tmp_path):
             forwarded_out_msat INTEGER NOT NULL,
             fee_msat INTEGER NOT NULL,
             sourced_forward_count INTEGER NOT NULL,
+            sourced_volume_msat INTEGER NOT NULL,
+            sourced_fee_msat INTEGER NOT NULL,
             PRIMARY KEY (archive_generation, date_utc, channel_id)
         );
         CREATE INDEX idx_forward_daily_channel_v1_date
@@ -132,19 +141,25 @@ def snapshot_db(tmp_path):
     connection.execute(
         "INSERT INTO forward_archive_coverage_v1 ("
         "archive_generation, date_utc, created_sync_complete, "
-        "updated_sync_complete, aggregate_complete, reconciliation_status, "
-        "reasons_json) VALUES "
-        "(1, ?, 1, 1, 1, 'complete', '[]')",
-        (DAY_START,),
+        "updated_sync_complete, aggregate_complete, settled_forward_count, "
+        "forwarded_in_msat, forwarded_out_msat, fee_msat, "
+        "sourced_forward_count, reconciliation_status, reasons_json, "
+        "checked_at, schema_version) VALUES "
+        "(1, ?, 1, 1, 1, 2, 5000, 4700, 300, 2, "
+        "'complete', '[]', ?, 1)",
+        (DAY_START, DAY_END * 1_000_000_000),
     )
     connection.executemany(
         "INSERT INTO forward_daily_channel_v1 ("
         "archive_generation, date_utc, channel_id, settled_forward_count, "
         "forwarded_in_msat, forwarded_out_msat, fee_msat, "
-        "sourced_forward_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "sourced_forward_count, sourced_volume_msat, sourced_fee_msat) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            (1, DAY_START, "2x2x2", 1, 2000, 1900, 100, 1),
-            (1, DAY_START, "3x3x3", 1, 3000, 2800, 200, 1),
+            (1, DAY_START, "2x2x2", 1, 2000, 1900, 100, 0, 0, 0),
+            (1, DAY_START, "3x3x3", 1, 3000, 2800, 200, 0, 0, 0),
+            (1, DAY_START, "1x1x1", 0, 0, 0, 0, 1, 2000, 100),
+            (1, DAY_START, "4x4x4", 0, 0, 0, 0, 1, 3000, 200),
         ],
     )
     connection.execute(
@@ -193,12 +208,80 @@ def _add_exact_archive_duplicate(snapshot_db):
         "SET settled_forward_count = settled_forward_count + 1, "
         "forwarded_in_msat = forwarded_in_msat + 2000, "
         "forwarded_out_msat = forwarded_out_msat + 1900, "
-        "fee_msat = fee_msat + 100, "
-        "sourced_forward_count = sourced_forward_count + 1 "
+        "fee_msat = fee_msat + 100 "
         "WHERE channel_id = '2x2x2'"
+    )
+    connection.execute(
+        "UPDATE forward_daily_channel_v1 "
+        "SET sourced_forward_count = sourced_forward_count + 1, "
+        "sourced_volume_msat = sourced_volume_msat + 2000, "
+        "sourced_fee_msat = sourced_fee_msat + 100 "
+        "WHERE channel_id = '1x1x1'"
+    )
+    connection.execute(
+        "UPDATE forward_archive_coverage_v1 "
+        "SET settled_forward_count = settled_forward_count + 1, "
+        "forwarded_in_msat = forwarded_in_msat + 2000, "
+        "forwarded_out_msat = forwarded_out_msat + 1900, "
+        "fee_msat = fee_msat + 100, "
+        "sourced_forward_count = sourced_forward_count + 1"
     )
     connection.commit()
     connection.close()
+
+
+def _add_second_complete_day(snapshot_db):
+    second_day = DAY_END
+    second_end = second_day + 86400
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(
+        "INSERT INTO forward_archive_v1 (archive_generation, created_index, "
+        "status, in_channel, out_channel, in_msat, out_msat, fee_msat, "
+        "received_time_ns, resolved_time_ns) "
+        "SELECT archive_generation, created_index + 2, status, in_channel, "
+        "out_channel, in_msat, out_msat, fee_msat, received_time_ns + ?, "
+        "resolved_time_ns + ? FROM forward_archive_v1 "
+        "WHERE archive_generation = 1",
+        (86400 * 1_000_000_000, 86400 * 1_000_000_000),
+    )
+    connection.execute(
+        "INSERT INTO forward_archive_coverage_v1 SELECT archive_generation, "
+        "?, created_sync_complete, updated_sync_complete, aggregate_complete, "
+        "settled_forward_count, forwarded_in_msat, forwarded_out_msat, "
+        "fee_msat, sourced_forward_count, reconciliation_status, "
+        "reasons_json, ?, schema_version FROM forward_archive_coverage_v1 "
+        "WHERE date_utc = ?",
+        (second_day, second_end * 1_000_000_000, DAY_START),
+    )
+    connection.execute(
+        "INSERT INTO forward_daily_channel_v1 SELECT archive_generation, ?, "
+        "channel_id, settled_forward_count, forwarded_in_msat, "
+        "forwarded_out_msat, fee_msat, sourced_forward_count, "
+        "sourced_volume_msat, sourced_fee_msat "
+        "FROM forward_daily_channel_v1 WHERE date_utc = ?",
+        (second_day, DAY_START),
+    )
+    connection.execute(
+        "INSERT INTO forwards (id, in_channel, out_channel, in_msat, out_msat, "
+        "fee_msat, timestamp, resolved_time) SELECT 2, in_channel, out_channel, "
+        "in_msat, out_msat, fee_msat, timestamp + 86400, "
+        "resolved_time + 86400 FROM forwards WHERE id = 1"
+    )
+    connection.execute(
+        "INSERT INTO daily_forwarding_stats SELECT channel_id, ?, "
+        "total_in_msat, total_out_msat, total_fee_msat, forward_count "
+        "FROM daily_forwarding_stats WHERE date = ?",
+        (second_day, DAY_START),
+    )
+    connection.execute(
+        "INSERT INTO daily_forwarding_stats_inbound SELECT channel_id, ?, "
+        "total_in_msat, total_fee_msat, forward_count "
+        "FROM daily_forwarding_stats_inbound WHERE date = ?",
+        (second_day, DAY_START),
+    )
+    connection.commit()
+    connection.close()
+    return second_end
 
 
 def test_verifier_matches_archive_to_raw_plus_rollup(snapshot_db):
@@ -705,6 +788,120 @@ def test_verifier_coverage_validation_plans_are_bounded_searches(snapshot_db):
         assert "SEARCH " in plan, (name, plan)
         assert "idx_forward_archive_coverage_v1_date_generation" in plan
         assert "SCAN " not in plan, (name, plan)
+
+
+def test_verifier_daily_reconciliation_plans_are_bounded_searches(snapshot_db):
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    expected = {
+        "archive_daily_totals": "idx_forward_archive_v1_status_received",
+        "daily_channel_totals": "idx_forward_daily_channel_v1_date",
+    }
+    for name, index_name in expected.items():
+        plan = " ".join(result["query_plans"][name])
+        assert "SEARCH " in plan, (name, plan)
+        assert index_name in plan, (name, plan)
+        assert "SCAN " not in plan, (name, plan)
+
+
+def test_verifier_rejects_well_typed_wrong_coverage_total(
+    snapshot_db, capsys
+):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(
+        "UPDATE forward_archive_coverage_v1 SET fee_msat = 999"
+    )
+    connection.commit()
+    connection.close()
+
+    exit_code = main([
+        "--database", str(snapshot_db),
+        "--history-since", str(DAY_START),
+        "--history-until", str(DAY_END),
+    ])
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert result["coverage_complete"] is False
+    assert "coverage_day_mismatch" in result["reasons"]
+
+
+def test_verifier_rejects_cross_day_compensating_coverage_errors(snapshot_db):
+    history_until = _add_second_complete_day(snapshot_db)
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(
+        "UPDATE forward_archive_coverage_v1 SET fee_msat = 400 "
+        "WHERE date_utc = ?",
+        (DAY_START,),
+    )
+    connection.execute(
+        "UPDATE forward_archive_coverage_v1 SET fee_msat = 200 "
+        "WHERE date_utc = ?",
+        (DAY_END,),
+    )
+    connection.commit()
+    connection.close()
+
+    result = verify_database(snapshot_db, DAY_START, history_until)
+
+    assert sum(row["fee_msat"] for row in result["coverage_days"]) == 600
+    assert result["coverage_complete"] is False
+    assert "coverage_day_mismatch" in result["reasons"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE forward_archive_coverage_v1 SET fee_msat = 300.5",
+        "UPDATE forward_archive_coverage_v1 SET forwarded_in_msat = 'bad'",
+        "UPDATE forward_archive_coverage_v1 SET settled_forward_count = NULL",
+        "UPDATE forward_archive_coverage_v1 SET checked_at = 1.5",
+        "UPDATE forward_archive_coverage_v1 SET schema_version = 0",
+        "UPDATE forward_archive_coverage_v1 SET schema_version = NULL",
+    ],
+)
+def test_verifier_rejects_malformed_coverage_totals_and_metadata(
+    snapshot_db, mutation
+):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(mutation)
+    connection.commit()
+    connection.close()
+
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    assert result["coverage_complete"] is False
+    assert "malformed_coverage_record" in result["reasons"]
+
+
+def test_verifier_requires_full_production_coverage_columns(snapshot_db):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(
+        "DROP INDEX idx_forward_archive_coverage_v1_date_generation"
+    )
+    connection.execute(
+        "ALTER TABLE forward_archive_coverage_v1 "
+        "RENAME TO forward_archive_coverage_old"
+    )
+    connection.execute(
+        "CREATE TABLE forward_archive_coverage_v1 ("
+        "archive_generation INTEGER, date_utc INTEGER, "
+        "created_sync_complete INTEGER, updated_sync_complete INTEGER, "
+        "aggregate_complete INTEGER, reconciliation_status TEXT, "
+        "reasons_json TEXT)"
+    )
+    connection.execute(
+        "CREATE INDEX idx_forward_archive_coverage_v1_date_generation "
+        "ON forward_archive_coverage_v1(date_utc, archive_generation)"
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(
+        VerificationError,
+        match="table forward_archive_coverage_v1 missing required columns",
+    ):
+        verify_database(snapshot_db, DAY_START, DAY_END)
 
 
 def test_verifier_reports_incomplete_coverage(snapshot_db):

@@ -660,6 +660,24 @@ def test_rebuild_day_is_replacement_based_and_idempotent():
     assert second["totals"]["fee_msat"] == 300
 
 
+def test_history_fails_closed_on_well_typed_coverage_total_mismatch():
+    store, connection = _memory_store()
+    day = 1699920000
+    checked_at = _seed_complete_day(store, day)
+    store.rebuild_days([day], checked_at)
+    connection.execute(
+        "UPDATE forward_archive_coverage_v1 SET fee_msat = 999 "
+        "WHERE archive_generation = ? AND date_utc = ?",
+        (ARCHIVE_GENERATION, day),
+    )
+
+    result = store.history(day, day + 86400, None, 100)
+
+    assert result["complete"] is False
+    assert result["totals"]["fee_msat"] is None
+    assert "coverage_mismatch" in result["coverage"][0]["reasons"]
+
+
 def test_incomplete_updated_cursor_cannot_mark_day_complete():
     store, _connection = _memory_store()
     day = 1699920000
