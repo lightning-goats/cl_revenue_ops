@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-13
 **Scope:** Phase 0.1–0.6
-**Status:** Implemented locally; production activation and gate not started
+**Status:** Archive correction deployed observationally; fee-intent preflight blocked; 72-hour gate not started
 **Recommendation:** **CONTINUE SHADOW**
 
 ## Hypothesis
@@ -232,3 +232,55 @@ canonical delta is therefore quantified as explained legacy deduplication loss,
 not archive duplication; canonical totals remain authoritative. The successor
 window remains inactive: state is preflight, formal_window_active=false,
 and the 72-hour durable-evidence gate has not started.
+
+## Corrected forward archive production preflight (2026-08-14)
+
+The first corrected deployment at `dcacb8e3a532364ef66e8ee2a482f10e877266fa`
+proved cursor recovery but exposed a second fail-closed defect: coverage totals
+counted failed and offered rows while the canonical daily aggregate counted only
+settled rows. All 223 retained closed days therefore reported
+`aggregate_mismatch`; the 72-hour gate was not started. The root-cause fix keeps
+cursor maxima and unresolved-offer evidence all-status while making count,
+volume, and fee coverage totals settled-only. A separate verifier portability
+fix uses validated `NOT NULL` schema constraints as proof for impossible NULL
+sentinels, while retaining indexed sentinels for nullable columns.
+
+The combined reviewed correction was dynamically loaded on `lnnode` at
+`2026-08-14 02:40:14 UTC`, production SHA
+`6a4ab411025340404e73ce50df43d2b8c1c0f21a`. Core Lightning was not restarted;
+the plugin was stopped and started dynamically with explicit
+`revenue-ops-db-path=/data/lightningd/.lightning/revenue_ops.db` and
+`revenue-ops-dry-run=false`. No economic action RPC was invoked.
+
+Read-only recovery evidence at `2026-08-14 02:41:36 UTC` showed:
+
+- created cursor `next_index=171265`, `complete_through_index=171264`;
+- updated cursor `next_index=153287`, `complete_through_index=153286`;
+- null `last_error` for both cursor families;
+- 171,264 archive rows and 171,264 distinct created indices;
+- all 223 retained closed UTC days complete with `reasons=[]`;
+- the current UTC day incomplete, as required; and
+- `PRAGMA quick_check=ok`, with no new archive page-limit, **BROKEN**, or
+  traceback entry in the CLN in-memory log.
+
+SQLite online backup produced
+`/tmp/revenue_ops-forward-archive-postfix-6a4ab41-20260814T024219Z.db`, SHA-256
+`4fc60daad7b055621e6af2d6ddc3daf4c0a63a6c856e0765ae60185e35d9c380` before
+and after verification. The exact verifier exited 0 with
+`coverage_complete=true`, `query_plan_bounded=true`, no reasons, and only the
+expected `legacy_operational_dedup_loss` warning. It confirmed:
+
+| Source | Settled forwards | Inbound | Outbound | Fees |
+| --- | ---: | ---: | ---: | ---: |
+| Canonical archive | 1,592 | 181,585,409.261 sats | 181,565,144.891 sats | 20,264.370 sats |
+| Exact legacy projection / operational | 1,559 | 180,054,800.496 sats | 180,034,807.224 sats | 19,993.272 sats |
+| Explained legacy deduplication loss | 33 | 1,530,608.765 sats | 1,530,337.667 sats | 271.098 sats |
+
+The final governance gate still did not pass. The durable reconciliation run
+for `[2026-08-14 01:00:00, 02:00:00) UTC` completed cleanly, was ledger-aligned,
+and had zero unexplained divergences, but `fee_intent_complete=false`. The
+persisted mismatch is the fee cycle at `2026-08-13 07:52:57 UTC`, with 7 fee
+changes versus 9 intents. Therefore the successor window remains inactive,
+`formal_window_active=false`, optimization activation remains none, and the
+72-hour durable-evidence gate is still **not started**. Phase 0.7 fee-intent
+mismatch investigation remains the next engineering item.

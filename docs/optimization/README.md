@@ -23,7 +23,10 @@ and updated cursors populate versioned raw evidence, replacement daily
 aggregates carry explicit coverage, and the daily collector requires one exact
 closed UTC day through a bounded read-only RPC. Optional diagnostic loss is a
 warning; required evidence loss remains fail closed. Economic behavior is
-unchanged. Production activation and the 72-hour evidence gate remain pending.
+unchanged. The corrected archive is deployed observationally at production SHA
+`6a4ab411025340404e73ce50df43d2b8c1c0f21a`: archive coverage and the exact
+copied-database verifier pass, but the 72-hour evidence gate remains blocked by
+an independently persisted fee-intent completeness mismatch.
 
 state: preflight
 formal_window_active=false
@@ -66,7 +69,7 @@ See [validation/baseline.md](validation/baseline.md) and the historical
 | 0.3 Daily collector repair | implementation | shadow evidence | [phase0-daily-collector.md](findings/phase0-daily-collector.md) |
 | 0.4 Validator failure semantics | implementation | shadow evidence | [phase0-validator-failure-semantics.md](findings/phase0-validator-failure-semantics.md) |
 | 0.5 Versioned evaluation identity | implementation | preflight only | [phase0-evaluation-identity.md](findings/phase0-evaluation-identity.md) |
-| 0.6 Canonical forward archive | implementation | production activation pending | [ADR-002](adr/ADR-002-canonical-forward-archive.md) |
+| 0.6 Canonical forward archive | implementation | archive production preflight passes; 72-hour gate blocked | [ADR-002](adr/ADR-002-canonical-forward-archive.md) |
 | 0B. Refactor closure | queued | inactive | future finding |
 | 1. Deterministic replay and traces | blocked by Phase 0 | inactive | future finding |
 | 2. Route-liquidity evidence | blocked by Phase 1 | inactive | future finding |

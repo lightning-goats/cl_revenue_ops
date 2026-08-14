@@ -79,6 +79,21 @@ state: preflight
 formal_window_active: false
 72-hour durable-evidence gate: not started
 
+The corrected observational archive was dynamically loaded on `lnnode` at
+`2026-08-14 02:40:14 UTC`, production SHA
+`6a4ab411025340404e73ce50df43d2b8c1c0f21a`. At `02:41:36 UTC`, both archive
+cursors were caught up with null errors, all 223 retained closed UTC days were
+complete with empty reasons, the current UTC day remained incomplete, and
+`PRAGMA quick_check` returned `ok`. The exact copied-database verifier exited 0
+against snapshot SHA-256
+`4fc60daad7b055621e6af2d6ddc3daf4c0a63a6c856e0765ae60185e35d9c380`.
+
+The 72-hour gate did not start. The durable reconciliation for
+`[2026-08-14 01:00:00, 02:00:00) UTC` completed cleanly, was ledger-aligned,
+and had zero unexplained divergences, but its fee-intent completeness was false:
+the cycle at `2026-08-13 07:52:57 UTC` recorded 7 fee changes for 9 intents.
+This is a preflight blocker, not evidence that may be silently counted.
+
 The forward-archive preflight correction is documented in the [design](../plans/2026-08-13-forward-archive-preflight-corrections-design.md),
 [implementation plan](../plans/2026-08-13-forward-archive-preflight-corrections.md),
 and [measurement-hardening finding](../findings/phase0-measurement-hardening.md).
