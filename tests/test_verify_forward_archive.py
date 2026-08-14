@@ -39,6 +39,10 @@ def snapshot_db(tmp_path):
         ON forward_archive_v1(
             archive_generation, status, received_time_ns, created_index
         );
+        CREATE INDEX idx_forward_archive_v1_received
+        ON forward_archive_v1(
+            archive_generation, received_time_ns, created_index
+        );
         CREATE TABLE forward_archive_coverage_v1 (
             archive_generation INTEGER NOT NULL,
             date_utc INTEGER NOT NULL,
@@ -419,6 +423,52 @@ def test_verifier_rejects_nonexact_legacy_identity(snapshot_db, mutation):
     assert result["overlap_status"] == "unexplained"
     assert "archive_operational_mismatch" in result["reasons"]
     assert result["warnings"] == []
+
+
+def test_verifier_detects_in_window_archive_generation_without_coverage(
+    snapshot_db,
+):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(
+        "INSERT INTO forward_archive_v1 ("
+        "archive_generation, created_index, status, in_channel, out_channel, "
+        "in_msat, out_msat, fee_msat, received_time_ns, resolved_time_ns) "
+        "VALUES (2, 1, 'settled', '1x1x1', '2x2x2', 2000, 1900, 100, ?, ?)",
+        (
+            (DAY_START + 3600) * 1_000_000_000,
+            (DAY_START + 3605) * 1_000_000_000,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    assert "multiple_archive_generations" in result["reasons"]
+    plan = " ".join(result["query_plans"]["generation_discovery"])
+    assert "idx_forward_archive_coverage_v1_date" in plan
+    assert "idx_forward_archive_v1_received" in plan
+    assert result["query_plan_bounded"] is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE forward_archive_v1 SET archive_generation = 1.5 "
+        "WHERE created_index = 2",
+        "UPDATE forward_archive_coverage_v1 SET archive_generation = 1.5",
+    ],
+)
+def test_verifier_rejects_malformed_in_window_generation_id(
+    snapshot_db, mutation
+):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(mutation)
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(VerificationError, match="positive integer"):
+        verify_database(snapshot_db, DAY_START, DAY_END)
 
 
 def test_verifier_opens_sqlite_read_only(snapshot_db):

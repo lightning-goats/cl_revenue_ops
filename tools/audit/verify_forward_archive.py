@@ -47,6 +47,24 @@ _REQUIRED_COLUMNS = {
     },
 }
 
+_GENERATION_DISCOVERY_SQL = """
+    WITH discovered_generations AS (
+        SELECT archive_generation
+        FROM forward_archive_coverage_v1
+            INDEXED BY idx_forward_archive_coverage_v1_date
+        WHERE date_utc >= ? AND date_utc < ?
+        UNION
+        SELECT archive_generation
+        FROM forward_archive_v1
+            INDEXED BY idx_forward_archive_v1_received
+        WHERE received_time_ns >= ? AND received_time_ns < ?
+    )
+    SELECT archive_generation
+    FROM discovered_generations
+    ORDER BY archive_generation
+"""
+
+
 _ARCHIVE_TOTAL_SQL = """
     SELECT COUNT(*) AS settled_forward_count,
            COALESCE(SUM(in_msat), 0) AS forwarded_in_msat,
@@ -303,25 +321,28 @@ def verify_database(
     connection = _open_read_only(database_path)
     try:
         tables = _discover_schema(connection)
-        generations = [
-            int(row[0])
-            for row in connection.execute(
-                """
-                SELECT DISTINCT archive_generation
-                FROM forward_archive_coverage_v1
-                WHERE date_utc >= ? AND date_utc < ?
-                ORDER BY archive_generation
-                """,
-                (start, end),
-            )
-        ]
-        if generations:
-            generation = generations[-1]
-        else:
-            row = connection.execute(
-                "SELECT MAX(archive_generation) FROM forward_archive_v1"
-            ).fetchone()
-            generation = int(row[0]) if row and row[0] is not None else 1
+        generation_params = (
+            start,
+            end,
+            start * 1_000_000_000,
+            end * 1_000_000_000,
+        )
+        generation_rows = connection.execute(
+            _GENERATION_DISCOVERY_SQL,
+            generation_params,
+        ).fetchall()
+        generations = []
+        for row in generation_rows:
+            value = row[0]
+            if type(value) is not int or value <= 0:
+                raise VerificationError(
+                    "archive generation ID must be a positive integer"
+                )
+            generations.append(value)
+        generation = generations[-1] if generations else 1
+        generation_plan = _query_plan(
+            connection, _GENERATION_DISCOVERY_SQL, generation_params
+        )
 
         archive_params = (
             generation,
@@ -501,6 +522,7 @@ def verify_database(
         )
 
         plans = {
+            "generation_discovery": generation_plan,
             "archive": _query_plan(
                 connection,
                 _ARCHIVE_TOTAL_SQL,
@@ -556,9 +578,20 @@ def verify_database(
                 "idx_daily_fwd_stats_inbound_date"
             ),
         }
-        query_plan_bounded = all(
-            _uses_index(plans[name], index_name)
-            for name, index_name in expected_indexes.items()
+        generation_plan_bounded = (
+            _uses_index(
+                generation_plan, "idx_forward_archive_coverage_v1_date"
+            )
+            and _uses_index(
+                generation_plan, "idx_forward_archive_v1_received"
+            )
+        )
+        query_plan_bounded = (
+            generation_plan_bounded
+            and all(
+                _uses_index(plans[name], index_name)
+                for name, index_name in expected_indexes.items()
+            )
         )
 
         reasons = []
