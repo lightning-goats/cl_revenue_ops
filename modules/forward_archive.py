@@ -1025,10 +1025,17 @@ class ForwardArchiveStore:
             end_ns = (day + 86400) * 1_000_000_000
             raw = connection.execute(
                 """
-                SELECT COUNT(*) AS settled_forward_count,
-                       COALESCE(SUM(in_msat), 0) AS forwarded_in_msat,
-                       COALESCE(SUM(out_msat), 0) AS forwarded_out_msat,
-                       COALESCE(SUM(fee_msat), 0) AS fee_msat,
+                SELECT COALESCE(SUM(
+                           CASE WHEN status = 'settled' THEN 1 ELSE 0 END
+                       ), 0) AS settled_forward_count,
+                       COALESCE(SUM(CASE WHEN status = 'settled'
+                           THEN in_msat ELSE 0 END), 0)
+                           AS forwarded_in_msat,
+                       COALESCE(SUM(CASE WHEN status = 'settled'
+                           THEN out_msat ELSE 0 END), 0)
+                           AS forwarded_out_msat,
+                       COALESCE(SUM(CASE WHEN status = 'settled'
+                           THEN fee_msat ELSE 0 END), 0) AS fee_msat,
                        MAX(created_index) AS max_created_index,
                        MAX(updated_index) AS max_updated_index,
                        SUM(CASE WHEN status = 'offered' THEN 1 ELSE 0 END)

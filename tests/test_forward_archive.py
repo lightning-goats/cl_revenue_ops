@@ -812,6 +812,130 @@ def test_complete_cursors_and_matching_aggregate_mark_day_complete():
     assert result["totals"]["sourced_forward_count"] == 2
 
 
+def test_mixed_status_coverage_counts_only_settled_economics():
+    store, connection = _memory_store()
+    day = 1699920000
+    checked_at = (day + 86400 + 1) * 1_000_000_000
+    settled = _settled_page_record(
+        1, 11, "1x1x1", "2x2x2", 2000, 1900, 100, "1700000000"
+    )
+    failed = {
+        **_settled_page_record(
+            2, 12, "1x1x1", "3x3x3", 9000, 8000, 1000,
+            "1700000100",
+        ),
+        "status": "failed",
+    }
+    offered = {
+        "created_index": 3,
+        "status": "offered",
+        "in_channel": "1x1x1",
+        "out_channel": "4x4x4",
+        "in_msat": 7000,
+        "out_msat": 6500,
+        "fee_msat": 500,
+        "received_time": "1700000200",
+    }
+    store.apply_page(
+        "created", [settled, failed, offered], checked_at, live_max_index=3
+    )
+    store.apply_page(
+        "updated", [settled, failed], checked_at, live_max_index=12
+    )
+
+    store.rebuild_days([day], checked_at)
+
+    coverage = connection.execute(
+        "SELECT * FROM forward_archive_coverage_v1 WHERE date_utc = ?",
+        (day,),
+    ).fetchone()
+    assert coverage["created_sync_complete"] == 1
+    assert coverage["updated_sync_complete"] == 1
+    assert coverage["aggregate_complete"] == 1
+    assert coverage["settled_forward_count"] == 1
+    assert coverage["forwarded_in_msat"] == 2000
+    assert coverage["forwarded_out_msat"] == 1900
+    assert coverage["fee_msat"] == 100
+    assert coverage["reconciliation_status"] == "incomplete"
+    assert coverage["reasons_json"] == '["unresolved_offered"]'
+
+    connection.execute(
+        "UPDATE forward_archive_sync_state_v1 "
+        "SET complete_through_index = CASE index_family "
+        "WHEN 'created' THEN 2 ELSE 11 END "
+        "WHERE index_family IN ('created', 'updated')"
+    )
+    store.refresh_coverage([day], checked_at)
+    coverage = connection.execute(
+        "SELECT * FROM forward_archive_coverage_v1 WHERE date_utc = ?",
+        (day,),
+    ).fetchone()
+    assert coverage["created_sync_complete"] == 0
+    assert coverage["updated_sync_complete"] == 0
+    assert "created_sync_incomplete" in coverage["reasons_json"]
+    assert "updated_sync_incomplete" in coverage["reasons_json"]
+
+    connection.execute(
+        "UPDATE forward_archive_sync_state_v1 "
+        "SET complete_through_index = CASE index_family "
+        "WHEN 'created' THEN 3 ELSE 12 END "
+        "WHERE index_family IN ('created', 'updated')"
+    )
+    terminal = _settled_page_record(
+        3, None, "1x1x1", "4x4x4", 3000, 2800, 200, "1700000200"
+    )
+    store.apply_page("created", [terminal], checked_at + 1, live_max_index=3)
+    store.rebuild_days([day], checked_at + 1)
+
+    before_history = connection.total_changes
+    result = store.history(day, day + 86400, None, 100)
+    assert connection.total_changes == before_history
+    assert result["complete"] is True
+    assert result["coverage"][0]["reasons"] == []
+    assert result["totals"]["settled_forward_count"] == 2
+    assert result["totals"]["sourced_forward_count"] == 2
+    assert result["totals"]["forwarded_in_msat"] == 5000
+    assert result["totals"]["forwarded_out_msat"] == 4700
+    assert result["totals"]["fee_msat"] == 300
+
+
+def test_malformed_settled_row_keeps_mixed_status_coverage_incomplete():
+    store, connection = _memory_store()
+    day = 1699920000
+    checked_at = (day + 86400 + 1) * 1_000_000_000
+    malformed = _settled_page_record(
+        1, 11, "1x1x1", "2x2x2", 2000, 1900, 100, "1700000000"
+    )
+    malformed["out_channel"] = None
+    failed = {
+        **_settled_page_record(
+            2, 12, "1x1x1", "3x3x3", 9000, 8000, 1000,
+            "1700000100",
+        ),
+        "status": "failed",
+    }
+    store.apply_page(
+        "created", [malformed, failed], checked_at, live_max_index=2
+    )
+    store.apply_page(
+        "updated", [malformed, failed], checked_at, live_max_index=12
+    )
+
+    store.rebuild_days([day], checked_at)
+
+    coverage = connection.execute(
+        "SELECT * FROM forward_archive_coverage_v1 WHERE date_utc = ?",
+        (day,),
+    ).fetchone()
+    assert coverage["settled_forward_count"] == 1
+    assert coverage["forwarded_in_msat"] == 2000
+    assert coverage["forwarded_out_msat"] == 1900
+    assert coverage["fee_msat"] == 100
+    assert coverage["aggregate_complete"] == 0
+    assert coverage["reconciliation_status"] == "incomplete"
+    assert "malformed_settled_record" in coverage["reasons_json"]
+
+
 def test_missing_coverage_is_null_and_incomplete_not_green_zero():
     store, _connection = _memory_store()
 
