@@ -15,6 +15,7 @@ reservation until reconciled").
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -22,6 +23,17 @@ from .econ_ledger import EconLedger
 
 # Statuses in spend_reservations that mean "no longer outstanding".
 _DB_TERMINAL = frozenset({"spent", "released"})
+FEE_INTENT_WINDOW_SECONDS = 86400
+
+
+def fee_change_query_bounds(
+    now: int, window_seconds: int = FEE_INTENT_WINDOW_SECONDS
+) -> tuple[int, int]:
+    observed = int(now)
+    window = int(window_seconds)
+    if observed < 0 or window < 0:
+        raise ValueError("fee-intent window values must be non-negative")
+    return max(0, observed - window), observed + 1
 
 
 @dataclass(frozen=True)
@@ -140,6 +152,16 @@ def reconcile(ledger: EconLedger, db_states: Dict[str, dict], now: int,
     )
 
 
+def _malformed_fee_change_data(error: str) -> dict:
+    return {
+        "status": "malformed_fee_change_data",
+        "cycles_checked": 0,
+        "complete": False,
+        "mismatched_cycles": {},
+        "error": error,
+    }
+
+
 def fee_intent_completeness(ledger: EconLedger, fee_changes: list,
                             now: int, window_seconds: int = 86400,
                             tolerance_seconds: int = 120) -> dict:
@@ -152,6 +174,26 @@ def fee_intent_completeness(ledger: EconLedger, fee_changes: list,
     with a tolerance because the journal stamp and the fee_changes rows
     are written seconds apart within one cycle.
     """
+    if not isinstance(fee_changes, list):
+        return _malformed_fee_change_data(
+            "fee_changes must be a list")
+    fee_change_timestamps = []
+    for index, row in enumerate(fee_changes):
+        if not isinstance(row, Mapping):
+            return _malformed_fee_change_data(
+                f"fee_changes[{index}] must be a mapping")
+        if "timestamp" not in row:
+            return _malformed_fee_change_data(
+                f"fee_changes[{index}] missing timestamp")
+        raw_ts = row["timestamp"]
+        if isinstance(raw_ts, bool) or not isinstance(raw_ts, int):
+            return _malformed_fee_change_data(
+                f"fee_changes[{index}].timestamp must be an integer")
+        if raw_ts < 0:
+            return _malformed_fee_change_data(
+                f"fee_changes[{index}].timestamp must be non-negative")
+        fee_change_timestamps.append(raw_ts)
+
     intents_by_ts: dict = {}
     for event in ledger.events():
         if event["event_type"] != "intent_proposed":
@@ -175,9 +217,8 @@ def fee_intent_completeness(ledger: EconLedger, fee_changes: list,
     window_start = max(int(now) - int(window_seconds),
                        min(intents_by_ts))
     changes_by_ts: dict = {}
-    for row in fee_changes or []:
-        ts = int(row.get("timestamp", 0) or 0)
-        if ts >= window_start:
+    for ts in fee_change_timestamps:
+        if window_start <= ts <= int(now):
             changes_by_ts[ts] = changes_by_ts.get(ts, 0) + 1
 
     # One fee cycle can write its fee_changes rows across adjacent
