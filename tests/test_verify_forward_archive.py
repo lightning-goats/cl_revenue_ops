@@ -344,6 +344,13 @@ def test_verifier_rejects_null_settled_legacy_key(
             "malformed_settled_record",
         ),
         (
+            "archive",
+            "UPDATE forward_archive_v1 "
+            "SET received_time_ns = 'not-an-integer' "
+            "WHERE created_index = 1",
+            "malformed_settled_record",
+        ),
+        (
             "raw",
             "UPDATE forwards SET out_msat = 1900.5 WHERE id = 1",
             "malformed_operational_record",
@@ -361,6 +368,11 @@ def test_verifier_rejects_null_settled_legacy_key(
         (
             "raw",
             "UPDATE forwards SET resolved_time = NULL WHERE id = 1",
+            "malformed_operational_record",
+        ),
+        (
+            "raw",
+            "UPDATE forwards SET timestamp = timestamp + 0.5 WHERE id = 1",
             "malformed_operational_record",
         ),
         (

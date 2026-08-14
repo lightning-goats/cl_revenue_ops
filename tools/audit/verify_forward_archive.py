@@ -142,12 +142,6 @@ _MALFORMED_OPERATIONAL_KEY_SQL = """
       )
 """
 
-_MALFORMED_OPERATIONAL_TIME_SQL = """
-    SELECT COUNT(*) AS malformed_operational_time_count
-    FROM forwards INDEXED BY idx_forwards_time
-    WHERE typeof(timestamp) != 'integer' OR timestamp < 0
-"""
-
 _ARCHIVE_HISTORY_SQL = """
     SELECT * FROM forward_daily_channel_v1
     WHERE archive_generation = ?
@@ -357,16 +351,9 @@ def verify_database(
             _MALFORMED_OPERATIONAL_KEY_SQL,
             (start, end),
         ).fetchone()["malformed_operational_count"]
-        malformed_operational_time_count = connection.execute(
-            _MALFORMED_OPERATIONAL_TIME_SQL,
-        ).fetchone()["malformed_operational_time_count"]
         for name, count in (
             ("malformed_settled_count", malformed_settled_count),
             ("malformed_operational_count", malformed_operational_count),
-            (
-                "malformed_operational_time_count",
-                malformed_operational_time_count,
-            ),
         ):
             if type(count) is not int or count < 0:
                 raise VerificationError(
@@ -406,7 +393,6 @@ def verify_database(
         legacy_identity_consistent = (
             malformed_settled_count == 0
             and malformed_operational_count == 0
-            and malformed_operational_time_count == 0
             and raw_identity_consistent
         )
 
@@ -540,9 +526,6 @@ def verify_database(
             "malformed_operational_identity": _query_plan(
                 connection, _MALFORMED_OPERATIONAL_KEY_SQL, (start, end)
             ),
-            "malformed_operational_time": _query_plan(
-                connection, _MALFORMED_OPERATIONAL_TIME_SQL, ()
-            ),
             "archive_history": _query_plan(
                 connection,
                 _ARCHIVE_HISTORY_SQL,
@@ -569,7 +552,6 @@ def verify_database(
             ),
             "malformed_legacy_identity": "idx_forward_archive_v1_status_received",
             "malformed_operational_identity": "idx_forwards_time",
-            "malformed_operational_time": "idx_forwards_time",
             "archive_history": "idx_forward_daily_channel_v1_date",
             "operational_raw": "idx_forwards_time",
             "operational_raw_identity": "idx_forwards_time",
@@ -599,7 +581,7 @@ def verify_database(
             reasons.append("multiple_archive_generations")
         if malformed_settled_count:
             reasons.append("malformed_settled_record")
-        if malformed_operational_count or malformed_operational_time_count:
+        if malformed_operational_count:
             reasons.append("malformed_operational_record")
         if not aggregate_results_valid:
             reasons.append("malformed_aggregate_result")
@@ -629,10 +611,7 @@ def verify_database(
             "legacy_loss_consistent": legacy_loss_consistent,
             "aggregate_results_valid": aggregate_results_valid,
             "malformed_settled_count": malformed_settled_count,
-            "malformed_operational_count": (
-                malformed_operational_count
-                + malformed_operational_time_count
-            ),
+            "malformed_operational_count": malformed_operational_count,
             "overlap_status": overlap_status,
             "warnings": warnings,
             "direct_sourced_equal": direct_sourced_equal,
