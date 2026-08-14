@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from modules.forward_archive import ForwardArchiveStore
+from modules.forward_archive import ForwardArchiveError, ForwardArchiveStore
 from modules.forward_archive_sync import (
     ForwardArchiveSyncError,
     ForwardArchiveSynchronizer,
@@ -431,6 +431,31 @@ def test_caught_up_cycle_recovers_missing_closed_day_coverage(store):
     assert result.caught_up is True
     assert day in result.touched_dates
     assert store.history(day, day + 86400, None, 100)["complete"] is True
+
+
+def test_recovery_discovery_error_is_recorded_for_both_cursor_families(
+    store,
+):
+    rpc = MagicMock()
+    rpc.wait.side_effect = [
+        {"subsystem": "forwards", "created": 0},
+        {"subsystem": "forwards", "updated": 0},
+    ]
+    store.closed_days_needing_rebuild = MagicMock(
+        side_effect=ForwardArchiveError("coverage recovery failed")
+    )
+
+    with pytest.raises(
+        ForwardArchiveSyncError, match="coverage recovery failed"
+    ):
+        ForwardArchiveSynchronizer(rpc, store, _log).sync_once(now_ns=10)
+
+    assert store.get_sync_state("created")["last_error"] == (
+        "coverage recovery failed"
+    )
+    assert store.get_sync_state("updated")["last_error"] == (
+        "coverage recovery failed"
+    )
 
 
 def test_sync_rpc_allowlist_is_wait_and_listforwards_only(store):
