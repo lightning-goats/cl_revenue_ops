@@ -365,7 +365,9 @@ def _open_read_only(database_path: str | Path) -> sqlite3.Connection:
     return connection
 
 
-def _discover_schema(connection: sqlite3.Connection) -> list[str]:
+def _discover_schema(
+    connection: sqlite3.Connection,
+) -> tuple[list[str], frozenset[tuple[str, str]]]:
     tables = {
         str(row[0])
         for row in connection.execute(
@@ -377,17 +379,26 @@ def _discover_schema(connection: sqlite3.Connection) -> list[str]:
         raise VerificationError(
             "missing required tables: " + ", ".join(missing)
         )
+    not_null_columns = set()
     for table, expected in _REQUIRED_COLUMNS.items():
-        columns = {
-            str(row[1])
-            for row in connection.execute(f'PRAGMA table_info("{table}")')
-        }
+        column_rows = list(
+            connection.execute(f'PRAGMA table_info("{table}")')
+        )
+        columns = {str(row[1]) for row in column_rows}
         absent = sorted(expected - columns)
         if absent:
             raise VerificationError(
                 f"table {table} missing required columns: "
                 + ", ".join(absent)
             )
+        for row in column_rows:
+            not_null = row[3]
+            if type(not_null) is not int or not_null not in (0, 1):
+                raise VerificationError(
+                    f"table {table} has invalid NOT NULL metadata"
+                )
+            if not_null == 1:
+                not_null_columns.add((table, str(row[1])))
     indexes = {
         str(row[0])
         for row in connection.execute(
@@ -400,7 +411,7 @@ def _discover_schema(connection: sqlite3.Connection) -> list[str]:
             "missing required observational indexes: "
             + ", ".join(missing_indexes)
         )
-    return sorted(tables)
+    return sorted(tables), frozenset(not_null_columns)
 
 
 def _strict_int_row(
@@ -516,13 +527,33 @@ def verify_database(
     start, end = _validate_bounds(history_since, history_until)
     connection = _open_read_only(database_path)
     try:
-        tables = _discover_schema(connection)
+        tables, not_null_columns = _discover_schema(connection)
+        coverage_date_not_null = (
+            "forward_archive_coverage_v1", "date_utc"
+        ) in not_null_columns
+        operational_timestamp_not_null = (
+            "forwards", "timestamp"
+        ) in not_null_columns
+        schema_null_sentinels_skipped = []
+        if coverage_date_not_null:
+            schema_null_sentinels_skipped.append("coverage_date_null")
+        if operational_timestamp_not_null:
+            schema_null_sentinels_skipped.append(
+                "operational_timestamp_null"
+            )
+
         malformed_coverage_count = connection.execute(
             _MALFORMED_COVERAGE_SQL,
             (start, end),
         ).fetchone()["malformed_coverage_count"]
         malformed_coverage_count += sum((
-            _sentinel_found(connection, _COVERAGE_DATE_NULL_SQL, ()),
+            (
+                False
+                if coverage_date_not_null
+                else _sentinel_found(
+                    connection, _COVERAGE_DATE_NULL_SQL, ()
+                )
+            ),
             _sentinel_found(connection, _COVERAGE_DATE_NEGATIVE_SQL, ()),
             _sentinel_found(
                 connection, _COVERAGE_DATE_TYPE_DOMAIN_SQL, ()
@@ -587,7 +618,13 @@ def verify_database(
             (start, end),
         ).fetchone()["malformed_operational_count"]
         malformed_operational_count += sum((
-            _sentinel_found(connection, _OPERATIONAL_TIMESTAMP_NULL_SQL, ()),
+            (
+                False
+                if operational_timestamp_not_null
+                else _sentinel_found(
+                    connection, _OPERATIONAL_TIMESTAMP_NULL_SQL, ()
+                )
+            ),
             _sentinel_found(
                 connection, _OPERATIONAL_TIMESTAMP_NEGATIVE_SQL, ()
             ),
@@ -853,9 +890,6 @@ def verify_database(
             "malformed_coverage_identity": _query_plan(
                 connection, _MALFORMED_COVERAGE_SQL, (start, end)
             ),
-            "coverage_date_null": _query_plan(
-                connection, _COVERAGE_DATE_NULL_SQL, ()
-            ),
             "coverage_date_negative": _query_plan(
                 connection, _COVERAGE_DATE_NEGATIVE_SQL, ()
             ),
@@ -900,9 +934,6 @@ def verify_database(
             "malformed_operational_identity": _query_plan(
                 connection, _MALFORMED_OPERATIONAL_KEY_SQL, (start, end)
             ),
-            "operational_timestamp_null": _query_plan(
-                connection, _OPERATIONAL_TIMESTAMP_NULL_SQL, ()
-            ),
             "operational_timestamp_negative": _query_plan(
                 connection, _OPERATIONAL_TIMESTAMP_NEGATIVE_SQL, ()
             ),
@@ -927,6 +958,15 @@ def verify_database(
                 connection, _ROLLED_INBOUND_SQL, (start, end)
             ),
         }
+        if not coverage_date_not_null:
+            plans["coverage_date_null"] = _query_plan(
+                connection, _COVERAGE_DATE_NULL_SQL, ()
+            )
+        if not operational_timestamp_not_null:
+            plans["operational_timestamp_null"] = _query_plan(
+                connection, _OPERATIONAL_TIMESTAMP_NULL_SQL, ()
+            )
+
         expected_indexes = {
             "malformed_coverage_identity": (
                 "idx_forward_archive_coverage_v1_date_generation"
@@ -951,9 +991,6 @@ def verify_database(
             ),
         }
         sentinel_indexes = {
-            "coverage_date_null": (
-                "idx_forward_archive_coverage_v1_date_generation"
-            ),
             "coverage_date_negative": (
                 "idx_forward_archive_coverage_v1_date_generation"
             ),
@@ -973,10 +1010,18 @@ def verify_database(
                 "idx_forward_archive_v1_received_generation"
             ),
             "malformed_operational_identity": "idx_forwards_time",
-            "operational_timestamp_null": "idx_forwards_time",
             "operational_timestamp_negative": "idx_forwards_time",
             "operational_timestamp_type_domain": "idx_forwards_time",
         }
+        if not coverage_date_not_null:
+            sentinel_indexes["coverage_date_null"] = (
+                "idx_forward_archive_coverage_v1_date_generation"
+            )
+        if not operational_timestamp_not_null:
+            sentinel_indexes["operational_timestamp_null"] = (
+                "idx_forwards_time"
+            )
+
         sentinel_plans_bounded = all(
             _uses_search_index(plans[name], index_name)
             for name, index_name in sentinel_indexes.items()
@@ -1064,6 +1109,9 @@ def verify_database(
             "daily_channel_totals": daily_channel_rows,
             "coverage_complete": coverage_complete,
             "query_plan_bounded": query_plan_bounded,
+            "schema_null_sentinels_skipped": (
+                schema_null_sentinels_skipped
+            ),
             "query_plans": plans,
             "reasons": reasons,
         }

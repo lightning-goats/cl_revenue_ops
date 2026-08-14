@@ -188,6 +188,59 @@ def snapshot_db(tmp_path):
     return path
 
 
+@pytest.fixture
+def production_not_null_snapshot_db(snapshot_db):
+    connection = sqlite3.connect(snapshot_db)
+    connection.executescript(
+        """
+        CREATE TABLE forward_archive_coverage_production (
+            archive_generation INTEGER,
+            date_utc INTEGER NOT NULL,
+            created_sync_complete INTEGER,
+            updated_sync_complete INTEGER,
+            aggregate_complete INTEGER,
+            settled_forward_count INTEGER,
+            forwarded_in_msat INTEGER,
+            forwarded_out_msat INTEGER,
+            fee_msat INTEGER,
+            sourced_forward_count INTEGER,
+            reconciliation_status TEXT,
+            reasons_json TEXT,
+            checked_at INTEGER,
+            schema_version INTEGER,
+            PRIMARY KEY (archive_generation, date_utc)
+        );
+        INSERT INTO forward_archive_coverage_production
+        SELECT * FROM forward_archive_coverage_v1;
+        DROP TABLE forward_archive_coverage_v1;
+        ALTER TABLE forward_archive_coverage_production
+        RENAME TO forward_archive_coverage_v1;
+        CREATE INDEX idx_forward_archive_coverage_v1_date
+        ON forward_archive_coverage_v1(archive_generation, date_utc);
+        CREATE INDEX idx_forward_archive_coverage_v1_date_generation
+        ON forward_archive_coverage_v1(date_utc, archive_generation);
+
+        CREATE TABLE forwards_production (
+            id INTEGER PRIMARY KEY,
+            in_channel TEXT NOT NULL,
+            out_channel TEXT NOT NULL,
+            in_msat INTEGER NOT NULL,
+            out_msat INTEGER NOT NULL,
+            fee_msat INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL,
+            resolved_time INTEGER
+        );
+        INSERT INTO forwards_production SELECT * FROM forwards;
+        DROP TABLE forwards;
+        ALTER TABLE forwards_production RENAME TO forwards;
+        CREATE INDEX idx_forwards_time ON forwards(timestamp);
+        """
+    )
+    connection.commit()
+    connection.close()
+    return snapshot_db
+
+
 def _add_exact_archive_duplicate(snapshot_db):
     connection = sqlite3.connect(snapshot_db)
     connection.execute(
@@ -787,6 +840,42 @@ def test_verifier_coverage_validation_plans_are_bounded_searches(snapshot_db):
         plan = " ".join(result["query_plans"][name])
         assert "SEARCH " in plan, (name, plan)
         assert "idx_forward_archive_coverage_v1_date_generation" in plan
+        assert "SCAN " not in plan, (name, plan)
+
+
+def test_verifier_uses_not_null_schema_proof_for_impossible_sentinels(
+    production_not_null_snapshot_db,
+):
+    result = verify_database(
+        production_not_null_snapshot_db, DAY_START, DAY_END
+    )
+
+    assert result["query_plan_bounded"] is True
+    assert result["schema_null_sentinels_skipped"] == [
+        "coverage_date_null",
+        "operational_timestamp_null",
+    ]
+    assert "coverage_date_null" not in result["query_plans"]
+    assert "operational_timestamp_null" not in result["query_plans"]
+    for name in (
+        "coverage_date_negative",
+        "coverage_date_type_domain",
+        "archive_received_null",
+        "operational_timestamp_negative",
+        "operational_timestamp_type_domain",
+    ):
+        plan = " ".join(result["query_plans"][name])
+        assert "SEARCH " in plan, (name, plan)
+        assert "SCAN " not in plan, (name, plan)
+
+
+def test_nullable_schema_keeps_null_sentinel_plan_guards(snapshot_db):
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    assert result["schema_null_sentinels_skipped"] == []
+    for name in ("coverage_date_null", "operational_timestamp_null"):
+        plan = " ".join(result["query_plans"][name])
+        assert "SEARCH " in plan, (name, plan)
         assert "SCAN " not in plan, (name, plan)
 
 
