@@ -61,7 +61,7 @@ _LEGACY_PROJECTED_ARCHIVE_SQL = """
     WITH legacy_rows AS (
         SELECT in_channel, out_channel, in_msat, out_msat, fee_msat,
                received_time_ns / 1000000000 AS timestamp,
-               COALESCE(resolved_time_ns / 1000000000, 0) AS resolved_time
+               resolved_time_ns / 1000000000 AS resolved_time
         FROM forward_archive_v1
         WHERE archive_generation = ? AND status = 'settled'
           AND received_time_ns >= ? AND received_time_ns < ?
@@ -78,7 +78,7 @@ _LEGACY_PROJECTED_ARCHIVE_SQL = """
 _LEGACY_PROJECTED_KEYS_SQL = """
     SELECT in_channel, out_channel, in_msat, out_msat, fee_msat,
            received_time_ns / 1000000000 AS timestamp,
-           COALESCE(resolved_time_ns / 1000000000, 0) AS resolved_time
+           resolved_time_ns / 1000000000 AS resolved_time
     FROM forward_archive_v1
     WHERE archive_generation = ? AND status = 'settled'
       AND received_time_ns >= ? AND received_time_ns < ?
@@ -89,18 +89,45 @@ _LEGACY_PROJECTED_KEYS_SQL = """
 _MALFORMED_SETTLED_LEGACY_KEY_SQL = """
     SELECT COUNT(*) AS malformed_settled_count
     FROM forward_archive_v1
+        INDEXED BY idx_forward_archive_v1_status_received
     WHERE archive_generation = ? AND status = 'settled'
       AND (
-          received_time_ns IS NULL
+          typeof(received_time_ns) != 'integer'
+          OR received_time_ns < 0
           OR (
               received_time_ns >= ? AND received_time_ns < ?
               AND (
-                  in_channel IS NULL OR out_channel IS NULL
-                  OR in_msat IS NULL OR out_msat IS NULL
-                  OR fee_msat IS NULL OR resolved_time_ns IS NULL
+                  typeof(in_channel) != 'text'
+                  OR typeof(out_channel) != 'text'
+                  OR typeof(in_msat) != 'integer' OR in_msat < 0
+                  OR typeof(out_msat) != 'integer' OR out_msat < 0
+                  OR typeof(fee_msat) != 'integer' OR fee_msat < 0
+                  OR typeof(resolved_time_ns) != 'integer'
+                  OR resolved_time_ns < 0
               )
           )
       )
+"""
+
+_MALFORMED_OPERATIONAL_KEY_SQL = """
+    SELECT COUNT(*) AS malformed_operational_count
+    FROM forwards INDEXED BY idx_forwards_time
+    WHERE timestamp >= ? AND timestamp < ?
+      AND (
+          typeof(in_channel) != 'text'
+          OR typeof(out_channel) != 'text'
+          OR typeof(in_msat) != 'integer' OR in_msat < 0
+          OR typeof(out_msat) != 'integer' OR out_msat < 0
+          OR typeof(fee_msat) != 'integer' OR fee_msat < 0
+          OR typeof(timestamp) != 'integer' OR timestamp < 0
+          OR typeof(resolved_time) != 'integer' OR resolved_time < 0
+      )
+"""
+
+_MALFORMED_OPERATIONAL_TIME_SQL = """
+    SELECT COUNT(*) AS malformed_operational_time_count
+    FROM forwards INDEXED BY idx_forwards_time
+    WHERE typeof(timestamp) != 'integer' OR timestamp < 0
 """
 
 _ARCHIVE_HISTORY_SQL = """
@@ -121,7 +148,7 @@ _RAW_TOTAL_SQL = """
 
 _RAW_LEGACY_KEYS_SQL = """
     SELECT in_channel, out_channel, in_msat, out_msat, fee_msat,
-           timestamp, COALESCE(resolved_time, 0) AS resolved_time
+           timestamp, resolved_time
     FROM forwards
     WHERE timestamp >= ? AND timestamp < ?
 """
@@ -206,8 +233,35 @@ def _discover_schema(connection: sqlite3.Connection) -> list[str]:
     return sorted(tables)
 
 
-def _int_row(row: Mapping[str, Any], fields: Iterable[str]) -> dict[str, int]:
-    return {field: int(row[field] or 0) for field in fields}
+def _strict_int_row(
+    row: Mapping[str, Any],
+    fields: Iterable[str],
+) -> tuple[dict[str, int | None], bool]:
+    result: dict[str, int | None] = {}
+    valid = True
+    for field in fields:
+        value = row[field]
+        if type(value) is not int or value < 0:
+            result[field] = None
+            valid = False
+        else:
+            result[field] = value
+    return result, valid
+
+
+def _sum_strict_fields(
+    left: Mapping[str, int | None],
+    right: Mapping[str, int | None],
+    fields: Iterable[str],
+) -> dict[str, int | None]:
+    return {
+        field: (
+            left[field] + right[field]
+            if type(left[field]) is int and type(right[field]) is int
+            else None
+        )
+        for field in fields
+    }
 
 
 _LEGACY_KEY_FIELDS = (
@@ -274,12 +328,30 @@ def verify_database(
             start * 1_000_000_000,
             end * 1_000_000_000,
         )
-        malformed_settled_count = int(
-            connection.execute(
-                _MALFORMED_SETTLED_LEGACY_KEY_SQL,
-                archive_params,
-            ).fetchone()["malformed_settled_count"] or 0
-        )
+        malformed_settled_count = connection.execute(
+            _MALFORMED_SETTLED_LEGACY_KEY_SQL,
+            archive_params,
+        ).fetchone()["malformed_settled_count"]
+        malformed_operational_count = connection.execute(
+            _MALFORMED_OPERATIONAL_KEY_SQL,
+            (start, end),
+        ).fetchone()["malformed_operational_count"]
+        malformed_operational_time_count = connection.execute(
+            _MALFORMED_OPERATIONAL_TIME_SQL,
+        ).fetchone()["malformed_operational_time_count"]
+        for name, count in (
+            ("malformed_settled_count", malformed_settled_count),
+            ("malformed_operational_count", malformed_operational_count),
+            (
+                "malformed_operational_time_count",
+                malformed_operational_time_count,
+            ),
+        ):
+            if type(count) is not int or count < 0:
+                raise VerificationError(
+                    f"{name} aggregate must be a non-negative integer"
+                )
+
         archive_row = connection.execute(
             _ARCHIVE_TOTAL_SQL,
             archive_params,
@@ -290,8 +362,10 @@ def verify_database(
             "forwarded_out_msat",
             "fee_msat",
         )
-        archive = _int_row(archive_row, total_fields)
-        legacy_projected_archive = _int_row(
+        archive, archive_totals_valid = _strict_int_row(
+            archive_row, total_fields
+        )
+        legacy_projected_archive, projected_totals_valid = _strict_int_row(
             connection.execute(
                 _LEGACY_PROJECTED_ARCHIVE_SQL,
                 archive_params,
@@ -310,36 +384,42 @@ def verify_database(
         )
         legacy_identity_consistent = (
             malformed_settled_count == 0
+            and malformed_operational_count == 0
+            and malformed_operational_time_count == 0
             and raw_identity_consistent
         )
 
-        raw = _int_row(
+        raw, raw_totals_valid = _strict_int_row(
             connection.execute(_RAW_TOTAL_SQL, (start, end)).fetchone(),
             total_fields,
         )
-        rolled = _int_row(
+        rolled, rolled_totals_valid = _strict_int_row(
             connection.execute(_ROLLED_TOTAL_SQL, (start, end)).fetchone(),
             total_fields,
         )
-        operational = {
-            field: raw[field] + rolled[field]
-            for field in total_fields
-        }
+        operational = _sum_strict_fields(raw, rolled, total_fields)
         inbound_fields = ("sourced_forward_count", "sourced_volume_msat")
-        raw_inbound = _int_row(
+        raw_inbound, raw_inbound_valid = _strict_int_row(
             connection.execute(_RAW_INBOUND_SQL, (start, end)).fetchone(),
             inbound_fields,
         )
-        rolled_inbound = _int_row(
+        rolled_inbound, rolled_inbound_valid = _strict_int_row(
             connection.execute(
                 _ROLLED_INBOUND_SQL, (start, end)
             ).fetchone(),
             inbound_fields,
         )
-        operational.update({
-            field: raw_inbound[field] + rolled_inbound[field]
-            for field in inbound_fields
-        })
+        operational.update(
+            _sum_strict_fields(raw_inbound, rolled_inbound, inbound_fields)
+        )
+        aggregate_results_valid = all((
+            archive_totals_valid,
+            projected_totals_valid,
+            raw_totals_valid,
+            rolled_totals_valid,
+            raw_inbound_valid,
+            rolled_inbound_valid,
+        ))
 
         coverage_rows = [
             dict(row)
@@ -370,21 +450,33 @@ def verify_database(
                 for index, row in enumerate(coverage_rows)
             )
         )
-        canonical_equal = all(
-            archive[field] == operational[field]
-            for field in total_fields
+        canonical_equal = (
+            aggregate_results_valid
+            and all(
+                archive[field] == operational[field]
+                for field in total_fields
+            )
         )
         overlap_equal = canonical_equal
-        legacy_projection_equal = all(
-            legacy_projected_archive[field] == operational[field]
-            for field in total_fields
+        legacy_projection_equal = (
+            aggregate_results_valid
+            and all(
+                legacy_projected_archive[field] == operational[field]
+                for field in total_fields
+            )
         )
         legacy_dedup_loss = {
-            field: archive[field] - operational[field]
+            field: (
+                archive[field] - operational[field]
+                if type(archive[field]) is int
+                and type(operational[field]) is int
+                else None
+            )
             for field in total_fields
         }
         legacy_loss_consistent = all(
-            value >= 0 for value in legacy_dedup_loss.values()
+            type(value) is int and value >= 0
+            for value in legacy_dedup_loss.values()
         )
         if canonical_equal and legacy_identity_consistent:
             overlap_status = "equal"
@@ -402,7 +494,9 @@ def verify_database(
             else []
         )
         direct_sourced_equal = (
-            operational["settled_forward_count"]
+            type(operational["settled_forward_count"]) is int
+            and type(operational["sourced_forward_count"]) is int
+            and operational["settled_forward_count"]
             == operational["sourced_forward_count"]
         )
 
@@ -420,6 +514,12 @@ def verify_database(
             ),
             "malformed_legacy_identity": _query_plan(
                 connection, _MALFORMED_SETTLED_LEGACY_KEY_SQL, archive_params
+            ),
+            "malformed_operational_identity": _query_plan(
+                connection, _MALFORMED_OPERATIONAL_KEY_SQL, (start, end)
+            ),
+            "malformed_operational_time": _query_plan(
+                connection, _MALFORMED_OPERATIONAL_TIME_SQL, ()
             ),
             "archive_history": _query_plan(
                 connection,
@@ -446,6 +546,8 @@ def verify_database(
                 "idx_forward_archive_v1_status_received"
             ),
             "malformed_legacy_identity": "idx_forward_archive_v1_status_received",
+            "malformed_operational_identity": "idx_forwards_time",
+            "malformed_operational_time": "idx_forwards_time",
             "archive_history": "idx_forward_daily_channel_v1_date",
             "operational_raw": "idx_forwards_time",
             "operational_raw_identity": "idx_forwards_time",
@@ -464,6 +566,10 @@ def verify_database(
             reasons.append("multiple_archive_generations")
         if malformed_settled_count:
             reasons.append("malformed_settled_record")
+        if malformed_operational_count or malformed_operational_time_count:
+            reasons.append("malformed_operational_record")
+        if not aggregate_results_valid:
+            reasons.append("malformed_aggregate_result")
         if overlap_status == "unexplained":
             reasons.append("archive_operational_mismatch")
         if not direct_sourced_equal:
@@ -488,6 +594,12 @@ def verify_database(
             "legacy_projection_equal": legacy_projection_equal,
             "legacy_identity_consistent": legacy_identity_consistent,
             "legacy_loss_consistent": legacy_loss_consistent,
+            "aggregate_results_valid": aggregate_results_valid,
+            "malformed_settled_count": malformed_settled_count,
+            "malformed_operational_count": (
+                malformed_operational_count
+                + malformed_operational_time_count
+            ),
             "overlap_status": overlap_status,
             "warnings": warnings,
             "direct_sourced_equal": direct_sourced_equal,

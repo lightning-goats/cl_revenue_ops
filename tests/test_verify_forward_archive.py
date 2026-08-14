@@ -74,7 +74,7 @@ def snapshot_db(tmp_path):
             out_msat INTEGER NOT NULL,
             fee_msat INTEGER NOT NULL,
             timestamp INTEGER NOT NULL,
-            resolved_time INTEGER NOT NULL
+            resolved_time INTEGER
         );
         CREATE INDEX idx_forwards_time ON forwards(timestamp);
         CREATE TABLE daily_forwarding_stats (
@@ -316,6 +316,74 @@ def test_verifier_rejects_null_settled_legacy_key(
     cli_result = json.loads(capsys.readouterr().out)
     assert exit_code == 1
     assert "malformed_settled_record" in cli_result["reasons"]
+
+
+@pytest.mark.parametrize(
+    "table, mutation, malformed_reason",
+    [
+        (
+            "archive",
+            "UPDATE forward_archive_v1 SET in_msat = 2000.5 "
+            "WHERE created_index = 1",
+            "malformed_settled_record",
+        ),
+        (
+            "archive",
+            "UPDATE forward_archive_v1 SET fee_msat = 'not-an-integer' "
+            "WHERE created_index = 1",
+            "malformed_settled_record",
+        ),
+        (
+            "archive",
+            "UPDATE forward_archive_v1 SET in_channel = X'31' "
+            "WHERE created_index = 1",
+            "malformed_settled_record",
+        ),
+        (
+            "raw",
+            "UPDATE forwards SET out_msat = 1900.5 WHERE id = 1",
+            "malformed_operational_record",
+        ),
+        (
+            "raw",
+            "UPDATE forwards SET fee_msat = 'not-an-integer' WHERE id = 1",
+            "malformed_operational_record",
+        ),
+        (
+            "raw",
+            "UPDATE forwards SET out_channel = X'32' WHERE id = 1",
+            "malformed_operational_record",
+        ),
+        (
+            "raw",
+            "UPDATE forwards SET resolved_time = NULL WHERE id = 1",
+            "malformed_operational_record",
+        ),
+        (
+            "rollup",
+            "UPDATE daily_forwarding_stats SET total_fee_msat = 200.5",
+            "malformed_aggregate_result",
+        ),
+    ],
+)
+def test_verifier_cli_fails_closed_on_malformed_storage_types(
+    snapshot_db, capsys, table, mutation, malformed_reason
+):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(mutation)
+    connection.commit()
+    connection.close()
+
+    exit_code = main([
+        "--database", str(snapshot_db),
+        "--history-since", str(DAY_START),
+        "--history-until", str(DAY_END),
+    ])
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code != 0, table
+    assert malformed_reason in result["reasons"]
+    assert "archive_operational_mismatch" in result["reasons"]
 
 
 @pytest.mark.parametrize(
