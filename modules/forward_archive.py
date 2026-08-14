@@ -854,6 +854,24 @@ class ForwardArchiveStore:
             checked_at_ns, "checked_at_ns", optional=False
         )
         days = sorted({self._validate_day(day) for day in date_epochs})
+        checked_seconds = checked_at // 1_000_000_000
+        current_day = checked_seconds - (checked_seconds % 86400)
+        closed_days = [day for day in days if day < current_day]
+        if len(closed_days) > MAX_ARCHIVE_RETENTION_DAYS:
+            raise ForwardArchiveError(
+                "closed-day rebuild exceeds 400-day bound"
+            )
+        retained_start = max(
+            0, current_day - MAX_ARCHIVE_RETENTION_DAYS * 86400
+        )
+        if any(day < retained_start for day in closed_days):
+            raise ForwardArchiveError(
+                "closed-day rebuild is outside retained window"
+            )
+        if any(day > current_day for day in days):
+            raise ForwardArchiveError(
+                "rebuild day cannot be after current UTC day"
+            )
         connection = self._connection_provider()
         for day in days:
             start_ns = day * 1_000_000_000

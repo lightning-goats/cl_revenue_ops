@@ -563,6 +563,66 @@ def test_closed_days_needing_rebuild_rejects_invalid_bounds():
         store.closed_days_needing_rebuild(1700006400, retention_days=401)
 
 
+@pytest.mark.parametrize(
+    "days, error",
+    [
+        (lambda current: [current - 401 * 86400], "retained window"),
+        (
+            lambda current: [
+                current - offset * 86400 for offset in range(1, 402)
+            ],
+            "exceeds 400-day bound",
+        ),
+    ],
+)
+def test_rebuild_days_rejects_unbounded_set_before_any_write(days, error):
+    store, connection = _memory_store()
+    current_day = 1700006400
+    checked_at = (current_day + 60) * 1_000_000_000
+    valid_day = current_day - 86400
+    record = _settled_page_record(
+        1, 1, "1x1x1", "2x2x2", 2000, 1900, 100,
+        str(valid_day + 3600),
+    )
+    store.apply_page("created", [record], checked_at, live_max_index=1)
+    store.apply_page("updated", [record], checked_at, live_max_index=1)
+
+    with pytest.raises(ForwardArchiveError, match=error):
+        store.rebuild_days([valid_day, *days(current_day)], checked_at)
+
+    assert connection.execute(
+        "SELECT COUNT(*) FROM forward_daily_channel_v1"
+    ).fetchone()[0] == 0
+    assert connection.execute(
+        "SELECT COUNT(*) FROM forward_archive_coverage_v1"
+    ).fetchone()[0] == 0
+
+
+def test_rebuild_days_handles_current_utc_day_separately_from_closed_bound():
+    store, connection = _memory_store()
+    current_day = 1700006400
+    checked_at = (current_day + 60) * 1_000_000_000
+    record = _settled_page_record(
+        1, 1, "1x1x1", "2x2x2", 2000, 1900, 100,
+        str(current_day + 30),
+    )
+    store.apply_page("created", [record], checked_at, live_max_index=1)
+    store.apply_page("updated", [record], checked_at, live_max_index=1)
+
+    store.rebuild_days([current_day], checked_at)
+
+    assert connection.execute(
+        "SELECT COUNT(*) FROM forward_daily_channel_v1"
+    ).fetchone()[0] == 2
+    coverage = connection.execute(
+        "SELECT reconciliation_status, reasons_json "
+        "FROM forward_archive_coverage_v1 WHERE date_utc = ?",
+        (current_day,),
+    ).fetchone()
+    assert coverage["reconciliation_status"] == "incomplete"
+    assert "day_not_closed" in coverage["reasons_json"]
+
+
 def test_rebuild_day_is_replacement_based_and_idempotent():
     store, _connection = _memory_store()
     checked_at = _seed_complete_day(store)
