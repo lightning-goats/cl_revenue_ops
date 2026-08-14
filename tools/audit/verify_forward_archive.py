@@ -59,6 +59,9 @@ _GENERATION_DISCOVERY_SQL = """
         FROM forward_archive_coverage_v1
             INDEXED BY idx_forward_archive_coverage_v1_date_generation
         WHERE date_utc >= ? AND date_utc < ?
+          AND typeof(date_utc) = 'integer' AND date_utc >= 0
+          AND typeof(archive_generation) = 'integer'
+          AND archive_generation > 0
         UNION
         SELECT archive_generation
         FROM forward_archive_v1
@@ -68,6 +71,52 @@ _GENERATION_DISCOVERY_SQL = """
     SELECT archive_generation
     FROM discovered_generations
     ORDER BY archive_generation
+"""
+
+
+_MALFORMED_COVERAGE_SQL = """
+    SELECT COUNT(*) AS malformed_coverage_count
+    FROM forward_archive_coverage_v1
+        INDEXED BY idx_forward_archive_coverage_v1_date_generation
+    WHERE date_utc >= ? AND date_utc < ?
+      AND (
+          typeof(date_utc) != 'integer' OR date_utc < 0
+          OR typeof(archive_generation) != 'integer'
+          OR archive_generation <= 0
+          OR typeof(created_sync_complete) != 'integer'
+          OR created_sync_complete NOT IN (0, 1)
+          OR typeof(updated_sync_complete) != 'integer'
+          OR updated_sync_complete NOT IN (0, 1)
+          OR typeof(aggregate_complete) != 'integer'
+          OR aggregate_complete NOT IN (0, 1)
+          OR typeof(reconciliation_status) != 'text'
+          OR typeof(reasons_json) != 'text'
+      )
+"""
+
+_COVERAGE_DATE_NULL_SQL = """
+    SELECT 1
+    FROM forward_archive_coverage_v1
+        INDEXED BY idx_forward_archive_coverage_v1_date_generation
+    WHERE date_utc IS NULL
+    LIMIT 1
+"""
+
+_COVERAGE_DATE_NEGATIVE_SQL = """
+    SELECT 1
+    FROM forward_archive_coverage_v1
+        INDEXED BY idx_forward_archive_coverage_v1_date_generation
+    WHERE date_utc < 0
+    LIMIT 1
+"""
+
+_COVERAGE_DATE_TYPE_DOMAIN_SQL = """
+    SELECT 1
+    FROM forward_archive_coverage_v1
+        INDEXED BY idx_forward_archive_coverage_v1_date_generation
+    WHERE date_utc >= ''
+      AND typeof(date_utc) IN ('text', 'blob')
+    LIMIT 1
 """
 
 
@@ -404,6 +453,26 @@ def verify_database(
     connection = _open_read_only(database_path)
     try:
         tables = _discover_schema(connection)
+        malformed_coverage_count = connection.execute(
+            _MALFORMED_COVERAGE_SQL,
+            (start, end),
+        ).fetchone()["malformed_coverage_count"]
+        malformed_coverage_count += sum((
+            _sentinel_found(connection, _COVERAGE_DATE_NULL_SQL, ()),
+            _sentinel_found(connection, _COVERAGE_DATE_NEGATIVE_SQL, ()),
+            _sentinel_found(
+                connection, _COVERAGE_DATE_TYPE_DOMAIN_SQL, ()
+            ),
+        ))
+        if (
+            type(malformed_coverage_count) is not int
+            or malformed_coverage_count < 0
+        ):
+            raise VerificationError(
+                "malformed_coverage_count aggregate must be a "
+                "non-negative integer"
+            )
+
         generation_params = (
             start,
             end,
@@ -556,13 +625,30 @@ def verify_database(
             )
         ]
         expected_days = (end - start) // 86400
+        coverage_rows_valid = all(
+            type(row["archive_generation"]) is int
+            and row["archive_generation"] > 0
+            and type(row["date_utc"]) is int
+            and row["date_utc"] >= 0
+            and type(row["created_sync_complete"]) is int
+            and row["created_sync_complete"] in (0, 1)
+            and type(row["updated_sync_complete"]) is int
+            and row["updated_sync_complete"] in (0, 1)
+            and type(row["aggregate_complete"]) is int
+            and row["aggregate_complete"] in (0, 1)
+            and type(row["reconciliation_status"]) is str
+            and type(row["reasons_json"]) is str
+            for row in coverage_rows
+        )
         coverage_complete = (
-            len(coverage_rows) == expected_days
+            malformed_coverage_count == 0
+            and coverage_rows_valid
+            and len(coverage_rows) == expected_days
             and all(
-                int(row["date_utc"]) == start + index * 86400
-                and int(row["created_sync_complete"]) == 1
-                and int(row["updated_sync_complete"]) == 1
-                and int(row["aggregate_complete"]) == 1
+                row["date_utc"] == start + index * 86400
+                and row["created_sync_complete"] == 1
+                and row["updated_sync_complete"] == 1
+                and row["aggregate_complete"] == 1
                 and row["reconciliation_status"] == "complete"
                 and json.loads(row["reasons_json"]) == []
                 for index, row in enumerate(coverage_rows)
@@ -620,6 +706,18 @@ def verify_database(
 
         plans = {
             "generation_discovery": generation_plan,
+            "malformed_coverage_identity": _query_plan(
+                connection, _MALFORMED_COVERAGE_SQL, (start, end)
+            ),
+            "coverage_date_null": _query_plan(
+                connection, _COVERAGE_DATE_NULL_SQL, ()
+            ),
+            "coverage_date_negative": _query_plan(
+                connection, _COVERAGE_DATE_NEGATIVE_SQL, ()
+            ),
+            "coverage_date_type_domain": _query_plan(
+                connection, _COVERAGE_DATE_TYPE_DOMAIN_SQL, ()
+            ),
             "archive": _query_plan(
                 connection,
                 _ARCHIVE_TOTAL_SQL,
@@ -676,6 +774,9 @@ def verify_database(
             ),
         }
         expected_indexes = {
+            "malformed_coverage_identity": (
+                "idx_forward_archive_coverage_v1_date_generation"
+            ),
             "archive": "idx_forward_archive_v1_status_received",
             "legacy_projection": "idx_forward_archive_v1_status_received",
             "legacy_projection_keys": (
@@ -692,6 +793,15 @@ def verify_database(
             ),
         }
         sentinel_indexes = {
+            "coverage_date_null": (
+                "idx_forward_archive_coverage_v1_date_generation"
+            ),
+            "coverage_date_negative": (
+                "idx_forward_archive_coverage_v1_date_generation"
+            ),
+            "coverage_date_type_domain": (
+                "idx_forward_archive_coverage_v1_date_generation"
+            ),
             "malformed_archive_identity": (
                 "idx_forward_archive_v1_status_received"
             ),
@@ -737,6 +847,8 @@ def verify_database(
         reasons = []
         if len(generations) > 1:
             reasons.append("multiple_archive_generations")
+        if malformed_coverage_count or not coverage_rows_valid:
+            reasons.append("malformed_coverage_record")
         if malformed_settled_count:
             reasons.append("malformed_settled_record")
         if malformed_operational_count:
@@ -768,6 +880,7 @@ def verify_database(
             "legacy_identity_consistent": legacy_identity_consistent,
             "legacy_loss_consistent": legacy_loss_consistent,
             "aggregate_results_valid": aggregate_results_valid,
+            "malformed_coverage_count": malformed_coverage_count,
             "malformed_settled_count": malformed_settled_count,
             "malformed_operational_count": malformed_operational_count,
             "overlap_status": overlap_status,

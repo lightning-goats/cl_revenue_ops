@@ -46,13 +46,13 @@ def snapshot_db(tmp_path):
         CREATE INDEX idx_forward_archive_v1_received_generation
         ON forward_archive_v1(received_time_ns, archive_generation);
         CREATE TABLE forward_archive_coverage_v1 (
-            archive_generation INTEGER NOT NULL,
-            date_utc INTEGER NOT NULL,
-            created_sync_complete INTEGER NOT NULL,
-            updated_sync_complete INTEGER NOT NULL,
-            aggregate_complete INTEGER NOT NULL,
-            reconciliation_status TEXT NOT NULL,
-            reasons_json TEXT NOT NULL,
+            archive_generation INTEGER,
+            date_utc INTEGER,
+            created_sync_complete INTEGER,
+            updated_sync_complete INTEGER,
+            aggregate_complete INTEGER,
+            reconciliation_status TEXT,
+            reasons_json TEXT,
             PRIMARY KEY (archive_generation, date_utc)
         );
         CREATE INDEX idx_forward_archive_coverage_v1_date
@@ -543,19 +543,14 @@ def test_verifier_detects_in_window_archive_generation_without_coverage(
     assert result["query_plan_bounded"] is True
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "UPDATE forward_archive_v1 SET archive_generation = 1.5 "
-        "WHERE created_index = 2",
-        "UPDATE forward_archive_coverage_v1 SET archive_generation = 1.5",
-    ],
-)
-def test_verifier_rejects_malformed_in_window_generation_id(
-    snapshot_db, mutation
+def test_verifier_rejects_malformed_in_window_archive_generation_id(
+    snapshot_db,
 ):
     connection = sqlite3.connect(snapshot_db)
-    connection.execute(mutation)
+    connection.execute(
+        "UPDATE forward_archive_v1 SET archive_generation = 1.5 "
+        "WHERE created_index = 2"
+    )
     connection.commit()
     connection.close()
 
@@ -622,6 +617,54 @@ def test_verifier_rejects_residual_total_with_matching_projected_count(
     assert result["legacy_loss_consistent"] is True
     assert result["overlap_status"] == "unexplained"
     assert "archive_operational_mismatch" in result["reasons"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE forward_archive_coverage_v1 SET date_utc = 1786492800.5",
+        "UPDATE forward_archive_coverage_v1 SET date_utc = 'not-a-date'",
+        "UPDATE forward_archive_coverage_v1 SET date_utc = NULL",
+        "UPDATE forward_archive_coverage_v1 SET archive_generation = 1.5",
+        "UPDATE forward_archive_coverage_v1 "
+        "SET created_sync_complete = 'not-an-integer'",
+        "UPDATE forward_archive_coverage_v1 "
+        "SET updated_sync_complete = NULL",
+    ],
+)
+def test_verifier_cli_fails_closed_on_malformed_coverage_record(
+    snapshot_db, capsys, mutation
+):
+    connection = sqlite3.connect(snapshot_db)
+    connection.execute(mutation)
+    connection.commit()
+    connection.close()
+
+    exit_code = main([
+        "--database", str(snapshot_db),
+        "--history-since", str(DAY_START),
+        "--history-until", str(DAY_END),
+    ])
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert "malformed_coverage_record" in result["reasons"]
+    assert result["coverage_complete"] is False
+
+
+def test_verifier_coverage_validation_plans_are_bounded_searches(snapshot_db):
+    result = verify_database(snapshot_db, DAY_START, DAY_END)
+
+    for name in (
+        "malformed_coverage_identity",
+        "coverage_date_null",
+        "coverage_date_negative",
+        "coverage_date_type_domain",
+    ):
+        plan = " ".join(result["query_plans"][name])
+        assert "SEARCH " in plan, (name, plan)
+        assert "idx_forward_archive_coverage_v1_date_generation" in plan
+        assert "SCAN " not in plan, (name, plan)
 
 
 def test_verifier_reports_incomplete_coverage(snapshot_db):
