@@ -818,25 +818,69 @@ Expected: all functional tests pass. Run the deselected supply-chain pin test
 separately and report its result; do not conflate an environment pin mismatch
 with functional correctness.
 
-- [ ] **Step 4: Re-run the verifier against a local copy of the production snapshot**
+- [ ] **Step 4: Re-run the verifier against an indexed derivative of the immutable production snapshot**
 
-Copy `/tmp/revenue_ops-cf0cf49-20260813T2158Z.db` from `lnnode` into a new
-local temporary directory without modifying the production DB:
+Preserve the copied `cf0cf49` source byte-for-byte. Hash it, make it read-only,
+and create a disposable local derivative for the two observational indexes
+introduced after that schema snapshot:
 
 ```bash
 snapshot_dir="$(mktemp -d)"
-scp lnnode:/tmp/revenue_ops-cf0cf49-20260813T2158Z.db \
-  "$snapshot_dir/revenue_ops.db"
+source_db="$snapshot_dir/revenue_ops-cf0cf49-source.db"
+derivative_db="$snapshot_dir/revenue_ops-cf0cf49-indexed.db"
+scp lnnode:/tmp/revenue_ops-cf0cf49-20260813T2158Z.db "$source_db"
+source_hash_before="$(sha256sum "$source_db" | awk '{print $1}')"
+chmod 0444 "$source_db"
+cp "$source_db" "$derivative_db"
+chmod 0644 "$derivative_db"
+
+set +e
 .venv/bin/python tools/audit/verify_forward_archive.py \
-  --database "$snapshot_dir/revenue_ops.db" \
+  --database "$source_db" \
   --history-since 1783900800 \
-  --history-until 1786579200
+  --history-until 1786579200 \
+  > "$snapshot_dir/source-result.json"
+source_exit="$?"
+set -e
+source_hash_after="$(sha256sum "$source_db" | awk '{print $1}')"
+test "$source_hash_before" = "$source_hash_after"
+test "$source_exit" -eq 2
+jq -e '.error | contains("missing required observational indexes")' \
+  "$snapshot_dir/source-result.json"
+
+sqlite3 "$derivative_db" <<'SQL'
+CREATE INDEX idx_forward_archive_v1_received_generation
+ON forward_archive_v1(received_time_ns, archive_generation);
+CREATE INDEX idx_forward_archive_coverage_v1_date_generation
+ON forward_archive_coverage_v1(date_utc, archive_generation);
+SQL
+
+derivative_hash_before="$(sha256sum "$derivative_db" | awk '{print $1}')"
+set +e
+.venv/bin/python tools/audit/verify_forward_archive.py \
+  --database "$derivative_db" \
+  --history-since 1783900800 \
+  --history-until 1786579200 \
+  > "$snapshot_dir/derivative-result.json"
+derivative_exit="$?"
+set -e
+derivative_hash_after="$(sha256sum "$derivative_db" | awk '{print $1}')"
+test "$derivative_hash_before" = "$derivative_hash_after"
+test "$derivative_exit" -eq 1
+jq -e '
+  .overlap_status == "legacy_dedup_explained"
+  and (.reasons | index("coverage_incomplete") != null)
+' "$snapshot_dir/derivative-result.json"
 ```
 
-Expected before deploying the coverage recovery: overlap status is
-`legacy_dedup_explained`; coverage may remain incomplete because this copied
-snapshot intentionally captures the pre-fix two-row coverage state. The
-verifier must not mutate the snapshot.
+The two `CREATE INDEX` statements run **only** against the disposable
+derivative. The direct, unprepared `cf0cf49` source is expected to exit 2
+because it predates the two required bounded-generation indexes; that is schema
+provenance evidence, not an overlap verdict. The prepared derivative is
+expected to exit 1 with `overlap_status=legacy_dedup_explained` and
+`coverage_incomplete`, because the snapshot intentionally captures the pre-fix
+two-row coverage state. Equal before/after hashes prove both verifier runs are
+read-only.
 
 - [ ] **Step 5: Inspect change boundaries**
 

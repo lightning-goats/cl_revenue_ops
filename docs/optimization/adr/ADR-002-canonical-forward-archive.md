@@ -264,9 +264,20 @@ bound fails explicitly rather than truncating silently.
 - Pruning never removes the current day or unresolved rows. The fixed
   400-day floor protects the successor evaluation without depending on the
   control host's separate validation identity.
-- Database indexes cover status/time, received-time, updated-index, and
-  day/channel history queries.
-- Query-plan tests prevent unbounded lifetime scans in the collector/RPC path.
+- Runtime indexes cover status/time, generation-scoped received-time,
+  updated-index, coverage-day, and day/channel history queries.
+- The authoritative time-leading generation-discovery indexes are
+  `idx_forward_archive_v1_received_generation(received_time_ns,
+  archive_generation)` and
+  `idx_forward_archive_coverage_v1_date_generation(date_utc,
+  archive_generation)`. They make bounded time-range generation discovery a
+  `SEARCH`, even though generation is not known before discovery.
+- The offline verifier is strictly read-only and requires those two indexes.
+  A pre-index snapshot fails closed with a missing-observational-index schema
+  error; an analyst may add exactly those indexes only to a disposable local
+  derivative, never to the preserved source snapshot.
+- Query-plan tests prevent unbounded lifetime scans in the collector/RPC and
+  offline-verifier paths.
 
 At current production volume, 400 days is comfortably bounded while preserving
 raw replay across the successor evaluation and optimization experiments.
