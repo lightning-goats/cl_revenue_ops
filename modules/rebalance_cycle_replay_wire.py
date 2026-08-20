@@ -145,6 +145,11 @@ def _require_exact_keys(value: Any, keys: set[str], label: str) -> Mapping[str, 
     return value
 
 
+def _reject_reserved_float_key(value: Mapping[str, Any], label: str) -> None:
+    if BINARY64_TAG_KEY in value:
+        raise ValueError(f"{label} must not contain reserved binary64 float key __f64__")
+
+
 def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be an object")
@@ -293,8 +298,12 @@ def _validate_generated_pairs(value: Any) -> list[Tuple[str, str]]:
         rejection_reason = generated_object.get("planner_rejection_reason")
         if rejection_reason is not None and not isinstance(rejection_reason, str):
             raise ValueError(f"{label}.planner_rejection_reason must be a string or null")
-        _require_mapping(
+        bootstrap_score_decomposition = _require_mapping(
             generated_object.get("bootstrap_score_decomposition"),
+            f"{label}.bootstrap_score_decomposition",
+        )
+        _reject_reserved_float_key(
+            bootstrap_score_decomposition,
             f"{label}.bootstrap_score_decomposition",
         )
     if ranks != set(range(1, len(generated_pairs) + 1)):

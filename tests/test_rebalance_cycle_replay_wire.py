@@ -209,6 +209,43 @@ def test_runtime_and_schema_reject_legacy_or_malformed_binary64_tags(tag):
         Draft202012Validator(schema).validate(envelope)
 
 
+def _body_for_reserved_binary64_wrapper(wrapper):
+    if wrapper == "channel":
+        body = valid_body()
+        body["pre_state"]["normalized_snapshot"]["channels"] = [
+            {"channel_id": "1x1x1"}
+        ]
+        return body
+    body = body_with_pair()
+    if wrapper == "score_decomposition":
+        body["funnel"]["generated_pairs"][0]["bootstrap_score_decomposition"] = {}
+    return body
+
+
+def _reserved_binary64_wrapper(body, wrapper):
+    if wrapper == "channel":
+        return body["pre_state"]["normalized_snapshot"]["channels"][0]
+    if wrapper == "pair_ref":
+        return body["funnel"]["planner_selected_pairs"][0]
+    if wrapper == "score_decomposition":
+        return body["funnel"]["generated_pairs"][0]["bootstrap_score_decomposition"]
+    raise AssertionError(f"unknown wrapper: {wrapper}")
+
+
+@pytest.mark.parametrize("wrapper", ["channel", "pair_ref", "score_decomposition"])
+def test_runtime_and_schema_reject_reserved_binary64_key_in_non_tag_wrappers(wrapper):
+    body = _body_for_reserved_binary64_wrapper(wrapper)
+    _reserved_binary64_wrapper(body, wrapper)["__f64__"] = "3ff0000000000000"
+    with pytest.raises(ValueError, match="binary64 float"):
+        validate_body(body)
+
+    envelope = seal_envelope(_body_for_reserved_binary64_wrapper(wrapper))
+    _reserved_binary64_wrapper(envelope, wrapper)["__f64__"] = "3ff0000000000000"
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(envelope)
+
+
 def test_binary64_tag_tampering_is_digest_evident():
     body = valid_body()
     body["configuration"]["target_band_low"] = {"__f64__": "3ff0000000000000"}

@@ -80,6 +80,7 @@
       "type": "object",
       "required": ["channel_id"],
       "properties": {"channel_id": {"type": "string", "minLength": 1}},
+      "propertyNames": {"not": {"enum": ["__f__", "__f64__"]}},
       "additionalProperties": {"$ref": "#/$defs/wire_value"}
     },
     "pre_state": {
@@ -107,6 +108,7 @@
         "source_channel_id": {"type": "string", "minLength": 1},
         "dest_channel_id": {"type": "string", "minLength": 1}
       },
+      "propertyNames": {"not": {"enum": ["__f__", "__f64__"]}},
       "additionalProperties": {"$ref": "#/$defs/wire_value"}
     },
     "generated_pair": {
@@ -124,7 +126,11 @@
             "cheap_score": {"$ref": "#/$defs/wire_number"},
             "planner_selected": {"type": "boolean"},
             "planner_rejection_reason": {"type": ["string", "null"]},
-            "bootstrap_score_decomposition": {"type": "object", "additionalProperties": {"$ref": "#/$defs/wire_value"}}
+            "bootstrap_score_decomposition": {
+              "type": "object",
+              "propertyNames": {"not": {"enum": ["__f__", "__f64__"]}},
+              "additionalProperties": {"$ref": "#/$defs/wire_value"}
+            }
           }
         }
       ]
