@@ -421,6 +421,7 @@ class _CapturePreparationFailure:
 
 
 _UNPREPARED = object()
+_PREPARING = object()
 
 
 def _assert_bounded_handoff_graph(values: tuple[Any, ...]) -> None:
@@ -602,6 +603,8 @@ class RebalanceCycleCaptureManager:
         self._logger = logger
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
+        self._lifecycle_lock = threading.Lock()
+        self._filesystem_lock = threading.Lock()
         self._queue: queue.Queue = queue.Queue(maxsize=WRITER_QUEUE_SIZE)
         self._slots = threading.BoundedSemaphore(WRITER_QUEUE_SIZE)
         # Disabled construction is intentionally inert; provenance is resolved
@@ -615,6 +618,8 @@ class RebalanceCycleCaptureManager:
         self._prepared: dict[int, Any] = {}
         self._inflight = 0
         self._manifest: Optional[dict] = None
+        self._manifest_revision = 0
+        self._manifest_attempted_revision = 0
 
     @staticmethod
     def _discover_python_commit() -> str:
@@ -633,7 +638,8 @@ class RebalanceCycleCaptureManager:
 
     def set_enabled(self, enabled: bool, timeout_seconds: float = 5.0) -> bool:
         try:
-            return self._enable() if enabled else self._disable(timeout_seconds)
+            with self._lifecycle_lock:
+                return self._enable() if enabled else self._disable(timeout_seconds)
         except Exception:
             return False
 
@@ -682,55 +688,108 @@ class RebalanceCycleCaptureManager:
             return None
 
     def prepare_cycle_result(self, reference: Any, result: Any) -> bool:
-        """Detach bounded finish-time evidence before public objects escape."""
+        """Reserve capacity, then detach bounded evidence before objects escape."""
         sequence = _field(reference, "capture_seq", None)
-        with self._condition:
-            if not isinstance(sequence, int) or sequence not in self._active:
-                return False
-        try:
-            detached = _detached_cycle_result(result)
-        except Exception as exc:
-            detached = _CapturePreparationFailure(
-                type(exc).__name__, _bounded_text(exc),
-            )
+        slot_acquired = False
         try:
             with self._condition:
                 if not isinstance(sequence, int) or sequence not in self._active:
                     return False
-                self._prepared[sequence] = detached
-                return not isinstance(detached, _CapturePreparationFailure)
-        except Exception:
-            return False
-
-    def finish_cycle(self, reference: Any, result: Any, terminal_stage: str = "completed") -> None:
-        """Transfer a bounded cycle lease to the writer without heavy work.
-
-        Prepared engine evidence uses its bounded detached copy. Direct callers
-        without preparation transfer mutation ownership of ``result`` here.
-        Projection, validation, sealing, serialization, and size checks are all
-        performed by the daemon writer before publication.
-        """
-        slot_acquired = False
-        attempt = None
-        try:
-            with self._condition:
-                sequence = _field(reference, "capture_seq", None)
-                if not isinstance(sequence, int) or sequence not in self._active:
-                    return
-                self._active.remove(sequence)
+                existing = self._prepared.get(sequence, _UNPREPARED)
+                if existing is not _UNPREPARED:
+                    return not isinstance(existing, _CapturePreparationFailure)
                 attempt = self._attempt_locked(sequence)
                 if attempt is None:
-                    return
-                attempt["terminal_stage"] = terminal_stage
+                    return False
                 if not self._slots.acquire(blocking=False):
+                    self._active.remove(sequence)
+                    self._prepared.pop(sequence, None)
                     attempt.update(
                         status="dropped", error_category="queue_full",
                         eligible=False,
                     )
                     self._manifest["dropped"] += 1
                     self._condition.notify_all()
-                    return
+                    return False
                 slot_acquired = True
+                # This marker makes duplicate preparation idempotent and keeps
+                # the private preparation map bounded by the two reservations.
+                self._prepared[sequence] = _PREPARING
+
+            try:
+                detached = _detached_cycle_result(result)
+            except Exception as exc:
+                detached = _CapturePreparationFailure(
+                    type(exc).__name__, _bounded_text(exc),
+                )
+
+            with self._condition:
+                if sequence not in self._active:
+                    if self._prepared.get(sequence) is _PREPARING:
+                        self._prepared.pop(sequence, None)
+                        self._slots.release()
+                    return False
+                self._prepared[sequence] = detached
+                slot_acquired = False
+                return not isinstance(detached, _CapturePreparationFailure)
+        except Exception:
+            if slot_acquired:
+                try:
+                    with self._condition:
+                        if self._prepared.get(sequence) is _PREPARING:
+                            self._prepared.pop(sequence, None)
+                        self._slots.release()
+                        self._condition.notify_all()
+                except Exception:
+                    pass
+            return False
+
+    def finish_cycle(self, reference: Any, result: Any, terminal_stage: str = "completed") -> None:
+        """Transfer one reserved cycle lease to the writer without heavy work.
+
+        Prepared engine evidence uses its bounded detached copy. Direct callers
+        without preparation reserve a slot and transfer mutation ownership of
+        ``result`` here. Projection, validation, sealing, serialization, and
+        size checks are all performed by the daemon writer before publication.
+        """
+        slot_acquired = False
+        attempt = None
+        sequence = _field(reference, "capture_seq", None)
+        try:
+            with self._condition:
+                if not isinstance(sequence, int):
+                    return
+                if sequence not in self._active:
+                    dropped_attempt = self._attempt_locked(sequence)
+                    if (
+                        isinstance(dropped_attempt, dict)
+                        and dropped_attempt.get("status") == "dropped"
+                        and dropped_attempt.get("terminal_stage") is None
+                    ):
+                        dropped_attempt["terminal_stage"] = terminal_stage
+                        self._condition.notify_all()
+                    return
+                attempt = self._attempt_locked(sequence)
+                if attempt is None:
+                    return
+                prepared = self._prepared.get(sequence, _UNPREPARED)
+                if prepared is _PREPARING:
+                    return
+                if prepared is _UNPREPARED:
+                    if not self._slots.acquire(blocking=False):
+                        self._active.remove(sequence)
+                        self._prepared.pop(sequence, None)
+                        attempt.update(
+                            status="dropped", error_category="queue_full",
+                            eligible=False,
+                        )
+                        self._manifest["dropped"] += 1
+                        self._condition.notify_all()
+                        return
+                slot_acquired = True
+                self._active.remove(sequence)
+                self._prepared.pop(sequence, None)
+                attempt["terminal_stage"] = terminal_stage
 
                 completed_producer = dict(_field(reference, "producer", {}) or {})
                 completed_producer["completed_at"] = _utc_now()
@@ -739,7 +798,6 @@ class RebalanceCycleCaptureManager:
                     configuration=reference.configuration,
                     producer=completed_producer,
                 )
-                prepared = self._prepared.pop(sequence, _UNPREPARED)
                 handoff_result = result if prepared is _UNPREPARED else prepared
                 handoff = _CaptureHandoff(
                     completed_reference, handoff_result, terminal_stage,
@@ -754,6 +812,7 @@ class RebalanceCycleCaptureManager:
                 self._slots.release()
             try:
                 with self._condition:
+                    self._prepared.pop(sequence, None)
                     if isinstance(attempt, dict):
                         self._fail_locked(attempt, exc)
                     self._condition.notify_all()
@@ -775,9 +834,20 @@ class RebalanceCycleCaptureManager:
                 return True
             if self._writer is not None and self._writer.is_alive():
                 return False
-            self._ensure_output_dir()
-            if self.python_commit == "unknown":
-                self.python_commit = self._discover_python_commit()
+
+        # Lifecycle calls are serialized separately, so setup I/O and commit
+        # discovery need not hold the cycle-intake condition.
+        self._ensure_output_dir()
+        python_commit = self.python_commit
+        if python_commit == "unknown":
+            python_commit = self._discover_python_commit()
+
+        with self._condition:
+            if self._enabled:
+                return True
+            if self._writer is not None and self._writer.is_alive():
+                return False
+            self.python_commit = python_commit
             self._run_id = uuid.uuid4().hex
             self._next_seq = 0
             self._active.clear()
@@ -791,47 +861,73 @@ class RebalanceCycleCaptureManager:
                 "last_error_category": None, "attempts": [], "updated_at": _utc_now(),
             }
             self._enabled = True
-            self._writer = threading.Thread(target=self._writer_main, name="rebalance-cycle-capture-writer", daemon=True)
-            self._writer.start()
-            self._publish_manifest_locked()
-            return True
+            writer = threading.Thread(
+                target=self._writer_main,
+                name="rebalance-cycle-capture-writer",
+                daemon=True,
+            )
+            self._writer = writer
+            manifest_snapshot = self._manifest_snapshot_locked()
+
+        self._publish_manifest_snapshot(manifest_snapshot)
+        # Starting after the initial manifest write prevents an older initial
+        # snapshot racing a writer snapshot. Intake remains bounded meanwhile.
+        with self._condition:
+            if self._writer is writer and not writer.is_alive():
+                writer.start()
+        return True
 
     def _disable(self, timeout_seconds: float) -> bool:
-        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        timeout = max(0.0, float(timeout_seconds))
         with self._condition:
             self._enabled = False
             if self._manifest is None:
                 return True
             self._manifest["state"] = "draining"
-            self._publish_manifest_locked()
+            draining_snapshot = self._manifest_snapshot_locked()
+
+        # Manifest I/O is explicitly outside the drain timeout and condition.
+        self._publish_manifest_snapshot(draining_snapshot)
+        deadline = time.monotonic() + timeout
+        rollback_snapshot = None
+        with self._condition:
             while self._active or self._inflight or not self._queue.empty():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    # A rejected transition must restore intake and config truth.
+                    # A rejected transition restores intake and observable state.
                     self._enabled = True
                     self._manifest["state"] = "active"
-                    self._publish_manifest_locked()
-                    return False
+                    rollback_snapshot = self._manifest_snapshot_locked()
+                    break
                 self._condition.wait(remaining)
-            try:
-                self._queue.put_nowait(_DRAIN_SENTINEL)
-            except queue.Full:
-                self._enabled = True
-                self._manifest["state"] = "active"
-                self._publish_manifest_locked()
-                return False
+            if rollback_snapshot is None:
+                try:
+                    self._queue.put_nowait(_DRAIN_SENTINEL)
+                except queue.Full:
+                    self._enabled = True
+                    self._manifest["state"] = "active"
+                    rollback_snapshot = self._manifest_snapshot_locked()
+
+        if rollback_snapshot is not None:
+            self._publish_manifest_snapshot(rollback_snapshot)
+            return False
+
         writer = self._writer
         if writer is not None:
             writer.join(max(0.0, deadline - time.monotonic()))
         with self._condition:
             if self._manifest is not None:
                 self._manifest["state"] = "closed"
-                self._publish_manifest_locked()
+                closed_snapshot = self._manifest_snapshot_locked()
+            else:
+                closed_snapshot = (None, None, None)
             if writer is None or not writer.is_alive():
                 self._writer = None
             # Once the sentinel is accepted, intake is disabled coherently even
             # if the daemon needs a little longer to return from its loop.
-            return True
+        self._publish_manifest_snapshot(closed_snapshot)
+        return True
+
 
     def _writer_main(self) -> None:
         while True:
@@ -878,14 +974,8 @@ class RebalanceCycleCaptureManager:
                         self._fail_locked(attempt, exc)
             finally:
                 with self._condition:
-                    manifest_path, manifest_data = self._manifest_snapshot_locked()
-                try:
-                    self._write_manifest_snapshot(manifest_path, manifest_data)
-                except Exception as exc:
-                    with self._condition:
-                        if self._manifest is not None:
-                            self._manifest["writer_health"] = "degraded"
-                            self._manifest["last_error_category"] = type(exc).__name__
+                    manifest_snapshot = self._manifest_snapshot_locked()
+                self._publish_manifest_snapshot(manifest_snapshot)
                 with self._condition:
                     self._inflight -= 1
                     self._condition.notify_all()
@@ -894,8 +984,9 @@ class RebalanceCycleCaptureManager:
 
     def _publish_envelope(self, reference: Any, serialized: bytes) -> None:
         filename = f"{reference.capture_run_id}-{reference.capture_seq:08d}-{reference.cycle_id}.json"
-        self._atomic_write(self.output_dir / filename, serialized)
-        self._rotate_capture_files()
+        with self._filesystem_lock:
+            self._atomic_write(self.output_dir / filename, serialized)
+            self._rotate_capture_files()
 
     def _prune_attempts_locked(self) -> None:
         if self._manifest is None:
@@ -923,34 +1014,47 @@ class RebalanceCycleCaptureManager:
     def _manifest_path(self) -> Path:
         return self.output_dir / f"manifest-{self._run_id}.v{SCHEMA_VERSION}.json"
 
-    def _manifest_snapshot_locked(self) -> tuple[Optional[Path], Optional[bytes]]:
+    def _manifest_snapshot_locked(
+        self,
+    ) -> tuple[Optional[Path], Optional[bytes], Optional[int]]:
         if self._manifest is None or self._run_id is None:
-            return None, None
+            return None, None, None
         self._prune_attempts_locked()
         self._manifest["updated_at"] = _utc_now()
+        self._manifest_revision += 1
         return (
             self._manifest_path(),
             json.dumps(
                 self._manifest, sort_keys=True, separators=(",", ":"),
             ).encode("utf-8"),
+            self._manifest_revision,
         )
 
     def _write_manifest_snapshot(
-        self, path: Optional[Path], data: Optional[bytes],
+        self, path: Optional[Path], data: Optional[bytes], revision: Optional[int],
     ) -> None:
-        if path is None or data is None:
+        if path is None or data is None or revision is None:
             return
-        self._atomic_write(path, data)
-        self._rotate_capture_files()
+        with self._filesystem_lock:
+            # Concurrent writer/lifecycle snapshots may reach I/O out of order;
+            # never let an older state overwrite a newer attempted publication.
+            if revision <= self._manifest_attempted_revision:
+                return
+            self._manifest_attempted_revision = revision
+            self._atomic_write(path, data)
+            self._rotate_capture_files()
 
-    def _publish_manifest_locked(self) -> None:
-        path, data = self._manifest_snapshot_locked()
+    def _publish_manifest_snapshot(
+        self, snapshot: tuple[Optional[Path], Optional[bytes], Optional[int]],
+    ) -> None:
         try:
-            self._write_manifest_snapshot(path, data)
+            self._write_manifest_snapshot(*snapshot)
         except Exception as exc:
-            if self._manifest is not None:
-                self._manifest["writer_health"] = "degraded"
-                self._manifest["last_error_category"] = type(exc).__name__
+            with self._condition:
+                if self._manifest is not None:
+                    self._manifest["writer_health"] = "degraded"
+                    self._manifest["last_error_category"] = type(exc).__name__
+
 
     def _ensure_output_dir(self) -> None:
         if self.output_dir.is_symlink():

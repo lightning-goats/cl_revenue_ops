@@ -590,25 +590,49 @@ def test_projection_failure_evidence_uses_safe_bounded_allowlist():
     assert "secret" not in repr(projected)
 
 
-def test_queue_full_is_detected_before_any_slow_copy_or_projection(tmp_path, monkeypatch):
+def test_queue_full_reserves_before_copy_and_repeated_drops_do_not_leak(
+    tmp_path, monkeypatch,
+):
     monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
-    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
     assert manager.set_enabled(True)
     for _ in range(2):
-        manager.finish_cycle(manager.begin_cycle(_configuration(), {"trigger": "automatic"}), _strict_result())
+        reference = manager.begin_cycle(
+            _configuration(), {"trigger": "automatic"},
+        )
+        result = _strict_result()
+        assert manager.prepare_cycle_result(reference, result) is True
+        manager.finish_cycle(reference, result)
+    assert manager._queue.qsize() == 2
+    assert manager._prepared == {}
+
     original = __import__("modules.rebalance_cycle_capture", fromlist=["copy"]).copy.deepcopy
+    copy_calls = 0
 
     def slow_copy(value):
+        nonlocal copy_calls
+        copy_calls += 1
         time.sleep(0.2)
         return original(value)
 
     monkeypatch.setattr("modules.rebalance_cycle_capture.copy.deepcopy", slow_copy)
-    reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
-    started = time.monotonic()
-    manager.finish_cycle(reference, _strict_result())
+    for _ in range(40):
+        reference = manager.begin_cycle(
+            _configuration(), {"trigger": "automatic"},
+        )
+        started = time.monotonic()
+        assert manager.prepare_cycle_result(reference, _strict_result()) is False
+        assert time.monotonic() - started < 0.05
+        manager.finish_cycle(reference, _strict_result(), "planning_only")
+        manager.finish_cycle(reference, _strict_result(), "completed")
 
-    assert time.monotonic() - started < 0.05
-    assert manager._manifest["dropped"] == 1
+    assert copy_calls == 0
+    assert manager._manifest["dropped"] == 40
+    assert manager._manifest["attempts"][-1]["terminal_stage"] == "planning_only"
+    assert manager._prepared == {}
+    assert manager._active == set()
 
 
 def test_forty_manifest_only_toggles_stay_within_owned_retention(tmp_path):
@@ -784,6 +808,203 @@ def test_manifest_filesystem_io_never_holds_cycle_intake_lock(tmp_path, monkeypa
 
     assert elapsed < 0.05
     assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def test_enable_manifest_io_does_not_block_begin_or_finish(tmp_path, monkeypatch):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    original = manager._atomic_write
+    write_started = threading.Event()
+    release_write = threading.Event()
+    enable_result = []
+
+    def slow_initial_manifest(path, data):
+        if path.name.startswith("manifest-") and not write_started.is_set():
+            write_started.set()
+            assert release_write.wait(1.0)
+        return original(path, data)
+
+    monkeypatch.setattr(manager, "_atomic_write", slow_initial_manifest)
+    enable_thread = threading.Thread(
+        target=lambda: enable_result.append(manager.set_enabled(True)),
+    )
+    enable_thread.start()
+    assert write_started.wait(1.0)
+
+    begin_result = []
+    begin_done = threading.Event()
+
+    def begin_while_manifest_is_slow():
+        begin_result.append(manager.begin_cycle(
+            _configuration(), {"trigger": "automatic"},
+        ))
+        begin_done.set()
+
+    begin_thread = threading.Thread(target=begin_while_manifest_is_slow)
+    begin_thread.start()
+    assert begin_done.wait(0.05)
+    assert begin_result[0] is not None
+
+    finish_done = threading.Event()
+    finish_thread = threading.Thread(
+        target=lambda: (
+            manager.finish_cycle(begin_result[0], _strict_result()),
+            finish_done.set(),
+        ),
+    )
+    finish_thread.start()
+    assert finish_done.wait(0.05)
+
+    release_write.set()
+    enable_thread.join(1.0)
+    begin_thread.join(1.0)
+    finish_thread.join(1.0)
+    assert enable_result == [True]
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def test_disable_manifest_io_does_not_block_existing_finish_or_new_begin(
+    tmp_path, monkeypatch,
+):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    assert manager.set_enabled(True)
+    reference = manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
+    )
+    original = manager._atomic_write
+    write_started = threading.Event()
+    release_write = threading.Event()
+    disable_result = []
+
+    def slow_draining_manifest(path, data):
+        if path.name.startswith("manifest-") and not write_started.is_set():
+            write_started.set()
+            assert release_write.wait(1.0)
+        return original(path, data)
+
+    monkeypatch.setattr(manager, "_atomic_write", slow_draining_manifest)
+    disable_thread = threading.Thread(
+        target=lambda: disable_result.append(
+            manager.set_enabled(False, timeout_seconds=1.0)
+        ),
+    )
+    disable_thread.start()
+    assert write_started.wait(1.0)
+
+    finish_done = threading.Event()
+    begin_done = threading.Event()
+    begin_result = []
+    finish_thread = threading.Thread(
+        target=lambda: (
+            manager.finish_cycle(reference, _strict_result()),
+            finish_done.set(),
+        ),
+    )
+    begin_thread = threading.Thread(
+        target=lambda: (
+            begin_result.append(manager.begin_cycle(
+                _configuration(), {"trigger": "automatic"},
+            )),
+            begin_done.set(),
+        ),
+    )
+    finish_thread.start()
+    begin_thread.start()
+    assert finish_done.wait(0.05)
+    assert begin_done.wait(0.05)
+    assert begin_result == [None]
+
+    release_write.set()
+    finish_thread.join(1.0)
+    begin_thread.join(1.0)
+    disable_thread.join(2.0)
+    assert disable_result == [True]
+
+
+def test_every_lifecycle_manifest_write_occurs_outside_condition(
+    tmp_path, monkeypatch,
+):
+    import queue
+
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    original_atomic = manager._atomic_write
+    observed = []
+
+    def assert_unlocked_manifest(path, data):
+        if path.name.startswith("manifest-"):
+            observed.append((
+                json.loads(data)["state"],
+                manager._condition._is_owned(),
+            ))
+        return original_atomic(path, data)
+
+    monkeypatch.setattr(manager, "_atomic_write", assert_unlocked_manifest)
+    assert manager.set_enabled(True)
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+    assert manager.set_enabled(True)
+    active_reference = manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
+    )
+    assert manager.set_enabled(False, timeout_seconds=0.01) is False
+    manager.finish_cycle(active_reference, _strict_result(), "planning_only")
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+    assert manager.set_enabled(True)
+    writer_queue = manager._queue
+
+    class SentinelFullQueue:
+        @staticmethod
+        def empty():
+            return True
+
+        @staticmethod
+        def put_nowait(_item):
+            raise queue.Full
+
+    manager._queue = SentinelFullQueue()
+    assert manager.set_enabled(False, timeout_seconds=1.0) is False
+    manager._queue = writer_queue
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+    states = [state for state, _owned in observed]
+    assert {"active", "draining", "closed"} <= set(states)
+    assert all(not owned for _state, owned in observed)
+
+
+def test_disable_timeout_budget_starts_after_manifest_io(tmp_path, monkeypatch):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    assert manager.set_enabled(True)
+    manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    original = manager._atomic_write
+    first_finished = []
+    rollback_started = []
+
+    def timed_manifest(path, data):
+        if path.name.startswith("manifest-"):
+            if not first_finished:
+                time.sleep(0.10)
+                result = original(path, data)
+                first_finished.append(time.monotonic())
+                return result
+            if not rollback_started:
+                rollback_started.append(time.monotonic())
+        return original(path, data)
+
+    monkeypatch.setattr(manager, "_atomic_write", timed_manifest)
+
+    assert manager.set_enabled(False, timeout_seconds=0.05) is False
+
+    assert rollback_started[0] - first_finished[0] >= 0.04
+    assert manager._enabled is True
+    assert manager.read_manifest()["state"] == "active"
 
 
 def test_handoff_graph_bound_rejects_before_deepcopy_and_manifests_failure(
