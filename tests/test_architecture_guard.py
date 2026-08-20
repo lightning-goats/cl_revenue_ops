@@ -291,6 +291,37 @@ class TestNoSlingDependency:
             assert "sling" not in source, f"dependency Sling reference found in {path}"
 
 
+class TestRebalanceReplayToolBoundary:
+    """The offline replay tool must remain a pure planner-only reader."""
+
+    def test_replay_tool_has_only_pure_local_imports(self):
+        tool = ROOT / "tools" / "rebalance_replay.py"
+        tree = ast.parse(tool.read_text(encoding="utf-8"), filename=str(tool))
+        imports = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imports.add(node.module or "")
+
+        assert imports <= {
+            "__future__", "json", "pathlib", "struct", "sys",
+            "modules.rebalance_cycle_replay_wire",
+            "modules.rebalance_planner_v2",
+            "modules.rebalance_state_v2",
+        }
+
+    def test_replay_tool_never_mentions_plugin_or_action_surfaces(self):
+        tool = ROOT / "tools" / "rebalance_replay.py"
+        source = tool.read_text(encoding="utf-8")
+        forbidden = (
+            "cl-revenue-ops.py", "pyln", "rebalance_router", "executor",
+            "revenue-rebalance", "revenue-fee", "lightning-cli",
+        )
+        for value in forbidden:
+            assert value not in source, f"replay tool exposes forbidden surface: {value}"
+
+
 class TestFinalRuntimeAuthorityBoundary:
     def test_forbidden_import_match_uses_module_components_not_word_substrings(self):
         assert _is_forbidden_coordinator_import("modules.hive_router") is True
