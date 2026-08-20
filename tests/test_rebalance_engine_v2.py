@@ -3659,13 +3659,27 @@ def test_engine_capture_is_once_for_live_and_once_for_standalone(mock_plugin, mo
     engine.find_candidates()
 
     assert manager.begin_cycle.call_count == 1
-    assert manager.finish_cycle.call_args.args[2] == "planning_only"
+    assert manager.finish_cycle.call_args.args[2] == "no_router"
 
 
 
 def _capture_reference_for_engine(seq=1):
     from modules.rebalance_cycle_capture import RebalanceCycleCaptureReference
     return RebalanceCycleCaptureReference("a" * 32, seq, ("a" * 32) + f":{seq:08d}", {"config_version": 1, "target_band_low": 0.35, "target_band_high": 0.65, "max_chunk_sats": 1, "max_pairs": 1, "pair_fee_cap_ppm": 0}, {"trigger": "automatic"})
+
+
+def test_live_no_router_finishes_once_with_ineligible_terminal_stage(mock_plugin, mock_database):
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = MagicMock()
+    manager.begin_cycle.return_value = _capture_reference_for_engine()
+    engine.rebalance_capture_manager = manager
+    engine._active_router = lambda: None
+
+    result = engine.run_cycle()
+
+    assert result.candidates == []
+    assert manager.finish_cycle.call_count == 1
+    assert manager.finish_cycle.call_args.args[2] == "no_router"
 
 
 def test_engine_capture_marks_lock_contention_terminal_stage(mock_plugin, mock_database):
@@ -3755,4 +3769,92 @@ def test_rebalance_engine_shutdown_bounds_capture_drain(mock_plugin, mock_databa
 
     assert time.monotonic() - started < 0.1
     manager.set_enabled.assert_called_once_with(False, timeout_seconds=5.0)
+    assert any(
+        "capture" in str(call).lower() and "shutdown" in str(call).lower()
+        for call in mock_plugin.log.call_args_list
+    )
     engine._pool.shutdown.assert_called_once_with(wait=False)
+
+
+
+def test_standalone_no_router_finishes_failed_ineligible_capture(mock_plugin, mock_database):
+    from modules.rebalance_cycle_capture import RebalanceCycleCaptureReference
+
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = MagicMock()
+    manager.begin_cycle.return_value = RebalanceCycleCaptureReference("a" * 32, 1, ("a" * 32) + ":00000001", {"config_version": 1, "target_band_low": 0.35, "target_band_high": 0.65, "max_chunk_sats": 1, "max_pairs": 1, "pair_fee_cap_ppm": 0}, {"trigger": "planning"})
+    engine.rebalance_capture_manager = manager
+    engine._active_router = lambda: None
+
+    assert engine.find_candidates() == []
+
+    assert manager.finish_cycle.call_args.args[2] == "no_router"
+
+
+
+def test_standalone_exception_finishes_owned_capture_failed_once(mock_plugin, mock_database):
+    from modules.rebalance_cycle_capture import RebalanceCycleCaptureReference
+
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = MagicMock()
+    manager.begin_cycle.return_value = RebalanceCycleCaptureReference("a" * 32, 1, ("a" * 32) + ":00000001", {"config_version": 1, "target_band_low": 0.35, "target_band_high": 0.65, "max_chunk_sats": 1, "max_pairs": 1, "pair_fee_cap_ppm": 0}, {"trigger": "planning"})
+    engine.rebalance_capture_manager = manager
+    engine._active_router = lambda: object()
+    engine._build_snapshot = MagicMock(side_effect=RuntimeError("snapshot boom"))
+
+    with pytest.raises(RuntimeError, match="snapshot boom"):
+        engine.find_candidates()
+
+    assert manager.finish_cycle.call_count == 1
+    assert manager.finish_cycle.call_args.args[2] == "failed"
+
+
+
+def test_run_cycle_releases_engine_lock_before_capture_finish(mock_plugin, mock_database):
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = MagicMock()
+    manager.begin_cycle.return_value = _capture_reference_for_engine()
+    manager.finish_cycle.side_effect = lambda *_args: (
+        pytest.fail("capture finished while engine lock held")
+        if engine._cycle_lock.locked() else None
+    )
+    engine.rebalance_capture_manager = manager
+    engine.find_candidates = MagicMock(return_value=[])
+
+    engine.run_cycle()
+
+    manager.finish_cycle.assert_called_once()
+
+
+def test_find_candidates_with_live_reference_never_finishes_capture(mock_plugin, mock_database):
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = MagicMock()
+    engine.rebalance_capture_manager = manager
+    engine._active_router = lambda: None
+
+    assert engine.find_candidates(capture_reference=_capture_reference_for_engine()) == []
+
+    manager.begin_cycle.assert_not_called()
+    manager.finish_cycle.assert_not_called()
+
+
+def test_standalone_planner_exception_finishes_owned_capture_once_and_reraises(
+    mock_plugin, mock_database,
+):
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = MagicMock()
+    manager.begin_cycle.return_value = _capture_reference_for_engine()
+    engine.rebalance_capture_manager = manager
+    engine._active_router = lambda: object()
+    engine._build_snapshot = MagicMock(return_value=SimpleNamespace(
+        channels=[object()], valuable_channel_count=0,
+        total_remaining_budget_sats=0,
+    ))
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner_cls.return_value.plan.side_effect = RuntimeError("planner boom")
+        with pytest.raises(RuntimeError, match="planner boom"):
+            engine.find_candidates()
+
+    assert manager.finish_cycle.call_count == 1
+    assert manager.finish_cycle.call_args.args[2] == "failed"

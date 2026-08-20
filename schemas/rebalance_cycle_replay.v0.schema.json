@@ -3,26 +3,81 @@
   "$id": "https://schemas.cl-revenue-ops.invalid/rebalance_cycle_replay.v0.schema.json",
   "title": "Rebalance Cycle Replay v0",
   "type": "object",
-  "required": ["schema_name", "schema_version", "capture_run_id", "capture_seq", "cycle_id", "producer", "configuration", "pre_state", "funnel", "execution", "completeness", "payload_sha256"],
+  "required": [
+    "schema_name",
+    "schema_version",
+    "capture_run_id",
+    "capture_seq",
+    "cycle_id",
+    "terminal_stage",
+    "producer",
+    "configuration",
+    "pre_state",
+    "funnel",
+    "execution",
+    "completeness",
+    "payload_sha256"
+  ],
   "additionalProperties": false,
   "properties": {
-    "schema_name": {"const": "rebalance_cycle_replay"},
-    "schema_version": {"type": "integer", "const": 0},
-    "capture_run_id": {"type": "string", "minLength": 1},
-    "capture_seq": {"$ref": "#/$defs/positive_integer"},
-    "cycle_id": {"type": "string", "minLength": 1},
-    "producer": {"$ref": "#/$defs/producer"},
-    "configuration": {"$ref": "#/$defs/configuration"},
-    "pre_state": {"$ref": "#/$defs/pre_state"},
-    "funnel": {"$ref": "#/$defs/funnel"},
-    "execution": {"$ref": "#/$defs/execution"},
-    "completeness": {"$ref": "#/$defs/completeness"},
-    "payload_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    "schema_name": {
+      "const": "rebalance_cycle_replay"
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 0
+    },
+    "capture_run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "capture_seq": {
+      "$ref": "#/$defs/positive_integer"
+    },
+    "cycle_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "producer": {
+      "$ref": "#/$defs/producer"
+    },
+    "configuration": {
+      "$ref": "#/$defs/configuration"
+    },
+    "pre_state": {
+      "$ref": "#/$defs/pre_state"
+    },
+    "funnel": {
+      "$ref": "#/$defs/funnel"
+    },
+    "execution": {
+      "$ref": "#/$defs/execution"
+    },
+    "completeness": {
+      "$ref": "#/$defs/completeness"
+    },
+    "payload_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "terminal_stage": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "planning_only",
+        "no_router",
+        "missing_snapshot",
+        "failed",
+        "lock_contended"
+      ]
+    }
   },
   "$defs": {
     "binary64": {
       "type": "object",
-      "required": ["__f64__"],
+      "required": [
+        "__f64__"
+      ],
       "additionalProperties": false,
       "properties": {
         "__f64__": {
@@ -34,137 +89,748 @@
     },
     "wire_value": {
       "anyOf": [
-        {"type": "null"},
-        {"type": "boolean"},
-        {"type": "integer"},
-        {"type": "string"},
-        {"type": "array", "items": {"$ref": "#/$defs/wire_value"}},
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/wire_value"
+          }
+        },
         {
           "type": "object",
-          "not": {"required": ["__f__"]},
-          "if": {"required": ["__f64__"]},
-          "then": {"$ref": "#/$defs/binary64"},
-          "else": {"additionalProperties": {"$ref": "#/$defs/wire_value"}}
+          "not": {
+            "required": [
+              "__f__"
+            ]
+          },
+          "if": {
+            "required": [
+              "__f64__"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/binary64"
+          },
+          "else": {
+            "additionalProperties": {
+              "$ref": "#/$defs/wire_value"
+            }
+          }
         }
       ]
     },
-    "wire_number": {"anyOf": [{"type": "integer"}, {"$ref": "#/$defs/binary64"}]},
-    "positive_integer": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
-    "nonnegative_integer": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "wire_number": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "$ref": "#/$defs/binary64"
+        }
+      ]
+    },
+    "positive_integer": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "nonnegative_integer": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
     "producer": {
       "type": "object",
-      "required": ["started_at", "completed_at", "python_commit", "algorithm_version", "trigger"],
+      "required": [
+        "started_at",
+        "completed_at",
+        "python_commit",
+        "algorithm_version",
+        "trigger"
+      ],
       "additionalProperties": false,
       "properties": {
-        "started_at": {"type": "string", "minLength": 1},
-        "completed_at": {"type": "string", "minLength": 1},
-        "python_commit": {"type": "string", "minLength": 1},
-        "algorithm_version": {"type": "string", "minLength": 1},
-        "trigger": {"type": "string", "minLength": 1}
+        "started_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "completed_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "python_commit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "algorithm_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "trigger": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "configuration": {
       "type": "object",
-      "required": ["config_version", "target_band_low", "target_band_high", "max_chunk_sats", "max_pairs", "pair_fee_cap_ppm"],
+      "required": [
+        "config_version",
+        "target_band_low",
+        "target_band_high",
+        "max_chunk_sats",
+        "max_pairs",
+        "pair_fee_cap_ppm"
+      ],
       "additionalProperties": false,
       "properties": {
-        "config_version": {"$ref": "#/$defs/positive_integer"},
-        "target_band_low": {"$ref": "#/$defs/wire_number"},
-        "target_band_high": {"$ref": "#/$defs/wire_number"},
-        "max_chunk_sats": {"$ref": "#/$defs/positive_integer"},
-        "max_pairs": {"$ref": "#/$defs/positive_integer"},
-        "pair_fee_cap_ppm": {"$ref": "#/$defs/nonnegative_integer"}
+        "config_version": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "target_band_low": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "target_band_high": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "max_chunk_sats": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "max_pairs": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "pair_fee_cap_ppm": {
+          "$ref": "#/$defs/nonnegative_integer"
+        }
       }
     },
     "channel": {
       "type": "object",
-      "required": ["channel_id"],
-      "properties": {"channel_id": {"type": "string", "minLength": 1}},
-      "propertyNames": {"not": {"enum": ["__f__", "__f64__"]}},
-      "additionalProperties": {"$ref": "#/$defs/wire_value"}
+      "required": [
+        "channel_id",
+        "peer_id",
+        "capacity_sats",
+        "local_ratio",
+        "actual_inbound_fee_ppm",
+        "value_class",
+        "is_valuable",
+        "remaining_budget_sats",
+        "cooldown_active",
+        "source_eligible",
+        "dest_eligible",
+        "source_reason",
+        "dest_reason",
+        "dest_urgency",
+        "source_drain_score",
+        "budget_source",
+        "local_out_fee_ppm",
+        "historical_direct_fee_ppm",
+        "historical_sourced_fee_ppm",
+        "is_active",
+        "realized_utilization",
+        "utilization_is_realized",
+        "activity_out_sats",
+        "activity_in_sats",
+        "target_band_low",
+        "target_band_high"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "peer_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "capacity_sats": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "local_ratio": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "actual_inbound_fee_ppm": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "value_class": {
+          "type": "string"
+        },
+        "is_valuable": {
+          "type": "boolean"
+        },
+        "remaining_budget_sats": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "cooldown_active": {
+          "type": "boolean"
+        },
+        "source_eligible": {
+          "type": "boolean"
+        },
+        "dest_eligible": {
+          "type": "boolean"
+        },
+        "source_reason": {
+          "type": "string"
+        },
+        "dest_reason": {
+          "type": "string"
+        },
+        "dest_urgency": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "source_drain_score": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "budget_source": {
+          "type": "string"
+        },
+        "local_out_fee_ppm": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "historical_direct_fee_ppm": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "historical_sourced_fee_ppm": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "is_active": {
+          "type": "boolean"
+        },
+        "realized_utilization": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "utilization_is_realized": {
+          "type": "boolean"
+        },
+        "activity_out_sats": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "activity_in_sats": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "target_band_low": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "target_band_high": {
+          "$ref": "#/$defs/wire_number"
+        }
+      }
     },
     "pre_state": {
       "type": "object",
-      "required": ["normalized_snapshot"],
+      "required": [
+        "normalized_snapshot"
+      ],
       "additionalProperties": false,
       "properties": {
         "normalized_snapshot": {
           "type": "object",
-          "required": ["channels", "total_capacity_sats", "total_remaining_budget_sats", "valuable_channel_count"],
+          "required": [
+            "channels",
+            "total_capacity_sats",
+            "total_remaining_budget_sats",
+            "valuable_channel_count"
+          ],
           "additionalProperties": false,
           "properties": {
-            "channels": {"type": "array", "items": {"$ref": "#/$defs/channel"}},
-            "total_capacity_sats": {"$ref": "#/$defs/nonnegative_integer"},
-            "total_remaining_budget_sats": {"$ref": "#/$defs/nonnegative_integer"},
-            "valuable_channel_count": {"$ref": "#/$defs/nonnegative_integer"}
+            "channels": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/channel"
+              },
+              "maxItems": 1024
+            },
+            "total_capacity_sats": {
+              "$ref": "#/$defs/nonnegative_integer"
+            },
+            "total_remaining_budget_sats": {
+              "$ref": "#/$defs/nonnegative_integer"
+            },
+            "valuable_channel_count": {
+              "$ref": "#/$defs/nonnegative_integer"
+            }
           }
         }
       }
     },
     "pair_ref": {
       "type": "object",
-      "required": ["source_channel_id", "dest_channel_id"],
+      "required": [
+        "source_channel_id",
+        "dest_channel_id"
+      ],
+      "additionalProperties": false,
       "properties": {
-        "source_channel_id": {"type": "string", "minLength": 1},
-        "dest_channel_id": {"type": "string", "minLength": 1}
-      },
-      "propertyNames": {"not": {"enum": ["__f__", "__f64__"]}},
-      "additionalProperties": {"$ref": "#/$defs/wire_value"}
+        "source_channel_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dest_channel_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
     },
     "generated_pair": {
-      "allOf": [
-        {"$ref": "#/$defs/pair_ref"},
-        {
-          "required": ["planned_amount_sats", "pair_budget_sats", "source_excess_sats", "dest_need_sats", "max_chunk_sats", "cheap_rank", "cheap_score", "planner_selected", "planner_rejection_reason", "bootstrap_score_decomposition"],
-          "properties": {
-            "planned_amount_sats": {"$ref": "#/$defs/positive_integer"},
-            "pair_budget_sats": {"$ref": "#/$defs/nonnegative_integer"},
-            "source_excess_sats": {"$ref": "#/$defs/positive_integer"},
-            "dest_need_sats": {"$ref": "#/$defs/positive_integer"},
-            "max_chunk_sats": {"$ref": "#/$defs/positive_integer"},
-            "cheap_rank": {"$ref": "#/$defs/positive_integer"},
-            "cheap_score": {"$ref": "#/$defs/wire_number"},
-            "planner_selected": {"type": "boolean"},
-            "planner_rejection_reason": {"type": ["string", "null"]},
-            "bootstrap_score_decomposition": {
-              "type": "object",
-              "propertyNames": {"not": {"enum": ["__f__", "__f64__"]}},
-              "additionalProperties": {"$ref": "#/$defs/wire_value"}
+      "type": "object",
+      "required": [
+        "source_channel_id",
+        "dest_channel_id",
+        "planned_amount_sats",
+        "pair_budget_sats",
+        "source_excess_sats",
+        "dest_need_sats",
+        "max_chunk_sats",
+        "cheap_rank",
+        "cheap_score",
+        "planner_selected",
+        "planner_rejection_reason",
+        "bootstrap_score_decomposition",
+        "score_decomposition",
+        "route_cost_sats",
+        "effective_budget_sats",
+        "rejection_reason",
+        "route_summary"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_channel_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dest_channel_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "planned_amount_sats": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "pair_budget_sats": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "source_excess_sats": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "dest_need_sats": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "max_chunk_sats": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "cheap_rank": {
+          "$ref": "#/$defs/positive_integer"
+        },
+        "cheap_score": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "planner_selected": {
+          "type": "boolean"
+        },
+        "planner_rejection_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bootstrap_score_decomposition": {
+          "type": "object",
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "__f__",
+                "__f64__"
+              ]
             }
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/wire_value"
+          }
+        },
+        "score_decomposition": {
+          "type": "object",
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "__f__",
+                "__f64__"
+              ]
+            }
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/wire_value"
+          }
+        },
+        "route_cost_sats": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/nonnegative_integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effective_budget_sats": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/nonnegative_integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rejection_reason": {
+          "type": "string"
+        },
+        "route_summary": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/route_hop"
           }
         }
-      ]
+      }
     },
     "funnel": {
       "type": "object",
-      "required": ["generated_pairs", "planner_selected_pairs", "final_selected_pairs", "skipped"],
+      "required": [
+        "generated_pairs",
+        "planner_selected_pairs",
+        "final_selected_pairs",
+        "skipped"
+      ],
       "additionalProperties": false,
       "properties": {
-        "generated_pairs": {"type": "array", "items": {"$ref": "#/$defs/generated_pair"}},
-        "planner_selected_pairs": {"type": "array", "items": {"$ref": "#/$defs/pair_ref"}},
-        "final_selected_pairs": {"type": "array", "items": {"$ref": "#/$defs/pair_ref"}},
-        "skipped": {"type": "array", "items": {"$ref": "#/$defs/wire_value"}}
+        "generated_pairs": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/generated_pair"
+          }
+        },
+        "planner_selected_pairs": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/pair_ref"
+          }
+        },
+        "final_selected_pairs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/generated_pair"
+          }
+        },
+        "skipped": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/skip"
+          }
+        }
       }
     },
     "execution": {
       "type": "object",
-      "required": ["pair_outcomes"],
+      "required": [
+        "pair_outcomes"
+      ],
       "additionalProperties": false,
-      "properties": {"pair_outcomes": {"type": "array", "items": {"$ref": "#/$defs/pair_ref"}}}
+      "properties": {
+        "pair_outcomes": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/execution_outcome"
+          }
+        }
+      }
     },
     "completeness": {
       "type": "object",
-      "required": ["generated_pair_count", "retained_generated_pair_count", "planner_selected_pair_count", "final_selected_pair_count", "execution_outcome_count", "candidate_universe_truncated", "eligible"],
+      "required": [
+        "generated_pair_count",
+        "retained_generated_pair_count",
+        "planner_selected_pair_count",
+        "final_selected_pair_count",
+        "execution_outcome_count",
+        "candidate_universe_truncated",
+        "eligible"
+      ],
       "additionalProperties": false,
       "properties": {
-        "generated_pair_count": {"$ref": "#/$defs/nonnegative_integer"},
-        "retained_generated_pair_count": {"$ref": "#/$defs/nonnegative_integer"},
-        "planner_selected_pair_count": {"$ref": "#/$defs/nonnegative_integer"},
-        "final_selected_pair_count": {"$ref": "#/$defs/nonnegative_integer"},
-        "execution_outcome_count": {"$ref": "#/$defs/nonnegative_integer"},
-        "candidate_universe_truncated": {"type": "boolean"},
-        "eligible": {"type": "boolean"}
+        "generated_pair_count": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "retained_generated_pair_count": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "planner_selected_pair_count": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "final_selected_pair_count": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "execution_outcome_count": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "candidate_universe_truncated": {
+          "type": "boolean"
+        },
+        "eligible": {
+          "type": "boolean"
+        }
+      }
+    },
+    "route_hop": {
+      "type": "object",
+      "required": [
+        "index",
+        "channel",
+        "direction",
+        "id",
+        "amount_msat",
+        "delay"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "channel": {
+          "type": "string"
+        },
+        "direction": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "id": {
+          "type": "string"
+        },
+        "amount_msat": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "delay": {
+          "$ref": "#/$defs/wire_value"
+        }
+      }
+    },
+    "skip": {
+      "type": "object",
+      "required": [
+        "channel_id",
+        "reason",
+        "detail"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "channel_id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string"
+        }
+      }
+    },
+    "failure_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "failure_class": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "failure_kind": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "failure_code": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "erring_channel": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "erring_direction": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "erring_node": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "wire_message": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "retry_excluded_channels": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "previous_failure": {
+          "$ref": "#/$defs/wire_value"
+        },
+        "partial_fill": {
+          "$ref": "#/$defs/wire_value"
+        }
+      }
+    },
+    "execution_result": {
+      "type": "object",
+      "required": [
+        "success",
+        "amount_sats",
+        "fee_sats",
+        "fee_msat",
+        "fee_ppm",
+        "attempts",
+        "hops",
+        "parts",
+        "route_type",
+        "error",
+        "excluded_channels",
+        "failure_data",
+        "payment_pending"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "amount_sats": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "fee_sats": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "fee_msat": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "fee_ppm": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "attempts": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "hops": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "parts": {
+          "$ref": "#/$defs/nonnegative_integer"
+        },
+        "route_type": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "excluded_channels": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string"
+          }
+        },
+        "failure_data": {
+          "$ref": "#/$defs/failure_data"
+        },
+        "payment_pending": {
+          "type": "boolean"
+        }
+      }
+    },
+    "execution_outcome": {
+      "type": "object",
+      "required": [
+        "source_channel_id",
+        "dest_channel_id",
+        "status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_channel_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dest_channel_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "result": {
+          "$ref": "#/$defs/execution_result"
+        }
       }
     }
-  }
+  },
+  "examples": [
+    {
+      "schema_name": "rebalance_cycle_replay",
+      "schema_version": 0,
+      "capture_run_id": "00000000000000000000000000000000",
+      "capture_seq": 1,
+      "cycle_id": "00000000000000000000000000000000:00000001",
+      "terminal_stage": "completed",
+      "producer": {
+        "started_at": "2026-08-20T00:00:00+00:00",
+        "completed_at": "2026-08-20T00:00:01+00:00",
+        "python_commit": "example",
+        "algorithm_version": "rebalance-v2-phase1a",
+        "trigger": "automatic"
+      },
+      "configuration": {
+        "config_version": 1,
+        "target_band_low": {
+          "__f64__": "3fd6666666666666"
+        },
+        "target_band_high": {
+          "__f64__": "3fe4cccccccccccd"
+        },
+        "max_chunk_sats": 2000000,
+        "max_pairs": 1,
+        "pair_fee_cap_ppm": 1000
+      },
+      "pre_state": {
+        "normalized_snapshot": {
+          "channels": [],
+          "total_capacity_sats": 0,
+          "total_remaining_budget_sats": 0,
+          "valuable_channel_count": 0
+        }
+      },
+      "funnel": {
+        "generated_pairs": [],
+        "planner_selected_pairs": [],
+        "final_selected_pairs": [],
+        "skipped": []
+      },
+      "execution": {
+        "pair_outcomes": []
+      },
+      "completeness": {
+        "generated_pair_count": 0,
+        "retained_generated_pair_count": 0,
+        "planner_selected_pair_count": 0,
+        "final_selected_pair_count": 0,
+        "execution_outcome_count": 0,
+        "candidate_universe_truncated": false,
+        "eligible": true
+      },
+      "payload_sha256": "470a4ac3d68e772125f388d3cbac3cd6e9f2b2fd10d74d09be75672ef6ae38a2"
+    }
+  ]
 }

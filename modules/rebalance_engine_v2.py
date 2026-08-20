@@ -121,6 +121,7 @@ class CycleResult:
     cycle_id: str = ""
     trigger: str = "unknown"
     pair_outcomes: List[Dict[str, Any]] = field(default_factory=list)
+    planner_bootstrap_evidence: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class RebalanceEngine:
@@ -145,6 +146,9 @@ class RebalanceEngine:
         self.database = database
         self._policy_manager = policy_manager
         # Capture is optional and observational; construction must not affect live execution.
+        capture_requested = (
+            getattr(config, "rebalance_replay_capture_enabled", False) is True
+        )
         if rebalance_capture_manager is not None:
             self.rebalance_capture_manager = rebalance_capture_manager
         else:
@@ -153,10 +157,22 @@ class RebalanceEngine:
                 self.rebalance_capture_manager = RebalanceCycleCaptureManager(
                     getattr(config, "db_path", "revenue_ops.db"), self._log
                 )
-                if getattr(config, "rebalance_replay_capture_enabled", False) is True:
-                    self.rebalance_capture_manager.set_enabled(True)
-            except Exception:
+                if capture_requested:
+                    enabled = self.rebalance_capture_manager.set_enabled(True)
+                    if enabled is not True:
+                        raise RuntimeError("capture manager rejected startup enable")
+            except Exception as exc:
                 self.rebalance_capture_manager = None
+                if capture_requested:
+                    try:
+                        config.rebalance_replay_capture_enabled = False
+                    except Exception:
+                        pass
+                    self._log(
+                        "Rebalance replay capture requested at startup but could not "
+                        f"be enabled ({type(exc).__name__}); corrected config to disabled",
+                        level="warn",
+                    )
         # Phase 2C: optional shadow-governor (EconShadow), injected at
         # plugin init; None = no shadow. Fail-open by contract.
         self.econ_shadow = None
@@ -384,26 +400,31 @@ class RebalanceEngine:
         return len(orphans)
 
     def shutdown(self) -> None:
-        """Release thread pool resources."""
+        """Release thread pool resources without extending routing shutdown."""
         try:
             if self.rebalance_capture_manager is not None:
-                self.rebalance_capture_manager.set_enabled(False, timeout_seconds=5.0)
-        except Exception:
-            pass
+                stopped = self.rebalance_capture_manager.set_enabled(
+                    False, timeout_seconds=5.0
+                )
+                if stopped is not True:
+                    self._log(
+                        "Rebalance replay capture shutdown did not complete within its bound",
+                        level="warn",
+                    )
+        except Exception as exc:
+            self._log(
+                f"Rebalance replay capture shutdown failed: {type(exc).__name__}",
+                level="warn",
+            )
         self._pool.shutdown(wait=False)
 
     def _cache_cycle_result(self, result: CycleResult) -> None:
         self._last_cycle_result = result
 
-    def _cache_planning_result(self, result: CycleResult, reference: Any, owns_reference: bool) -> None:
+    def _cache_planning_result(self, result: CycleResult, reference: Any) -> None:
         result.cycle_id = str(getattr(reference, "cycle_id", "") or "")
         result.trigger = "planning"
         self._cache_cycle_result(result)
-        if owns_reference and reference is not None:
-            try:
-                self.rebalance_capture_manager.finish_cycle(reference, result, "planning_only")
-            except Exception:
-                pass
 
     @staticmethod
     def _pair_key(pair: PairCandidate) -> Tuple[str, str]:
@@ -1285,15 +1306,37 @@ class RebalanceEngine:
 
 
     def find_candidates(self, capture_reference: Any = None) -> List[PairCandidate]:
-        """Dry-run: build snapshot, plan, and return candidates without executing.
-
-        This is the entry point called by EVRebalancer when rebalance_engine=v2.
-        Captures the active router at the start of the cycle so mid-cycle
-        config flips do not split a cycle across two routers.
-        """
+        """Public planning entrypoint with exactly-once capture ownership."""
         owns_capture_reference = capture_reference is None
         if owns_capture_reference:
             capture_reference = self._begin_rebalance_capture("planning")
+        terminal_result: Optional[CycleResult] = None
+        terminal_stage = "failed"
+        try:
+            candidates = self._find_candidates_impl(capture_reference)
+            terminal_result = self._last_cycle_result or CycleResult()
+            if self._cycle_router is None:
+                terminal_stage = "no_router"
+            elif terminal_result.snapshot is None or not getattr(
+                terminal_result.snapshot, "channels", None
+            ):
+                terminal_stage = "missing_snapshot"
+            else:
+                terminal_stage = "planning_only"
+            return candidates
+        finally:
+            if owns_capture_reference and capture_reference is not None:
+                try:
+                    self.rebalance_capture_manager.finish_cycle(
+                        capture_reference,
+                        terminal_result or CycleResult(),
+                        terminal_stage,
+                    )
+                except Exception:
+                    pass
+
+    def _find_candidates_impl(self, capture_reference: Any = None) -> List[PairCandidate]:
+        """Build and price candidates using a caller-owned capture reference."""
         # New cycle: drop the per-cycle dest success-rate memo so the
         # aggregate reflects results recorded since the last cycle.
         self._dest_success_rate_memo.clear()
@@ -1303,14 +1346,14 @@ class RebalanceEngine:
                 "askrene unavailable; v3 router is required for rebalancing",
                 level="warn",
             )
-            self._cache_planning_result(CycleResult(), capture_reference, owns_capture_reference)
+            self._cache_planning_result(CycleResult(), capture_reference)
             return []
         router_tag = "v3"
 
         snapshot = self._build_snapshot()
         if not snapshot or not snapshot.channels:
             self._log("No channels in snapshot")
-            self._cache_planning_result(CycleResult(snapshot=snapshot), capture_reference, owns_capture_reference)
+            self._cache_planning_result(CycleResult(snapshot=snapshot), capture_reference)
             return []
 
         cfg = self.config if not hasattr(self.config, 'snapshot') else self.config.snapshot()
@@ -1333,16 +1376,21 @@ class RebalanceEngine:
         )
 
         plan = planner.plan(snapshot)
-        for generated_pair in getattr(plan, "generated", []) or []:
-            if not getattr(generated_pair, "bootstrap_score_decomposition", None):
-                generated_pair.bootstrap_score_decomposition = copy.deepcopy(
-                    getattr(generated_pair, "score_decomposition", {}) or {}
-                )
         generated = list(getattr(plan, "generated", []) or [])
         # Keep hand-constructed legacy PlanResult fixtures diagnostic-only
         # compatible; the real planner always provides its complete universe.
         if not generated and plan.selected:
             generated = list(plan.selected)
+        planner_bootstrap_evidence = [
+            {
+                "source_channel_id": pair.source_channel_id,
+                "dest_channel_id": pair.dest_channel_id,
+                "score_decomposition": copy.deepcopy(
+                    getattr(pair, "score_decomposition", {}) or {}
+                ),
+            }
+            for pair in generated
+        ]
         considered_candidates = [copy.deepcopy(pair) for pair in generated]
         considered_lookup = {
             self._pair_key(pair): pair for pair in considered_candidates
@@ -1674,9 +1722,9 @@ class RebalanceEngine:
                 audit_records=list(plan.skipped),
                 snapshot=snapshot,
                 plan=plan,
+                planner_bootstrap_evidence=planner_bootstrap_evidence,
             ),
             capture_reference,
-            owns_capture_reference,
         )
 
         return plan.selected
@@ -3967,12 +4015,28 @@ class RebalanceEngine:
             result = self._run_cycle_locked(capture_reference)
             return result
         finally:
+            self._cycle_lock.release()
             try:
                 if capture_reference is not None:
-                    self.rebalance_capture_manager.finish_cycle(capture_reference, result or CycleResult(), "completed" if result is not None else "failed")
+                    terminal_stage = "failed"
+                    if result is not None:
+                        if self._cycle_router is None:
+                            terminal_stage = "no_router"
+                        elif result.snapshot is None or not getattr(
+                            result.snapshot, "channels", None
+                        ):
+                            terminal_stage = "missing_snapshot"
+                        elif result.plan is None:
+                            terminal_stage = "planning_only"
+                        else:
+                            terminal_stage = "completed"
+                    self.rebalance_capture_manager.finish_cycle(
+                        capture_reference,
+                        result or CycleResult(),
+                        terminal_stage,
+                    )
             except Exception:
                 pass
-            self._cycle_lock.release()
 
     def _run_cycle_locked(self, capture_reference: Any = None) -> CycleResult:
         try:
@@ -3987,6 +4051,9 @@ class RebalanceEngine:
             audit_records=list(getattr(planned, "audit_records", []) or []),
             snapshot=getattr(planned, "snapshot", None),
             plan=getattr(planned, "plan", None),
+            planner_bootstrap_evidence=list(
+                getattr(planned, "planner_bootstrap_evidence", []) or []
+            ),
         )
         result.cycle_id = str(getattr(capture_reference, "cycle_id", "") or "")
         result.trigger = "automatic"

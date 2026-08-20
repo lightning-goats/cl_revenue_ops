@@ -75,8 +75,6 @@ class PairCandidate:
     reason_code: str = "ev_positive"
     route_decision: Optional[RouteDecision] = None
     score_decomposition: Dict[str, Any] = field(default_factory=dict)
-    # Immutable planner-stage explanation retained before engine route mutation.
-    bootstrap_score_decomposition: Dict[str, Any] = field(default_factory=dict)
     rejection_reason: str = ""
     # Replay-capture trace metadata. These observations preserve the pure
     # planner funnel and never participate in scoring, routing, or execution.

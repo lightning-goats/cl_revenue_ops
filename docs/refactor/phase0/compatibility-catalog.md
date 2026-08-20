@@ -99,7 +99,7 @@ cannot schedule work or authorize action.
 - `authority_level` (added 2026-07-13, Phase 4 Workstream I; observe/fees/liquidity/capital, default `capital`)
 - `risk_profile` (added 2026-07-13, Phase D PR 7; default `custom`)
 
-### Full Config dataclass surface (102 fields with defaults)
+### Full Config dataclass surface (103 fields with defaults)
 
 | Field | Default | Runtime-settable |
 |---|---|---|
@@ -109,6 +109,7 @@ cannot schedule work or authorize action.
 | `rebalance_interval` | `900` |  |
 | `fee_authority_enabled` | `True` |  |
 | `fee_replay_capture_enabled` | `False` |  |
+| `rebalance_replay_capture_enabled` | `False` |  |
 | `hot_channel_protection_enabled` | `True` |  |
 | `hot_channel_protection_override_peers` | `''` |  |
 | `hot_channel_protection_min_velocity` | `0.2` |  |

@@ -121,6 +121,7 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "fee_market_boundary_max_downshift_ratio": "advanced_expert",
     "fee_market_boundary_cache_seconds": "advanced_expert",
     "fee_replay_capture_enabled": "advanced_expert",
+    "rebalance_replay_capture_enabled": "advanced_expert",
     "low_liquidity_threshold": "advanced_expert",
     "high_liquidity_threshold": "advanced_expert",
     "rebalance_emergency_local_ratio": "advanced_expert",

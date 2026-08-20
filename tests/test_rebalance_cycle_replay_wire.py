@@ -28,6 +28,7 @@ def valid_body():
         "capture_run_id": "a" * 32,
         "capture_seq": 1,
         "cycle_id": f"{'a' * 32}:00000001",
+        "terminal_stage": "completed",
         "producer": {
             "started_at": "2026-08-20T18:00:00+00:00",
             "completed_at": "2026-08-20T18:00:01+00:00",
@@ -82,6 +83,11 @@ def pair(source="1x1x1", dest="2x2x2", rank=1):
         "planner_selected": True,
         "planner_rejection_reason": None,
         "bootstrap_score_decomposition": {"base": 0.5},
+        "score_decomposition": {"inputs": {"effective_budget_sats": 900}},
+        "route_cost_sats": 12,
+        "effective_budget_sats": 900,
+        "rejection_reason": "",
+        "route_summary": [],
     }
 
 
@@ -94,9 +100,9 @@ def body_with_pair():
     generated = pair()
     body["funnel"]["generated_pairs"] = [generated]
     body["funnel"]["planner_selected_pairs"] = [pair_ref()]
-    body["funnel"]["final_selected_pairs"] = [pair_ref()]
+    body["funnel"]["final_selected_pairs"] = [dict(generated)]
     body["execution"]["pair_outcomes"] = [
-        {**pair_ref(), "outcome": "skipped"}
+        {**pair_ref(), "status": "returned_none"}
     ]
     body["completeness"].update(
         generated_pair_count=1,
@@ -116,6 +122,40 @@ def test_valid_minimal_body_seals_verifies_and_matches_closed_schema():
 
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     Draft202012Validator(schema).validate(sealed)
+
+
+@pytest.mark.parametrize(
+    "terminal_stage",
+    ["no_router", "missing_snapshot", "failed", "lock_contended", "planning_only"],
+)
+def test_terminal_stages_are_explicit_and_noncompleted_stages_are_ineligible(
+    terminal_stage,
+):
+    body = valid_body()
+    body["terminal_stage"] = terminal_stage
+    body["completeness"]["eligible"] = False
+
+    sealed = seal_envelope(body)
+
+    assert sealed["terminal_stage"] == terminal_stage
+    verify_envelope(sealed)
+
+
+def test_completed_terminal_stage_requires_eligible_complete_evidence():
+    body = valid_body()
+    body["completeness"]["eligible"] = False
+
+    with pytest.raises(ValueError, match="completed terminal stage"):
+        validate_body(body)
+
+
+def test_unknown_terminal_stage_is_rejected():
+    body = valid_body()
+    body["terminal_stage"] = "invented"
+    body["completeness"]["eligible"] = False
+
+    with pytest.raises(ValueError, match="terminal_stage"):
+        validate_body(body)
 
 
 def test_canonicalization_tags_floats_and_digest_is_deterministic():
@@ -212,13 +252,12 @@ def test_runtime_and_schema_reject_legacy_or_malformed_binary64_tags(tag):
 def _body_for_reserved_binary64_wrapper(wrapper):
     if wrapper == "channel":
         body = valid_body()
-        body["pre_state"]["normalized_snapshot"]["channels"] = [
-            {"channel_id": "1x1x1"}
-        ]
+        body["pre_state"]["normalized_snapshot"]["channels"] = [full_channel()]
         return body
     body = body_with_pair()
     if wrapper == "score_decomposition":
         body["funnel"]["generated_pairs"][0]["bootstrap_score_decomposition"] = {}
+        body["funnel"]["final_selected_pairs"][0]["bootstrap_score_decomposition"] = {}
     return body
 
 
@@ -278,10 +317,9 @@ def test_seal_rejects_wrong_schema_identity(field, value):
 
 def test_validate_rejects_duplicate_snapshot_channel_identity():
     body = valid_body()
-    body["pre_state"]["normalized_snapshot"]["channels"] = [
-        {"channel_id": "1x1x1", "peer_id": "peer-a"},
-        {"channel_id": "1x1x1", "peer_id": "peer-b"},
-    ]
+    first = full_channel()
+    second = {**full_channel(), "peer_id": "03" + "b" * 64}
+    body["pre_state"]["normalized_snapshot"]["channels"] = [first, second]
 
     with pytest.raises(ValueError, match="duplicate snapshot channel"):
         validate_body(body)
@@ -488,6 +526,7 @@ def test_validate_requires_truncation_to_be_explicitly_ineligible():
         validate_body(body)
 
     body["completeness"]["eligible"] = False
+    body["terminal_stage"] = "planning_only"
     validate_body(body)
 
 
@@ -554,5 +593,71 @@ def test_schema_is_closed_to_unknown_top_level_properties():
     envelope = seal_envelope(valid_body())
     envelope["unexpected"] = "nope"
 
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(envelope)
+
+
+
+def full_channel():
+    return {
+        "channel_id": "1x1x1", "peer_id": "02" + "a" * 64,
+        "capacity_sats": 1000, "local_ratio": 0.8,
+        "actual_inbound_fee_ppm": 10, "value_class": "active",
+        "is_valuable": True, "remaining_budget_sats": 20,
+        "cooldown_active": False, "source_eligible": True,
+        "dest_eligible": False, "source_reason": "",
+        "dest_reason": "inside_band", "dest_urgency": 0.0,
+        "source_drain_score": 0.5, "budget_source": "capex",
+        "local_out_fee_ppm": 100, "historical_direct_fee_ppm": 10.0,
+        "historical_sourced_fee_ppm": 5.0, "is_active": True,
+        "realized_utilization": 0.5, "utilization_is_realized": False,
+        "activity_out_sats": 0, "activity_in_sats": 0,
+        "target_band_low": 0.35, "target_band_high": 0.65,
+    }
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda channel: channel.pop("peer_id"),
+    lambda channel: channel.update(capacity_sats="1000"),
+    lambda channel: channel.update(unknown_field=1),
+])
+def test_runtime_and_schema_reject_partial_malformed_or_unknown_snapshot_channel(mutation):
+    body = valid_body()
+    channel = full_channel()
+    mutation(channel)
+    body["pre_state"]["normalized_snapshot"]["channels"] = [channel]
+
+    with pytest.raises(ValueError, match="snapshot channel"):
+        validate_body(body)
+
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    envelope = {**replay_wire.tag_floats(body), "payload_sha256": "0" * 64}
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(envelope)
+
+
+@pytest.mark.parametrize("section", ["planner_selected_pairs", "final_selected_pairs"])
+def test_validate_rejects_duplicate_selected_pair_references(section):
+    body = body_with_pair()
+    duplicate = dict(body["funnel"][section][0])
+    body["funnel"][section].append(duplicate)
+    body["completeness"][
+        "planner_selected_pair_count" if section == "planner_selected_pairs" else "final_selected_pair_count"
+    ] += 1
+
+    with pytest.raises(ValueError, match="duplicate"):
+        validate_body(body)
+
+
+
+def test_runtime_and_schema_reject_unknown_generated_pair_field():
+    body = body_with_pair()
+    body["funnel"]["generated_pairs"][0]["raw_rpc"] = {"secret": True}
+
+    with pytest.raises(ValueError, match="generated pair"):
+        validate_body(body)
+
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    envelope = {**replay_wire.tag_floats(body), "payload_sha256": "0" * 64}
     with pytest.raises(ValidationError):
         Draft202012Validator(schema).validate(envelope)

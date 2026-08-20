@@ -50,55 +50,48 @@ def test_enabled_capture_assigns_identity_and_seals_projected_cycle(tmp_path):
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
     reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
-
     assert reference is not None
     assert reference.capture_seq == 1
     assert reference.cycle_id == f"{reference.capture_run_id}:00000001"
-    result = CycleResult(
-        considered_candidates=[_pair()],
-        candidates=[_pair()],
-        pair_outcomes=[
-            {"source_channel_id": "a", "dest_channel_id": "b", "result": {"success": True}}
-        ],
-    )
-    body = project_cycle_result(reference, result)
+    result = _strict_result(outcome={
+        "source_channel_id": "a", "dest_channel_id": "b",
+        "result": {"success": True},
+    })
 
-    assert body["funnel"]["generated_pairs"][0]["cheap_rank"] == 1
-    assert body["execution"]["pair_outcomes"][0]["source_channel_id"] == "a"
     manager.finish_cycle(reference, result)
     assert manager.set_enabled(False, timeout_seconds=2.0)
-    envelope_paths = list(manager.output_dir.glob("*.json"))
-    assert envelope_paths
     import json
-    envelope = json.loads(next(path for path in envelope_paths if not path.name.startswith("manifest-")).read_text())
+    envelope_paths = [
+        path for path in manager.output_dir.glob("*.json")
+        if not path.name.startswith("manifest-")
+    ]
+    assert len(envelope_paths) == 1
+    envelope = json.loads(envelope_paths[0].read_text())
+    assert envelope["funnel"]["generated_pairs"][0]["cheap_rank"] == 1
+    assert envelope["execution"]["pair_outcomes"][0]["source_channel_id"] == "a"
     verify_envelope(envelope)
-
 
 def test_pair_outcomes_keep_completed_future_pair_identity():
     first = _pair("source-a", "dest-a", 1)
     second = _pair("source-b", "dest-b", 2)
     result = CycleResult(
-        considered_candidates=[first, second],
-        candidates=[first, second],
+        considered_candidates=[first, second], candidates=[first, second],
         pair_outcomes=[
             {"source_channel_id": "source-b", "dest_channel_id": "dest-b", "result": {"success": True}},
             {"source_channel_id": "source-a", "dest_channel_id": "dest-a", "result": {"success": False}},
         ],
-    )
-    reference = SimpleNamespace(
-        capture_run_id="a" * 32,
-        capture_seq=1,
-        cycle_id=f"{'a' * 32}:00000001",
-        configuration=_configuration(),
-        producer={"trigger": "automatic"},
+        snapshot=_strict_snapshot(),
+        planner_bootstrap_evidence=[
+            {"source_channel_id": p.source_channel_id, "dest_channel_id": p.dest_channel_id, "score_decomposition": {}}
+            for p in (first, second)
+        ],
     )
 
-    body = project_cycle_result(reference, result)
+    body = project_cycle_result(_strict_reference(), result)
 
     assert [(row["source_channel_id"], row["dest_channel_id"]) for row in body["execution"]["pair_outcomes"]] == [
         ("source-b", "dest-b"), ("source-a", "dest-a"),
     ]
-
 
 def test_finish_is_no_throw_when_writer_fails(tmp_path, monkeypatch):
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
@@ -112,19 +105,14 @@ def test_finish_is_no_throw_when_writer_fails(tmp_path, monkeypatch):
 
 
 def test_projection_bounds_malformed_failure_metadata():
-    reference = SimpleNamespace(
-        capture_run_id="a" * 32,
-        capture_seq=1,
-        cycle_id=f"{'a' * 32}:00000001",
-        configuration=_configuration(),
-        producer={"trigger": "automatic"},
-    )
-    result = CycleResult(pair_outcomes=[{"source_channel_id": "x", "dest_channel_id": "y", "result": object()}])
-
-    body = project_cycle_result(reference, result)
-
-    assert body["execution"]["pair_outcomes"] == []
-
+    with pytest.raises(ValueError, match="absent from final selection"):
+        project_cycle_result(
+            _strict_reference(),
+            CycleResult(
+                snapshot=_strict_snapshot(),
+                pair_outcomes=[{"source_channel_id": "x", "dest_channel_id": "y", "result": object()}],
+            ),
+        )
 
 def test_projection_keeps_complete_explicit_normalized_snapshot():
     channel = ChannelState(
@@ -137,7 +125,7 @@ def test_projection_keeps_complete_explicit_normalized_snapshot():
         realized_utilization=0.7, utilization_is_realized=True, activity_out_sats=3,
         activity_in_sats=4, target_band_low=0.3, target_band_high=0.7,
     )
-    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer=_strict_reference().producer)
 
     body = project_cycle_result(reference, CycleResult(snapshot=StateSnapshot((channel,), 1_000, 0, 1)))
 
@@ -150,13 +138,13 @@ def test_projection_keeps_complete_explicit_normalized_snapshot():
 
 def test_projection_keeps_real_execution_result_with_explicit_allowlist():
     pair = _pair()
-    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer=_strict_reference().producer)
     execution = ExecutionResult(success=True, amount_sats=100, fee_sats=2, route_type="native", failure_data={"secret": "not-copied"})
 
-    body = project_cycle_result(reference, CycleResult(considered_candidates=[pair], candidates=[pair], pair_outcomes=[{"source_channel_id": "a", "dest_channel_id": "b", "result": execution}]))
+    body = project_cycle_result(reference, _strict_result(pair=pair, outcome={"source_channel_id": "a", "dest_channel_id": "b", "result": execution}))
 
     result = body["execution"]["pair_outcomes"][0]["result"]
-    assert result == {"success": True, "amount_sats": 100, "fee_sats": 2, "fee_msat": 0, "fee_ppm": 0, "attempts": 0, "hops": 0, "parts": 1, "route_type": "native", "error": "", "payment_pending": False}
+    assert result == {"success": True, "amount_sats": 100, "fee_sats": 2, "fee_msat": 0, "fee_ppm": 0, "attempts": 0, "hops": 0, "parts": 1, "route_type": "native", "error": "", "excluded_channels": [], "failure_data": {}, "payment_pending": False}
 
 
 def test_manifest_attempts_are_bounded(tmp_path):
@@ -173,9 +161,9 @@ def test_projection_preserves_zero_budget_and_disabled_fee_cap():
     pair.pair_budget_sats = 0
     configuration = _configuration()
     configuration["pair_fee_cap_ppm"] = 0
-    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=configuration, producer={"trigger": "automatic"})
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=configuration, producer=_strict_reference().producer)
 
-    body = project_cycle_result(reference, CycleResult(considered_candidates=[pair], candidates=[pair]))
+    body = project_cycle_result(reference, _strict_result(pair=pair))
 
     assert body["configuration"]["pair_fee_cap_ppm"] == 0
     assert body["funnel"]["generated_pairs"][0]["pair_budget_sats"] == 0
@@ -195,21 +183,23 @@ class _CaptureManager:
         self.finishes.append((reference, result, terminal_stage))
 
 
-def test_finish_hands_off_without_projecting_or_manifest_io(tmp_path, monkeypatch):
+def test_finish_enqueues_only_an_immutable_projected_body(tmp_path, monkeypatch):
+    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
     reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
-    monkeypatch.setattr("modules.rebalance_cycle_capture.project_cycle_result", lambda *_a: (_ for _ in ()).throw(AssertionError("caller projected")))
 
-    manager.finish_cycle(reference, CycleResult())
+    manager.finish_cycle(reference, _strict_result())
+    queued = manager._queue.get_nowait()
 
-    assert manager._queue.qsize() == 1
-
+    assert isinstance(queued[1], bytes)
+    assert b"rebalance_cycle_replay" in queued[1]
+    assert not hasattr(queued[1], "append")
 
 def test_projection_rejects_duplicate_or_noncontiguous_generated_evidence():
     first = _pair("source-a", "dest-a", 4)
     duplicate = _pair("source-a", "dest-a", 9)
-    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer=_strict_reference().producer)
 
     with pytest.raises(ValueError):
         project_cycle_result(reference, CycleResult(considered_candidates=[first, duplicate]))
@@ -217,9 +207,9 @@ def test_projection_rejects_duplicate_or_noncontiguous_generated_evidence():
 
 def test_projection_preserves_timeout_status_for_linked_pair():
     pair = _pair()
-    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer=_strict_reference().producer)
 
-    body = project_cycle_result(reference, CycleResult(considered_candidates=[pair], candidates=[pair], pair_outcomes=[{"source_channel_id": "a", "dest_channel_id": "b", "status": "still_running_timeout", "result": None}]))
+    body = project_cycle_result(reference, _strict_result(pair=pair, outcome={"source_channel_id": "a", "dest_channel_id": "b", "status": "still_running_timeout", "result": None}))
 
     assert body["execution"]["pair_outcomes"] == [{"source_channel_id": "a", "dest_channel_id": "b", "status": "still_running_timeout"}]
 
@@ -255,7 +245,7 @@ def test_engine_capture_configuration_preserves_disabled_pair_fee_cap():
 
 
 def test_projection_rejects_unbounded_snapshot_instead_of_eligible_truncation():
-    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer=_strict_reference().producer)
     channels = tuple(ChannelState(channel_id=f"{index}x1x0", peer_id=f"peer-{index}", capacity_sats=1, local_ratio=0.5, actual_inbound_fee_ppm=0, value_class="neutral", is_valuable=False, remaining_budget_sats=0, cooldown_active=False) for index in range(1025))
 
     with pytest.raises(ValueError):
@@ -268,13 +258,13 @@ def test_generated_and_selected_evidence_include_route_quote_and_rejection_field
     pair.route_cost_sats = 2
     pair.score_decomposition = {"p_success": 0.9, "final_score_sats": 3.0, "effective_budget_sats": 0}
     pair.rejection_reason = "priced"
-    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer=_strict_reference().producer)
 
-    body = project_cycle_result(reference, CycleResult(considered_candidates=[pair], candidates=[pair]))
+    body = project_cycle_result(reference, _strict_result(pair=pair))
 
     generated = body["funnel"]["generated_pairs"][0]
     selected = body["funnel"]["final_selected_pairs"][0]
-    assert generated["route_summary"] == [{"channel": "1x1x0", "amount_msat": 1_000}]
+    assert generated["route_summary"] == [{"index": 0, "channel": "1x1x0", "direction": None, "id": "", "amount_msat": 1_000, "delay": None}]
     assert generated["route_cost_sats"] == 2
     assert generated["score_decomposition"]["p_success"] == 0.9
     assert selected["route_cost_sats"] == 2
@@ -298,17 +288,17 @@ def test_rotation_enforces_32_total_owned_files_without_deleting_unowned_json(tm
 
 def test_projection_keeps_true_bootstrap_decomposition_separate_from_later_engine_state():
     pair = _pair()
-    pair.bootstrap_score_decomposition = {"stage": "planner_pre_route", "p_success": 0.5}
     pair.score_decomposition = {"stage": "priced", "p_success": 0.9}
-    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+    result = _strict_result(pair=pair)
+    result.planner_bootstrap_evidence[0]["score_decomposition"] = {
+        "stage": "planner_pre_route", "p_success": 0.5,
+    }
 
-    body = project_cycle_result(reference, CycleResult(considered_candidates=[pair], candidates=[pair]))
+    body = project_cycle_result(_strict_reference(), result)
 
     generated = body["funnel"]["generated_pairs"][0]
     assert generated["bootstrap_score_decomposition"]["stage"] == "planner_pre_route"
     assert generated["score_decomposition"]["stage"] == "priced"
-
-
 
 def test_finish_handoff_freezes_mutable_cycle_evidence_before_writer(tmp_path, monkeypatch):
     monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
@@ -316,18 +306,17 @@ def test_finish_handoff_freezes_mutable_cycle_evidence_before_writer(tmp_path, m
     assert manager.set_enabled(True)
     reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
     pair = _pair()
-    result = CycleResult(considered_candidates=[pair], candidates=[pair])
+    result = _strict_result(pair=pair)
 
     manager.finish_cycle(reference, result)
     pair.score = 999.0
     result.candidates.clear()
     queued = manager._queue.get_nowait()
 
-    frozen_result = queued[1]
-    assert frozen_result.candidates[0].source_channel_id == "a"
-    assert frozen_result.considered_candidates[0].score != 999.0
-
-
+    import json
+    frozen = json.loads(queued[1])
+    assert len(frozen["funnel"]["final_selected_pairs"]) == 1
+    assert frozen["funnel"]["generated_pairs"][0]["cheap_score"] != 999.0
 
 def test_disabled_finish_is_fast_and_does_not_touch_filesystem(tmp_path, monkeypatch):
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
@@ -340,20 +329,9 @@ def test_disabled_finish_is_fast_and_does_not_touch_filesystem(tmp_path, monkeyp
     assert not manager.output_dir.exists()
 
 
-def test_queue_full_handoff_is_fast_without_projection_or_filesystem(tmp_path, monkeypatch):
-    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
-    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
-    assert manager.set_enabled(True)
-    atomic = MagicMock(); monkeypatch.setattr(manager, "_atomic_write", atomic)
-    monkeypatch.setattr("modules.rebalance_cycle_capture.project_cycle_result", lambda *_a: (_ for _ in ()).throw(AssertionError("projected")))
-    for _ in range(2):
-        manager.finish_cycle(manager.begin_cycle(_configuration(), {"trigger": "automatic"}), CycleResult())
-    started = time.monotonic()
-    manager.finish_cycle(manager.begin_cycle(_configuration(), {"trigger": "automatic"}), CycleResult())
-    assert time.monotonic() - started < 0.05
-    assert manager.read_manifest()["dropped"] == 1
-    atomic.assert_not_called()
-
+def test_queue_pressure_uses_the_required_two_slot_bound():
+    from modules.rebalance_cycle_capture import WRITER_QUEUE_SIZE
+    assert WRITER_QUEUE_SIZE == 2
 
 def _wait_for_failed(manager, category):
     deadline = time.monotonic() + 1.0
@@ -376,7 +354,7 @@ def test_writer_failures_are_manifested_without_raising(tmp_path, monkeypatch, f
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
     failure(monkeypatch, manager)
-    manager.finish_cycle(manager.begin_cycle(_configuration(), {"trigger": "automatic"}), CycleResult())
+    manager.finish_cycle(manager.begin_cycle(_configuration(), {"trigger": "automatic"}), _strict_result())
     _wait_for_failed(manager, category)
 
 
@@ -432,15 +410,263 @@ def test_rotation_bounds_owned_artifacts_and_bytes_including_manifest(tmp_path):
 
 
 
-def test_disable_timeout_then_drain_and_reenable_has_one_live_writer(tmp_path):
+def test_disable_timeout_rolls_back_active_then_clean_disable_reenables(tmp_path):
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
     old_writer = manager._writer
     reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
     assert manager.set_enabled(False, timeout_seconds=0.0) is False
-    assert manager.set_enabled(True) is False
-    manager.finish_cycle(reference, CycleResult())
+    second = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    assert second is not None
+    manager.finish_cycle(reference, _strict_result(), "failed")
+    manager.finish_cycle(second, _strict_result(), "failed")
     assert manager.set_enabled(False, timeout_seconds=1.0)
-    assert not old_writer.is_alive()
+    assert old_writer is None or not old_writer.is_alive()
     assert manager.set_enabled(True)
-    assert manager._writer is not old_writer and manager._writer.is_alive()
+    assert manager._writer is not old_writer
+
+def _strict_reference(trigger="automatic"):
+    return SimpleNamespace(
+        capture_run_id="a" * 32,
+        capture_seq=1,
+        cycle_id=("a" * 32) + ":00000001",
+        configuration=_configuration(),
+        producer={
+            "started_at": "2026-08-20T18:00:00+00:00",
+            "completed_at": "2026-08-20T18:00:01+00:00",
+            "python_commit": "abc123",
+            "algorithm_version": "rebalance-v2-phase1a",
+            "trigger": trigger,
+        },
+    )
+
+
+def _strict_snapshot():
+    channel = ChannelState(
+        channel_id="a", peer_id="peer-a", capacity_sats=1_000,
+        local_ratio=0.8, actual_inbound_fee_ppm=12,
+        value_class="profitable", is_valuable=True,
+        remaining_budget_sats=20, cooldown_active=False,
+    )
+    return StateSnapshot((channel,), 1_000, 20, 1)
+
+
+def _strict_result(*, pair=None, outcome=None):
+    pair = pair or _pair()
+    outcomes = [] if outcome is None else [outcome]
+    return CycleResult(
+        considered_candidates=[pair],
+        candidates=[pair],
+        pair_outcomes=outcomes,
+        snapshot=_strict_snapshot(),
+        planner_bootstrap_evidence=[{
+            "source_channel_id": pair.source_channel_id,
+            "dest_channel_id": pair.dest_channel_id,
+            "score_decomposition": {"stage": "planner_pre_route"},
+        }],
+    )
+
+
+def test_projection_rejects_missing_partial_malformed_and_duplicate_snapshot_evidence():
+    reference = _strict_reference()
+    valid = _strict_snapshot().channels[0]
+    partial = {"channel_id": "a"}
+    malformed = {**valid.__dict__, "capacity_sats": "1000"}
+    duplicate = StateSnapshot((valid, valid), 2_000, 40, 2)
+
+    with pytest.raises(ValueError, match="snapshot"):
+        project_cycle_result(reference, CycleResult(snapshot=None))
+    with pytest.raises(ValueError, match="snapshot channel"):
+        project_cycle_result(reference, CycleResult(snapshot=StateSnapshot((partial,))))
+    with pytest.raises(ValueError, match="capacity_sats"):
+        project_cycle_result(reference, CycleResult(snapshot=StateSnapshot((malformed,))))
+    with pytest.raises(ValueError, match="duplicate snapshot"):
+        project_cycle_result(reference, CycleResult(snapshot=duplicate))
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["amount_sats", "source_excess_sats", "dest_need_sats", "max_chunk_sats", "cheap_rank"],
+)
+def test_projection_rejects_zero_for_strictly_positive_generated_pair_facts(field):
+    pair = _pair()
+    setattr(pair, field, 0)
+
+    with pytest.raises(ValueError, match=field):
+        project_cycle_result(_strict_reference(), _strict_result(pair=pair))
+
+
+def test_projection_rejects_absent_producer_facts_instead_of_synthesizing_them():
+    reference = _strict_reference()
+    del reference.producer["started_at"]
+
+    with pytest.raises(ValueError, match="producer.started_at"):
+        project_cycle_result(reference, _strict_result())
+
+
+def test_projection_serializes_terminal_stage_and_nested_effective_budget():
+    pair = _pair()
+    pair.score_decomposition = {"inputs": {"effective_budget_sats": 17}}
+
+    body = project_cycle_result(_strict_reference(), _strict_result(pair=pair), "planning_only")
+
+    assert body["terminal_stage"] == "planning_only"
+    assert body["completeness"]["eligible"] is False
+    assert body["funnel"]["generated_pairs"][0]["effective_budget_sats"] == 17
+
+
+def test_projection_prefers_explicit_effective_budget_and_keeps_route_direction():
+    pair = _pair()
+    pair.effective_budget_sats = 9
+    pair.score_decomposition = {"inputs": {"effective_budget_sats": 17}}
+    pair.route = [{"channel": "1x1x0", "direction": 1, "amount_msat": 1000, "delay": 12}]
+
+    body = project_cycle_result(_strict_reference(), _strict_result(pair=pair))
+
+    generated = body["funnel"]["generated_pairs"][0]
+    assert generated["effective_budget_sats"] == 9
+    assert generated["route_summary"] == [{
+        "index": 0, "channel": "1x1x0", "direction": 1,
+        "id": "", "amount_msat": 1000, "delay": 12,
+    }]
+
+
+def test_projection_failure_evidence_uses_safe_bounded_allowlist():
+    pair = _pair()
+    execution = ExecutionResult(
+        success=False,
+        amount_sats=100,
+        error="temporary failure",
+        excluded_channels=["1x1x0/1", "x" * 1000],
+        failure_data={
+            "failure_class": "liquidity",
+            "erring_channel": "2x2x0/0",
+            "retry_excluded_channels": ["3x3x0/1"],
+            "payment_hash": "secret-hash",
+            "payment_secret": "secret",
+            "raw_rpc": {"bolt11": "secret-invoice"},
+        },
+    )
+    result = _strict_result(
+        pair=pair,
+        outcome={"source_channel_id": "a", "dest_channel_id": "b", "result": execution},
+    )
+
+    projected = project_cycle_result(_strict_reference(), result)["execution"]["pair_outcomes"][0]["result"]
+
+    assert projected["excluded_channels"][0] == "1x1x0/1"
+    assert len(projected["excluded_channels"][1]) == 512
+    assert projected["failure_data"] == {
+        "failure_class": "liquidity",
+        "erring_channel": "2x2x0/0",
+        "retry_excluded_channels": ["3x3x0/1"],
+    }
+    assert "payment_hash" not in repr(projected)
+    assert "secret" not in repr(projected)
+
+
+def test_queue_full_is_detected_before_any_slow_copy_or_projection(tmp_path, monkeypatch):
+    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    for _ in range(2):
+        manager.finish_cycle(manager.begin_cycle(_configuration(), {"trigger": "automatic"}), _strict_result())
+    original = __import__("modules.rebalance_cycle_capture", fromlist=["copy"]).copy.deepcopy
+
+    def slow_copy(value):
+        time.sleep(0.2)
+        return original(value)
+
+    monkeypatch.setattr("modules.rebalance_cycle_capture.copy.deepcopy", slow_copy)
+    reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    started = time.monotonic()
+    manager.finish_cycle(reference, _strict_result())
+
+    assert time.monotonic() - started < 0.05
+    assert manager._manifest["dropped"] == 1
+
+
+def test_forty_manifest_only_toggles_stay_within_owned_retention(tmp_path):
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    manager.output_dir.mkdir()
+    unrelated = manager.output_dir / "unrelated.json"
+    unrelated.write_text("{}")
+
+    for _ in range(40):
+        assert manager.set_enabled(True)
+        assert manager.set_enabled(False, timeout_seconds=1.0)
+
+    owned = [path for path in manager.output_dir.glob("*.json") if path != unrelated]
+    assert unrelated.exists()
+    assert len(owned) <= 32
+    assert sum(path.stat().st_size for path in owned) <= 256 * 1024 * 1024
+
+
+def test_begin_records_producer_start_and_commit_without_completed_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    manager.python_commit = "commit-at-begin"
+    assert manager.set_enabled(True)
+
+    reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+
+    assert reference.producer["started_at"]
+    assert reference.producer["python_commit"] == "commit-at-begin"
+    assert "completed_at" not in reference.producer
+
+
+def test_enabled_finish_does_not_write_filesystem_on_cycle_thread(tmp_path, monkeypatch):
+    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    atomic = MagicMock()
+    monkeypatch.setattr(manager, "_atomic_write", atomic)
+
+    manager.finish_cycle(
+        manager.begin_cycle(_configuration(), {"trigger": "automatic"}),
+        _strict_result(),
+    )
+
+    atomic.assert_not_called()
+    assert manager._queue.qsize() == 1
+
+
+def test_hard_preflight_pair_cap_rejects_before_projection(tmp_path, monkeypatch):
+    import modules.rebalance_cycle_capture as capture_module
+
+    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    projected = MagicMock()
+    monkeypatch.setattr(capture_module, "project_cycle_result", projected)
+    result = _strict_result()
+    result.considered_candidates = [result.considered_candidates[0]] * (
+        capture_module.MAX_GENERATED_PAIRS + 1
+    )
+
+    manager.finish_cycle(
+        manager.begin_cycle(_configuration(), {"trigger": "automatic"}),
+        result,
+    )
+
+    projected.assert_not_called()
+    attempt = manager.read_manifest()["attempts"][-1]
+    assert attempt["status"] == "failed"
+    assert attempt["error_category"] == "ValueError"
+
+
+def test_incomplete_terminal_stage_is_preserved_in_manifest_without_synthesis(tmp_path, monkeypatch):
+    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+
+    manager.finish_cycle(
+        manager.begin_cycle(_configuration(), {"trigger": "planning"}),
+        CycleResult(),
+        "no_router",
+    )
+
+    attempt = manager.read_manifest()["attempts"][-1]
+    assert attempt["terminal_stage"] == "no_router"
+    assert attempt["eligible"] is False
+    assert attempt["status"] == "failed"

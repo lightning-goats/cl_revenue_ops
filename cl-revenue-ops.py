@@ -1101,6 +1101,8 @@ def _on_rebalance_replay_capture_change(
     rebalancer_ = globals().get("rebalancer")
     engine = getattr(rebalancer_, "rebalance_engine_v2", None) if rebalancer_ is not None else None
     manager = getattr(engine, "rebalance_capture_manager", None)
+    if manager is None and enabled:
+        raise ValueError(f"{option_name} manager is unavailable")
     if manager is not None:
         manager_ready = manager.set_enabled(enabled, timeout_seconds=5.0)
         if enabled and manager_ready is not True:
