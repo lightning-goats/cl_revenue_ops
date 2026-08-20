@@ -1,0 +1,9 @@
+[Unit]
+Description=Observe cl_revenue_ops durable measurement preflight
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/sat/bin/cl_revenue_ops
+ExecStart=/home/sat/bin/cl_revenue_ops/.venv/bin/python /home/sat/bin/cl_revenue_ops/tools/revenue_validation_preflight.py --config /home/sat/bin/cl_revenue_ops/config/revenue_validation.yaml --hours 72 --not-before 2026-08-20T18:00:00Z
+Environment=PYTHONUNBUFFERED=1

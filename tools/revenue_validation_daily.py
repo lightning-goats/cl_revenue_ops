@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 if __package__ in {None, ""}:
     from pathlib import Path
@@ -14,6 +14,13 @@ from tools import revenue_validation_report as report
 from tools import revenue_validation_watch as watch
 
 
+def closed_utc_day(now: datetime | None = None) -> str:
+    observed = datetime.now(timezone.utc) if now is None else now
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    return (observed.astimezone(timezone.utc).date() - timedelta(days=1)).isoformat()
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the daily revenue validation pipeline.")
     parser.add_argument(
@@ -21,12 +28,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="config/revenue_validation.yaml",
         help="Path to revenue validation config.",
     )
-    parser.add_argument(
+    date_group = parser.add_mutually_exclusive_group()
+    date_group.add_argument(
         "--date",
-        default=date.today().isoformat(),
         help="Run date in YYYY-MM-DD format. Defaults to local today.",
     )
-    return parser.parse_args(argv)
+    date_group.add_argument(
+        "--closed-utc-day",
+        action="store_true",
+        help="Collect the previous fully closed UTC calendar day.",
+    )
+    args = parser.parse_args(argv)
+    if args.closed_utc_day:
+        args.date = closed_utc_day()
+    elif args.date is None:
+        args.date = date.today().isoformat()
+    return args
 
 
 def run_collect(config_path: str, run_date: str) -> int:

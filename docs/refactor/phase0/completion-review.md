@@ -10,8 +10,10 @@
 > (snapshot adoption, risk profiles, EV contract, conformance corpus,
 > evidence reports). **Architectural completion is withheld on two
 > named residuals** (item 13 evidence gaps; item 15 projections
-> schema); **original-DoD completion is withheld on the two time
-> gates** (2026-08-12 removals; production evaluation window).
+> schema); **original-DoD completion remains withheld because both
+> former time gates elapsed without satisfying their completion conditions**
+> (compatibility removals remain unexecuted; the production evaluation
+> closed YELLOW).
 
 Operator directive: complete the initiative WITHOUT the optional Rust
 port (spec Phase 6 explicitly excluded). Assessed against
@@ -32,9 +34,9 @@ flag-gated.
 | 9 | Lifecycle/protections one authority | met: protection service + explicit lifecycle model (3C). |
 | 10 | Small operator surface and coherent profiles | met (2026-07-13, PRs 7–8 — risk_profile resolver in exact-parity custom default, 141-field classification with coverage pin, bundles caged to economic_risk keys, preview/diff + observe-only comparison RPC; non-custom activation deliberately operator-directed) — `authority_level` (observe/fees/liquidity/capital) enforced at the governor on every path (LN+ obligations exempt per invariant 6); paused/budgets/fee bounds complete the normal surface. Startup detection of contradictory settings (cross-field repairs now WARN, crossed budgets flagged), shadowed settings (explicit overrides behind an off gate flag), and deprecated options (with replacement guidance) — Workstream I's advanced-configuration items. |
 | 11 | RPC/telemetry compatibility | met: pinned surfaces; 3 added diagnostics explicitly unpromised; datastore contracts untouched. |
-| 12 | Deprecated no-ops and duplicate paths removed | pending_time_gate (2026-08-12; prep COMPLETE — scanner READY on lnnode, staged acceptance tests, by-symbol checklist) — duplicate implementations are gone or transition-only; the one deprecated no-op (`rebalance_min_profit`) and remaining transition paths have an ANNOUNCED 30-day removal window (contract-compatibility-policy.md) — same-day removal would violate the spec's own window rule. |
+| 12 | Deprecated no-ops and duplicate paths removed | not_met (2026-08-20) - the announced 2026-08-12 compatibility date elapsed, but the separately governed removal checklist has not been executed. The remaining rebalance_min_profit, legacy budget_reservations, and v0-emission transitions require separate reviewable removal work; they are not part of successor measurement activation. |
 | 13 | Golden/invariant/failure-injection/integration/production gates | partial (per-category evidence filed in governance-evidence-report.md; two declared gaps: pyln minimum-CLN integration not exercised in this environment; full daemon restart deferred to node maintenance): 88+ goldens (zero unexplained fixture changes across the entire refactor), invariant/failure tests throughout; integration matrix pre-existing; production validation pipeline running. |
-| 14 | Economic outcomes no worse within evaluation window | pending_time_gate (window 2026-07-13 → 2026-08-12 per production-evaluation-spec.md; frozen baseline + thresholds + confounder rules filed; interim report captured): the window is time-based. Evidence so far: routing revenue uninterrupted through ~20 deploys; zero governance-caused failures. The existing daily validation pipeline carries the formal comparison. |
+| 14 | Economic outcomes no worse within evaluation window | not_met (2026-08-13 final adjudication) - evaluation completed with FORMAL VERDICT: YELLOW because 0/31 days met the frozen durable-evidence completeness gate. Observed economics were acceptable (632.45 sats net/day, 106.9% of the frozen baseline), with zero governance-caused failures, but YELLOW cannot satisfy this DoD item. |
 | 15 | Contracts versioned, language-neutral, independently validated | met (2026-07-13: snapshot+intent v1 FROZEN; ledger_event.v0, conformance_case.v0, and ledger_projection.v0 published — the corpus emits a schema-typed replay projection for the production capture; standalone validator covers all five schema families). |
 | 16 | Deterministic semantics explicit | met: wire-contract spec; cycle determinism byte-pinned. |
 | 17 | Conformance corpus sufficient for another implementation | met (2026-07-13, PR 9 — 40 scenario classes, reference-generated expecteds, byte-identical regeneration pin, coverage report, sanitized production capture, zero documented gaps after PR 10): schemas+rules+corpus suffice structurally; corpus grows with production capture (E4). |
@@ -56,7 +58,7 @@ recorded as completed work.
 
 The governed architecture is implemented, tested (3,703), and operating
 in production with per-capability rollback. Status: **14 met, 1
-partial, 2 pending_time_gate, 1 not_applicable.**
+partial, 2 not_met, 1 not_applicable.**
 
 **Architectural completion: NOT yet declared — one named residual**:
 item 13's two evidence gaps (pyln-based minimum-CLN integration not
@@ -64,7 +66,7 @@ exercised in this environment; full daemon restart deferred to node
 maintenance). Both are operational-evidence items, not code gaps; when
 exercised, architectural completion may be declared.
 
-**Original-DoD completion: NOT declared** (operator constraint 10) —
-it additionally requires the 2026-08-12 removals (prep complete,
-scanner READY) and a GREEN production-evaluation verdict
-(window 2026-07-13 → 2026-08-12, spec + frozen baseline filed).
+**Original-DoD completion: NOT declared** (operator constraint 10).
+The 2026-08-12 compatibility date elapsed without execution of the
+separate removal checklist, and the production evaluation closed with
+FORMAL VERDICT: YELLOW rather than the required GREEN.

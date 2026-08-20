@@ -895,8 +895,13 @@ historical basis of this report; the canonical archive is successor-window
 evidence only. The [correction design](../../optimization/plans/2026-08-13-forward-archive-preflight-corrections-design.md),
 [implementation plan](../../optimization/plans/2026-08-13-forward-archive-preflight-corrections.md),
 and [measurement-hardening finding](../../optimization/findings/phase0-measurement-hardening.md)
-document the preflight state. No successor window is active
-and the 72-hour durable-evidence gate has not started.
+document the preflight state. No successor window is active. Post-window
+measurement hardening at production SHA
+`39fe455dab8112ad8934ba068c5508fefc25dde8` removed the persisted fee-intent
+range blocker, and archive catch-up was complete on 2026-08-20. The replacement
+72-hour preflight has a frozen earliest boundary of
+`2026-08-20 18:00:00 UTC`, excludes the plugin-startup catch-up slot, and
+does not alter this report or its formal YELLOW verdict.
 
 
 The refactor did not fail economically in production. It failed to earn a formally trustworthy GREEN because the production evidence pipeline was not hardened enough to satisfy its own frozen counted-day standard. The optimization program should not treat this as a clean economic pass; it should treat it as a telemetry-qualified economic pass with a mandatory measurement hardening step before algorithm claims are trusted.

@@ -23,14 +23,18 @@ and updated cursors populate versioned raw evidence, replacement daily
 aggregates carry explicit coverage, and the daily collector requires one exact
 closed UTC day through a bounded read-only RPC. Optional diagnostic loss is a
 warning; required evidence loss remains fail closed. Economic behavior is
-unchanged. The corrected archive is deployed observationally at production SHA
-`6a4ab411025340404e73ce50df43d2b8c1c0f21a`: archive coverage and the exact
-copied-database verifier pass, but the 72-hour evidence gate remains blocked by
-an independently persisted fee-intent completeness mismatch.
+unchanged. The fee-intent range and evidence-lock correction is deployed
+observationally at production SHA
+`39fe455dab8112ad8934ba068c5508fefc25dde8`. Read-only production evidence on
+2026-08-20 shows the three most recent closed UTC archive days complete and the
+post-load startup reconciliation clean. That startup slot is excluded from the
+new gate. The earliest eligible boundary is frozen at
+`2026-08-20 18:00:00 UTC`; an hourly read-only control-host monitor records
+progress without authorizing activation.
 
 state: preflight
 formal_window_active=false
-72-hour durable-evidence gate: not started
+72-hour durable-evidence gate: boundary staged; awaiting first eligible natural slot
 
 Live algorithm changes remain blocked until the Phase 0 production gate proves
 at least 72 consecutive hours of reconstructable completeness from durable
@@ -69,7 +73,7 @@ See [validation/baseline.md](validation/baseline.md) and the historical
 | 0.3 Daily collector repair | implementation | shadow evidence | [phase0-daily-collector.md](findings/phase0-daily-collector.md) |
 | 0.4 Validator failure semantics | implementation | shadow evidence | [phase0-validator-failure-semantics.md](findings/phase0-validator-failure-semantics.md) |
 | 0.5 Versioned evaluation identity | implementation | preflight only | [phase0-evaluation-identity.md](findings/phase0-evaluation-identity.md) |
-| 0.6 Canonical forward archive | implementation | archive production preflight passes; 72-hour gate blocked | [ADR-002](adr/ADR-002-canonical-forward-archive.md) |
+| 0.6 Canonical forward archive | implementation | archive coverage complete; gate boundary staged | [ADR-002](adr/ADR-002-canonical-forward-archive.md) |
 | 0B. Refactor closure | queued | inactive | future finding |
 | 1. Deterministic replay and traces | blocked by Phase 0 | inactive | future finding |
 | 2. Route-liquidity evidence | blocked by Phase 1 | inactive | future finding |

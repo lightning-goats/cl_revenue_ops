@@ -1,0 +1,10 @@
+[Unit]
+Description=Observe cl_revenue_ops durable measurement preflight hourly
+
+[Timer]
+OnCalendar=*-*-* *:10:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

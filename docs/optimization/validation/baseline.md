@@ -77,7 +77,7 @@ it is not a successor-window activation record.
 
 state: preflight
 formal_window_active: false
-72-hour durable-evidence gate: not started
+72-hour durable-evidence gate: boundary staged; awaiting first eligible natural slot
 
 The corrected observational archive was dynamically loaded on `lnnode` at
 `2026-08-14 02:40:14 UTC`, production SHA
@@ -88,11 +88,20 @@ complete with empty reasons, the current UTC day remained incomplete, and
 against snapshot SHA-256
 `4fc60daad7b055621e6af2d6ddc3daf4c0a63a6c856e0765ae60185e35d9c380`.
 
-The 72-hour gate did not start. The durable reconciliation for
+That attempted 72-hour gate did not start. The durable reconciliation for
 `[2026-08-14 01:00:00, 02:00:00) UTC` completed cleanly, was ledger-aligned,
 and had zero unexplained divergences, but its fee-intent completeness was false:
 the cycle at `2026-08-13 07:52:57 UTC` recorded 7 fee changes for 9 intents.
-This is a preflight blocker, not evidence that may be silently counted.
+
+The exact fee-intent range and evidence-lock correction was dynamically loaded
+on `lnnode` at `2026-08-20 17:04:43 UTC`, production SHA
+`39fe455dab8112ad8934ba068c5508fefc25dde8`. A read-only check at
+`17:30 UTC` found the three most recent closed UTC archive days complete.
+The clean `17:00 UTC` reconciliation slot was a startup catch-up and is
+explicitly excluded. The next gate lower bound is frozen at
+`2026-08-20 18:00:00 UTC`; it remains preflight evidence only until the
+future natural slot is durably observed and all 72 hours plus daily
+completeness evidence pass.
 
 The forward-archive preflight correction is documented in the [design](../plans/2026-08-13-forward-archive-preflight-corrections-design.md),
 [implementation plan](../plans/2026-08-13-forward-archive-preflight-corrections.md),

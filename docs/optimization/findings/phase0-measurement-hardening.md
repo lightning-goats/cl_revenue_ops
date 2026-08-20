@@ -1,8 +1,8 @@
 # Phase 0 Measurement Hardening — Reconciliation Evidence
 
 **Date:** 2026-08-13
-**Scope:** Phase 0.1–0.6
-**Status:** Archive correction deployed observationally; fee-intent preflight blocked; 72-hour gate not started
+**Scope:** Phase 0.1-0.7
+**Status:** Measurement corrections deployed observationally; gate boundary staged; successor window inactive
 **Recommendation:** **CONTINUE SHADOW**
 
 ## Hypothesis
@@ -284,3 +284,37 @@ changes versus 9 intents. Therefore the successor window remains inactive,
 `formal_window_active=false`, optimization activation remains none, and the
 72-hour durable-evidence gate is still **not started**. Phase 0.7 fee-intent
 mismatch investigation remains the next engineering item.
+
+## Fee-intent evidence correction and timer boundary (2026-08-20)
+
+The reviewed exact-range and shared evidence-lock correction was dynamically
+loaded on `lnnode` at `2026-08-20 17:04:43 UTC`, production SHA
+`39fe455dab8112ad8934ba068c5508fefc25dde8`. The plugin was reloaded
+dynamically; CLN was not restarted and no economic action RPC was invoked.
+
+The scheduler persisted a clean, ledger-aligned `17:00 UTC` reconciliation
+with fee-intent completeness `ok`, but that run was startup catch-up evidence
+and is excluded from the new consecutive-hour gate. Read-only archive history
+at `17:30 UTC` showed all three most recent closed UTC days complete with no
+coverage reasons. The earliest eligible gate boundary is therefore frozen at
+`2026-08-20 18:00:00 UTC`; the gate remains not started until that future
+natural slot is durably observed.
+
+Control-host scheduling was also corrected:
+
+- the canonical daily validator remains at 06:00 America/Denver but now passes
+  `--closed-utc-day`, so it evaluates the previous fully closed UTC day;
+- `revenue-validation-preflight.timer` observes progress hourly at minute 10
+  using only `revenue-econ-reconcile apply=false` and
+  `revenue-forward-history`;
+- observations append to
+  `results/revenue-validation/preflight/lnnode.jsonl`;
+- the monitor explicitly reports that it does not authorize formal activation;
+  and
+- the obsolete system `cl-revenue-report.timer`, which targeted a nonexistent
+  local Lightning socket while masking failure, was disabled but retained for
+  rollback.
+
+This is observational measurement work only. The successor window remains
+inactive, `formal_window_active=false`, and no optimization may influence live
+economic decisions.
