@@ -3634,3 +3634,29 @@ def test_serialized_candidate_includes_trace_only_planner_metadata(
     assert serialized["cheap_rank"] == 3
     assert serialized["planner_selected"] is False
     assert serialized["planner_rejection_reason"] == "source_already_paired"
+
+
+
+def test_engine_capture_is_once_for_live_and_once_for_standalone(mock_plugin, mock_database):
+    from modules.rebalance_cycle_capture import RebalanceCycleCaptureReference
+
+    engine = _make_engine(mock_plugin, mock_database)
+    reference = RebalanceCycleCaptureReference("a" * 32, 1, ("a" * 32) + ":00000001", {"config_version": 1, "target_band_low": 0.35, "target_band_high": 0.65, "max_chunk_sats": 1, "max_pairs": 1, "pair_fee_cap_ppm": 0}, {"trigger": "automatic"})
+    manager = MagicMock()
+    manager.begin_cycle.return_value = reference
+    engine.rebalance_capture_manager = manager
+    engine.find_candidates = MagicMock(return_value=[])
+
+    engine.run_cycle()
+
+    assert manager.begin_cycle.call_count == 1
+    manager.finish_cycle.assert_called_once()
+
+    manager.reset_mock()
+    engine.find_candidates = type(engine).find_candidates.__get__(engine, type(engine))
+    manager.begin_cycle.return_value = reference
+    engine._active_router = lambda: None
+    engine.find_candidates()
+
+    assert manager.begin_cycle.call_count == 1
+    assert manager.finish_cycle.call_args.args[2] == "planning_only"

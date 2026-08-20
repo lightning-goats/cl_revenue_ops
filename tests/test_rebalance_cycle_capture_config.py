@@ -46,3 +46,18 @@ def test_rebalance_capture_option_is_parsed_at_init(monkeypatch):
     cfg = _run_init_with_stubbed_dependencies(mod, monkeypatch, {CAPTURE_OPTION: "true"})
 
     assert cfg.rebalance_replay_capture_enabled is True
+
+
+
+def test_rebalance_capture_disable_failure_rolls_back_config():
+    mod = load_plugin_module()
+    manager = MagicMock()
+    manager.set_enabled.return_value = False
+    mod.config = Config(rebalance_replay_capture_enabled=True)
+    mod.rebalancer = MagicMock(rebalance_engine_v2=MagicMock(rebalance_capture_manager=manager))
+
+    with pytest.raises(ValueError, match="could not be disabled"):
+        mod._on_rebalance_replay_capture_change(mod.plugin, CAPTURE_OPTION, False)
+
+    assert mod.config.rebalance_replay_capture_enabled is True
+    manager.set_enabled.assert_called_once_with(False, timeout_seconds=5.0)
