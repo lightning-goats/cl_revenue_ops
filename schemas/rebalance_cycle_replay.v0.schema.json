@@ -27,7 +27,8 @@
       "properties": {
         "__f__": {
           "type": "string",
-          "pattern": "^(?:nan|inf|-inf|-?(?:(?:0|[1-9][0-9]*)\\.[0-9]+|(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?e[+-][0-9]+))$"
+          "description": "Mirrors CANONICAL_TAGGED_FLOAT_PATTERN in modules/rebalance_cycle_replay_wire.py; runtime additionally verifies exact repr(float) equality.",
+          "pattern": "^(?:nan|inf|-inf|-?(?:(?:0|[1-9][0-9]*)\\.(?:0|[0-9]*[1-9])|(?:(?:0|[1-9][0-9]*)|(?:0|[1-9][0-9]*)\\.[0-9]*[1-9])e(?:\\+(?:1[6-9]|[2-9][0-9]|[1-9][0-9]{2,})|-(?:0[5-9]|[1-9][0-9]+))))$"
         }
       }
     },

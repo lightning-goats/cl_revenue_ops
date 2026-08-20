@@ -160,6 +160,38 @@ def test_schema_rejects_malformed_tagged_float_values(tag):
         Draft202012Validator(schema).validate(envelope)
 
 
+@pytest.mark.parametrize(
+    "tag",
+    ["0.35", "-0.0", "1e+20", "1e-05", "1.25e+20", "nan", "inf", "-inf"],
+)
+def test_schema_and_runtime_accept_the_same_canonical_tagged_float_values(tag):
+    body = valid_body()
+    body["configuration"]["target_band_low"] = {"__f__": tag}
+    validate_body(body)
+
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    envelope = seal_envelope(valid_body())
+    envelope["configuration"]["target_band_low"] = {"__f__": tag}
+    Draft202012Validator(schema).validate(envelope)
+
+
+@pytest.mark.parametrize(
+    "tag",
+    ["1.00", "-1.00", "0.00", "1.20", "1.0e+20", "1e+020", "01.0", "-00.0"],
+)
+def test_schema_and_runtime_reject_noncanonical_tagged_float_values(tag):
+    body = valid_body()
+    body["configuration"]["target_band_low"] = {"__f__": tag}
+    with pytest.raises(ValueError, match="number"):
+        validate_body(body)
+
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    envelope = seal_envelope(valid_body())
+    envelope["configuration"]["target_band_low"] = {"__f__": tag}
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(envelope)
+
+
 def test_validate_rejects_malformed_tagged_float_in_nested_wire_value():
     body = body_with_pair()
     body["funnel"]["generated_pairs"][0]["bootstrap_score_decomposition"] = {

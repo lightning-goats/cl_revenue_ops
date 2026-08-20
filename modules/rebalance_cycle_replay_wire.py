@@ -4,12 +4,21 @@ import hashlib
 import hmac
 import json
 import math
+import re
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 
 SCHEMA_NAME = "rebalance_cycle_replay"
 SCHEMA_VERSION = 0
 MAX_ENVELOPE_BYTES = 32 * 1024 * 1024
+
+# Mirrored by schemas/rebalance_cycle_replay.v0.schema.json. Finite tags use
+# Python's canonical repr(float) lexical form; runtime confirms exact repr
+# equality after this grammar prefilter. The three non-finite spellings are
+# explicit because tag_floats emits them deliberately.
+CANONICAL_TAGGED_FLOAT_PATTERN = re.compile(
+    r"^(?:nan|inf|-inf|-?(?:(?:0|[1-9][0-9]*)\.(?:0|[0-9]*[1-9])|(?:(?:0|[1-9][0-9]*)|(?:0|[1-9][0-9]*)\.[0-9]*[1-9])e(?:\+(?:1[6-9]|[2-9][0-9]|[1-9][0-9]{2,})|-(?:0[5-9]|[1-9][0-9]+))))$"
+)
 
 
 def tag_floats(value: Any) -> Any:
@@ -187,6 +196,8 @@ def _require_wire_number(value: Any, label: str) -> None:
 
 
 def _is_canonical_tagged_float(value: str) -> bool:
+    if not CANONICAL_TAGGED_FLOAT_PATTERN.fullmatch(value):
+        return False
     if value in {"nan", "inf", "-inf"}:
         return True
     try:
