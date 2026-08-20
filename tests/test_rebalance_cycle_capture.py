@@ -306,3 +306,22 @@ def test_projection_keeps_true_bootstrap_decomposition_separate_from_later_engin
     generated = body["funnel"]["generated_pairs"][0]
     assert generated["bootstrap_score_decomposition"]["stage"] == "planner_pre_route"
     assert generated["score_decomposition"]["stage"] == "priced"
+
+
+
+def test_finish_handoff_freezes_mutable_cycle_evidence_before_writer(tmp_path, monkeypatch):
+    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    pair = _pair()
+    result = CycleResult(considered_candidates=[pair], candidates=[pair])
+
+    manager.finish_cycle(reference, result)
+    pair.score = 999.0
+    result.candidates.clear()
+    queued = manager._queue.get_nowait()
+
+    frozen_result = queued[1]
+    assert frozen_result.candidates[0].source_channel_id == "a"
+    assert frozen_result.considered_candidates[0].score != 999.0

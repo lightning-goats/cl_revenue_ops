@@ -402,7 +402,7 @@ class RebalanceCycleCaptureManager:
                     return
                 # Keep the engine path bounded: only a non-blocking handoff.
                 try:
-                    self._queue.put_nowait((reference, result, terminal_stage, attempt))
+                    self._queue.put_nowait((reference, copy.deepcopy(result), terminal_stage, attempt))
                     attempt["status"] = "queued"
                 except queue.Full:
                     attempt.update(status="dropped", error_category="queue_full")
