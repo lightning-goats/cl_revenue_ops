@@ -193,8 +193,20 @@ class _CaptureManager:
         self.finishes.append((reference, result, terminal_stage))
 
 
+def _install_live_blocked_cycle_writer(monkeypatch):
+    release = threading.Event()
+    original_writer = RebalanceCycleCaptureManager._writer_main
+
+    def blocked_writer(manager):
+        assert release.wait(2.0)
+        original_writer(manager)
+
+    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", blocked_writer)
+    return release
+
+
 def test_finish_enqueues_only_a_frozen_bounded_reference_handoff(tmp_path, monkeypatch):
-    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+    release_writer = _install_live_blocked_cycle_writer(monkeypatch)
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
     reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
@@ -210,6 +222,8 @@ def test_finish_enqueues_only_a_frozen_bounded_reference_handoff(tmp_path, monke
     assert handoff.terminal_stage == "completed"
     with pytest.raises(FrozenInstanceError):
         handoff.result = None
+    release_writer.set()
+    assert manager.set_enabled(False, timeout_seconds=1.0)
 
 def test_projection_rejects_duplicate_or_noncontiguous_generated_evidence():
     first = _pair("source-a", "dest-a", 4)
@@ -362,7 +376,7 @@ def _wait_for_manifest_idle(manager, timeout=1.0):
     deadline = time.monotonic() + timeout
     with manager._manifest_publish_condition:
         while (
-            manager._pending_manifest_snapshot is not None
+            manager._pending_manifest_snapshots
             or manager._manifest_publish_inflight
         ):
             remaining = deadline - time.monotonic()
@@ -608,7 +622,7 @@ def test_projection_failure_evidence_uses_safe_bounded_allowlist():
 def test_queue_full_reserves_before_copy_and_repeated_drops_do_not_leak(
     tmp_path, monkeypatch,
 ):
-    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+    release_writer = _install_live_blocked_cycle_writer(monkeypatch)
     manager = RebalanceCycleCaptureManager(
         tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
     )
@@ -648,6 +662,8 @@ def test_queue_full_reserves_before_copy_and_repeated_drops_do_not_leak(
     assert manager._manifest["attempts"][-1]["terminal_stage"] == "planning_only"
     assert manager._prepared == {}
     assert manager._active == set()
+    release_writer.set()
+    assert manager.set_enabled(False, timeout_seconds=1.0)
 
 
 def test_forty_manifest_only_toggles_stay_within_owned_retention(tmp_path):
@@ -667,7 +683,7 @@ def test_forty_manifest_only_toggles_stay_within_owned_retention(tmp_path):
 
 
 def test_begin_records_producer_start_and_commit_without_completed_time(tmp_path, monkeypatch):
-    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+    release_writer = _install_live_blocked_cycle_writer(monkeypatch)
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     manager.python_commit = "commit-at-begin"
     assert manager.set_enabled(True)
@@ -677,12 +693,16 @@ def test_begin_records_producer_start_and_commit_without_completed_time(tmp_path
     assert reference.producer["started_at"]
     assert reference.producer["python_commit"] == "commit-at-begin"
     assert "completed_at" not in reference.producer
+    manager.finish_cycle(reference, _strict_result(), "planning_only")
+    release_writer.set()
+    assert manager.set_enabled(False, timeout_seconds=1.0)
 
 
 def test_enabled_finish_does_not_write_filesystem_on_cycle_thread(tmp_path, monkeypatch):
-    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+    release_writer = _install_live_blocked_cycle_writer(monkeypatch)
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
+    _wait_for_manifest_idle(manager)
     atomic = MagicMock()
     monkeypatch.setattr(manager, "_atomic_write", atomic)
 
@@ -693,6 +713,8 @@ def test_enabled_finish_does_not_write_filesystem_on_cycle_thread(tmp_path, monk
 
     atomic.assert_not_called()
     assert manager._queue.qsize() == 1
+    release_writer.set()
+    assert manager.set_enabled(False, timeout_seconds=1.0)
 
 
 def test_hard_preflight_pair_cap_rejects_before_projection(tmp_path, monkeypatch):
@@ -759,6 +781,161 @@ def test_normal_finish_returns_before_slow_projection(tmp_path, monkeypatch):
 
     assert elapsed < 0.05
     assert projection_started.wait(1.0)
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def _assert_failed_enable_is_fully_rolled_back(
+    manager, preserve_existing_publication=False,
+):
+    assert manager._enabled is False
+    assert manager._run_id is None
+    assert manager._manifest is None
+    assert manager._active == set()
+    assert manager._prepared == {}
+    assert manager._inflight == 0
+    assert manager._writer is None
+    assert manager._queue.empty()
+    publisher = manager._manifest_publisher
+    if preserve_existing_publication:
+        assert manager._pending_manifest_snapshots
+        assert publisher is not None and publisher.is_alive()
+    else:
+        assert not manager._pending_manifest_snapshots
+        assert publisher is None or not publisher.is_alive()
+    assert manager._slots.acquire(blocking=False)
+    assert manager._slots.acquire(blocking=False)
+    assert manager._slots.acquire(blocking=False) is False
+    manager._slots.release()
+    manager._slots.release()
+
+
+def test_manifest_publisher_start_failure_rolls_back_then_retry_is_fresh(
+    tmp_path, monkeypatch,
+):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    original_start = threading.Thread.start
+    failed = []
+
+    def fail_first_publisher(thread):
+        if (
+            thread.name == "rebalance-cycle-capture-manifest-writer"
+            and not failed
+        ):
+            failed.append(thread)
+            raise RuntimeError("publisher start failed")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_first_publisher)
+
+    assert manager.set_enabled(True) is False
+    _assert_failed_enable_is_fully_rolled_back(manager)
+    assert manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
+    ) is None
+
+    assert manager.set_enabled(True) is True
+    reference = manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
+    )
+    assert reference is not None
+    assert reference.capture_seq == 1
+    assert manager._writer.is_alive()
+    assert manager._manifest_publisher.is_alive()
+    manager.finish_cycle(reference, _strict_result(), "planning_only")
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def test_manifest_publisher_that_never_becomes_live_rolls_back(tmp_path, monkeypatch):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    original_start = threading.Thread.start
+    skipped = []
+
+    def skip_first_publisher_start(thread):
+        if (
+            thread.name == "rebalance-cycle-capture-manifest-writer"
+            and not skipped
+        ):
+            skipped.append(thread)
+            return None
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", skip_first_publisher_start)
+
+    assert manager.set_enabled(True) is False
+    _assert_failed_enable_is_fully_rolled_back(manager)
+    assert manager.set_enabled(True) is True
+    assert manager._writer.is_alive()
+    assert manager._manifest_publisher.is_alive()
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def test_cycle_writer_start_failure_stops_new_publisher_and_retry_succeeds(
+    tmp_path, monkeypatch,
+):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    original_start = threading.Thread.start
+    failed = []
+    created_publishers = []
+
+    def fail_first_cycle_writer(thread):
+        if thread.name == "rebalance-cycle-capture-manifest-writer":
+            created_publishers.append(thread)
+        if thread.name == "rebalance-cycle-capture-writer" and not failed:
+            failed.append(thread)
+            raise RuntimeError("cycle writer start failed")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_first_cycle_writer)
+
+    assert manager.set_enabled(True) is False
+    _assert_failed_enable_is_fully_rolled_back(manager)
+    assert created_publishers
+    assert all(not thread.is_alive() for thread in created_publishers)
+
+    assert manager.set_enabled(True) is True
+    reference = manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
+    )
+    assert reference.capture_seq == 1
+    manager.finish_cycle(reference, _strict_result(), "planning_only")
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def test_partial_cycle_writer_start_is_stopped_and_leaves_no_pending_state(
+    tmp_path, monkeypatch,
+):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    original_start = threading.Thread.start
+    partially_started = []
+
+    def start_then_fail_cycle_writer(thread):
+        if thread.name == "rebalance-cycle-capture-writer" and not partially_started:
+            original_start(thread)
+            partially_started.append(thread)
+            raise RuntimeError("cycle writer failed after start")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start_then_fail_cycle_writer)
+
+    assert manager.set_enabled(True) is False
+    _assert_failed_enable_is_fully_rolled_back(manager)
+    assert partially_started
+    assert all(not thread.is_alive() for thread in partially_started)
+    assert manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
+    ) is None
+
+    assert manager.set_enabled(True) is True
+    assert manager._writer.is_alive()
+    assert manager._manifest_publisher.is_alive()
     assert manager.set_enabled(False, timeout_seconds=1.0)
 
 
@@ -1106,6 +1283,98 @@ def test_disable_is_bounded_when_filesystem_lock_is_stuck(tmp_path):
         thread.join(1.0)
 
 
+def test_blocked_run_keeps_closed_terminal_snapshot_across_next_run(
+    tmp_path, monkeypatch,
+):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    original = manager._atomic_write
+    first_write_started = threading.Event()
+    release_first_write = threading.Event()
+
+    def block_first_manifest(path, data):
+        if path.name.startswith("manifest-") and not first_write_started.is_set():
+            first_write_started.set()
+            assert release_first_write.wait(1.0)
+        return original(path, data)
+
+    monkeypatch.setattr(manager, "_atomic_write", block_first_manifest)
+    try:
+        assert manager.set_enabled(True)
+        assert first_write_started.wait(1.0)
+        first_path = manager._manifest_path()
+        first_run_id = manager._run_id
+        assert manager.set_enabled(False, timeout_seconds=0.05)
+        assert manager.set_enabled(True)
+        second_path = manager._manifest_path()
+        second_run_id = manager._run_id
+        assert second_run_id != first_run_id
+        with manager._manifest_publish_condition:
+            assert first_path in manager._pending_manifest_snapshots
+            assert second_path in manager._pending_manifest_snapshots
+            assert len(manager._pending_manifest_snapshots) <= 64
+    finally:
+        release_first_write.set()
+
+    _wait_for_manifest_idle(manager, timeout=2.0)
+    first_manifest = json.loads(first_path.read_text())
+    second_manifest = json.loads(second_path.read_text())
+    assert first_manifest["capture_run_id"] == first_run_id
+    assert first_manifest["state"] == "closed"
+    assert second_manifest["capture_run_id"] == second_run_id
+    assert second_manifest["state"] == "active"
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def test_pending_run_bound_rejects_new_enable_without_evicting_closed_truth(
+    tmp_path, monkeypatch,
+):
+    from modules.rebalance_cycle_capture import MAX_PENDING_MANIFEST_RUNS
+
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    original = manager._atomic_write
+    first_write_started = threading.Event()
+    release_first_write = threading.Event()
+    closed_runs = set()
+
+    def observe_and_block_first(path, data):
+        if path.name.startswith("manifest-"):
+            manifest = json.loads(data)
+            if not first_write_started.is_set():
+                first_write_started.set()
+                assert release_first_write.wait(2.0)
+            if manifest.get("state") == "closed":
+                closed_runs.add(manifest["capture_run_id"])
+        return original(path, data)
+
+    monkeypatch.setattr(manager, "_atomic_write", observe_and_block_first)
+    assert manager.set_enabled(True)
+    assert first_write_started.wait(1.0)
+    successful_run_ids = []
+    for index in range(MAX_PENDING_MANIFEST_RUNS):
+        successful_run_ids.append(manager._run_id)
+        assert manager.set_enabled(False, timeout_seconds=0.05)
+        if index + 1 < MAX_PENDING_MANIFEST_RUNS:
+            assert manager.set_enabled(True)
+
+    assert manager.set_enabled(True) is False
+    _assert_failed_enable_is_fully_rolled_back(
+        manager, preserve_existing_publication=True,
+    )
+    with manager._manifest_publish_condition:
+        assert len(manager._pending_manifest_snapshots) == MAX_PENDING_MANIFEST_RUNS
+    release_first_write.set()
+    _wait_for_manifest_idle(manager, timeout=4.0)
+    assert closed_runs == set(successful_run_ids)
+
+    assert manager.set_enabled(True)
+    assert manager._run_id not in successful_run_ids
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
 def test_manifest_publication_coalesces_repeated_toggles_and_writes_newest_revision(
     tmp_path, monkeypatch,
 ):
@@ -1146,9 +1415,9 @@ def test_manifest_publication_coalesces_repeated_toggles_and_writes_newest_revis
         latest_path = manager._manifest_path()
         latest_run_id = manager._run_id
         with manager._manifest_publish_condition:
-            pending = manager._pending_manifest_snapshot
-            assert pending is not None
-            assert pending[2] == manager._manifest_revision
+            pending = manager._pending_manifest_snapshots
+            assert 1 <= len(pending) <= 64
+            assert pending[latest_path][2] == manager._manifest_revision
     finally:
         release_write.set()
         enable_thread.join(1.0)

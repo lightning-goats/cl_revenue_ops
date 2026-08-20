@@ -16,6 +16,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from types import MappingProxyType, SimpleNamespace
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ from modules.rebalance_cycle_replay_wire import (
 RETENTION_MAX_FILES = 32
 RETENTION_MAX_BYTES = 256 * 1024 * 1024
 WRITER_QUEUE_SIZE = 2
+MAX_PENDING_MANIFEST_RUNS = 64
 MAX_SNAPSHOT_CHANNELS = 1024
 MAX_GENERATED_PAIRS = 4096
 MAX_FINAL_PAIRS = 64
@@ -606,8 +608,9 @@ class RebalanceCycleCaptureManager:
         self._lifecycle_lock = threading.Lock()
         self._filesystem_lock = threading.Lock()
         self._manifest_publish_condition = threading.Condition(threading.Lock())
-        self._pending_manifest_snapshot = None
+        self._pending_manifest_snapshots: OrderedDict[Path, tuple] = OrderedDict()
         self._manifest_publish_inflight = False
+        self._manifest_publisher_stop = False
         self._manifest_publisher: Optional[threading.Thread] = None
         self._queue: queue.Queue = queue.Queue(maxsize=WRITER_QUEUE_SIZE)
         self._slots = threading.BoundedSemaphore(WRITER_QUEUE_SIZE)
@@ -623,7 +626,7 @@ class RebalanceCycleCaptureManager:
         self._inflight = 0
         self._manifest: Optional[dict] = None
         self._manifest_revision = 0
-        self._manifest_attempted_revision = 0
+        self._manifest_attempted_revisions: OrderedDict[Path, int] = OrderedDict()
 
     @staticmethod
     def _discover_python_commit() -> str:
@@ -843,6 +846,42 @@ class RebalanceCycleCaptureManager:
             self._prune_attempts_locked()
             return copy.deepcopy(self._manifest) if self._manifest else {}
 
+    def _rollback_failed_enable(
+        self,
+        writer: Optional[threading.Thread],
+        publisher: Optional[threading.Thread],
+        publisher_created: bool,
+    ) -> None:
+        failed_queue = self._queue
+        with self._condition:
+            failed_manifest_path = (
+                self._manifest_path() if self._run_id is not None else None
+            )
+        if writer is not None and writer.is_alive():
+            try:
+                failed_queue.put_nowait(_DRAIN_SENTINEL)
+            except queue.Full:
+                pass
+            writer.join(1.0)
+        if publisher_created and publisher is not None:
+            self._stop_manifest_publisher(publisher)
+        if failed_manifest_path is not None:
+            with self._manifest_publish_condition:
+                self._pending_manifest_snapshots.pop(failed_manifest_path, None)
+                self._manifest_publish_condition.notify_all()
+        with self._condition:
+            self._enabled = False
+            self._run_id = None
+            self._next_seq = 0
+            self._active.clear()
+            self._prepared.clear()
+            self._inflight = 0
+            self._manifest = None
+            self._writer = None
+            self._queue = queue.Queue(maxsize=WRITER_QUEUE_SIZE)
+            self._slots = threading.BoundedSemaphore(WRITER_QUEUE_SIZE)
+            self._condition.notify_all()
+
     def _enable(self) -> bool:
         with self._condition:
             if self._enabled:
@@ -857,40 +896,62 @@ class RebalanceCycleCaptureManager:
         if python_commit == "unknown":
             python_commit = self._discover_python_commit()
 
-        with self._condition:
-            if self._enabled:
-                return True
-            if self._writer is not None and self._writer.is_alive():
-                return False
-            self.python_commit = python_commit
-            self._run_id = uuid.uuid4().hex
-            self._next_seq = 0
-            self._active.clear()
-            self._prepared.clear()
-            self._queue = queue.Queue(maxsize=WRITER_QUEUE_SIZE)
-            self._slots = threading.BoundedSemaphore(WRITER_QUEUE_SIZE)
-            self._manifest = {
-                "schema_name": "rebalance_cycle_capture_manifest", "schema_version": SCHEMA_VERSION,
-                "capture_run_id": self._run_id, "state": "active", "attempted": 0,
-                "completed": 0, "failed": 0, "dropped": 0, "writer_health": "healthy",
-                "last_error_category": None, "attempts": [], "updated_at": _utc_now(),
-            }
-            self._enabled = True
-            writer = threading.Thread(
-                target=self._writer_main,
-                name="rebalance-cycle-capture-writer",
-                daemon=True,
-            )
-            self._writer = writer
-            manifest_snapshot = self._manifest_snapshot_locked()
+        publisher = None
+        publisher_created = False
+        writer = None
+        try:
+            publisher, publisher_created = self._ensure_manifest_publisher()
+            with self._condition:
+                if self._enabled:
+                    return True
+                if self._writer is not None and self._writer.is_alive():
+                    return False
+                self.python_commit = python_commit
+                self._run_id = uuid.uuid4().hex
+                self._next_seq = 0
+                self._active.clear()
+                self._prepared.clear()
+                self._inflight = 0
+                self._queue = queue.Queue(maxsize=WRITER_QUEUE_SIZE)
+                self._slots = threading.BoundedSemaphore(WRITER_QUEUE_SIZE)
+                self._manifest = {
+                    "schema_name": "rebalance_cycle_capture_manifest", "schema_version": SCHEMA_VERSION,
+                    "capture_run_id": self._run_id, "state": "active", "attempted": 0,
+                    "completed": 0, "failed": 0, "dropped": 0, "writer_health": "healthy",
+                    "last_error_category": None, "attempts": [], "updated_at": _utc_now(),
+                }
+                writer = threading.Thread(
+                    target=self._writer_main,
+                    name="rebalance-cycle-capture-writer",
+                    daemon=True,
+                )
+                self._writer = writer
 
-        self._publish_manifest_snapshot(manifest_snapshot)
-        # Starting after the initial manifest write prevents an older initial
-        # snapshot racing a writer snapshot. Intake remains bounded meanwhile.
-        with self._condition:
-            if self._writer is writer and not writer.is_alive():
-                writer.start()
-        return True
+            writer.start()
+            if not writer.is_alive():
+                raise RuntimeError("cycle writer did not become live")
+            if publisher is None or not publisher.is_alive():
+                raise RuntimeError("manifest publisher did not remain live")
+
+            with self._condition:
+                manifest_snapshot = self._manifest_snapshot_locked()
+            if not self._publish_manifest_snapshot(manifest_snapshot):
+                raise RuntimeError("initial manifest publication was not accepted")
+            with self._condition:
+                if not writer.is_alive():
+                    raise RuntimeError("cycle writer exited during enable")
+                current_publisher = self._manifest_publisher
+                if current_publisher is None or not current_publisher.is_alive():
+                    raise RuntimeError("manifest publisher exited during enable")
+                self._enabled = True
+                self._condition.notify_all()
+            return True
+        except Exception:
+            self._rollback_failed_enable(
+                writer, publisher, publisher_created,
+            )
+            raise
+
 
     def _disable(self, deadline: float) -> bool:
         with self._condition:
@@ -1050,48 +1111,121 @@ class RebalanceCycleCaptureManager:
         if path is None or data is None or revision is None:
             return
         with self._filesystem_lock:
-            # Concurrent writer/lifecycle snapshots may reach I/O out of order;
-            # never let an older state overwrite a newer attempted publication.
-            if revision <= self._manifest_attempted_revision:
+            # Revisions are ordered per run/path so a newer run can never make a
+            # pending terminal snapshot for an older run look stale.
+            previous = self._manifest_attempted_revisions.get(path, 0)
+            if revision <= previous:
                 return
-            self._manifest_attempted_revision = revision
+            self._manifest_attempted_revisions[path] = revision
+            self._manifest_attempted_revisions.move_to_end(path)
+            while len(self._manifest_attempted_revisions) > RETENTION_MAX_FILES:
+                self._manifest_attempted_revisions.popitem(last=False)
             self._atomic_write(path, data)
             self._rotate_capture_files()
 
+    def _ensure_manifest_publisher(self) -> tuple[threading.Thread, bool]:
+        with self._manifest_publish_condition:
+            publisher = self._manifest_publisher
+            if publisher is not None and publisher.is_alive():
+                return publisher, False
+            publisher = threading.Thread(
+                target=self._manifest_publisher_main,
+                name="rebalance-cycle-capture-manifest-writer",
+                daemon=True,
+            )
+            self._manifest_publisher = publisher
+            self._manifest_publisher_stop = False
+        try:
+            publisher.start()
+        except Exception:
+            with self._manifest_publish_condition:
+                if self._manifest_publisher is publisher:
+                    if publisher.is_alive():
+                        self._manifest_publisher_stop = True
+                        self._manifest_publish_condition.notify_all()
+                    else:
+                        self._manifest_publisher = None
+                        self._manifest_publisher_stop = False
+            if publisher.is_alive():
+                publisher.join(1.0)
+            with self._manifest_publish_condition:
+                if self._manifest_publisher is publisher and not publisher.is_alive():
+                    self._manifest_publisher = None
+                    self._manifest_publisher_stop = False
+            raise
+        if not publisher.is_alive():
+            with self._manifest_publish_condition:
+                if self._manifest_publisher is publisher:
+                    self._manifest_publisher = None
+                    self._manifest_publisher_stop = False
+            raise RuntimeError("manifest publisher did not become live")
+        return publisher, True
+
+    def _stop_manifest_publisher(self, publisher: threading.Thread) -> None:
+        with self._manifest_publish_condition:
+            if self._manifest_publisher is not publisher:
+                return
+            self._manifest_publisher_stop = True
+            self._manifest_publish_condition.notify_all()
+        if publisher.is_alive():
+            publisher.join(1.0)
+        with self._manifest_publish_condition:
+            if self._manifest_publisher is publisher and not publisher.is_alive():
+                self._manifest_publisher = None
+                self._manifest_publisher_stop = False
+            self._manifest_publish_condition.notify_all()
+
     def _publish_manifest_snapshot(
         self, snapshot: tuple[Optional[Path], Optional[bytes], Optional[int]],
-    ) -> None:
-        """Non-blocking, single-slot publication of the newest manifest state."""
+    ) -> bool:
+        # Keep only the newest state for each retained run path; never wait on I/O.
         path, data, revision = snapshot
         if path is None or data is None or revision is None:
-            return
+            return True
         with self._manifest_publish_condition:
-            pending = self._pending_manifest_snapshot
-            if pending is None or revision > pending[2]:
-                self._pending_manifest_snapshot = snapshot
-            publisher = self._manifest_publisher
-            if publisher is None or not publisher.is_alive():
-                publisher = threading.Thread(
-                    target=self._manifest_publisher_main,
-                    name="rebalance-cycle-capture-manifest-writer",
-                    daemon=True,
-                )
-                self._manifest_publisher = publisher
-                publisher.start()
-            self._manifest_publish_condition.notify()
+            existing = self._pending_manifest_snapshots.get(path)
+            if (
+                existing is None
+                and len(self._pending_manifest_snapshots)
+                >= MAX_PENDING_MANIFEST_RUNS
+            ):
+                return False
+            if existing is None or revision > existing[2]:
+                self._pending_manifest_snapshots[path] = snapshot
+                self._pending_manifest_snapshots.move_to_end(path)
+        try:
+            publisher, _created = self._ensure_manifest_publisher()
+        except Exception as exc:
+            # Retain the bounded newest-per-run snapshot for the next retry.
+            with self._condition:
+                if self._manifest is not None:
+                    self._manifest["writer_health"] = "degraded"
+                    self._manifest["last_error_category"] = type(exc).__name__
+            return False
+        with self._manifest_publish_condition:
+            self._manifest_publish_condition.notify_all()
+            return publisher.is_alive()
 
     def _manifest_publisher_main(self) -> None:
         current = threading.current_thread()
         while True:
             with self._manifest_publish_condition:
-                if self._pending_manifest_snapshot is None:
+                if (
+                    not self._pending_manifest_snapshots
+                    and not self._manifest_publisher_stop
+                ):
                     self._manifest_publish_condition.wait(1.0)
-                if self._pending_manifest_snapshot is None:
+                if self._manifest_publisher_stop:
+                    if self._manifest_publisher is current:
+                        self._manifest_publisher = None
+                    self._manifest_publisher_stop = False
+                    self._manifest_publish_condition.notify_all()
+                    return
+                if not self._pending_manifest_snapshots:
                     if self._manifest_publisher is current:
                         self._manifest_publisher = None
                     return
-                snapshot = self._pending_manifest_snapshot
-                self._pending_manifest_snapshot = None
+                _path, snapshot = self._pending_manifest_snapshots.popitem(last=False)
                 self._manifest_publish_inflight = True
             try:
                 self._write_manifest_snapshot(*snapshot)
