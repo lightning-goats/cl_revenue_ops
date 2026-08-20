@@ -1,4 +1,7 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
 
 from modules.rebalance_cycle_capture import RebalanceCycleCaptureManager, project_cycle_result
 from modules.rebalance_cycle_replay_wire import seal_envelope, verify_envelope
@@ -176,3 +179,60 @@ def test_projection_preserves_zero_budget_and_disabled_fee_cap():
     assert body["configuration"]["pair_fee_cap_ppm"] == 0
     assert body["funnel"]["generated_pairs"][0]["pair_budget_sats"] == 0
     seal_envelope(body)
+
+
+class _CaptureManager:
+    def __init__(self):
+        self.begins = []
+        self.finishes = []
+
+    def begin_cycle(self, configuration, producer):
+        self.begins.append((configuration, producer))
+        return SimpleNamespace(capture_run_id="a" * 32, capture_seq=len(self.begins), cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer=producer)
+
+    def finish_cycle(self, reference, result, terminal_stage="completed"):
+        self.finishes.append((reference, result, terminal_stage))
+
+
+def test_finish_hands_off_without_projecting_or_manifest_io(tmp_path, monkeypatch):
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    monkeypatch.setattr("modules.rebalance_cycle_capture.project_cycle_result", lambda *_a: (_ for _ in ()).throw(AssertionError("caller projected")))
+
+    manager.finish_cycle(reference, CycleResult())
+
+    assert manager._queue.qsize() == 1
+
+
+def test_projection_rejects_duplicate_or_noncontiguous_generated_evidence():
+    first = _pair("source-a", "dest-a", 4)
+    duplicate = _pair("source-a", "dest-a", 9)
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+
+    with pytest.raises(ValueError):
+        project_cycle_result(reference, CycleResult(considered_candidates=[first, duplicate]))
+
+
+def test_projection_preserves_timeout_status_for_linked_pair():
+    pair = _pair()
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+
+    body = project_cycle_result(reference, CycleResult(considered_candidates=[pair], candidates=[pair], pair_outcomes=[{"source_channel_id": "a", "dest_channel_id": "b", "status": "still_running_timeout", "result": None}]))
+
+    assert body["execution"]["pair_outcomes"] == [{"source_channel_id": "a", "dest_channel_id": "b", "status": "still_running_timeout"}]
+
+
+def test_retention_leaves_unowned_json_untouched_and_counts_owned_manifests(tmp_path):
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    unrelated = manager.output_dir / "operator-note.json"
+    unrelated.write_text("{}")
+    for index in range(34):
+        path = manager.output_dir / (("a" * 32) + f"-{index + 1:08d}-" + ("a" * 32) + f":{index + 1:08d}.json")
+        path.write_text("{}")
+
+    manager._rotate_capture_files()
+
+    assert unrelated.exists()
+    assert len(list(manager.output_dir.glob("*.json"))) <= 33

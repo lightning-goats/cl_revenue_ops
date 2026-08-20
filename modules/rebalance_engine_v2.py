@@ -395,6 +395,16 @@ class RebalanceEngine:
     def _cache_cycle_result(self, result: CycleResult) -> None:
         self._last_cycle_result = result
 
+    def _cache_planning_result(self, result: CycleResult, reference: Any, owns_reference: bool) -> None:
+        result.cycle_id = str(getattr(reference, "cycle_id", "") or "")
+        result.trigger = "planning"
+        self._cache_cycle_result(result)
+        if owns_reference and reference is not None:
+            try:
+                self.rebalance_capture_manager.finish_cycle(reference, result, "planning_only")
+            except Exception:
+                pass
+
     @staticmethod
     def _pair_key(pair: PairCandidate) -> Tuple[str, str]:
         return (str(pair.source_channel_id), str(pair.dest_channel_id))
@@ -1281,6 +1291,9 @@ class RebalanceEngine:
         Captures the active router at the start of the cycle so mid-cycle
         config flips do not split a cycle across two routers.
         """
+        owns_capture_reference = capture_reference is None
+        if owns_capture_reference:
+            capture_reference = self._begin_rebalance_capture("planning")
         # New cycle: drop the per-cycle dest success-rate memo so the
         # aggregate reflects results recorded since the last cycle.
         self._dest_success_rate_memo.clear()
@@ -1290,14 +1303,14 @@ class RebalanceEngine:
                 "askrene unavailable; v3 router is required for rebalancing",
                 level="warn",
             )
-            self._cache_cycle_result(CycleResult())
+            self._cache_planning_result(CycleResult(), capture_reference, owns_capture_reference)
             return []
         router_tag = "v3"
 
         snapshot = self._build_snapshot()
         if not snapshot or not snapshot.channels:
             self._log("No channels in snapshot")
-            self._cache_cycle_result(CycleResult(snapshot=snapshot))
+            self._cache_planning_result(CycleResult(snapshot=snapshot), capture_reference, owns_capture_reference)
             return []
 
         cfg = self.config if not hasattr(self.config, 'snapshot') else self.config.snapshot()
@@ -1649,14 +1662,16 @@ class RebalanceEngine:
             total_channels=len(snapshot.channels),
             total_budget_sats=snapshot.total_remaining_budget_sats,
         )
-        self._cache_cycle_result(
+        self._cache_planning_result(
             CycleResult(
                 considered_candidates=considered_candidates,
                 candidates=list(plan.selected),
                 audit_records=list(plan.skipped),
                 snapshot=snapshot,
                 plan=plan,
-            )
+            ),
+            capture_reference,
+            owns_capture_reference,
         )
 
         return plan.selected
@@ -3886,7 +3901,7 @@ class RebalanceEngine:
             rebalance_id=rebalance_id,
         )
 
-    def _begin_rebalance_capture(self):
+    def _begin_rebalance_capture(self, trigger: str = "automatic"):
         manager = self.rebalance_capture_manager
         if manager is None:
             return None
@@ -3901,7 +3916,7 @@ class RebalanceEngine:
                     "max_pairs": self._max_concurrent_jobs(cfg),
                     "pair_fee_cap_ppm": getattr(cfg, "pair_fee_cap_ppm", 1) or 1,
                 },
-                {"trigger": "automatic"},
+                {"trigger": trigger},
             )
         except Exception:
             return None
@@ -3917,13 +3932,16 @@ class RebalanceEngine:
         Filters out pairs in futility state before submitting to the executor,
         and records success/failure in the pair tracker for the next cycle.
         """
+        capture_reference = self._begin_rebalance_capture()
         if not self._cycle_lock.acquire(blocking=False):
             self._log(
                 "cycle_already_running: another rebalance cycle holds the "
                 "engine lock; skipping this cycle",
                 level="info",
             )
-            return CycleResult(
+            contention_result = CycleResult(
+                cycle_id=str(getattr(capture_reference, "cycle_id", "") or ""),
+                trigger="automatic",
                 audit_records=[
                     SkipRecord(
                         channel_id="",
@@ -3933,7 +3951,12 @@ class RebalanceEngine:
                     )
                 ]
             )
-        capture_reference = self._begin_rebalance_capture()
+            try:
+                if capture_reference is not None:
+                    self.rebalance_capture_manager.finish_cycle(capture_reference, contention_result, "lock_contended")
+            except Exception:
+                pass
+            return contention_result
         result = None
         try:
             result = self._run_cycle_locked(capture_reference)
@@ -3941,7 +3964,7 @@ class RebalanceEngine:
         finally:
             try:
                 if capture_reference is not None:
-                    self.rebalance_capture_manager.finish_cycle(capture_reference, result or CycleResult(), "completed")
+                    self.rebalance_capture_manager.finish_cycle(capture_reference, result or CycleResult(), "completed" if result is not None else "failed")
             except Exception:
                 pass
             self._cycle_lock.release()
@@ -4127,6 +4150,7 @@ class RebalanceEngine:
                     result.pair_outcomes.append({
                         "source_channel_id": pair.source_channel_id,
                         "dest_channel_id": pair.dest_channel_id,
+                        "status": "returned",
                         "result": copy.deepcopy(exec_result),
                     })
                     # Idempotent backstop: the worker already recorded this
@@ -4135,11 +4159,22 @@ class RebalanceEngine:
                     # stubbed execution paths that bypass the worker-side
                     # recording.
                     self._record_pair_outcome(pair, exec_result)
-                # exec_result None: the worker's own completion path already
-                # counted the failure (a None result carries no idempotency
-                # marker, so recording it here again would double-strike).
+                else:
+                    result.pair_outcomes.append({
+                        "source_channel_id": pair.source_channel_id,
+                        "dest_channel_id": pair.dest_channel_id,
+                        "status": "returned_none",
+                        "result": None,
+                    })
+                # Worker bookkeeping remains independent and is never repeated here.
             except Exception as e:
                 completed_futures.add(future)
+                result.pair_outcomes.append({
+                    "source_channel_id": pair.source_channel_id,
+                    "dest_channel_id": pair.dest_channel_id,
+                    "status": "raised",
+                    "result": {"error": type(e).__name__},
+                })
                 # The worker's finally recorded the failure even though it
                 # raised; do not double-record here.
                 self._log(
@@ -4174,7 +4209,19 @@ class RebalanceEngine:
                         route_type=self._executor_mode(),
                     )
                     result.executions.append(timeout_result)
+                    result.pair_outcomes.append({
+                        "source_channel_id": pair.source_channel_id,
+                        "dest_channel_id": pair.dest_channel_id,
+                        "status": "cancelled_timeout",
+                        "result": copy.deepcopy(timeout_result),
+                    })
                     continue
+                result.pair_outcomes.append({
+                    "source_channel_id": pair.source_channel_id,
+                    "dest_channel_id": pair.dest_channel_id,
+                    "status": "still_running_timeout",
+                    "result": None,
+                })
                 self._log(
                     f"Execution still running after cycle timeout for "
                     f"{pair.source_channel_id}->{pair.dest_channel_id}; "

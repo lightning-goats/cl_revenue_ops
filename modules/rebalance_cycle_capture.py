@@ -11,6 +11,7 @@ import copy
 import json
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -220,14 +221,16 @@ def _project_outcomes(outcomes: Any, final_identities: set[tuple[str, str]]) -> 
         identity = _pair_identity(outcome)
         if identity is None or identity not in final_identities:
             continue
-        result = _project_execution_result(_field(outcome, "result", None))
-        if result is None:
-            continue
-        projected.append({
+        status = _field(outcome, "status", "returned")
+        row = {
             "source_channel_id": identity[0],
             "dest_channel_id": identity[1],
-            "result": result,
-        })
+            "status": status[:_MAX_TEXT] if isinstance(status, str) else "malformed",
+        }
+        result = _project_execution_result(_field(outcome, "result", None))
+        if result is not None:
+            row["result"] = result
+        projected.append(row)
     return projected
 
 
@@ -263,39 +266,27 @@ def project_cycle_result(reference: Any, result: Any, terminal_stage: str = "com
     for ordinal, pair in enumerate(_field(result, "considered_candidates", []) or [], 1):
         projected = _project_pair(pair, ordinal)
         if projected is None:
-            continue
+            raise ValueError("malformed generated pair")
         identity = (projected["source_channel_id"], projected["dest_channel_id"])
         if identity in seen:
-            continue
+            raise ValueError("duplicate generated pair")
         seen.add(identity)
-        projected["cheap_rank"] = len(generated) + 1
         generated.append(projected)
 
-    planner_selected = [
-        _project_identity(pair) for pair in generated if pair["planner_selected"]
-    ]
-    # A legacy hand-built CycleResult has no generated trace metadata.  It is
-    # evidence-incomplete, never a reason to alter the selected candidates.
+    planner_selected = [_project_identity(pair) for pair in generated if pair["planner_selected"]]
+    generated_ids = {(row["source_channel_id"], row["dest_channel_id"]) for row in generated}
+    planner_ids = {(row["source_channel_id"], row["dest_channel_id"]) for row in planner_selected}
     final_selected = []
     final_seen = set()
-    generated_ids = {(row["source_channel_id"], row["dest_channel_id"]) for row in generated}
     for pair in _field(result, "candidates", []) or []:
         row = _project_identity(pair)
         if row is None:
-            continue
+            raise ValueError("malformed final selected pair")
         identity = (row["source_channel_id"], row["dest_channel_id"])
-        if identity in generated_ids and identity not in final_seen:
-            final_seen.add(identity)
-            final_selected.append(row)
-    planner_ids = {(row["source_channel_id"], row["dest_channel_id"]) for row in planner_selected if row}
-    if final_selected:
-        planner_selected = [row for row in planner_selected if row]
-        # The strict wire requires a final pair to be planner-selected.
-        # Evidence-incomplete rows are omitted without modifying a list during iteration.
-        final_selected = [
-            row for row in final_selected
-            if (row["source_channel_id"], row["dest_channel_id"]) in planner_ids
-        ]
+        if identity not in generated_ids or identity not in planner_ids or identity in final_seen:
+            raise ValueError("invalid final selected pair relation")
+        final_seen.add(identity)
+        final_selected.append(row)
     final_ids = {(row["source_channel_id"], row["dest_channel_id"]) for row in final_selected}
     skipped = []
     for skip in list(_field(result, "audit_records", []) or [])[:128]:
@@ -384,7 +375,7 @@ class RebalanceCycleCaptureManager:
                 self._active.add(sequence)
                 self._manifest["attempted"] += 1
                 self._manifest["attempts"].append({"capture_seq": sequence, "cycle_id": cycle_id, "status": "active"})
-                self._publish_manifest_locked()
+                # Durability is writer-owned; this hot path only allocates an identity.
                 return reference
         except Exception:
             return None
@@ -399,20 +390,15 @@ class RebalanceCycleCaptureManager:
                 attempt = self._attempt_locked(sequence)
                 if attempt is None:
                     return
+                # Keep the engine path bounded: only a non-blocking handoff.
                 try:
-                    payload = project_cycle_result(reference, result, terminal_stage)
-                except Exception as exc:
-                    self._fail_locked(attempt, exc)
-                    return
-                try:
-                    self._queue.put_nowait((reference, payload, attempt))
+                    self._queue.put_nowait((reference, result, terminal_stage, attempt))
                     attempt["status"] = "queued"
                 except queue.Full:
                     attempt.update(status="dropped", error_category="queue_full")
                     self._manifest["dropped"] += 1
                 except Exception as exc:
                     self._fail_locked(attempt, exc)
-                self._publish_manifest_locked()
                 self._condition.notify_all()
         except Exception:
             return
@@ -422,12 +408,15 @@ class RebalanceCycleCaptureManager:
 
     def read_manifest(self) -> dict:
         with self._lock:
+            self._prune_attempts_locked()
             return copy.deepcopy(self._manifest) if self._manifest else {}
 
     def _enable(self) -> bool:
         with self._condition:
             if self._enabled:
                 return True
+            if self._writer is not None and self._writer.is_alive():
+                return False
             self._ensure_output_dir()
             self._run_id = uuid.uuid4().hex
             self._next_seq = 0
@@ -479,11 +468,12 @@ class RebalanceCycleCaptureManager:
             if item is _DRAIN_SENTINEL:
                 self._queue.task_done()
                 return
-            reference, payload, attempt = item
+            reference, result, terminal_stage, attempt = item
             with self._condition:
                 self._inflight += 1
                 attempt["status"] = "writing"
             try:
+                payload = project_cycle_result(reference, result, terminal_stage)
                 self._publish_envelope(reference, payload)
                 with self._condition:
                     attempt["status"] = "completed"
@@ -588,8 +578,10 @@ class RebalanceCycleCaptureManager:
 
     def _rotate_capture_files(self) -> None:
         candidates = []
+        envelope_name = re.compile(r"[0-9a-f]{32}-[0-9]{8}-[0-9a-f]{32}:[0-9]{8}\.json\Z")
+        manifest_name = re.compile(r"manifest-[0-9a-f]{32}\.v0\.json\Z")
         for path in self.output_dir.glob("*.json"):
-            if path.name.startswith("manifest-") or path.is_symlink():
+            if path.is_symlink() or not (envelope_name.fullmatch(path.name) or manifest_name.fullmatch(path.name)):
                 continue
             try:
                 stat = path.stat()

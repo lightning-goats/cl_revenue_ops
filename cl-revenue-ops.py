@@ -1106,10 +1106,7 @@ def _on_rebalance_replay_capture_change(
         if enabled and manager_ready is not True:
             raise ValueError(f"{option_name} could not be enabled")
         if not enabled and manager_ready is not True:
-            if cfg is not None:
-                cfg.rebalance_replay_capture_enabled = False
-            plugin_.log("REBALANCE REPLAY CAPTURE: disabled; writer is still draining", level="warn")
-            return
+            raise ValueError(f"{option_name} could not be disabled")
     if cfg is not None:
         cfg.rebalance_replay_capture_enabled = enabled
     plugin_.log(f"REBALANCE REPLAY CAPTURE: {'enabled' if enabled else 'disabled'}", level="info")
