@@ -414,3 +414,18 @@ def test_many_enable_disable_cycles_close_without_writer_wedge(tmp_path):
         assert manager.set_enabled(True)
         assert manager.set_enabled(False, timeout_seconds=1.0)
         assert manager._writer is None or not manager._writer.is_alive()
+
+
+
+def test_rotation_bounds_owned_artifacts_and_bytes_including_manifest(tmp_path):
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    unrelated = manager.output_dir / "keep.json"; unrelated.write_text("{}")
+    for index in range(40):
+        path = manager.output_dir / (("a" * 32) + f"-{index + 1:08d}-" + ("a" * 32) + f":{index + 1:08d}.json")
+        with path.open("wb") as handle: handle.truncate(10 * 1024 * 1024)
+    manager._rotate_capture_files()
+    owned = [path for path in manager.output_dir.glob("*.json") if path.name != "keep.json"]
+    assert unrelated.exists()
+    assert len(owned) <= 32
+    assert sum(path.stat().st_size for path in owned) <= 256 * 1024 * 1024
