@@ -1,3 +1,4 @@
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -325,3 +326,55 @@ def test_finish_handoff_freezes_mutable_cycle_evidence_before_writer(tmp_path, m
     frozen_result = queued[1]
     assert frozen_result.candidates[0].source_channel_id == "a"
     assert frozen_result.considered_candidates[0].score != 999.0
+
+
+
+def test_disabled_finish_is_fast_and_does_not_touch_filesystem(tmp_path, monkeypatch):
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    atomic = MagicMock()
+    monkeypatch.setattr(manager, "_atomic_write", atomic)
+    started = time.monotonic()
+    assert manager.begin_cycle(_configuration(), {"trigger": "automatic"}) is None
+    assert time.monotonic() - started < 0.05
+    atomic.assert_not_called()
+    assert not manager.output_dir.exists()
+
+
+def test_queue_full_handoff_is_fast_without_projection_or_filesystem(tmp_path, monkeypatch):
+    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    atomic = MagicMock(); monkeypatch.setattr(manager, "_atomic_write", atomic)
+    monkeypatch.setattr("modules.rebalance_cycle_capture.project_cycle_result", lambda *_a: (_ for _ in ()).throw(AssertionError("projected")))
+    for _ in range(2):
+        manager.finish_cycle(manager.begin_cycle(_configuration(), {"trigger": "automatic"}), CycleResult())
+    started = time.monotonic()
+    manager.finish_cycle(manager.begin_cycle(_configuration(), {"trigger": "automatic"}), CycleResult())
+    assert time.monotonic() - started < 0.05
+    assert manager.read_manifest()["dropped"] == 1
+    atomic.assert_not_called()
+
+
+def _wait_for_failed(manager, category):
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        manifest = manager.read_manifest()
+        if manifest.get("failed") == 1:
+            assert manifest["writer_health"] == "degraded"
+            assert manifest["last_error_category"] == category
+            return
+        time.sleep(0.01)
+    raise AssertionError(manager.read_manifest())
+
+
+@pytest.mark.parametrize("failure, category", [
+    (lambda monkeypatch, manager: monkeypatch.setattr("modules.rebalance_cycle_capture.project_cycle_result", lambda *_a: (_ for _ in ()).throw(ValueError("projection"))), "ValueError"),
+    (lambda monkeypatch, manager: monkeypatch.setattr(manager, "_atomic_write", lambda *_a: (_ for _ in ()).throw(OSError("write"))), "OSError"),
+    (lambda monkeypatch, manager: monkeypatch.setattr("modules.rebalance_cycle_capture.MAX_ENVELOPE_BYTES", 1), "ValueError"),
+])
+def test_writer_failures_are_manifested_without_raising(tmp_path, monkeypatch, failure, category):
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    failure(monkeypatch, manager)
+    manager.finish_cycle(manager.begin_cycle(_configuration(), {"trigger": "automatic"}), CycleResult())
+    _wait_for_failed(manager, category)
