@@ -236,3 +236,59 @@ def test_retention_leaves_unowned_json_untouched_and_counts_owned_manifests(tmp_
 
     assert unrelated.exists()
     assert len(list(manager.output_dir.glob("*.json"))) <= 33
+
+
+
+def test_engine_capture_configuration_preserves_disabled_pair_fee_cap():
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    manager = _CaptureManager()
+    engine = object.__new__(RebalanceEngine)
+    engine.rebalance_capture_manager = manager
+    engine.config = SimpleNamespace(snapshot=lambda: SimpleNamespace(low_liquidity_threshold=0.35, high_liquidity_threshold=0.65, rebalance_max_amount=100, pair_fee_cap_ppm=0))
+    engine._max_concurrent_jobs = lambda cfg: 1
+
+    engine._begin_rebalance_capture()
+
+    assert manager.begins[0][0]["pair_fee_cap_ppm"] == 0
+
+
+def test_projection_rejects_unbounded_snapshot_instead_of_eligible_truncation():
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+    channels = tuple(ChannelState(channel_id=f"{index}x1x0", peer_id=f"peer-{index}", capacity_sats=1, local_ratio=0.5, actual_inbound_fee_ppm=0, value_class="neutral", is_valuable=False, remaining_budget_sats=0, cooldown_active=False) for index in range(1025))
+
+    with pytest.raises(ValueError):
+        project_cycle_result(reference, CycleResult(snapshot=StateSnapshot(channels)))
+
+
+def test_generated_and_selected_evidence_include_route_quote_and_rejection_fields():
+    pair = _pair()
+    pair.route = [{"channel": "1x1x0", "amount_msat": 1_000}]
+    pair.route_cost_sats = 2
+    pair.score_decomposition = {"p_success": 0.9, "final_score_sats": 3.0, "effective_budget_sats": 0}
+    pair.rejection_reason = "priced"
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+
+    body = project_cycle_result(reference, CycleResult(considered_candidates=[pair], candidates=[pair]))
+
+    generated = body["funnel"]["generated_pairs"][0]
+    selected = body["funnel"]["final_selected_pairs"][0]
+    assert generated["route_summary"] == [{"channel": "1x1x0", "amount_msat": 1_000}]
+    assert generated["route_cost_sats"] == 2
+    assert generated["score_decomposition"]["p_success"] == 0.9
+    assert selected["route_cost_sats"] == 2
+
+
+def test_rotation_enforces_32_total_owned_files_without_deleting_unowned_json(tmp_path):
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    unrelated = manager.output_dir / "operator-note.json"
+    unrelated.write_text("{}")
+    for index in range(40):
+        (manager.output_dir / (("a" * 32) + f"-{index + 1:08d}-" + ("a" * 32) + f":{index + 1:08d}.json")).write_text("{}")
+
+    manager._rotate_capture_files()
+
+    owned = [path for path in manager.output_dir.glob("*.json") if path.name != unrelated.name]
+    assert unrelated.exists()
+    assert len(owned) <= 32

@@ -123,6 +123,14 @@ def _project_pair(pair: Any, fallback_rank: int) -> Optional[dict]:
         "planner_selected": bool(_field(pair, "planner_selected", False)),
         "planner_rejection_reason": rejection or None,
         "bootstrap_score_decomposition": _safe_value(decomposition),
+        "score_decomposition": _safe_value(decomposition),
+        "route_cost_sats": _nonnegative(_field(pair, "route_cost_sats", 0)),
+        "effective_budget_sats": _nonnegative(decomposition.get("effective_budget_sats", _field(pair, "pair_budget_sats", 0))),
+        "rejection_reason": _bounded_text(_field(pair, "rejection_reason", "")),
+        "route_summary": [
+            {key: _safe_value(hop.get(key)) for key in ("channel", "id", "amount_msat", "delay") if key in hop}
+            for hop in (_field(pair, "route", []) or [])[:20] if isinstance(hop, dict)
+        ],
     }
 
 
@@ -146,6 +154,8 @@ def _project_snapshot(snapshot: Any) -> dict:
     channels = _field(snapshot, "channels", []) if snapshot is not None else []
     if not isinstance(channels, (list, tuple)):
         channels = []
+    if len(channels) > 1024:
+        raise ValueError("normalized snapshot exceeds capture bound")
     projected_channels = []
     identities = set()
     for channel in list(channels)[:1024]:
@@ -279,7 +289,7 @@ def project_cycle_result(reference: Any, result: Any, terminal_stage: str = "com
     final_selected = []
     final_seen = set()
     for pair in _field(result, "candidates", []) or []:
-        row = _project_identity(pair)
+        row = _project_pair(pair, 1)
         if row is None:
             raise ValueError("malformed final selected pair")
         identity = (row["source_channel_id"], row["dest_channel_id"])

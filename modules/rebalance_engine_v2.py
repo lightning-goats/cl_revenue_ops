@@ -3914,7 +3914,7 @@ class RebalanceEngine:
                     "target_band_high": getattr(cfg, "high_liquidity_threshold", 0.65),
                     "max_chunk_sats": getattr(cfg, "rebalance_max_amount", 2_000_000),
                     "max_pairs": self._max_concurrent_jobs(cfg),
-                    "pair_fee_cap_ppm": getattr(cfg, "pair_fee_cap_ppm", 1) or 1,
+                    "pair_fee_cap_ppm": getattr(cfg, "pair_fee_cap_ppm", 0),
                 },
                 {"trigger": trigger},
             )
