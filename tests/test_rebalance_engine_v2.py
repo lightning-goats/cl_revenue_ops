@@ -3533,3 +3533,104 @@ def test_activity_penalty_sums_source_and_dest_activity(mock_plugin, mock_databa
 
     assert expected_penalty > 0
     assert decomp["activity_penalty_sats"] == pytest.approx(expected_penalty)
+
+
+
+def test_considered_pairs_retain_full_generated_universe_before_pricing(
+    mock_plugin, mock_database
+):
+    """Capture diagnostics retain the planner funnel, not just priced output."""
+    from modules.rebalance_types_v2 import PairCandidate, PlanResult
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._audit = MagicMock()
+    engine._build_snapshot = MagicMock(
+        return_value=SimpleNamespace(
+            channels=[object()],
+            valuable_channel_count=2,
+            total_remaining_budget_sats=10_000,
+        )
+    )
+    engine.router_v3 = MagicMock()
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=1,
+        route=[{"channel": "400x1x0", "direction": 0}],
+        probability_ppm=1_000_000,
+        error="",
+    )
+
+    selected = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "1" * 64,
+        dest_peer_id="02" + "2" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=100,
+        source_capacity_sats=1_000_000,
+        dest_capacity_sats=1_000_000,
+        source_local_ratio=0.90,
+        dest_local_ratio=0.10,
+        dest_out_fee_ppm=1_000,
+        dest_fee_history_validated=True,
+        dest_historical_direct_fee_ppm=1_000,
+        score=2.0,
+    )
+    rejected = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="300x1x0",
+        source_peer_id="02" + "1" * 64,
+        dest_peer_id="02" + "3" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=100,
+        score=1.0,
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner = planner_cls.return_value
+        planner.plan.return_value = PlanResult(
+            selected=[selected], skipped=[], generated=[selected, rejected]
+        )
+
+        final_selected = engine.find_candidates()
+
+    result = engine._last_cycle_result
+    assert final_selected == [selected]
+    assert result.candidates == [selected]
+    assert [
+        (pair.source_channel_id, pair.dest_channel_id)
+        for pair in result.considered_candidates
+    ] == [("100x1x0", "200x1x0"), ("100x1x0", "300x1x0")]
+    assert result.considered_candidates[0] is not selected
+    assert result.considered_candidates[1] is not rejected
+
+
+
+def test_serialized_candidate_includes_trace_only_planner_metadata(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "1" * 64,
+        dest_peer_id="02" + "2" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=100,
+        source_excess_sats=250_000,
+        dest_need_sats=125_000,
+        max_chunk_sats=2_000_000,
+        cheap_rank=3,
+        planner_selected=False,
+        planner_rejection_reason="source_already_paired",
+    )
+
+    serialized = _make_engine(mock_plugin, mock_database)._serialize_pair_candidate(pair)
+
+    assert serialized["source_excess_sats"] == 250_000
+    assert serialized["dest_need_sats"] == 125_000
+    assert serialized["max_chunk_sats"] == 2_000_000
+    assert serialized["cheap_rank"] == 3
+    assert serialized["planner_selected"] is False
+    assert serialized["planner_rejection_reason"] == "source_already_paired"

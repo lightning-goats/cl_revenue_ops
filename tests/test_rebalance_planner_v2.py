@@ -770,3 +770,68 @@ def test_all_three_features_thread_onto_one_big_channel_pair():
     # --- #1 (activity): threaded without transpose. ---
     assert pair.source_activity_out_sats == 150_000
     assert pair.dest_activity_in_sats == 200_000
+
+
+
+class TestGeneratedPlannerUniverse:
+    def _four_pair_snapshot(self):
+        """Two sources x two destinations keeps score ties in input order."""
+        return _snap(
+            _ch(channel_id="src-1", peer_id="02" + "a1" * 32, local_ratio=0.90),
+            _ch(channel_id="src-2", peer_id="02" + "a2" * 32, local_ratio=0.90),
+            _ch(channel_id="dest-1", peer_id="02" + "b1" * 32, local_ratio=0.10),
+            _ch(channel_id="dest-2", peer_id="02" + "b2" * 32, local_ratio=0.10),
+        )
+
+    def test_retains_complete_ranked_universe_without_changing_greedy_selection(self):
+        planner = RebalancePlanner(max_pairs=2)
+
+        result = planner.plan(self._four_pair_snapshot())
+
+        assert [pair.cheap_rank for pair in result.generated] == [1, 2, 3, 4]
+        assert len(result.generated) == 4
+        assert [
+            (pair.source_channel_id, pair.dest_channel_id)
+            for pair in result.selected
+        ] == [("src-1", "dest-1"), ("src-2", "dest-2")]
+        assert all(pair.source_excess_sats > 0 for pair in result.generated)
+        assert all(pair.dest_need_sats > 0 for pair in result.generated)
+        assert all(pair.max_chunk_sats == planner.max_chunk_sats for pair in result.generated)
+        assert {
+            pair.planner_rejection_reason
+            for pair in result.generated
+            if not pair.planner_selected
+        } <= {
+            "source_already_paired",
+            "dest_already_paired",
+            "max_pairs_reached",
+        }
+        assert [
+            (pair.source_channel_id, pair.dest_channel_id)
+            for pair in result.generated
+            if pair.planner_selected
+        ] == [
+            (pair.source_channel_id, pair.dest_channel_id)
+            for pair in result.selected
+        ]
+
+    def test_same_captured_snapshot_order_replays_same_generated_ranks(self):
+        planner = RebalancePlanner(max_pairs=2)
+        snapshot = self._four_pair_snapshot()
+
+        first = planner.plan(snapshot)
+        second = planner.plan(snapshot)
+
+        assert [
+            (pair.source_channel_id, pair.dest_channel_id, pair.cheap_rank)
+            for pair in first.generated
+        ] == [
+            (pair.source_channel_id, pair.dest_channel_id, pair.cheap_rank)
+            for pair in second.generated
+        ]
+
+    def test_empty_snapshot_has_a_neutral_generated_universe(self):
+        result = RebalancePlanner().plan(_snap())
+
+        assert result.selected == []
+        assert result.generated == []

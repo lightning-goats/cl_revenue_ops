@@ -1,5 +1,7 @@
 """Golden: RebalancePlanner.plan — source/dest pairing, amount sizing,
 scoring, skip reasons. Pure snapshot-in / PlanResult-out."""
+import dataclasses
+
 import pytest
 
 from modules.rebalance_planner_v2 import RebalancePlanner
@@ -67,6 +69,23 @@ SCENARIOS = {
 }
 
 
+def _legacy_plan_output(result):
+    """Keep existing goldens pinned to the public selected/skipped contract."""
+    output = dataclasses.asdict(result)
+    output.pop("generated", None)
+    for pair in output["selected"]:
+        for trace_field in (
+            "source_excess_sats",
+            "dest_need_sats",
+            "max_chunk_sats",
+            "cheap_rank",
+            "planner_selected",
+            "planner_rejection_reason",
+        ):
+            pair.pop(trace_field, None)
+    return output
+
+
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
 def test_golden_plan(name):
     planner = RebalancePlanner(
@@ -74,7 +93,7 @@ def test_golden_plan(name):
         max_chunk_sats=2_000_000, max_pairs=10, pair_fee_cap_ppm=0,
     )
     result = planner.plan(_snapshot(SCENARIOS[name]))
-    golden_check(f"rebalance/plan_{name}", result)
+    golden_check(f"rebalance/plan_{name}", _legacy_plan_output(result))
 
 
 def test_plan_hand_computed_anchor():

@@ -740,6 +740,14 @@ class RebalanceEngine:
             ),
             "route_summary": self._route_summary(pair.route or []),
             "rejection_reason": pair.rejection_reason or None,
+            "source_excess_sats": int(getattr(pair, "source_excess_sats", 0) or 0),
+            "dest_need_sats": int(getattr(pair, "dest_need_sats", 0) or 0),
+            "max_chunk_sats": int(getattr(pair, "max_chunk_sats", 0) or 0),
+            "cheap_rank": int(getattr(pair, "cheap_rank", 0) or 0),
+            "planner_selected": bool(getattr(pair, "planner_selected", False)),
+            "planner_rejection_reason": str(
+                getattr(pair, "planner_rejection_reason", "") or ""
+            ),
             "score_decomposition": copy.deepcopy(pair.score_decomposition or {}),
         }
 
@@ -1289,6 +1297,15 @@ class RebalanceEngine:
         )
 
         plan = planner.plan(snapshot)
+        generated = list(getattr(plan, "generated", []) or [])
+        # Keep hand-constructed legacy PlanResult fixtures diagnostic-only
+        # compatible; the real planner always provides its complete universe.
+        if not generated and plan.selected:
+            generated = list(plan.selected)
+        considered_candidates = [copy.deepcopy(pair) for pair in generated]
+        considered_lookup = {
+            self._pair_key(pair): pair for pair in considered_candidates
+        }
 
         # P4-008: in-flight-destination guard. Drop any selected pair whose
         # destination still has an outstanding reserve+pay in flight (typically
@@ -1354,11 +1371,6 @@ class RebalanceEngine:
                 -float(getattr(pair, "score", 0.0) or 0.0),
             )
         )
-        considered_candidates = [copy.deepcopy(pair) for pair in plan.selected]
-        considered_lookup = {
-            self._pair_key(pair): pair for pair in considered_candidates
-        }
-
         # Route-price selected pairs using the cycle's captured router
         if plan.selected:
             router = self._cycle_router

@@ -76,6 +76,14 @@ class PairCandidate:
     route_decision: Optional[RouteDecision] = None
     score_decomposition: Dict[str, Any] = field(default_factory=dict)
     rejection_reason: str = ""
+    # Replay-capture trace metadata. These observations preserve the pure
+    # planner funnel and never participate in scoring, routing, or execution.
+    source_excess_sats: int = 0
+    dest_need_sats: int = 0
+    max_chunk_sats: int = 0
+    cheap_rank: int = 0
+    planner_selected: bool = False
+    planner_rejection_reason: str = ""
 
 
 @dataclass
@@ -95,3 +103,4 @@ class PlanResult:
 
     selected: List[PairCandidate] = field(default_factory=list)
     skipped: List[SkipRecord] = field(default_factory=list)
+    generated: List[PairCandidate] = field(default_factory=list)

@@ -153,13 +153,18 @@ class RebalancePlanner:
         pairs = self._generate_pairs(over_local, over_remote)
         pairs.sort(key=lambda p: p.score, reverse=True)
 
-        for pair in pairs:
+        for cheap_rank, pair in enumerate(pairs, start=1):
+            pair.cheap_rank = cheap_rank
             if len(candidates) >= self.max_pairs:
-                break
+                pair.planner_rejection_reason = "max_pairs_reached"
+                continue
             if pair.source_channel_id in paired_sources:
+                pair.planner_rejection_reason = "source_already_paired"
                 continue
             if pair.dest_channel_id in paired_dests:
+                pair.planner_rejection_reason = "dest_already_paired"
                 continue
+            pair.planner_selected = True
             candidates.append(pair)
             paired_sources.add(pair.source_channel_id)
             paired_dests.add(pair.dest_channel_id)
@@ -200,7 +205,7 @@ class RebalancePlanner:
                     detail=detail,
                 ))
 
-        return PlanResult(selected=candidates, skipped=skipped)
+        return PlanResult(selected=candidates, skipped=skipped, generated=pairs)
 
     def _generate_pairs(
         self,
@@ -297,6 +302,9 @@ class RebalancePlanner:
 
                 pairs.append(PairCandidate(
                     source_channel_id=src.channel_id,
+                    source_excess_sats=source_excess,
+                    dest_need_sats=dest_need,
+                    max_chunk_sats=self.max_chunk_sats,
                     dest_channel_id=dest.channel_id,
                     source_peer_id=src.peer_id,
                     dest_peer_id=dest.peer_id,
