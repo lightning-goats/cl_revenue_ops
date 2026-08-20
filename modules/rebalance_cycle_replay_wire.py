@@ -1,8 +1,10 @@
 """Strict, standalone v0 wire contract for rebalance replay capture."""
 
+import copy
 import hashlib
 import hmac
 import json
+import math
 import struct
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
@@ -13,6 +15,7 @@ MAX_ENVELOPE_BYTES = 32 * 1024 * 1024
 
 BINARY64_TAG_KEY = "__f64__"
 _BINARY64_HEX = frozenset("0123456789abcdef")
+_MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
 
 
 def tag_floats(value: Any) -> Any:
@@ -43,8 +46,9 @@ def canonical_body_bytes(body: Dict[str, Any]) -> bytes:
 
 def seal_envelope(body: Dict[str, Any]) -> Dict[str, Any]:
     """Validate and seal an observational rebalance replay body."""
-    validate_body(body)
-    tagged = tag_floats(body)
+    normalized_body = _normalize_integer_domains(body)
+    _validate_body(normalized_body)
+    tagged = tag_floats(normalized_body)
     payload = canonical_body_bytes(tagged)
     envelope = {
         **tagged,
@@ -64,17 +68,23 @@ def verify_envelope(envelope: Dict[str, Any]) -> None:
         raise ValueError("missing payload digest")
     body = dict(envelope)
     del body["payload_sha256"]
-    payload = canonical_body_bytes(body)
+    normalized_body = _normalize_integer_domains(body)
+    payload = canonical_body_bytes(normalized_body)
     expected = hashlib.sha256(payload).hexdigest()
     if not hmac.compare_digest(supplied, expected):
         raise ValueError("payload digest mismatch")
-    validate_body(body)
-    if len(canonical_body_bytes(envelope)) > MAX_ENVELOPE_BYTES:
+    _validate_body(normalized_body)
+    normalized_envelope = {**normalized_body, "payload_sha256": supplied}
+    if len(canonical_body_bytes(normalized_envelope)) > MAX_ENVELOPE_BYTES:
         raise ValueError("envelope exceeds 32 MiB")
 
 
 def validate_body(body: Dict[str, Any]) -> None:
     """Validate v0 structural and cross-field replay invariants."""
+    _validate_body(_normalize_integer_domains(body))
+
+
+def _validate_body(body: Dict[str, Any]) -> None:
     if not isinstance(body, dict):
         raise ValueError("body must be an object")
     _validate_tagged_floats(body)
@@ -112,6 +122,74 @@ def validate_body(body: Dict[str, Any]) -> None:
     _validate_completeness(
         body["completeness"], generated, planner_selected, final_selected, outcomes
     )
+
+
+def _normalize_integer_value(value: Any, label: str) -> Any:
+    if not isinstance(value, float):
+        return value
+    if not math.isfinite(value) or not value.is_integer():
+        raise ValueError(f"{label} must be a finite integral number")
+    if abs(value) > _MAX_SAFE_JSON_INTEGER:
+        raise ValueError(f"{label} exceeds the safe JSON integer range")
+    return int(value)
+
+
+def _normalize_mapping_integer_field(
+    mapping: Any,
+    field: str,
+    label: str,
+) -> None:
+    if isinstance(mapping, dict) and field in mapping:
+        mapping[field] = _normalize_integer_value(mapping[field], label)
+
+
+def _normalize_integer_domains(body: Any) -> Any:
+    if not isinstance(body, dict):
+        return body
+    normalized = copy.deepcopy(body)
+    _normalize_mapping_integer_field(normalized, "capture_seq", "capture_seq")
+
+    configuration = normalized.get("configuration")
+    for field in ("config_version", "max_chunk_sats", "max_pairs", "pair_fee_cap_ppm"):
+        _normalize_mapping_integer_field(configuration, field, f"configuration.{field}")
+
+    pre_state = normalized.get("pre_state")
+    snapshot = pre_state.get("normalized_snapshot") if isinstance(pre_state, dict) else None
+    for field in (
+        "total_capacity_sats",
+        "total_remaining_budget_sats",
+        "valuable_channel_count",
+    ):
+        _normalize_mapping_integer_field(snapshot, field, f"normalized_snapshot.{field}")
+
+    funnel = normalized.get("funnel")
+    generated_pairs = funnel.get("generated_pairs") if isinstance(funnel, dict) else None
+    if isinstance(generated_pairs, list):
+        for index, generated_pair in enumerate(generated_pairs):
+            for field in (
+                "planned_amount_sats",
+                "pair_budget_sats",
+                "source_excess_sats",
+                "dest_need_sats",
+                "max_chunk_sats",
+                "cheap_rank",
+            ):
+                _normalize_mapping_integer_field(
+                    generated_pair,
+                    field,
+                    f"generated pair {index}.{field}",
+                )
+
+    completeness = normalized.get("completeness")
+    for field in (
+        "generated_pair_count",
+        "retained_generated_pair_count",
+        "planner_selected_pair_count",
+        "final_selected_pair_count",
+        "execution_outcome_count",
+    ):
+        _normalize_mapping_integer_field(completeness, field, f"completeness.{field}")
+    return normalized
 
 
 def _validate_tagged_floats(value: Any) -> None:
@@ -168,12 +246,22 @@ def _require_nonempty_string(value: Any, label: str) -> None:
 
 
 def _require_positive_int(value: Any, label: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > _MAX_SAFE_JSON_INTEGER
+    ):
         raise ValueError(f"{label} must be a positive integer")
 
 
 def _require_nonnegative_int(value: Any, label: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > _MAX_SAFE_JSON_INTEGER
+    ):
         raise ValueError(f"{label} must be a non-negative integer")
 
 

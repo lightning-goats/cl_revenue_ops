@@ -353,6 +353,87 @@ def test_zero_rebalance_budget_domains_reject_negative_and_boolean_values(field,
         Draft202012Validator(schema).validate(envelope)
 
 
+INTEGER_DOMAIN_CASES = [
+    pytest.param(("capture_seq",), id="capture-seq"),
+    pytest.param(("configuration", "config_version"), id="config-version"),
+    pytest.param(("configuration", "max_chunk_sats"), id="max-chunk"),
+    pytest.param(("configuration", "max_pairs"), id="max-pairs"),
+    pytest.param(("configuration", "pair_fee_cap_ppm"), id="pair-fee-cap"),
+    pytest.param(("pre_state", "normalized_snapshot", "total_capacity_sats"), id="total-capacity"),
+    pytest.param(("pre_state", "normalized_snapshot", "total_remaining_budget_sats"), id="remaining-budget"),
+    pytest.param(("pre_state", "normalized_snapshot", "valuable_channel_count"), id="valuable-count"),
+    pytest.param(("funnel", "generated_pairs", 0, "planned_amount_sats"), id="planned-amount"),
+    pytest.param(("funnel", "generated_pairs", 0, "pair_budget_sats"), id="pair-budget"),
+    pytest.param(("funnel", "generated_pairs", 0, "source_excess_sats"), id="source-excess"),
+    pytest.param(("funnel", "generated_pairs", 0, "dest_need_sats"), id="dest-need"),
+    pytest.param(("funnel", "generated_pairs", 0, "max_chunk_sats"), id="pair-max-chunk"),
+    pytest.param(("funnel", "generated_pairs", 0, "cheap_rank"), id="cheap-rank"),
+    pytest.param(("completeness", "generated_pair_count"), id="generated-count"),
+    pytest.param(("completeness", "retained_generated_pair_count"), id="retained-count"),
+    pytest.param(("completeness", "planner_selected_pair_count"), id="planner-count"),
+    pytest.param(("completeness", "final_selected_pair_count"), id="final-count"),
+    pytest.param(("completeness", "execution_outcome_count"), id="execution-count"),
+]
+
+
+def _path_value(body, path):
+    value = body
+    for part in path:
+        value = value[part]
+    return value
+
+
+def _set_path_value(body, path, value):
+    target = body
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = value
+
+
+@pytest.mark.parametrize("path", INTEGER_DOMAIN_CASES)
+def test_integral_float_integer_domains_normalize_for_seal_verify_and_schema(path):
+    body = body_with_pair()
+    integer_value = _path_value(body, path)
+    _set_path_value(body, path, float(integer_value))
+    validate_body(body)
+
+    sealed = seal_envelope(body)
+    assert isinstance(_path_value(sealed, path), int)
+    assert not isinstance(_path_value(sealed, path), bool)
+    verify_envelope(sealed)
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    Draft202012Validator(schema).validate(sealed)
+
+    _set_path_value(sealed, path, float(integer_value))
+    verify_envelope(sealed)
+    Draft202012Validator(schema).validate(sealed)
+
+
+@pytest.mark.parametrize(
+    ("path", "invalid"),
+    [
+        pytest.param(("capture_seq",), 1.5, id="positive-nonintegral"),
+        pytest.param(("configuration", "pair_fee_cap_ppm"), 0.5, id="nonnegative-nonintegral"),
+        pytest.param(("capture_seq",), True, id="positive-bool"),
+        pytest.param(("configuration", "pair_fee_cap_ppm"), True, id="nonnegative-bool"),
+        pytest.param(("capture_seq",), float("nan"), id="nan"),
+        pytest.param(("configuration", "pair_fee_cap_ppm"), float("inf"), id="inf"),
+        pytest.param(("capture_seq",), 9_007_199_254_740_992.0, id="out-of-range"),
+    ],
+)
+def test_integer_domains_reject_nonintegral_boolean_nonfinite_and_out_of_range(path, invalid):
+    body = body_with_pair()
+    _set_path_value(body, path, invalid)
+    with pytest.raises(ValueError):
+        validate_body(body)
+
+    envelope = seal_envelope(body_with_pair())
+    _set_path_value(envelope, path, invalid)
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(envelope)
+
+
 def test_validate_requires_contiguous_generated_pair_ranks_starting_at_one():
     body = body_with_pair()
     body["funnel"]["generated_pairs"][0]["cheap_rank"] = 2
