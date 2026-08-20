@@ -59,8 +59,8 @@ def seal_envelope(body: Dict[str, Any]) -> Dict[str, Any]:
     return envelope
 
 
-def verify_envelope(envelope: Dict[str, Any]) -> None:
-    """Fail closed unless an envelope digest and its full structure are valid."""
+def verify_normalized_envelope(envelope: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify integrity and return the sole normalized replay representation."""
     if not isinstance(envelope, dict):
         raise ValueError("envelope must be an object")
     supplied = envelope.get("payload_sha256")
@@ -69,14 +69,19 @@ def verify_envelope(envelope: Dict[str, Any]) -> None:
     body = dict(envelope)
     del body["payload_sha256"]
     normalized_body = _normalize_integer_domains(body)
-    payload = canonical_body_bytes(normalized_body)
-    expected = hashlib.sha256(payload).hexdigest()
+    expected = hashlib.sha256(canonical_body_bytes(normalized_body)).hexdigest()
     if not hmac.compare_digest(supplied, expected):
         raise ValueError("payload digest mismatch")
     _validate_body(normalized_body)
     normalized_envelope = {**normalized_body, "payload_sha256": supplied}
     if len(canonical_body_bytes(normalized_envelope)) > MAX_ENVELOPE_BYTES:
         raise ValueError("envelope exceeds 32 MiB")
+    return normalized_envelope
+
+
+def verify_envelope(envelope: Dict[str, Any]) -> None:
+    """Fail closed unless an envelope digest and its full structure are valid."""
+    verify_normalized_envelope(envelope)
 
 
 def validate_body(body: Dict[str, Any]) -> None:

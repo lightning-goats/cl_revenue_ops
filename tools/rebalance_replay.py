@@ -3,25 +3,24 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 from pathlib import Path
+import stat
 import struct
 import sys
+import types
 
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from modules.rebalance_cycle_replay_wire import (  # noqa: E402
-    BINARY64_TAG_KEY,
-    MAX_ENVELOPE_BYTES,
-    tag_floats,
-    verify_envelope,
+_PURE_MODULES = (
+    "utils",
+    "rebalance_route_policy",
+    "rebalance_types_v2",
+    "rebalance_state_v2",
+    "rebalance_planner_v2",
+    "rebalance_cycle_replay_wire",
 )
-from modules.rebalance_planner_v2 import RebalancePlanner  # noqa: E402
-from modules.rebalance_state_v2 import ChannelState, StateSnapshot  # noqa: E402
-
-
 _CHANNEL_FIELDS = (
     "channel_id", "peer_id", "capacity_sats", "local_ratio",
     "actual_inbound_fee_ppm", "value_class", "is_valuable",
@@ -39,19 +38,69 @@ _CONFIGURATION_FIELDS = (
     "config_version", "target_band_low", "target_band_high", "max_chunk_sats",
     "max_pairs", "pair_fee_cap_ppm",
 )
+_COMPONENTS = None
 
 
-def _decode_floats(value):
+def _load_pure_components():
+    """Load the planner's pure modules without executing modules/__init__.py."""
+    if "modules" in sys.modules:
+        raise ValueError("standalone replay refuses a preloaded modules package")
+    package = types.ModuleType("modules")
+    package.__package__ = "modules"
+    package.__path__ = [str(ROOT / "modules")]
+    sys.modules["modules"] = package
+    loaded = {}
+    try:
+        for name in _PURE_MODULES:
+            module_name = f"modules.{name}"
+            module = types.ModuleType(module_name)
+            module.__file__ = str(ROOT / "modules" / f"{name}.py")
+            module.__package__ = "modules"
+            sys.modules[module_name] = module
+            source = Path(module.__file__).read_text(encoding="utf-8")
+            exec(compile(source, module.__file__, "exec"), module.__dict__)
+            loaded[name] = module
+    except BaseException:
+        for name in _PURE_MODULES:
+            sys.modules.pop(f"modules.{name}", None)
+        sys.modules.pop("modules", None)
+        raise
+    return (
+        loaded["rebalance_cycle_replay_wire"],
+        loaded["rebalance_planner_v2"].RebalancePlanner,
+        loaded["rebalance_state_v2"].ChannelState,
+        loaded["rebalance_state_v2"].StateSnapshot,
+    )
+
+
+def _components():
+    global _COMPONENTS
+    if _COMPONENTS is None:
+        _COMPONENTS = _load_pure_components()
+    return _COMPONENTS
+
+
+def _decode_floats(value, binary64_tag_key):
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite numeric value")
+        return value
     if isinstance(value, dict):
-        if set(value) == {BINARY64_TAG_KEY}:
-            return struct.unpack(">d", bytes.fromhex(value[BINARY64_TAG_KEY]))[0]
-        return {key: _decode_floats(item) for key, item in value.items()}
+        if set(value) == {binary64_tag_key}:
+            decoded = struct.unpack(">d", bytes.fromhex(value[binary64_tag_key]))[0]
+            if not math.isfinite(decoded):
+                raise ValueError("non-finite binary64 value")
+            return decoded
+        return {
+            key: _decode_floats(item, binary64_tag_key)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_decode_floats(item) for item in value]
+        return [_decode_floats(item, binary64_tag_key) for item in value]
     return value
 
 
-def _canonical_bytes(value):
+def _canonical_bytes(value, tag_floats):
     return json.dumps(
         tag_floats(value), sort_keys=True, separators=(",", ":"),
         ensure_ascii=False, allow_nan=False,
@@ -85,22 +134,22 @@ def _captured_generated_projection(pair):
     return {field: pair[field] for field in fields}
 
 
-def _reconstruct_snapshot(envelope):
+def _reconstruct_snapshot(envelope, channel_state, state_snapshot):
     snapshot = envelope["pre_state"]["normalized_snapshot"]
     channels = tuple(
-        ChannelState(**{field: channel[field] for field in _CHANNEL_FIELDS})
+        channel_state(**{field: channel[field] for field in _CHANNEL_FIELDS})
         for channel in snapshot["channels"]
     )
-    return StateSnapshot(
+    return state_snapshot(
         channels=channels,
         **{field: snapshot[field] for field in _SNAPSHOT_FIELDS},
     )
 
 
-def _planner(envelope):
+def _planner(envelope, planner_class):
     configuration = envelope["configuration"]
     captured = {field: configuration[field] for field in _CONFIGURATION_FIELDS}
-    return RebalancePlanner(
+    return planner_class(
         target_band_low=captured["target_band_low"],
         target_band_high=captured["target_band_high"],
         max_chunk_sats=captured["max_chunk_sats"],
@@ -109,10 +158,27 @@ def _planner(envelope):
     )
 
 
+def _require_complete_capture(envelope):
+    completeness = envelope["completeness"]
+    if not completeness["eligible"]:
+        raise ValueError("replay evidence is ineligible")
+    if completeness["candidate_universe_truncated"]:
+        raise ValueError("replay candidate universe is truncated")
+    if (
+        completeness["generated_pair_count"]
+        != completeness["retained_generated_pair_count"]
+    ):
+        raise ValueError("replay generated-pair counts differ")
+
+
 def replay(envelope):
-    verify_envelope(envelope)
-    decoded = _decode_floats(envelope)
-    result = _planner(decoded).plan(_reconstruct_snapshot(decoded))
+    wire, planner_class, channel_state, state_snapshot = _components()
+    normalized = wire.verify_normalized_envelope(envelope)
+    _require_complete_capture(normalized)
+    decoded = _decode_floats(normalized, wire.BINARY64_TAG_KEY)
+    result = _planner(decoded, planner_class).plan(
+        _reconstruct_snapshot(decoded, channel_state, state_snapshot)
+    )
     generated = [_generated_projection(pair) for pair in result.generated]
     expected_generated = [
         _captured_generated_projection(pair)
@@ -123,8 +189,12 @@ def replay(envelope):
         for pair in result.selected
     ]
     expected_selected = decoded["funnel"]["planner_selected_pairs"]
-    generated_matches = _canonical_bytes(generated) == _canonical_bytes(expected_generated)
-    selected_matches = _canonical_bytes(selected) == _canonical_bytes(expected_selected)
+    generated_matches = _canonical_bytes(generated, wire.tag_floats) == _canonical_bytes(
+        expected_generated, wire.tag_floats
+    )
+    selected_matches = _canonical_bytes(selected, wire.tag_floats) == _canonical_bytes(
+        expected_selected, wire.tag_floats
+    )
     mismatches = []
     if not generated_matches:
         mismatches.append("generated_pairs")
@@ -151,21 +221,40 @@ def _parse_arguments(arguments):
     raise ValueError("usage: rebalance_replay.py <envelope.json> [--pretty]")
 
 
-def _load_envelope(filename):
-    path = Path(filename)
-    if path.stat().st_size > MAX_ENVELOPE_BYTES:
+def _reject_json_constant(value):
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _load_envelope(filename, maximum_bytes):
+    required_flags = ("O_NOFOLLOW", "O_NONBLOCK")
+    if any(not hasattr(os, name) for name in required_flags):
+        raise ValueError("safe local-file reading is unavailable")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(os.fspath(filename), flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("input must be a regular file")
+        payload = os.read(descriptor, maximum_bytes + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) > maximum_bytes:
         raise ValueError("input exceeds 32 MiB")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
+        return json.loads(
+            payload.decode("utf-8"), parse_constant=_reject_json_constant
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError("invalid JSON") from error
 
 
 def main(arguments=None):
     try:
         filename, pretty = _parse_arguments(sys.argv[1:] if arguments is None else arguments)
-        output = replay(_load_envelope(filename))
-    except (OSError, TypeError, ValueError, struct.error) as error:
+        wire, _planner_class, _channel_state, _state_snapshot = _components()
+        output = replay(_load_envelope(filename, wire.MAX_ENVELOPE_BYTES))
+    except (ArithmeticError, OSError, TypeError, ValueError, struct.error) as error:
         sys.stderr.write(f"rebalance replay error: {error}\n")
         return 2
 

@@ -305,10 +305,8 @@ class TestRebalanceReplayToolBoundary:
                 imports.add(node.module or "")
 
         assert imports <= {
-            "__future__", "json", "pathlib", "struct", "sys",
-            "modules.rebalance_cycle_replay_wire",
-            "modules.rebalance_planner_v2",
-            "modules.rebalance_state_v2",
+            "__future__", "json", "math", "os", "pathlib", "stat", "struct", "sys",
+            "types",
         }
 
     def test_replay_tool_never_mentions_plugin_or_action_surfaces(self):
