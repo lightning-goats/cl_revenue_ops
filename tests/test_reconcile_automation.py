@@ -160,9 +160,11 @@ def test_completeness_gap_warns(stack):
     db.get_fee_changes_between = MagicMock(return_value=[
         {"timestamp": NOW - 3600}, {"timestamp": NOW - 60},
     ])
+    db.get_recent_fee_changes = MagicMock()
     result = shadow.maybe_run_reconciliation(db, NOW)
     db.get_fee_changes_between.assert_called_once_with(
-        NOW - 86400, NOW + 1)
+        NOW - 86400 - 120, NOW + 1)
+    db.get_recent_fee_changes.assert_not_called()
     assert result["completeness_ok"] is False
     warns = [c for c in plugin.log.call_args_list
              if c.kwargs.get("level") == "warn"
@@ -214,6 +216,46 @@ def test_more_than_500_changes_do_not_split_a_fee_cycle(stack):
         since_at=SLOT, until_at=SLOT + 3600
     )["runs"][0]
     assert run["fee_intent_completeness"] == "ok"
+
+
+def test_incomplete_run_recovery_reuses_original_evidence_time(
+        stack, monkeypatch):
+    shadow, db, _ = stack
+    ledger = shadow.ledger_for_reconciliation()
+    original_evidence_at = NOW
+    retry_at = NOW + 600
+    ledger.start_reconciliation_run(
+        slot_started_at=SLOT,
+        started_at=original_evidence_at,
+        snapshot_id=None,
+        state_reference=f"spend_reservations@{SLOT}",
+    )
+    ledger.append(
+        event_type="intent_proposed",
+        intent_id="original-fee-intent",
+        idempotency_key="e" * 64,
+        cycle_id=f"fee-cycle-{original_evidence_at}",
+        at=original_evidence_at,
+        details={},
+    )
+    db.get_fee_changes_between = MagicMock(return_value=[
+        {"timestamp": original_evidence_at},
+        {"timestamp": retry_at - 1},
+    ])
+    monkeypatch.setattr("modules.econ_shadow.time.time", lambda: retry_at)
+
+    result = shadow.maybe_run_reconciliation(db, retry_at)
+
+    db.get_fee_changes_between.assert_called_once_with(
+        original_evidence_at - 86400 - 120,
+        original_evidence_at + 1,
+    )
+    assert result["completeness_ok"] is True
+    run = ledger.reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 3600
+    )["runs"][0]
+    assert run["started_at"] == original_evidence_at
+    assert run["completed_at"] == retry_at
 
 
 def test_database_error_persists_failed_run(stack):

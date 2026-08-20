@@ -27,13 +27,15 @@ FEE_INTENT_WINDOW_SECONDS = 86400
 
 
 def fee_change_query_bounds(
-    now: int, window_seconds: int = FEE_INTENT_WINDOW_SECONDS
+    now: int, window_seconds: int = FEE_INTENT_WINDOW_SECONDS,
+    tolerance_seconds: int = 120,
 ) -> tuple[int, int]:
     observed = int(now)
     window = int(window_seconds)
-    if observed < 0 or window < 0:
+    tolerance = int(tolerance_seconds)
+    if observed < 0 or window < 0 or tolerance < 0:
         raise ValueError("fee-intent window values must be non-negative")
-    return max(0, observed - window), observed + 1
+    return max(0, observed - window - tolerance), observed + 1
 
 
 @dataclass(frozen=True)
@@ -194,6 +196,13 @@ def fee_intent_completeness(ledger: EconLedger, fee_changes: list,
                 f"fee_changes[{index}].timestamp must be non-negative")
         fee_change_timestamps.append(raw_ts)
 
+    observed = int(now)
+    window = int(window_seconds)
+    tolerance = int(tolerance_seconds)
+    if observed < 0 or window < 0 or tolerance < 0:
+        return _malformed_fee_change_data(
+            "fee-intent window values must be non-negative")
+
     intents_by_ts: dict = {}
     for event in ledger.events():
         if event["event_type"] != "intent_proposed":
@@ -201,12 +210,17 @@ def fee_intent_completeness(ledger: EconLedger, fee_changes: list,
         cycle = str(event["cycle_id"])
         # fee-cycle-<ts>: post-hoc batch recording (observe mode);
         # fee-broadcast-<ts>: per-broadcast governed recording (2H).
-        if not (cycle.startswith("fee-cycle-")
-                or cycle.startswith("fee-broadcast-")):
+        if cycle.startswith("fee-cycle-"):
+            raw_cycle_ts = cycle[len("fee-cycle-"):]
+        elif cycle.startswith("fee-broadcast-"):
+            raw_cycle_ts = cycle[len("fee-broadcast-"):]
+        else:
             continue
         try:
-            ts = int(cycle.rsplit("-", 1)[1])
+            ts = int(raw_cycle_ts)
         except ValueError:
+            continue
+        if ts < 0 or ts > observed:
             continue
         intents_by_ts[ts] = intents_by_ts.get(ts, 0) + 1
 
@@ -214,11 +228,11 @@ def fee_intent_completeness(ledger: EconLedger, fee_changes: list,
         return {"status": "no_intent_data", "cycles_checked": 0,
                 "complete": None, "mismatched_cycles": {}}
 
-    window_start = max(int(now) - int(window_seconds),
-                       min(intents_by_ts))
+    window_start = max(observed - window, min(intents_by_ts))
+    clustering_start = max(0, window_start - tolerance)
     changes_by_ts: dict = {}
     for ts in fee_change_timestamps:
-        if window_start <= ts <= int(now):
+        if clustering_start <= ts <= observed:
             changes_by_ts[ts] = changes_by_ts.get(ts, 0) + 1
 
     # One fee cycle can write its fee_changes rows across adjacent
@@ -228,18 +242,22 @@ def fee_intent_completeness(ledger: EconLedger, fee_changes: list,
     # against the whole cycle's intent count.
     clusters = []  # [start_ts, end_ts, change_count]
     for ts in sorted(changes_by_ts):
-        if clusters and ts - clusters[-1][1] <= tolerance_seconds:
+        if clusters and ts - clusters[-1][1] <= tolerance:
             clusters[-1][1] = ts
             clusters[-1][2] += changes_by_ts[ts]
         else:
             clusters.append([ts, ts, changes_by_ts[ts]])
 
     mismatched = {}
+    cycles_checked = 0
     for start_ts, end_ts, change_count in clusters:
+        if end_ts < window_start:
+            continue
+        cycles_checked += 1
         matched_intents = sum(
             count for intent_ts, count in intents_by_ts.items()
-            if start_ts - tolerance_seconds <= intent_ts
-            <= end_ts + tolerance_seconds)
+            if start_ts - tolerance <= intent_ts
+            <= end_ts + tolerance)
         if matched_intents != change_count:
             mismatched[str(start_ts)] = {
                 "fee_changes": change_count,
@@ -248,7 +266,7 @@ def fee_intent_completeness(ledger: EconLedger, fee_changes: list,
     return {
         "status": "ok",
         "window_start": window_start,
-        "cycles_checked": len(clusters),
+        "cycles_checked": cycles_checked,
         "complete": not mismatched,
         "mismatched_cycles": mismatched,
     }

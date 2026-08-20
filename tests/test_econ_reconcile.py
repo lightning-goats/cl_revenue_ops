@@ -129,8 +129,17 @@ class TestFeeIntentCompleteness:
 
     def test_fee_change_query_bounds_are_half_open_and_include_now(self):
         from modules.econ_reconcile import fee_change_query_bounds
-        assert fee_change_query_bounds(NOW) == (NOW - 86400, NOW + 1)
+        assert fee_change_query_bounds(NOW) == (
+            NOW - 86400 - 120, NOW + 1)
         assert fee_change_query_bounds(10, window_seconds=20) == (0, 11)
+
+    def test_fee_change_query_bounds_validate_tolerance(self):
+        from modules.econ_reconcile import fee_change_query_bounds
+        assert fee_change_query_bounds(
+            NOW, window_seconds=20, tolerance_seconds=5
+        ) == (NOW - 25, NOW + 1)
+        with pytest.raises(ValueError, match="non-negative"):
+            fee_change_query_bounds(NOW, tolerance_seconds=-1)
 
     def test_future_fee_changes_do_not_contaminate_completeness(self, ledger):
         self._intent(ledger, NOW, n=2)
@@ -154,6 +163,69 @@ class TestFeeIntentCompleteness:
         result = fee_intent_completeness(ledger, changes, now=NOW)
         assert result["complete"] is True
         assert result["mismatched_cycles"] == {}
+
+    def test_cycle_split_across_logical_window_start_is_complete(
+            self, ledger):
+        logical_start = NOW - 86400
+        self._intent(ledger, logical_start, n=2)
+        changes = [
+            {"timestamp": logical_start - 1},
+            {"timestamp": logical_start},
+        ]
+        from modules.econ_reconcile import fee_intent_completeness
+        result = fee_intent_completeness(ledger, changes, now=NOW)
+        assert result["window_start"] == logical_start
+        assert result["cycles_checked"] == 1
+        assert result["complete"] is True
+
+    def test_padding_only_old_cycle_is_not_evaluated(self, ledger):
+        logical_start = NOW - 86400
+        self._intent(ledger, logical_start, n=1)
+        changes = [{"timestamp": logical_start - 1}]
+        from modules.econ_reconcile import fee_intent_completeness
+        result = fee_intent_completeness(ledger, changes, now=NOW)
+        assert result["window_start"] == logical_start
+        assert result["cycles_checked"] == 0
+        assert result["complete"] is True
+
+    def test_future_intent_cannot_hide_unjournaled_current_change(
+            self, ledger):
+        self._intent(ledger, NOW - 3600, n=1)
+        self._intent(ledger, NOW + 60, n=1)
+        changes = [
+            {"timestamp": NOW - 3600},
+            {"timestamp": NOW},
+        ]
+        from modules.econ_reconcile import fee_intent_completeness
+        result = fee_intent_completeness(ledger, changes, now=NOW)
+        assert result["complete"] is False
+        assert result["mismatched_cycles"][str(NOW)] == {
+            "fee_changes": 1, "intents": 0,
+        }
+
+    def test_future_intent_cannot_inflate_current_cycle(self, ledger):
+        self._intent(ledger, NOW, n=1)
+        self._intent(ledger, NOW + 60, n=1)
+        from modules.econ_reconcile import fee_intent_completeness
+        result = fee_intent_completeness(
+            ledger, [{"timestamp": NOW}], now=NOW)
+        assert result["cycles_checked"] == 1
+        assert result["complete"] is True
+
+    def test_negative_fee_intent_timestamp_is_not_recognized(self, ledger):
+        ledger.append(
+            event_type="intent_proposed",
+            intent_id="negative-cycle",
+            idempotency_key="f" * 64,
+            cycle_id="fee-cycle--1",
+            at=NOW,
+            details={},
+        )
+        from modules.econ_reconcile import fee_intent_completeness
+        result = fee_intent_completeness(
+            ledger, [{"timestamp": NOW}], now=NOW)
+        assert result["status"] == "no_intent_data"
+        assert result["complete"] is None
 
     def _assert_malformed_fee_changes(self, ledger, changes):
         self._intent(ledger, NOW, n=1)

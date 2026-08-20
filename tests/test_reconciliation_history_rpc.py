@@ -34,7 +34,7 @@ def test_reconcile_uses_one_clock_for_bounded_fee_history(tmp_path):
     assert result["enabled"] is True
     mod.time.time.assert_called_once_with()
     database.get_fee_changes_between.assert_called_once_with(
-        observed_now - 86400, observed_now + 1
+        observed_now - 86400 - 120, observed_now + 1
     )
     database.get_recent_fee_changes.assert_not_called()
     assert shadow.ledger_for_reconciliation().count_events(

@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved design; implementation not started.
+Implementation complete; final review pending.
 
 ## Problem and production evidence
 
