@@ -378,3 +378,39 @@ def test_writer_failures_are_manifested_without_raising(tmp_path, monkeypatch, f
     failure(monkeypatch, manager)
     manager.finish_cycle(manager.begin_cycle(_configuration(), {"trigger": "automatic"}), CycleResult())
     _wait_for_failed(manager, category)
+
+
+
+def test_enable_rejects_symlink_output_directory(tmp_path):
+    target = tmp_path / "target"; target.mkdir()
+    database = tmp_path / "revenue_ops.db"
+    output = tmp_path / "revenue_ops_rebalance_replay"
+    output.symlink_to(target, target_is_directory=True)
+    manager = RebalanceCycleCaptureManager(database, lambda *_a, **_k: None)
+
+    assert manager.set_enabled(True) is False
+    assert manager.read_manifest() == {}
+
+
+def test_atomic_write_rejects_symlink_destination_and_cleans_temp(tmp_path):
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    target = manager.output_dir / "target"
+    target.write_text("unchanged")
+    destination = manager.output_dir / "capture.json"
+    destination.symlink_to(target)
+
+    with pytest.raises(OSError):
+        manager._atomic_write(destination, b"bad")
+
+    assert target.read_text() == "unchanged"
+    assert not list(manager.output_dir.glob(".*.tmp"))
+
+
+
+def test_many_enable_disable_cycles_close_without_writer_wedge(tmp_path):
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    for _ in range(40):
+        assert manager.set_enabled(True)
+        assert manager.set_enabled(False, timeout_seconds=1.0)
+        assert manager._writer is None or not manager._writer.is_alive()
