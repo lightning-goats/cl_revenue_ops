@@ -17,9 +17,10 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
+from types import MappingProxyType, SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from modules.rebalance_cycle_replay_wire import (
     MAX_ENVELOPE_BYTES,
@@ -36,6 +37,7 @@ MAX_GENERATED_PAIRS = 4096
 MAX_FINAL_PAIRS = 64
 MAX_OUTCOMES = 64
 MAX_SKIPS = 128
+MAX_HANDOFF_GRAPH_NODES = 100_000
 _MAX_TEXT = 512
 _DRAIN_SENTINEL = object()
 
@@ -364,13 +366,13 @@ def _project_outcomes(outcomes: Any, final_identities: set[tuple[str, str]]) -> 
 
 
 def _configuration(value: Any) -> dict:
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise ValueError("configuration must be an object")
     expected = {
         "config_version", "target_band_low", "target_band_high",
         "max_chunk_sats", "max_pairs", "pair_fee_cap_ppm",
     }
-    if set(value) != expected:
+    if len(value) != len(expected) or set(value) != expected:
         raise ValueError("configuration fields are incomplete or unknown")
     return {
         "config_version": _strict_int(value["config_version"], "configuration.config_version", positive=True),
@@ -399,8 +401,80 @@ class RebalanceCycleCaptureReference:
     capture_run_id: str
     capture_seq: int
     cycle_id: str
-    configuration: dict
-    producer: dict
+    configuration: Mapping[str, Any]
+    producer: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _CaptureHandoff:
+    """Bounded ownership-transfer token consumed only by the daemon writer."""
+
+    reference: RebalanceCycleCaptureReference
+    result: Any
+    terminal_stage: str
+
+
+@dataclass(frozen=True)
+class _CapturePreparationFailure:
+    error_category: str
+    error: str
+
+
+_UNPREPARED = object()
+
+
+def _assert_bounded_handoff_graph(values: tuple[Any, ...]) -> None:
+    """Bound traversal before deepcopy so capture never copies an unbounded graph."""
+    pending = list(values)
+    seen = set()
+    nodes = 0
+    while pending:
+        value = pending.pop()
+        if value is None or isinstance(value, (bool, int, float, str, bytes)):
+            continue
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        nodes += 1
+        if nodes > MAX_HANDOFF_GRAPH_NODES:
+            raise ValueError("cycle evidence exceeds handoff graph bound")
+        if isinstance(value, Mapping):
+            expansion = len(value) * 2
+            if len(pending) + expansion > MAX_HANDOFF_GRAPH_NODES:
+                raise ValueError("cycle evidence mapping exceeds handoff bound")
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            if len(pending) + len(value) > MAX_HANDOFF_GRAPH_NODES:
+                raise ValueError("cycle evidence sequence exceeds handoff bound")
+            pending.extend(value)
+        else:
+            attributes = getattr(value, "__dict__", None)
+            if isinstance(attributes, dict):
+                pending.append(attributes)
+
+
+def _detached_cycle_result(result: Any) -> Any:
+    """Copy only strict replay inputs after hard count and graph bounds."""
+    _preflight_cycle_result(result)
+    fields = {
+        "considered_candidates": _required(
+            result, "considered_candidates", "cycle result"
+        ),
+        "candidates": _required(result, "candidates", "cycle result"),
+        "audit_records": _required(result, "audit_records", "cycle result"),
+        "snapshot": _required(result, "snapshot", "cycle result"),
+        "pair_outcomes": _required(result, "pair_outcomes", "cycle result"),
+        "planner_bootstrap_evidence": _required(
+            result, "planner_bootstrap_evidence", "cycle result"
+        ),
+    }
+    _assert_bounded_handoff_graph(tuple(fields.values()))
+    detached = copy.deepcopy(fields)
+    # The projector consumes attributes only; do not retain unrelated plan,
+    # executor, DB, RPC, or engine objects in the writer handoff.
+    return SimpleNamespace(**detached)
 
 
 def project_cycle_result(reference: Any, result: Any, terminal_stage: str = "completed") -> dict:
@@ -530,12 +604,15 @@ class RebalanceCycleCaptureManager:
         self._condition = threading.Condition(self._lock)
         self._queue: queue.Queue = queue.Queue(maxsize=WRITER_QUEUE_SIZE)
         self._slots = threading.BoundedSemaphore(WRITER_QUEUE_SIZE)
-        self.python_commit = self._discover_python_commit()
+        # Disabled construction is intentionally inert; provenance is resolved
+        # only as part of an accepted enable transition.
+        self.python_commit = "unknown"
         self._enabled = False
         self._writer: Optional[threading.Thread] = None
         self._run_id: Optional[str] = None
         self._next_seq = 0
         self._active = set()
+        self._prepared: dict[int, Any] = {}
         self._inflight = 0
         self._manifest: Optional[dict] = None
 
@@ -566,11 +643,13 @@ class RebalanceCycleCaptureManager:
                 if not self._enabled or self._run_id is None or self._manifest is None:
                     return None
                 configuration_value = configuration() if callable(configuration) else configuration
-                configuration_copy = _configuration(copy.deepcopy(configuration_value))
+                configuration_copy = MappingProxyType(
+                    _configuration(configuration_value)
+                )
                 producer_value = producer() if callable(producer) else producer
-                producer_copy = copy.deepcopy(producer_value)
-                if not isinstance(producer_copy, dict):
+                if not isinstance(producer_value, Mapping) or len(producer_value) > 4:
                     return None
+                producer_copy = dict(producer_value)
                 producer_copy.setdefault("started_at", _utc_now())
                 producer_copy.setdefault("python_commit", self.python_commit)
                 producer_copy.setdefault("algorithm_version", "rebalance-v2-phase1a")
@@ -580,6 +659,7 @@ class RebalanceCycleCaptureManager:
                 allowed = {"started_at", "python_commit", "algorithm_version", "trigger"}
                 if set(producer_copy) != allowed:
                     return None
+                producer_copy = MappingProxyType(producer_copy)
                 self._next_seq += 1
                 sequence = self._next_seq
                 cycle_id = f"{self._run_id}:{sequence:08d}"
@@ -601,8 +681,37 @@ class RebalanceCycleCaptureManager:
         except Exception:
             return None
 
+    def prepare_cycle_result(self, reference: Any, result: Any) -> bool:
+        """Detach bounded finish-time evidence before public objects escape."""
+        sequence = _field(reference, "capture_seq", None)
+        with self._condition:
+            if not isinstance(sequence, int) or sequence not in self._active:
+                return False
+        try:
+            detached = _detached_cycle_result(result)
+        except Exception as exc:
+            detached = _CapturePreparationFailure(
+                type(exc).__name__, _bounded_text(exc),
+            )
+        try:
+            with self._condition:
+                if not isinstance(sequence, int) or sequence not in self._active:
+                    return False
+                self._prepared[sequence] = detached
+                return not isinstance(detached, _CapturePreparationFailure)
+        except Exception:
+            return False
+
     def finish_cycle(self, reference: Any, result: Any, terminal_stage: str = "completed") -> None:
+        """Transfer a bounded cycle lease to the writer without heavy work.
+
+        Prepared engine evidence uses its bounded detached copy. Direct callers
+        without preparation transfer mutation ownership of ``result`` here.
+        Projection, validation, sealing, serialization, and size checks are all
+        performed by the daemon writer before publication.
+        """
         slot_acquired = False
+        attempt = None
         try:
             with self._condition:
                 sequence = _field(reference, "capture_seq", None)
@@ -623,23 +732,21 @@ class RebalanceCycleCaptureManager:
                     return
                 slot_acquired = True
 
-            completed_producer = dict(_field(reference, "producer", {}) or {})
-            completed_producer["completed_at"] = _utc_now()
-            completed_reference = replace(reference, producer=completed_producer)
-            _preflight_cycle_result(result)
-            body = project_cycle_result(completed_reference, result, terminal_stage)
-            envelope = seal_envelope(body)
-            serialized = json.dumps(
-                envelope, sort_keys=True, separators=(",", ":"),
-                ensure_ascii=False,
-            ).encode("utf-8")
-            if len(serialized) > MAX_ENVELOPE_BYTES:
-                raise ValueError("complete sealed envelope exceeds 32 MiB")
-
-            with self._condition:
-                self._queue.put_nowait((completed_reference, serialized, attempt))
+                completed_producer = dict(_field(reference, "producer", {}) or {})
+                completed_producer["completed_at"] = _utc_now()
+                completed_reference = replace(
+                    reference,
+                    configuration=reference.configuration,
+                    producer=completed_producer,
+                )
+                prepared = self._prepared.pop(sequence, _UNPREPARED)
+                handoff_result = result if prepared is _UNPREPARED else prepared
+                handoff = _CaptureHandoff(
+                    completed_reference, handoff_result, terminal_stage,
+                )
+                self._queue.put_nowait(handoff)
                 attempt["status"] = "queued"
-                attempt["eligible"] = bool(body["completeness"]["eligible"])
+                attempt["eligible"] = False
                 slot_acquired = False
                 self._condition.notify_all()
         except Exception as exc:
@@ -647,7 +754,6 @@ class RebalanceCycleCaptureManager:
                 self._slots.release()
             try:
                 with self._condition:
-                    attempt = locals().get("attempt")
                     if isinstance(attempt, dict):
                         self._fail_locked(attempt, exc)
                     self._condition.notify_all()
@@ -670,9 +776,12 @@ class RebalanceCycleCaptureManager:
             if self._writer is not None and self._writer.is_alive():
                 return False
             self._ensure_output_dir()
+            if self.python_commit == "unknown":
+                self.python_commit = self._discover_python_commit()
             self._run_id = uuid.uuid4().hex
             self._next_seq = 0
             self._active.clear()
+            self._prepared.clear()
             self._queue = queue.Queue(maxsize=WRITER_QUEUE_SIZE)
             self._slots = threading.BoundedSemaphore(WRITER_QUEUE_SIZE)
             self._manifest = {
@@ -730,22 +839,55 @@ class RebalanceCycleCaptureManager:
             if item is _DRAIN_SENTINEL:
                 self._queue.task_done()
                 return
-            reference, serialized, attempt = item
+            handoff = item
+            reference = handoff.reference
+            attempt = None
             with self._condition:
+                attempt = self._attempt_locked(reference.capture_seq)
                 self._inflight += 1
-                attempt["status"] = "writing"
+                if attempt is not None:
+                    attempt["status"] = "writing"
             try:
+                if isinstance(handoff.result, _CapturePreparationFailure):
+                    raise ValueError(
+                        "capture preparation failed: "
+                        f"{handoff.result.error_category}: {handoff.result.error}"
+                    )
+                _preflight_cycle_result(handoff.result)
+                body = project_cycle_result(
+                    reference, handoff.result, handoff.terminal_stage,
+                )
+                envelope = seal_envelope(body)
+                serialized = json.dumps(
+                    envelope, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                if len(serialized) > MAX_ENVELOPE_BYTES:
+                    raise ValueError("complete sealed envelope exceeds 32 MiB")
                 self._publish_envelope(reference, serialized)
                 with self._condition:
-                    attempt["status"] = "completed"
+                    if attempt is not None:
+                        attempt["status"] = "completed"
+                        attempt["eligible"] = bool(
+                            body["completeness"]["eligible"]
+                        )
                     self._manifest["completed"] += 1
             except Exception as exc:
                 with self._condition:
-                    self._fail_locked(attempt, exc)
+                    if attempt is not None:
+                        self._fail_locked(attempt, exc)
             finally:
                 with self._condition:
+                    manifest_path, manifest_data = self._manifest_snapshot_locked()
+                try:
+                    self._write_manifest_snapshot(manifest_path, manifest_data)
+                except Exception as exc:
+                    with self._condition:
+                        if self._manifest is not None:
+                            self._manifest["writer_health"] = "degraded"
+                            self._manifest["last_error_category"] = type(exc).__name__
+                with self._condition:
                     self._inflight -= 1
-                    self._publish_manifest_locked()
                     self._condition.notify_all()
                 self._slots.release()
                 self._queue.task_done()
@@ -781,17 +923,34 @@ class RebalanceCycleCaptureManager:
     def _manifest_path(self) -> Path:
         return self.output_dir / f"manifest-{self._run_id}.v{SCHEMA_VERSION}.json"
 
-    def _publish_manifest_locked(self) -> None:
+    def _manifest_snapshot_locked(self) -> tuple[Optional[Path], Optional[bytes]]:
         if self._manifest is None or self._run_id is None:
-            return
+            return None, None
         self._prune_attempts_locked()
         self._manifest["updated_at"] = _utc_now()
+        return (
+            self._manifest_path(),
+            json.dumps(
+                self._manifest, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+
+    def _write_manifest_snapshot(
+        self, path: Optional[Path], data: Optional[bytes],
+    ) -> None:
+        if path is None or data is None:
+            return
+        self._atomic_write(path, data)
+        self._rotate_capture_files()
+
+    def _publish_manifest_locked(self) -> None:
+        path, data = self._manifest_snapshot_locked()
         try:
-            self._atomic_write(self._manifest_path(), json.dumps(self._manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-            self._rotate_capture_files()
+            self._write_manifest_snapshot(path, data)
         except Exception as exc:
-            self._manifest["writer_health"] = "degraded"
-            self._manifest["last_error_category"] = type(exc).__name__
+            if self._manifest is not None:
+                self._manifest["writer_health"] = "degraded"
+                self._manifest["last_error_category"] = type(exc).__name__
 
     def _ensure_output_dir(self) -> None:
         if self.output_dir.is_symlink():

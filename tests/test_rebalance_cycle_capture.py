@@ -1,4 +1,7 @@
+import json
+import threading
 import time
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -93,15 +96,20 @@ def test_pair_outcomes_keep_completed_future_pair_identity():
         ("source-b", "dest-b"), ("source-a", "dest-a"),
     ]
 
-def test_finish_is_no_throw_when_writer_fails(tmp_path, monkeypatch):
+def test_finish_is_no_throw_and_writer_failure_is_manifested(tmp_path, monkeypatch):
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
     ref = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
-    monkeypatch.setattr(manager, "_publish_envelope", lambda *_a: (_ for _ in ()).throw(OSError("blocked")))
+    monkeypatch.setattr(
+        manager,
+        "_publish_envelope",
+        lambda *_a: (_ for _ in ()).throw(OSError("blocked")),
+    )
 
-    manager.finish_cycle(ref, CycleResult())
+    manager.finish_cycle(ref, _strict_result())
 
-    assert manager.read_manifest()["failed"] >= 0
+    _wait_for_failed(manager, "OSError")
+    assert manager.set_enabled(False, timeout_seconds=1.0)
 
 
 def test_projection_bounds_malformed_failure_metadata():
@@ -176,6 +184,8 @@ class _CaptureManager:
         self.finishes = []
 
     def begin_cycle(self, configuration, producer):
+        configuration = configuration() if callable(configuration) else configuration
+        producer = producer() if callable(producer) else producer
         self.begins.append((configuration, producer))
         return SimpleNamespace(capture_run_id="a" * 32, capture_seq=len(self.begins), cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer=producer)
 
@@ -183,18 +193,23 @@ class _CaptureManager:
         self.finishes.append((reference, result, terminal_stage))
 
 
-def test_finish_enqueues_only_an_immutable_projected_body(tmp_path, monkeypatch):
+def test_finish_enqueues_only_a_frozen_bounded_reference_handoff(tmp_path, monkeypatch):
     monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
     reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    result = _strict_result()
 
-    manager.finish_cycle(reference, _strict_result())
-    queued = manager._queue.get_nowait()
+    manager.finish_cycle(reference, result)
+    handoff = manager._queue.get_nowait()
 
-    assert isinstance(queued[1], bytes)
-    assert b"rebalance_cycle_replay" in queued[1]
-    assert not hasattr(queued[1], "append")
+    assert handoff.reference is not reference
+    assert handoff.result is result
+    with pytest.raises(TypeError):
+        reference.configuration["raw"] = "mutation"
+    assert handoff.terminal_stage == "completed"
+    with pytest.raises(FrozenInstanceError):
+        handoff.result = None
 
 def test_projection_rejects_duplicate_or_noncontiguous_generated_evidence():
     first = _pair("source-a", "dest-a", 4)
@@ -300,21 +315,31 @@ def test_projection_keeps_true_bootstrap_decomposition_separate_from_later_engin
     assert generated["bootstrap_score_decomposition"]["stage"] == "planner_pre_route"
     assert generated["score_decomposition"]["stage"] == "priced"
 
-def test_finish_handoff_freezes_mutable_cycle_evidence_before_writer(tmp_path, monkeypatch):
-    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+def test_writer_freezes_mutable_cycle_evidence_before_publication(tmp_path, monkeypatch):
+    published = []
+    projection_complete = threading.Event()
+    allow_publish = threading.Event()
+
+    def blocked_publish(_reference, serialized):
+        published.append(serialized)
+        projection_complete.set()
+        assert allow_publish.wait(1.0)
+
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    monkeypatch.setattr(manager, "_publish_envelope", blocked_publish)
     assert manager.set_enabled(True)
     reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
     pair = _pair()
     result = _strict_result(pair=pair)
 
     manager.finish_cycle(reference, result)
+    assert projection_complete.wait(1.0)
     pair.score = 999.0
     result.candidates.clear()
-    queued = manager._queue.get_nowait()
+    allow_publish.set()
+    assert manager.set_enabled(False, timeout_seconds=1.0)
 
-    import json
-    frozen = json.loads(queued[1])
+    frozen = json.loads(published[0])
     assert len(frozen["funnel"]["final_selected_pairs"]) == 1
     assert frozen["funnel"]["generated_pairs"][0]["cheap_score"] != 999.0
 
@@ -634,7 +659,6 @@ def test_enabled_finish_does_not_write_filesystem_on_cycle_thread(tmp_path, monk
 def test_hard_preflight_pair_cap_rejects_before_projection(tmp_path, monkeypatch):
     import modules.rebalance_cycle_capture as capture_module
 
-    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
     projected = MagicMock()
@@ -649,14 +673,15 @@ def test_hard_preflight_pair_cap_rejects_before_projection(tmp_path, monkeypatch
         result,
     )
 
+    _wait_for_failed(manager, "ValueError")
     projected.assert_not_called()
     attempt = manager.read_manifest()["attempts"][-1]
     assert attempt["status"] == "failed"
     assert attempt["error_category"] == "ValueError"
+    assert manager.set_enabled(False, timeout_seconds=1.0)
 
 
-def test_incomplete_terminal_stage_is_preserved_in_manifest_without_synthesis(tmp_path, monkeypatch):
-    monkeypatch.setattr(RebalanceCycleCaptureManager, "_writer_main", lambda self: None)
+def test_incomplete_terminal_stage_is_preserved_in_manifest_without_synthesis(tmp_path):
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
 
@@ -666,7 +691,129 @@ def test_incomplete_terminal_stage_is_preserved_in_manifest_without_synthesis(tm
         "no_router",
     )
 
+    _wait_for_failed(manager, "ValueError")
     attempt = manager.read_manifest()["attempts"][-1]
     assert attempt["terminal_stage"] == "no_router"
     assert attempt["eligible"] is False
     assert attempt["status"] == "failed"
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def test_normal_finish_returns_before_slow_projection(tmp_path, monkeypatch):
+    import modules.rebalance_cycle_capture as capture_module
+
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    original = capture_module.project_cycle_result
+    projection_started = threading.Event()
+
+    def slow_projection(*args, **kwargs):
+        projection_started.set()
+        time.sleep(0.30)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(capture_module, "project_cycle_result", slow_projection)
+    reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    started = time.monotonic()
+    manager.finish_cycle(reference, _strict_result())
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.05
+    assert projection_started.wait(1.0)
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def test_disabled_manager_construction_does_not_probe_git(tmp_path, monkeypatch):
+    import modules.rebalance_cycle_capture as capture_module
+
+    run = MagicMock(side_effect=AssertionError("disabled constructor probed git"))
+    monkeypatch.setattr(capture_module.subprocess, "run", run)
+
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+
+    run.assert_not_called()
+    assert manager.begin_cycle(_configuration(), {"trigger": "automatic"}) is None
+
+
+def test_disabled_engine_capture_skips_config_snapshot_and_building():
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    manager = RebalanceCycleCaptureManager(
+        "/tmp/disabled-rebalance-capture.db", lambda *_a, **_k: None,
+    )
+    engine = object.__new__(RebalanceEngine)
+    engine.rebalance_capture_manager = manager
+    engine.config = MagicMock()
+    engine.config.snapshot.side_effect = AssertionError("disabled capture read config")
+    engine._max_concurrent_jobs = MagicMock(
+        side_effect=AssertionError("disabled capture built configuration"),
+    )
+
+    assert engine._begin_rebalance_capture() is None
+    engine.config.snapshot.assert_not_called()
+    engine._max_concurrent_jobs.assert_not_called()
+
+
+def test_manifest_filesystem_io_never_holds_cycle_intake_lock(tmp_path, monkeypatch):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    assert manager.set_enabled(True)
+    first = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    second = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    original = manager._atomic_write
+    manifest_write_started = threading.Event()
+    allow_manifest_write = threading.Event()
+
+    def slow_manifest(path, data):
+        if path.name.startswith("manifest-"):
+            manifest_write_started.set()
+            allow_manifest_write.wait(0.30)
+        return original(path, data)
+
+    monkeypatch.setattr(manager, "_atomic_write", slow_manifest)
+    manager.finish_cycle(first, _strict_result())
+    assert manifest_write_started.wait(1.0)
+
+    started = time.monotonic()
+    manager.finish_cycle(second, _strict_result())
+    elapsed = time.monotonic() - started
+    allow_manifest_write.set()
+
+    assert elapsed < 0.05
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def test_handoff_graph_bound_rejects_before_deepcopy_and_manifests_failure(
+    tmp_path,
+):
+    import modules.rebalance_cycle_capture as capture_module
+
+    class OversizedMapping(dict):
+        deepcopy_calls = 0
+
+        def __len__(self):
+            return capture_module.MAX_HANDOFF_GRAPH_NODES + 1
+
+        def __deepcopy__(self, memo):
+            self.deepcopy_calls += 1
+            raise AssertionError("oversized graph was deep-copied")
+
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    assert manager.set_enabled(True)
+    reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    pair = _pair()
+    oversized = OversizedMapping()
+    pair.score_decomposition = oversized
+    result = _strict_result(pair=pair)
+
+    assert manager.prepare_cycle_result(reference, result) is False
+    manager.finish_cycle(reference, result)
+
+    _wait_for_failed(manager, "ValueError")
+    assert oversized.deepcopy_calls == 0
+    assert manager.set_enabled(False, timeout_seconds=1.0)

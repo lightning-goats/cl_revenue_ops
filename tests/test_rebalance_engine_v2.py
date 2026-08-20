@@ -3694,6 +3694,9 @@ def test_engine_capture_marks_lock_contention_terminal_stage(mock_plugin, mock_d
         engine._cycle_lock.release()
 
     assert result.audit_records[0].reason == "cycle_already_running"
+    manager.prepare_cycle_result.assert_called_once_with(
+        manager.begin_cycle.return_value, result,
+    )
     assert manager.finish_cycle.call_args.args[2] == "lock_contended"
 
 
@@ -3814,10 +3817,12 @@ def test_run_cycle_releases_engine_lock_before_capture_finish(mock_plugin, mock_
     engine = _make_engine(mock_plugin, mock_database)
     manager = MagicMock()
     manager.begin_cycle.return_value = _capture_reference_for_engine()
-    manager.finish_cycle.side_effect = lambda *_args: (
-        pytest.fail("capture finished while engine lock held")
-        if engine._cycle_lock.locked() else None
-    )
+    def assert_unlocked(*_args):
+        if engine._cycle_lock.locked():
+            pytest.fail("capture work occurred while engine lock held")
+
+    manager.prepare_cycle_result.side_effect = assert_unlocked
+    manager.finish_cycle.side_effect = assert_unlocked
     engine.rebalance_capture_manager = manager
     engine.find_candidates = MagicMock(return_value=[])
 
@@ -3858,3 +3863,159 @@ def test_standalone_planner_exception_finishes_owned_capture_once_and_reraises(
 
     assert manager.finish_cycle.call_count == 1
     assert manager.finish_cycle.call_args.args[2] == "failed"
+
+
+def test_run_cycle_detaches_returned_and_cached_result_before_writer_projection(
+    mock_plugin, mock_database, tmp_path, monkeypatch,
+):
+    import json
+    import threading
+
+    import modules.rebalance_cycle_capture as capture_module
+    from modules.rebalance_cycle_capture import RebalanceCycleCaptureManager
+    from modules.rebalance_engine_v2 import CycleResult
+    from modules.rebalance_state_v2 import ChannelState, StateSnapshot
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    assert manager.set_enabled(True)
+    engine.rebalance_capture_manager = manager
+    engine._cycle_router = object()
+    pair = PairCandidate(
+        "source", "dest", "source-peer", "dest-peer", 100, 20,
+        source_excess_sats=100, dest_need_sats=100, max_chunk_sats=100,
+        cheap_rank=1, planner_selected=True,
+    )
+    snapshot = StateSnapshot((ChannelState(
+        channel_id="source", peer_id="source-peer", capacity_sats=1000,
+        local_ratio=0.8, actual_inbound_fee_ppm=0,
+        value_class="valuable", is_valuable=True,
+        remaining_budget_sats=20, cooldown_active=False,
+    ),), 1000, 20, 1)
+    capture_result = CycleResult(
+        considered_candidates=[pair], candidates=[pair], snapshot=snapshot,
+        plan=object(),
+        pair_outcomes=[{
+            "source_channel_id": "source", "dest_channel_id": "dest",
+            "status": "returned_none", "result": None,
+        }],
+        planner_bootstrap_evidence=[{
+            "source_channel_id": "source", "dest_channel_id": "dest",
+            "score_decomposition": {},
+        }],
+    )
+    engine._last_cycle_result = capture_result
+    engine._run_cycle_locked = MagicMock(return_value=capture_result)
+    projection_entered = threading.Event()
+    release_projection = threading.Event()
+    published = []
+    original_project = capture_module.project_cycle_result
+
+    def blocked_projection(*args, **kwargs):
+        projection_entered.set()
+        assert release_projection.wait(1.0)
+        return original_project(*args, **kwargs)
+
+    monkeypatch.setattr(capture_module, "project_cycle_result", blocked_projection)
+    monkeypatch.setattr(
+        manager, "_publish_envelope",
+        lambda _reference, serialized: published.append(serialized),
+    )
+
+    returned = engine.run_cycle()
+    assert projection_entered.wait(1.0)
+    assert engine._last_cycle_result is returned
+    returned.considered_candidates[0].score = 999.0
+    returned.candidates.clear()
+    returned.pair_outcomes[0]["status"] = "mutated"
+    returned.snapshot = StateSnapshot(())
+    release_projection.set()
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+    envelope = json.loads(published[0])
+    assert envelope["pre_state"]["normalized_snapshot"]["channels"]
+    assert envelope["funnel"]["generated_pairs"][0]["cheap_score"] != 999.0
+    assert len(envelope["funnel"]["final_selected_pairs"]) == 1
+    assert envelope["execution"]["pair_outcomes"][0]["status"] == "returned_none"
+
+
+def test_find_candidates_detaches_returned_and_cached_evidence_before_projection(
+    mock_plugin, mock_database, tmp_path, monkeypatch,
+):
+    import json
+    import threading
+
+    import modules.rebalance_cycle_capture as capture_module
+    from modules.rebalance_cycle_capture import RebalanceCycleCaptureManager
+    from modules.rebalance_engine_v2 import CycleResult
+    from modules.rebalance_state_v2 import ChannelState, StateSnapshot
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    assert manager.set_enabled(True)
+    engine.rebalance_capture_manager = manager
+    pair = PairCandidate(
+        "source", "dest", "source-peer", "dest-peer", 100, 20,
+        source_excess_sats=100, dest_need_sats=100, max_chunk_sats=100,
+        cheap_rank=1, planner_selected=True,
+    )
+    snapshot = StateSnapshot((ChannelState(
+        channel_id="source", peer_id="source-peer", capacity_sats=1000,
+        local_ratio=0.8, actual_inbound_fee_ppm=0,
+        value_class="valuable", is_valuable=True,
+        remaining_budget_sats=20, cooldown_active=False,
+    ),), 1000, 20, 1)
+    capture_result = CycleResult(
+        considered_candidates=[pair], candidates=[pair], snapshot=snapshot,
+        plan=object(),
+        pair_outcomes=[{
+            "source_channel_id": "source", "dest_channel_id": "dest",
+            "status": "returned_none", "result": None,
+        }],
+        planner_bootstrap_evidence=[{
+            "source_channel_id": "source", "dest_channel_id": "dest",
+            "score_decomposition": {},
+        }],
+    )
+
+    def fake_find(_reference):
+        engine._cycle_router = object()
+        engine._last_cycle_result = capture_result
+        return capture_result.candidates
+
+    engine._find_candidates_impl = fake_find
+    projection_entered = threading.Event()
+    release_projection = threading.Event()
+    published = []
+    original_project = capture_module.project_cycle_result
+
+    def blocked_projection(*args, **kwargs):
+        projection_entered.set()
+        assert release_projection.wait(1.0)
+        return original_project(*args, **kwargs)
+
+    monkeypatch.setattr(capture_module, "project_cycle_result", blocked_projection)
+    monkeypatch.setattr(
+        manager, "_publish_envelope",
+        lambda _reference, serialized: published.append(serialized),
+    )
+
+    returned = engine.find_candidates()
+    assert projection_entered.wait(1.0)
+    assert returned is engine._last_cycle_result.candidates
+    returned[0].score = 999.0
+    engine._last_cycle_result.pair_outcomes[0]["status"] = "mutated"
+    engine._last_cycle_result.snapshot = StateSnapshot(())
+    release_projection.set()
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+    envelope = json.loads(published[0])
+    assert envelope["pre_state"]["normalized_snapshot"]["channels"]
+    assert envelope["funnel"]["generated_pairs"][0]["cheap_score"] != 999.0
+    assert envelope["execution"]["pair_outcomes"][0]["status"] == "returned_none"

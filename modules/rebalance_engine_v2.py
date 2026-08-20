@@ -1323,6 +1323,10 @@ class RebalanceEngine:
                 terminal_stage = "missing_snapshot"
             else:
                 terminal_stage = "planning_only"
+            if owns_capture_reference and capture_reference is not None:
+                self._prepare_rebalance_capture(
+                    capture_reference, terminal_result,
+                )
             return candidates
         finally:
             if owns_capture_reference and capture_reference is not None:
@@ -3959,20 +3963,46 @@ class RebalanceEngine:
         if manager is None:
             return None
         try:
-            cfg = self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
-            return manager.begin_cycle(
-                {
+            def configuration_factory():
+                cfg = (
+                    self.config.snapshot()
+                    if hasattr(self.config, "snapshot")
+                    else self.config
+                )
+                return {
                     "config_version": 1,
-                    "target_band_low": getattr(cfg, "low_liquidity_threshold", 0.35),
-                    "target_band_high": getattr(cfg, "high_liquidity_threshold", 0.65),
-                    "max_chunk_sats": getattr(cfg, "rebalance_max_amount", 2_000_000),
+                    "target_band_low": getattr(
+                        cfg, "low_liquidity_threshold", 0.35
+                    ),
+                    "target_band_high": getattr(
+                        cfg, "high_liquidity_threshold", 0.65
+                    ),
+                    "max_chunk_sats": getattr(
+                        cfg, "rebalance_max_amount", 2_000_000
+                    ),
                     "max_pairs": self._max_concurrent_jobs(cfg),
                     "pair_fee_cap_ppm": getattr(cfg, "pair_fee_cap_ppm", 0),
-                },
-                {"trigger": trigger},
+                }
+
+            return manager.begin_cycle(
+                configuration_factory,
+                lambda: {"trigger": trigger},
             )
         except Exception:
             return None
+
+    def _prepare_rebalance_capture(self, reference: Any, result: Any) -> None:
+        if reference is None or self.rebalance_capture_manager is None:
+            return
+        prepare = getattr(
+            self.rebalance_capture_manager, "prepare_cycle_result", None,
+        )
+        if not callable(prepare):
+            return
+        try:
+            prepare(reference, result)
+        except Exception:
+            pass
 
     def run_cycle(self) -> CycleResult:
         """Live execution: find candidates (already priced), execute concurrently.
@@ -4006,7 +4036,12 @@ class RebalanceEngine:
             )
             try:
                 if capture_reference is not None:
-                    self.rebalance_capture_manager.finish_cycle(capture_reference, contention_result, "lock_contended")
+                    self._prepare_rebalance_capture(
+                        capture_reference, contention_result,
+                    )
+                    self.rebalance_capture_manager.finish_cycle(
+                        capture_reference, contention_result, "lock_contended",
+                    )
             except Exception:
                 pass
             return contention_result
@@ -4018,6 +4053,10 @@ class RebalanceEngine:
             self._cycle_lock.release()
             try:
                 if capture_reference is not None:
+                    if result is not None:
+                        self._prepare_rebalance_capture(
+                            capture_reference, result,
+                        )
                     terminal_stage = "failed"
                     if result is not None:
                         if self._cycle_router is None:
