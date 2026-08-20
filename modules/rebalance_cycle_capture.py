@@ -122,7 +122,7 @@ def _project_pair(pair: Any, fallback_rank: int) -> Optional[dict]:
         "cheap_score": score,
         "planner_selected": bool(_field(pair, "planner_selected", False)),
         "planner_rejection_reason": rejection or None,
-        "bootstrap_score_decomposition": _safe_value(decomposition),
+        "bootstrap_score_decomposition": _safe_value(_field(pair, "bootstrap_score_decomposition", decomposition) or decomposition),
         "score_decomposition": _safe_value(decomposition),
         "route_cost_sats": _nonnegative(_field(pair, "route_cost_sats", 0)),
         "effective_budget_sats": _nonnegative(decomposition.get("effective_budget_sats", _field(pair, "pair_budget_sats", 0))),

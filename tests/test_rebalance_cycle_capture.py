@@ -292,3 +292,17 @@ def test_rotation_enforces_32_total_owned_files_without_deleting_unowned_json(tm
     owned = [path for path in manager.output_dir.glob("*.json") if path.name != unrelated.name]
     assert unrelated.exists()
     assert len(owned) <= 32
+
+
+
+def test_projection_keeps_true_bootstrap_decomposition_separate_from_later_engine_state():
+    pair = _pair()
+    pair.bootstrap_score_decomposition = {"stage": "planner_pre_route", "p_success": 0.5}
+    pair.score_decomposition = {"stage": "priced", "p_success": 0.9}
+    reference = SimpleNamespace(capture_run_id="a" * 32, capture_seq=1, cycle_id=("a" * 32) + ":00000001", configuration=_configuration(), producer={"trigger": "automatic"})
+
+    body = project_cycle_result(reference, CycleResult(considered_candidates=[pair], candidates=[pair]))
+
+    generated = body["funnel"]["generated_pairs"][0]
+    assert generated["bootstrap_score_decomposition"]["stage"] == "planner_pre_route"
+    assert generated["score_decomposition"]["stage"] == "priced"

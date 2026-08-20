@@ -1333,6 +1333,11 @@ class RebalanceEngine:
         )
 
         plan = planner.plan(snapshot)
+        for generated_pair in getattr(plan, "generated", []) or []:
+            if not getattr(generated_pair, "bootstrap_score_decomposition", None):
+                generated_pair.bootstrap_score_decomposition = copy.deepcopy(
+                    getattr(generated_pair, "score_decomposition", {}) or {}
+                )
         generated = list(getattr(plan, "generated", []) or [])
         # Keep hand-constructed legacy PlanResult fixtures diagnostic-only
         # compatible; the real planner always provides its complete universe.
