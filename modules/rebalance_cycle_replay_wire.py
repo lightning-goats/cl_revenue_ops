@@ -134,6 +134,15 @@ def _normalize_integer_value(value: Any, label: str) -> Any:
     return int(value)
 
 
+def _normalize_schema_version(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("schema_version must be an integer")
+    value = _normalize_integer_value(value, "schema_version")
+    if not isinstance(value, int) or value != SCHEMA_VERSION:
+        raise ValueError("wrong schema_version")
+    return value
+
+
 def _normalize_mapping_integer_field(
     mapping: Any,
     field: str,
@@ -147,6 +156,10 @@ def _normalize_integer_domains(body: Any) -> Any:
     if not isinstance(body, dict):
         return body
     normalized = copy.deepcopy(body)
+    if "schema_version" in normalized:
+        normalized["schema_version"] = _normalize_schema_version(
+            normalized["schema_version"]
+        )
     _normalize_mapping_integer_field(normalized, "capture_seq", "capture_seq")
 
     configuration = normalized.get("configuration")

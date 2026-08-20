@@ -354,6 +354,7 @@ def test_zero_rebalance_budget_domains_reject_negative_and_boolean_values(field,
 
 
 INTEGER_DOMAIN_CASES = [
+    pytest.param(("schema_version",), id="schema-version"),
     pytest.param(("capture_seq",), id="capture-seq"),
     pytest.param(("configuration", "config_version"), id="config-version"),
     pytest.param(("configuration", "max_chunk_sats"), id="max-chunk"),
@@ -412,6 +413,17 @@ def test_integral_float_integer_domains_normalize_for_seal_verify_and_schema(pat
 @pytest.mark.parametrize(
     ("path", "invalid"),
     [
+        pytest.param(("schema_version",), False, id="schema-version-bool-false"),
+        pytest.param(("schema_version",), True, id="schema-version-bool-true"),
+        pytest.param(("schema_version",), 1, id="schema-version-nonzero"),
+        pytest.param(("schema_version",), 0.5, id="schema-version-nonintegral"),
+        pytest.param(("schema_version",), float("nan"), id="schema-version-nan"),
+        pytest.param(("schema_version",), float("inf"), id="schema-version-inf"),
+        pytest.param(
+            ("schema_version",),
+            9_007_199_254_740_992.0,
+            id="schema-version-out-of-range",
+        ),
         pytest.param(("capture_seq",), 1.5, id="positive-nonintegral"),
         pytest.param(("configuration", "pair_fee_cap_ppm"), 0.5, id="nonnegative-nonintegral"),
         pytest.param(("capture_seq",), True, id="positive-bool"),
