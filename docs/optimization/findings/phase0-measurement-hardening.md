@@ -315,6 +315,10 @@ Control-host scheduling was also corrected:
   local Lightning socket while masking failure, was disabled but retained for
   rollback.
 
+An isolated end-to-end smoke run used a temporary results root and the
+closed-UTC-day selector. It selected 2026-08-19, exited 0, and produced a
+complete node manifest with no errors without overwriting historical evidence.
+
 This is observational measurement work only. The successor window remains
 inactive, `formal_window_active=false`, and no optimization may influence live
 economic decisions.
