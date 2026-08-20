@@ -18,7 +18,7 @@ The reviewed range is `b6e6c9a5437405fae2c09169847d507acab13b94..cec0309a55b00b6
 
 - `583bd0657a890e153f1bacee900bae50a40c094f` — approved Phase 1A design;
 - `17575ec0c6890df2ca093c2e7c5e798fc7c829c2` — implementation plan;
-- `25f996e97cdedb4b4986f54080a6dd604e52cb8a` through `79b61069eb7b74703ffd3d68f17d3033796e4089` — v0 sealed wire corrections;
+- `25f996e97cdedb4b4986f54080a6dd604e52cb8a` (initial envelope), `c188ce4b207491fd1a517d06e3f58a06c893fcb3` (validation hardening), `3d23e2243860c16f7cfc91827dcff13519a54941` (schema alignment), `1877c04494b4e1f0212e99d7d436282cf6de3875` (binary64 encoding), `94950b6e1e2345426cfbc33b76b57d1758e47273` (reserved float tags), and `79b61069eb7b74703ffd3d68f17d3033796e4089` (integer normalization);
 - `3ca0324382e9aafe04557bda17abd95df794ba10` — complete planner-funnel retention;
 - `d0c8d7fbab35001dc178b0c057ad69dff537b0f2` through `7630b75077629b9da85b0fbb9e038170fb535b75` — bounded capture and Task 3 lifecycle hardening; and
 - `503db0eda7c2d88da416dccef5e957b0c6798b4a` and `cec0309a55b00b669f20c1ead8b68fc60c828981` — standalone replay and final hardening.
@@ -26,6 +26,10 @@ The reviewed range is `b6e6c9a5437405fae2c09169847d507acab13b94..cec0309a55b00b6
 The v0 envelope captures the normalized pre-cycle `StateSnapshot`, the six planner configuration fields, producer identity/version/timestamps, the full generated cheap-pair universe and rank, planner selection/rejection metadata, final selected-pair observations (including the existing route summary and post-price evidence), pair-linked execution outcomes, completeness counters, terminal stage, and a SHA-256 integrity seal. It intentionally does **not** capture payment secrets, invoices, raw RPC payloads, a full plugin-config dump, historical gossip, route alternatives, amount ladders, or a re-executable Askrene session.
 
 Bounds are explicit: 1,024 snapshot channels; 4,096 generated pairs; 64 final pairs and pair outcomes; 128 skips; a 100,000-node handoff graph; a two-slot non-blocking writer queue; 32 MiB per sealed envelope; and retention of at most 32 owned files / 256 MiB. Error text and structured failure evidence are bounded; only an allowlisted failure projection and the existing bounded route summary cross the capture boundary. Symlink output and unsafe replay input types are rejected.
+
+### Manifest durability limitation
+
+Lifecycle calls return after a non-blocking manifest-publication enqueue; disk state may therefore lag the in-memory lifecycle state. Newer snapshots coalesce per run, and a fixed 64-pending-run cap applies backpressure rather than silently accepting a run whose terminal manifest cannot be retained. Consumers must verify that the terminal manifest is durable before treating a capture as recorded. An abrupt process death can still lose an enqueued, not-yet-durable manifest correction; this is observational evidence loss, not an authorization or execution signal.
 
 ### Narrow replay guarantee
 
@@ -68,13 +72,25 @@ The focused command is exactly the Task 5 matrix in `.superpowers/sdd/task-5-bri
 Static and boundary evidence:
 
 ```text
-python -m py_compile [the seven Task 5 runtime files]: passed
+/home/sat/bin/cl_revenue_ops/.venv/bin/python -m py_compile \
+  modules/rebalance_cycle_replay_wire.py modules/rebalance_cycle_capture.py \
+  modules/rebalance_types_v2.py modules/rebalance_planner_v2.py \
+  modules/rebalance_engine_v2.py tools/rebalance_replay.py cl-revenue-ops.py
+exit 0
+
+rg -n -i '(^|[^[:alpha:]])(sling|hive|mycelium|fleet)([^[:alpha:]]|$)' \
+  modules/rebalance_cycle_capture.py modules/rebalance_cycle_replay_wire.py \
+  tools/rebalance_replay.py
+exit 1 (no matches)
+
+rg -n -i 'sendpay|waitsendpay|lightning|plugin|pyln|\.rpc|rpc\.call|revenue-rebalance|revenue-fee|execute|apply' \
+  tools/rebalance_replay.py
+exit 1 (no matches)
+
 tests/test_architecture_guard.py: included in the 404-pass focused run
-direct scan of the three new runtime files for Sling/Hive/mycelium/fleet: no matches
-direct scan of tools/rebalance_replay.py for action/RPC/plugin terms: no matches
 ```
 
-The prescribed `pyflakes` command reports three pre-existing unused imports in `modules/rebalance_engine_v2.py` (`RouteDecision`, `RoutePolicy`, and the shared `_drain_score`/`_refill_urgency` import line). The same imports exist at the merge base; the capture increment introduced none. The prescribed `git diff --check b6e6c9a..HEAD` is also non-green solely for blank EOF lines in the pre-existing Task 1 plan/design files: `docs/optimization/plans/2026-08-20-rebalance-replay-capture.md:574` and `...-design.md:241`. Neither issue is changed by this finding.
+The prescribed `pyflakes` command reports four pre-existing unused-import diagnostics in `modules/rebalance_engine_v2.py`: `RouteDecision`, `RoutePolicy`, `_drain_score`, and `_refill_urgency`. The same imports exist at the merge base; the capture increment introduced none. After removing the two branch-owned trailing blank EOF lines in the Task 1 plan/design, the prescribed whole-range `git diff --check $(git merge-base main HEAD)..HEAD` exits 0.
 
 The separately run installed-environment pin test is intentionally recorded without concealment:
 
@@ -89,11 +105,11 @@ The only failure is known development-environment drift: required versus install
 
 The complete merge-base range was reviewed for selected-list/order, route-call, executor-call, capture-thread, filesystem/retention, secret/payload, malformed evidence, replay dependency, schema/config/RPC, and standalone-architecture regressions. No Critical or Important finding remained.
 
-Planner trace fields are assigned after the existing score sort and greedy selection. `selected` continues to be the only list passed to existing pricing/execution; `generated` is observational. Dedicated regressions cover unchanged golden selected output, disabled-path inertness, unchanged route, reserve, and executor call counts when capture fails or drops, pair-linked concurrent outcomes, malformed/neutral data, and action-option rejection.
+Planner trace fields are assigned after the existing score sort and greedy selection. `selected` continues to be the only list passed to existing pricing/execution; `generated` is observational. The review and golden tests establish unchanged selected output, while dedicated capture/replay regressions establish disabled-path inertness, queue/failure containment, pair-linked concurrent outcomes, malformed/neutral handling, and action-option rejection. This finding does not claim dedicated capture-integrated route/reserve/executor call-count parity tests.
 
 On the cycle path, bounded evidence detachment occurs only after the engine cycle lock is released. Projection, validation, sealing, serialization, manifest I/O, fsync, and retention are daemon-owned. A full handoff queue drops the observation before copying it; capture exceptions are contained and leave the pre-existing cycle result/exception identity authoritative.
 
-Task 3's in-memory host benchmark measured representative 16-pair/32-channel preparation at 1.746–2.195 ms and 41,751 serialized bytes. The maximum fixture (4,096 generated pairs, 1,024 channels, 64 final pairs, 128 skips, 64 outcomes) prepared in 142.640 ms and serialized to 2,820,095 bytes. Its daemon projection took 30.989 ms and sealing/serialization 220.578 ms; those daemon costs are absent from the cycle thread. These are laboratory preparation measurements, not production latency evidence.
+The following are archival Task 3 in-memory measurements, not a preserved benchmark harness or repeatable gate: representative 16-pair/32-channel preparation measured 1.746–2.195 ms and 41,751 serialized bytes. The recorded maximum fixture (4,096 generated pairs, 1,024 channels, 64 final pairs, 128 skips, 64 outcomes) prepared in 142.640 ms and serialized to 2,820,095 bytes. Its daemon projection took 30.989 ms and sealing/serialization 220.578 ms; those daemon costs are absent from the cycle thread. These archival laboratory measurements are not production latency evidence.
 
 ## Follow-ups and gate
 
@@ -101,7 +117,7 @@ Task 3's in-memory host benchmark measured representative 16-pair/32-channel pre
 - Capture the complete pre-engine/orchestrator suppression funnel before claiming whole-cycle replay coverage.
 - Gather shadow evidence for alternate amount candidates/amount ladders; no alternate-amount regret claim is supported now.
 - After the Phase 0 gate passes, require a separate operator-approved, bounded-latency production shadow proposal before enabling capture. That proposal still must not give any optimizer authority.
-- Resolve the local `pyln-client`/`PyYAML`/`numpy` pin drift in a release-like environment, and separately clean the inherited pyflakes/diff-check hygiene findings if their owners choose to do so.
+- Resolve the local `pyln-client`/`PyYAML`/`numpy` pin drift in a release-like environment; the four inherited pyflakes diagnostics remain outside this documentation slice.
 
 ## Activation recommendation
 

@@ -238,4 +238,3 @@ Merging Phase 1A code does not authorize production capture. Production use
 requires a separate reviewed rollout after the Phase 0 evidence gate, with an
 explicit enablement decision and a bounded runtime/latency observation. No
 optimizer may consume this trace as authority in Phase 1A.
-
