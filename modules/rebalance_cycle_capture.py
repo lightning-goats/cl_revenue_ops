@@ -605,6 +605,10 @@ class RebalanceCycleCaptureManager:
         self._condition = threading.Condition(self._lock)
         self._lifecycle_lock = threading.Lock()
         self._filesystem_lock = threading.Lock()
+        self._manifest_publish_condition = threading.Condition(threading.Lock())
+        self._pending_manifest_snapshot = None
+        self._manifest_publish_inflight = False
+        self._manifest_publisher: Optional[threading.Thread] = None
         self._queue: queue.Queue = queue.Queue(maxsize=WRITER_QUEUE_SIZE)
         self._slots = threading.BoundedSemaphore(WRITER_QUEUE_SIZE)
         # Disabled construction is intentionally inert; provenance is resolved
@@ -638,8 +642,19 @@ class RebalanceCycleCaptureManager:
 
     def set_enabled(self, enabled: bool, timeout_seconds: float = 5.0) -> bool:
         try:
-            with self._lifecycle_lock:
-                return self._enable() if enabled else self._disable(timeout_seconds)
+            if enabled:
+                with self._lifecycle_lock:
+                    return self._enable()
+            timeout = max(0.0, float(timeout_seconds))
+            deadline = time.monotonic() + timeout
+            if not self._lifecycle_lock.acquire(
+                timeout=max(0.0, deadline - time.monotonic())
+            ):
+                return False
+            try:
+                return self._disable(deadline)
+            finally:
+                self._lifecycle_lock.release()
         except Exception:
             return False
 
@@ -877,8 +892,7 @@ class RebalanceCycleCaptureManager:
                 writer.start()
         return True
 
-    def _disable(self, timeout_seconds: float) -> bool:
-        timeout = max(0.0, float(timeout_seconds))
+    def _disable(self, deadline: float) -> bool:
         with self._condition:
             self._enabled = False
             if self._manifest is None:
@@ -886,9 +900,9 @@ class RebalanceCycleCaptureManager:
             self._manifest["state"] = "draining"
             draining_snapshot = self._manifest_snapshot_locked()
 
-        # Manifest I/O is explicitly outside the drain timeout and condition.
+        # Publication is non-blocking and the absolute deadline already includes
+        # lifecycle-lock acquisition and every disable transition step.
         self._publish_manifest_snapshot(draining_snapshot)
-        deadline = time.monotonic() + timeout
         rollback_snapshot = None
         with self._condition:
             while self._active or self._inflight or not self._queue.empty():
@@ -1047,13 +1061,50 @@ class RebalanceCycleCaptureManager:
     def _publish_manifest_snapshot(
         self, snapshot: tuple[Optional[Path], Optional[bytes], Optional[int]],
     ) -> None:
-        try:
-            self._write_manifest_snapshot(*snapshot)
-        except Exception as exc:
-            with self._condition:
-                if self._manifest is not None:
-                    self._manifest["writer_health"] = "degraded"
-                    self._manifest["last_error_category"] = type(exc).__name__
+        """Non-blocking, single-slot publication of the newest manifest state."""
+        path, data, revision = snapshot
+        if path is None or data is None or revision is None:
+            return
+        with self._manifest_publish_condition:
+            pending = self._pending_manifest_snapshot
+            if pending is None or revision > pending[2]:
+                self._pending_manifest_snapshot = snapshot
+            publisher = self._manifest_publisher
+            if publisher is None or not publisher.is_alive():
+                publisher = threading.Thread(
+                    target=self._manifest_publisher_main,
+                    name="rebalance-cycle-capture-manifest-writer",
+                    daemon=True,
+                )
+                self._manifest_publisher = publisher
+                publisher.start()
+            self._manifest_publish_condition.notify()
+
+    def _manifest_publisher_main(self) -> None:
+        current = threading.current_thread()
+        while True:
+            with self._manifest_publish_condition:
+                if self._pending_manifest_snapshot is None:
+                    self._manifest_publish_condition.wait(1.0)
+                if self._pending_manifest_snapshot is None:
+                    if self._manifest_publisher is current:
+                        self._manifest_publisher = None
+                    return
+                snapshot = self._pending_manifest_snapshot
+                self._pending_manifest_snapshot = None
+                self._manifest_publish_inflight = True
+            try:
+                self._write_manifest_snapshot(*snapshot)
+            except Exception as exc:
+                with self._condition:
+                    if self._manifest is not None:
+                        self._manifest["writer_health"] = "degraded"
+                        self._manifest["last_error_category"] = type(exc).__name__
+            finally:
+                with self._manifest_publish_condition:
+                    self._manifest_publish_inflight = False
+                    self._manifest_publish_condition.notify_all()
+
 
 
     def _ensure_output_dir(self) -> None:
@@ -1115,7 +1166,7 @@ class RebalanceCycleCaptureManager:
         removed = False
         for _mtime, _name, size, path in candidates:
             if retained_files >= RETENTION_MAX_FILES or retained_bytes + size > RETENTION_MAX_BYTES:
-                path.unlink()
+                path.unlink(missing_ok=True)
                 removed = True
             else:
                 retained_files += 1

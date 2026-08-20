@@ -358,6 +358,19 @@ def test_queue_pressure_uses_the_required_two_slot_bound():
     from modules.rebalance_cycle_capture import WRITER_QUEUE_SIZE
     assert WRITER_QUEUE_SIZE == 2
 
+def _wait_for_manifest_idle(manager, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    with manager._manifest_publish_condition:
+        while (
+            manager._pending_manifest_snapshot is not None
+            or manager._manifest_publish_inflight
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError("manifest publisher did not become idle")
+            manager._manifest_publish_condition.wait(remaining)
+
+
 def _wait_for_failed(manager, category):
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
@@ -398,6 +411,7 @@ def test_enable_rejects_symlink_output_directory(tmp_path):
 def test_atomic_write_rejects_symlink_destination_and_cleans_temp(tmp_path):
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
+    _wait_for_manifest_idle(manager)
     target = manager.output_dir / "target"
     target.write_text("unchanged")
     destination = manager.output_dir / "capture.json"
@@ -423,6 +437,7 @@ def test_many_enable_disable_cycles_close_without_writer_wedge(tmp_path):
 def test_rotation_bounds_owned_artifacts_and_bytes_including_manifest(tmp_path):
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
+    _wait_for_manifest_idle(manager)
     unrelated = manager.output_dir / "keep.json"; unrelated.write_text("{}")
     for index in range(40):
         path = manager.output_dir / (("a" * 32) + f"-{index + 1:08d}-" + ("a" * 32) + f":{index + 1:08d}.json")
@@ -924,7 +939,7 @@ def test_disable_manifest_io_does_not_block_existing_finish_or_new_begin(
     assert disable_result == [True]
 
 
-def test_every_lifecycle_manifest_write_occurs_outside_condition(
+def test_every_lifecycle_manifest_snapshot_is_enqueued_outside_condition(
     tmp_path, monkeypatch,
 ):
     import queue
@@ -932,18 +947,26 @@ def test_every_lifecycle_manifest_write_occurs_outside_condition(
     manager = RebalanceCycleCaptureManager(
         tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
     )
+    original_publish = manager._publish_manifest_snapshot
     original_atomic = manager._atomic_write
-    observed = []
+    enqueued = []
+    written_lock_states = []
 
-    def assert_unlocked_manifest(path, data):
-        if path.name.startswith("manifest-"):
-            observed.append((
-                json.loads(data)["state"],
+    def assert_unlocked_enqueue(snapshot):
+        if snapshot[1] is not None:
+            enqueued.append((
+                json.loads(snapshot[1])["state"],
                 manager._condition._is_owned(),
             ))
+        return original_publish(snapshot)
+
+    def assert_unlocked_write(path, data):
+        if path.name.startswith("manifest-"):
+            written_lock_states.append(manager._condition._is_owned())
         return original_atomic(path, data)
 
-    monkeypatch.setattr(manager, "_atomic_write", assert_unlocked_manifest)
+    monkeypatch.setattr(manager, "_publish_manifest_snapshot", assert_unlocked_enqueue)
+    monkeypatch.setattr(manager, "_atomic_write", assert_unlocked_write)
     assert manager.set_enabled(True)
     assert manager.set_enabled(False, timeout_seconds=1.0)
 
@@ -971,40 +994,178 @@ def test_every_lifecycle_manifest_write_occurs_outside_condition(
     assert manager.set_enabled(False, timeout_seconds=1.0) is False
     manager._queue = writer_queue
     assert manager.set_enabled(False, timeout_seconds=1.0)
+    _wait_for_manifest_idle(manager)
 
-    states = [state for state, _owned in observed]
+    states = [state for state, _owned in enqueued]
     assert {"active", "draining", "closed"} <= set(states)
-    assert all(not owned for _state, owned in observed)
+    assert states.count("active") >= 3
+    assert all(not owned for _state, owned in enqueued)
+    assert written_lock_states
+    assert all(not owned for owned in written_lock_states)
 
 
-def test_disable_timeout_budget_starts_after_manifest_io(tmp_path, monkeypatch):
+def test_disable_wall_clock_bound_includes_stuck_manifest_and_keeps_intake_free(
+    tmp_path, monkeypatch,
+):
     manager = RebalanceCycleCaptureManager(
         tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
     )
     assert manager.set_enabled(True)
-    manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    first = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    blocker = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
     original = manager._atomic_write
-    first_finished = []
-    rollback_started = []
+    write_started = threading.Event()
+    release_write = threading.Event()
 
-    def timed_manifest(path, data):
-        if path.name.startswith("manifest-"):
-            if not first_finished:
-                time.sleep(0.10)
-                result = original(path, data)
-                first_finished.append(time.monotonic())
-                return result
-            if not rollback_started:
-                rollback_started.append(time.monotonic())
+    def stuck_manifest(path, data):
+        if path.name.startswith("manifest-") and not release_write.is_set():
+            write_started.set()
+            assert release_write.wait(1.0)
         return original(path, data)
 
-    monkeypatch.setattr(manager, "_atomic_write", timed_manifest)
+    monkeypatch.setattr(manager, "_atomic_write", stuck_manifest)
+    disable_result = []
+    disable_done = threading.Event()
+    started = time.monotonic()
+    disable_thread = threading.Thread(
+        target=lambda: (
+            disable_result.append(manager.set_enabled(False, timeout_seconds=0.05)),
+            disable_done.set(),
+        ),
+    )
+    disable_thread.start()
+    try:
+        assert write_started.wait(1.0)
+        finish_started = time.monotonic()
+        manager.finish_cycle(first, _strict_result(), "planning_only")
+        assert time.monotonic() - finish_started < 0.05
+        begin_started = time.monotonic()
+        assert manager.begin_cycle(
+            _configuration(), {"trigger": "automatic"},
+        ) is None
+        assert time.monotonic() - begin_started < 0.05
+        assert disable_done.wait(0.08)
+        assert time.monotonic() - started < 0.10
+        assert disable_result == [False]
+        resumed = manager.begin_cycle(
+            _configuration(), {"trigger": "automatic"},
+        )
+        assert resumed is not None
+    finally:
+        release_write.set()
+        disable_thread.join(1.0)
 
-    assert manager.set_enabled(False, timeout_seconds=0.05) is False
+    manager.finish_cycle(blocker, _strict_result(), "planning_only")
+    manager.finish_cycle(resumed, _strict_result(), "planning_only")
+    assert manager.set_enabled(False, timeout_seconds=1.0)
 
-    assert rollback_started[0] - first_finished[0] >= 0.04
+
+def test_disable_deadline_includes_lifecycle_lock_acquisition(tmp_path):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    assert manager.set_enabled(True)
+    manager._lifecycle_lock.acquire()
+    started = time.monotonic()
+    try:
+        assert manager.set_enabled(False, timeout_seconds=0.05) is False
+    finally:
+        manager._lifecycle_lock.release()
+    assert time.monotonic() - started < 0.08
     assert manager._enabled is True
-    assert manager.read_manifest()["state"] == "active"
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def test_disable_is_bounded_when_filesystem_lock_is_stuck(tmp_path):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    assert manager.set_enabled(True)
+    deadline = time.monotonic() + 1.0
+    while not list(manager.output_dir.glob("manifest-*.json")):
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+
+    manager._filesystem_lock.acquire()
+    result = []
+    done = threading.Event()
+    started = time.monotonic()
+    thread = threading.Thread(
+        target=lambda: (
+            result.append(manager.set_enabled(False, timeout_seconds=0.05)),
+            done.set(),
+        ),
+    )
+    thread.start()
+    try:
+        assert done.wait(0.08)
+        assert time.monotonic() - started < 0.10
+        assert result == [True]
+    finally:
+        manager._filesystem_lock.release()
+        thread.join(1.0)
+
+
+def test_manifest_publication_coalesces_repeated_toggles_and_writes_newest_revision(
+    tmp_path, monkeypatch,
+):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    original = manager._atomic_write
+    write_started = threading.Event()
+    release_write = threading.Event()
+
+    def stuck_first_manifest(path, data):
+        if path.name.startswith("manifest-") and not write_started.is_set():
+            write_started.set()
+            assert release_write.wait(1.0)
+        return original(path, data)
+
+    monkeypatch.setattr(manager, "_atomic_write", stuck_first_manifest)
+    enable_result = []
+    enable_done = threading.Event()
+    enable_thread = threading.Thread(
+        target=lambda: (
+            enable_result.append(manager.set_enabled(True)),
+            enable_done.set(),
+        ),
+    )
+    enable_thread.start()
+    try:
+        assert write_started.wait(1.0)
+        assert enable_done.wait(0.08)
+        assert enable_result == [True]
+        publisher = manager._manifest_publisher
+        for _ in range(40):
+            started = time.monotonic()
+            assert manager.set_enabled(False, timeout_seconds=0.05)
+            assert time.monotonic() - started < 0.08
+            assert manager.set_enabled(True)
+            assert manager._manifest_publisher is publisher
+        latest_path = manager._manifest_path()
+        latest_run_id = manager._run_id
+        with manager._manifest_publish_condition:
+            pending = manager._pending_manifest_snapshot
+            assert pending is not None
+            assert pending[2] == manager._manifest_revision
+    finally:
+        release_write.set()
+        enable_thread.join(1.0)
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if latest_path.exists():
+            persisted = json.loads(latest_path.read_text())
+            if persisted.get("capture_run_id") == latest_run_id:
+                break
+        time.sleep(0.01)
+    else:
+        pytest.fail("newest coalesced manifest revision was not published")
+    assert persisted["state"] == "active"
+    assert manager._manifest_publisher is publisher
+    assert publisher.is_alive()
+    assert manager.set_enabled(False, timeout_seconds=1.0)
 
 
 def test_handoff_graph_bound_rejects_before_deepcopy_and_manifests_failure(
