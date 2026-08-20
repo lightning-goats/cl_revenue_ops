@@ -41,6 +41,120 @@ def test_reconcile_uses_one_clock_for_bounded_fee_history(tmp_path):
         "reconciliation_completed") == 0
 
 
+class _TrackingGuard:
+    def __init__(self):
+        self.depth = 0
+
+    @property
+    def active(self):
+        return self.depth > 0
+
+    def __enter__(self):
+        self.depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.depth -= 1
+
+
+class _BrokenEnterGuard:
+    def __enter__(self):
+        raise RuntimeError("guard enter failed")
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
+def test_diagnostic_completeness_guards_both_reads_without_action(
+        tmp_path, monkeypatch):
+    from modules import econ_reconcile
+
+    mod, shadow, database = _module_with_history(tmp_path)
+    guard = _TrackingGuard()
+    shadow.fee_evidence_guard = lambda: guard
+    original_reconcile = econ_reconcile.reconcile
+    original_completeness = econ_reconcile.fee_intent_completeness
+
+    def reservation_states():
+        assert guard.active is False
+        return {}
+
+    def reconcile(*args, **kwargs):
+        assert guard.active is False
+        return original_reconcile(*args, **kwargs)
+
+    def fee_changes(*_args, **_kwargs):
+        assert guard.active
+        return []
+
+    def completeness(*args, **kwargs):
+        assert guard.active
+        return original_completeness(*args, **kwargs)
+
+    database.get_spend_reservation_states.side_effect = reservation_states
+    database.get_fee_changes_between.side_effect = fee_changes
+    monkeypatch.setattr(econ_reconcile, "reconcile", reconcile)
+    monkeypatch.setattr(
+        econ_reconcile, "fee_intent_completeness", completeness)
+    apply = MagicMock()
+    monkeypatch.setattr(econ_reconcile, "apply", apply)
+    mod.fee_controller = MagicMock()
+
+    result = mod.revenue_econ_reconcile(mod.plugin)
+
+    assert result["enabled"] is True
+    assert result["fee_intent_completeness"]["status"] == "no_intent_data"
+    assert guard.active is False
+    apply.assert_not_called()
+    mod.fee_controller.set_channel_fee.assert_not_called()
+    database.record_fee_change.assert_not_called()
+
+
+def test_diagnostic_guard_accessor_failure_is_explicit_error_without_reads(
+        tmp_path, monkeypatch):
+    from modules import econ_reconcile
+
+    mod, shadow, database = _module_with_history(tmp_path)
+    shadow.fee_evidence_guard = MagicMock(
+        side_effect=RuntimeError("guard accessor failed"))
+    database.get_fee_changes_between = MagicMock(
+        side_effect=AssertionError("must not read fee rows"))
+    completeness = MagicMock(
+        side_effect=AssertionError("must not classify ledger evidence"))
+    monkeypatch.setattr(
+        econ_reconcile, "fee_intent_completeness", completeness)
+
+    result = mod.revenue_econ_reconcile(mod.plugin)
+
+    assert result["fee_intent_completeness"]["status"] == "error"
+    assert "complete" not in result["fee_intent_completeness"]
+    assert "guard accessor failed" in result["fee_intent_completeness"]["error"]
+    database.get_fee_changes_between.assert_not_called()
+    completeness.assert_not_called()
+
+
+def test_diagnostic_guard_enter_failure_is_explicit_error_without_reads(
+        tmp_path, monkeypatch):
+    from modules import econ_reconcile
+
+    mod, shadow, database = _module_with_history(tmp_path)
+    shadow.fee_evidence_guard = lambda: _BrokenEnterGuard()
+    database.get_fee_changes_between = MagicMock(
+        side_effect=AssertionError("must not read fee rows"))
+    completeness = MagicMock(
+        side_effect=AssertionError("must not classify ledger evidence"))
+    monkeypatch.setattr(
+        econ_reconcile, "fee_intent_completeness", completeness)
+
+    result = mod.revenue_econ_reconcile(mod.plugin)
+
+    assert result["fee_intent_completeness"]["status"] == "error"
+    assert "complete" not in result["fee_intent_completeness"]
+    assert "guard enter failed" in result["fee_intent_completeness"]["error"]
+    database.get_fee_changes_between.assert_not_called()
+    completeness.assert_not_called()
+
+
 def _record_run(ledger, started_at, result="clean", unexplained=0,
                 fee_intent_completeness="ok"):
     slot_started_at = started_at - (started_at % 3600)

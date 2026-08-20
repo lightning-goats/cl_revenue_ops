@@ -67,6 +67,7 @@ from pyln.client import Plugin, RpcError
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from . import admission_policy as _admission_policy
 from .database import Database
+from .econ_shadow import fail_open_fee_evidence_guard
 from .fee_authority import FeeAuthorityGate
 from .fee_cycle_capture import (
     FeeCycleCaptureManager,
@@ -8059,6 +8060,11 @@ class FeeController:
         except Exception:
             return False
 
+    def _fee_evidence_guard(self):
+        """Use optional evidence synchronization without blocking fees."""
+        return fail_open_fee_evidence_guard(
+            lambda: getattr(self, "econ_shadow").fee_evidence_guard())
+
     def _governed_authorize_fee_broadcast(self, *, channel_id, fee_ppm,
                                           old_fee_ppm, reason, reason_code):
         request = {
@@ -8243,6 +8249,12 @@ class FeeController:
             "base_fee_msat_override": base_fee_msat_override,
             "effective_min_fee_ppm": effective_min_fee_ppm,
         }
+        with self._fee_evidence_guard():
+            return self._set_channel_fee_evidence_locked(request)
+
+    def _set_channel_fee_evidence_locked(
+        self, request: Dict[str, Any]
+    ) -> Dict[str, Any]:
         try:
             result = self._set_channel_fee_inner(**request)
         except Exception as exc:

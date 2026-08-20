@@ -218,7 +218,158 @@ def test_more_than_500_changes_do_not_split_a_fee_cycle(stack):
     assert run["fee_intent_completeness"] == "ok"
 
 
-def test_incomplete_run_recovery_reuses_original_evidence_time(
+class _TrackingGuard:
+    def __init__(self):
+        self.depth = 0
+
+    @property
+    def active(self):
+        return self.depth > 0
+
+    def __enter__(self):
+        self.depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.depth -= 1
+
+
+class _BrokenEnterGuard:
+    def __enter__(self):
+        raise RuntimeError("guard enter failed")
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
+def test_scheduled_completeness_guards_only_the_two_evidence_reads(
+        stack, monkeypatch):
+    from modules import econ_reconcile
+
+    shadow, db, _ = stack
+    guard = _TrackingGuard()
+    monkeypatch.setattr(
+        shadow, "fee_evidence_guard", lambda: guard, raising=False)
+    original_states = db.get_spend_reservation_states
+    original_changes = db.get_fee_changes_between
+    original_reconcile = econ_reconcile.reconcile
+    original_apply = econ_reconcile.apply
+    original_completeness = econ_reconcile.fee_intent_completeness
+    observed = []
+
+    def reservation_states():
+        assert guard.active is False
+        return original_states()
+
+    def reconcile(*args, **kwargs):
+        assert guard.active is False
+        return original_reconcile(*args, **kwargs)
+
+    def apply(*args, **kwargs):
+        assert guard.active is False
+        return original_apply(*args, **kwargs)
+
+    def fee_changes(*args, **kwargs):
+        observed.append(("fee_changes", guard.active))
+        assert guard.active
+        return original_changes(*args, **kwargs)
+
+    def completeness(*args, **kwargs):
+        observed.append(("completeness", guard.active))
+        assert guard.active
+        return original_completeness(*args, **kwargs)
+
+    db.get_spend_reservation_states = MagicMock(
+        side_effect=reservation_states)
+    db.get_fee_changes_between = MagicMock(side_effect=fee_changes)
+    monkeypatch.setattr(econ_reconcile, "reconcile", reconcile)
+    monkeypatch.setattr(econ_reconcile, "apply", apply)
+    monkeypatch.setattr(
+        econ_reconcile, "fee_intent_completeness", completeness)
+
+    result = shadow.maybe_run_reconciliation(db, NOW)
+
+    assert result["result"] == "clean"
+    assert observed == [
+        ("fee_changes", True),
+        ("completeness", True),
+    ]
+    assert guard.active is False
+
+
+def test_scheduled_guard_enter_failure_is_error_without_evidence_reads(
+        stack, monkeypatch):
+    from modules import econ_reconcile
+
+    shadow, db, _ = stack
+    monkeypatch.setattr(
+        shadow, "fee_evidence_guard", lambda: _BrokenEnterGuard())
+    db.get_fee_changes_between = MagicMock(
+        side_effect=AssertionError("must not read fee rows"))
+    completeness = MagicMock(
+        side_effect=AssertionError("must not classify ledger evidence"))
+    monkeypatch.setattr(
+        econ_reconcile, "fee_intent_completeness", completeness)
+
+    result = shadow.maybe_run_reconciliation(db, NOW)
+
+    assert result["completeness_ok"] is None
+    db.get_fee_changes_between.assert_not_called()
+    completeness.assert_not_called()
+    run = shadow.ledger_for_reconciliation().reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 3600)["runs"][0]
+    assert run["fee_intent_completeness"] == "error"
+
+
+def test_fee_writer_cannot_interleave_with_scheduled_evidence_snapshot(
+        stack, monkeypatch):
+    from modules import econ_reconcile
+
+    shadow, db, _ = stack
+    classifier_entered = threading.Event()
+    release_classifier = threading.Event()
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+
+    def blocked_completeness(*_args, **_kwargs):
+        classifier_entered.set()
+        assert release_classifier.wait(timeout=2)
+        return {"status": "ok", "complete": True,
+                "mismatched_cycles": []}
+
+    monkeypatch.setattr(
+        econ_reconcile, "fee_intent_completeness", blocked_completeness)
+    reader = threading.Thread(
+        target=lambda: shadow.maybe_run_reconciliation(db, NOW))
+    reader.start()
+    assert classifier_entered.wait(timeout=2)
+
+    adjustment = SimpleNamespace(
+        channel_id="123x456x0",
+        old_fee_ppm=100,
+        new_fee_ppm=250,
+        reason_code="dts_pid_sample",
+    )
+
+    def write_intent():
+        writer_started.set()
+        shadow.record_fee_intents([adjustment], NOW)
+        writer_finished.set()
+
+    writer = threading.Thread(target=write_intent)
+    writer.start()
+    assert writer_started.wait(timeout=2)
+    assert writer_finished.wait(timeout=0.1) is False
+
+    release_classifier.set()
+    reader.join(timeout=2)
+    writer.join(timeout=2)
+    assert reader.is_alive() is False
+    assert writer.is_alive() is False
+    assert writer_finished.is_set()
+
+
+def test_incomplete_run_recovery_fails_closed_without_current_reads(
         stack, monkeypatch):
     shadow, db, _ = stack
     ledger = shadow.ledger_for_reconciliation()
@@ -230,32 +381,72 @@ def test_incomplete_run_recovery_reuses_original_evidence_time(
         snapshot_id=None,
         state_reference=f"spend_reservations@{SLOT}",
     )
-    ledger.append(
-        event_type="intent_proposed",
-        intent_id="original-fee-intent",
-        idempotency_key="e" * 64,
-        cycle_id=f"fee-cycle-{original_evidence_at}",
-        at=original_evidence_at,
-        details={},
-    )
-    db.get_fee_changes_between = MagicMock(return_value=[
-        {"timestamp": original_evidence_at},
-        {"timestamp": retry_at - 1},
-    ])
+    db.get_spend_reservation_states = MagicMock(
+        side_effect=AssertionError("must not read current reservations"))
+    db.get_fee_changes_between = MagicMock(
+        side_effect=AssertionError("must not read current fee rows"))
     monkeypatch.setattr("modules.econ_shadow.time.time", lambda: retry_at)
+    from modules import econ_reconcile
+    apply = MagicMock(side_effect=AssertionError("must not auto-apply"))
+    monkeypatch.setattr(econ_reconcile, "apply", apply)
 
     result = shadow.maybe_run_reconciliation(db, retry_at)
 
-    db.get_fee_changes_between.assert_called_once_with(
-        original_evidence_at - 86400 - 120,
-        original_evidence_at + 1,
-    )
-    assert result["completeness_ok"] is True
+    assert result == {
+        "reconciliation_id": f"reconcile-hour-{SLOT}",
+        "slot_started_at": SLOT,
+        "started_at": original_evidence_at,
+        "completed_at": retry_at,
+        "result": "failed",
+        "checked": None,
+        "divergences": None,
+        "applied": None,
+        "quarantined": None,
+        "completeness_ok": None,
+        "ledger_projection_status": "unknown",
+        "error": "incomplete_run_snapshot_unavailable",
+    }
+    db.get_spend_reservation_states.assert_not_called()
+    db.get_fee_changes_between.assert_not_called()
+    apply.assert_not_called()
     run = ledger.reconciliation_runs(
         since_at=SLOT, until_at=SLOT + 3600
     )["runs"][0]
     assert run["started_at"] == original_evidence_at
     assert run["completed_at"] == retry_at
+    assert run["result"] == "failed"
+    assert run["divergence_count"] is None
+    assert run["unexplained_divergence_count"] is None
+    assert run["reservation_count"] is None
+    assert run["ledger_projection_status"] == "unknown"
+    assert run["applied_count"] is None
+    assert run["fee_intent_completeness"] == "unknown"
+    assert run["error"] == "incomplete_run_snapshot_unavailable"
+    assert ledger.count_events("reconciliation_completed") == 0
+
+
+def test_next_slot_runs_after_incomplete_slot_fails_closed(stack, monkeypatch):
+    shadow, db, _ = stack
+    ledger = shadow.ledger_for_reconciliation()
+    retry_at = NOW + 600
+    ledger.start_reconciliation_run(
+        slot_started_at=SLOT,
+        started_at=NOW,
+        snapshot_id=None,
+        state_reference=f"spend_reservations@{SLOT}",
+    )
+    monkeypatch.setattr("modules.econ_shadow.time.time", lambda: retry_at)
+
+    failed = shadow.maybe_run_reconciliation(db, retry_at)
+    next_at = SLOT + 3600 + 10
+    monkeypatch.setattr("modules.econ_shadow.time.time", lambda: next_at)
+    next_result = shadow.maybe_run_reconciliation(db, next_at)
+
+    assert failed["result"] == "failed"
+    assert next_result["result"] == "clean"
+    runs = ledger.reconciliation_runs(
+        since_at=SLOT, until_at=SLOT + 7200)["runs"]
+    assert [run["result"] for run in runs] == ["failed", "clean"]
 
 
 def test_database_error_persists_failed_run(stack):

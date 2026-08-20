@@ -1,6 +1,8 @@
 import sys
 import os
+import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from typing import Union
 
@@ -11,6 +13,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 from modules.fee_authority import FeeAuthorityGate
+
+
+def _other_thread_can_acquire(lock):
+    acquired = []
+
+    def attempt():
+        held = lock.acquire(blocking=False)
+        acquired.append(held)
+        if held:
+            lock.release()
+
+    thread = threading.Thread(target=attempt)
+    thread.start()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    return acquired == [True]
+
 
 def _make_data_service(mock_plugin):
     """Build a data_service MagicMock that delegates to mock_plugin.rpc.
@@ -256,6 +275,128 @@ class TestFeeAuthorityExecutionBoundary:
         controller._fee_governor_enabled.assert_not_called()
         controller._governed_authorize_fee_broadcast.assert_not_called()
         controller.data_service.set_channel.assert_not_called()
+
+
+class TestFeeEvidenceGuard:
+    class FaultyGuard:
+        def __init__(self, phase):
+            self.phase = phase
+
+        def __enter__(self):
+            if self.phase == "enter":
+                raise RuntimeError("guard enter failed")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            if self.phase == "exit":
+                raise RuntimeError("guard exit failed")
+
+    @staticmethod
+    def _controller(mock_plugin, mock_database, shadow):
+        from modules.config import Config
+        from modules.fee_controller import FeeController
+
+        controller = FeeController(
+            mock_plugin,
+            Config(
+                min_fee_ppm=10,
+                max_fee_ppm=5000,
+                base_fee_msat=0,
+                dry_run=False,
+                econ_governor_fees_enabled=True,
+            ),
+            mock_database,
+            fee_authority_gate=FeeAuthorityGate(),
+        )
+        controller.econ_shadow = shadow
+        controller.data_service = MagicMock()
+        return controller
+
+    @staticmethod
+    def _channel_info():
+        return {
+            "short_channel_id": "123x456x0",
+            "peer_id": "02" + "a" * 64,
+            "fee_proportional_millionths": 100,
+        }
+
+    def test_guard_spans_governor_broadcast_and_fee_change_audit(
+        self, mock_plugin, mock_database
+    ):
+        guard = threading.RLock()
+        shadow = SimpleNamespace(fee_evidence_guard=lambda: guard)
+        controller = self._controller(mock_plugin, mock_database, shadow)
+
+        def authorize(**_kwargs):
+            assert _other_thread_can_acquire(guard) is False
+            return True, ""
+
+        def broadcast(**_kwargs):
+            assert _other_thread_can_acquire(guard) is False
+            return {}
+
+        def record_change(**_kwargs):
+            assert _other_thread_can_acquire(guard) is False
+
+        controller._governed_authorize_fee_broadcast = MagicMock(
+            side_effect=authorize)
+        controller.data_service.set_channel.side_effect = broadcast
+        mock_database.record_fee_change.side_effect = record_change
+
+        result = controller.set_channel_fee(
+            "123x456x0",
+            250,
+            manual=False,
+            reason="dts",
+            reason_code="dts_pid_sample",
+            channel_info=self._channel_info(),
+        )
+
+        assert result["success"] is True
+        assert _other_thread_can_acquire(guard) is True
+
+    @pytest.mark.parametrize("shadow", [
+        None,
+        SimpleNamespace(
+            fee_evidence_guard=MagicMock(
+                side_effect=RuntimeError("guard unavailable"))),
+    ])
+    def test_absent_or_broken_shadow_preserves_fee_execution(
+        self, mock_plugin, mock_database, shadow
+    ):
+        controller = self._controller(mock_plugin, mock_database, shadow)
+        controller.data_service.set_channel.return_value = {}
+
+        result = controller.set_channel_fee(
+            "123x456x0",
+            250,
+            manual=True,
+            channel_info=self._channel_info(),
+        )
+
+        assert result["success"] is True
+        controller.data_service.set_channel.assert_called_once()
+        mock_database.record_fee_change.assert_called_once()
+
+    @pytest.mark.parametrize("phase", ["enter", "exit"])
+    def test_guard_context_failure_preserves_manual_fee_and_audit(
+        self, mock_plugin, mock_database, phase
+    ):
+        shadow = SimpleNamespace(
+            fee_evidence_guard=lambda: self.FaultyGuard(phase))
+        controller = self._controller(mock_plugin, mock_database, shadow)
+        controller.data_service.set_channel.return_value = {}
+
+        result = controller.set_channel_fee(
+            "123x456x0",
+            250,
+            manual=True,
+            channel_info=self._channel_info(),
+        )
+
+        assert result["success"] is True
+        controller.data_service.set_channel.assert_called_once()
+        mock_database.record_fee_change.assert_called_once()
 
 
 class TestChannelInfoShaping:

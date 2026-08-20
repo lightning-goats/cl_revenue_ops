@@ -53,7 +53,7 @@ from modules.capex_budget import CapexBudgetEngine
 from modules.capital_efficiency import CapitalEfficiencyAnalyzer
 from modules.segment_observations import SegmentObservationStore
 from modules.utils import normalize_scid, parse_msat
-from modules.econ_shadow import EconShadow
+from modules.econ_shadow import EconShadow, fail_open_fee_evidence_guard
 from modules.forward_archive import ForwardArchiveError
 from modules.forward_archive_sync import ForwardArchiveSynchronizer
 
@@ -2685,6 +2685,12 @@ def _run_scheduled_reconciliation(now=None):
         return None
 
 
+def _fee_evidence_guard_or_noop():
+    """Use optional process-local evidence synchronization fail-open."""
+    return fail_open_fee_evidence_guard(
+        lambda: econ_shadow.fee_evidence_guard())
+
+
 def run_fee_adjustment():
     """Run one complete Python fee cycle under the shared authority lease."""
     with fee_authority_gate.execution_lease(
@@ -2696,6 +2702,10 @@ def run_fee_adjustment():
 
 
 def _run_fee_adjustment_authorized():
+    return _run_fee_adjustment_evidence_locked()
+
+
+def _run_fee_adjustment_evidence_locked():
     """
     Module 2: DTS+PID Fee Controller (Dynamic Pricing)
 
@@ -2706,23 +2716,28 @@ def _run_fee_adjustment_authorized():
         return []
     
     try:
-        adjustments = fee_controller.adjust_all_fees()
-        plugin.log(f"Fee adjustment complete: {len(adjustments)} channels adjusted")
+        with _fee_evidence_guard_or_noop():
+            adjustments = fee_controller.adjust_all_fees()
+            plugin.log(
+                f"Fee adjustment complete: "
+                f"{len(adjustments)} channels adjusted")
 
-        # Phase 1 shadow: record this cycle's decisions as typed intents.
-        # Fail-open by contract — a shadow failure must never affect fees.
-        # Phase 2H: skipped when fee broadcasts are GOVERNED — each
-        # broadcast then records its own pre-authorization trail, and
-        # double-recording would skew the completeness detector.
-        try:
-            _cfg_gov = config.snapshot() if config else None
-            _fees_governed = getattr(
-                _cfg_gov, "econ_governor_fees_enabled", False) is True
-            if econ_shadow is not None and econ_shadow.enabled() \
-                    and not _fees_governed:
-                econ_shadow.record_fee_intents(adjustments, int(time.time()))
-        except Exception as _shadow_err:
-            plugin.log(f"econ shadow skipped: {_shadow_err}", level='debug')
+            # Phase 1 shadow: record this cycle's decisions as typed intents.
+            # Fail-open by contract — a shadow failure must never affect fees.
+            # Phase 2H: skipped when fee broadcasts are GOVERNED — each
+            # broadcast then records its own pre-authorization trail, and
+            # double-recording would skew the completeness detector.
+            try:
+                _cfg_gov = config.snapshot() if config else None
+                _fees_governed = getattr(
+                    _cfg_gov, "econ_governor_fees_enabled", False) is True
+                if econ_shadow is not None and econ_shadow.enabled() \
+                        and not _fees_governed:
+                    econ_shadow.record_fee_intents(
+                        adjustments, int(time.time()))
+            except Exception as _shadow_err:
+                plugin.log(
+                    f"econ shadow skipped: {_shadow_err}", level='debug')
 
         # Push status + profitability to datastore for external consumers.
         # This keeps local reporting cheap and consistent.
@@ -5129,14 +5144,15 @@ def revenue_econ_reconcile(plugin: Plugin, apply: bool = False,
                 ],
             })
             try:
-                fee_since, fee_until = (
-                    econ_reconcile.fee_change_query_bounds(observed_now)
-                )
-                recent_changes = database.get_fee_changes_between(
-                    fee_since, fee_until)
-                result["fee_intent_completeness"] = (
-                    econ_reconcile.fee_intent_completeness(
-                        ledger, recent_changes, now=observed_now))
+                with econ_shadow.fee_evidence_guard():
+                    fee_since, fee_until = (
+                        econ_reconcile.fee_change_query_bounds(observed_now)
+                    )
+                    recent_changes = database.get_fee_changes_between(
+                        fee_since, fee_until)
+                    result["fee_intent_completeness"] = (
+                        econ_reconcile.fee_intent_completeness(
+                            ledger, recent_changes, now=observed_now))
             except Exception as completeness_err:
                 result["fee_intent_completeness"] = {
                     "status": "error", "error": str(completeness_err)}

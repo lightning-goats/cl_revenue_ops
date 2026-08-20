@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from .econ_intents import Explanation, make_intent
@@ -33,6 +34,36 @@ from .econ_snapshot import (
     to_wire,
 )
 from .econ_types import Micro, Msat, SignedMsat, UnixTime
+
+
+_RLOCK_TYPE = type(threading.RLock())
+
+
+@contextmanager
+def fail_open_fee_evidence_guard(accessor):
+    """Acquire the trusted producer evidence lock without blocking fees.
+
+    Only the concrete runtime ``threading.RLock`` type is accepted. Missing,
+    malformed, or custom substitutes are ignored, so they cannot perturb
+    reentrant ownership or change fee execution semantics.
+    """
+    lock = None
+    try:
+        candidate = accessor() if callable(accessor) else None
+        if type(candidate) is _RLOCK_TYPE:
+            candidate.acquire()
+            lock = candidate
+    except Exception:
+        lock = None
+
+    try:
+        yield
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
 
 
 class EconShadow:
@@ -59,6 +90,10 @@ class EconShadow:
         # prevents concurrent callers from applying the same corrections twice
         # before either has appended the terminal marker.
         self._reconciliation_lock = threading.Lock()
+        # Fee changes and their intent evidence live in separate SQLite
+        # stores. This process-local, reentrant guard keeps producers and
+        # completeness readers on one coherent observation boundary.
+        self._fee_evidence_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # plumbing
@@ -102,6 +137,10 @@ class EconShadow:
             self._log(f"ledger unavailable ({e}) — shadow recording "
                       f"disabled for this session", level="warn")
             return None
+
+    def fee_evidence_guard(self):
+        """Return the process-local reentrant fee-evidence guard."""
+        return self._fee_evidence_lock
 
     # ------------------------------------------------------------------
     # canonical snapshot service (PR 3a)
@@ -150,52 +189,55 @@ class EconShadow:
         """Record this fee cycle's applied adjustments as SET_FEE intent
         proposals. Never raises; returns the count recorded."""
         try:
-            if not self.enabled() or not adjustments:
-                return 0
-            ledger = self._get_ledger()
-            if ledger is None:
-                return 0
-            recorded = 0
-            for adj in adjustments:
-                try:
-                    env = make_intent(
-                        intent_type="SET_FEE",
-                        snapshot_id=f"fee-cycle-{int(now)}",
-                        created_at=UnixTime(int(now)),
-                        expires_at=UnixTime(int(now) + 3600),
-                        target=str(adj.channel_id),
-                        amount_msat=None,
-                        expected_benefit_msat=SignedMsat(0),
-                        max_cost_msat=Msat(0),
-                        capital_committed_msat=Msat(0),
-                        confidence_micro=Micro(0),
-                        reason_codes=(),
-                        explanation=Explanation("fee_adjustment", (
-                            ("old_fee_ppm", int(adj.old_fee_ppm)),
-                            ("new_fee_ppm", int(adj.new_fee_ppm)),
-                            ("controller_reason_code",
-                             str(getattr(adj, "reason_code", ""))),
-                        )),
-                        preconditions=(),
-                        priority=50,
-                        budget_bucket="fees",
-                        origin_policy="fee_controller_shadow",
-                        reversible=True,
-                    )
-                    ledger.append(
-                        event_type="intent_proposed",
-                        intent_id=env.intent_id.value,
-                        idempotency_key=env.idempotency_key,
-                        cycle_id=env.snapshot_id,
-                        at=int(now),
-                        details={"explanation": env.explanation.render(),
-                                 "target": env.target},
-                    )
-                    recorded += 1
-                except Exception as e:
-                    self._log(f"adjustment skipped: {e}")
-            self.intents_recorded_total += recorded
-            return recorded
+            with self.fee_evidence_guard():
+                if not self.enabled() or not adjustments:
+                    return 0
+                ledger = self._get_ledger()
+                if ledger is None:
+                    return 0
+                recorded = 0
+                for adj in adjustments:
+                    try:
+                        env = make_intent(
+                            intent_type="SET_FEE",
+                            snapshot_id=f"fee-cycle-{int(now)}",
+                            created_at=UnixTime(int(now)),
+                            expires_at=UnixTime(int(now) + 3600),
+                            target=str(adj.channel_id),
+                            amount_msat=None,
+                            expected_benefit_msat=SignedMsat(0),
+                            max_cost_msat=Msat(0),
+                            capital_committed_msat=Msat(0),
+                            confidence_micro=Micro(0),
+                            reason_codes=(),
+                            explanation=Explanation("fee_adjustment", (
+                                ("old_fee_ppm", int(adj.old_fee_ppm)),
+                                ("new_fee_ppm", int(adj.new_fee_ppm)),
+                                ("controller_reason_code",
+                                 str(getattr(adj, "reason_code", ""))),
+                            )),
+                            preconditions=(),
+                            priority=50,
+                            budget_bucket="fees",
+                            origin_policy="fee_controller_shadow",
+                            reversible=True,
+                        )
+                        ledger.append(
+                            event_type="intent_proposed",
+                            intent_id=env.intent_id.value,
+                            idempotency_key=env.idempotency_key,
+                            cycle_id=env.snapshot_id,
+                            at=int(now),
+                            details={
+                                "explanation": env.explanation.render(),
+                                "target": env.target,
+                            },
+                        )
+                        recorded += 1
+                    except Exception as e:
+                        self._log(f"adjustment skipped: {e}")
+                self.intents_recorded_total += recorded
+                return recorded
         except Exception as e:
             self._log(f"record_fee_intents failed open: {e}")
             return 0
@@ -445,6 +487,49 @@ class EconShadow:
         )["runs"]
         if existing and existing[0]["completed_at"] is not None:
             return None
+        if existing:
+            incomplete = existing[0]
+            evidence_started_at = int(incomplete["started_at"])
+            reconciliation_id = str(incomplete["reconciliation_id"])
+            completed_at = max(evidence_started_at, int(time.time()))
+            error = "incomplete_run_snapshot_unavailable"
+            try:
+                ledger.complete_reconciliation_run(
+                    reconciliation_id=reconciliation_id,
+                    started_at=evidence_started_at,
+                    completed_at=completed_at,
+                    result="failed",
+                    divergence_count=None,
+                    unexplained_divergence_count=None,
+                    reservation_count=None,
+                    ledger_projection_status="unknown",
+                    applied_count=None,
+                    fee_intent_completeness="unknown",
+                    error=error,
+                )
+            except Exception as evidence_error:
+                self._log(
+                    f"incomplete reconciliation failure evidence failed: "
+                    f"{evidence_error}", level="warn")
+                return None
+            summary = {
+                "reconciliation_id": reconciliation_id,
+                "slot_started_at": slot_started_at,
+                "started_at": evidence_started_at,
+                "completed_at": completed_at,
+                "result": "failed",
+                "checked": None,
+                "divergences": None,
+                "applied": None,
+                "quarantined": None,
+                "completeness_ok": None,
+                "ledger_projection_status": "unknown",
+                "error": error,
+            }
+            self._log(
+                f"reconciliation sweep failed closed: {summary}",
+                level="warn")
+            return summary
         evidence_started_at = (
             int(existing[0]["started_at"]) if existing else started_at
         )
@@ -538,14 +623,15 @@ class EconShadow:
 
             completeness_ok = None
             try:
-                fee_since, fee_until = (
-                    econ_reconcile.fee_change_query_bounds(
-                        evidence_started_at)
-                )
-                changes = database.get_fee_changes_between(
-                    fee_since, fee_until)
-                completeness = econ_reconcile.fee_intent_completeness(
-                    ledger, changes, now=evidence_started_at)
+                with self.fee_evidence_guard():
+                    fee_since, fee_until = (
+                        econ_reconcile.fee_change_query_bounds(
+                            evidence_started_at)
+                    )
+                    changes = database.get_fee_changes_between(
+                        fee_since, fee_until)
+                    completeness = econ_reconcile.fee_intent_completeness(
+                        ledger, changes, now=evidence_started_at)
                 raw_status = str(completeness.get("status", "unknown"))
                 completeness_status = raw_status
                 if raw_status == "ok":

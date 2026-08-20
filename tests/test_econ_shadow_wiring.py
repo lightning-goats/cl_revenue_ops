@@ -3,8 +3,11 @@
 Proves the fail-open contract at the plugin level: a broken or absent
 shadow must never affect the fee cycle, and the RPC never raises.
 """
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from tests.plugin_test_utils import load_plugin_module
 
@@ -33,6 +36,40 @@ def _fee_module(shadow):
     return mod
 
 
+def _other_thread_can_acquire(lock):
+    acquired = []
+
+    def attempt():
+        held = lock.acquire(blocking=False)
+        acquired.append(held)
+        if held:
+            lock.release()
+
+    thread = threading.Thread(target=attempt)
+    thread.start()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    return acquired == [True]
+
+
+class _FaultyGuard:
+    def __init__(self, *, enter_error=False, exit_error=False,
+                 suppress_body_error=False):
+        self.enter_error = enter_error
+        self.exit_error = exit_error
+        self.suppress_body_error = suppress_body_error
+
+    def __enter__(self):
+        if self.enter_error:
+            raise RuntimeError("guard enter failed")
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.exit_error:
+            raise RuntimeError("guard exit failed")
+        return self.suppress_body_error
+
+
 def test_enabled_shadow_receives_cycle_adjustments():
     shadow = MagicMock()
     shadow.enabled.return_value = True
@@ -41,6 +78,86 @@ def test_enabled_shadow_receives_cycle_adjustments():
     shadow.record_fee_intents.assert_called_once()
     args = shadow.record_fee_intents.call_args.args
     assert len(args[0]) == 2
+
+
+def test_legacy_fee_cycle_holds_guard_through_post_cycle_intents():
+    guard = threading.RLock()
+    shadow = MagicMock()
+    shadow.enabled.return_value = True
+    shadow.fee_evidence_guard.return_value = guard
+    mod = _fee_module(shadow)
+
+    def adjust_all_fees():
+        assert _other_thread_can_acquire(guard) is False
+        return _adjustments()
+
+    def record_fee_intents(adjustments, now):
+        assert _other_thread_can_acquire(guard) is False
+        assert len(adjustments) == 2
+        return 2
+
+    def datastore_push(*_args, **_kwargs):
+        assert _other_thread_can_acquire(guard) is True
+
+    def dashboard_push():
+        assert _other_thread_can_acquire(guard) is True
+
+    mod.fee_controller.adjust_all_fees.side_effect = adjust_all_fees
+    shadow.record_fee_intents.side_effect = record_fee_intents
+    mod.data_service = MagicMock()
+    mod.data_service.datastore_push.side_effect = datastore_push
+    mod._push_dashboard_to_datastore = MagicMock(
+        side_effect=dashboard_push)
+
+    assert mod.run_fee_adjustment() == _adjustments()
+    assert _other_thread_can_acquire(guard) is True
+    mod.data_service.datastore_push.assert_called()
+    mod._push_dashboard_to_datastore.assert_called_once_with()
+
+
+def test_broken_fee_evidence_guard_does_not_break_fee_cycle():
+    shadow = MagicMock()
+    shadow.enabled.return_value = True
+    shadow.fee_evidence_guard.side_effect = RuntimeError("guard broke")
+    mod = _fee_module(shadow)
+
+    assert mod.run_fee_adjustment() == _adjustments()
+    mod.fee_controller.adjust_all_fees.assert_called_once_with()
+
+
+def test_guard_enter_failure_does_not_break_legacy_fee_cycle():
+    shadow = MagicMock()
+    shadow.enabled.return_value = True
+    shadow.fee_evidence_guard.return_value = _FaultyGuard(enter_error=True)
+    mod = _fee_module(shadow)
+
+    assert mod.run_fee_adjustment() == _adjustments()
+    mod.fee_controller.adjust_all_fees.assert_called_once_with()
+    shadow.record_fee_intents.assert_called_once()
+
+
+def test_guard_exit_failure_does_not_break_completed_legacy_fee_cycle():
+    shadow = MagicMock()
+    shadow.enabled.return_value = True
+    shadow.fee_evidence_guard.return_value = _FaultyGuard(exit_error=True)
+    mod = _fee_module(shadow)
+
+    assert mod.run_fee_adjustment() == _adjustments()
+    mod.fee_controller.adjust_all_fees.assert_called_once_with()
+    shadow.record_fee_intents.assert_called_once()
+
+
+def test_guard_cannot_suppress_fee_cycle_body_exception():
+    shadow = MagicMock()
+    shadow.enabled.return_value = True
+    shadow.fee_evidence_guard.return_value = _FaultyGuard(
+        suppress_body_error=True)
+    mod = _fee_module(shadow)
+    mod.fee_controller.adjust_all_fees.side_effect = ValueError(
+        "fee cycle failed")
+
+    with pytest.raises(ValueError, match="fee cycle failed"):
+        mod.run_fee_adjustment()
 
 
 def test_disabled_shadow_not_asked_to_record():

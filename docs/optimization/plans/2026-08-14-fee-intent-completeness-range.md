@@ -1,17 +1,35 @@
 # Phase 0.7 Fee-Intent Completeness Range Implementation Plan
 
+## Current status
+
+Tasks 1-3 of the original bounded-range plan are implemented. The 2026-08-20
+exact-range review found two evidence-coherency gaps and one documentation gap;
+the operator-approved process-local lock and fail-closed incomplete-run
+recovery are implemented and locally verified on the isolated branch. The
+required focused/safety suite passes (230 tests) and changed production files
+compile. Merge, push, deployment, restart, and production evidence collection
+are not part of this branch task.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the row-limited fee-intent completeness sample with an exact indexed 24-hour interval so equal-timestamp fee cycles cannot be split into false mismatches.
 
-**Architecture:** Add one read-only, half-open interval query to `Database`, keep completeness classification in `econ_reconcile`, and make the scheduled sweep and diagnostic RPC share one captured clock and one bounds helper. Preserve the existing dashboard history API and every fee decision/execution path.
+**Architecture:** Add one read-only, half-open interval query to `Database`,
+keep completeness classification in `econ_reconcile`, and make the scheduled
+sweep and diagnostic RPC share one captured clock and one bounds helper.
+`EconShadow` owns a process-local reentrant fee-evidence lock spanning all fee
+producers and each two-store completeness snapshot. Preserve the existing
+dashboard history API and every fee decision/execution path.
 
 **Tech Stack:** Python 3, SQLite, pytest, Core Lightning plugin RPC, existing `EconLedger`/`EconShadow` modules.
 
 ## Global Constraints
 
 - The query interval is `since_timestamp <= timestamp < until_timestamp`.
-- Reconciliation reads `[max(0, observed_now - 86400), observed_now + 1)` and rejects fee rows with `timestamp > observed_now`.
+- Reconciliation reads
+  `[max(0, observed_now - 86400 - 120), observed_now + 1)`; the lower
+  120-second padding matches clustering tolerance, and rows with
+  `timestamp > observed_now` are rejected.
 - `get_recent_fee_changes()` remains unchanged.
 - No schema or index migration; use existing `idx_fee_changes_time`.
 - A bounded-query failure is fail closed; never fall back to `LIMIT 500`.
@@ -20,6 +38,36 @@
 - No action RPC during tests or production verification.
 - No Sling, Hive, mycelium, fleet, Boltz, LN+, or planner dependency.
 - Keep `formal_window_active=false`; do not activate optimization work.
+
+## Evidence-coherency follow-up (2026-08-20)
+
+- One process-local `threading.RLock` on `EconShadow` synchronizes fee
+  evidence only; it grants no execution authority.
+- The scheduled fee cycle retains the guard through legacy post-cycle intent
+  emission, while nested `set_channel_fee` and `record_fee_intents`
+  acquisitions are reentrant. It releases the guard before status, fee-bounds,
+  and dashboard datastore work.
+- `FeeController.set_channel_fee` covers governed intent emission, the CLN fee
+  call, and the `fee_changes` audit write for automatic, direct, manual, and
+  initial paths. The producer helper accepts only the concrete runtime
+  `threading.RLock`, acquires and releases it exactly once, and never calls an
+  arbitrary context protocol. Missing, wrong-type, custom, or broken
+  substitutes remain fail open without changing nested lock ownership; fee
+  body exceptions retain their identity.
+- Scheduled and diagnostic completeness readers hold the same guard from
+  `get_fee_changes_between` through `fee_intent_completeness`, but unrelated
+  spend/reservation reconciliation and apply work remain outside it.
+- Diagnostic readers acquire the real guard directly: accessor or entry
+  failure yields `fee_intent_completeness.status=error` and performs no fee
+  row or ledger-classifier read. Scheduled readers retain their local
+  fail-closed completeness error handling.
+- An incomplete current-hour run is completed as
+  `failed/incomplete_run_snapshot_unavailable` with null measurements and
+  unknown projection/completeness. Recovery performs no current DB read or
+  correction apply; the next hour remains eligible.
+- The lock is intentionally process-local. It cannot make two SQLite stores
+  crash-atomic or synchronize another process; a durable single-store or
+  explicit completion design remains the stronger future option.
 
 ---
 
@@ -129,7 +177,7 @@ def test_fee_changes_between_uses_bounded_time_search(self, tmp_path):
         db._get_connection(),
         "SELECT * FROM fee_changes WHERE timestamp >= ? AND timestamp < ? "
         "ORDER BY timestamp, id",
-        (NOW - 86400, NOW + 1),
+        (NOW - 86400 - 120, NOW + 1),
     )
     assert "SEARCH fee_changes" in plan
     assert "idx_fee_changes_time" in plan
@@ -162,14 +210,16 @@ git commit -m "fix: add bounded fee-change interval query"
 
 **Interfaces:**
 - Consumes: `EconLedger`, fee-change rows, and an integer `now`.
-- Produces: `fee_change_query_bounds(now: int, window_seconds: int = 86400) -> tuple[int, int]`; preserves `fee_intent_completeness(...) -> dict`.
+- Produces:
+  `fee_change_query_bounds(now: int, window_seconds: int = 86400, tolerance_seconds: int = 120) -> tuple[int, int]`;
+  preserves `fee_intent_completeness(...) -> dict`.
 
 - [ ] **Step 1: Write failing bounds and future-row tests**
 
 ```python
 def test_fee_change_query_bounds_are_half_open_and_include_now():
     from modules.econ_reconcile import fee_change_query_bounds
-    assert fee_change_query_bounds(NOW) == (NOW - 86400, NOW + 1)
+    assert fee_change_query_bounds(NOW) == (NOW - 86400 - 120, NOW + 1)
     assert fee_change_query_bounds(10, window_seconds=20) == (0, 11)
 
 
@@ -206,13 +256,15 @@ FEE_INTENT_WINDOW_SECONDS = 86400
 
 
 def fee_change_query_bounds(
-    now: int, window_seconds: int = FEE_INTENT_WINDOW_SECONDS
+    now: int, window_seconds: int = FEE_INTENT_WINDOW_SECONDS,
+    tolerance_seconds: int = 120,
 ) -> tuple[int, int]:
     observed = int(now)
     window = int(window_seconds)
-    if observed < 0 or window < 0:
+    tolerance = int(tolerance_seconds)
+    if observed < 0 or window < 0 or tolerance < 0:
         raise ValueError("fee-intent window values must be non-negative")
-    return max(0, observed - window), observed + 1
+    return max(0, observed - window - tolerance), observed + 1
 ```
 
 In `fee_intent_completeness`, retain the existing `window_start` calculation
@@ -262,7 +314,8 @@ db.get_fee_changes_between = MagicMock(return_value=[
     {"timestamp": NOW - 3600}, {"timestamp": NOW - 60},
 ])
 result = shadow.maybe_run_reconciliation(db, NOW)
-db.get_fee_changes_between.assert_called_once_with(NOW - 86400, NOW + 1)
+db.get_fee_changes_between.assert_called_once_with(
+    NOW - 86400 - 120, NOW + 1)
 assert result["completeness_ok"] is False
 ```
 
@@ -325,7 +378,7 @@ Add an RPC clock test that patches `mod.time.time` to one value and asserts:
 
 ```python
 database.get_fee_changes_between.assert_called_once_with(
-    observed_now - 86400, observed_now + 1
+    observed_now - 86400 - 120, observed_now + 1
 )
 database.get_recent_fee_changes.assert_not_called()
 ```

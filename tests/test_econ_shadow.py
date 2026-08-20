@@ -2,13 +2,14 @@
 snapshot preview. Nothing here may raise into a caller."""
 import json
 import pathlib
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from modules.econ_ledger import EconLedger
-from modules.econ_shadow import EconShadow
+from modules.econ_shadow import EconShadow, fail_open_fee_evidence_guard
 
 SCHEMA_PATH = (pathlib.Path(__file__).resolve().parent.parent
                / "schemas" / "economic_snapshot.v0.schema.json")
@@ -36,7 +37,114 @@ def _shadow(tmp_path, enabled=True):
                       ledger_path=str(tmp_path / "econ_ledger.db"))
 
 
+class _LockOwningFaultGuard:
+    def __init__(self, lock, enter_error=False, exit_error=False,
+                 release_before_exit_error=False):
+        self.lock = lock
+        self.enter_error = enter_error
+        self.exit_error = exit_error
+        self.release_before_exit_error = release_before_exit_error
+        self.calls = []
+
+    def __enter__(self):
+        self.calls.append("enter")
+        self.lock.acquire()
+        if self.enter_error:
+            raise RuntimeError("guard enter failed after acquiring")
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.calls.append("exit")
+        if self.exit_error:
+            if self.release_before_exit_error:
+                self.lock.release()
+            raise RuntimeError("guard exit failed")
+        self.lock.release()
+
+    def release(self):
+        self.calls.append("release")
+        self.lock.release()
+
+
+def _assert_other_thread_can_acquire(lock):
+    acquired = threading.Event()
+
+    def attempt():
+        if lock.acquire(timeout=1):
+            acquired.set()
+            lock.release()
+
+    thread = threading.Thread(target=attempt)
+    thread.start()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert acquired.is_set()
+
+
+def _other_thread_can_acquire(lock):
+    acquired = threading.Event()
+
+    def attempt():
+        if lock.acquire(timeout=0.2):
+            acquired.set()
+            lock.release()
+
+    thread = threading.Thread(target=attempt)
+    thread.start()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    return acquired.is_set()
+
+
+def test_fail_open_guard_ignores_custom_context_manager():
+    lock = threading.Lock()
+    body_calls = []
+    guard = _LockOwningFaultGuard(lock, enter_error=True)
+
+    with fail_open_fee_evidence_guard(lambda: guard):
+        body_calls.append("body")
+
+    assert body_calls == ["body"]
+    assert guard.calls == []
+    _assert_other_thread_can_acquire(lock)
+
+
+def test_fail_open_guard_does_not_consume_outer_rlock_for_bad_inner_guard():
+    lock = threading.RLock()
+    body_calls = []
+    bad_inner = _LockOwningFaultGuard(
+        lock, exit_error=True, release_before_exit_error=True)
+
+    with fail_open_fee_evidence_guard(lambda: lock):
+        with fail_open_fee_evidence_guard(lambda: bad_inner):
+            body_calls.append("body")
+        assert _other_thread_can_acquire(lock) is False
+
+    assert body_calls == ["body"]
+    assert bad_inner.calls == []
+    _assert_other_thread_can_acquire(lock)
+
+
+def test_fail_open_guard_preserves_body_exception_identity():
+    lock = threading.RLock()
+    body_error = RuntimeError("fee body failed")
+
+    with pytest.raises(RuntimeError) as caught:
+        with fail_open_fee_evidence_guard(lambda: lock):
+            raise body_error
+
+    assert caught.value is body_error
+    _assert_other_thread_can_acquire(lock)
+
+
 class TestRecordFeeIntents:
+    def test_fee_evidence_guard_is_reentrant(self, tmp_path):
+        shadow = _shadow(tmp_path)
+
+        with shadow.fee_evidence_guard():
+            with shadow.fee_evidence_guard():
+                assert True
+
     def test_disabled_records_nothing(self, tmp_path):
         shadow = _shadow(tmp_path, enabled=False)
         assert shadow.record_fee_intents([_adjustment()], NOW) == 0
