@@ -1092,6 +1092,28 @@ def _on_fee_replay_capture_change(
     )
 
 
+def _on_rebalance_replay_capture_change(
+    plugin_: Plugin, option_name: str, new_value: Any,
+) -> None:
+    """Apply rebalance capture lifecycle changes without running a cycle."""
+    enabled = _parse_dynamic_bool(option_name, new_value)
+    cfg = globals().get("config")
+    rebalancer_ = globals().get("rebalancer")
+    engine = getattr(rebalancer_, "rebalance_engine_v2", None) if rebalancer_ is not None else None
+    manager = getattr(engine, "rebalance_capture_manager", None)
+    if manager is not None:
+        manager_ready = manager.set_enabled(enabled, timeout_seconds=5.0)
+        if enabled and manager_ready is not True:
+            raise ValueError(f"{option_name} could not be enabled")
+        if not enabled and manager_ready is not True:
+            if cfg is not None:
+                cfg.rebalance_replay_capture_enabled = False
+            plugin_.log("REBALANCE REPLAY CAPTURE: disabled; writer is still draining", level="warn")
+            return
+    if cfg is not None:
+        cfg.rebalance_replay_capture_enabled = enabled
+    plugin_.log(f"REBALANCE REPLAY CAPTURE: {'enabled' if enabled else 'disabled'}", level="info")
+
 plugin.add_option(
     name='revenue-ops-db-path',
     default='~/.lightning/revenue_ops.db',
@@ -1129,6 +1151,14 @@ plugin.add_option(
     ),
     dynamic=True,
     on_change=_on_fee_replay_capture_change,
+)
+
+plugin.add_option(
+    name="revenue-ops-rebalance-replay-capture-enabled",
+    default="false",
+    description="Internal observational rebalance-cycle replay capture; disabled by default.",
+    dynamic=True,
+    on_change=_on_rebalance_replay_capture_change,
 )
 
 plugin.add_option(
@@ -1769,6 +1799,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 'revenue-ops-fee-replay-capture-enabled',
                 'false',
             )).strip().lower() == 'true'
+        ),
+        rebalance_replay_capture_enabled=(
+            str(options.get("revenue-ops-rebalance-replay-capture-enabled", "false")).strip().lower() == "true"
         ),
         hot_channel_protection_enabled=options.get('revenue-ops-hot-channel-protection-enabled', 'true').lower() == 'true',
         hot_channel_protection_override_peers=str(options.get('revenue-ops-hot-channel-protection-override-peers', '') or ''),

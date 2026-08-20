@@ -386,6 +386,8 @@ class Config:
     # Internal fee-cycle replay instrumentation. Disabled by default and
     # observational only; enabling affects the next naturally scheduled cycle.
     fee_replay_capture_enabled: bool = False
+    # Internal, default-off rebalance-cycle replay instrumentation.
+    rebalance_replay_capture_enabled: bool = False
     # Hot-channel protection (aggressiveness for fast-draining, high-profit channels)
     hot_channel_protection_enabled: bool = True
     hot_channel_protection_override_peers: str = ''  # CSV fallback; DB override table preferred
@@ -1159,6 +1161,9 @@ class ConfigSnapshot:
 
     # Internal, default-off fee-cycle replay instrumentation.
     fee_replay_capture_enabled: bool = False
+
+    # Internal, default-off rebalance-cycle replay instrumentation.
+    rebalance_replay_capture_enabled: bool = False
 
     # V3 rebalance router (askrene getroutes)
     rebalance_router: str = 'v3'

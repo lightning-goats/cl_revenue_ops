@@ -117,6 +117,10 @@ class CycleResult:
     audit_records: List[SkipRecord] = field(default_factory=list)
     snapshot: Optional[StateSnapshot] = None
     plan: Optional[PlanResult] = None
+    # Observational replay metadata; never used for a decision or action.
+    cycle_id: str = ""
+    trigger: str = "unknown"
+    pair_outcomes: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class RebalanceEngine:
@@ -134,11 +138,25 @@ class RebalanceEngine:
         global_budget_limit_provider: Any = None,
         external_liquidity_cost_provider: Any = None,
         policy_manager: Any = None,
+        rebalance_capture_manager: Any = None,
     ):
         self.plugin = plugin
         self.config = config
         self.database = database
         self._policy_manager = policy_manager
+        # Capture is optional and observational; construction must not affect live execution.
+        if rebalance_capture_manager is not None:
+            self.rebalance_capture_manager = rebalance_capture_manager
+        else:
+            try:
+                from modules.rebalance_cycle_capture import RebalanceCycleCaptureManager
+                self.rebalance_capture_manager = RebalanceCycleCaptureManager(
+                    getattr(config, "db_path", "revenue_ops.db"), self._log
+                )
+                if getattr(config, "rebalance_replay_capture_enabled", False) is True:
+                    self.rebalance_capture_manager.set_enabled(True)
+            except Exception:
+                self.rebalance_capture_manager = None
         # Phase 2C: optional shadow-governor (EconShadow), injected at
         # plugin init; None = no shadow. Fail-open by contract.
         self.econ_shadow = None
@@ -367,6 +385,11 @@ class RebalanceEngine:
 
     def shutdown(self) -> None:
         """Release thread pool resources."""
+        try:
+            if self.rebalance_capture_manager is not None:
+                self.rebalance_capture_manager.set_enabled(False, timeout_seconds=5.0)
+        except Exception:
+            pass
         self._pool.shutdown(wait=False)
 
     def _cache_cycle_result(self, result: CycleResult) -> None:
@@ -1251,7 +1274,7 @@ class RebalanceEngine:
         )
 
 
-    def find_candidates(self) -> List[PairCandidate]:
+    def find_candidates(self, capture_reference: Any = None) -> List[PairCandidate]:
         """Dry-run: build snapshot, plan, and return candidates without executing.
 
         This is the entry point called by EVRebalancer when rebalance_engine=v2.
@@ -3863,6 +3886,26 @@ class RebalanceEngine:
             rebalance_id=rebalance_id,
         )
 
+    def _begin_rebalance_capture(self):
+        manager = self.rebalance_capture_manager
+        if manager is None:
+            return None
+        try:
+            cfg = self.config.snapshot() if hasattr(self.config, "snapshot") else self.config
+            return manager.begin_cycle(
+                {
+                    "config_version": 1,
+                    "target_band_low": getattr(cfg, "low_liquidity_threshold", 0.35),
+                    "target_band_high": getattr(cfg, "high_liquidity_threshold", 0.65),
+                    "max_chunk_sats": getattr(cfg, "rebalance_max_amount", 2_000_000),
+                    "max_pairs": self._max_concurrent_jobs(cfg),
+                    "pair_fee_cap_ppm": getattr(cfg, "pair_fee_cap_ppm", 1) or 1,
+                },
+                {"trigger": "automatic"},
+            )
+        except Exception:
+            return None
+
     def run_cycle(self) -> CycleResult:
         """Live execution: find candidates (already priced), execute concurrently.
 
@@ -3890,17 +3933,25 @@ class RebalanceEngine:
                     )
                 ]
             )
+        capture_reference = self._begin_rebalance_capture()
+        result = None
         try:
-            return self._run_cycle_locked()
+            result = self._run_cycle_locked(capture_reference)
+            return result
         finally:
+            try:
+                if capture_reference is not None:
+                    self.rebalance_capture_manager.finish_cycle(capture_reference, result or CycleResult(), "completed")
+            except Exception:
+                pass
             self._cycle_lock.release()
 
-    def _run_cycle_locked(self) -> CycleResult:
+    def _run_cycle_locked(self, capture_reference: Any = None) -> CycleResult:
         try:
             self.reconcile_pending_settlements()
         except Exception as exc:
             self._log(f"pending settlement sweep failed: {exc}", level="warn")
-        candidates = self.find_candidates()
+        candidates = self.find_candidates(capture_reference=capture_reference)
         planned = self._last_cycle_result or CycleResult()
         result = CycleResult(
             considered_candidates=list(getattr(planned, "considered_candidates", []) or []),
@@ -3909,6 +3960,8 @@ class RebalanceEngine:
             snapshot=getattr(planned, "snapshot", None),
             plan=getattr(planned, "plan", None),
         )
+        result.cycle_id = str(getattr(capture_reference, "cycle_id", "") or "")
+        result.trigger = "automatic"
         considered_lookup = {
             self._pair_key(pair): pair for pair in result.considered_candidates
         }
@@ -4071,6 +4124,11 @@ class RebalanceEngine:
                 completed_futures.add(future)
                 if exec_result is not None:
                     result.executions.append(exec_result)
+                    result.pair_outcomes.append({
+                        "source_channel_id": pair.source_channel_id,
+                        "dest_channel_id": pair.dest_channel_id,
+                        "result": copy.deepcopy(exec_result),
+                    })
                     # Idempotent backstop: the worker already recorded this
                     # result's pair outcome (record_pair_outcome=True) and
                     # marked it, making this a no-op. It still covers
