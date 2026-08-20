@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.cl-revenue-ops.invalid/rebalance_cycle_replay.v0.schema.json",
+  "title": "Rebalance Cycle Replay v0",
+  "type": "object",
+  "required": ["schema_name", "schema_version", "capture_run_id", "capture_seq", "cycle_id", "producer", "configuration", "pre_state", "funnel", "execution", "completeness", "payload_sha256"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_name": {"const": "rebalance_cycle_replay"},
+    "schema_version": {"const": 0},
+    "capture_run_id": {"type": "string", "minLength": 1},
+    "capture_seq": {"$ref": "#/$defs/positive_integer"},
+    "cycle_id": {"type": "string", "minLength": 1},
+    "producer": {"$ref": "#/$defs/producer"},
+    "configuration": {"$ref": "#/$defs/configuration"},
+    "pre_state": {"$ref": "#/$defs/pre_state"},
+    "funnel": {"$ref": "#/$defs/funnel"},
+    "execution": {"$ref": "#/$defs/execution"},
+    "completeness": {"$ref": "#/$defs/completeness"},
+    "payload_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "tagged_float": {
+      "type": "object",
+      "required": ["__f__"],
+      "additionalProperties": false,
+      "properties": {"__f__": {"type": "string"}}
+    },
+    "wire_value": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "boolean"},
+        {"type": "integer"},
+        {"type": "string"},
+        {"type": "array", "items": {"$ref": "#/$defs/wire_value"}},
+        {"type": "object", "additionalProperties": {"$ref": "#/$defs/wire_value"}}
+      ]
+    },
+    "wire_number": {"anyOf": [{"type": "integer"}, {"$ref": "#/$defs/tagged_float"}]},
+    "positive_integer": {"type": "integer", "minimum": 1},
+    "nonnegative_integer": {"type": "integer", "minimum": 0},
+    "producer": {
+      "type": "object",
+      "required": ["started_at", "completed_at", "python_commit", "algorithm_version", "trigger"],
+      "additionalProperties": false,
+      "properties": {
+        "started_at": {"type": "string", "minLength": 1},
+        "completed_at": {"type": "string", "minLength": 1},
+        "python_commit": {"type": "string", "minLength": 1},
+        "algorithm_version": {"type": "string", "minLength": 1},
+        "trigger": {"type": "string", "minLength": 1}
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "required": ["config_version", "target_band_low", "target_band_high", "max_chunk_sats", "max_pairs", "pair_fee_cap_ppm"],
+      "additionalProperties": false,
+      "properties": {
+        "config_version": {"$ref": "#/$defs/positive_integer"},
+        "target_band_low": {"$ref": "#/$defs/wire_number"},
+        "target_band_high": {"$ref": "#/$defs/wire_number"},
+        "max_chunk_sats": {"$ref": "#/$defs/positive_integer"},
+        "max_pairs": {"$ref": "#/$defs/positive_integer"},
+        "pair_fee_cap_ppm": {"$ref": "#/$defs/positive_integer"}
+      }
+    },
+    "channel": {
+      "type": "object",
+      "required": ["channel_id"],
+      "properties": {"channel_id": {"type": "string", "minLength": 1}},
+      "additionalProperties": {"$ref": "#/$defs/wire_value"}
+    },
+    "pre_state": {
+      "type": "object",
+      "required": ["normalized_snapshot"],
+      "additionalProperties": false,
+      "properties": {
+        "normalized_snapshot": {
+          "type": "object",
+          "required": ["channels", "total_capacity_sats", "total_remaining_budget_sats", "valuable_channel_count"],
+          "additionalProperties": false,
+          "properties": {
+            "channels": {"type": "array", "items": {"$ref": "#/$defs/channel"}},
+            "total_capacity_sats": {"$ref": "#/$defs/nonnegative_integer"},
+            "total_remaining_budget_sats": {"$ref": "#/$defs/nonnegative_integer"},
+            "valuable_channel_count": {"$ref": "#/$defs/nonnegative_integer"}
+          }
+        }
+      }
+    },
+    "pair_ref": {
+      "type": "object",
+      "required": ["source_channel_id", "dest_channel_id"],
+      "properties": {
+        "source_channel_id": {"type": "string", "minLength": 1},
+        "dest_channel_id": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": {"$ref": "#/$defs/wire_value"}
+    },
+    "generated_pair": {
+      "allOf": [
+        {"$ref": "#/$defs/pair_ref"},
+        {
+          "required": ["planned_amount_sats", "pair_budget_sats", "source_excess_sats", "dest_need_sats", "max_chunk_sats", "cheap_rank", "cheap_score", "planner_selected", "planner_rejection_reason", "bootstrap_score_decomposition"],
+          "properties": {
+            "planned_amount_sats": {"$ref": "#/$defs/positive_integer"},
+            "pair_budget_sats": {"$ref": "#/$defs/positive_integer"},
+            "source_excess_sats": {"$ref": "#/$defs/positive_integer"},
+            "dest_need_sats": {"$ref": "#/$defs/positive_integer"},
+            "max_chunk_sats": {"$ref": "#/$defs/positive_integer"},
+            "cheap_rank": {"$ref": "#/$defs/positive_integer"},
+            "cheap_score": {"$ref": "#/$defs/wire_number"},
+            "planner_selected": {"type": "boolean"},
+            "planner_rejection_reason": {"type": ["string", "null"]},
+            "bootstrap_score_decomposition": {"type": "object", "additionalProperties": {"$ref": "#/$defs/wire_value"}}
+          }
+        }
+      ]
+    },
+    "funnel": {
+      "type": "object",
+      "required": ["generated_pairs", "planner_selected_pairs", "final_selected_pairs", "skipped"],
+      "additionalProperties": false,
+      "properties": {
+        "generated_pairs": {"type": "array", "items": {"$ref": "#/$defs/generated_pair"}},
+        "planner_selected_pairs": {"type": "array", "items": {"$ref": "#/$defs/pair_ref"}},
+        "final_selected_pairs": {"type": "array", "items": {"$ref": "#/$defs/pair_ref"}},
+        "skipped": {"type": "array", "items": {"$ref": "#/$defs/wire_value"}}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "required": ["pair_outcomes"],
+      "additionalProperties": false,
+      "properties": {"pair_outcomes": {"type": "array", "items": {"$ref": "#/$defs/pair_ref"}}}
+    },
+    "completeness": {
+      "type": "object",
+      "required": ["generated_pair_count", "retained_generated_pair_count", "planner_selected_pair_count", "final_selected_pair_count", "execution_outcome_count", "candidate_universe_truncated", "eligible"],
+      "additionalProperties": false,
+      "properties": {
+        "generated_pair_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "retained_generated_pair_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "planner_selected_pair_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "final_selected_pair_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "execution_outcome_count": {"$ref": "#/$defs/nonnegative_integer"},
+        "candidate_universe_truncated": {"type": "boolean"},
+        "eligible": {"type": "boolean"}
+      }
+    }
+  }
+}
