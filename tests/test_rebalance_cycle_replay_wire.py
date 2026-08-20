@@ -124,93 +124,99 @@ def test_canonicalization_tags_floats_and_digest_is_deterministic():
 
     payload = canonical_body_bytes(body)
     assert payload == canonical_body_bytes(reversed_body)
-    assert b'{"__f__":"0.35"}' in payload
+    assert b'{"__f64__":"3fd6666666666666"}' in payload
     assert seal_envelope(body)["payload_sha256"] == seal_envelope(reversed_body)[
         "payload_sha256"
     ]
 
 
-@pytest.mark.parametrize(
-    "tag",
-    ["not-a-float", "", " ", "0.35 ", "NaN", "+inf", "1.0.0", "1e"],
-)
-def test_validate_rejects_malformed_tagged_float_values(tag):
-    body = valid_body()
-    body["configuration"]["target_band_low"] = {"__f__": tag}
-
-    with pytest.raises(ValueError, match="number"):
+def test_runtime_and_schema_reject_malformed_binary64_tag_in_nested_wire_value():
+    body = body_with_pair()
+    body["funnel"]["generated_pairs"][0]["bootstrap_score_decomposition"] = {
+        "score": {"__f64__": "not-a-float"}
+    }
+    with pytest.raises(ValueError, match="binary64 float"):
         validate_body(body)
 
-
-@pytest.mark.parametrize("tag", ["0.35", "-0.0", "1e+20", "nan", "inf", "-inf"])
-def test_validate_accepts_canonical_tagged_float_values(tag):
-    body = valid_body()
-    body["configuration"]["target_band_low"] = {"__f__": tag}
-
-    validate_body(body)
-
-
-@pytest.mark.parametrize("tag", ["not-a-float", "", " ", "0.35 ", "NaN", "+inf"])
-def test_schema_rejects_malformed_tagged_float_values(tag):
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-    envelope = seal_envelope(valid_body())
-    envelope["configuration"]["target_band_low"] = {"__f__": tag}
-
+    envelope = seal_envelope(body_with_pair())
+    envelope["funnel"]["generated_pairs"][0]["bootstrap_score_decomposition"] = {
+        "score": {"__f64__": "not-a-float"}
+    }
     with pytest.raises(ValidationError):
         Draft202012Validator(schema).validate(envelope)
 
 
 @pytest.mark.parametrize(
-    "tag",
-    ["0.35", "-0.0", "1e+20", "1e-05", "1.25e+20", "nan", "inf", "-inf"],
+    ("value", "bits"),
+    [
+        pytest.param(1.0, "3ff0000000000000", id="finite"),
+        pytest.param(-0.0, "8000000000000000", id="signed-zero"),
+        pytest.param(float("inf"), "7ff0000000000000", id="inf"),
+        pytest.param(float("-inf"), "fff0000000000000", id="negative-inf"),
+        pytest.param(float("nan"), "7ff8000000000000", id="nan"),
+    ],
 )
-def test_schema_and_runtime_accept_the_same_canonical_tagged_float_values(tag):
+def test_binary64_float_tags_are_exact_sealable_and_schema_valid(value, bits):
     body = valid_body()
-    body["configuration"]["target_band_low"] = {"__f__": tag}
+    body["configuration"]["target_band_low"] = value
+    sealed = seal_envelope(body)
+
+    assert sealed["configuration"]["target_band_low"] == {"__f64__": bits}
+    verify_envelope(sealed)
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    Draft202012Validator(schema).validate(sealed)
+
+
+@pytest.mark.parametrize(
+    "bits",
+    ["0000000000000000", "8000000000000000", "7ff0000000000000", "fff0000000000000", "7ff8000000000000", "deadbeefcafebabe"],
+)
+def test_runtime_and_schema_accept_all_binary64_bit_patterns(bits):
+    body = valid_body()
+    body["configuration"]["target_band_low"] = {"__f64__": bits}
     validate_body(body)
 
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     envelope = seal_envelope(valid_body())
-    envelope["configuration"]["target_band_low"] = {"__f__": tag}
+    envelope["configuration"]["target_band_low"] = {"__f64__": bits}
     Draft202012Validator(schema).validate(envelope)
 
 
 @pytest.mark.parametrize(
     "tag",
-    ["1.00", "-1.00", "0.00", "1.20", "1.0e+20", "1e+020", "01.0", "-00.0"],
+    [
+        {"__f__": "0.35"},
+        {"__f64__": "3FF0000000000000"},
+        {"__f64__": "3ff000000000000"},
+        {"__f64__": "3ff00000000000000"},
+        {"__f64__": "3ff000000000000g"},
+        {"__f64__": "3ff0000000000000", "extra": True},
+        {"__f64__": " 3ff0000000000000"},
+        {"__f64__": "3ff0000000000000 "},
+    ],
 )
-def test_schema_and_runtime_reject_noncanonical_tagged_float_values(tag):
+def test_runtime_and_schema_reject_legacy_or_malformed_binary64_tags(tag):
     body = valid_body()
-    body["configuration"]["target_band_low"] = {"__f__": tag}
-    with pytest.raises(ValueError, match="number"):
+    body["configuration"]["target_band_low"] = tag
+    with pytest.raises(ValueError, match="float|number"):
         validate_body(body)
 
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     envelope = seal_envelope(valid_body())
-    envelope["configuration"]["target_band_low"] = {"__f__": tag}
+    envelope["configuration"]["target_band_low"] = tag
     with pytest.raises(ValidationError):
         Draft202012Validator(schema).validate(envelope)
 
 
-def test_validate_rejects_malformed_tagged_float_in_nested_wire_value():
-    body = body_with_pair()
-    body["funnel"]["generated_pairs"][0]["bootstrap_score_decomposition"] = {
-        "score": {"__f__": "not-a-float"}
-    }
+def test_binary64_tag_tampering_is_digest_evident():
+    body = valid_body()
+    body["configuration"]["target_band_low"] = {"__f64__": "3ff0000000000000"}
+    sealed = seal_envelope(body)
+    sealed["configuration"]["target_band_low"] = {"__f64__": "bff0000000000000"}
 
-    with pytest.raises(ValueError, match="tagged float"):
-        validate_body(body)
-
-
-def test_schema_rejects_malformed_tagged_float_in_nested_wire_value():
-    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-    envelope = seal_envelope(body_with_pair())
-    envelope["funnel"]["generated_pairs"][0]["bootstrap_score_decomposition"] = {
-        "score": {"__f__": "not-a-float"}
-    }
-
-    with pytest.raises(ValidationError):
-        Draft202012Validator(schema).validate(envelope)
+    with pytest.raises(ValueError, match="digest"):
+        verify_envelope(sealed)
 
 
 def test_verify_detects_payload_tampering():

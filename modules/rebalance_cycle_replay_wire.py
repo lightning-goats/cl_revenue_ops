@@ -3,8 +3,7 @@
 import hashlib
 import hmac
 import json
-import math
-import re
+import struct
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 
@@ -12,13 +11,8 @@ SCHEMA_NAME = "rebalance_cycle_replay"
 SCHEMA_VERSION = 0
 MAX_ENVELOPE_BYTES = 32 * 1024 * 1024
 
-# Mirrored by schemas/rebalance_cycle_replay.v0.schema.json. Finite tags use
-# Python's canonical repr(float) lexical form; runtime confirms exact repr
-# equality after this grammar prefilter. The three non-finite spellings are
-# explicit because tag_floats emits them deliberately.
-CANONICAL_TAGGED_FLOAT_PATTERN = re.compile(
-    r"^(?:nan|inf|-inf|-?(?:(?:0|[1-9][0-9]*)\.(?:0|[0-9]*[1-9])|(?:(?:0|[1-9][0-9]*)|(?:0|[1-9][0-9]*)\.[0-9]*[1-9])e(?:\+(?:1[6-9]|[2-9][0-9]|[1-9][0-9]{2,})|-(?:0[5-9]|[1-9][0-9]+))))$"
-)
+BINARY64_TAG_KEY = "__f64__"
+_BINARY64_HEX = frozenset("0123456789abcdef")
 
 
 def tag_floats(value: Any) -> Any:
@@ -26,14 +20,7 @@ def tag_floats(value: Any) -> Any:
     if isinstance(value, bool):
         return value
     if isinstance(value, float):
-        rendered = repr(value)
-        if math.isnan(value):
-            rendered = "nan"
-        elif value == math.inf:
-            rendered = "inf"
-        elif value == -math.inf:
-            rendered = "-inf"
-        return {"__f__": rendered}
+        return {BINARY64_TAG_KEY: struct.pack(">d", value).hex()}
     if isinstance(value, dict):
         return {str(key): tag_floats(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -130,11 +117,13 @@ def validate_body(body: Dict[str, Any]) -> None:
 def _validate_tagged_floats(value: Any) -> None:
     if isinstance(value, dict):
         if "__f__" in value:
-            if set(value) != {"__f__"}:
-                raise ValueError("tagged float must contain only __f__")
-            tagged = value["__f__"]
-            if not isinstance(tagged, str) or not _is_canonical_tagged_float(tagged):
-                raise ValueError("malformed tagged float number")
+            raise ValueError("legacy __f__ float tags are not supported")
+        if BINARY64_TAG_KEY in value:
+            if set(value) != {BINARY64_TAG_KEY}:
+                raise ValueError("binary64 float tag must contain only __f64__")
+            tagged = value[BINARY64_TAG_KEY]
+            if not isinstance(tagged, str) or not _is_binary64_tag(tagged):
+                raise ValueError("malformed binary64 float tag")
             return
         for item in value.values():
             _validate_tagged_floats(item)
@@ -188,23 +177,15 @@ def _require_wire_number(value: Any, label: str) -> None:
         raise ValueError(f"{label} must be a number")
     if isinstance(value, (int, float)):
         return
-    if isinstance(value, dict) and set(value) == {"__f__"}:
-        tagged = value["__f__"]
-        if isinstance(tagged, str) and _is_canonical_tagged_float(tagged):
+    if isinstance(value, dict) and set(value) == {BINARY64_TAG_KEY}:
+        tagged = value[BINARY64_TAG_KEY]
+        if isinstance(tagged, str) and _is_binary64_tag(tagged):
             return
     raise ValueError(f"{label} must be a number")
 
 
-def _is_canonical_tagged_float(value: str) -> bool:
-    if not CANONICAL_TAGGED_FLOAT_PATTERN.fullmatch(value):
-        return False
-    if value in {"nan", "inf", "-inf"}:
-        return True
-    try:
-        parsed = float(value)
-    except ValueError:
-        return False
-    return math.isfinite(parsed) and repr(parsed) == value
+def _is_binary64_tag(value: str) -> bool:
+    return len(value) == 16 and all(character in _BINARY64_HEX for character in value)
 
 
 def _validate_producer(value: Any) -> None:
