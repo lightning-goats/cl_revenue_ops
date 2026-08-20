@@ -40,6 +40,12 @@ Live algorithm changes remain blocked until the Phase 0 production gate proves
 at least 72 consecutive hours of reconstructable completeness from durable
 evidence.
 
+The local Phase 1A rebalance replay-capture implementation is recorded in
+[its finding](findings/2026-08-20-rebalance-replay-capture.md):
+**IMPLEMENTED, NOT DEPLOYED**; **SHADOW ACTIVATION NOT AUTHORIZED**; and
+**PHASE 1 GATE NOT YET MET**. It remains default-off and offline-only pending
+the Phase 0 gate and a separately approved shadow proposal.
+
 ## Authoritative plan
 
 - [Post-Evaluation Hardening and Economic Optimization Plan](POST_EVALUATION_OPTIMIZATION_PLAN.md)
@@ -75,7 +81,7 @@ See [validation/baseline.md](validation/baseline.md) and the historical
 | 0.5 Versioned evaluation identity | implementation | preflight only | [phase0-evaluation-identity.md](findings/phase0-evaluation-identity.md) |
 | 0.6 Canonical forward archive | implementation | archive coverage complete; gate boundary staged | [ADR-002](adr/ADR-002-canonical-forward-archive.md) |
 | 0B. Refactor closure | queued | inactive | future finding |
-| 1. Deterministic replay and traces | blocked by Phase 0 | inactive | future finding |
+| 1. Deterministic replay and traces | local Phase 1A implementation only; blocked from production by Phase 0 | implemented, not deployed | [2026-08-20 replay capture](findings/2026-08-20-rebalance-replay-capture.md) |
 | 2. Route-liquidity evidence | blocked by Phase 1 | inactive | future finding |
 | 3. Amount optimizer | blocked by Phases 1–2 | inactive | future finding |
 | 4. Price before final selection | blocked by Phase 3 | inactive | future finding |
