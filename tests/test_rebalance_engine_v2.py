@@ -3660,3 +3660,83 @@ def test_engine_capture_is_once_for_live_and_once_for_standalone(mock_plugin, mo
 
     assert manager.begin_cycle.call_count == 1
     assert manager.finish_cycle.call_args.args[2] == "planning_only"
+
+
+
+def _capture_reference_for_engine(seq=1):
+    from modules.rebalance_cycle_capture import RebalanceCycleCaptureReference
+    return RebalanceCycleCaptureReference("a" * 32, seq, ("a" * 32) + f":{seq:08d}", {"config_version": 1, "target_band_low": 0.35, "target_band_high": 0.65, "max_chunk_sats": 1, "max_pairs": 1, "pair_fee_cap_ppm": 0}, {"trigger": "automatic"})
+
+
+def test_engine_capture_marks_lock_contention_terminal_stage(mock_plugin, mock_database):
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = MagicMock()
+    manager.begin_cycle.return_value = _capture_reference_for_engine()
+    engine.rebalance_capture_manager = manager
+    assert engine._cycle_lock.acquire(blocking=False)
+    try:
+        result = engine.run_cycle()
+    finally:
+        engine._cycle_lock.release()
+
+    assert result.audit_records[0].reason == "cycle_already_running"
+    assert manager.finish_cycle.call_args.args[2] == "lock_contended"
+
+
+def test_engine_capture_marks_raised_cycle_ineligible_and_reraises(mock_plugin, mock_database):
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = MagicMock()
+    manager.begin_cycle.return_value = _capture_reference_for_engine()
+    engine.rebalance_capture_manager = manager
+    engine._run_cycle_locked = MagicMock(side_effect=RuntimeError("cycle boom"))
+
+    with pytest.raises(RuntimeError, match="cycle boom"):
+        engine.run_cycle()
+
+    assert manager.finish_cycle.call_args.args[2] == "failed"
+
+
+def test_engine_links_out_of_order_and_raised_future_results(mock_plugin, mock_database):
+    from concurrent.futures import Future
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    first = PairCandidate("src-a", "dst-a", "peer-a", "peer-b", 10, 0, cheap_rank=1, planner_selected=True)
+    second = PairCandidate("src-b", "dst-b", "peer-c", "peer-d", 10, 0, cheap_rank=2, planner_selected=True)
+    engine.find_candidates = MagicMock(return_value=[first, second])
+    executor = MagicMock(); executor.is_available.return_value = True
+    engine._make_executor = MagicMock(return_value=executor)
+    first_future = Future(); first_future.set_exception(RuntimeError("worker boom"))
+    second_future = Future(); second_future.set_result(ExecutionResult(success=True, amount_sats=10))
+    engine._pool = MagicMock(); engine._pool.submit.side_effect = [first_future, second_future]
+
+    with patch("modules.rebalance_engine_v2.as_completed", return_value=iter([second_future, first_future])):
+        result = engine.run_cycle()
+
+    assert [(row["source_channel_id"], row["dest_channel_id"], row["status"]) for row in result.pair_outcomes] == [("src-b", "dst-b", "returned"), ("src-a", "dst-a", "raised")]
+    assert len(result.executions) == 1
+
+
+def test_engine_links_cancelled_and_still_running_timeouts_once(mock_plugin, mock_database):
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
+    from modules.rebalance_types_v2 import PairCandidate
+
+    class FutureStub:
+        def __init__(self, cancel_result): self.cancel_result = cancel_result
+        def done(self): return False
+        def cancel(self): return self.cancel_result
+
+    engine = _make_engine(mock_plugin, mock_database)
+    first = PairCandidate("src-a", "dst-a", "peer-a", "peer-b", 10, 0, cheap_rank=1, planner_selected=True)
+    second = PairCandidate("src-b", "dst-b", "peer-c", "peer-d", 10, 0, cheap_rank=2, planner_selected=True)
+    engine.find_candidates = MagicMock(return_value=[first, second])
+    executor = MagicMock(); executor.is_available.return_value = True
+    engine._make_executor = MagicMock(return_value=executor)
+    engine._pool = MagicMock(); engine._pool.submit.side_effect = [FutureStub(True), FutureStub(False)]
+
+    with patch("modules.rebalance_engine_v2.as_completed", side_effect=FuturesTimeoutError):
+        result = engine.run_cycle()
+
+    assert [(row["source_channel_id"], row["dest_channel_id"], row["status"]) for row in result.pair_outcomes] == [("src-a", "dst-a", "cancelled_timeout"), ("src-b", "dst-b", "still_running_timeout")]
+    assert len(result.executions) == 1
