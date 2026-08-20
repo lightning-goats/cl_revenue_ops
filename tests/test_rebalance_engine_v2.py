@@ -3740,3 +3740,19 @@ def test_engine_links_cancelled_and_still_running_timeouts_once(mock_plugin, moc
 
     assert [(row["source_channel_id"], row["dest_channel_id"], row["status"]) for row in result.pair_outcomes] == [("src-a", "dst-a", "cancelled_timeout"), ("src-b", "dst-b", "still_running_timeout")]
     assert len(result.executions) == 1
+
+
+
+def test_rebalance_engine_shutdown_bounds_capture_drain(mock_plugin, mock_database):
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = MagicMock()
+    manager.set_enabled.return_value = False
+    engine.rebalance_capture_manager = manager
+    engine._pool = MagicMock()
+
+    started = time.monotonic()
+    engine.shutdown()
+
+    assert time.monotonic() - started < 0.1
+    manager.set_enabled.assert_called_once_with(False, timeout_seconds=5.0)
+    engine._pool.shutdown.assert_called_once_with(wait=False)

@@ -429,3 +429,18 @@ def test_rotation_bounds_owned_artifacts_and_bytes_including_manifest(tmp_path):
     assert unrelated.exists()
     assert len(owned) <= 32
     assert sum(path.stat().st_size for path in owned) <= 256 * 1024 * 1024
+
+
+
+def test_disable_timeout_then_drain_and_reenable_has_one_live_writer(tmp_path):
+    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+    assert manager.set_enabled(True)
+    old_writer = manager._writer
+    reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    assert manager.set_enabled(False, timeout_seconds=0.0) is False
+    assert manager.set_enabled(True) is False
+    manager.finish_cycle(reference, CycleResult())
+    assert manager.set_enabled(False, timeout_seconds=1.0)
+    assert not old_writer.is_alive()
+    assert manager.set_enabled(True)
+    assert manager._writer is not old_writer and manager._writer.is_alive()
