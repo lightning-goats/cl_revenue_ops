@@ -851,24 +851,37 @@ class RebalanceCycleCaptureManager:
         writer: Optional[threading.Thread],
         publisher: Optional[threading.Thread],
         publisher_created: bool,
+        error: Exception,
+        initial_manifest_accepted: bool,
     ) -> None:
         failed_queue = self._queue
+        terminal_snapshot = None
         with self._condition:
             failed_manifest_path = (
                 self._manifest_path() if self._run_id is not None else None
             )
+            if initial_manifest_accepted and self._manifest is not None:
+                self._manifest["state"] = "closed"
+                self._manifest["writer_health"] = "degraded"
+                self._manifest["last_error_category"] = type(error).__name__
+                terminal_snapshot = self._manifest_snapshot_locked()
         if writer is not None and writer.is_alive():
             try:
                 failed_queue.put_nowait(_DRAIN_SENTINEL)
             except queue.Full:
                 pass
             writer.join(1.0)
-        if publisher_created and publisher is not None:
-            self._stop_manifest_publisher(publisher)
-        if failed_manifest_path is not None:
-            with self._manifest_publish_condition:
-                self._pending_manifest_snapshots.pop(failed_manifest_path, None)
-                self._manifest_publish_condition.notify_all()
+        if terminal_snapshot is not None:
+            # A newer terminal revision corrects any active snapshot already
+            # inflight or durable, without waiting for filesystem recovery.
+            self._publish_manifest_snapshot(terminal_snapshot)
+        else:
+            if publisher_created and publisher is not None:
+                self._stop_manifest_publisher(publisher)
+            if failed_manifest_path is not None:
+                with self._manifest_publish_condition:
+                    self._pending_manifest_snapshots.pop(failed_manifest_path, None)
+                    self._manifest_publish_condition.notify_all()
         with self._condition:
             self._enabled = False
             self._run_id = None
@@ -899,6 +912,7 @@ class RebalanceCycleCaptureManager:
         publisher = None
         publisher_created = False
         writer = None
+        initial_manifest_accepted = False
         try:
             publisher, publisher_created = self._ensure_manifest_publisher()
             with self._condition:
@@ -937,6 +951,7 @@ class RebalanceCycleCaptureManager:
                 manifest_snapshot = self._manifest_snapshot_locked()
             if not self._publish_manifest_snapshot(manifest_snapshot):
                 raise RuntimeError("initial manifest publication was not accepted")
+            initial_manifest_accepted = True
             with self._condition:
                 if not writer.is_alive():
                     raise RuntimeError("cycle writer exited during enable")
@@ -946,9 +961,10 @@ class RebalanceCycleCaptureManager:
                 self._enabled = True
                 self._condition.notify_all()
             return True
-        except Exception:
+        except Exception as exc:
             self._rollback_failed_enable(
-                writer, publisher, publisher_created,
+                writer, publisher, publisher_created, exc,
+                initial_manifest_accepted,
             )
             raise
 

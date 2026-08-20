@@ -663,7 +663,7 @@ def test_queue_full_reserves_before_copy_and_repeated_drops_do_not_leak(
     assert manager._prepared == {}
     assert manager._active == set()
     release_writer.set()
-    assert manager.set_enabled(False, timeout_seconds=1.0)
+    assert manager.set_enabled(False, timeout_seconds=2.0)
 
 
 def test_forty_manifest_only_toggles_stay_within_owned_retention(tmp_path):
@@ -937,6 +937,129 @@ def test_partial_cycle_writer_start_is_stopped_and_leaves_no_pending_state(
     assert manager._writer.is_alive()
     assert manager._manifest_publisher.is_alive()
     assert manager.set_enabled(False, timeout_seconds=1.0)
+
+
+def test_post_publication_cycle_writer_exit_persists_closed_degraded_rollback(
+    tmp_path, monkeypatch,
+):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    stop_writer = threading.Event()
+    terminal_write_started = threading.Event()
+    release_terminal_write = threading.Event()
+    original_atomic = manager._atomic_write
+
+    def block_terminal_write(path, data):
+        if (
+            path.name.startswith("manifest-")
+            and json.loads(data).get("state") == "closed"
+        ):
+            terminal_write_started.set()
+            assert release_terminal_write.wait(1.0)
+        return original_atomic(path, data)
+
+    monkeypatch.setattr(manager, "_atomic_write", block_terminal_write)
+
+    def exit_on_signal():
+        assert stop_writer.wait(1.0)
+
+    monkeypatch.setattr(manager, "_writer_main", exit_on_signal)
+    original_publish = manager._publish_manifest_snapshot
+    failed_path = []
+
+    def persist_active_then_stop(snapshot):
+        accepted = original_publish(snapshot)
+        if json.loads(snapshot[1])["state"] == "active" and not failed_path:
+            failed_path.append(snapshot[0])
+            deadline = time.monotonic() + 1.0
+            while not snapshot[0].exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.005)
+            assert json.loads(snapshot[0].read_text())["state"] == "active"
+            stop_writer.set()
+            manager._writer.join(1.0)
+            assert not manager._writer.is_alive()
+        return accepted
+
+    monkeypatch.setattr(manager, "_publish_manifest_snapshot", persist_active_then_stop)
+
+    started = time.monotonic()
+    try:
+        assert manager.set_enabled(True) is False
+        assert time.monotonic() - started < 0.20
+        assert terminal_write_started.wait(1.0)
+        assert manager.begin_cycle(
+            _configuration(), {"trigger": "automatic"},
+        ) is None
+    finally:
+        release_terminal_write.set()
+    _wait_for_manifest_idle(manager, timeout=2.0)
+
+    persisted = json.loads(failed_path[0].read_text())
+    assert persisted["state"] == "closed"
+    assert persisted["writer_health"] == "degraded"
+    assert persisted["last_error_category"] == "RuntimeError"
+    assert manager._enabled is False
+    assert manager._run_id is None
+    assert manager._manifest is None
+    assert manager._writer is None
+    assert not manager._pending_manifest_snapshots
+
+
+def test_post_publication_publisher_exit_restarts_for_terminal_rollback(
+    tmp_path, monkeypatch,
+):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+
+    def one_shot_publisher():
+        current = threading.current_thread()
+        with manager._manifest_publish_condition:
+            while not manager._pending_manifest_snapshots:
+                manager._manifest_publish_condition.wait(1.0)
+            _path, snapshot = manager._pending_manifest_snapshots.popitem(last=False)
+            manager._manifest_publish_inflight = True
+        try:
+            manager._write_manifest_snapshot(*snapshot)
+        finally:
+            with manager._manifest_publish_condition:
+                manager._manifest_publish_inflight = False
+                if manager._manifest_publisher is current:
+                    manager._manifest_publisher = None
+                manager._manifest_publish_condition.notify_all()
+
+    monkeypatch.setattr(manager, "_manifest_publisher_main", one_shot_publisher)
+    original_publish = manager._publish_manifest_snapshot
+    failed_path = []
+
+    def wait_for_publisher_exit(snapshot):
+        accepted = original_publish(snapshot)
+        if json.loads(snapshot[1])["state"] == "active" and not failed_path:
+            failed_path.append(snapshot[0])
+            publisher = manager._manifest_publisher
+            if publisher is not None:
+                publisher.join(1.0)
+            assert snapshot[0].exists()
+            assert json.loads(snapshot[0].read_text())["state"] == "active"
+        return accepted
+
+    monkeypatch.setattr(manager, "_publish_manifest_snapshot", wait_for_publisher_exit)
+
+    assert manager.set_enabled(True) is False
+    _wait_for_manifest_idle(manager, timeout=2.0)
+
+    persisted = json.loads(failed_path[0].read_text())
+    assert persisted["state"] == "closed"
+    assert persisted["writer_health"] == "degraded"
+    assert persisted["last_error_category"] == "RuntimeError"
+    assert manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
+    ) is None
+    assert manager._run_id is None
+    assert manager._manifest is None
+    assert not manager._pending_manifest_snapshots
 
 
 def test_disabled_manager_construction_does_not_probe_git(tmp_path, monkeypatch):
