@@ -852,7 +852,7 @@ class RebalanceCycleCaptureManager:
         publisher: Optional[threading.Thread],
         publisher_created: bool,
         error: Exception,
-        initial_manifest_accepted: bool,
+        initial_manifest_may_have_persisted: bool,
     ) -> None:
         failed_queue = self._queue
         terminal_snapshot = None
@@ -860,7 +860,7 @@ class RebalanceCycleCaptureManager:
             failed_manifest_path = (
                 self._manifest_path() if self._run_id is not None else None
             )
-            if initial_manifest_accepted and self._manifest is not None:
+            if initial_manifest_may_have_persisted and self._manifest is not None:
                 self._manifest["state"] = "closed"
                 self._manifest["writer_health"] = "degraded"
                 self._manifest["last_error_category"] = type(error).__name__
@@ -912,7 +912,7 @@ class RebalanceCycleCaptureManager:
         publisher = None
         publisher_created = False
         writer = None
-        initial_manifest_accepted = False
+        initial_manifest_may_have_persisted = False
         try:
             publisher, publisher_created = self._ensure_manifest_publisher()
             with self._condition:
@@ -949,9 +949,13 @@ class RebalanceCycleCaptureManager:
 
             with self._condition:
                 manifest_snapshot = self._manifest_snapshot_locked()
+            # Once a run identity exists, a false acknowledgement is ambiguous:
+            # the publisher may have accepted or even persisted this active
+            # snapshot before exiting.  Rollback must therefore publish a newer
+            # terminal revision conservatively.
+            initial_manifest_may_have_persisted = True
             if not self._publish_manifest_snapshot(manifest_snapshot):
                 raise RuntimeError("initial manifest publication was not accepted")
-            initial_manifest_accepted = True
             with self._condition:
                 if not writer.is_alive():
                     raise RuntimeError("cycle writer exited during enable")
@@ -964,7 +968,7 @@ class RebalanceCycleCaptureManager:
         except Exception as exc:
             self._rollback_failed_enable(
                 writer, publisher, publisher_created, exc,
-                initial_manifest_accepted,
+                initial_manifest_may_have_persisted,
             )
             raise
 

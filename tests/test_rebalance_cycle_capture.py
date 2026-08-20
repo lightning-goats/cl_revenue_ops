@@ -246,6 +246,7 @@ def test_projection_preserves_timeout_status_for_linked_pair():
 def test_retention_leaves_unowned_json_untouched_and_counts_owned_manifests(tmp_path):
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
+    _wait_for_manifest_idle(manager)
     unrelated = manager.output_dir / "operator-note.json"
     unrelated.write_text("{}")
     for index in range(34):
@@ -938,6 +939,109 @@ def test_partial_cycle_writer_start_is_stopped_and_leaves_no_pending_state(
     assert manager._manifest_publisher.is_alive()
     assert manager.set_enabled(False, timeout_seconds=1.0)
 
+
+@pytest.mark.parametrize("publication_point", ["rejected", "queued", "durable"])
+def test_false_initial_publication_ack_always_terminalizes_owned_run(
+    tmp_path, monkeypatch, publication_point,
+):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    original_publish = manager._publish_manifest_snapshot
+    failed_path = []
+
+    def false_ack_after_selected_point(snapshot):
+        state = json.loads(snapshot[1])["state"]
+        if state != "active":
+            return original_publish(snapshot)
+        failed_path.append(snapshot[0])
+        if publication_point == "queued":
+            with manager._manifest_publish_condition:
+                manager._pending_manifest_snapshots[snapshot[0]] = snapshot
+                manager._manifest_publish_condition.notify_all()
+        elif publication_point == "durable":
+            manager._write_manifest_snapshot(*snapshot)
+        return False
+
+    monkeypatch.setattr(
+        manager, "_publish_manifest_snapshot", false_ack_after_selected_point,
+    )
+
+    assert manager.set_enabled(True) is False
+    assert manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
+    ) is None
+    _wait_for_manifest_idle(manager, timeout=2.0)
+
+    assert len(failed_path) == 1
+    persisted = json.loads(failed_path[0].read_text())
+    assert persisted["state"] == "closed"
+    assert persisted["writer_health"] == "degraded"
+    assert persisted["last_error_category"] == "RuntimeError"
+    assert manager._enabled is False
+    assert manager._run_id is None
+    assert manager._manifest is None
+    assert manager._writer is None
+    assert not manager._pending_manifest_snapshots
+
+
+
+@pytest.mark.parametrize("publication_point", ["queued", "durable"])
+def test_publisher_exit_before_initial_ack_terminalizes_exact_owned_run(
+    tmp_path, monkeypatch, publication_point,
+):
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    original_ensure = manager._ensure_manifest_publisher
+    ensure_calls = []
+    failed_path = []
+
+    class ExitedPublisher:
+        @staticmethod
+        def is_alive():
+            return False
+
+    def exit_publisher_at_ack():
+        ensure_calls.append(True)
+        if len(ensure_calls) != 2:
+            return original_ensure()
+        with manager._manifest_publish_condition:
+            assert len(manager._pending_manifest_snapshots) == 1
+            path, snapshot = next(iter(manager._pending_manifest_snapshots.items()))
+            failed_path.append(path)
+            if publication_point == "durable":
+                manager._pending_manifest_snapshots.pop(path)
+            publisher = manager._manifest_publisher
+            assert publisher is not None and publisher.is_alive()
+            manager._manifest_publisher_stop = True
+            manager._manifest_publish_condition.notify_all()
+        publisher.join(1.0)
+        assert not publisher.is_alive()
+        if publication_point == "durable":
+            manager._write_manifest_snapshot(*snapshot)
+        return ExitedPublisher(), False
+
+    monkeypatch.setattr(
+        manager, "_ensure_manifest_publisher", exit_publisher_at_ack,
+    )
+
+    assert manager.set_enabled(True) is False
+    assert manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
+    ) is None
+    _wait_for_manifest_idle(manager, timeout=2.0)
+
+    assert len(failed_path) == 1
+    persisted = json.loads(failed_path[0].read_text())
+    assert persisted["state"] == "closed"
+    assert persisted["writer_health"] == "degraded"
+    assert persisted["last_error_category"] == "RuntimeError"
+    assert manager._enabled is False
+    assert manager._run_id is None
+    assert manager._manifest is None
+    assert manager._writer is None
+    assert not manager._pending_manifest_snapshots
 
 def test_post_publication_cycle_writer_exit_persists_closed_degraded_rollback(
     tmp_path, monkeypatch,
