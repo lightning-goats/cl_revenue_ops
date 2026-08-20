@@ -73,7 +73,7 @@
         "target_band_high": {"$ref": "#/$defs/wire_number"},
         "max_chunk_sats": {"$ref": "#/$defs/positive_integer"},
         "max_pairs": {"$ref": "#/$defs/positive_integer"},
-        "pair_fee_cap_ppm": {"$ref": "#/$defs/positive_integer"}
+        "pair_fee_cap_ppm": {"$ref": "#/$defs/nonnegative_integer"}
       }
     },
     "channel": {
@@ -118,7 +118,7 @@
           "required": ["planned_amount_sats", "pair_budget_sats", "source_excess_sats", "dest_need_sats", "max_chunk_sats", "cheap_rank", "cheap_score", "planner_selected", "planner_rejection_reason", "bootstrap_score_decomposition"],
           "properties": {
             "planned_amount_sats": {"$ref": "#/$defs/positive_integer"},
-            "pair_budget_sats": {"$ref": "#/$defs/positive_integer"},
+            "pair_budget_sats": {"$ref": "#/$defs/nonnegative_integer"},
             "source_excess_sats": {"$ref": "#/$defs/positive_integer"},
             "dest_need_sats": {"$ref": "#/$defs/positive_integer"},
             "max_chunk_sats": {"$ref": "#/$defs/positive_integer"},

@@ -312,6 +312,47 @@ def test_validate_rejects_duplicate_generated_pair_rank_or_identity(duplicate):
         validate_body(body)
 
 
+def _set_zero_domain_value(body, field, value):
+    if field == "pair_fee_cap_ppm":
+        body["configuration"][field] = value
+        return
+    body["funnel"]["generated_pairs"][0][field] = value
+
+
+@pytest.mark.parametrize("field", ["pair_fee_cap_ppm", "pair_budget_sats"])
+def test_zero_rebalance_budget_domains_seal_verify_and_match_schema(field):
+    body = body_with_pair()
+    _set_zero_domain_value(body, field, 0)
+    validate_body(body)
+    sealed = seal_envelope(body)
+    verify_envelope(sealed)
+
+    if field == "pair_fee_cap_ppm":
+        assert sealed["configuration"][field] == 0
+    else:
+        assert sealed["funnel"]["generated_pairs"][0][field] == 0
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    Draft202012Validator(schema).validate(sealed)
+
+
+@pytest.mark.parametrize("field", ["pair_fee_cap_ppm", "pair_budget_sats"])
+@pytest.mark.parametrize("invalid", [-1, True])
+def test_zero_rebalance_budget_domains_reject_negative_and_boolean_values(field, invalid):
+    body = body_with_pair()
+    _set_zero_domain_value(body, field, invalid)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        validate_body(body)
+
+    envelope = seal_envelope(body_with_pair())
+    if field == "pair_fee_cap_ppm":
+        envelope["configuration"][field] = invalid
+    else:
+        envelope["funnel"]["generated_pairs"][0][field] = invalid
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(envelope)
+
+
 def test_validate_requires_contiguous_generated_pair_ranks_starting_at_one():
     body = body_with_pair()
     body["funnel"]["generated_pairs"][0]["cheap_rank"] = 2

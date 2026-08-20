@@ -222,8 +222,12 @@ def _validate_configuration(value: Any) -> None:
         },
         "configuration",
     )
-    for field in ("config_version", "max_chunk_sats", "max_pairs", "pair_fee_cap_ppm"):
+    for field in ("config_version", "max_chunk_sats", "max_pairs"):
         _require_positive_int(configuration[field], f"configuration.{field}")
+    _require_nonnegative_int(
+        configuration["pair_fee_cap_ppm"],
+        "configuration.pair_fee_cap_ppm",
+    )
     for field in ("target_band_low", "target_band_high"):
         _require_wire_number(configuration[field], f"configuration.{field}")
 
@@ -281,13 +285,16 @@ def _validate_generated_pairs(value: Any) -> list[Tuple[str, str]]:
         generated_object = _require_mapping(generated, label)
         for field in (
             "planned_amount_sats",
-            "pair_budget_sats",
             "source_excess_sats",
             "dest_need_sats",
             "max_chunk_sats",
             "cheap_rank",
         ):
             _require_positive_int(generated_object.get(field), f"{label}.{field}")
+        _require_nonnegative_int(
+            generated_object.get("pair_budget_sats"),
+            f"{label}.pair_budget_sats",
+        )
         rank = generated_object["cheap_rank"]
         if rank in ranks:
             raise ValueError("duplicate generated pair rank")
