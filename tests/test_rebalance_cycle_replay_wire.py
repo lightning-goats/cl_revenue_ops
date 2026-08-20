@@ -130,6 +130,57 @@ def test_canonicalization_tags_floats_and_digest_is_deterministic():
     ]
 
 
+@pytest.mark.parametrize(
+    "tag",
+    ["not-a-float", "", " ", "0.35 ", "NaN", "+inf", "1.0.0", "1e"],
+)
+def test_validate_rejects_malformed_tagged_float_values(tag):
+    body = valid_body()
+    body["configuration"]["target_band_low"] = {"__f__": tag}
+
+    with pytest.raises(ValueError, match="number"):
+        validate_body(body)
+
+
+@pytest.mark.parametrize("tag", ["0.35", "-0.0", "1e+20", "nan", "inf", "-inf"])
+def test_validate_accepts_canonical_tagged_float_values(tag):
+    body = valid_body()
+    body["configuration"]["target_band_low"] = {"__f__": tag}
+
+    validate_body(body)
+
+
+@pytest.mark.parametrize("tag", ["not-a-float", "", " ", "0.35 ", "NaN", "+inf"])
+def test_schema_rejects_malformed_tagged_float_values(tag):
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    envelope = seal_envelope(valid_body())
+    envelope["configuration"]["target_band_low"] = {"__f__": tag}
+
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(envelope)
+
+
+def test_validate_rejects_malformed_tagged_float_in_nested_wire_value():
+    body = body_with_pair()
+    body["funnel"]["generated_pairs"][0]["bootstrap_score_decomposition"] = {
+        "score": {"__f__": "not-a-float"}
+    }
+
+    with pytest.raises(ValueError, match="tagged float"):
+        validate_body(body)
+
+
+def test_schema_rejects_malformed_tagged_float_in_nested_wire_value():
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    envelope = seal_envelope(body_with_pair())
+    envelope["funnel"]["generated_pairs"][0]["bootstrap_score_decomposition"] = {
+        "score": {"__f__": "not-a-float"}
+    }
+
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(envelope)
+
+
 def test_verify_detects_payload_tampering():
     sealed = seal_envelope(valid_body())
     sealed["cycle_id"] = "tampered"
@@ -250,12 +301,26 @@ def test_validate_rejects_booleans_where_positive_integers_are_required(path, va
         validate_body(body)
 
 
-def test_seal_rejects_maximum_size_exceeded(monkeypatch):
+def test_seal_accepts_an_envelope_exactly_at_the_sealed_size_bound(monkeypatch):
     body = valid_body()
+    baseline = seal_envelope(body)
     monkeypatch.setattr(
         replay_wire,
         "MAX_ENVELOPE_BYTES",
-        len(canonical_body_bytes(body)) - 1,
+        len(canonical_body_bytes(baseline)),
+    )
+
+    sealed = seal_envelope(body)
+    assert len(canonical_body_bytes(sealed)) <= replay_wire.MAX_ENVELOPE_BYTES
+
+
+def test_seal_rejects_output_that_exceeds_the_sealed_size_bound(monkeypatch):
+    body = valid_body()
+    baseline = seal_envelope(body)
+    monkeypatch.setattr(
+        replay_wire,
+        "MAX_ENVELOPE_BYTES",
+        len(canonical_body_bytes(baseline)) - 1,
     )
 
     with pytest.raises(ValueError, match="32 MiB"):

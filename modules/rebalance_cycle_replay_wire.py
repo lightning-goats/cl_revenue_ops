@@ -50,12 +50,13 @@ def seal_envelope(body: Dict[str, Any]) -> Dict[str, Any]:
     validate_body(body)
     tagged = tag_floats(body)
     payload = canonical_body_bytes(tagged)
-    if len(payload) > MAX_ENVELOPE_BYTES:
-        raise ValueError("envelope exceeds 32 MiB")
-    return {
+    envelope = {
         **tagged,
         "payload_sha256": hashlib.sha256(payload).hexdigest(),
     }
+    if len(canonical_body_bytes(envelope)) > MAX_ENVELOPE_BYTES:
+        raise ValueError("envelope exceeds 32 MiB")
+    return envelope
 
 
 def verify_envelope(envelope: Dict[str, Any]) -> None:
@@ -68,18 +69,19 @@ def verify_envelope(envelope: Dict[str, Any]) -> None:
     body = dict(envelope)
     del body["payload_sha256"]
     payload = canonical_body_bytes(body)
-    if len(payload) > MAX_ENVELOPE_BYTES:
-        raise ValueError("envelope exceeds 32 MiB")
     expected = hashlib.sha256(payload).hexdigest()
     if not hmac.compare_digest(supplied, expected):
         raise ValueError("payload digest mismatch")
     validate_body(body)
+    if len(canonical_body_bytes(envelope)) > MAX_ENVELOPE_BYTES:
+        raise ValueError("envelope exceeds 32 MiB")
 
 
 def validate_body(body: Dict[str, Any]) -> None:
     """Validate v0 structural and cross-field replay invariants."""
     if not isinstance(body, dict):
         raise ValueError("body must be an object")
+    _validate_tagged_floats(body)
     _require_exact_keys(
         body,
         {
@@ -114,6 +116,22 @@ def validate_body(body: Dict[str, Any]) -> None:
     _validate_completeness(
         body["completeness"], generated, planner_selected, final_selected, outcomes
     )
+
+
+def _validate_tagged_floats(value: Any) -> None:
+    if isinstance(value, dict):
+        if "__f__" in value:
+            if set(value) != {"__f__"}:
+                raise ValueError("tagged float must contain only __f__")
+            tagged = value["__f__"]
+            if not isinstance(tagged, str) or not _is_canonical_tagged_float(tagged):
+                raise ValueError("malformed tagged float number")
+            return
+        for item in value.values():
+            _validate_tagged_floats(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_tagged_floats(item)
 
 
 def _require_exact_keys(value: Any, keys: set[str], label: str) -> Mapping[str, Any]:
@@ -161,9 +179,21 @@ def _require_wire_number(value: Any, label: str) -> None:
         raise ValueError(f"{label} must be a number")
     if isinstance(value, (int, float)):
         return
-    if isinstance(value, dict) and set(value) == {"__f__"} and isinstance(value["__f__"], str):
-        return
+    if isinstance(value, dict) and set(value) == {"__f__"}:
+        tagged = value["__f__"]
+        if isinstance(tagged, str) and _is_canonical_tagged_float(tagged):
+            return
     raise ValueError(f"{label} must be a number")
+
+
+def _is_canonical_tagged_float(value: str) -> bool:
+    if value in {"nan", "inf", "-inf"}:
+        return True
+    try:
+        parsed = float(value)
+    except ValueError:
+        return False
+    return math.isfinite(parsed) and repr(parsed) == value
 
 
 def _validate_producer(value: Any) -> None:

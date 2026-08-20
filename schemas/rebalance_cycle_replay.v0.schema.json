@@ -24,7 +24,12 @@
       "type": "object",
       "required": ["__f__"],
       "additionalProperties": false,
-      "properties": {"__f__": {"type": "string"}}
+      "properties": {
+        "__f__": {
+          "type": "string",
+          "pattern": "^(?:nan|inf|-inf|-?(?:(?:0|[1-9][0-9]*)\\.[0-9]+|(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?e[+-][0-9]+))$"
+        }
+      }
     },
     "wire_value": {
       "anyOf": [
@@ -33,7 +38,12 @@
         {"type": "integer"},
         {"type": "string"},
         {"type": "array", "items": {"$ref": "#/$defs/wire_value"}},
-        {"type": "object", "additionalProperties": {"$ref": "#/$defs/wire_value"}}
+        {
+          "type": "object",
+          "if": {"required": ["__f__"]},
+          "then": {"$ref": "#/$defs/tagged_float"},
+          "else": {"additionalProperties": {"$ref": "#/$defs/wire_value"}}
+        }
       ]
     },
     "wire_number": {"anyOf": [{"type": "integer"}, {"$ref": "#/$defs/tagged_float"}]},
