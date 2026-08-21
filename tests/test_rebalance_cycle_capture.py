@@ -392,29 +392,67 @@ def _wait_for_manifest_idle(manager, timeout=1.0):
             manager._manifest_publish_condition.wait(remaining)
 
 
-def _wait_for_failed(manager, category):
+def _wait_for_failed_attempt(manager):
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
         manifest = manager.read_manifest()
         if manifest.get("failed") == 1:
             assert manifest["writer_health"] == "degraded"
-            assert manifest["last_error_category"] == category
-            return
+            return manifest, manifest["attempts"][-1]
         time.sleep(0.01)
     raise AssertionError(manager.read_manifest())
 
 
-@pytest.mark.parametrize("failure, category", [
-    (lambda monkeypatch, manager: monkeypatch.setattr("modules.rebalance_cycle_capture.project_cycle_result", lambda *_a: (_ for _ in ()).throw(ValueError("projection"))), "ValueError"),
-    (lambda monkeypatch, manager: monkeypatch.setattr(manager, "_atomic_write", lambda *_a: (_ for _ in ()).throw(OSError("write"))), "OSError"),
-    (lambda monkeypatch, manager: monkeypatch.setattr("modules.rebalance_cycle_capture.MAX_ENVELOPE_BYTES", 1), "ValueError"),
-])
-def test_writer_failures_are_manifested_without_raising(tmp_path, monkeypatch, failure, category):
-    manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
+def _wait_for_failed(manager, category):
+    manifest, _attempt = _wait_for_failed_attempt(manager)
+    assert manifest["last_error_category"] == category
+
+
+@pytest.mark.parametrize(
+    "failure_kind, category, exact_error",
+    [
+        pytest.param("projection", "ValueError", "projection", id="projection"),
+        pytest.param("write", "OSError", "write", id="write"),
+        pytest.param(
+            "size", "ValueError", "complete sealed envelope exceeds 32 MiB",
+            id="size",
+        ),
+    ],
+)
+def test_writer_failures_are_manifested_without_raising(
+    tmp_path, monkeypatch, failure_kind, category, exact_error,
+):
+    import modules.rebalance_cycle_capture as capture_module
+
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
     assert manager.set_enabled(True)
-    failure(monkeypatch, manager)
-    manager.finish_cycle(manager.begin_cycle(_configuration(), {"trigger": "automatic"}), _strict_result())
-    _wait_for_failed(manager, category)
+    _wait_for_manifest_idle(manager)
+    reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    result = _strict_result()
+    assert manager.prepare_cycle_result(reference, result) is True
+    _wait_for_manifest_idle(manager)
+
+    if failure_kind == "projection":
+        injected = MagicMock(side_effect=ValueError("projection"))
+        monkeypatch.setattr(capture_module, "project_cycle_result", injected)
+    elif failure_kind == "write":
+        injected = MagicMock(side_effect=OSError("write"))
+        monkeypatch.setattr(manager, "_publish_envelope", injected)
+    else:
+        injected = MagicMock(wraps=capture_module.seal_envelope)
+        monkeypatch.setattr(capture_module, "seal_envelope", injected)
+        monkeypatch.setattr(capture_module, "MAX_ENVELOPE_BYTES", 1)
+
+    manager.finish_cycle(reference, result)
+
+    manifest, attempt = _wait_for_failed_attempt(manager)
+    injected.assert_called_once()
+    assert manifest["last_error_category"] == category
+    assert attempt["error_category"] == category
+    assert attempt["error"] == exact_error
+    assert manager.set_enabled(False, timeout_seconds=1.0)
 
 
 
@@ -947,21 +985,35 @@ def test_hard_preflight_pair_cap_rejects_before_projection(tmp_path, monkeypatch
     assert manager.set_enabled(True)
     projected = MagicMock()
     monkeypatch.setattr(capture_module, "project_cycle_result", projected)
+    preflight = MagicMock(wraps=capture_module._preflight_cycle_result)
+    monkeypatch.setattr(capture_module, "_preflight_cycle_result", preflight)
     result = _strict_result()
     result.considered_candidates = [result.considered_candidates[0]] * (
         capture_module.MAX_GENERATED_PAIRS + 1
     )
 
-    manager.finish_cycle(
-        manager.begin_cycle(_configuration(), {"trigger": "automatic"}),
-        result,
+    reference = manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
     )
-
-    _wait_for_failed(manager, "ValueError")
+    assert manager.prepare_cycle_result(reference, result) is False
+    preflight.assert_called_once_with(result)
     projected.assert_not_called()
-    attempt = manager.read_manifest()["attempts"][-1]
+    preparation_failure = manager._prepared[reference.capture_seq]
+    assert preparation_failure.error_category == "ValueError"
+    assert preparation_failure.error == "considered_candidates exceeds capture bound"
+
+    manager.finish_cycle(reference, result)
+
+    manifest, attempt = _wait_for_failed_attempt(manager)
+    preflight.assert_called_once_with(result)
+    projected.assert_not_called()
+    assert manifest["last_error_category"] == "ValueError"
     assert attempt["status"] == "failed"
     assert attempt["error_category"] == "ValueError"
+    assert attempt["error"] == (
+        "capture preparation failed: ValueError: "
+        "considered_candidates exceeds capture bound"
+    )
     assert manager.set_enabled(False, timeout_seconds=1.0)
 
 
