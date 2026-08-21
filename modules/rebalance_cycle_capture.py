@@ -803,10 +803,10 @@ class RebalanceCycleCaptureManager:
     def finish_cycle(self, reference: Any, result: Any, terminal_stage: str = "completed") -> None:
         """Transfer one reserved cycle lease to the writer without heavy work.
 
-        Prepared engine evidence uses its bounded detached copy. Direct callers
-        without preparation reserve a slot and transfer mutation ownership of
-        ``result`` here. Projection, validation, sealing, serialization, and
-        size checks are all performed by the daemon writer before publication.
+        Prepared engine evidence uses its bounded detached copy. An unprepared
+        finish transfers only a constant bounded failure marker; the supplied
+        result is never inspected or transferred. Projection, validation,
+        sealing, serialization, and size checks remain daemon-owned.
         """
         slot_acquired = False
         attempt = None
@@ -858,7 +858,12 @@ class RebalanceCycleCaptureManager:
                             configuration=reference.configuration,
                             producer=completed_producer,
                         )
-                        handoff_result = result if prepared is _UNPREPARED else prepared
+                        handoff_result = prepared
+                        if prepared is _UNPREPARED:
+                            handoff_result = _CapturePreparationFailure(
+                                "UnpreparedCapture",
+                                "cycle result was not prepared for capture",
+                            )
                         handoff = _CaptureHandoff(
                             completed_reference, handoff_result, terminal_stage,
                         )

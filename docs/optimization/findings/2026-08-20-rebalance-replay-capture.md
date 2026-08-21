@@ -26,7 +26,7 @@ The final-review fix wave reviewed the complete range from `b6e6c9a5437405fae2c0
 
 The v0 envelope captures the normalized pre-cycle `StateSnapshot`, the six planner configuration fields, producer identity/version/timestamps, the full generated cheap-pair universe and rank, planner selection/rejection metadata, final selected-pair observations (including the existing route summary and post-price evidence), pair-linked execution outcomes, completeness counters, terminal stage, and a SHA-256 integrity seal. It intentionally does **not** capture payment secrets, invoices, raw RPC payloads, a full plugin-config dump, historical gossip, route alternatives, amount ladders, or a re-executable Askrene session.
 
-Bounds are explicit: 1,024 snapshot channels; 4,096 generated and 4,096 planner-selected pair references; 64 final pairs and pair outcomes; 128 skips; a 100,000-node handoff graph; a two-slot non-blocking writer queue; 32 MiB per sealed envelope; and retention of at most 32 owned files / 256 MiB. Runtime validation and JSON Schema now enforce the same six collection limits and the same integer domains. Error text and structured failure evidence are bounded; outcome evidence is reduced to the strict primitive-only allowlist before graph traversal, deepcopy, or async handoff, so payment secrets, hashes, invoices, and raw RPC graphs cannot enter the queue-owned object graph. Symlink output and unsafe replay input types are rejected.
+Bounds are explicit: 1,024 snapshot channels; 4,096 generated and 4,096 planner-selected pair references; 64 final pairs and pair outcomes; 128 skips; a 100,000-node handoff graph; a two-slot non-blocking writer queue; 32 MiB per sealed envelope; and retention of at most 32 owned files / 256 MiB. Runtime validation and JSON Schema now enforce the same six collection limits and the same integer domains. Error text and structured failure evidence are bounded; outcome evidence is reduced to the strict primitive-only allowlist before graph traversal, deepcopy, or async handoff, so payment secrets, hashes, invoices, and raw RPC graphs cannot enter the queue-owned object graph. An unprepared `finish_cycle` never inspects or transfers its supplied result: it enqueues only a constant bounded failure marker, preserving terminal manifest truth while failing closed. Symlink output and unsafe replay input types are rejected.
 
 ### Manifest durability limitation
 
@@ -79,13 +79,15 @@ wire integer/boundary regressions: 31 failed, 155 passed, 77 deselected
 After the integrated fixes and the retention-race correction exposed by the first focused run, final GREEN evidence is:
 
 ```text
-exact focused Task 5 matrix: 575 passed in 10.78s
+exact focused Task 5 matrix after unprepared-handoff correction: 576 passed in 10.64s
 full functional suite excluding only tests/test_supply_chain_pins.py:
-3640 passed, 5 skipped, 2 xfailed in 63.12s
+3641 passed, 5 skipped, 2 xfailed in 63.50s
 
 installed-environment pin suite:
 1 failed, 18 passed in 0.40s
 ```
+
+The post-`f229eaa` re-review found the sole raw unprepared-handoff bypass. Its blocked-writer regression was RED (`1 failed, 72 deselected`) because the queue owned a `CycleResult`; after the fail-closed marker correction the exact probe passed (`1 passed, 72 deselected`) and the expanded capture/config suite passed (`82 passed`). The regression inspects both an unprepared marker and a prepared normal handoff and verifies forbidden keys/markers are absent from queue, manifest, and logs.
 
 The focused command is exactly the Task 5 matrix in `.superpowers/sdd/task-5-brief.md`: replay wire, capture, capture config, replay, planner, engine, orchestrator, policy gate, operator/RPC surface, and architecture guards. The skips require unavailable live/`pyln.testing` infrastructure. The two expected failures are separately staged compatibility-removal checks; they do not concern replay capture.
 
@@ -127,7 +129,7 @@ The complete merge-base range was reviewed for selected-list/order, route-call, 
 
 Planner trace fields are assigned after the existing score sort and greedy selection. `selected` continues to be the only list passed to existing pricing/execution; `generated` is observational. The review and golden tests establish unchanged selected output. New direct capture-enabled/disabled engine regressions prove identical route pricing, budget reservation, executor, authoritative worker bookkeeping, and idempotent backstop calls even when an execution result rejects deepcopy. A separate deterministic ownership race proves that an outer capture attempt returning no identity cannot let inner planning acquire a second identity after capture becomes enabled.
 
-On the cycle path, authoritative result bookkeeping now precedes fallible observational detachment; a detachment failure retains returned status/result authority and is contained. Bounded manager evidence detachment occurs only after the engine cycle lock is released. Outcome allowlisting occurs before generic graph traversal/deepcopy. Projection, validation, sealing, serialization, manifest I/O, fsync, and retention are daemon-owned. A full handoff queue drops the observation before copying it; capture exceptions remain contained. Direct and publication-triggered retention rotation share one re-entrant filesystem lock, preserving the 32-file bound during concurrent manifest publication.
+On the cycle path, authoritative result bookkeeping now precedes fallible observational detachment; a detachment failure retains returned status/result authority and is contained. Bounded manager evidence detachment occurs only after the engine cycle lock is released. Outcome allowlisting occurs before generic graph traversal/deepcopy, and an unprepared finish ignores the raw result entirely in favor of a bounded failure marker. Projection, validation, sealing, serialization, manifest I/O, fsync, and retention are daemon-owned. A full handoff queue drops the observation before copying it; capture exceptions remain contained. Direct and publication-triggered retention rotation share one re-entrant filesystem lock, preserving the 32-file bound during concurrent manifest publication.
 
 The following are archival Task 3 in-memory measurements, not a preserved benchmark harness or repeatable gate: representative 16-pair/32-channel preparation measured 1.746–2.195 ms and 41,751 serialized bytes. The recorded maximum fixture (4,096 generated pairs, 1,024 channels, 64 final pairs, 128 skips, 64 outcomes) prepared in 142.640 ms and serialized to 2,820,095 bytes. Its daemon projection took 30.989 ms and sealing/serialization 220.578 ms; those daemon costs are absent from the cycle thread. These archival laboratory measurements are not production latency evidence.
 

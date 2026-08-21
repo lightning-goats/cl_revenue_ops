@@ -61,6 +61,7 @@ def test_enabled_capture_assigns_identity_and_seals_projected_cycle(tmp_path):
         "result": {"success": True},
     })
 
+    assert manager.prepare_cycle_result(reference, result) is True
     manager.finish_cycle(reference, result)
     assert manager.set_enabled(False, timeout_seconds=2.0)
     import json
@@ -106,7 +107,9 @@ def test_finish_is_no_throw_and_writer_failure_is_manifested(tmp_path, monkeypat
         lambda *_a: (_ for _ in ()).throw(OSError("blocked")),
     )
 
-    manager.finish_cycle(ref, _strict_result())
+    result = _strict_result()
+    assert manager.prepare_cycle_result(ref, result) is True
+    manager.finish_cycle(ref, result)
 
     _wait_for_failed(manager, "OSError")
     assert manager.set_enabled(False, timeout_seconds=1.0)
@@ -205,18 +208,20 @@ def _install_live_blocked_cycle_writer(monkeypatch):
     return release
 
 
-def test_finish_enqueues_only_a_frozen_bounded_reference_handoff(tmp_path, monkeypatch):
+def test_prepared_finish_enqueues_only_a_frozen_bounded_reference_handoff(tmp_path, monkeypatch):
     release_writer = _install_live_blocked_cycle_writer(monkeypatch)
     manager = RebalanceCycleCaptureManager(tmp_path / "revenue_ops.db", lambda *_a, **_k: None)
     assert manager.set_enabled(True)
     reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
     result = _strict_result()
 
+    assert manager.prepare_cycle_result(reference, result) is True
     manager.finish_cycle(reference, result)
     handoff = manager._queue.get_nowait()
 
     assert handoff.reference is not reference
-    assert handoff.result is result
+    assert handoff.result is not result
+    assert type(handoff.result).__name__ == "SimpleNamespace"
     with pytest.raises(TypeError):
         reference.configuration["raw"] = "mutation"
     assert handoff.terminal_stage == "completed"
@@ -347,6 +352,7 @@ def test_writer_freezes_mutable_cycle_evidence_before_publication(tmp_path, monk
     pair = _pair()
     result = _strict_result(pair=pair)
 
+    assert manager.prepare_cycle_result(reference, result) is True
     manager.finish_cycle(reference, result)
     assert projection_complete.wait(1.0)
     pair.score = 999.0
@@ -618,6 +624,93 @@ def test_projection_failure_evidence_uses_safe_bounded_allowlist():
     }
     assert "payment_hash" not in repr(projected)
     assert "secret" not in repr(projected)
+
+
+def test_blocked_writer_never_owns_raw_unprepared_or_prepared_metadata(
+    tmp_path, monkeypatch,
+):
+    marker_text = "UNPREPARED-FORBIDDEN-MARKER"
+    logs = []
+
+    class HostileSecret:
+        deepcopy_calls = 0
+
+        def __deepcopy__(self, _memo):
+            self.deepcopy_calls += 1
+            raise AssertionError(marker_text)
+
+        def __repr__(self):
+            return marker_text
+
+    def result_with_forbidden_metadata(hostile):
+        return _strict_result(outcome={
+            "source_channel_id": "a",
+            "dest_channel_id": "b",
+            "status": "returned",
+            "result": {
+                "success": False,
+                "amount_sats": 100,
+                "failure_data": {
+                    "failure_class": "liquidity",
+                    "payment_secret": hostile,
+                    "raw_rpc": {"marker": hostile},
+                },
+                "payment_hash": hostile,
+                "invoice": hostile,
+            },
+        })
+
+    release_writer = _install_live_blocked_cycle_writer(monkeypatch)
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db",
+        lambda *args, **kwargs: logs.append((args, kwargs)),
+    )
+    assert manager.set_enabled(True)
+
+    unprepared_reference = manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
+    )
+    unprepared_hostile = HostileSecret()
+    manager.finish_cycle(
+        unprepared_reference,
+        result_with_forbidden_metadata(unprepared_hostile),
+        "failed",
+    )
+
+    prepared_reference = manager.begin_cycle(
+        _configuration(), {"trigger": "automatic"},
+    )
+    prepared_hostile = HostileSecret()
+    prepared_result = result_with_forbidden_metadata(prepared_hostile)
+    assert manager.prepare_cycle_result(prepared_reference, prepared_result) is True
+    manager.finish_cycle(prepared_reference, prepared_result, "completed")
+
+    with manager._queue.mutex:
+        handoffs = list(manager._queue.queue)
+    assert len(handoffs) == 2
+    assert type(handoffs[0].result).__name__ == "_CapturePreparationFailure"
+    assert type(handoffs[1].result).__name__ == "SimpleNamespace"
+    handoff_text = repr(handoffs)
+    assert marker_text not in handoff_text
+    for forbidden in ("payment_secret", "payment_hash", "invoice", "raw_rpc"):
+        assert forbidden not in handoff_text
+    assert unprepared_hostile.deepcopy_calls == 0
+    assert prepared_hostile.deepcopy_calls == 0
+
+    release_writer.set()
+    assert manager.set_enabled(False, timeout_seconds=2.0)
+    manifest = manager.read_manifest()
+    assert manifest["failed"] == 1
+    assert manifest["completed"] == 1
+    assert [attempt["terminal_stage"] for attempt in manifest["attempts"]] == [
+        "failed", "completed",
+    ]
+    assert manifest["attempts"][0]["error_category"] == "ValueError"
+    manifest_text = repr(manifest)
+    assert marker_text not in manifest_text
+    for forbidden in ("payment_secret", "payment_hash", "invoice", "raw_rpc"):
+        assert forbidden not in manifest_text
+    assert marker_text not in repr(logs)
 
 
 def test_forbidden_failure_metadata_never_crosses_handoff_or_publication(
@@ -905,8 +998,10 @@ def test_normal_finish_returns_before_slow_projection(tmp_path, monkeypatch):
 
     monkeypatch.setattr(capture_module, "project_cycle_result", slow_projection)
     reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    result = _strict_result()
+    assert manager.prepare_cycle_result(reference, result) is True
     started = time.monotonic()
-    manager.finish_cycle(reference, _strict_result())
+    manager.finish_cycle(reference, result)
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.05
