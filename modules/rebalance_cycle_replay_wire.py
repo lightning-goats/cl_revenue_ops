@@ -12,6 +12,14 @@ from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 SCHEMA_NAME = "rebalance_cycle_replay"
 SCHEMA_VERSION = 0
 MAX_ENVELOPE_BYTES = 32 * 1024 * 1024
+# These are the v0 schema's maxItems values. Runtime validation and capture
+# intake import the same constants so neither surface can silently diverge.
+MAX_SNAPSHOT_CHANNELS = 1024
+MAX_GENERATED_PAIRS = 4096
+MAX_PLANNER_SELECTED_PAIRS = 4096
+MAX_FINAL_PAIRS = 64
+MAX_SKIPS = 128
+MAX_OUTCOMES = 64
 
 BINARY64_TAG_KEY = "__f64__"
 _BINARY64_HEX = frozenset("0123456789abcdef")
@@ -187,23 +195,53 @@ def _normalize_integer_domains(body: Any) -> Any:
         "valuable_channel_count",
     ):
         _normalize_mapping_integer_field(snapshot, field, f"normalized_snapshot.{field}")
-
-    funnel = normalized.get("funnel")
-    generated_pairs = funnel.get("generated_pairs") if isinstance(funnel, dict) else None
-    if isinstance(generated_pairs, list):
-        for index, generated_pair in enumerate(generated_pairs):
+    channels = snapshot.get("channels") if isinstance(snapshot, dict) else None
+    if isinstance(channels, list):
+        for index, channel in enumerate(channels):
             for field in (
-                "planned_amount_sats",
-                "pair_budget_sats",
-                "source_excess_sats",
-                "dest_need_sats",
-                "max_chunk_sats",
-                "cheap_rank",
+                "capacity_sats", "actual_inbound_fee_ppm",
+                "remaining_budget_sats", "local_out_fee_ppm",
+                "activity_out_sats", "activity_in_sats",
             ):
                 _normalize_mapping_integer_field(
-                    generated_pair,
-                    field,
-                    f"generated pair {index}.{field}",
+                    channel, field, f"snapshot channel {index}.{field}",
+                )
+
+    funnel = normalized.get("funnel")
+    if isinstance(funnel, dict):
+        for collection_name in ("generated_pairs", "final_selected_pairs"):
+            pairs = funnel.get(collection_name)
+            if not isinstance(pairs, list):
+                continue
+            for index, pair in enumerate(pairs):
+                for field in (
+                    "planned_amount_sats", "pair_budget_sats",
+                    "source_excess_sats", "dest_need_sats",
+                    "max_chunk_sats", "cheap_rank", "route_cost_sats",
+                    "effective_budget_sats",
+                ):
+                    _normalize_mapping_integer_field(
+                        pair, field, f"{collection_name} {index}.{field}",
+                    )
+                route = pair.get("route_summary") if isinstance(pair, dict) else None
+                if isinstance(route, list):
+                    for hop_index, hop in enumerate(route):
+                        _normalize_mapping_integer_field(
+                            hop, "index",
+                            f"{collection_name} {index}.route_summary {hop_index}.index",
+                        )
+
+    execution = normalized.get("execution")
+    outcomes = execution.get("pair_outcomes") if isinstance(execution, dict) else None
+    if isinstance(outcomes, list):
+        for index, outcome in enumerate(outcomes):
+            result = outcome.get("result") if isinstance(outcome, dict) else None
+            for field in (
+                "amount_sats", "fee_sats", "fee_msat", "fee_ppm",
+                "attempts", "hops", "parts",
+            ):
+                _normalize_mapping_integer_field(
+                    result, field, f"execution pair {index}.result.{field}",
                 )
 
     completeness = normalized.get("completeness")
@@ -264,6 +302,15 @@ def _require_list(value: Any, label: str) -> Sequence[Any]:
     if not isinstance(value, list):
         raise ValueError(f"{label} must be an array")
     return value
+
+
+def _require_bounded_list(
+    value: Any, label: str, maximum: int,
+) -> Sequence[Any]:
+    items = _require_list(value, label)
+    if len(items) > maximum:
+        raise ValueError(f"{label} exceeds runtime bound of {maximum}")
+    return items
 
 
 def _require_nonempty_string(value: Any, label: str) -> None:
@@ -358,7 +405,9 @@ def _validate_snapshot(value: Any) -> None:
         },
         "normalized_snapshot",
     )
-    channels = _require_list(snapshot["channels"], "normalized_snapshot.channels")
+    channels = _require_bounded_list(
+        snapshot["channels"], "normalized_snapshot.channels", MAX_SNAPSHOT_CHANNELS,
+    )
     for field in (
         "total_capacity_sats",
         "total_remaining_budget_sats",
@@ -478,7 +527,9 @@ def _validate_generated_pair(value: Any, label: str) -> Tuple[str, str]:
 
 
 def _validate_generated_pairs(value: Any) -> list[Tuple[str, str]]:
-    generated_pairs = _require_list(value, "funnel.generated_pairs")
+    generated_pairs = _require_bounded_list(
+        value, "funnel.generated_pairs", MAX_GENERATED_PAIRS,
+    )
     identities = set()
     ranks = set()
     for index, generated in enumerate(generated_pairs):
@@ -496,9 +547,11 @@ def _validate_generated_pairs(value: Any) -> list[Tuple[str, str]]:
     return list(identities)
 
 
-def _pair_ref_identities(value: Any, label: str) -> list[Tuple[str, str]]:
+def _pair_ref_identities(
+    value: Any, label: str, maximum: int,
+) -> list[Tuple[str, str]]:
     identities = []
-    for index, item in enumerate(_require_list(value, label)):
+    for index, item in enumerate(_require_bounded_list(value, label, maximum)):
         item_label = f"{label} {index}"
         _require_exact_keys(item, _PAIR_REF_FIELDS, item_label)
         identities.append(_pair_identity(item, item_label))
@@ -509,7 +562,9 @@ def _pair_ref_identities(value: Any, label: str) -> list[Tuple[str, str]]:
 
 def _validate_final_pairs(value: Any) -> tuple[list[Tuple[str, str]], list[Mapping[str, Any]]]:
     identities = []
-    rows = _require_list(value, "final-selected pair")
+    rows = _require_bounded_list(
+        value, "final-selected pair", MAX_FINAL_PAIRS,
+    )
     for index, item in enumerate(rows):
         identities.append(_validate_generated_pair(item, f"final-selected pair {index}"))
     if len(set(identities)) != len(identities):
@@ -539,7 +594,9 @@ def _validate_execution_result(value: Any, label: str) -> None:
 
 def _validate_outcomes(value: Any) -> list[Tuple[str, str]]:
     identities = []
-    for index, item_value in enumerate(_require_list(value, "execution pair")):
+    for index, item_value in enumerate(_require_bounded_list(
+        value, "execution pair", MAX_OUTCOMES,
+    )):
         label = f"execution pair {index}"
         item = _require_mapping(item_value, label)
         allowed = _PAIR_REF_FIELDS | {"status", "result"}
@@ -571,7 +628,8 @@ def _validate_funnel_and_execution(
     )
     generated = _validate_generated_pairs(funnel["generated_pairs"])
     planner_selected = _pair_ref_identities(
-        funnel["planner_selected_pairs"], "planner-selected pair"
+        funnel["planner_selected_pairs"], "planner-selected pair",
+        MAX_PLANNER_SELECTED_PAIRS,
     )
     final_selected, _final_rows = _validate_final_pairs(funnel["final_selected_pairs"])
     generated_set = set(generated)
@@ -581,7 +639,9 @@ def _validate_funnel_and_execution(
         raise ValueError("planner-selected pair is absent from generated pairs")
     if not final_selected_set <= planner_selected_set:
         raise ValueError("final-selected pair is absent from planner-selected pairs")
-    for index, skip_value in enumerate(_require_list(funnel["skipped"], "funnel.skipped")):
+    for index, skip_value in enumerate(_require_bounded_list(
+        funnel["skipped"], "funnel.skipped", MAX_SKIPS,
+    )):
         label = f"funnel.skipped {index}"
         skip = _require_exact_keys(skip_value, {"channel_id", "reason", "detail"}, label)
         if not isinstance(skip["channel_id"], str) or not isinstance(skip["detail"], str):

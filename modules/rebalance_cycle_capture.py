@@ -25,6 +25,11 @@ from typing import Any, Mapping, Optional
 
 from modules.rebalance_cycle_replay_wire import (
     MAX_ENVELOPE_BYTES,
+    MAX_FINAL_PAIRS,
+    MAX_GENERATED_PAIRS,
+    MAX_OUTCOMES,
+    MAX_SKIPS,
+    MAX_SNAPSHOT_CHANNELS,
     SCHEMA_VERSION,
     seal_envelope,
 )
@@ -34,11 +39,6 @@ RETENTION_MAX_FILES = 32
 RETENTION_MAX_BYTES = 256 * 1024 * 1024
 WRITER_QUEUE_SIZE = 2
 MAX_PENDING_MANIFEST_RUNS = 64
-MAX_SNAPSHOT_CHANNELS = 1024
-MAX_GENERATED_PAIRS = 4096
-MAX_FINAL_PAIRS = 64
-MAX_OUTCOMES = 64
-MAX_SKIPS = 128
 MAX_HANDOFF_GRAPH_NODES = 100_000
 _MAX_TEXT = 512
 _DRAIN_SENTINEL = object()
@@ -347,6 +347,33 @@ def _project_execution_result(value: Any) -> Optional[dict]:
     }
 
 
+def _sanitize_outcomes_for_handoff(outcomes: Any) -> list[dict]:
+    """Project outcome evidence before graph walking or detachment.
+
+    Only the v0 allowlist crosses the ownership-transfer boundary. In
+    particular, raw payment credentials and RPC response graphs are never
+    traversed or deep-copied by capture intake.
+    """
+    bounded = _bounded_sequence(outcomes, "pair_outcomes", MAX_OUTCOMES)
+    sanitized = []
+    for outcome in bounded:
+        identity = _pair_identity(outcome)
+        status = _strict_string(
+            _field(outcome, "status", "returned"),
+            "outcome.status", nonempty=True,
+        )
+        row = {
+            "source_channel_id": identity[0],
+            "dest_channel_id": identity[1],
+            "status": status,
+        }
+        result = _project_execution_result(_field(outcome, "result", None))
+        if result is not None:
+            row["result"] = result
+        sanitized.append(row)
+    return sanitized
+
+
 def _project_outcomes(outcomes: Any, final_identities: set[tuple[str, str]]) -> list[dict]:
     outcomes = _bounded_sequence(outcomes, "pair_outcomes", MAX_OUTCOMES)
     projected = []
@@ -468,7 +495,11 @@ def _detached_cycle_result(result: Any) -> Any:
         "candidates": _required(result, "candidates", "cycle result"),
         "audit_records": _required(result, "audit_records", "cycle result"),
         "snapshot": _required(result, "snapshot", "cycle result"),
-        "pair_outcomes": _required(result, "pair_outcomes", "cycle result"),
+        # Sanitize potentially hostile executor metadata before the generic
+        # graph walk and deepcopy can observe it.
+        "pair_outcomes": _sanitize_outcomes_for_handoff(
+            _required(result, "pair_outcomes", "cycle result")
+        ),
         "planner_bootstrap_evidence": _required(
             result, "planner_bootstrap_evidence", "cycle result"
         ),
@@ -606,7 +637,7 @@ class RebalanceCycleCaptureManager:
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._lifecycle_lock = threading.Lock()
-        self._filesystem_lock = threading.Lock()
+        self._filesystem_lock = threading.RLock()
         self._manifest_publish_condition = threading.Condition(threading.Lock())
         self._pending_manifest_snapshots: OrderedDict[Path, tuple] = OrderedDict()
         self._manifest_publish_inflight = False
@@ -700,8 +731,9 @@ class RebalanceCycleCaptureManager:
                     "terminal_stage": None,
                     "eligible": False,
                 })
-                self._prune_attempts_locked()
-                return reference
+                manifest_snapshot = self._manifest_snapshot_locked()
+            self._publish_manifest_snapshot(manifest_snapshot)
+            return reference
         except Exception:
             return None
 
@@ -709,6 +741,7 @@ class RebalanceCycleCaptureManager:
         """Reserve capacity, then detach bounded evidence before objects escape."""
         sequence = _field(reference, "capture_seq", None)
         slot_acquired = False
+        drop_snapshot = None
         try:
             with self._condition:
                 if not isinstance(sequence, int) or sequence not in self._active:
@@ -727,12 +760,17 @@ class RebalanceCycleCaptureManager:
                         eligible=False,
                     )
                     self._manifest["dropped"] += 1
+                    drop_snapshot = self._manifest_snapshot_locked()
                     self._condition.notify_all()
-                    return False
-                slot_acquired = True
-                # This marker makes duplicate preparation idempotent and keeps
-                # the private preparation map bounded by the two reservations.
-                self._prepared[sequence] = _PREPARING
+                else:
+                    slot_acquired = True
+                    # This marker makes duplicate preparation idempotent and keeps
+                    # the private preparation map bounded by the two reservations.
+                    self._prepared[sequence] = _PREPARING
+
+            if drop_snapshot is not None:
+                self._publish_manifest_snapshot(drop_snapshot)
+                return False
 
             try:
                 detached = _detached_cycle_result(result)
@@ -772,6 +810,7 @@ class RebalanceCycleCaptureManager:
         """
         slot_acquired = False
         attempt = None
+        manifest_snapshot = None
         sequence = _field(reference, "capture_seq", None)
         try:
             with self._condition:
@@ -785,46 +824,52 @@ class RebalanceCycleCaptureManager:
                         and dropped_attempt.get("terminal_stage") is None
                     ):
                         dropped_attempt["terminal_stage"] = terminal_stage
+                        manifest_snapshot = self._manifest_snapshot_locked()
                         self._condition.notify_all()
-                    return
-                attempt = self._attempt_locked(sequence)
-                if attempt is None:
-                    return
-                prepared = self._prepared.get(sequence, _UNPREPARED)
-                if prepared is _PREPARING:
-                    return
-                if prepared is _UNPREPARED:
-                    if not self._slots.acquire(blocking=False):
+                else:
+                    attempt = self._attempt_locked(sequence)
+                    if attempt is None:
+                        return
+                    prepared = self._prepared.get(sequence, _UNPREPARED)
+                    if prepared is _PREPARING:
+                        return
+                    if prepared is _UNPREPARED and not self._slots.acquire(blocking=False):
                         self._active.remove(sequence)
                         self._prepared.pop(sequence, None)
                         attempt.update(
                             status="dropped", error_category="queue_full",
-                            eligible=False,
+                            terminal_stage=terminal_stage, eligible=False,
                         )
                         self._manifest["dropped"] += 1
+                        manifest_snapshot = self._manifest_snapshot_locked()
                         self._condition.notify_all()
-                        return
-                slot_acquired = True
-                self._active.remove(sequence)
-                self._prepared.pop(sequence, None)
-                attempt["terminal_stage"] = terminal_stage
+                    else:
+                        slot_acquired = True
+                        self._active.remove(sequence)
+                        self._prepared.pop(sequence, None)
+                        attempt["terminal_stage"] = terminal_stage
 
-                completed_producer = dict(_field(reference, "producer", {}) or {})
-                completed_producer["completed_at"] = _utc_now()
-                completed_reference = replace(
-                    reference,
-                    configuration=reference.configuration,
-                    producer=completed_producer,
-                )
-                handoff_result = result if prepared is _UNPREPARED else prepared
-                handoff = _CaptureHandoff(
-                    completed_reference, handoff_result, terminal_stage,
-                )
-                self._queue.put_nowait(handoff)
-                attempt["status"] = "queued"
-                attempt["eligible"] = False
-                slot_acquired = False
-                self._condition.notify_all()
+                        completed_producer = dict(
+                            _field(reference, "producer", {}) or {}
+                        )
+                        completed_producer["completed_at"] = _utc_now()
+                        completed_reference = replace(
+                            reference,
+                            configuration=reference.configuration,
+                            producer=completed_producer,
+                        )
+                        handoff_result = result if prepared is _UNPREPARED else prepared
+                        handoff = _CaptureHandoff(
+                            completed_reference, handoff_result, terminal_stage,
+                        )
+                        self._queue.put_nowait(handoff)
+                        attempt["status"] = "queued"
+                        attempt["eligible"] = False
+                        manifest_snapshot = self._manifest_snapshot_locked()
+                        slot_acquired = False
+                        self._condition.notify_all()
+            if manifest_snapshot is not None:
+                self._publish_manifest_snapshot(manifest_snapshot)
         except Exception as exc:
             if slot_acquired:
                 self._slots.release()
@@ -833,7 +878,9 @@ class RebalanceCycleCaptureManager:
                     self._prepared.pop(sequence, None)
                     if isinstance(attempt, dict):
                         self._fail_locked(attempt, exc)
+                    manifest_snapshot = self._manifest_snapshot_locked()
                     self._condition.notify_all()
+                self._publish_manifest_snapshot(manifest_snapshot)
             except Exception:
                 pass
 
@@ -1304,6 +1351,12 @@ class RebalanceCycleCaptureManager:
             os.close(fd)
 
     def _rotate_capture_files(self) -> None:
+        # Rotation can be invoked directly by maintenance/tests as well as from
+        # publication paths already holding the re-entrant filesystem lock.
+        with self._filesystem_lock:
+            self._rotate_capture_files_locked()
+
+    def _rotate_capture_files_locked(self) -> None:
         candidates = []
         envelope_name = re.compile(r"[0-9a-f]{32}-[0-9]{8}-[0-9a-f]{32}:[0-9]{8}\.json\Z")
         manifest_name = re.compile(r"manifest-[0-9a-f]{32}\.v0\.json\Z")

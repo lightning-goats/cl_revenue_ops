@@ -620,6 +620,83 @@ def test_projection_failure_evidence_uses_safe_bounded_allowlist():
     assert "secret" not in repr(projected)
 
 
+def test_forbidden_failure_metadata_never_crosses_handoff_or_publication(
+    tmp_path, monkeypatch,
+):
+    marker_text = "FORBIDDEN-RAW-FAILURE-MARKER"
+    logs = []
+
+    class HostileSecret:
+        deepcopy_calls = 0
+
+        def __deepcopy__(self, _memo):
+            self.deepcopy_calls += 1
+            raise AssertionError(marker_text)
+
+        def __str__(self):
+            return marker_text
+
+        def __repr__(self):
+            return marker_text
+
+    release_writer = _install_live_blocked_cycle_writer(monkeypatch)
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db",
+        lambda *args, **kwargs: logs.append((args, kwargs)),
+    )
+    assert manager.set_enabled(True)
+    reference = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    hostile = HostileSecret()
+    result = _strict_result(outcome={
+        "source_channel_id": "a",
+        "dest_channel_id": "b",
+        "status": "returned",
+        "result": {
+            "success": False,
+            "amount_sats": 100,
+            "error": "temporary failure",
+            "failure_data": {
+                "failure_class": "liquidity",
+                "payment_secret": hostile,
+                "payment_hash": hostile,
+                "invoice": hostile,
+                "raw_rpc": {"marker": hostile},
+            },
+            "payment_secret": hostile,
+            "payment_hash": hostile,
+            "invoice": hostile,
+            "raw_rpc": {"marker": hostile},
+        },
+    })
+
+    assert manager.prepare_cycle_result(reference, result) is True
+    manager.finish_cycle(reference, result)
+    with manager._queue.mutex:
+        handoff = manager._queue.queue[0]
+        handoff_text = repr(handoff)
+    assert marker_text not in handoff_text
+    for forbidden in ("payment_secret", "payment_hash", "invoice", "raw_rpc"):
+        assert forbidden not in handoff_text
+    assert hostile.deepcopy_calls == 0
+
+    release_writer.set()
+    assert manager.set_enabled(False, timeout_seconds=2.0)
+    envelope_path = next(
+        path for path in manager.output_dir.glob("*.json")
+        if not path.name.startswith("manifest-")
+    )
+    envelope_text = envelope_path.read_text(encoding="utf-8")
+    manifest_text = "".join(
+        path.read_text(encoding="utf-8")
+        for path in manager.output_dir.glob("manifest-*.json")
+    )
+    combined_logs = repr(logs)
+    for output_text in (envelope_text, manifest_text, combined_logs):
+        assert marker_text not in output_text
+        for forbidden in ("payment_secret", "payment_hash", "invoice", "raw_rpc"):
+            assert forbidden not in output_text
+
+
 def test_queue_full_reserves_before_copy_and_repeated_drops_do_not_leak(
     tmp_path, monkeypatch,
 ):
@@ -663,6 +740,58 @@ def test_queue_full_reserves_before_copy_and_repeated_drops_do_not_leak(
     assert manager._manifest["attempts"][-1]["terminal_stage"] == "planning_only"
     assert manager._prepared == {}
     assert manager._active == set()
+    release_writer.set()
+    assert manager.set_enabled(False, timeout_seconds=2.0)
+
+
+def test_blocked_manifest_publisher_keeps_newest_begin_drop_and_terminal_truth(
+    tmp_path, monkeypatch,
+):
+    release_writer = _install_live_blocked_cycle_writer(monkeypatch)
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    assert manager.set_enabled(True)
+    _wait_for_manifest_idle(manager)
+    manifest_path = manager._manifest_path()
+    assert json.loads(manifest_path.read_text())["attempted"] == 0
+
+    original_write = manager._write_manifest_snapshot
+    write_started = threading.Event()
+    release_manifest = threading.Event()
+
+    def blocked_manifest_write(path, data, revision):
+        write_started.set()
+        assert release_manifest.wait(2.0)
+        return original_write(path, data, revision)
+
+    monkeypatch.setattr(manager, "_write_manifest_snapshot", blocked_manifest_write)
+    first = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    assert write_started.wait(1.0)
+    assert manager.prepare_cycle_result(first, _strict_result()) is True
+    manager.finish_cycle(first, _strict_result())
+    second = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    assert manager.prepare_cycle_result(second, _strict_result()) is True
+    manager.finish_cycle(second, _strict_result())
+    third = manager.begin_cycle(_configuration(), {"trigger": "automatic"})
+    assert manager.prepare_cycle_result(third, _strict_result()) is False
+    manager.finish_cycle(third, _strict_result(), "planning_only")
+
+    with manager._manifest_publish_condition:
+        pending = manager._pending_manifest_snapshots[manifest_path]
+        pending_manifest = json.loads(pending[1])
+    assert pending_manifest["attempted"] == 3
+    assert pending_manifest["dropped"] == 1
+    assert pending_manifest["attempts"][-1]["status"] == "dropped"
+    assert pending_manifest["attempts"][-1]["terminal_stage"] == "planning_only"
+    assert json.loads(manifest_path.read_text())["attempted"] == 0
+
+    release_manifest.set()
+    _wait_for_manifest_idle(manager, timeout=2.0)
+    durable = json.loads(manifest_path.read_text())
+    assert durable["attempted"] == 3
+    assert durable["dropped"] == 1
+    assert durable["attempts"][-1]["terminal_stage"] == "planning_only"
     release_writer.set()
     assert manager.set_enabled(False, timeout_seconds=2.0)
 

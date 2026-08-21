@@ -106,6 +106,11 @@ def _historical_fee_rate_ppm(fee_msat: Any, volume_msat: Any, cap_ppm: float) ->
 # looked the anchor up and found none" in _effective_dest_cooldown_secs.
 _ANCHOR_UNSET = object()
 
+# None is a valid result of an attempted outer capture acquisition. Keep
+# omission distinct so an inner planning call cannot acquire a second identity
+# if capture is enabled after the outer cycle has already attempted ownership.
+_CAPTURE_REFERENCE_UNSET = object()
+
 
 @dataclass
 class CycleResult:
@@ -1305,9 +1310,11 @@ class RebalanceEngine:
         )
 
 
-    def find_candidates(self, capture_reference: Any = None) -> List[PairCandidate]:
+    def find_candidates(
+        self, capture_reference: Any = _CAPTURE_REFERENCE_UNSET,
+    ) -> List[PairCandidate]:
         """Public planning entrypoint with exactly-once capture ownership."""
-        owns_capture_reference = capture_reference is None
+        owns_capture_reference = capture_reference is _CAPTURE_REFERENCE_UNSET
         if owns_capture_reference:
             capture_reference = self._begin_rebalance_capture("planning")
         terminal_result: Optional[CycleResult] = None
@@ -4258,18 +4265,31 @@ class RebalanceEngine:
                 completed_futures.add(future)
                 if exec_result is not None:
                     result.executions.append(exec_result)
+                    # Authoritative bookkeeping must precede every observational
+                    # capture operation. The worker normally recorded this
+                    # result already; this idempotent backstop also covers
+                    # stubs and alternate worker paths.
+                    self._record_pair_outcome(pair, exec_result)
+                    try:
+                        detached_result = copy.deepcopy(exec_result)
+                    except Exception as exc:
+                        # A hostile or malformed observation cannot reclassify a
+                        # returned execution as raised or suppress bookkeeping.
+                        # Preserve pair identity/status without retaining the
+                        # unsafe result graph.
+                        detached_result = None
+                        self._log(
+                            "rebalance outcome observation detachment failed for "
+                            f"{pair.source_channel_id}->{pair.dest_channel_id} "
+                            f"({type(exc).__name__})",
+                            level="warn",
+                        )
                     result.pair_outcomes.append({
                         "source_channel_id": pair.source_channel_id,
                         "dest_channel_id": pair.dest_channel_id,
                         "status": "returned",
-                        "result": copy.deepcopy(exec_result),
+                        "result": detached_result,
                     })
-                    # Idempotent backstop: the worker already recorded this
-                    # result's pair outcome (record_pair_outcome=True) and
-                    # marked it, making this a no-op. It still covers
-                    # stubbed execution paths that bypass the worker-side
-                    # recording.
-                    self._record_pair_outcome(pair, exec_result)
                 else:
                     result.pair_outcomes.append({
                         "source_channel_id": pair.source_channel_id,

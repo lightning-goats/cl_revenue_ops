@@ -3668,6 +3668,130 @@ def _capture_reference_for_engine(seq=1):
     return RebalanceCycleCaptureReference("a" * 32, seq, ("a" * 32) + f":{seq:08d}", {"config_version": 1, "target_band_low": 0.35, "target_band_high": 0.65, "max_chunk_sats": 1, "max_pairs": 1, "pair_fee_cap_ppm": 0}, {"trigger": "automatic"})
 
 
+def test_mid_cycle_enable_cannot_acquire_inner_planning_capture(
+    mock_plugin, mock_database,
+):
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = MagicMock()
+    begin_lock_states = []
+
+    def begin_cycle(*_args, **_kwargs):
+        begin_lock_states.append(engine._cycle_lock.locked())
+        if len(begin_lock_states) == 1:
+            # Simulate capture becoming enabled after this outer acquisition
+            # attempt. The historical None/default conflation called us again.
+            return None
+        return _capture_reference_for_engine()
+
+    manager.begin_cycle.side_effect = begin_cycle
+    engine.rebalance_capture_manager = manager
+    engine._active_router = lambda: None
+
+    result = engine.run_cycle()
+
+    assert result.candidates == []
+    assert begin_lock_states == [False]
+    assert manager.begin_cycle.call_count == 1
+    manager.prepare_cycle_result.assert_not_called()
+    manager.finish_cycle.assert_not_called()
+
+
+@pytest.mark.parametrize("capture_enabled", [False, True])
+def test_hostile_deepcopy_capture_parity_preserves_route_reserve_executor_and_backstop(
+    mock_plugin, mock_database, tmp_path, capture_enabled,
+):
+    from modules.rebalance_cycle_capture import RebalanceCycleCaptureManager
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_state_v2 import ChannelState, StateSnapshot
+    from modules.rebalance_types_v2 import PairCandidate, PlanResult
+
+    class HostileDeepcopyResult(ExecutionResult):
+        def __deepcopy__(self, _memo):
+            raise RuntimeError("observational deepcopy rejected")
+
+    engine = _make_engine(mock_plugin, mock_database)
+    manager = RebalanceCycleCaptureManager(
+        tmp_path / "revenue_ops.db", lambda *_a, **_k: None,
+    )
+    if capture_enabled:
+        assert manager.set_enabled(True)
+    engine.rebalance_capture_manager = manager
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=10_000,
+        source_excess_sats=50_000,
+        dest_need_sats=50_000,
+        max_chunk_sats=50_000,
+        cheap_rank=1,
+        planner_selected=True,
+        reason_code="ev_positive",
+        score=100.0,
+    )
+    snapshot = StateSnapshot((
+        ChannelState(
+            channel_id="100x1x0", peer_id=pair.source_peer_id,
+            capacity_sats=1_000_000, local_ratio=0.90,
+            actual_inbound_fee_ppm=0, value_class="valuable",
+            is_valuable=True, remaining_budget_sats=10_000,
+            cooldown_active=False,
+        ),
+        ChannelState(
+            channel_id="200x1x0", peer_id=pair.dest_peer_id,
+            capacity_sats=1_000_000, local_ratio=0.10,
+            actual_inbound_fee_ppm=0, value_class="valuable",
+            is_valuable=True, remaining_budget_sats=10_000,
+            cooldown_active=False,
+        ),
+    ), 2_000_000, 20_000, 2)
+    engine._build_snapshot = MagicMock(return_value=snapshot)
+    engine._audit = MagicMock()
+    engine.router_v3 = MagicMock()
+    engine.router_v3.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=0,
+        route=[{"channel": "100x1x0", "direction": 0}],
+        probability_ppm=1_000_000,
+        error="",
+    )
+    executor = MagicMock()
+    executor.is_available.return_value = True
+    executor.execute.return_value = HostileDeepcopyResult(
+        success=True,
+        amount_sats=50_000,
+        fee_sats=0,
+        fee_msat=0,
+        route_type="native",
+    )
+    engine._make_executor = MagicMock(return_value=executor)
+    engine._record_pair_success = MagicMock()
+    original_backstop = engine._record_pair_outcome
+    engine._record_pair_outcome = MagicMock(wraps=original_backstop)
+    planner_result = PlanResult(
+        selected=[pair], generated=[pair], skipped=[],
+    )
+
+    try:
+        with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+            planner_cls.return_value.plan.return_value = planner_result
+            result = engine.run_cycle()
+        if capture_enabled:
+            assert manager.set_enabled(False, timeout_seconds=2.0)
+    finally:
+        engine._pool.shutdown(wait=True)
+
+    engine.router_v3.price_pair.assert_called_once()
+    mock_database.reserve_budget.assert_called_once()
+    executor.execute.assert_called_once()
+    assert engine._record_pair_outcome.call_count == 2
+    engine._record_pair_success.assert_called_once_with("100x1x0", "200x1x0")
+    assert len(result.executions) == 1
+    assert result.pair_outcomes[0]["status"] == "returned"
+
+
 def test_live_no_router_finishes_once_with_ineligible_terminal_stage(mock_plugin, mock_database):
     engine = _make_engine(mock_plugin, mock_database)
     manager = MagicMock()
