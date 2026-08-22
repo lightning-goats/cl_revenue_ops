@@ -566,10 +566,57 @@ def _validate_final_pairs(value: Any) -> tuple[list[Tuple[str, str]], list[Mappi
         value, "final-selected pair", MAX_FINAL_PAIRS,
     )
     for index, item in enumerate(rows):
-        identities.append(_validate_generated_pair(item, f"final-selected pair {index}"))
+        identity = _validate_generated_pair(item, f"final-selected pair {index}")
+        _validate_ev_decomposition(
+            item["score_decomposition"],
+            f"final-selected pair {index}.score_decomposition",
+        )
+        identities.append(identity)
     if len(set(identities)) != len(identities):
         raise ValueError("duplicate final-selected pair identity")
     return identities, rows
+
+
+# Gate keys a recorded-price EV decomposition must carry so offline replay
+# can recompute the verdict. Values are validated as wire numbers/booleans;
+# economic recomputation happens in the standalone reader only.
+_EV_GATE_NUMBER_KEYS = (
+    "p_success", "expected_fee_sats", "expected_utilization",
+    "source_utilization", "source_utilization_discount",
+    "activity_penalty_sats",
+)
+
+
+def _validate_ev_decomposition(value: Any, label: str) -> None:
+    decomposition = _require_mapping(value, label)
+    _reject_reserved_float_key(decomposition, label)
+    for key in (
+        "model_version", "p_success", "expected_fee_sats", "rejection_reason",
+        "expected_utilization", "source_utilization",
+        "source_utilization_discount", "activity_penalty_sats", "inputs",
+    ):
+        if key not in decomposition:
+            raise ValueError(f"{label}.{key} is required")
+    if not isinstance(decomposition["model_version"], str) or not (
+        decomposition["model_version"]
+    ):
+        raise ValueError(f"{label}.model_version must be a non-empty string")
+    if decomposition["model_version"] != "v2-sats-ev":
+        raise ValueError(
+            f"{label}.model_version {decomposition['model_version']!r} "
+            "is not a supported gate model"
+        )
+    if not isinstance(decomposition["rejection_reason"], str):
+        raise ValueError(f"{label}.rejection_reason must be a string")
+    for key in _EV_GATE_NUMBER_KEYS:
+        _require_wire_number(decomposition[key], f"{label}.{key}")
+    inputs = decomposition["inputs"]
+    if not isinstance(inputs, dict):
+        raise ValueError(f"{label}.inputs must be an object")
+    _reject_reserved_float_key(inputs, f"{label}.inputs")
+    for key in ("dest_out_fee_ppm", "failure_count", "expected_fee_sats"):
+        if key not in inputs:
+            raise ValueError(f"{label}.inputs.{key} is required")
 
 
 def _validate_execution_result(value: Any, label: str) -> None:

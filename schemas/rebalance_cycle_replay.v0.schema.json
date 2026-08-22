@@ -533,7 +533,7 @@
           "type": "array",
           "maxItems": 64,
           "items": {
-            "$ref": "#/$defs/generated_pair"
+            "$ref": "#/$defs/final_pair"
           }
         },
         "skipped": {
@@ -775,6 +775,93 @@
           "$ref": "#/$defs/execution_result"
         }
       }
+    },
+    "final_pair": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/generated_pair"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "score_decomposition": {
+              "$ref": "#/$defs/ev_score_decomposition"
+            }
+          }
+        }
+      ]
+    },
+    "ev_gate_inputs": {
+      "type": "object",
+      "required": [
+        "dest_out_fee_ppm",
+        "failure_count",
+        "expected_fee_sats"
+      ],
+      "propertyNames": {
+        "not": {
+          "enum": [
+            "__f__",
+            "__f64__"
+          ]
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/wire_value"
+      }
+    },
+    "ev_score_decomposition": {
+      "type": "object",
+      "required": [
+        "model_version",
+        "p_success",
+        "expected_fee_sats",
+        "rejection_reason",
+        "expected_utilization",
+        "source_utilization",
+        "source_utilization_discount",
+        "activity_penalty_sats",
+        "inputs"
+      ],
+      "properties": {
+        "model_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "p_success": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "expected_fee_sats": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "rejection_reason": {
+          "type": "string"
+        },
+        "expected_utilization": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "source_utilization": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "source_utilization_discount": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "activity_penalty_sats": {
+          "$ref": "#/$defs/wire_number"
+        },
+        "inputs": {
+          "$ref": "#/$defs/ev_gate_inputs"
+        }
+      },
+      "propertyNames": {
+        "not": {
+          "enum": [
+            "__f__",
+            "__f64__"
+          ]
+        }
+      },
+      "additionalProperties": true
     }
   },
   "examples": [

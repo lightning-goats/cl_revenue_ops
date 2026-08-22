@@ -39,7 +39,29 @@ def _pair(source="a", dest="b", rank=1):
         max_chunk_sats=100,
         cheap_rank=rank,
         planner_selected=True,
+        score_decomposition=_ev_decomposition(),
     )
+
+
+def _ev_decomposition():
+    return {
+        "model_version": "v2-sats-ev",
+        "p_success": 0.75,
+        "expected_fee_sats": 2,
+        "rejection_reason": "",
+        "expected_utilization": 0.5,
+        "source_utilization": 0.5,
+        "source_utilization_discount": 0.5,
+        "activity_penalty_sats": 0.0,
+        "final_score_sats": -2.0,
+        "beats_do_nothing": False,
+        "inputs": {
+            "dest_out_fee_ppm": 500,
+            "failure_count": 0,
+            "expected_fee_sats": 2,
+            "effective_budget_sats": 900,
+        },
+    }
 
 
 def test_disabled_capture_creates_no_directory(tmp_path):

@@ -84,7 +84,22 @@ def pair(source="1x1x1", dest="2x2x2", rank=1):
         "planner_selected": True,
         "planner_rejection_reason": None,
         "bootstrap_score_decomposition": {"base": 0.5},
-        "score_decomposition": {"inputs": {"effective_budget_sats": 900}},
+        "score_decomposition": {
+            "model_version": "v2-sats-ev",
+            "p_success": 0.75,
+            "expected_fee_sats": 12,
+            "rejection_reason": "",
+            "expected_utilization": 0.5,
+            "source_utilization": 0.5,
+            "source_utilization_discount": 0.5,
+            "activity_penalty_sats": 0.0,
+            "inputs": {
+                "dest_out_fee_ppm": 500,
+                "failure_count": 0,
+                "expected_fee_sats": 12,
+                "effective_budget_sats": 900,
+            },
+        },
         "route_cost_sats": 12,
         "effective_budget_sats": 900,
         "rejection_reason": "",
@@ -845,3 +860,117 @@ def test_runtime_and_schema_reject_unknown_generated_pair_field():
     envelope = {**replay_wire.tag_floats(body), "payload_sha256": "0" * 64}
     with pytest.raises(ValidationError):
         Draft202012Validator(schema).validate(envelope)
+
+
+# --- Final-pair EV decomposition structural validation ----------------------
+
+
+def ev_decomposition():
+    return {
+        "model_version": "v2-sats-ev",
+        "p_success": 0.75,
+        "expected_fee_sats": 10,
+        "rejection_reason": "",
+        "expected_utilization": 0.5,
+        "source_utilization": 0.5,
+        "source_utilization_discount": 0.5,
+        "activity_penalty_sats": 0.0,
+        "inputs": {
+            "dest_out_fee_ppm": 500,
+            "dest_value_fee_ppm": 250.0,
+            "dest_fee_history_validated": True,
+            "source_opportunity_fee_ppm": 300.0,
+            "failure_count": 0,
+            "expected_fee_sats": 10,
+            "pair_budget_sats": 100_000,
+            "effective_budget_sats": 100_000,
+        },
+    }
+
+
+def body_with_ev_final_pair():
+    body = body_with_pair()
+    body["funnel"]["final_selected_pairs"][0]["score_decomposition"] = (
+        ev_decomposition()
+    )
+    return body
+
+
+def test_final_pair_with_complete_ev_decomposition_is_valid():
+    validate_body(body_with_ev_final_pair())
+
+
+@pytest.mark.parametrize("key", [
+    "model_version", "p_success", "expected_fee_sats", "rejection_reason",
+    "expected_utilization", "source_utilization",
+    "source_utilization_discount", "activity_penalty_sats", "inputs",
+])
+def test_final_pair_missing_ev_gate_keys_rejected(key):
+    decomposition = ev_decomposition()
+    del decomposition[key]
+    body = body_with_ev_final_pair()
+    body["funnel"]["final_selected_pairs"][0]["score_decomposition"] = (
+        decomposition
+    )
+
+    with pytest.raises(ValueError, match="final-selected pair"):
+        validate_body(body)
+
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    envelope = {**replay_wire.tag_floats(body), "payload_sha256": "0" * 64}
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(envelope)
+
+
+def test_final_pair_unknown_model_version_rejected():
+    body = body_with_ev_final_pair()
+    body["funnel"]["final_selected_pairs"][0]["score_decomposition"][
+        "model_version"
+    ] = "v9-future"
+
+    with pytest.raises(ValueError, match="final-selected pair"):
+        validate_body(body)
+
+
+def test_final_pair_non_number_gate_term_rejected():
+    body = body_with_ev_final_pair()
+    body["funnel"]["final_selected_pairs"][0]["score_decomposition"][
+        "p_success"
+    ] = "high"
+
+    with pytest.raises(ValueError, match="final-selected pair"):
+        validate_body(body)
+
+
+def test_final_pair_boolean_gate_term_rejected():
+    body = body_with_ev_final_pair()
+    body["funnel"]["final_selected_pairs"][0]["score_decomposition"][
+        "expected_fee_sats"
+    ] = True
+
+    with pytest.raises(ValueError, match="final-selected pair"):
+        validate_body(body)
+
+
+def test_final_pair_inputs_not_object_rejected():
+    body = body_with_ev_final_pair()
+    body["funnel"]["final_selected_pairs"][0]["score_decomposition"][
+        "inputs"
+    ] = [1, 2]
+
+    with pytest.raises(ValueError, match="final-selected pair"):
+        validate_body(body)
+
+
+def test_generated_pair_decomposition_remains_opaque():
+    # Generated-pair bootstrap/selection decompositions are not gate
+    # evidence and stay structurally unrestricted.
+    body = valid_body()
+    generated = pair()
+    generated["bootstrap_score_decomposition"] = {"anything": ["goes", 1]}
+    generated["score_decomposition"] = {}
+    body["funnel"]["generated_pairs"] = [generated]
+    body["completeness"].update(
+        generated_pair_count=1, retained_generated_pair_count=1,
+    )
+    validate_body(body)
