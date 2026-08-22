@@ -4012,6 +4012,24 @@ def test_run_cycle_detaches_returned_and_cached_result_before_writer_projection(
         "source", "dest", "source-peer", "dest-peer", 100, 20,
         source_excess_sats=100, dest_need_sats=100, max_chunk_sats=100,
         cheap_rank=1, planner_selected=True,
+        score_decomposition={
+            "model_version": "v2-sats-ev",
+            "p_success": 0.75,
+            "expected_fee_sats": 0,
+            "rejection_reason": "",
+            "expected_utilization": 0.5,
+            "source_utilization": 0.5,
+            "source_utilization_discount": 0.5,
+            "activity_penalty_sats": 0.0,
+            "final_score_sats": 0.0,
+            "beats_do_nothing": True,
+            "inputs": {
+                "dest_out_fee_ppm": 500,
+                "failure_count": 0,
+                "expected_fee_sats": 0,
+                "effective_budget_sats": 20,
+            },
+        },
     )
     snapshot = StateSnapshot((ChannelState(
         channel_id="source", peer_id="source-peer", capacity_sats=1000,
@@ -4088,6 +4106,24 @@ def test_find_candidates_detaches_returned_and_cached_evidence_before_projection
         "source", "dest", "source-peer", "dest-peer", 100, 20,
         source_excess_sats=100, dest_need_sats=100, max_chunk_sats=100,
         cheap_rank=1, planner_selected=True,
+        score_decomposition={
+            "model_version": "v2-sats-ev",
+            "p_success": 0.75,
+            "expected_fee_sats": 0,
+            "rejection_reason": "",
+            "expected_utilization": 0.5,
+            "source_utilization": 0.5,
+            "source_utilization_discount": 0.5,
+            "activity_penalty_sats": 0.0,
+            "final_score_sats": 0.0,
+            "beats_do_nothing": True,
+            "inputs": {
+                "dest_out_fee_ppm": 500,
+                "failure_count": 0,
+                "expected_fee_sats": 0,
+                "effective_budget_sats": 20,
+            },
+        },
     )
     snapshot = StateSnapshot((ChannelState(
         channel_id="source", peer_id="source-peer", capacity_sats=1000,
