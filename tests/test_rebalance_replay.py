@@ -140,6 +140,10 @@ def _expected_match_output(envelope):
     return {
         "status": "match", "cycle_id": envelope["cycle_id"],
         "generated_pairs_match": True, "planner_selected_pairs_match": True,
+        "ev_gate_matches": True,
+        "ev_gate_pairs_checked": envelope["completeness"][
+            "final_selected_pair_count"
+        ],
         "mismatches": [],
     }
 
@@ -222,3 +226,168 @@ def test_neutral_empty_snapshot_replays_without_action(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == _expected_match_output(envelope)
+
+
+# --- Recorded-price EV gate replay ------------------------------------------
+
+
+def _ev_decomposition(final_score_sats=1.0, beats_do_nothing=True):
+    return {
+        "model_version": "v2-sats-ev",
+        "p_success": 0.75,
+        "expected_fee_sats": 2,
+        "rejection_reason": "",
+        "expected_utilization": 0.6,
+        "source_utilization": 0.6,
+        "source_utilization_discount": 0.5,
+        "activity_penalty_sats": 0.0,
+        "final_score_sats": final_score_sats,
+        "beats_do_nothing": beats_do_nothing,
+        "inputs": {
+            "dest_value_fee_ppm": 100.0,
+            "source_historical_sourced_fee_ppm": 20.0,
+            "source_opportunity_fee_ppm": 80.0,
+            "dest_out_fee_ppm": 250,
+            "failure_count": 0,
+            "expected_fee_sats": 2,
+            "pair_budget_sats": 1_000,
+            "effective_budget_sats": 1_000,
+        },
+    }
+
+
+def _envelope_with_ev_final_pair():
+    """Seal a real planner envelope plus one recorded-price final pair.
+
+    Uses the planner's own first selected pair so the recorded planner
+    selection stays byte-identical under replay; only the recorded-price
+    gate evidence is synthetic.
+    """
+    envelope = _sealed_envelope()
+    body = copy.deepcopy(envelope)
+    body.pop("payload_sha256")
+    selected = body["funnel"]["planner_selected_pairs"][0]
+    identity = {
+        "source_channel_id": selected["source_channel_id"],
+        "dest_channel_id": selected["dest_channel_id"],
+    }
+    final_pair = {
+        **identity,
+        "planned_amount_sats": 100_000,
+        "pair_budget_sats": 1_000,
+        "source_excess_sats": 1,
+        "dest_need_sats": 1,
+        "max_chunk_sats": 500_000,
+        "cheap_rank": 1,
+        "cheap_score": 0.5,
+        "planner_selected": True,
+        "planner_rejection_reason": None,
+        "bootstrap_score_decomposition": {},
+        "score_decomposition": _ev_decomposition(),
+        "route_cost_sats": 2,
+        "effective_budget_sats": 1_000,
+        "rejection_reason": "",
+        "route_summary": [],
+    }
+    body["funnel"]["final_selected_pairs"] = [final_pair]
+    body["completeness"]["planner_selected_pair_count"] = len(
+        body["funnel"]["planner_selected_pairs"]
+    )
+    body["completeness"]["final_selected_pair_count"] = 1
+    return seal_envelope(body)
+
+
+def test_match_output_includes_ev_gate_fields():
+    envelope = _sealed_envelope()
+    expected = _expected_match_output(envelope)
+    assert expected["ev_gate_matches"] is True
+    assert expected["ev_gate_pairs_checked"] == 0
+
+
+def test_sealed_ev_final_pair_replays_with_gate_verdict_match(tmp_path):
+    envelope = _envelope_with_ev_final_pair()
+
+    result = _run_tool(_write_envelope(tmp_path, envelope))
+
+    output = json.loads(result.stdout)
+    assert result.returncode == 0, result.stderr
+    assert output["status"] == "match"
+    assert output["ev_gate_matches"] is True
+    assert output["ev_gate_pairs_checked"] == 1
+    assert output["mismatches"] == []
+
+
+def test_tampered_recorded_final_score_is_a_gate_mismatch(tmp_path):
+    envelope = _envelope_with_ev_final_pair()
+    body = copy.deepcopy(envelope)
+    body.pop("payload_sha256")
+    decomposition = body["funnel"]["final_selected_pairs"][0][
+        "score_decomposition"
+    ]
+    # Sealed envelopes store floats as binary64 tags; decode, tamper, retag.
+    from modules.rebalance_cycle_replay_wire import (
+        BINARY64_TAG_KEY, tag_floats,
+    )
+    import struct
+
+    decoded = struct.unpack(
+        ">d", bytes.fromhex(decomposition["final_score_sats"][BINARY64_TAG_KEY])
+    )[0]
+    decomposition["final_score_sats"] = tag_floats(decoded + 5.0)
+    tampered = seal_envelope(body)
+
+    result = _run_tool(_write_envelope(tmp_path, tampered))
+
+    output = json.loads(result.stdout)
+    assert result.returncode == 1
+    assert output["status"] == "mismatch"
+    assert output["generated_pairs_match"] is True
+    assert output["planner_selected_pairs_match"] is True
+    assert output["ev_gate_matches"] is False
+    assert output["mismatches"] == ["ev_gate"]
+
+
+def test_tampered_beats_do_nothing_is_a_gate_mismatch(tmp_path):
+    envelope = _envelope_with_ev_final_pair()
+    body = copy.deepcopy(envelope)
+    body.pop("payload_sha256")
+    decomposition = body["funnel"]["final_selected_pairs"][0][
+        "score_decomposition"
+    ]
+    # Recompute-consistent score but flipped verdict: only the verdict lies.
+    decomposition["beats_do_nothing"] = not decomposition["beats_do_nothing"]
+    tampered = seal_envelope(body)
+
+    result = _run_tool(_write_envelope(tmp_path, tampered))
+
+    output = json.loads(result.stdout)
+    assert result.returncode == 1
+    assert output["status"] == "mismatch"
+    assert output["ev_gate_matches"] is False
+
+
+def test_unknown_gate_model_version_is_a_controlled_input_failure(tmp_path):
+    # Unknown model versions are rejected at wire validation; build the
+    # envelope by bypassing validation to exercise the tool's defense.
+    from modules.rebalance_cycle_replay_wire import (
+        canonical_body_bytes, tag_floats,
+    )
+    import hashlib
+
+    body = copy.deepcopy(_envelope_with_ev_final_pair())
+    body.pop("payload_sha256")
+    body["funnel"]["final_selected_pairs"][0]["score_decomposition"][
+        "model_version"
+    ] = "v9-future"
+    digest = hashlib.sha256(canonical_body_bytes(tag_floats(body))).hexdigest()
+
+    path = tmp_path / "unknown-model.json"
+    path.write_text(
+        json.dumps({**body, "payload_sha256": digest}), encoding="utf-8",
+    )
+
+    result = _run_tool(path)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "model" in result.stderr.lower()

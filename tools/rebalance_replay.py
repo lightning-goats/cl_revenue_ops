@@ -12,7 +12,7 @@ import sys
 import types
 
 
-ROOT = Path(__file__).resolve().parents[1]
+_ROOT = Path(__file__).resolve().parents[1]
 _PURE_MODULES = (
     "utils",
     "rebalance_route_policy",
@@ -20,6 +20,7 @@ _PURE_MODULES = (
     "rebalance_state_v2",
     "rebalance_planner_v2",
     "rebalance_cycle_replay_wire",
+    "rebalance_ev_model",
 )
 _CHANNEL_FIELDS = (
     "channel_id", "peer_id", "capacity_sats", "local_ratio",
@@ -47,14 +48,14 @@ def _load_pure_components():
         raise ValueError("standalone replay refuses a preloaded modules package")
     package = types.ModuleType("modules")
     package.__package__ = "modules"
-    package.__path__ = [str(ROOT / "modules")]
+    package.__path__ = [str(_ROOT / "modules")]
     sys.modules["modules"] = package
     loaded = {}
     try:
         for name in _PURE_MODULES:
             module_name = f"modules.{name}"
             module = types.ModuleType(module_name)
-            module.__file__ = str(ROOT / "modules" / f"{name}.py")
+            module.__file__ = str(_ROOT / "modules" / f"{name}.py")
             module.__package__ = "modules"
             sys.modules[module_name] = module
             source = Path(module.__file__).read_text(encoding="utf-8")
@@ -67,6 +68,7 @@ def _load_pure_components():
         raise
     return (
         loaded["rebalance_cycle_replay_wire"],
+        loaded["rebalance_ev_model"],
         loaded["rebalance_planner_v2"].RebalancePlanner,
         loaded["rebalance_state_v2"].ChannelState,
         loaded["rebalance_state_v2"].StateSnapshot,
@@ -172,7 +174,7 @@ def _require_complete_capture(envelope):
 
 
 def replay(envelope):
-    wire, planner_class, channel_state, state_snapshot = _components()
+    wire, ev_model, planner_class, channel_state, state_snapshot = _components()
     normalized = wire.verify_normalized_envelope(envelope)
     _require_complete_capture(normalized)
     decoded = _decode_floats(normalized, wire.BINARY64_TAG_KEY)
@@ -200,11 +202,35 @@ def replay(envelope):
         mismatches.append("generated_pairs")
     if not selected_matches:
         mismatches.append("planner_selected_pairs")
+
+    gate_checked = 0
+    gate_matches = True
+    for index, final_pair in enumerate(decoded["funnel"]["final_selected_pairs"]):
+        decomposition = final_pair.get("score_decomposition")
+        if not isinstance(decomposition, dict):
+            raise ValueError(f"final pair {index} has no score_decomposition")
+        recomputed = ev_model.recompute_gate(
+            decomposition,
+            amount_sats=final_pair["planned_amount_sats"],
+        )
+        recorded_final_score_sats = decomposition["final_score_sats"]
+        recorded_beats_do_nothing = decomposition["beats_do_nothing"]
+        gate_checked += 1
+        if (
+            recomputed["final_score_sats"] != recorded_final_score_sats
+            or recomputed["beats_do_nothing"] is not recorded_beats_do_nothing
+        ):
+            gate_matches = False
+    if not gate_matches:
+        mismatches.append("ev_gate")
+
     return {
         "status": "match" if not mismatches else "mismatch",
         "cycle_id": decoded["cycle_id"],
         "generated_pairs_match": generated_matches,
         "planner_selected_pairs_match": selected_matches,
+        "ev_gate_matches": gate_matches,
+        "ev_gate_pairs_checked": gate_checked,
         "mismatches": mismatches,
     }
 
@@ -252,7 +278,7 @@ def _load_envelope(filename, maximum_bytes):
 def main(arguments=None):
     try:
         filename, pretty = _parse_arguments(sys.argv[1:] if arguments is None else arguments)
-        wire, _planner_class, _channel_state, _state_snapshot = _components()
+        wire, _ev_model, _planner_class, _channel_state, _state_snapshot = _components()
         output = replay(_load_envelope(filename, wire.MAX_ENVELOPE_BYTES))
     except (ArithmeticError, OSError, TypeError, ValueError, struct.error) as error:
         sys.stderr.write(f"rebalance replay error: {error}\n")
