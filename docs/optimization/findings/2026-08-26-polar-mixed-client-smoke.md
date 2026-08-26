@@ -18,6 +18,7 @@ Sling, swap, open, or close action was in scope.
 | Check | Outcome |
 | --- | --- |
 | Baseline traffic | 4/4 payments settled. |
+| Fresh-network repeatability | A second network was provisioned from zero with the same 12-channel topology. Its corrected deterministic matrix settled 8/8 payments: two rounds on each CLN/LND forward and reverse lane. Each forward seed was 45,000 sats and each return payment 20,000 sats, preserving the 20,000-sat channel reserve plus fee margin. Polar's fixed host ports require networks to run sequentially in the same app; the harness now refuses to create a fresh lab while another network is started, preventing a half-created error-state network. |
 | Competitors at 200 ppm | 10/10 settled; the target forwarded 7/10. |
 | Competitors at 25 ppm | 10/10 settled; the target forwarded 6/10. |
 | Fee crossover by client | With both competitors at 0 ppm, the LND lane sent 10/10 through the CLN competitor; the CLN lane split 1 target / 3 CLN competitor / 6 LND competitor. At 25 ppm, the LND lane sent 10/10 through the 14-ppm target while the CLN lane still split 2 target / 3 CLN competitor / 5 LND competitor. This is useful client/cache divergence evidence, not a fee-only attribution. |

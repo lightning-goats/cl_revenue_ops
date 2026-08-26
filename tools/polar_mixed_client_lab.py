@@ -22,6 +22,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:37373"
 DEFAULT_LAB_NAME = "revenue-ops-mixed-client"
+DEFAULT_REVERSE_FEE_BUFFER_SATS = 25_000
 
 
 @dataclass(frozen=True)
@@ -132,8 +133,25 @@ def role_renames(network: dict[str, Any]) -> list[tuple[str, str]]:
 def create_lab(bridge: PolarMcp, name: str, description: str) -> int:
     """Create the stopped lab and assign deterministic node names."""
     existing = bridge.call("list_networks", {}).get("networks", [])
+    if not isinstance(existing, list):
+        raise PolarMcpError("list_networks did not return a network list")
     if any(isinstance(network, dict) and network.get("name") == name for network in existing):
         raise PolarMcpError(f'network "{name}" already exists; choose a new --name')
+    running = [
+        network
+        for network in existing
+        if isinstance(network, dict)
+        and str(network.get("status", "")).casefold() in {"started", "starting"}
+    ]
+    if running:
+        labels = ", ".join(
+            f'{network.get("name", "unnamed")} (id={network.get("id", "unknown")})'
+            for network in running
+        )
+        raise PolarMcpError(
+            "cannot create a fresh lab while another Polar network is running: "
+            f"{labels}; stop it first or reuse it with --network-id"
+        )
     result = bridge.call(
         "create_network",
         {
@@ -299,7 +317,15 @@ def run_deterministic_traffic(
                     "invoice": invoice["invoice"],
                 },
             )
-            records.append({"round": round_index, "payer": payer, "sink": sink, "payment": payment})
+            records.append(
+                {
+                    "round": round_index,
+                    "payer": payer,
+                    "sink": sink,
+                    "amount_sats": amount_sats,
+                    "payment": payment,
+                }
+            )
             if pause_seconds:
                 time.sleep(pause_seconds)
     return records
@@ -319,6 +345,29 @@ def select_traffic_lanes(direction: str, lane: str) -> tuple[tuple[str, str], ..
     return tuple(pair for pair in selected if pair[0].startswith(marker))
 
 
+def traffic_batches(
+    direction: str,
+    lane: str,
+    amount_sats: int,
+    reverse_fee_buffer_sats: int,
+) -> tuple[tuple[tuple[tuple[str, str], ...], int], ...]:
+    """Build executable traffic batches, seeding return liquidity when needed."""
+    if amount_sats <= 0:
+        raise ValueError("amount_sats must be positive")
+    if reverse_fee_buffer_sats < 0:
+        raise ValueError("reverse_fee_buffer_sats must be nonnegative")
+    if direction != "both":
+        return ((select_traffic_lanes(direction, lane), amount_sats),)
+    # A sink cannot return the exact amount it just received because its
+    # outgoing payment must cover routing fees while leaving the channel
+    # reserve intact. Seed an explicit surplus on the forward pass so a fresh
+    # topology can run both directions.
+    return (
+        (select_traffic_lanes("forward", lane), amount_sats + reverse_fee_buffer_sats),
+        (select_traffic_lanes("reverse", lane), amount_sats),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", default=DEFAULT_LAB_NAME)
@@ -331,6 +380,12 @@ def main() -> int:
     )
     parser.add_argument("--traffic-rounds", type=int, default=0)
     parser.add_argument("--amount-sats", type=int, default=20_000)
+    parser.add_argument(
+        "--reverse-fee-buffer-sats",
+        type=int,
+        default=DEFAULT_REVERSE_FEE_BUFFER_SATS,
+        help="extra forward liquidity for fees/reserve when --traffic-direction=both",
+    )
     parser.add_argument("--pause-seconds", type=float, default=0.25)
     parser.add_argument(
         "--traffic-direction",
@@ -373,15 +428,23 @@ def main() -> int:
             wire_lab(bridge, network_id) if args.network_id else start_and_wire_lab(bridge, network_id)
         )
         if args.traffic_rounds:
-            selected_lanes = select_traffic_lanes(args.traffic_direction, args.traffic_lane)
-            plan["traffic"] = run_deterministic_traffic(
-                bridge,
-                network_id,
-                args.traffic_rounds,
+            plan["traffic"] = []
+            for selected_lanes, amount_sats in traffic_batches(
+                args.traffic_direction,
+                args.traffic_lane,
                 args.amount_sats,
-                args.pause_seconds,
-                selected_lanes,
-            )
+                args.reverse_fee_buffer_sats,
+            ):
+                plan["traffic"].extend(
+                    run_deterministic_traffic(
+                        bridge,
+                        network_id,
+                        args.traffic_rounds,
+                        amount_sats,
+                        args.pause_seconds,
+                        selected_lanes,
+                    )
+                )
     rendered = json.dumps(plan, indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

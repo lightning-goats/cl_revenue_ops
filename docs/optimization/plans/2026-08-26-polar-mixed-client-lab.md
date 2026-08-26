@@ -59,6 +59,10 @@ repairing that image in a separate clean lab.
 
 1. Start Polar and wait for `GET /health` on its local MCP bridge.
 2. Run `python tools/polar_mixed_client_lab.py --apply --output results/polar-lab/topology.json`.
+   Polar assigns fixed host ports, so stop (do not delete) any other lab before
+   creating the next fresh network. The harness fails before creation if a
+   network is already started; existing labs can be resumed with
+   `--network-id` after they are started in Polar.
 3. Confirm every node is RPC-ready, all twelve channels are announced, and
    mine six blocks after opening them.
 4. Install the exact plugin revision and its pinned runtime dependencies only
@@ -90,7 +94,11 @@ burst before and after each background window; it gives a bounded event set for
 assertions even while the UI-only simulator remains asynchronous.
 The deterministic driver accepts `--traffic-direction forward|reverse|both`
 and `--traffic-lane all|lnd|cln`; use those selectors instead of creating a
-second Polar window or hand-paying one-off invoices.
+second Polar window or hand-paying one-off invoices. For `both`, the forward
+batch defaults to a 25,000-sat surplus per payment before the return batch.
+That surplus covers the 20,000-sat reserve on these 2,000,000-sat channels and
+a bounded routing-fee margin; override it only with
+`--reverse-fee-buffer-sats` and record the value.
 
 Run the following phases in order, with a fresh network per candidate setting:
 

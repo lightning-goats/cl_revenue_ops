@@ -73,6 +73,28 @@ def test_traffic_lane_selector_supports_both_directions():
     )
 
 
+def test_both_direction_traffic_seeds_explicit_return_fee_buffer():
+    lab = load_lab()
+
+    assert lab.traffic_batches("both", "lnd", 20_000, 100) == (
+        ((("lnd-payer", "lnd-sink"),), 20_100),
+        ((("lnd-sink", "lnd-payer"),), 20_000),
+    )
+
+
+def test_reverse_fee_buffer_must_be_nonnegative():
+    lab = load_lab()
+
+    with pytest.raises(ValueError, match="must be nonnegative"):
+        lab.traffic_batches("both", "all", 20_000, -1)
+
+
+def test_default_reverse_buffer_covers_two_million_sat_channel_reserve():
+    lab = load_lab()
+
+    assert lab.DEFAULT_REVERSE_FEE_BUFFER_SATS > 20_000
+
+
 def test_required_channel_check_requires_matching_peer_capacity_and_state():
     lab = load_lab()
 
@@ -96,3 +118,27 @@ def test_required_channel_check_accepts_pending_channel_for_retry_safety():
         "destination",
         2_000_000,
     )
+
+
+def test_create_lab_refuses_running_network_before_creating_an_orphan():
+    lab = load_lab()
+
+    class Bridge:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, tool, arguments):
+            self.calls.append((tool, arguments))
+            if tool == "list_networks":
+                return {
+                    "networks": [
+                        {"id": 1, "name": "existing-lab", "status": "Started"},
+                    ]
+                }
+            raise AssertionError(f"unexpected mutation: {tool}")
+
+    bridge = Bridge()
+    with pytest.raises(lab.PolarMcpError, match=r"existing-lab \(id=1\)"):
+        lab.create_lab(bridge, "new-lab", "test")
+
+    assert bridge.calls == [("list_networks", {})]
