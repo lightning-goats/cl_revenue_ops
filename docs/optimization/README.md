@@ -26,25 +26,26 @@ warning; required evidence loss remains fail closed. Economic behavior is
 unchanged. The fee-intent range and evidence-lock correction is deployed
 observationally at production SHA
 `39fe455dab8112ad8934ba068c5508fefc25dde8`. Read-only production evidence on
-2026-08-20 shows the three most recent closed UTC archive days complete and the
-post-load startup reconciliation clean. That startup slot is excluded from the
-new gate. The earliest eligible boundary is frozen at
-`2026-08-20 18:00:00 UTC`; an hourly read-only control-host monitor records
-progress without authorizing activation.
+2026-08-20 showed the three most recent closed UTC archive days complete and
+the post-load startup reconciliation clean. The final Phase 0 gate used the
+fully aligned interval `[2026-08-22 00:00:00, 2026-08-25 00:00:00) UTC` and
+passed all 72 hourly and daily completeness conditions. The exact evidence and
+two brief, non-disqualifying CLN restarts are recorded in the
+[final gate disposition](findings/2026-08-26-phase0-durable-evidence-gate.md).
 
 state: preflight
 formal_window_active=false
-72-hour durable-evidence gate: boundary staged; awaiting first eligible natural slot
+72-hour durable-evidence gate: PASS
 
-Live algorithm changes remain blocked until the Phase 0 production gate proves
-at least 72 consecutive hours of reconstructable completeness from durable
-evidence.
+The Phase 0 measurement prerequisite is satisfied. Live algorithm changes
+remain separately gated by reviewed shadow proposals and explicit operator
+approval; this PASS does not activate any optimizer or the successor window.
 
 The local Phase 1A rebalance replay-capture implementation is recorded in
 [its finding](findings/2026-08-20-rebalance-replay-capture.md):
 **IMPLEMENTED, NOT DEPLOYED**; **SHADOW ACTIVATION NOT AUTHORIZED**; and
 **PHASE 1 GATE NOT YET MET**. It remains default-off and offline-only pending
-the Phase 0 gate and a separately approved shadow proposal.
+a separately approved deployment and shadow proposal.
 
 ## Authoritative plan
 
@@ -75,13 +76,13 @@ See [validation/baseline.md](validation/baseline.md) and the historical
 
 | Phase | Mode | Activation state | Evidence location |
 | --- | --- | --- | --- |
-| 0. Measurement integrity | implementation | active work | `findings/phase0-measurement-hardening.md` |
+| 0. Measurement integrity | production evidence | 72-hour gate passed; successor window inactive | [2026-08-26 gate disposition](findings/2026-08-26-phase0-durable-evidence-gate.md) |
 | 0.3 Daily collector repair | implementation | shadow evidence | [phase0-daily-collector.md](findings/phase0-daily-collector.md) |
 | 0.4 Validator failure semantics | implementation | shadow evidence | [phase0-validator-failure-semantics.md](findings/phase0-validator-failure-semantics.md) |
 | 0.5 Versioned evaluation identity | implementation | preflight only | [phase0-evaluation-identity.md](findings/phase0-evaluation-identity.md) |
-| 0.6 Canonical forward archive | implementation | archive coverage complete; gate boundary staged | [ADR-002](adr/ADR-002-canonical-forward-archive.md) |
+| 0.6 Canonical forward archive | production evidence | archive coverage complete; Phase 0 gate passed | [ADR-002](adr/ADR-002-canonical-forward-archive.md) |
 | 0B. Refactor closure | queued | inactive | future finding |
-| 1. Deterministic replay and traces | local Phase 1A implementation only; blocked from production by Phase 0 | implemented, not deployed | [2026-08-20 replay capture](findings/2026-08-20-rebalance-replay-capture.md) |
+| 1. Deterministic replay and traces | local Phase 1A implementation only | implemented, not deployed; shadow approval required | [2026-08-20 replay capture](findings/2026-08-20-rebalance-replay-capture.md) |
 | 2. Route-liquidity evidence | blocked by Phase 1 | inactive | future finding |
 | 3. Amount optimizer | blocked by Phases 1–2 | inactive | future finding |
 | 4. Price before final selection | blocked by Phase 3 | inactive | future finding |

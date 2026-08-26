@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-13
 **Scope:** Phase 0.1-0.7
-**Status:** Measurement corrections deployed observationally; gate boundary staged; successor window inactive
+**Status:** Measurement corrections deployed observationally; Phase 0 gate passed; successor window inactive
 **Recommendation:** **CONTINUE SHADOW**
 
 ## Hypothesis
@@ -322,3 +322,18 @@ complete node manifest with no errors without overwriting historical evidence.
 This is observational measurement work only. The successor window remains
 inactive, `formal_window_active=false`, and no optimization may influence live
 economic decisions.
+
+## Final 72-hour gate disposition (2026-08-26)
+
+The aligned interval `[2026-08-22 00:00:00, 2026-08-25 00:00:00) UTC`
+contains 72 of 72 durable clean reconciliation slots. The three exact
+closed-day collections have complete fee-intent, budget, required-manifest,
+and forward-archive evidence. Two brief CLN restarts remained well inside the
+22-hour daily plugin-coverage floor and produced no missing or unexplained
+reconciliation slot.
+
+**PHASE 0 PRODUCTION GATE: PASS.** See the
+[final gate disposition](2026-08-26-phase0-durable-evidence-gate.md) for the
+daily matrix, restart attribution, artifact inventory, and activation limits.
+The successor window remains inactive and no optimizer is authorized by this
+finding.

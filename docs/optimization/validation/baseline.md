@@ -77,7 +77,7 @@ it is not a successor-window activation record.
 
 state: preflight
 formal_window_active: false
-72-hour durable-evidence gate: boundary staged; awaiting first eligible natural slot
+72-hour durable-evidence gate: PASS
 
 The corrected observational archive was dynamically loaded on `lnnode` at
 `2026-08-14 02:40:14 UTC`, production SHA
@@ -99,9 +99,16 @@ on `lnnode` at `2026-08-20 17:04:43 UTC`, production SHA
 `17:30 UTC` found the three most recent closed UTC archive days complete.
 The clean `17:00 UTC` reconciliation slot was a startup catch-up and is
 explicitly excluded. The next gate lower bound is frozen at
-`2026-08-20 18:00:00 UTC`; it remains preflight evidence only until the
-future natural slot is durably observed and all 72 hours plus daily
-completeness evidence pass.
+`2026-08-20 18:00:00 UTC`. The final adjudicated interval is
+`[2026-08-22 00:00:00, 2026-08-25 00:00:00) UTC`: all 72 hourly runs and all
+three daily completeness records pass. The evidence, brief CLN restart
+confounders, and exact arithmetic are recorded in the
+[final Phase 0 gate disposition](../findings/2026-08-26-phase0-durable-evidence-gate.md).
+
+Passing this measurement preflight does not activate the successor window.
+The configured identity remains `preflight` with
+`formal_window_active=false`, and no pre-activation data may be silently
+counted in the formal successor evaluation.
 
 The forward-archive preflight correction is documented in the [design](../plans/2026-08-13-forward-archive-preflight-corrections-design.md),
 [implementation plan](../plans/2026-08-13-forward-archive-preflight-corrections.md),
