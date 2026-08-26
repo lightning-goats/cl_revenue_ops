@@ -27,11 +27,14 @@ Sling, swap, open, or close action was in scope.
 | Failure path | A manual 300,000-sat, 4-sat-cap attempt hit `WIRE_TEMPORARY_CHANNEL_FAILURE` on a return edge with zero directional liquidity; it recorded a failure and spent zero. |
 | Seeded execution | Eight competitor-routed 50,000-sat payments gave the failed return edge 400,000 sats local. The same manual rebalance then settled 300,000 sats for 3,301 msat, rendered as 4 sats. |
 | Automatic failover and settlement | A first automatic 439,994-sat attempt correctly released its reservation after both visible return routes lacked directional liquidity. Ten bounded 50,000-sat LND-lane payments then seeded 500,000 sats through the CLN competitor. On retry, the LND route again failed, native routing excluded that edge, the CLN route settled 439,994 sats for 3,440 msat in two attempts, and the plugin paused immediately afterward. |
+| Pending settlement — late success | A container-only fault injector raised a transport timeout immediately after real `sendpay` submission. The 400,000-sat CLN-competitor payment was parked as `pending_settlement` with its real payment hash; actual spend stayed at 318 sats while the full 400-sat pair budget remained reserved. `listsendpays` proved completion for 3,401 msat. The normal reconciliation sweep atomically marked success, booked 4 conservative sats, and released the 396-sat remainder. A second fixed-code run reproduced the same result at history row 10. |
+| Pending settlement — confirmed failure | The same post-`sendpay` timeout was applied to a deliberately dry LND return route. The real payment first held a 400-sat reservation as `pending_settlement`; `listsendpays` then reported `failed`, target balances did not move, and reconciliation marked `payment_pending_resolved_failed`, released all 400 sats, and left actual spend unchanged at 326 sats. |
+| Late-success cooldown bug | The first live late-success sweep exposed that it cleared only the in-memory pair failure, not the persisted `payment_pending_timeout` cooldown. After restart, an emergency 90/10 pair was incorrectly blocked for one hour even though the payment had succeeded. The sweep now clears the durable pair failure through the same database primitive as the synchronous-success path. A repeated late-success run followed by fresh depletion selected the pair immediately, proving the cooldown was gone. |
 | Liquidity result | After the manual and automatic settlements, source `216x1x0` landed at 1,400,042 sats local and destination `108x1x1` at 599,999 sats: effectively the planner's 70/30 post-state. |
 | Fresh accounting | Final budget state was 318 sats total = 310 open + 8 conservative whole-sat rebalance accounting, zero reservations, and 682/1,000 sats remaining. Exact aggregate rebalance cost was 6,741 msat, rendered as 7 sats by profitability/health. The five recorded jobs contained two successes; failed/governor-blocked paths spent zero. |
 | Reconciliation | `revenue-econ-reconcile apply=false` found no divergences; the single governed fee cycle had complete intent evidence. Manual rebalances do not create an automated governor intent to match. |
 | Reporting surface | `revenue-report summary` was only returning explicit peer-policy counts despite documenting node P&L, active channels, and warnings. The additive fix preserves `policies` and now returns canonical dashboard financials, the 30-day period, warnings, bleeder count, and live channel-state counts. Live readback reported four channels, 51 sats revenue, 7 sats exact rebalance opex, and 44 sats operating profit. |
-| Regression suite | Focused rebalance suites: 519 passed. Planner plus operator/reporting regressions: 94 passed. Final full suite: 3,720 passed, 5 environment-dependent skips, and 2 intentional expected failures. |
+| Regression suite | Focused rebalance suites: 519 passed. Planner plus operator/reporting regressions: 94 passed. Pending/atomic/engine suites after the late-success cooldown fix: 128 passed. Final full suite after all continuation changes: 3,720 passed, 5 environment-dependent skips, and 2 intentional expected failures. |
 
 ## Module disposition
 
@@ -64,6 +67,13 @@ Sling, swap, open, or close action was in scope.
   `revenue-report summary` implementation did not fulfil its documented
   financial/channel contract. It now composes the canonical dashboard result
   and current channel states while preserving the existing policy summary.
+- **Pending-settlement reconciliation:** live fault injection now covers both
+  terminal outcomes without synthetic database rows. Reservations remain held
+  while the outcome is unknown, late success atomically records exact-msat
+  cost and releases the remainder, and terminal failure releases without
+  spend. Late success must also clear the persisted pending-timeout pair
+  cooldown; a regression assertion and repeated live selection cover that
+  contract.
 - **Newest CLN:** this lab does not establish compatibility beyond Polar's
   bundled 25.12 image. Test current CLN in a separate custom-image lab; do not
   replace the known-good target image mid-run.

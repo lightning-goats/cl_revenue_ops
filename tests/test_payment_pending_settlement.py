@@ -437,6 +437,9 @@ def test_reconcile_settled_payment_records_cost_and_marks_spent(
     mock_database.update_rebalance_result.assert_not_called()
     mock_database.record_rebalance_cost.assert_not_called()
     mock_database.mark_budget_spent.assert_not_called()
+    mock_database.clear_pair_rebalance_failure.assert_called_once_with(
+        "100x1x0", "200x1x0"
+    )
 
 
 def test_reconcile_partial_fill_settles_with_actual_amount(

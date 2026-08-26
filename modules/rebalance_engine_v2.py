@@ -1943,16 +1943,24 @@ class RebalanceEngine:
             )
 
     def _clear_persisted_pair_failure(self, pair: PairCandidate) -> None:
+        self._clear_persisted_pair_failure_channels(
+            pair.source_channel_id, pair.dest_channel_id
+        )
+
+    def _clear_persisted_pair_failure_channels(
+        self, source_channel_id: str, dest_channel_id: str
+    ) -> None:
         if self.database is None:
             return
         clearer = getattr(self.database, "clear_pair_rebalance_failure", None)
         if clearer is None:
             return
         try:
-            clearer(pair.source_channel_id, pair.dest_channel_id)
+            clearer(source_channel_id, dest_channel_id)
         except Exception as e:
             self._log(
-                f"Clear pair failure failed for {pair.source_channel_id}->{pair.dest_channel_id}: {e}",
+                f"Clear pair failure failed for "
+                f"{source_channel_id}->{dest_channel_id}: {e}",
                 level="warn",
             )
 
@@ -3695,8 +3703,16 @@ class RebalanceEngine:
                         timestamp=int(time.time()),
                     )
                 self.database.mark_budget_spent(reservation_id, fee_sats)
-            self._record_pair_success(
-                str(row.get("from_channel") or ""), dest_channel
+            source_channel = str(row.get("from_channel") or "")
+            self._record_pair_success(source_channel, dest_channel)
+            # A payment_pending timeout is persisted as a conservative pair
+            # failure while its outcome is unknown. Once the sweep proves a
+            # late success, clear that durable cooldown just as the normal
+            # synchronous-success path does. Otherwise a successful refill
+            # remains blocked by the one-hour pending-payment cooldown after
+            # restart, including when fresh traffic depletes it again.
+            self._clear_persisted_pair_failure_channels(
+                source_channel, dest_channel
             )
             self._log(
                 f"late settlement confirmed for rebalance {rebalance_id}: "

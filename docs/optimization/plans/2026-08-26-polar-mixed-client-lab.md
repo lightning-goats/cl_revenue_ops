@@ -174,6 +174,14 @@ quoted and actual fee, EV benefit/hold margin, reservation id/state, settlement
 state, and reconciliation result alongside routed revenue net of rebalance
 cost.
 
+The 2026-08-26 continuation proved both unknown-outcome terminal branches in
+the existing network with a container-only timeout immediately after real
+`sendpay`; it did not insert synthetic history or reservation rows. It also
+found and fixed a durable-cooldown bug: late success must clear the persisted
+`payment_pending_timeout` pair failure as well as the in-memory counter. These
+results satisfy the branch-behavior smoke gate, but the separate-fresh-network
+and three-network repeatability requirements above remain in force.
+
 ## Acceptance scorecard
 
 A candidate is not tunable unless all of these hold per phase:
