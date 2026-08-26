@@ -663,6 +663,25 @@ class EVRebalancer:
         # Thread-safe config snapshot for this rebalance cycle
         cfg = self.config.snapshot()
 
+        # The operator pause is a cycle-level kill switch, not merely an
+        # execution-time governor check. Exit before reservation cleanup,
+        # slot inspection, snapshot construction, route pricing, or any
+        # planner work so manual and scheduled cycles have identical pause
+        # semantics.
+        if getattr(cfg, "paused", False) is True:
+            self._set_last_decision_summary(
+                action="suppressed",
+                reason="paused",
+                dominant_input="paused",
+                safety_block=True,
+                budget_blocked=False,
+            )
+            self.plugin.log(
+                "Rebalance cycle suppressed: revenue-ops is paused",
+                level="info",
+            )
+            return candidates
+
         # Capex allocations are computed once per cycle by the v2 engine's
         # _build_snapshot (engine.find_candidates/run_cycle below). Calling
         # compute_allocations here as well doubled the full flow-analysis

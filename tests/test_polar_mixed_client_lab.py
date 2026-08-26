@@ -56,6 +56,42 @@ def test_traffic_rejects_nonpositive_inputs_without_mcp_calls():
         lab.run_deterministic_traffic(object(), 1, 0, 10, 0)
 
 
+def test_payment_bridge_error_is_unknown_and_never_retried():
+    lab = load_lab()
+
+    class Bridge:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, tool, arguments):
+            self.calls.append((tool, arguments))
+            if tool == "create_invoice":
+                return {"invoice": "bolt11-redacted"}
+            raise lab.PolarMcpError("HTTP 500 after dispatch")
+
+    bridge = Bridge()
+    with pytest.raises(lab.PolarTrafficError) as caught:
+        lab.run_deterministic_traffic(
+            bridge, 4, 10, 50_000, 0, (("lnd-payer", "lnd-sink"),)
+        )
+
+    assert [tool for tool, _args in bridge.calls] == [
+        "create_invoice",
+        "pay_invoice",
+    ]
+    assert caught.value.completed_records == []
+    assert caught.value.uncertain_operation == {
+        "round": 0,
+        "payer": "lnd-payer",
+        "sink": "lnd-sink",
+        "amount_sats": 50_000,
+        "payment_outcome": "unknown_do_not_retry",
+        "invoice_created": True,
+        "error": "HTTP 500 after dispatch",
+    }
+    assert "bolt11" not in str(caught.value.uncertain_operation)
+
+
 def test_traffic_lane_selector_supports_reverse_single_client_lane():
     lab = load_lab()
 

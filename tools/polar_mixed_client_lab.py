@@ -72,6 +72,21 @@ class PolarMcpError(RuntimeError):
     """A local Polar MCP bridge call did not succeed."""
 
 
+class PolarTrafficError(PolarMcpError):
+    """A payment RPC failed after dispatch, so settlement is unknowable."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        completed_records: list[dict[str, Any]],
+        uncertain_operation: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.completed_records = completed_records
+        self.uncertain_operation = uncertain_operation
+
+
 class PolarMcp:
     def __init__(self, base_url: str = DEFAULT_BRIDGE_URL, timeout_seconds: float = 30.0):
         self.base_url = base_url.rstrip("/")
@@ -309,14 +324,35 @@ def run_deterministic_traffic(
                     "memo": f"revenue-ops-lab-{round_index}-{payer}",
                 },
             )
-            payment = bridge.call(
-                "pay_invoice",
-                {
-                    "networkId": network_id,
-                    "fromNode": payer,
-                    "invoice": invoice["invoice"],
-                },
-            )
+            try:
+                payment = bridge.call(
+                    "pay_invoice",
+                    {
+                        "networkId": network_id,
+                        "fromNode": payer,
+                        "invoice": invoice["invoice"],
+                    },
+                )
+            except PolarMcpError as exc:
+                # Polar can dispatch the client payment successfully and then
+                # fail while serializing the bridge response (observed with a
+                # missing UI activeId). Never retry an ambiguous money-path
+                # operation. Preserve a credential-free checkpoint instead.
+                uncertain = {
+                    "round": round_index,
+                    "payer": payer,
+                    "sink": sink,
+                    "amount_sats": amount_sats,
+                    "payment_outcome": "unknown_do_not_retry",
+                    "invoice_created": True,
+                    "error": str(exc),
+                }
+                raise PolarTrafficError(
+                    "Polar payment result is unknown; do not retry without "
+                    "reconciling client and router histories",
+                    completed_records=list(records),
+                    uncertain_operation=uncertain,
+                ) from exc
             records.append(
                 {
                     "round": round_index,
@@ -366,6 +402,15 @@ def traffic_batches(
         (select_traffic_lanes("forward", lane), amount_sats + reverse_fee_buffer_sats),
         (select_traffic_lanes("reverse", lane), amount_sats),
     )
+
+
+def emit_result(result: dict[str, Any], output: Path | None) -> None:
+    """Write and print one deterministic experiment result."""
+    rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered, encoding="utf-8")
+    print(rendered, end="")
 
 
 def main() -> int:
@@ -435,8 +480,8 @@ def main() -> int:
                 args.amount_sats,
                 args.reverse_fee_buffer_sats,
             ):
-                plan["traffic"].extend(
-                    run_deterministic_traffic(
+                try:
+                    batch_records = run_deterministic_traffic(
                         bridge,
                         network_id,
                         args.traffic_rounds,
@@ -444,12 +489,18 @@ def main() -> int:
                         args.pause_seconds,
                         selected_lanes,
                     )
-                )
-    rendered = json.dumps(plan, indent=2, sort_keys=True) + "\n"
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(rendered, encoding="utf-8")
-    print(rendered, end="")
+                except PolarTrafficError as exc:
+                    plan["traffic"].extend(exc.completed_records)
+                    plan["traffic"].append(exc.uncertain_operation)
+                    plan["status"] = "traffic_outcome_unknown"
+                    plan["required_operator_action"] = (
+                        "Reconcile payer payment and router forwarding histories; "
+                        "do not retry the uncertain payment."
+                    )
+                    emit_result(plan, args.output)
+                    return 2
+                plan["traffic"].extend(batch_records)
+    emit_result(plan, args.output)
     return 0
 
 

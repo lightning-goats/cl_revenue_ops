@@ -70,6 +70,37 @@ def test_rebalancer_dry_run_calls_engine_find_candidates_without_execution(
     r.rebalance_engine_v2.run_cycle.assert_not_called()
 
 
+def test_rebalancer_pause_exits_before_cleanup_slots_capital_or_planner(
+    mock_plugin, mock_database
+):
+    from modules.config import Config
+    from modules.rebalancer import EVRebalancer
+
+    r = EVRebalancer(
+        mock_plugin,
+        Config(dry_run=True, paused=True, daily_budget_sats=1000),
+        mock_database,
+    )
+    r._check_capital_controls = MagicMock(return_value=True)
+    r.job_manager = MagicMock()
+    r.rebalance_engine_v2 = MagicMock()
+
+    assert r.find_rebalance_candidates() == []
+
+    mock_database.cleanup_stale_reservations.assert_not_called()
+    r.job_manager.slots_available.assert_not_called()
+    r._check_capital_controls.assert_not_called()
+    r.rebalance_engine_v2.find_candidates.assert_not_called()
+    r.rebalance_engine_v2.run_cycle.assert_not_called()
+    assert r.get_last_decision_summary() == {
+        "action": "suppressed",
+        "reason": "paused",
+        "dominant_input": "paused",
+        "safety_block": True,
+        "budget_blocked": False,
+    }
+
+
 def test_rebalancer_live_mode_calls_engine_run_cycle(mock_plugin, mock_database):
     from modules.config import Config
     from modules.rebalancer import EVRebalancer
