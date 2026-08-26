@@ -54,8 +54,9 @@ the other candidates.
 
 ## Phase 3 — rebalance fail-closed matrix
 
-Status: **zero-budget gate passed; independent pause gate found and fixed a
-cycle-level planning leak**. Route-price and settlement cases remain.
+Status: **zero-budget gate passed; independent pause gate found, fixed, and
+verified live against the exact fixed commit**. Route-price and settlement
+cases remain.
 
 For both payer families and real quoted routes, cover:
 

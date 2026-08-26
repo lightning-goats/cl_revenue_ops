@@ -72,16 +72,23 @@ slot, snapshot, and route work.
 thread-safe config snapshot when paused. It reports `suppressed / paused`,
 marks the result as a safety block, and performs no cleanup, slot, capital,
 planner, router, or executor work. The regression pins every one of those
-never-call properties. Live Polar verification against the fixed committed
-revision is the next release-gate step.
+never-call properties.
+
+Live verification passed after a fresh exact deployment of commit
+`a38ba9d87f624ec6ac5d5419b406503881f5f4be`. With `paused=true`,
+`dry_run=true`, and a temporary 1,000-sat budget, the cycle returned
+`suppressed / paused`, `safety_block=true`, zero considered/selected/executed
+pairs, and no history. The cleanup trap restored the budget to zero. Final
+readbacks found zero spend, zero reservations, no fee changes, no rebalances,
+and no econ-ledger divergences. All twelve revenue/competitor gossip policies
+were active at the restored base 1 msat / 10 ppm baseline.
 
 ## Remaining high-value work
 
-1. Redeploy the fixed commit and repeat the positive-budget paused-cycle gate.
-2. Exercise real Askrene prices below/at/above pair ceilings and positive/
+1. Exercise real Askrene prices below/at/above pair ceilings and positive/
    negative sats-EV without spending on rejected cases.
-3. Cover route failure, pending settlement, restart reconciliation, malformed
+2. Cover route failure, pending settlement, restart reconciliation, malformed
    evidence, and reservation cleanup.
-4. Run longer client-stratified Polar Simulation Designer soaks, then restore
+3. Run longer client-stratified Polar Simulation Designer soaks, then restore
    competitor policies and require a clean final reconciliation.
-5. Repeat the smoke matrix with the selected custom recent-CLN image.
+4. Repeat the smoke matrix with the selected custom recent-CLN image.
