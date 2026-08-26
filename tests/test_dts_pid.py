@@ -1124,6 +1124,63 @@ def test_capture_entropy_preserves_seeded_controller_adjustment_and_state(
     ]
 
 
+def test_dry_run_proposal_does_not_advance_broadcast_state(
+    mock_plugin, mock_database
+):
+    channel_id = "123x456x0"
+    peer_id = "02" + "a" * 64
+    controller, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+    controller.config.dry_run = True
+    mock_database.get_fee_strategy_state.return_value[
+        "last_broadcast_fee_ppm"
+    ] = 500
+    channel_info = {
+        "short_channel_id": channel_id,
+        "peer_id": peer_id,
+        "fee_proportional_millionths": 500,
+        "capacity": 2_000_000,
+        "spendable_msat": "1000000000msat",
+        "opener": "local",
+    }
+
+    random.seed(20260718)
+    adjustment = controller._adjust_channel_fee(
+        channel_id,
+        peer_id,
+        {"state": "balanced", "forward_count": 50, "sats_out": 10_000},
+        channel_info,
+        cfg=cfg,
+    )
+
+    assert adjustment is not None
+    assert adjustment.algorithm_values["dry_run_proposal"] is True
+    assert controller._cycle_states[channel_id].last_broadcast_fee_ppm == 500
+    assert controller._channel_fee_states[channel_id].last_broadcast_fee_ppm == 500
+    assert controller._cycle_states[channel_id].pending_target_ppm == adjustment.new_fee_ppm
+    mock_plugin.rpc.setchannel.assert_not_called()
+
+
+def test_dry_run_load_repairs_small_persisted_broadcast_desync(
+    mock_plugin, mock_database
+):
+    channel_id = "123x456x0"
+    peer_id = "02" + "a" * 64
+    controller, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+    controller.config.dry_run = True
+    mock_database.get_fee_strategy_state.return_value[
+        "last_broadcast_fee_ppm"
+    ] = 76
+
+    cycle = controller._get_cycle_state(channel_id, actual_fee_ppm=10)
+    fee_state = controller._get_channel_fee_state(
+        channel_id, peer_id, actual_fee_ppm=10
+    )
+
+    assert cycle.last_broadcast_fee_ppm == 10
+    assert fee_state.last_broadcast_fee_ppm == 10
+    assert mock_database.update_fee_strategy_state.call_count >= 2
+
+
 class TestZeroFlowRatchetGuard:
     def test_moderate_stall_blocks_upward_target(self, mock_plugin, mock_database):
         fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -2592,6 +2649,7 @@ class TestClampedFeeReadback:
     def test_set_channel_fee_clamp_propagated_to_state(self, mock_plugin, mock_database):
         """If set_channel_fee clamps, last_broadcast_fee_ppm must reflect actual fee."""
         fc, cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+        fc.config.dry_run = True
         cfg.min_fee_ppm = 100
         ch_id = "123x456x0"
         peer_id = "02" + "a" * 64
@@ -2606,6 +2664,10 @@ class TestClampedFeeReadback:
         ts_state.thompson.sample_fee = lambda floor, ceiling: 30
         ts_state.pid = PIDState()
         ts_state.pid.last_update_time = int(time.time()) - 1800
+        fc.config.dry_run = False
+        fc.set_channel_fee = MagicMock(
+            return_value={"success": True, "fee_ppm": 100}
+        )
 
         result = fc._adjust_channel_fee(
             ch_id, peer_id, self._state("balanced"),

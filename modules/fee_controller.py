@@ -4153,7 +4153,12 @@ class FeeController:
             # Desync check
             if actual_fee_ppm is not None and actual_fee_ppm > 0:
                 tracked = cached_state.last_broadcast_fee_ppm
-                if tracked > 0 and abs(actual_fee_ppm - tracked) > max(100, tracked * 0.5):
+                desync_threshold = (
+                    0
+                    if getattr(self.config, "dry_run", False) is True
+                    else max(100, tracked * 0.5)
+                )
+                if tracked > 0 and abs(actual_fee_ppm - tracked) > desync_threshold:
                     self.plugin.log(
                         f"FEE DESYNC (cached): {channel_id[:16]}... "
                         f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
@@ -4190,17 +4195,26 @@ class FeeController:
                 )
 
         # Desync check
+        desync_repaired = False
         if actual_fee_ppm is not None and actual_fee_ppm > 0:
             tracked = state.last_broadcast_fee_ppm
-            if tracked > 0 and abs(actual_fee_ppm - tracked) > max(100, tracked * 0.5):
+            desync_threshold = (
+                0
+                if getattr(self.config, "dry_run", False) is True
+                else max(100, tracked * 0.5)
+            )
+            if tracked > 0 and abs(actual_fee_ppm - tracked) > desync_threshold:
                 self.plugin.log(
                     f"FEE DESYNC (db): {channel_id[:16]}... "
                     f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
                     level='warn'
                 )
                 state.last_broadcast_fee_ppm = actual_fee_ppm
+                desync_repaired = True
 
         self._channel_fee_states[channel_id] = state
+        if desync_repaired:
+            self._save_channel_fee_state(channel_id, state)
         return state
 
     def _build_fee_strategy_row_kwargs(
@@ -7737,6 +7751,7 @@ class FeeController:
         )
         
         if result.get("success"):
+            dry_run_proposal = bool(result.get("dry_run"))
             # Read back actual fee (may have been clamped by set_channel_fee)
             new_fee_ppm = result.get("fee_ppm", new_fee_ppm)
 
@@ -7744,6 +7759,8 @@ class FeeController:
             # fee actually crossed the pre-stretch supported cap — i.e. the
             # market test the probe exists to buy is now running.
             if (
+                not dry_run_proposal
+                and
                 upward_probe_pre_cap_ppm is not None
                 and new_fee_ppm > upward_probe_pre_cap_ppm
             ):
@@ -7754,20 +7771,24 @@ class FeeController:
                 except Exception:
                     pass
 
-            # Update state with new broadcast fee and refresh timer
-            cycle.pending_target_ppm = 0  # P2: pending escalation broadcast
+            # A dry-run result is a proposal, not a broadcast. It still
+            # consumes the observation window, but must not advance applied
+            # policy evidence, gossip timestamps, or broadcast streaks.
+            cycle.pending_target_ppm = new_fee_ppm if dry_run_proposal else 0
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = current_fee_ppm
-            cycle.last_broadcast_fee_ppm = new_fee_ppm
-            cycle.last_broadcast_at = now
+            if not dry_run_proposal:
+                cycle.last_broadcast_fee_ppm = new_fee_ppm
+                cycle.last_broadcast_at = now
             cycle.last_state = decision_reason
             # Telemetry honesty (2026-07-03 audit): the counter counts the
             # same-direction streak. Compare against the direction captured
             # BEFORE this cycle's branches overwrote trend_direction.
-            if new_direction != 0 and new_direction == prev_trend_direction:
-                cycle.consecutive_same_direction += 1
-            else:
-                cycle.consecutive_same_direction = 1 if new_direction != 0 else 0
+            if not dry_run_proposal:
+                if new_direction != 0 and new_direction == prev_trend_direction:
+                    cycle.consecutive_same_direction += 1
+                else:
+                    cycle.consecutive_same_direction = 1 if new_direction != 0 else 0
             cycle.trend_direction = new_direction
             cycle.step_ppm = step_ppm
             cycle.last_update = now
@@ -7778,14 +7799,16 @@ class FeeController:
             if ts_state is not None:
                 ts_state.last_revenue_rate = current_revenue_rate
                 ts_state.last_fee_ppm = current_fee_ppm
-                ts_state.last_broadcast_fee_ppm = new_fee_ppm
-                ts_state.last_broadcast_at = now
+                if not dry_run_proposal:
+                    ts_state.last_broadcast_fee_ppm = new_fee_ppm
+                    ts_state.last_broadcast_at = now
                 ts_state.last_state = decision_reason
                 ts_state.last_update = now
                 self._save_channel_fee_state(channel_id, ts_state)
 
             self.plugin.log(
-                f"FEE: {channel_id[:12]}... {current_fee_ppm}->{new_fee_ppm}ppm "
+                f"{'DRY_RUN_PROPOSAL' if dry_run_proposal else 'FEE'}: "
+                f"{channel_id[:12]}... {current_fee_ppm}->{new_fee_ppm}ppm "
                 f"[{fee_reason_code}] "
                 f"step:{original_step_ppm}->{step_ppm} | {target_summary} | {decision_reason}",
                 level='debug'
@@ -7848,6 +7871,7 @@ class FeeController:
                     "drain_discount_max_effective": effective_discount_max,
                     "node_receivable_ratio": node_receivable_ratio_value,
                     "node_drain_pressure": node_drain_pressure_value,
+                    "dry_run_proposal": dry_run_proposal,
                 },
                 reason_code=fee_reason_code,
             )
@@ -8405,6 +8429,7 @@ class FeeController:
                     level='debug',
                 )
                 result["success"] = True
+                result["dry_run"] = True
                 result["message"] = "Dry run - no changes made"
                 return result
             
@@ -9020,7 +9045,12 @@ class FeeController:
             # Issue #32: Check for desync even on cached state
             if actual_fee_ppm is not None and actual_fee_ppm > 0:
                 tracked = cached_state.last_broadcast_fee_ppm
-                if tracked > 0 and abs(actual_fee_ppm - tracked) > max(100, tracked * 0.5):
+                desync_threshold = (
+                    0
+                    if getattr(self.config, "dry_run", False) is True
+                    else max(100, tracked * 0.5)
+                )
+                if tracked > 0 and abs(actual_fee_ppm - tracked) > desync_threshold:
                     self.plugin.log(
                         f"FEE DESYNC (cached): {channel_id[:16]}... "
                         f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
@@ -9075,17 +9105,26 @@ class FeeController:
         cycle.clear_explicit_shared_fields()
 
         # Issue #32: Check for desync when loading from database
+        desync_repaired = False
         if actual_fee_ppm is not None and actual_fee_ppm > 0:
             tracked = cycle.last_broadcast_fee_ppm
-            if tracked > 0 and abs(actual_fee_ppm - tracked) > max(100, tracked * 0.5):
+            desync_threshold = (
+                0
+                if getattr(self.config, "dry_run", False) is True
+                else max(100, tracked * 0.5)
+            )
+            if tracked > 0 and abs(actual_fee_ppm - tracked) > desync_threshold:
                 self.plugin.log(
                     f"FEE DESYNC (db load): {channel_id[:16]}... "
                     f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
                     level='warn'
                 )
                 cycle.last_broadcast_fee_ppm = actual_fee_ppm
+                desync_repaired = True
 
         self._cycle_states[channel_id] = cycle
+        if desync_repaired:
+            self._save_cycle_state(channel_id, cycle)
         return cycle
 
     def _save_cycle_state(self, channel_id: str, state: ChannelCycleState):

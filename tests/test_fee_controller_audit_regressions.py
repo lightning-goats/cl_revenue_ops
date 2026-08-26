@@ -913,6 +913,10 @@ class TestAdjustChannelFeeEndToEnd:
 
     def test_successful_broadcast_updates_both_observation_and_broadcast_timestamps(self, mock_plugin, mock_database):
         fc, cfg = self._make_fc_full(mock_plugin, mock_database)
+        fc.config.dry_run = False
+        fc.set_channel_fee = MagicMock(
+            return_value={"success": True, "fee_ppm": 525}
+        )
         channel_id = "123x456x5"
         peer_id = "02" + "d" * 64
         now = int(time.time())

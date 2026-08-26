@@ -72,6 +72,12 @@ repairing that image in a separate clean lab.
    `revenue-fee-debug`, `revenue-rebalance-debug summary_only=true`,
    `revenue-profitability`, `revenue-budget`, and the three published
    datastore contracts. All must return shaped JSON without action RPCs.
+6. Before relying on dry-run fee evidence, compare every diagnostic
+   `last_broadcast_fee_ppm` with `listpeerchannels`. A dry-run proposal may
+   update learning and its pending target, but must not advance applied-policy
+   timestamps, broadcast streaks, probe consumption, or the tracked broadcast
+   fee. Require zero `setchannel` calls and exact policy agreement after the
+   evaluation.
 
 ## Traffic and tuning matrix
 
