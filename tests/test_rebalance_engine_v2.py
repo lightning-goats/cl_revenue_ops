@@ -1667,6 +1667,98 @@ def test_engine_execute_candidate_exports_failure_snapshot(mock_plugin, mock_dat
     assert snapshot["segment_observations"][0]["short_channel_id"] == "200x2x0"
 
 
+def test_engine_exports_first_route_failure_after_successful_failover(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+    from modules.segment_observations import SegmentObservationStore
+
+    engine = _make_engine(mock_plugin, mock_database)
+    engine._data_service = MagicMock()
+    engine._segment_observation_store = SegmentObservationStore()
+    engine._cycle_router = MagicMock()
+    engine._route_pair = MagicMock(
+        return_value=(
+            SimpleNamespace(
+                success=True,
+                route_cost_sats=0,
+                route=[
+                    {
+                        "channel": "300x3x0",
+                        "direction": 1,
+                        "id": "02" + "d" * 64,
+                    }
+                ],
+                probability_ppm=500_000,
+                error="",
+            ),
+            "market",
+        )
+    )
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=420_000,
+        pair_budget_sats=100,
+        route=[
+            {
+                "channel": "250x2x0",
+                "direction": 1,
+                "id": "02" + "e" * 64,
+            }
+        ],
+    )
+
+    class FailoverExecutor:
+        def __init__(self, store):
+            self.store = store
+            self.calls = 0
+
+        def execute(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                self.store.record_failure(
+                    short_channel_id="250x2x0",
+                    direction=1,
+                    amount_sats=kwargs["amount_sats"],
+                    failure_class="liquidity",
+                    confidence=0.85,
+                    source_channel_id=kwargs["source_channel_id"],
+                    dest_channel_id=kwargs["dest_channel_id"],
+                )
+                return ExecutionResult(
+                    success=False,
+                    amount_sats=kwargs["amount_sats"],
+                    error="native_sendpay_error: WIRE_TEMPORARY_CHANNEL_FAILURE",
+                    route_type="native",
+                    attempts=1,
+                    excluded_channels=["250x2x0/1"],
+                )
+            return ExecutionResult(
+                success=True,
+                amount_sats=kwargs["amount_sats"],
+                fee_sats=0,
+                fee_msat=0,
+                route_type="native",
+                attempts=1,
+            )
+
+    result = engine._execute_pair(
+        pair, FailoverExecutor(engine._segment_observation_store)
+    )
+
+    assert result.success is True
+    assert result.attempts == 2
+    assert result.failure_data["retry_excluded_channels"] == ["250x2x0/1"]
+    engine._data_service.datastore_push.assert_called_once()
+    key, snapshot = engine._data_service.datastore_push.call_args.args
+    assert key == ["revenue", "segment-observations"]
+    assert snapshot["segment_observations"][0]["short_channel_id"] == "250x2x0"
+
+
 
 
 

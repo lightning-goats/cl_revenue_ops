@@ -171,7 +171,9 @@ these ordered, local-only checks before changing any tuning value:
    reservation id, actual fee no greater than the reserved amount, an atomic
    success record, a released reservation remainder, and matching
    `revenue-budget`, `revenue-econ-reconcile apply=false`, profitability, and
-   capex-summary views.
+   capex-summary views. If the first route fails and an alternate settles,
+   require the failed segment to appear in the published
+   `segment-observations` contract despite the overall successful result.
 4. **Unknown outcome:** inject a local payment/RPC timeout only after a route
    is reserved. The result must be `pending_settlement`; do not retry that
    destination. Resolve it through the reconciliation sweep and prove that a

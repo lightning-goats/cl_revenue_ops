@@ -3144,7 +3144,27 @@ class RebalanceEngine:
                     reserved_budget=reserved_budget,
                     result=result,
                 )
-            if result is not None and not result.success:
+            # A retry can turn a route failure into an overall success.  The
+            # native executor records the failed segment immediately, but the
+            # old final-status-only condition skipped publication once the
+            # alternate route settled.  Preserve that failure evidence: it is
+            # exactly what lets later routing avoid a graph-visible but dry
+            # direction.  Plain successes still avoid an unnecessary
+            # datastore write.
+            failure_data = (
+                getattr(result, "failure_data", {}) or {}
+                if result is not None
+                else {}
+            )
+            publish_failure_observations = bool(
+                result is not None
+                and (
+                    not result.success
+                    or failure_data.get("previous_failure")
+                    or failure_data.get("retry_excluded_channels")
+                )
+            )
+            if publish_failure_observations:
                 self._push_segment_observation_snapshot()
             return result
         finally:
