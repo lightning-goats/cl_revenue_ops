@@ -94,6 +94,7 @@ def test_settle_writes_history_cost_and_reservation_together(tmp_path):
     db = _make_db(tmp_path)
     rid = _pending_row(db)
     _reserve(db, str(rid))
+    db.cost_budget_invalidator = MagicMock()
 
     db.settle_rebalance_success(
         rid,
@@ -121,6 +122,7 @@ def test_settle_writes_history_cost_and_reservation_together(tmp_path):
     assert costs[0]["channel_id"] == "200x1x0"
     assert costs[0]["amount_sats"] == 50_000
     assert _reservation_status(db, rid) == "spent"
+    db.cost_budget_invalidator.assert_called_once_with()
 
 
 def test_settle_rolls_back_everything_when_one_write_fails(tmp_path):
@@ -128,6 +130,7 @@ def test_settle_rolls_back_everything_when_one_write_fails(tmp_path):
     db = _make_db(tmp_path)
     rid = _pending_row(db)
     _reserve(db, str(rid))
+    db.cost_budget_invalidator = MagicMock()
 
     original = db.record_rebalance_cost
 
@@ -158,6 +161,41 @@ def test_settle_rolls_back_everything_when_one_write_fails(tmp_path):
     assert row["status"] == "pending"
     assert _cost_rows(db) == []
     assert _reservation_status(db, rid) == "active"
+    db.cost_budget_invalidator.assert_not_called()
+
+
+def test_direct_rebalance_cost_invalidates_after_autocommit(tmp_path):
+    db = _make_db(tmp_path)
+    db.cost_budget_invalidator = MagicMock()
+
+    db.record_rebalance_cost(
+        channel_id="200x1x0",
+        peer_id=DST_PEER,
+        cost_sats=3,
+        cost_msat=2_500,
+        amount_sats=50_000,
+    )
+
+    assert len(_cost_rows(db)) == 1
+    db.cost_budget_invalidator.assert_called_once_with()
+
+
+def test_cache_invalidation_failure_never_rolls_back_spend(tmp_path):
+    db = _make_db(tmp_path)
+    db.cost_budget_invalidator = MagicMock(side_effect=RuntimeError("cache unavailable"))
+
+    db.record_rebalance_cost(
+        channel_id="200x1x0",
+        peer_id=DST_PEER,
+        cost_sats=3,
+        amount_sats=50_000,
+    )
+
+    assert len(_cost_rows(db)) == 1
+    db.plugin.log.assert_any_call(
+        "cost budget cache invalidation skipped: cache unavailable",
+        level="debug",
+    )
 
 
 def test_settle_marks_legacy_budget_reservation(tmp_path):

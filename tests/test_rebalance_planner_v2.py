@@ -228,13 +228,8 @@ class TestPairGeneration:
         assert pair.dest_realized_utilization == pytest.approx(0.3)
         assert pair.dest_utilization_is_realized is False
 
-    def test_generate_pairs_threads_activity_sats_without_transpose(self):
-        """Task 8 coverage gap: _generate_pairs must map
-        src.activity_out_sats -> PairCandidate.source_activity_out_sats and
-        dest.activity_in_sats -> PairCandidate.dest_activity_in_sats WITHOUT
-        reading the wrong attribute (activity_out vs activity_in) or
-        swapping src/dest. Use distinct, asymmetric values on both fields of
-        both channels so either mistake would fail this assertion."""
+    def test_generate_pairs_threads_net_helpful_activity_without_transpose(self):
+        """Only net source-out and destination-in movement is helpful."""
         import dataclasses
 
         planner = RebalancePlanner()
@@ -255,8 +250,29 @@ class TestPairGeneration:
         pair = result.selected[0]
         assert pair.source_channel_id == "src"
         assert pair.dest_channel_id == "dest"
-        assert pair.source_activity_out_sats == 700_000
-        assert pair.dest_activity_in_sats == 900_000
+        assert pair.source_activity_out_sats == 699_889
+        assert pair.dest_activity_in_sats == 899_778
+
+    def test_generate_pairs_drops_gross_activity_when_net_flow_is_worsening(self):
+        """Opposing flow larger than helpful flow must not create a penalty."""
+        import dataclasses
+
+        planner = RebalancePlanner()
+        src = dataclasses.replace(
+            _ch(channel_id="src", peer_id="02" + "aa" * 32, local_ratio=0.90),
+            activity_out_sats=200_000,
+            activity_in_sats=400_000,
+        )
+        dest = dataclasses.replace(
+            _ch(channel_id="dest", peer_id="02" + "bb" * 32, local_ratio=0.10),
+            activity_in_sats=200_000,
+            activity_out_sats=400_000,
+        )
+
+        pair = planner.plan(_snap(src, dest)).selected[0]
+
+        assert pair.source_activity_out_sats == 0
+        assert pair.dest_activity_in_sats == 0
 
 
 class TestSkipReasons:
@@ -768,8 +784,8 @@ def test_all_three_features_thread_onto_one_big_channel_pair():
     assert pair.dest_utilization_is_realized is False
 
     # --- #1 (activity): threaded without transpose. ---
-    assert pair.source_activity_out_sats == 150_000
-    assert pair.dest_activity_in_sats == 200_000
+    assert pair.source_activity_out_sats == 149_990
+    assert pair.dest_activity_in_sats == 199_980
 
 
 

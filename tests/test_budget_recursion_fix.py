@@ -130,3 +130,25 @@ class TestBudgetStatusMemoization:
 
         assert second["components"]["rebalance"]["spent_24h_sats"] == clean_components
         assert second["actual_spent_by_category"]["rebalance"] != 999_999
+
+    def test_invalidator_clears_every_window(self):
+        mod = self._module()
+
+        mod._total_cost_budget_status(window_hours=24)
+        mod._total_cost_budget_status(window_hours=168)
+        assert set(mod._total_cost_budget_memo) == {24, 168}
+
+        mod._invalidate_total_cost_budget_memo()
+
+        assert mod._total_cost_budget_memo == {}
+
+    def test_operator_budget_rpc_forces_fresh_snapshot(self):
+        mod = self._module()
+
+        first = mod._rpc_total_cost_budget(mod.plugin, window_hours=24)
+        mod.database.get_total_routing_revenue.return_value = 999_000
+        second = mod._rpc_total_cost_budget(mod.plugin, window_hours=24)
+
+        assert first["revenue_sats"] == 0
+        assert second["revenue_sats"] == 999
+        assert mod.database.get_total_routing_revenue.call_count == 2

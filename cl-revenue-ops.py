@@ -2027,6 +2027,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize database
     database = Database(config.db_path, safe_plugin)
     database.initialize()
+    # Keep the advisory total-cost memo coherent with committed spend-ledger
+    # mutations.  Database callbacks are best-effort and run only after a
+    # successful commit, so cache maintenance can never affect authorization.
+    database.cost_budget_invalidator = _invalidate_total_cost_budget_memo
 
     # Canonical forward evidence is synchronized independently from the legacy
     # operational forwards table. Construction is fail-isolated so an archive
@@ -4604,7 +4608,9 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
     
     try:
         if report_type == "summary":
-            # Basic summary - expand with P&L when available
+            # Preserve the policy summary for compatibility, but fulfil the
+            # documented summary contract with the canonical dashboard P&L
+            # and live channel-state coverage as well.
             all_policies = policy_manager.get_all_policies()
             
             strategy_counts = {}
@@ -4615,15 +4621,46 @@ def revenue_report(plugin: Plugin, report_type: str = "summary",
                 strategy_counts[s] = strategy_counts.get(s, 0) + 1
                 rebalance_counts[r] = rebalance_counts.get(r, 0) + 1
             
-            return {
+            dashboard = revenue_dashboard(plugin, window_days=30)
+            channel_states = database.get_all_channel_states() or []
+            channel_ids = set()
+            state_counts = {}
+            for state in channel_states:
+                channel_id = (
+                    state.get("channel_id")
+                    or state.get("short_channel_id")
+                )
+                if channel_id:
+                    channel_ids.add(str(channel_id))
+                state_name = str(state.get("state") or "unknown")
+                state_counts[state_name] = state_counts.get(state_name, 0) + 1
+
+            result = {
                 "type": "summary",
                 "policies": {
                     "total": len(all_policies),
                     "by_strategy": strategy_counts,
                     "by_rebalance_mode": rebalance_counts
                 },
+                "channels": {
+                    "total": len(channel_ids),
+                    "by_state": state_counts,
+                },
                 "generated_at": int(time.time())
             }
+            if "error" in dashboard:
+                result["financial_health"] = {"error": dashboard["error"]}
+                result["period"] = {}
+                result["warnings"] = []
+                result["bleeder_count"] = 0
+            else:
+                result["financial_health"] = dashboard.get(
+                    "financial_health", {})
+                result["period"] = dashboard.get("period", {})
+                result["warnings"] = dashboard.get("warnings", [])
+                result["bleeder_count"] = dashboard.get(
+                    "bleeder_count", 0)
+            return result
         
         elif report_type == "peer":
             if not peer_id:
@@ -4886,6 +4923,11 @@ def revenue_config(
         result = config.update_runtime(database, key, str(value))
         
         if result.get("status") == "success":
+            # Public runtime controls include the daily/weekly envelopes and
+            # growth-budget inputs consumed by the unified budget report.
+            # Clearing for every successful public update is cheap and avoids
+            # a fragile second list of budget-affecting keys.
+            _invalidate_total_cost_budget_memo()
             plugin.log(
                 f"CONFIG UPDATE: {key} changed from {result['old_value']} "
                 f"to {result['new_value']} (v{result['version']})",
@@ -6710,7 +6752,11 @@ def _archive_closed_channel(channel_id: str, peer_id: Optional[str], close_type:
 def _rpc_total_cost_budget(plugin: Plugin, window_hours: int = None) -> Dict[str, Any]:
     """Unified budget status across rebalances and historical liquidity costs."""
     try:
-        return _total_cost_budget_status(window_hours=window_hours)
+        # An explicit operator read is a synchronization boundary: never show
+        # a known-stale pre-settlement/config snapshot merely to save a handful
+        # of local aggregate queries.  The fresh result repopulates the memo for
+        # lower-priority telemetry callers.
+        return _total_cost_budget_status(window_hours=window_hours, force_fresh=True)
     except Exception as e:
         return {"error": str(e)}
 
@@ -7119,6 +7165,12 @@ _total_cost_budget_memo_lock = threading.Lock()
 # Reentrancy guard (defense in depth): the unified status aggregates component
 # providers that may, through misconfigured wiring, call back into the status.
 _total_cost_budget_reentry = threading.local()
+
+
+def _invalidate_total_cost_budget_memo() -> None:
+    """Discard advisory budget snapshots after committed input changes."""
+    with _total_cost_budget_memo_lock:
+        _total_cost_budget_memo.clear()
 
 
 def _total_cost_budget_status(window_hours: Optional[int] = None,

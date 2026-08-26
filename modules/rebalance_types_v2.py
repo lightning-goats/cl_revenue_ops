@@ -60,9 +60,10 @@ class PairCandidate:
     source_realized_utilization: float = 0.5
     dest_utilization_is_realized: bool = False
     source_utilization_is_realized: bool = False
-    # Feature #1: live-forwarding activity already moving this pair's
-    # channels the "helpful" way (source draining outbound / dest refilling
-    # inbound). Populated from ChannelState.activity_out_sats/in_sats
+    # Feature #1: net live-forwarding activity already moving this pair's
+    # channels the "helpful" way (source outbound minus inbound / destination
+    # inbound minus outbound). Populated by the planner from both directional
+    # ChannelState activity counters.
     # (Task 4, short-window ChannelFlowFacts). Default 0 == no activity
     # facts, which must yield an identical score to pre-feature behavior.
     source_activity_out_sats: int = 0

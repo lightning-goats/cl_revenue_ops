@@ -737,6 +737,7 @@ def test_revenue_config_get_internal_key_marks_it_internal():
 
 def test_revenue_config_allows_public_set_updates():
     mod = _load_operator_surface_module()
+    mod._invalidate_total_cost_budget_memo = MagicMock()
     mod.config.update_runtime = MagicMock(
         return_value={
             "status": "success",
@@ -750,6 +751,18 @@ def test_revenue_config_allows_public_set_updates():
 
     assert result["status"] == "success"
     mod.config.update_runtime.assert_called_once_with(mod.database, "paused", "false")
+    mod._invalidate_total_cost_budget_memo.assert_called_once_with()
+
+
+def test_revenue_config_failed_update_keeps_budget_memo():
+    mod = _load_operator_surface_module()
+    mod._invalidate_total_cost_budget_memo = MagicMock()
+    mod.config.update_runtime = MagicMock(return_value={"status": "error"})
+
+    result = mod.revenue_config(mod.plugin, "set", "daily_budget_sats", "1000")
+
+    assert result["status"] == "error"
+    mod._invalidate_total_cost_budget_memo.assert_not_called()
 
 
 def test_revenue_config_rejects_internal_knob_resets():
@@ -917,6 +930,41 @@ def test_revenue_report_peer_returns_aggregated_profitability_and_all_flow_state
         "200x2x0",
     ]
     assert result["flow_state"] is None
+
+
+def test_revenue_report_summary_includes_financials_and_live_channels():
+    mod = _load_report_surface_module()
+    mod.policy_manager.get_all_policies.return_value = []
+    mod.profitability_analyzer.get_tlv.return_value = {"tlv_sats": 8_000_000}
+    mod.profitability_analyzer.get_pnl_summary.return_value = {
+        "net_profit_sats": 44,
+        "operating_margin_pct": 86.27,
+        "gross_revenue_sats": 51,
+        "opex_sats": 7,
+        "rebalance_cost_sats": 7,
+        "closure_cost_sats": 0,
+        "volume_sats": 1_140_000,
+        "forward_count": 42,
+    }
+    mod.profitability_analyzer.calculate_roc.return_value = {
+        "annualized_roc_pct": 0.2,
+    }
+    mod.profitability_analyzer.identify_bleeders.return_value = []
+    mod.database.get_all_channel_states.return_value = [
+        {"channel_id": "100x1x0", "state": "source"},
+        {"short_channel_id": "200x1x0", "state": "sink"},
+    ]
+
+    result = mod.revenue_report(mod.plugin, "summary")
+
+    assert result["financial_health"]["net_profit_sats"] == 44
+    assert result["period"]["forward_count"] == 42
+    assert result["channels"] == {
+        "total": 2,
+        "by_state": {"source": 1, "sink": 1},
+    }
+    assert result["policies"]["total"] == 0
+    assert result["warnings"] == []
 
 
 def test_revenue_dashboard_bleeder_warning_uses_channel_id():

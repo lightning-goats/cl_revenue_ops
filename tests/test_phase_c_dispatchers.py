@@ -137,8 +137,11 @@ class TestCycleDispatcher:
 
 def _wire_budget_sections(mod, monkeypatch):
     monkeypatch.setattr(mod, "_total_cost_budget_status",
-                        lambda window_hours=None: {"spent_sats": 10,
-                                                   "window_hours": window_hours})
+                        lambda window_hours=None, force_fresh=False: {
+                            "spent_sats": 10,
+                            "window_hours": window_hours,
+                            "force_fresh": force_fresh,
+                        })
     capex_engine = MagicMock()
     capex_engine.compute_allocations.return_value = SimpleNamespace(
         channel_budgets={},
@@ -179,12 +182,13 @@ class TestBudgetDispatcher:
         _wire_budget_sections(mod, monkeypatch)
         new = mod.revenue_budget(plugin, window_hours=48)
         assert new["total_cost"]["window_hours"] == 48
+        assert new["total_cost"]["force_fresh"] is True
 
     def test_total_cost_section_is_read_only(self, mod, plugin, monkeypatch):
-        observed_windows = []
+        observed_calls = []
 
-        def total_cost_status(window_hours=None):
-            observed_windows.append(window_hours)
+        def total_cost_status(window_hours=None, force_fresh=False):
+            observed_calls.append((window_hours, force_fresh))
             return {"spent_sats": 10, "window_hours": window_hours}
 
         capex_engine = MagicMock()
@@ -196,7 +200,7 @@ class TestBudgetDispatcher:
         result = mod.revenue_budget(plugin, "total_cost", window_hours=24)
 
         assert result == {"spent_sats": 10, "window_hours": 24}
-        assert observed_windows == [24]
+        assert observed_calls == [(24, True)]
         capex_engine.compute_allocations.assert_not_called()
         data_service.datastore_push.assert_not_called()
 

@@ -348,8 +348,20 @@ class RebalancePlanner:
                     source_utilization_is_realized=bool(
                         getattr(src, "utilization_is_realized", False)
                     ),
-                    source_activity_out_sats=int(getattr(src, "activity_out_sats", 0) or 0),
-                    dest_activity_in_sats=int(getattr(dest, "activity_in_sats", 0) or 0),
+                    # Penalize only flow already healing this exact imbalance.
+                    # Gross volume is wrong on bidirectional channels: stronger
+                    # opposing flow can be worsening the pair while an older
+                    # helpful amount still suppresses a profitable refill.
+                    source_activity_out_sats=max(
+                        0,
+                        int(getattr(src, "activity_out_sats", 0) or 0)
+                        - int(getattr(src, "activity_in_sats", 0) or 0),
+                    ),
+                    dest_activity_in_sats=max(
+                        0,
+                        int(getattr(dest, "activity_in_sats", 0) or 0)
+                        - int(getattr(dest, "activity_out_sats", 0) or 0),
+                    ),
                     score=score,
                     source_local_ratio=src.local_ratio,
                     dest_local_ratio=dest.local_ratio,

@@ -319,11 +319,31 @@ class Database:
         # Hooks fire only AFTER successful state changes and are guarded —
         # they can never affect an authorization outcome.
         self.spend_journal = None
+        # Optional plugin-owned advisory-cache invalidator.  It is deliberately
+        # best-effort and invoked only after committed budget-input mutations;
+        # cache maintenance must never make a database operation fail.
+        self.cost_budget_invalidator = None
         # Thread-local storage for connections (Thread Safety)
         self._local = threading.local()
         # EH-6: Track all thread connections for shutdown cleanup
         self._thread_connections: list = []
         self._thread_conn_lock = threading.Lock()
+
+    def _notify_cost_budget_changed(self) -> None:
+        """Best-effort notification that committed budget inputs changed."""
+        # Some migration/compatibility callers construct historical Database
+        # shapes without running the current __init__.  Missing is equivalent
+        # to the optional hook being disabled.
+        callback = getattr(self, "cost_budget_invalidator", None)
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as callback_err:
+            self.plugin.log(
+                f"cost budget cache invalidation skipped: {callback_err}",
+                level='debug',
+            )
         
     def _get_connection(self) -> sqlite3.Connection:
         """
@@ -3795,7 +3815,10 @@ class Database:
             SET status = 'released'
             WHERE reservation_id = ? AND status = 'active'
         """, (reservation_id,))
-        return cursor.rowcount > 0
+        released = cursor.rowcount > 0
+        if released:
+            self._notify_cost_budget_changed()
+        return released
 
     def mark_budget_spent(self, reservation_id: str, actual_spent: int) -> bool:
         """
@@ -3826,7 +3849,10 @@ class Database:
             SET status = 'spent'
             WHERE reservation_id = ? AND status = 'active'
         """, (reservation_id,))
-        return cursor.rowcount > 0
+        changed = cursor.rowcount > 0
+        if changed:
+            self._notify_cost_budget_changed()
+        return changed
 
     def settle_rebalance_success(self, rebalance_id: Optional[int],
                                  reservation_id: Optional[str] = None, *,
@@ -3918,6 +3944,8 @@ class Database:
             except Exception:
                 pass
             raise
+        if record_cost or reservation_id:
+            self._notify_cost_budget_changed()
         if journal_note is not None and self.spend_journal is not None:
             rid, row = journal_note
             try:
@@ -3986,6 +4014,7 @@ class Database:
         except sqlite3.OperationalError:
             pass  # minimal/partial schemas (tests, tooling)
         if count > 0:
+            self._notify_cost_budget_changed()
             self.plugin.log(f"Cleaned up {count} stale budget reservations", level='info')
         return count
 
@@ -4056,6 +4085,7 @@ class Database:
             raise
 
         if count > 0:
+            self._notify_cost_budget_changed()
             self.plugin.log(
                 f"Cleared {count} active budget reservations ({total_sats} sats)",
                 level='info'
@@ -4218,6 +4248,7 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
             """, (rid, cat, subcategory, amount, now, reference_id, channel_id, meta_json))
             conn.execute("COMMIT")
+            self._notify_cost_budget_changed()
             if self.spend_journal is not None:
                 try:
                     self.spend_journal.note_spend_reserved(rid, amount, cat)
@@ -4277,6 +4308,8 @@ class Database:
             WHERE reservation_id = ? AND status = 'active'
         """, (str(reservation_id),))
         released = cursor.rowcount > 0
+        if released:
+            self._notify_cost_budget_changed()
         if released and self.spend_journal is not None:
             try:
                 self.spend_journal.note_spend_released(str(reservation_id))
@@ -4329,6 +4362,8 @@ class Database:
                     conn.execute("ROLLBACK")
                     return False
             conn.execute("COMMIT")
+            if changed:
+                self._notify_cost_budget_changed()
             if changed and self.spend_journal is not None:
                 try:
                     settled = self._sanitize_amount(
@@ -4379,6 +4414,11 @@ class Database:
                     (event_id, category, subcategory, amount_sats, timestamp, reference_id, channel_id, source, metadata_json)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (eid, cat, subcategory, amount, ts, reference_id, channel_id, source, meta_json))
+                # When called by mark_spend_reservation_spent this INSERT is
+                # still inside its outer transaction; that caller notifies only
+                # after COMMIT.  Direct autocommit writes notify here.
+                if not conn.in_transaction:
+                    self._notify_cost_budget_changed()
                 return True
             except sqlite3.OperationalError as e:
                 last_exc = e
@@ -4444,7 +4484,10 @@ class Database:
             SET status = 'released'
             WHERE status = 'active' AND reserved_at < ?{category_clause}
         """, tuple(params))
-        return cursor.rowcount
+        changed = cursor.rowcount
+        if changed > 0:
+            self._notify_cost_budget_changed()
+        return changed
 
     def release_spend_reservations(
         self,
@@ -4504,6 +4547,7 @@ class Database:
             except Exception:
                 pass
             raise
+        self._notify_cost_budget_changed()
         if self.spend_journal is not None:
             for released_id in ids:
                 try:
@@ -5916,6 +5960,11 @@ class Database:
             VALUES (?, ?, ?, ?, ?, ?)
         """, (channel_id, peer_id, persisted_cost_sats, persisted_cost_msat, amount_sats,
               timestamp or int(time.time())))
+        # Atomic rebalance settlement owns the surrounding transaction and
+        # notifies after COMMIT.  Standalone/manual cost writes autocommit and
+        # can invalidate immediately.
+        if not conn.in_transaction:
+            self._notify_cost_budget_changed()
 
     def get_channel_rebalance_costs(self, channel_id: str) -> int:
         """Get total rebalance costs for a channel."""

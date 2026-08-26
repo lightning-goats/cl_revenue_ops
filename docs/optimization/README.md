@@ -50,6 +50,12 @@ a separately approved deployment and shadow proposal.
 ## Authoritative plan
 
 - [Post-Evaluation Hardening and Economic Optimization Plan](POST_EVALUATION_OPTIMIZATION_PLAN.md)
+- [Polar mixed-client revenue-ops laboratory](plans/2026-08-26-polar-mixed-client-lab.md) — local-only,
+  repeatable fee/rebalance acceptance and tuning plan; it does not authorize a
+  production optimizer or deployment.
+- [Polar mixed-client smoke result](findings/2026-08-26-polar-mixed-client-smoke.md) — one-network
+  fee crossover, EV-gate, failure, seeded-execution, and accounting evidence;
+  explicitly insufficient for production tuning.
 
 Implementation phases do not rewrite that roadmap to fit their results. Their
 evidence and activation recommendations are recorded under [findings/](findings/).
