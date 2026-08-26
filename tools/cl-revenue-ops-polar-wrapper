@@ -1,0 +1,10 @@
+#!/bin/sh
+# Launch cl_revenue_ops from the isolated Python environment installed in a
+# Polar CLN container.  Polar's stock CLN image deliberately has no system
+# Python, so relying on /usr/bin/env python3 makes fresh-network runs differ
+# from the pinned test environment.
+set -eu
+
+PLUGIN_ROOT="${CL_REVENUE_OPS_ROOT:-/opt/cl_revenue_ops}"
+export PYTHONPATH="$PLUGIN_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PLUGIN_ROOT/.venv/bin/python" "$PLUGIN_ROOT/cl-revenue-ops.py" "$@"

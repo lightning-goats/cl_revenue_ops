@@ -1181,6 +1181,28 @@ def test_dry_run_load_repairs_small_persisted_broadcast_desync(
     assert mock_database.update_fee_strategy_state.call_count >= 2
 
 
+def test_dry_run_load_initializes_unknown_broadcast_from_live_policy(
+    mock_plugin, mock_database
+):
+    """A fresh strategy row must not treat the DB's zero sentinel as a fee."""
+    channel_id = "123x456x0"
+    peer_id = "02" + "a" * 64
+    controller, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+    controller.config.dry_run = True
+    mock_database.get_fee_strategy_state.return_value[
+        "last_broadcast_fee_ppm"
+    ] = 0
+
+    cycle = controller._get_cycle_state(channel_id, actual_fee_ppm=10)
+    fee_state = controller._get_channel_fee_state(
+        channel_id, peer_id, actual_fee_ppm=10
+    )
+
+    assert cycle.last_broadcast_fee_ppm == 10
+    assert fee_state.last_broadcast_fee_ppm == 10
+    assert mock_database.update_fee_strategy_state.call_count >= 2
+
+
 class TestZeroFlowRatchetGuard:
     def test_moderate_stall_blocks_upward_target(self, mock_plugin, mock_database):
         fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
@@ -2488,6 +2510,11 @@ class TestDTSPIDIntegration:
             self._channel_info(current_fee_ppm=500), cfg=cfg
         )
         ts_state = fc._channel_fee_states[ch_id]
+        # Give the supported-fee gate real earning evidence.  This assertion
+        # is about the adjustment result type, not the fresh-prior hold path.
+        ts_state.thompson.observations = [
+            (500, 5.0, 1.0, int(time.time()))
+        ] * 10
         ts_state.thompson.sample_fee = lambda floor, ceiling: ceiling
         ts_state.pid = PIDState()
         ts_state.pid.last_update_time = int(time.time()) - 1800

@@ -4158,7 +4158,7 @@ class FeeController:
                     if getattr(self.config, "dry_run", False) is True
                     else max(100, tracked * 0.5)
                 )
-                if tracked > 0 and abs(actual_fee_ppm - tracked) > desync_threshold:
+                if tracked <= 0 or abs(actual_fee_ppm - tracked) > desync_threshold:
                     self.plugin.log(
                         f"FEE DESYNC (cached): {channel_id[:16]}... "
                         f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
@@ -4203,7 +4203,7 @@ class FeeController:
                 if getattr(self.config, "dry_run", False) is True
                 else max(100, tracked * 0.5)
             )
-            if tracked > 0 and abs(actual_fee_ppm - tracked) > desync_threshold:
+            if tracked <= 0 or abs(actual_fee_ppm - tracked) > desync_threshold:
                 self.plugin.log(
                     f"FEE DESYNC (db): {channel_id[:16]}... "
                     f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
@@ -9050,7 +9050,7 @@ class FeeController:
                     if getattr(self.config, "dry_run", False) is True
                     else max(100, tracked * 0.5)
                 )
-                if tracked > 0 and abs(actual_fee_ppm - tracked) > desync_threshold:
+                if tracked <= 0 or abs(actual_fee_ppm - tracked) > desync_threshold:
                     self.plugin.log(
                         f"FEE DESYNC (cached): {channel_id[:16]}... "
                         f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",
@@ -9113,7 +9113,7 @@ class FeeController:
                 if getattr(self.config, "dry_run", False) is True
                 else max(100, tracked * 0.5)
             )
-            if tracked > 0 and abs(actual_fee_ppm - tracked) > desync_threshold:
+            if tracked <= 0 or abs(actual_fee_ppm - tracked) > desync_threshold:
                 self.plugin.log(
                     f"FEE DESYNC (db load): {channel_id[:16]}... "
                     f"tracked={tracked} ppm, actual={actual_fee_ppm} ppm. Resyncing.",

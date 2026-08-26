@@ -67,7 +67,9 @@ repairing that image in a separate clean lab.
    mine six blocks after opening them.
 4. Install the exact plugin revision and its pinned runtime dependencies only
    in `revenue-node`; record CLN/Python/package versions in the run manifest.
-   Polar CLN images may need Python added before this step.
+   Polar CLN images may need Python added before this step. Use
+   `tools/cl-revenue-ops-polar-wrapper` to launch the plugin from the isolated
+   `/opt/cl_revenue_ops/.venv` instead of depending on a system `python3`.
 5. Start `cl-revenue-ops` with `paused=true`, read `revenue-status`,
    `revenue-fee-debug`, `revenue-rebalance-debug summary_only=true`,
    `revenue-profitability`, `revenue-budget`, and the three published
@@ -197,6 +199,11 @@ found and fixed a durable-cooldown bug: late success must clear the persisted
 `payment_pending_timeout` pair failure as well as the in-memory counter. These
 results satisfy the branch-behavior smoke gate, but the separate-fresh-network
 and three-network repeatability requirements above remain in force.
+
+Fresh network 3 adds a second independent 25-ppm client-divergence result and
+another real-priced rebalance hold. One more fresh 25-ppm network is still
+required before that configuration meets the repeatability count; the other
+fee candidates remain below three fresh networks.
 
 ## Acceptance scorecard
 
