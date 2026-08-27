@@ -44,6 +44,7 @@ FUNDING_UTXO_SATS = 1_100_000
 # buffer still leaves the sink unable to spend the newly received balance.
 REVERSE_FEE_BUFFER_SATS = 25_000
 TOURNAMENT_CYCLE_SECONDS = 60
+ACQUISITION_MIN_PPM = 1
 BASELINE_POLL_SECONDS = 5.0
 BASELINE_POLL_ATTEMPTS = 19
 CONTAINER_RE = re.compile(r"^polar-n[1-9][0-9]*-clboss-r[1-9][0-9]*-identity-[ab]$")
@@ -664,6 +665,195 @@ def enable_full_stack(
     return state
 
 
+def acquisition_lanes(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Resolve the revenue contender's two sink-facing experiment lanes."""
+    assignment = state.get("assignment", {})
+    contenders = state.get("contenders", {})
+    identity = assignment.get("revenue_ops")
+    contender = contenders.get(identity) if isinstance(identity, str) else None
+    container = contender.get("container") if isinstance(contender, dict) else None
+    if not isinstance(container, str) or not container:
+        raise RunnerError("acquisition treatment lacks a revenue contender")
+    active_by_id = {
+        str(row.get("channel_id")): row for row in active_channels(container)
+    }
+    lanes: dict[str, dict[str, Any]] = {}
+    for opened in state.get("channels", []):
+        if not isinstance(opened, dict) or opened.get("funder") != identity:
+            continue
+        sink = str(opened.get("sink") or "")
+        family = sink.removesuffix("-sink")
+        if family not in {"cln", "lnd"}:
+            continue
+        result = opened.get("result")
+        channel_id = result.get("channel_id") if isinstance(result, dict) else None
+        row = active_by_id.get(str(channel_id))
+        if row is None:
+            raise RunnerError(f"cannot resolve active {family} acquisition lane")
+        lanes[family] = {
+            "family": family,
+            "channel_id": str(row["channel_id"]),
+            "short_channel_id": str(row["short_channel_id"]),
+            "peer_id": str(row["peer_id"]),
+            "fee_base_msat": int(
+                ((row.get("updates") or {}).get("local") or {}).get("fee_base_msat", 0)
+            ),
+            "fee_ppm": int(
+                ((row.get("updates") or {}).get("local") or {}).get(
+                    "fee_proportional_millionths", 0
+                )
+            ),
+        }
+    if set(lanes) != {"cln", "lnd"}:
+        raise RunnerError(f"acquisition treatment requires CLN and LND lanes: {sorted(lanes)}")
+    return lanes
+
+
+def _policy_write(
+    container: str, action: str, peer_id: str, *, fee_ppm: int | None = None
+) -> dict[str, Any]:
+    arguments = [
+        "-k", "revenue-policy", f"action={action}", f"peer_id={peer_id}",
+        "internal=true",
+    ]
+    if action == "set":
+        arguments.extend(
+            ["strategy=static", f"fee_ppm={positive_int(fee_ppm)}", "expires_in_hours=1"]
+        )
+    response = cln_rpc(container, *arguments)
+    if response.get("error") or response.get("status") == "error":
+        raise RunnerError(f"revenue-policy {action} failed: {response}")
+    return response
+
+
+def _revenue_config_set(container: str, key: str, value: int) -> dict[str, Any]:
+    response = cln_rpc(container, "revenue-config", "set", key, str(value))
+    if response.get("error") or response.get("status") == "error":
+        raise RunnerError(f"revenue-config set {key} failed: {response}")
+    return response
+
+
+def apply_acquisition_treatment(
+    *, replica: int, results_dir: Path, family: str, fee_ppm: int
+) -> dict[str, Any]:
+    """Pin one revenue lane to a bounded acquisition fee and its peer as control."""
+    if family not in {"cln", "lnd"}:
+        raise RunnerError(f"unsupported acquisition family: {family!r}")
+    fee_ppm = positive_int(fee_ppm)
+    if fee_ppm < ACQUISITION_MIN_PPM:
+        raise RunnerError(
+            f"acquisition fee must respect the {ACQUISITION_MIN_PPM}-ppm absolute rail"
+        )
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if state.get("status") not in {"isolated_full_stack_ready", "smoke_complete"}:
+        raise RunnerError(f"replica is not acquisition-ready: {state.get('status')}")
+    if "acquisition_treatment" in state:
+        raise RunnerError("acquisition treatment capture already exists; refusing to overwrite it")
+
+    identity = state["assignment"]["revenue_ops"]
+    container = state["contenders"][identity]["container"]
+    lanes = acquisition_lanes(state)
+    treatment = lanes[family]
+    control = lanes["lnd" if family == "cln" else "cln"]
+    policies = cln_rpc(container, "revenue-policy", "list").get("policies", [])
+    if not isinstance(policies, list):
+        raise RunnerError("revenue-policy list returned malformed policies")
+    target_peers = {treatment["peer_id"], control["peer_id"]}
+    existing = [
+        row for row in policies
+        if isinstance(row, dict) and row.get("peer_id") in target_peers
+    ]
+    if existing:
+        raise RunnerError("acquisition treatment refuses to overwrite explicit peer policies")
+    status = cln_rpc(container, "revenue-status")
+    controls = status.get("operator_controls", {}).get("values", {})
+    original_min_fee_ppm_saturated = nonnegative_int(
+        controls.get("min_fee_ppm_saturated"),
+        "revenue saturated-channel minimum fee",
+    )
+    previous_status = str(state["status"])
+    state["acquisition_treatment"] = {
+        "status": "captured",
+        "family": family,
+        "fee_ppm": fee_ppm,
+        "control_family": control["family"],
+        "treatment_lane": treatment,
+        "control_lane": control,
+        "original_min_fee_ppm_saturated": original_min_fee_ppm_saturated,
+        "temporary_min_fee_ppm_saturated": min(
+            original_min_fee_ppm_saturated, fee_ppm, control["fee_ppm"]
+        ),
+        "previous_status": previous_status,
+    }
+    _checkpoint(path, state, "acquisition_treatment_captured")
+
+    temporary_min = state["acquisition_treatment"]["temporary_min_fee_ppm_saturated"]
+    _revenue_config_set(container, "min_fee_ppm_saturated", temporary_min)
+    _policy_write(container, "set", treatment["peer_id"], fee_ppm=fee_ppm)
+    _policy_write(container, "set", control["peer_id"], fee_ppm=control["fee_ppm"])
+    cln_rpc(container, "revenue-fee-cycle")
+    readback = acquisition_lanes(state)
+    if readback[family]["fee_ppm"] != fee_ppm:
+        raise RunnerError("acquisition treatment fee readback mismatch")
+    if readback[control["family"]]["fee_ppm"] != control["fee_ppm"]:
+        raise RunnerError("acquisition control fee readback mismatch")
+    controls = (
+        cln_rpc(container, "revenue-status")
+        .get("operator_controls", {})
+        .get("values", {})
+    )
+    if controls.get("min_fee_ppm_saturated") != temporary_min:
+        raise RunnerError("acquisition saturated-channel minimum-fee readback mismatch")
+    state["acquisition_treatment"]["status"] = "active"
+    state["acquisition_treatment"]["readback"] = readback
+    state["status"] = "acquisition_ready"
+    _checkpoint(path, state, "acquisition_treatment_active")
+    return state
+
+
+def restore_acquisition_treatment(state: dict[str, Any]) -> bool:
+    treatment = state.get("acquisition_treatment")
+    if (
+        not isinstance(treatment, dict)
+        or treatment.get("status") not in {"captured", "active"}
+    ):
+        return False
+    identity = state["assignment"]["revenue_ops"]
+    container = state["contenders"][identity]["container"]
+    for key in ("treatment_lane", "control_lane"):
+        lane = treatment.get(key)
+        if not isinstance(lane, dict) or not lane.get("peer_id"):
+            raise RunnerError("acquisition restoration lacks captured lane state")
+        _policy_write(container, "delete", str(lane["peer_id"]))
+    original_min = nonnegative_int(
+        treatment.get("original_min_fee_ppm_saturated"),
+        "captured revenue saturated-channel minimum fee",
+    )
+    _revenue_config_set(container, "min_fee_ppm_saturated", original_min)
+    cln_rpc(container, "revenue-fee-cycle")
+    controls = (
+        cln_rpc(container, "revenue-status")
+        .get("operator_controls", {})
+        .get("values", {})
+    )
+    if controls.get("min_fee_ppm_saturated") != original_min:
+        raise RunnerError("acquisition saturated-channel minimum-fee restoration mismatch")
+    treatment["status"] = "restored"
+    if state.get("status") == "acquisition_ready":
+        state["status"] = treatment.get("previous_status", "isolated_full_stack_ready")
+    return True
+
+
+def restore_acquisition(*, replica: int, results_dir: Path) -> dict[str, Any]:
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if not restore_acquisition_treatment(state):
+        raise RunnerError("no active acquisition treatment to restore")
+    _checkpoint(path, state, "acquisition_treatment_restored")
+    return state
+
+
 def wait_for_setup_spend_baseline(
     revenue_container: str,
     *,
@@ -843,6 +1033,7 @@ class Totals:
     min_local_balance_ppm: int = 0
     max_local_balance_ppm: int = 0
     worst_channel_imbalance_ppm: int = 0
+    channel_metrics: tuple[tuple[str, int, int, int], ...] = ()
 
 
 def msat_value(value: Any) -> int:
@@ -958,6 +1149,15 @@ def contender_totals(container: str) -> Totals:
         )
     if not local_sats:
         raise RunnerError(f"no active channels on {container}")
+    per_channel: dict[str, list[int]] = {}
+    for row in settled:
+        channel_id = str(row.get("out_channel") or "")
+        if not channel_id:
+            continue
+        metrics = per_channel.setdefault(channel_id, [0, 0, 0])
+        metrics[0] += 1
+        metrics[1] += msat_value(row.get("out_msat", 0))
+        metrics[2] += msat_value(row.get("fee_msat", 0))
     return Totals(
         forward_count=len(settled),
         volume_msat=sum(msat_value(row.get("out_msat", 0)) for row in settled),
@@ -970,10 +1170,14 @@ def contender_totals(container: str) -> Totals:
         worst_channel_imbalance_ppm=max(
             abs((2 * ratio) - 1_000_000) for ratio in local_balance_ppm
         ),
+        channel_metrics=tuple(
+            (channel_id, metrics[0], metrics[1], metrics[2])
+            for channel_id, metrics in sorted(per_channel.items())
+        ),
     )
 
 
-def totals_delta(before: Totals, after: Totals) -> dict[str, int]:
+def totals_delta(before: Totals, after: Totals) -> dict[str, Any]:
     values = {
         "forward_count": after.forward_count - before.forward_count,
         "volume_msat": after.volume_msat - before.volume_msat,
@@ -988,6 +1192,22 @@ def totals_delta(before: Totals, after: Totals) -> dict[str, int]:
     values["ending_min_local_balance_ppm"] = after.min_local_balance_ppm
     values["ending_max_local_balance_ppm"] = after.max_local_balance_ppm
     values["ending_worst_channel_imbalance_ppm"] = after.worst_channel_imbalance_ppm
+    before_channels = {row[0]: row[1:] for row in before.channel_metrics}
+    after_channels = {row[0]: row[1:] for row in after.channel_metrics}
+    channel_values: dict[str, dict[str, int]] = {}
+    for channel_id in sorted(set(before_channels) | set(after_channels)):
+        old = before_channels.get(channel_id, (0, 0, 0))
+        new = after_channels.get(channel_id, (0, 0, 0))
+        delta = tuple(new[index] - old[index] for index in range(3))
+        if any(value < 0 for value in delta):
+            raise RunnerError("contender per-channel counters regressed")
+        if any(delta):
+            channel_values[channel_id] = {
+                "forward_count": delta[0],
+                "volume_msat": delta[1],
+                "routing_fee_msat": delta[2],
+            }
+    values["channels"] = channel_values
     values["policy_changes"] = int(before.policy_fingerprint != after.policy_fingerprint)
     return values
 
@@ -1122,7 +1342,7 @@ def run_smoke(
     state = read_state(path)
     if state.get("status") not in {
         "fee_only_ready", "smoke_complete", "isolated_fee_only_ready",
-        "isolated_full_stack_ready",
+        "isolated_full_stack_ready", "acquisition_ready",
     }:
         raise RunnerError(f"replica is not traffic-ready: {state.get('status')}")
     assignment = state["assignment"]
@@ -1149,12 +1369,16 @@ def run_smoke(
                 "min_local_balance_ppm": totals.min_local_balance_ppm,
                 "max_local_balance_ppm": totals.max_local_balance_ppm,
                 "worst_channel_imbalance_ppm": totals.worst_channel_imbalance_ppm,
+                "channel_metrics": totals.channel_metrics,
                 "policy_fingerprint": totals.policy_fingerprint,
             }
             for name, totals in before.items()
         },
         "records": [],
     }
+    treatment = state.get("acquisition_treatment")
+    if isinstance(treatment, dict) and treatment.get("status") == "active":
+        progress["acquisition_treatment"] = treatment
     write_json_atomic(progress_path, progress)
     state["status"] = "smoke_running"
     _checkpoint(
@@ -1166,9 +1390,10 @@ def run_smoke(
     )
     records: list[dict[str, Any]] = []
     try:
-        for family, direction, traffic_amount in traffic_schedule(
+        entries_per_round = 4 if traffic_pattern == "balanced" else 2
+        for schedule_index, (family, direction, traffic_amount) in enumerate(traffic_schedule(
             rounds, amount_sats, traffic_pattern
-        ):
+        )):
             completed = run_reconciled_traffic(
                 bridge,
                 network_id=NETWORK_ID,
@@ -1177,6 +1402,12 @@ def run_smoke(
                 pause_seconds=pause_seconds,
                 lanes=select_traffic_lanes(direction, family),
             )
+            for row in completed:
+                row.update(
+                    round=schedule_index // entries_per_round,
+                    family=family,
+                    direction=direction,
+                )
             records.extend(completed)
             progress["records"] = records
             spend_monitor = enforce_clboss_spend_cap(state)
@@ -1191,6 +1422,17 @@ def run_smoke(
                     )
             write_json_atomic(progress_path, progress)
     except ReconciliationError as exc:
+        for row in exc.records:
+            row.update(
+                round=schedule_index // entries_per_round,
+                family=family,
+                direction=direction,
+            )
+        exc.operation.update(
+            round=schedule_index // entries_per_round,
+            family=family,
+            direction=direction,
+        )
         records.extend(exc.records)
         partial_after = {
             name: contender_totals(container)
@@ -1234,6 +1476,8 @@ def run_smoke(
             name: totals_delta(before[name], after[name]) for name in controller_containers
         },
     }
+    if isinstance(treatment, dict) and treatment.get("status") == "active":
+        block["acquisition_treatment"] = treatment
     progress["status"] = "complete"
     progress["records"] = records
     write_json_atomic(progress_path, progress)
@@ -1288,6 +1532,8 @@ def _stop_plugins(state: dict[str, Any]) -> None:
 def cleanup(bridge: PolarMcp, *, replica: int, results_dir: Path) -> dict[str, Any]:
     path = state_path(results_dir, replica)
     state = read_state(path)
+    if restore_acquisition_treatment(state):
+        _checkpoint(path, state, "acquisition_treatment_restored")
     _stop_plugins(state)
     _checkpoint(path, state, "controllers_stopped_or_paused")
     if restore_background(state):
@@ -1362,8 +1608,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         choices=(
-            "preflight", "setup", "isolate", "retune", "full-stack", "smoke",
-            "status", "cleanup",
+            "preflight", "setup", "isolate", "retune", "full-stack",
+            "acquire", "restore-acquire", "smoke", "status", "cleanup",
         ),
     )
     parser.add_argument("--network-id", type=positive_int, default=NETWORK_ID)
@@ -1380,6 +1626,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--background-ppm", type=positive_int, default=10_000)
     parser.add_argument("--spend-cap-sats", type=positive_int, default=1_000)
+    parser.add_argument("--acquisition-family", choices=("cln", "lnd"), default="cln")
+    parser.add_argument("--acquisition-ppm", type=positive_int, default=2)
     parser.add_argument("--apply", action="store_true")
     return parser
 
@@ -1393,7 +1641,8 @@ def main() -> int:
         result = preflight(bridge, args.network_id, args.image)
     else:
         if args.command in {
-            "setup", "isolate", "retune", "full-stack", "smoke", "cleanup"
+            "setup", "isolate", "retune", "full-stack", "acquire",
+            "restore-acquire", "smoke", "cleanup"
         } and not args.apply:
             raise RunnerError(f"{args.command} mutates the fake-sat lab; pass --apply")
         if args.command == "setup":
@@ -1416,6 +1665,18 @@ def main() -> int:
                 replica=args.replica,
                 results_dir=args.results_dir,
                 spend_cap_sats=args.spend_cap_sats,
+            )
+        elif args.command == "acquire":
+            result = apply_acquisition_treatment(
+                replica=args.replica,
+                results_dir=args.results_dir,
+                family=args.acquisition_family,
+                fee_ppm=args.acquisition_ppm,
+            )
+        elif args.command == "restore-acquire":
+            result = restore_acquisition(
+                replica=args.replica,
+                results_dir=args.results_dir,
             )
         elif args.command == "smoke":
             if args.pause_seconds < 0:

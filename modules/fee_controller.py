@@ -5233,8 +5233,20 @@ class FeeController:
                     if channel_info:
                         current_fee = channel_info.get("fee_proportional_millionths", 0)
                         requested_static_fee = int(policy.fee_ppm_target)
+                        capacity = int(channel_info.get("capacity") or 2_000_000)
+                        spendable = base_to_sats_floor(
+                            parse_msat(channel_info.get("spendable_msat", 0))
+                        )
+                        outbound_ratio = spendable / capacity if capacity > 0 else 0.5
+                        effective_static_min = self._effective_min_fee_ppm(
+                            cfg,
+                            flow_state=state.get("state", "balanced"),
+                            outbound_ratio=outbound_ratio,
+                            channel_id=channel_id,
+                            capacity_sats=capacity,
+                        )
                         effective_static_fee = max(
-                            cfg.min_fee_ppm,
+                            effective_static_min,
                             min(cfg.max_fee_ppm, requested_static_fee),
                         )
                         if current_fee != effective_static_fee:
@@ -5243,7 +5255,9 @@ class FeeController:
                                     channel_id,
                                     requested_static_fee,
                                     reason="Policy: STATIC",
-                                    reason_code=FeeReasonCode.POLICY_STATIC.value
+                                    reason_code=FeeReasonCode.POLICY_STATIC.value,
+                                    channel_info=channel_info,
+                                    effective_min_fee_ppm=effective_static_min,
                                 )
                                 if not result.get("success"):
                                     self.plugin.log(

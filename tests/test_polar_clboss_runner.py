@@ -149,6 +149,7 @@ def test_totals_delta_counts_policy_change_without_inventing_rebalance_cost():
         "ending_min_local_balance_ppm": 70_000,
         "ending_max_local_balance_ppm": 910_000,
         "ending_worst_channel_imbalance_ppm": 860_000,
+        "channels": {},
         "policy_changes": 1,
         "rebalance_cost_msat": 0,
     }
@@ -197,6 +198,26 @@ def test_contender_totals_normalizes_channel_depletion_by_capacity(monkeypatch):
     assert totals.min_local_balance_ppm == 100_000
     assert totals.max_local_balance_ppm == 900_000
     assert totals.worst_channel_imbalance_ppm == 800_000
+
+
+def test_totals_delta_reports_treatment_lane_economics():
+    runner = load_runner()
+    before = runner.Totals(
+        1, 5_000, 5, 500_000, (),
+        channel_metrics=(("1x1x0", 1, 5_000, 5),),
+    )
+    after = runner.Totals(
+        4, 50_000, 50, 500_000, (),
+        channel_metrics=(
+            ("1x1x0", 3, 35_000, 35),
+            ("1x1x1", 1, 15_000, 15),
+        ),
+    )
+
+    assert runner.totals_delta(before, after)["channels"] == {
+        "1x1x0": {"forward_count": 2, "volume_msat": 30_000, "routing_fee_msat": 30},
+        "1x1x1": {"forward_count": 1, "volume_msat": 15_000, "routing_fee_msat": 15},
+    }
 
 
 def test_rebalance_cost_counts_only_completed_self_payments(monkeypatch):
@@ -354,6 +375,106 @@ def test_start_revenue_uses_accelerated_tournament_cadences(monkeypatch):
         assert f"{key}={runner.TOURNAMENT_CYCLE_SECONDS}" in start_args
 
 
+def test_acquisition_treatment_pins_one_lane_and_restores_controls(monkeypatch, tmp_path):
+    runner = load_runner()
+    state_file = runner.state_path(tmp_path, 1)
+    cln_channel_id = "a" * 64
+    lnd_channel_id = "b" * 64
+    cln_peer = "02" + "c" * 64
+    lnd_peer = "03" + "d" * 64
+    runner.write_json_atomic(
+        state_file,
+        {
+            "schema": runner.SCHEMA,
+            "status": "isolated_full_stack_ready",
+            "events": [],
+            "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+            "contenders": {
+                "identity-a": {"container": "polar-n4-clboss-r1-identity-a"},
+                "identity-b": {"container": "polar-n4-clboss-r1-identity-b"},
+            },
+            "channels": [
+                {
+                    "funder": "identity-a", "sink": "cln-sink",
+                    "result": {"channel_id": cln_channel_id},
+                },
+                {
+                    "funder": "identity-a", "sink": "lnd-sink",
+                    "result": {"channel_id": lnd_channel_id},
+                },
+            ],
+        },
+    )
+    rows = [
+        {
+            "channel_id": cln_channel_id, "short_channel_id": "1x1x0",
+            "peer_id": cln_peer,
+            "updates": {"local": {"fee_base_msat": 0, "fee_proportional_millionths": 18}},
+        },
+        {
+            "channel_id": lnd_channel_id, "short_channel_id": "1x1x1",
+            "peer_id": lnd_peer,
+            "updates": {"local": {"fee_base_msat": 0, "fee_proportional_millionths": 15}},
+        },
+    ]
+    runtime = {"min_fee_ppm_saturated": 0, "policies": {}}
+
+    def rpc(_container, method, *args):
+        if method == "revenue-policy" and args == ("list",):
+            return {"policies": []}
+        if method == "revenue-status":
+            return {"operator_controls": {"values": {
+                "min_fee_ppm_saturated": runtime["min_fee_ppm_saturated"]
+            }}}
+        if method == "revenue-config":
+            runtime["min_fee_ppm_saturated"] = int(args[-1])
+            return {"status": "success"}
+        if method == "revenue-fee-cycle":
+            return {"status": "success"}
+        if method == "-k" and args[0] == "revenue-policy":
+            params = dict(arg.split("=", 1) for arg in args[1:] if "=" in arg)
+            peer = params["peer_id"]
+            if params["action"] == "set":
+                fee = int(params["fee_ppm"])
+                runtime["policies"][peer] = fee
+                next(row for row in rows if row["peer_id"] == peer)["updates"]["local"][
+                    "fee_proportional_millionths"
+                ] = fee
+                return {"status": "success"}
+            runtime["policies"].pop(peer, None)
+            return {"status": "success"}
+        raise AssertionError((method, args))
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(runner, "active_channels", lambda _container: rows)
+
+    active = runner.apply_acquisition_treatment(
+        replica=1, results_dir=tmp_path, family="cln", fee_ppm=5
+    )
+
+    assert active["status"] == "acquisition_ready"
+    assert active["acquisition_treatment"]["treatment_lane"]["fee_ppm"] == 18
+    assert runtime == {
+        "min_fee_ppm_saturated": 0,
+        "policies": {cln_peer: 5, lnd_peer: 15},
+    }
+
+    restored = runner.restore_acquisition(replica=1, results_dir=tmp_path)
+
+    assert restored["status"] == "isolated_full_stack_ready"
+    assert restored["acquisition_treatment"]["status"] == "restored"
+    assert runtime == {"min_fee_ppm_saturated": 0, "policies": {}}
+
+
+def test_acquisition_treatment_requires_positive_fee(tmp_path):
+    runner = load_runner()
+
+    with pytest.raises(runner.argparse.ArgumentTypeError, match="positive integer"):
+        runner.apply_acquisition_treatment(
+            replica=1, results_dir=tmp_path, family="cln", fee_ppm=0
+        )
+
+
 def test_totals_delta_fails_closed_on_counter_regression():
     runner = load_runner()
     before = runner.Totals(2, 20_000, 20, 500_000, ())
@@ -490,6 +611,7 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
             "ending_min_local_balance_ppm": 0,
             "ending_max_local_balance_ppm": 0,
             "ending_worst_channel_imbalance_ppm": 0,
+            "channels": {},
             "policy_changes": 0,
             "rebalance_cost_msat": 0,
         },
@@ -501,6 +623,7 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
             "ending_min_local_balance_ppm": 0,
             "ending_max_local_balance_ppm": 0,
             "ending_worst_channel_imbalance_ppm": 0,
+            "channels": {},
             "policy_changes": 0,
             "rebalance_cost_msat": 0,
         },

@@ -878,12 +878,47 @@ class TestStaticStrategyExecution:
             1,
             reason="Policy: STATIC",
             reason_code=FeeReasonCode.POLICY_STATIC.value,
+            channel_info={
+                "channel_id": channel_id,
+                "peer_id": sample_peer_ids[0],
+                "fee_proportional_millionths": 100,
+            },
+            effective_min_fee_ppm=10,
         )
         assert len(adjustments) == 1
         assert adjustments[0].new_fee_ppm == 10
         assert adjustments[0].reason_code == FeeReasonCode.POLICY_STATIC.value
         assert adjustments[0].algorithm_values["requested_fee_ppm"] == 1
         assert adjustments[0].algorithm_values["effective_fee_ppm"] == 10
+
+    def test_static_policy_uses_saturated_channel_floor(
+        self, mock_plugin, mock_database, sample_peer_ids
+    ):
+        from modules.fee_controller import FeeReasonCode
+
+        fc, channel_id = self._make_static_controller(
+            mock_plugin,
+            mock_database,
+            sample_peer_ids,
+            target_fee=1,
+            current_fee=10,
+            set_result={"success": True, "fee_ppm": 1},
+        )
+        fc.config.min_fee_ppm_saturated = 0
+        channel_info = fc._get_channels_info.return_value[channel_id]
+        channel_info.update(capacity=1_000_000, spendable_msat=1_000_000_000)
+
+        adjustments = fc.adjust_all_fees()
+
+        assert adjustments[0].new_fee_ppm == 1
+        fc.set_channel_fee.assert_called_once_with(
+            channel_id,
+            1,
+            reason="Policy: STATIC",
+            reason_code=FeeReasonCode.POLICY_STATIC.value,
+            channel_info=channel_info,
+            effective_min_fee_ppm=0,
+        )
 
     def test_static_policy_failure_does_not_append_success_adjustment(
         self, mock_plugin, mock_database, sample_peer_ids
