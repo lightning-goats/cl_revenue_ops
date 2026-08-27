@@ -43,6 +43,9 @@ FUNDING_UTXO_SATS = 1_100_000
 # Covers the 1% reserve on a 1M channel plus route fees.  A smaller fee-only
 # buffer still leaves the sink unable to spend the newly received balance.
 REVERSE_FEE_BUFFER_SATS = 25_000
+TOURNAMENT_CYCLE_SECONDS = 60
+BASELINE_POLL_SECONDS = 5.0
+BASELINE_POLL_ATTEMPTS = 19
 CONTAINER_RE = re.compile(r"^polar-n[1-9][0-9]*-clboss-r[1-9][0-9]*-identity-[ab]$")
 EXPECTED_ORIGINALS = (
     "backend1",
@@ -614,21 +617,7 @@ def enable_full_stack(
     revenue_container = contenders[assignment["revenue_ops"]]["container"]
     clboss_container = contenders[assignment["clboss"]]["container"]
 
-    revenue_debug = cln_rpc(
-        revenue_container, "revenue-rebalance-debug", "summary_only=true"
-    )
-    breakdown = (
-        revenue_debug.get("capital_controls", {})
-        .get("total_liquidity_breakdown", {})
-        .get("actual_spent_by_category", {})
-    )
-    if not isinstance(breakdown, dict):
-        raise RunnerError("revenue_ops lacks unified spend-category readback")
-    baseline_non_rebalance_sats = sum(
-        nonnegative_int(value, f"revenue spend category {key}")
-        for key, value in breakdown.items()
-        if key != "rebalance"
-    )
+    baseline_non_rebalance_sats = wait_for_setup_spend_baseline(revenue_container)
     revenue_budget_sats = baseline_non_rebalance_sats + positive_int(spend_cap_sats)
     cln_rpc(
         revenue_container,
@@ -675,11 +664,61 @@ def enable_full_stack(
     return state
 
 
+def wait_for_setup_spend_baseline(
+    revenue_container: str,
+    *,
+    attempts: int = BASELINE_POLL_ATTEMPTS,
+    poll_seconds: float = BASELINE_POLL_SECONDS,
+) -> int:
+    """Wait for the contender's two setup opens to reach unified accounting."""
+    if attempts <= 0 or poll_seconds < 0:
+        raise RunnerError("invalid setup-spend baseline polling bounds")
+    last_baseline = 0
+    for attempt in range(attempts):
+        revenue_debug = cln_rpc(
+            revenue_container, "revenue-rebalance-debug", "summary_only=true"
+        )
+        breakdown = (
+            revenue_debug.get("capital_controls", {})
+            .get("total_liquidity_breakdown", {})
+            .get("actual_spent_by_category", {})
+        )
+        if not isinstance(breakdown, dict):
+            raise RunnerError("revenue_ops lacks unified spend-category readback")
+        last_baseline = sum(
+            nonnegative_int(value, f"revenue spend category {key}")
+            for key, value in breakdown.items()
+            if key != "rebalance"
+        )
+        # Every complete tournament contender funds two outbound channels.
+        # A zero baseline means the asynchronous spend ledger has not caught
+        # up yet and would silently consume part of the rebalance allowance.
+        if last_baseline > 0:
+            return last_baseline
+        if attempt + 1 < attempts:
+            time.sleep(poll_seconds)
+    raise RunnerError(
+        "revenue_ops setup spend did not reach unified accounting before full-stack start"
+    )
+
+
 def start_revenue(container: str) -> dict[str, Any]:
     cln_rpc(
         container, "-k", "plugin", "subcommand=start", f"plugin={REVENUE_PLUGIN}",
         "revenue-ops-dry-run=false", "revenue-ops-daily-budget-sats=0",
+        f"revenue-ops-flow-interval={TOURNAMENT_CYCLE_SECONDS}",
+        f"revenue-ops-fee-interval={TOURNAMENT_CYCLE_SECONDS}",
+        f"revenue-ops-rebalance-interval={TOURNAMENT_CYCLE_SECONDS}",
     )
+    configs = cln_rpc(container, "listconfigs").get("configs", {})
+    for key in (
+        "revenue-ops-flow-interval",
+        "revenue-ops-fee-interval",
+        "revenue-ops-rebalance-interval",
+    ):
+        row = configs.get(key, {}) if isinstance(configs, dict) else {}
+        if str(row.get("value_str")) != str(TOURNAMENT_CYCLE_SECONDS):
+            raise RunnerError(f"revenue_ops tournament cadence mismatch for {key}")
     cln_rpc(container, "revenue-config", "set", "paused", "true")
     status = cln_rpc(container, "revenue-status")
     controls = status.get("operator_controls", {}).get("values", {})
@@ -843,6 +882,53 @@ def rebalance_cost_msat(container: str) -> int:
             raise RunnerError(f"circular payment cost regressed on {container}")
         cost += sent - delivered
     return cost
+
+
+def enforce_clboss_spend_cap(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Disable CLBOSS rebalancing once its full-stack budget is exhausted.
+
+    CLBOSS does not expose a native absolute rebalance budget.  The tournament
+    therefore polls completed circular-payment costs between traffic entries
+    and fails closed by switching its rebalance mode off at the configured cap.
+    """
+    controls = state.get("full_stack")
+    if not isinstance(controls, dict):
+        return None
+    cap_msat = nonnegative_int(
+        controls.get("spend_cap_sats_per_controller"),
+        "full-stack spend cap",
+    ) * 1000
+    baseline_msat = nonnegative_int(
+        controls.get("clboss_rebalance_cost_baseline_msat"),
+        "CLBOSS rebalance-cost baseline",
+    )
+    assignment = state.get("assignment")
+    contenders = state.get("contenders")
+    if not isinstance(assignment, dict) or not isinstance(contenders, dict):
+        raise RunnerError("full-stack state is missing contender assignment")
+    identity = assignment.get("clboss")
+    contender = contenders.get(identity) if isinstance(identity, str) else None
+    container = contender.get("container") if isinstance(contender, dict) else None
+    if not isinstance(container, str) or not container:
+        raise RunnerError("full-stack state is missing the CLBOSS container")
+
+    cumulative_msat = rebalance_cost_msat(container)
+    if cumulative_msat < baseline_msat:
+        raise RunnerError("CLBOSS cumulative rebalance cost regressed")
+    spent_msat = cumulative_msat - baseline_msat
+    disabled_now = False
+    if spent_msat >= cap_msat and not controls.get("clboss_spend_cap_enforced"):
+        cln_rpc(container, "setconfig", "clboss-rebalance-mode", "off")
+        controls["clboss_spend_cap_enforced"] = True
+        controls["clboss_spend_cap_enforced_at_msat"] = spent_msat
+        disabled_now = True
+    controls["clboss_rebalance_cost_msat"] = spent_msat
+    return {
+        "cap_msat": cap_msat,
+        "spent_msat": spent_msat,
+        "cap_enforced": bool(controls.get("clboss_spend_cap_enforced")),
+        "disabled_now": disabled_now,
+    }
 
 
 def contender_totals(container: str) -> Totals:
@@ -1064,6 +1150,16 @@ def run_smoke(
             )
             records.extend(completed)
             progress["records"] = records
+            spend_monitor = enforce_clboss_spend_cap(state)
+            if spend_monitor is not None:
+                progress["clboss_spend_monitor"] = spend_monitor
+                if spend_monitor["disabled_now"]:
+                    _checkpoint(
+                        path,
+                        state,
+                        "clboss_spend_cap_enforced",
+                        monitor=spend_monitor,
+                    )
             write_json_atomic(progress_path, progress)
     except ReconciliationError as exc:
         records.extend(exc.records)

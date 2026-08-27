@@ -178,6 +178,132 @@ def test_rebalance_cost_counts_only_completed_self_payments(monkeypatch):
     assert runner.rebalance_cost_msat("polar-n4-clboss-r1-identity-a") == 250
 
 
+def test_clboss_spend_cap_disables_rebalancing_at_limit(monkeypatch):
+    runner = load_runner()
+    state = {
+        "assignment": {"clboss": "identity-a"},
+        "contenders": {
+            "identity-a": {"container": "polar-n4-clboss-r1-identity-a"},
+        },
+        "full_stack": {
+            "spend_cap_sats_per_controller": 1_000,
+            "clboss_rebalance_cost_baseline_msat": 250,
+        },
+    }
+    calls = []
+    monkeypatch.setattr(runner, "rebalance_cost_msat", lambda _container: 1_000_250)
+    monkeypatch.setattr(
+        runner, "cln_rpc", lambda container, method, *args: calls.append((container, method, args)) or {}
+    )
+
+    monitor = runner.enforce_clboss_spend_cap(state)
+
+    assert monitor == {
+        "cap_msat": 1_000_000,
+        "spent_msat": 1_000_000,
+        "cap_enforced": True,
+        "disabled_now": True,
+    }
+    assert calls == [
+        (
+            "polar-n4-clboss-r1-identity-a",
+            "setconfig",
+            ("clboss-rebalance-mode", "off"),
+        )
+    ]
+    assert state["full_stack"]["clboss_spend_cap_enforced_at_msat"] == 1_000_000
+
+
+def test_clboss_spend_cap_does_not_disable_below_limit(monkeypatch):
+    runner = load_runner()
+    state = {
+        "assignment": {"clboss": "identity-b"},
+        "contenders": {
+            "identity-b": {"container": "polar-n4-clboss-r2-identity-b"},
+        },
+        "full_stack": {
+            "spend_cap_sats_per_controller": 1_000,
+            "clboss_rebalance_cost_baseline_msat": 500,
+        },
+    }
+    monkeypatch.setattr(runner, "rebalance_cost_msat", lambda _container: 999_500)
+    monkeypatch.setattr(
+        runner,
+        "cln_rpc",
+        lambda *_args: pytest.fail("CLBOSS must stay enabled below the cap"),
+    )
+
+    monitor = runner.enforce_clboss_spend_cap(state)
+
+    assert monitor["spent_msat"] == 999_000
+    assert monitor["cap_enforced"] is False
+    assert monitor["disabled_now"] is False
+
+
+def test_setup_spend_baseline_waits_for_late_accounting(monkeypatch):
+    runner = load_runner()
+    samples = iter((0, 0, 310))
+    sleeps = []
+
+    def rpc(_container, _method, *_args):
+        return {
+            "capital_controls": {
+                "total_liquidity_breakdown": {
+                    "actual_spent_by_category": {
+                        "rebalance": 0,
+                        "open": next(samples),
+                        "close": 0,
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+
+    baseline = runner.wait_for_setup_spend_baseline(
+        "polar-n4-clboss-r1-identity-a", attempts=3, poll_seconds=0.25
+    )
+
+    assert baseline == 310
+    assert sleeps == [0.25, 0.25]
+
+
+def test_start_revenue_uses_accelerated_tournament_cadences(monkeypatch):
+    runner = load_runner()
+    calls = []
+    cadence_keys = (
+        "revenue-ops-flow-interval",
+        "revenue-ops-fee-interval",
+        "revenue-ops-rebalance-interval",
+    )
+
+    def rpc(container, method, *args):
+        calls.append((container, method, args))
+        if method == "listconfigs":
+            return {
+                "configs": {
+                    key: {"value_str": str(runner.TOURNAMENT_CYCLE_SECONDS)}
+                    for key in cadence_keys
+                }
+            }
+        if method == "revenue-status":
+            return {
+                "operator_controls": {
+                    "values": {"paused": True, "daily_budget_sats": 0}
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+
+    runner.start_revenue("polar-n4-clboss-r1-identity-a")
+
+    start_args = next(args for _container, method, args in calls if method == "-k")
+    for key in cadence_keys:
+        assert f"{key}={runner.TOURNAMENT_CYCLE_SECONDS}" in start_args
+
+
 def test_totals_delta_fails_closed_on_counter_regression():
     runner = load_runner()
     before = runner.Totals(2, 20_000, 20, 500_000, ())
