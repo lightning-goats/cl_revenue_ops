@@ -83,12 +83,57 @@ readbacks found zero spend, zero reservations, no fee changes, no rebalances,
 and no econ-ledger divergences. All twelve revenue/competitor gossip policies
 were active at the restored base 1 msat / 10 ppm baseline.
 
+## Live route-price and execution matrix
+
+With a 5,000-sat temporary global budget, the candidate's destination capex
+allocation produced a 100-sat pair budget and a 50-sat effective quote ceiling.
+Changing only the disposable competitor policies produced real Askrene quotes:
+
+| competitor ppm | quoted cost | effective ceiling | result |
+|---:|---:|---:|---|
+| 10 | 4 sats | 50 sats | held at −3.991026 sats EV |
+| 900 | 48 sats | 50 sats | held at −47.991027 sats EV |
+| 920 | 49 sats | 50 sats | held at −48.991028 sats EV |
+| 940 | 50 sats | 50 sats | held at −49.991028 sats EV |
+| 3,000 | no admissible route | 50 sats | Askrene excessive-cost/no-route hold |
+
+All boundary cycles were dry-run, selected zero pairs, executed zero payments,
+and restored pause and budget. This proves the ceiling is inclusive while the
+sats-EV gate independently rejects fee-admissible but unprofitable routes.
+
+After explicit operator approval for Polar-only spend, every non-revenue edge
+was temporarily set to zero fee. The dry-run gate then selected a 49,996-sat
+`270x1x0 -> 108x1x1` rebalance with a zero-sat quote and +0.046030 sats EV.
+The plugin was restarted live, paused with zero budget, then allowed one
+candidate under a temporary 5,000-sat budget. Askrene selected both competitor
+families across the initial and alternate routes. Six bounded native attempts
+failed with explicit `WIRE_TEMPORARY_CHANNEL_FAILURE` edges because the return
+directions lacked liquidity. The history row failed terminally, the 100-sat
+reservation was fully released, spend stayed zero, and the next cycle held on
+the persisted pair cooldown. Two direct 100,000-sat Polar payments then seeded
+the missing competitor return directions. SQLite recorded one
+`temporary_channel_failure` with an exact five-minute cooldown; the test waited
+for natural expiry rather than deleting or bypassing it.
+
+The next one-candidate automatic cycle succeeded. Its first Askrene route hit
+the now-known stale-liquidity edge, the executor excluded that direction, and
+the alternate CLN-competitor route settled on attempt two for zero fee. Source
+`270x1x0` fell from 1,825,000,201 to 1,775,004,201 msat and destination
+`108x1x1` rose from 550,005,912 to 600,001,912 msat: exact opposing
+49,996,000-msat deltas. The success row records the 100-sat ceiling, zero actual
+fee, `ev_positive`, and destination post-local ratio 0.30. The reservation was
+settled/released, the prior durable pair failure was cleared, spend remained
+zero, and econ reconciliation found no divergence.
+
+Cleanup restarted the plugin with `dry_run=true`, persisted pause and budget
+zero, and restored all 24 directed policies to their exact pre-test settings:
+the revenue/CLN/competitor sources at base 1 msat / 10 ppm and LND payer/sink
+sources at their native base 1,000 msat / 1 ppm. Every edge was active.
+
 ## Remaining high-value work
 
-1. Exercise real Askrene prices below/at/above pair ceilings and positive/
-   negative sats-EV without spending on rejected cases.
-2. Cover route failure, pending settlement, restart reconciliation, malformed
+1. Cover pending settlement, restart reconciliation, malformed
    evidence, and reservation cleanup.
-3. Run longer client-stratified Polar Simulation Designer soaks, then restore
+2. Run longer client-stratified Polar Simulation Designer soaks, then restore
    competitor policies and require a clean final reconciliation.
-4. Repeat the smoke matrix with the selected custom recent-CLN image.
+3. Repeat the smoke matrix with the selected custom recent-CLN image.

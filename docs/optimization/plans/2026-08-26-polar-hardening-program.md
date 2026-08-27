@@ -54,9 +54,12 @@ the other candidates.
 
 ## Phase 3 — rebalance fail-closed matrix
 
-Status: **zero-budget gate passed; independent pause gate found, fixed, and
-verified live against the exact fixed commit**. Route-price and settlement
-cases remain.
+Status: **zero-budget and pause gates passed; pause defect fixed and verified;
+real Askrene below/at/above-ceiling and negative/positive-EV cases passed**.
+The first live positive-EV attempt proved route-failure cleanup and cooldown;
+the seeded retry proved alternate-route success, exact balance movement,
+reservation cleanup, and durable-failure clearing. Pending-settlement and
+restart cases remain.
 
 For both payer families and real quoted routes, cover:
 
