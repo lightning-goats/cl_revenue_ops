@@ -488,7 +488,7 @@ class TestSaturatedFloorPipeline:
         mock_plugin.rpc.feerates.return_value = {"perkw": {"opening": 1000}}
 
     def _run(self, mock_plugin, mock_database, *, spendable_msat, flow_state,
-             sat_floor=0, rebalance_floor=None):
+             sat_floor=0, rebalance_floor=None, current_fee_ppm=1000):
         now = int(time.time())
         self._wire(mock_plugin, mock_database, now)
         fc = _make_fc(mock_plugin, mock_database)
@@ -501,7 +501,7 @@ class TestSaturatedFloorPipeline:
         channel_id = "123x456x0"
         peer_id = "02" + "a" * 64
         channel_info = {
-            "fee_proportional_millionths": 1000,
+            "fee_proportional_millionths": current_fee_ppm,
             "capacity": 2_000_000,
             "spendable_msat": f"{spendable_msat}msat",
         }
@@ -544,6 +544,20 @@ class TestSaturatedFloorPipeline:
         av = result.algorithm_values
         assert av["effective_min_fee_ppm"] == 0
         assert av["floor_ppm"] >= 80, "REBALANCE_FLOOR must dominate the class floor"
+
+    def test_applied_fee_cannot_blend_up_through_rebalance_floor(
+        self, mock_plugin, mock_database,
+    ):
+        """Hard cost floors dominate gradual blending from a stale low fee."""
+        result = self._run(
+            mock_plugin, mock_database,
+            spendable_msat=1_800_000_000,
+            flow_state="source", sat_floor=0,
+            rebalance_floor=80, current_fee_ppm=10,
+        )
+        assert result is not None
+        assert result.algorithm_values["floor_ppm"] >= 80
+        assert result.new_fee_ppm >= 80
 
     def test_execution_clamp_honors_class_floor(self, mock_plugin, mock_database):
         now = int(time.time())

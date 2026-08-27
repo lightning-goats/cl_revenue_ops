@@ -49,6 +49,25 @@ def test_role_renames_fails_closed_on_incomplete_topology():
         lab.role_renames({"nodes": {"lightning": []}})
 
 
+def test_traffic_readiness_requires_sync_and_every_parallel_edge():
+    lab = load_lab()
+    healthy = {
+        name: {
+            "syncedToChain": True,
+            "numActiveChannels": expected,
+        }
+        for name, expected in lab.EXPECTED_ACTIVE_CHANNELS.items()
+    }
+    assert lab.traffic_readiness_issues(healthy) == []
+
+    healthy["lnd-payer"]["syncedToChain"] = False
+    healthy["lnd-competitor"]["numActiveChannels"] = 3
+    assert lab.traffic_readiness_issues(healthy) == [
+        "lnd-competitor: 3/4 active channels",
+        "lnd-payer: chain not synced",
+    ]
+
+
 def test_traffic_rejects_nonpositive_inputs_without_mcp_calls():
     lab = load_lab()
 
@@ -90,6 +109,45 @@ def test_payment_bridge_error_is_unknown_and_never_retried():
         "error": "HTTP 500 after dispatch",
     }
     assert "bolt11" not in str(caught.value.uncertain_operation)
+
+
+def test_invoice_creation_can_retry_before_payment_dispatch():
+    lab = load_lab()
+
+    class Bridge:
+        def __init__(self):
+            self.calls = []
+            self.invoice_attempts = 0
+
+        def call(self, tool, arguments):
+            self.calls.append(tool)
+            if tool == "create_invoice":
+                self.invoice_attempts += 1
+                if self.invoice_attempts == 1:
+                    raise lab.PolarMcpError("transient pre-dispatch timeout")
+                return {"invoice": "bolt11-redacted"}
+            return {"success": True}
+
+    bridge = Bridge()
+    records = lab.run_deterministic_traffic(
+        bridge, 4, 1, 5_000, 0,
+        (("lnd-payer", "lnd-sink"),),
+        invoice_retries=1,
+        invoice_retry_seconds=0,
+    )
+
+    assert bridge.calls == ["create_invoice", "create_invoice", "pay_invoice"]
+    assert records[0]["payment"]["success"] is True
+
+
+def test_invoice_retry_controls_reject_negative_values():
+    lab = load_lab()
+    with pytest.raises(ValueError, match="nonnegative"):
+        lab.run_deterministic_traffic(
+            object(), 4, 1, 5_000, 0,
+            (("lnd-payer", "lnd-sink"),),
+            invoice_retries=-1,
+        )
 
 
 def test_traffic_lane_selector_supports_reverse_single_client_lane():

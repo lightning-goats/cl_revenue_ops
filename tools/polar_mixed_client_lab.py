@@ -57,6 +57,16 @@ ROLE_NAMES = {
     "LND": ("lnd-competitor", "lnd-payer", "lnd-sink"),
 }
 
+EXPECTED_ACTIVE_CHANNELS = {
+    "revenue-node": 4,
+    "cln-competitor": 4,
+    "cln-payer": 3,
+    "cln-sink": 3,
+    "lnd-competitor": 4,
+    "lnd-payer": 3,
+    "lnd-sink": 3,
+}
+
 FORWARD_TRAFFIC_LANES = (
     ("lnd-payer", "lnd-sink"),
     ("cln-payer", "cln-sink"),
@@ -205,6 +215,56 @@ def wait_for_lightning_nodes(bridge: PolarMcp, network_id: int, timeout_seconds:
     raise PolarMcpError(f"Polar nodes were not RPC-ready within {timeout_seconds:.0f}s: {last_error}")
 
 
+def traffic_readiness_issues(node_info: dict[str, dict[str, Any]]) -> list[str]:
+    """Return mixed-client sync/channel deficits that make traffic invalid."""
+    issues: list[str] = []
+    for node_name, expected_channels in EXPECTED_ACTIVE_CHANNELS.items():
+        info = node_info.get(node_name)
+        if not isinstance(info, dict):
+            issues.append(f"{node_name}: missing node info")
+            continue
+        if node_name.startswith("lnd-") and info.get("syncedToChain") is not True:
+            issues.append(f"{node_name}: chain not synced")
+        try:
+            active_channels = int(info.get("numActiveChannels", -1))
+        except (TypeError, ValueError):
+            active_channels = -1
+        if active_channels < expected_channels:
+            issues.append(
+                f"{node_name}: {active_channels}/{expected_channels} active channels"
+            )
+    return issues
+
+
+def wait_for_traffic_ready(
+    bridge: PolarMcp,
+    network_id: int,
+    timeout_seconds: float = 180.0,
+) -> None:
+    """Require every mixed-client route edge before invoices or payments."""
+    deadline = time.monotonic() + timeout_seconds
+    last_issues = ["readiness probe has not completed"]
+    while time.monotonic() < deadline:
+        try:
+            node_info = {
+                node_name: bridge.call(
+                    "get_node_info",
+                    {"networkId": network_id, "nodeName": node_name},
+                ).get("info", {})
+                for node_name in EXPECTED_ACTIVE_CHANNELS
+            }
+            last_issues = traffic_readiness_issues(node_info)
+            if not last_issues:
+                return
+        except PolarMcpError as exc:
+            last_issues = [str(exc)]
+        time.sleep(3)
+    raise PolarMcpError(
+        "Polar mixed-client routes were not traffic-ready within "
+        f"{timeout_seconds:.0f}s: {'; '.join(last_issues)}"
+    )
+
+
 def has_required_channel(
     channels: list[dict[str, Any]], destination_pubkey: str, capacity_sats: int
 ) -> bool:
@@ -306,24 +366,42 @@ def run_deterministic_traffic(
     amount_sats: int,
     pause_seconds: float,
     lanes: tuple[tuple[str, str], ...] = TRAFFIC_LANES,
+    invoice_retries: int = 0,
+    invoice_retry_seconds: float = 1.0,
 ) -> list[dict[str, Any]]:
     """Send deterministic traffic over one or more competing route lanes."""
     if rounds <= 0 or amount_sats <= 0:
         raise ValueError("rounds and amount_sats must be positive")
     if not lanes:
         raise ValueError("at least one traffic lane is required")
+    if invoice_retries < 0 or invoice_retry_seconds < 0:
+        raise ValueError("invoice retry controls must be nonnegative")
     records: list[dict[str, Any]] = []
     for round_index in range(rounds):
         for payer, sink in lanes:
-            invoice = bridge.call(
-                "create_invoice",
-                {
-                    "networkId": network_id,
-                    "nodeName": sink,
-                    "amount": amount_sats,
-                    "memo": f"revenue-ops-lab-{round_index}-{payer}",
-                },
-            )
+            invoice = None
+            for attempt in range(invoice_retries + 1):
+                try:
+                    invoice = bridge.call(
+                        "create_invoice",
+                        {
+                            "networkId": network_id,
+                            "nodeName": sink,
+                            "amount": amount_sats,
+                            "memo": f"revenue-ops-lab-{round_index}-{payer}",
+                        },
+                    )
+                    break
+                except PolarMcpError:
+                    # Invoice creation has no money-path side effect. It is
+                    # safe to retry, unlike pay_invoice, whose result may be
+                    # ambiguous after dispatch.
+                    if attempt >= invoice_retries:
+                        raise
+                    if invoice_retry_seconds:
+                        time.sleep(invoice_retry_seconds)
+            if not isinstance(invoice, dict) or not isinstance(invoice.get("invoice"), str):
+                raise PolarMcpError("create_invoice returned no invoice")
             try:
                 payment = bridge.call(
                     "pay_invoice",
@@ -433,6 +511,10 @@ def main() -> int:
     )
     parser.add_argument("--pause-seconds", type=float, default=0.25)
     parser.add_argument(
+        "--invoice-retries", type=int, default=2,
+        help="retry count for pre-payment invoice creation only",
+    )
+    parser.add_argument(
         "--traffic-direction",
         choices=("forward", "reverse", "both"),
         default="forward",
@@ -488,6 +570,7 @@ def main() -> int:
                         amount_sats,
                         args.pause_seconds,
                         selected_lanes,
+                        invoice_retries=args.invoice_retries,
                     )
                 except PolarTrafficError as exc:
                     plan["traffic"].extend(exc.completed_records)

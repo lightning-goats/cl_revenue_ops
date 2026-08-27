@@ -5821,6 +5821,20 @@ class FeeController:
             "wake_damping_applied": woke_from_sleep,
         }
 
+    @staticmethod
+    def _apply_hard_fee_rails(
+        candidate_fee_ppm: int,
+        floor_ppm: int,
+        ceiling_ppm: int,
+    ) -> int:
+        """Clamp the final applied target after blending and damping.
+
+        Blending is allowed to move gradually inside the admissible range,
+        but it must not leave a fee below a chain/rebalance-cost floor merely
+        because the current on-chain fee started below that floor.
+        """
+        return max(int(floor_ppm), min(int(ceiling_ppm), int(candidate_fee_ppm)))
+
     def _zero_flow_streak_thresholds(
         self,
         gap_ema_hours: float,
@@ -7401,6 +7415,9 @@ class FeeController:
                 target_fee_ppm=blended_target_ppm,
                 woke_from_sleep=woke_from_sleep,
                 cfg=cfg,
+            )
+            new_fee_ppm = self._apply_hard_fee_rails(
+                new_fee_ppm, floor_ppm, ceiling_ppm,
             )
             applied_target_ppm = new_fee_ppm
             delta_cap_reason = damping_info["cap_reason"]
