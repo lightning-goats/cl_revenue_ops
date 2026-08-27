@@ -24,6 +24,7 @@ the smoke checklist below.
 | `v25.05` | Pass | askrene layer creation passes; plugin starts with documented dependencies; `revenue-status`, `revenue-rebalance-debug`, and fresh live `hive-export-hints` consumption respond. |
 | `v25.09.3` | Pass | askrene layer creation/removal passes; plugin starts after adding a Python runtime to the Polar image; `revenue-status` and `revenue-rebalance-debug` respond. |
 | `v25.12` | Pass | askrene layer creation passes; plugin starts after adding a Python runtime to the Polar image; `revenue-status`, `revenue-rebalance-debug`, and fresh live `hive-export-hints` consumption respond. |
+| `v26.06.6` | Pass | Exact revision `4c6ec87` ran on a fresh official image with four funded public channels. A mixed CLN/LND Polar matrix settled 60/60 payments and the node forwarded 49 with no failed forwards. Fee, rebalance, profitability, budget, and reconciliation surfaces passed before and after plugin restart. |
 
 ## Real-Channel Askrene Smoke
 
@@ -62,6 +63,11 @@ For each tested CLN version:
    - `revenue-status`
    - `revenue-fee-debug`
    - `revenue-rebalance-debug summary_only=true`
+8. For the newest supported release, attach a fresh identity to the mixed-client
+   Polar graph and require funded traffic through both a CLN and LND sink.
+   Verify source hashes, dry-run policy immutability, paused rebalance
+   suppression, profitability/budget/economic reconciliation, and plugin
+   restart before removing the temporary node.
 
 The minimum supported CLN version is the oldest version that passes this full
 checklist, not merely the oldest version with `getroutes`.

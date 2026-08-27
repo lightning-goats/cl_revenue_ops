@@ -209,9 +209,86 @@ empty-node results. A paused rebalance-cycle action returned
 `suppressed/paused`, `safety_block=true`, and zero candidates/executions. The
 temporary v26.06.6 container and source archive were removed afterward.
 
+The higher-confidence continuation repeated that check with a funded identity
+and exact commit `4c6ec87`. Two 1,000,000-sat payer channels and two
+1,000,000-sat sink channels connected the temporary node to both client
+families. With a temporary 1-ppm outbound policy, a three-size Polar MCP matrix
+settled 60/60 payments. The v26 router carried 49 payments (30 to the LND sink
+and 19 to the CLN sink), forwarded 885,000 sats, earned 934 msat, and recorded
+no failed forward.
+
+The plugin observed all four funded channels. A dry-run fee cycle evaluated two
+ready sink channels and proposed 51 ppm from the temporary 1-ppm policy without
+changing gossip; both source channels correctly waited for their own forwarding
+sample. Paused fee and rebalance cycles both returned a safety-blocked
+`suppressed/paused` result. Profitability classified two channels profitable
+and two underwater, the total-cost surface attributed 321 sats to channel-open
+cost, rebalance spend/reservations remained zero, and economic reconciliation
+was clean. All module and safety readbacks passed again after a dynamic plugin
+restart. The four channels were cooperatively closed and confirmed before the
+temporary container, isolated volume, and archive were removed. The original
+network remained traffic-ready with its target paused, dry-run, budget zero,
+four base-1/10-ppm policies, and no reconciliation divergence.
+
+## One-hour endurance and fee sweep
+
+`tools/polar_endurance_campaign.py` ran a resumable 60-minute active-controller
+campaign after a 600-payment, client-stratified fee sweep. Every one of the 600
+sweep and 240 endurance payments settled. Across endurance, the revenue node
+and LND competitor each forwarded 120 payments; the revenue node earned
+116,062 msat and the LND competitor 22,120 msat. The 60 fee cycles produced 18
+raise, two lower, and 40 interval-suppressed decisions, with 36 channel
+adjustments. Every rebalance cycle considered current economics and held with
+`below_hold_margin`; no candidate was selected, no payment executed, and no
+reservation or rebalance spend was created. That is the expected economic
+outcome, not missing module coverage.
+
+| target ppm | LND route share / earned | CLN route share / earned |
+|---:|---:|---:|
+| 5 | 100% / 5,560 msat | 33.3% / 1,720 msat |
+| 10 | 100% / 11,060 msat | 31.7% / 3,469 msat |
+| 25 | 100% / 27,560 msat | 18.3% / 4,636 msat |
+| 50 | 100% / 55,060 msat | 26.7% / 16,016 msat |
+| 10 replicate | 100% / 11,060 msat | 0% / 0 msat |
+
+Within this graph, 50 ppm maximized observed revenue without reducing payment
+success. It is not a production recommendation: the CLN 10-ppm replicate moved
+from 31.7% share to zero with no fee change, demonstrating route-memory and
+liquidity variance. Promotion still requires fresh-network replication and
+net-revenue comparison by client.
+
+## Economic-floor defect found during endurance
+
+One live cycle began from a temporary 10-ppm policy with a computed economic
+floor above it. Normal DTS+PID blending produced 19 ppm and applied it, so the
+gradual transition undercut the chain/rebalance-cost floor. The controller now
+reapplies the computed hard floor and ceiling after normal blending/damping.
+Sustained-congestion damping remains unchanged because its congestion target is
+not the same economic rail. A focused regression starts at 10 ppm with an
+80-ppm rebalance floor and requires the applied fee to remain at least 80 ppm.
+
+The exact fix was hot-validated in endurance epoch 21: DTS selected 59 ppm,
+PID produced 62, blending produced 33, and the final applied value was clamped
+to the live 55-ppm economic floor. The broader scoped suite passed 178 tests;
+the full Python 3.12.13 hash-pinned suite passed 3,773 tests with five expected
+skips and two expected xfails.
+
+## Runtime recovery and automation lessons
+
+Docker had retained container state while their processes were gone. The
+backend's block files survived but its index/chainstate did not, so an isolated
+Bitcoin Core 30.0 reindex recovered height 317 before the original container
+was restarted. A fresh block through Polar MCP restored LND tip freshness.
+Docker IP reassignment also exposed persisted ephemeral peer addresses; every
+LND edge was reconnected by pubkey and stable Docker DNS. The harness now
+rejects traffic until all expected channel endpoints are active and all LND
+nodes are chain-synced, and offers explicit preflight mining for an aged
+regtest tip.
+
 ## Remaining optional endurance work
 
 No correctness or compatibility blocker remains from this program. An
-overnight or multi-day Simulation Designer run can still improve confidence in
-long-horizon controller convergence, but Polar does not currently expose those
-UI rules through MCP and the bounded client-stratified acceptance gates pass.
+overnight or multi-day run can still improve confidence in long-horizon
+controller convergence and rebalance opportunity arrival. It should use the
+same resumable runner in bounded chunks; Polar still does not expose Simulation
+Designer rules through MCP.

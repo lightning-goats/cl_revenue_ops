@@ -108,6 +108,17 @@ That surplus covers the 20,000-sat reserve on these 2,000,000-sat channels and
 a bounded routing-fee margin; override it only with
 `--reverse-fee-buffer-sats` and record the value.
 
+For bounded long-duration work, use `tools/polar_endurance_campaign.py` against
+an already-running network. It checkpoints every client-specific fee cell and
+every active-controller epoch, supports `--resume`, and can cap each invocation
+with `--max-new-endurance-epochs`. Its readiness gate requires all 24 channel
+endpoints plus chain-synced LND nodes before creating an invoice. If an idle
+regtest tip makes LND report unsynced, use the explicit
+`--mine-preflight-block` option; the tool mines through Polar MCP before the
+readiness gate. Invoice creation may retry, but a dispatched payment never
+does. Every exit path restores pause, dry-run, budget zero, and the captured
+target policies, then verifies reservations and economic reconciliation.
+
 Run the following phases in order, with a fresh network per candidate setting:
 
 1. **Baseline:** equal target and competitor fees; no fee/rebalance action;
@@ -204,6 +215,15 @@ Fresh network 3 adds a second independent 25-ppm client-divergence result and
 another real-priced rebalance hold. One more fresh 25-ppm network is still
 required before that configuration meets the repeatability count; the other
 fee candidates remain below three fresh networks.
+
+Network 4 subsequently completed a 600-payment client-stratified fee sweep and
+a 60-minute, 240-payment active-controller endurance run. All 840 payments
+settled. The result strengthens the duration and mixed-client gates, but its
+fee cells share one persistent graph and therefore do not replace the
+three-fresh-network promotion rule. In particular, CLN route share at 10 ppm
+varied from 31.7% to 0% between replicas while payment success stayed 100%; fee
+tuning must optimize replicated net revenue rather than a single route-share
+sample.
 
 ## Acceptance scorecard
 

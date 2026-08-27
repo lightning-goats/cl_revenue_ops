@@ -78,11 +78,12 @@ atomic settlement, released remainder, fresh reporting, and clean reconcile.
 
 ## Phase 4 — automation and soak
 
-Status: **complete for the bounded acceptance soak**. The deterministic MCP
-driver is hardened against ambiguous bridge failures, and the client-
-stratified scorecard passed a 60-payment bidirectional soak across six observed
-amounts. Longer wall-clock endurance runs remain optional operational soak,
-not a release blocker for this change set.
+Status: **complete for bounded and one-hour endurance acceptance**. The
+deterministic MCP driver is hardened against ambiguous bridge failures, the
+client-stratified scorecard passed a 60-payment bidirectional soak, and network
+4 completed a 600-payment fee sweep plus 240 payments across 60 one-minute live
+controller epochs. All payments settled and every resumable chunk restored the
+safety rails.
 
 Run deterministic MCP bursts before and after longer Polar Simulation Designer
 activity windows. Vary payment sizes, direction, cadence, and client family;
@@ -91,11 +92,13 @@ that rejects cache-dependent or one-client-only improvements.
 
 ## Phase 5 — compatibility and release gate
 
-Status: **complete**. The bundled CLN 25.12 mixed-client campaign passed, and
-exact plugin commit `9a79eac` passed the retained-module and paused-cycle smoke
-matrix on the official Core Lightning v26.06.6 image. Polar's local version
-catalog stops at 25.12, so the recent-image node was attached temporarily to
-the existing Polar Docker network and removed after the smoke.
+Status: **complete**. The bundled CLN 25.12 mixed-client campaign passed. Exact
+plugin commit `4c6ec87` then passed a funded retained-module and restart matrix
+on the official Core Lightning v26.06.6 image: 60/60 mixed-client payments
+settled and the temporary router forwarded 49 without a failed forward. Polar's
+local version catalog stops at 25.12, so the recent-image node was attached
+temporarily to the existing Polar Docker network and removed after cooperative
+closure of its four channels.
 
 Repeat the smoke subset with a custom current-CLN image after the bundled CLN
 25.12 campaign is stable. A change may advance only when focused tests and the
