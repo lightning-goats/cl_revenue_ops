@@ -97,13 +97,33 @@ def test_wait_wallet_funds_handles_v26_amount_encoding(monkeypatch):
     calls = iter(
         [
             {"outputs": []},
-            {"outputs": [{"status": "confirmed", "amount_msat": "2050000000msat"}]},
+            {"outputs": [{"status": "confirmed", "amount_msat": "2200000000msat"}]},
         ]
     )
     monkeypatch.setattr(runner, "cln_rpc", lambda *_args: next(calls))
     monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
 
     runner.wait_wallet_funds("polar-n4-clboss-r1-identity-a", timeout_seconds=1)
+
+
+def test_wallet_funding_leaves_emergency_reserve_and_fee_headroom(monkeypatch):
+    runner = load_runner()
+    addresses = iter(({"p2tr": "bcrt1pa"}, {"p2tr": "bcrt1pb"}))
+    commands = []
+    monkeypatch.setattr(runner, "cln_rpc", lambda *_args: next(addresses))
+    monkeypatch.setattr(
+        runner,
+        "_run",
+        lambda command, **_kwargs: commands.append(command)
+        or type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+    )
+    monkeypatch.setattr(runner, "_mine", lambda *_args: None)
+
+    runner._fund_wallet("polar-n4-clboss-r1-identity-a", object(), 4)
+
+    funded = [command[-1] for command in commands if "sendtoaddress" in command]
+    assert funded == ["0.01100000", "0.01100000"]
+    assert runner.FUNDING_UTXO_SATS - runner.CHANNEL_CAPACITY_SATS >= 100_000
 
 
 def test_totals_delta_counts_policy_change_without_inventing_rebalance_cost():

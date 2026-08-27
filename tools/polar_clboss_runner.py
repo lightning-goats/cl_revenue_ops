@@ -39,6 +39,7 @@ CLBOSS_PLUGIN = "/usr/local/libexec/clboss"
 XREBALANCE_PLUGIN = "/usr/local/libexec/xrebalance"
 IDENTITIES = ("identity-a", "identity-b")
 CHANNEL_CAPACITY_SATS = 1_000_000
+FUNDING_UTXO_SATS = 1_100_000
 # Covers the 1% reserve on a 1M channel plus route fees.  A smaller fee-only
 # buffer still leaves the sink unable to spend the newly received balance.
 REVERSE_FEE_BUFFER_SATS = 25_000
@@ -334,7 +335,7 @@ def _fund_wallet(container: str, bridge: PolarMcp, network_id: int) -> str:
             [
                 "docker", "exec", f"polar-n{network_id}-backend1",
                 "bitcoin-cli", "-regtest", "-rpcuser=polaruser", "-rpcpassword=polarpass",
-                "sendtoaddress", address, "0.01025",
+                "sendtoaddress", address, f"{FUNDING_UTXO_SATS / 100_000_000:.8f}",
             ]
         )
     _mine(bridge, network_id, 6)
@@ -342,7 +343,9 @@ def _fund_wallet(container: str, bridge: PolarMcp, network_id: int) -> str:
 
 
 def wait_wallet_funds(
-    container: str, minimum_sats: int = 2_000_000, timeout_seconds: float = 120
+    container: str,
+    minimum_sats: int = FUNDING_UTXO_SATS * 2,
+    timeout_seconds: float = 120,
 ) -> None:
     """Wait for a newly funded v26 wallet to catch up to the mined block."""
     deadline = time.monotonic() + timeout_seconds
