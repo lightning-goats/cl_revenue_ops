@@ -724,7 +724,8 @@ class Database:
                 rebalance_type TEXT NOT NULL DEFAULT 'normal',  -- 'normal', 'diagnostic'
                 error_message TEXT,
                 timestamp INTEGER NOT NULL,
-                payment_hash TEXT
+                payment_hash TEXT,
+                reservation_id TEXT
             )
         """)
         # In-flight settlement tracking: payments that timed out unresolved
@@ -732,6 +733,17 @@ class Database:
         # so the engine's reconciliation sweep can settle them later.
         try:
             conn.execute("ALTER TABLE rebalance_history ADD COLUMN payment_hash TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        # A history insert can fail before the payment starts, forcing the
+        # executor to reserve under a synthetic id.  If the payment later
+        # becomes pending, a recovered history row must retain that original
+        # reservation id so restart reconciliation settles/releases the real
+        # hold rather than assuming reservation_id == history.id.
+        try:
+            conn.execute(
+                "ALTER TABLE rebalance_history ADD COLUMN reservation_id TEXT"
+            )
         except sqlite3.OperationalError:
             pass  # Column already exists
 
@@ -2496,6 +2508,8 @@ class Database:
                 rebalance_type: Type of rebalance ('normal', 'diagnostic')
                 reason_code: Structured RebalanceReasonCode value (for explainability)
                 bleeder_status: Bleeder classification ('hard', 'soft', 'none')
+                reservation_id: Explicit reservation link when it differs
+                    from the generated history id (recovered pending payment)
 
         Returns:
             Database row ID for the rebalance record
@@ -2513,15 +2527,22 @@ class Database:
             'rebalance_type': kwargs.get('rebalance_type', 'normal'),
             'reason_code': kwargs.get('reason_code'),
             'bleeder_status': kwargs.get('bleeder_status'),
+            'reservation_id': (
+                str(kwargs.get('reservation_id'))
+                if kwargs.get('reservation_id') is not None
+                else None
+            ),
             'timestamp': now
         }
 
         cursor = conn.execute("""
             INSERT INTO rebalance_history
             (from_channel, to_channel, amount_sats, max_fee_sats, expected_profit_sats,
-             status, rebalance_type, reason_code, bleeder_status, timestamp)
+             status, rebalance_type, reason_code, bleeder_status, reservation_id,
+             timestamp)
             VALUES (:from_channel, :to_channel, :amount_sats, :max_fee_sats, :expected_profit_sats,
-                    :status, :rebalance_type, :reason_code, :bleeder_status, :timestamp)
+                    :status, :rebalance_type, :reason_code, :bleeder_status,
+                    :reservation_id, :timestamp)
         """, params)
 
         return cursor.lastrowid
@@ -2581,7 +2602,8 @@ class Database:
         conn = self._get_connection()
         rows = conn.execute(
             """
-            SELECT id, from_channel, to_channel, amount_sats, payment_hash, timestamp
+            SELECT id, from_channel, to_channel, amount_sats, payment_hash,
+                   reservation_id, timestamp
             FROM rebalance_history
             WHERE status = 'pending_settlement'
                   AND payment_hash IS NOT NULL AND payment_hash != ''
@@ -3979,8 +4001,9 @@ class Database:
         # its HTLC is unresolved by parking the rebalance_history row as
         # 'pending_settlement'; reconcile_pending_settlements owns the terminal
         # release/spend once listsendpays reports a final state. The reservation
-        # is linked to that row by reservation_id == str(rebalance_history.id)
-        # (see rebalance_engine_v2._run_single / _reconcile_pending_row). Skip
+        # normally links by reservation_id == str(rebalance_history.id), while
+        # recovered rows persist their synthetic id in
+        # rebalance_history.reservation_id. Skip
         # any active reservation matching a still-pending row so the budget stays
         # held; a genuinely-abandoned reservation (no pending row, e.g. a crashed
         # job) is still released, and a reservation whose pending row terminally
@@ -3990,7 +4013,8 @@ class Database:
             SET status = 'released'
             WHERE status = 'active' AND reserved_at < ?
               AND reservation_id NOT IN (
-                  SELECT CAST(id AS TEXT) FROM rebalance_history
+                  SELECT COALESCE(NULLIF(reservation_id, ''), CAST(id AS TEXT))
+                  FROM rebalance_history
                   WHERE status = 'pending_settlement'
               )
         """, (cutoff,))
@@ -3998,7 +4022,7 @@ class Database:
         # Phase 2J dual-path: unified rebalance reservations live in
         # spend_reservations (category='rebalance') and must inherit the
         # SAME stale timeout and the SAME P4-015 in-flight-HTLC skip
-        # (reservation_id == str(rebalance_history.id) is unchanged).
+        # (including recovered rows with an explicit synthetic link).
         try:
             unified_cursor = conn.execute("""
                 UPDATE spend_reservations
@@ -4006,7 +4030,8 @@ class Database:
                 WHERE status = 'active' AND category = 'rebalance'
                   AND reserved_at < ?
                   AND reservation_id NOT IN (
-                      SELECT CAST(id AS TEXT) FROM rebalance_history
+                      SELECT COALESCE(NULLIF(reservation_id, ''), CAST(id AS TEXT))
+                      FROM rebalance_history
                       WHERE status = 'pending_settlement'
                   )
             """, (cutoff,))

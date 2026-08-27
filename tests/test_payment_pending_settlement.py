@@ -474,11 +474,11 @@ def test_reconcile_partial_fill_settles_with_actual_amount(
     assert kwargs["actual_fee_sats"] == 5
 
 
-def test_reconcile_settled_amount_missing_falls_back_to_planned(
+def test_reconcile_malformed_complete_amount_leaves_reservation_pending(
     mock_plugin, mock_database
 ):
-    # If listsendpays lacks a parseable amount_msat, keep the original
-    # planned amount rather than zeroing the anchor (and never crash).
+    # A malformed terminal response is not proof of either success or
+    # failure. Keep the row and reservation pending for the next sweep.
     engine = _make_engine(mock_plugin, mock_database)
     mock_database.get_pending_settlement_rebalances.return_value = [
         _reconcile_row(amount_sats=1_000_000)
@@ -495,10 +495,47 @@ def test_reconcile_settled_amount_missing_falls_back_to_planned(
 
     resolved = engine.reconcile_pending_settlements()
 
-    assert resolved == 1
-    args, kwargs = mock_database.settle_rebalance_success.call_args
-    assert kwargs["amount_sats"] == 1_000_000
-    assert kwargs["cost_amount_sats"] == 1_000_000
+    assert resolved == 0
+    mock_database.settle_rebalance_success.assert_not_called()
+    mock_database.update_rebalance_result.assert_not_called()
+    mock_database.release_budget_reservation.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        {},
+        {"payments": "not-a-list"},
+        {"payments": ["not-an-object"]},
+        {"payments": [{"status": "mystery"}]},
+        {"payments": [{"status": "complete", "amount_msat": 1000}]},
+        {
+            "payments": [
+                {
+                    "status": "complete",
+                    "amount_msat": 2000,
+                    "amount_sent_msat": 1000,
+                }
+            ]
+        },
+    ],
+)
+def test_reconcile_malformed_rpc_evidence_never_resolves_or_releases(
+    mock_plugin, mock_database, response
+):
+    engine = _make_engine(mock_plugin, mock_database)
+    mock_database.get_pending_settlement_rebalances.return_value = [_reconcile_row()]
+    mock_plugin.rpc.call.return_value = response
+
+    assert engine.reconcile_pending_settlements() == 0
+    mock_database.settle_rebalance_success.assert_not_called()
+    mock_database.update_rebalance_result.assert_not_called()
+    mock_database.release_budget_reservation.assert_not_called()
+    assert any(
+        "malformed listsendpays" in str(call.args[0])
+        for call in mock_plugin.log.call_args_list
+    )
 
 
 def test_reconcile_failed_payment_releases_reservation(mock_plugin, mock_database):
@@ -516,6 +553,30 @@ def test_reconcile_failed_payment_releases_reservation(mock_plugin, mock_databas
     assert args[1] == "failed"
     mock_database.release_budget_reservation.assert_called_once_with("42")
     mock_database.record_rebalance_cost.assert_not_called()
+
+
+def test_reconcile_uses_explicit_recovered_reservation_link(
+    mock_plugin, mock_database
+):
+    engine = _make_engine(mock_plugin, mock_database)
+    mock_database.get_pending_settlement_rebalances.return_value = [
+        _reconcile_row(id=55, reservation_id="v2-synthetic-123")
+    ]
+    mock_plugin.rpc.call.return_value = {
+        "payments": [
+            {
+                "status": "complete",
+                "amount_msat": 100_000_000,
+                "amount_sent_msat": 100_005_000,
+            }
+        ]
+    }
+
+    assert engine.reconcile_pending_settlements() == 1
+    assert (
+        mock_database.settle_rebalance_success.call_args.kwargs["reservation_id"]
+        == "v2-synthetic-123"
+    )
 
 
 def test_reconcile_missing_payment_treated_as_failed(mock_plugin, mock_database):
@@ -589,6 +650,26 @@ def test_database_stores_and_lists_pending_settlement(real_database):
     # Terminal update clears it from the pending queue.
     real_database.update_rebalance_result(rebalance_id, "success", actual_fee_msat=5000)
     assert real_database.get_pending_settlement_rebalances() == []
+
+
+def test_database_persists_explicit_pending_reservation_link(real_database):
+    rebalance_id = real_database.record_rebalance(
+        from_channel="100x1x0",
+        to_channel="200x1x0",
+        amount_sats=100_000,
+        max_fee_sats=100,
+        expected_profit_sats=0,
+        status="pending",
+        reservation_id="v2-synthetic-123",
+    )
+    real_database.update_rebalance_result(
+        rebalance_id,
+        "pending_settlement",
+        payment_hash="hash-linked",
+    )
+
+    rows = real_database.get_pending_settlement_rebalances()
+    assert rows[0]["reservation_id"] == "v2-synthetic-123"
 
 
 def test_database_late_settlement_corrects_amount_in_history_row(real_database):

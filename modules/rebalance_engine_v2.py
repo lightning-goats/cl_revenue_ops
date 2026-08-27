@@ -35,7 +35,7 @@ from .rebalance_state_v2 import (
 )
 from .segment_observations import SegmentObservationStore
 from .rebalance_types_v2 import PairCandidate, PlanResult, SkipRecord
-from .utils import base_to_sats_ceil, base_to_sats_floor, parse_msat
+from .utils import base_to_sats_ceil, base_to_sats_floor
 
 # ---------------------------------------------------------------------------
 # Sats-EV gate constants (audit F2).
@@ -80,6 +80,31 @@ def _nonnegative_msat_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _strict_nonnegative_msat(value: Any) -> Optional[int]:
+    """Parse authoritative settlement amounts without conflating bad data with 0.
+
+    ``parse_msat`` intentionally returns zero for malformed observational
+    values.  Settlement reconciliation needs a stricter contract: zero is a
+    valid amount, while malformed/missing evidence must leave the payment and
+    its reservation pending for a later sweep.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if hasattr(value, "millisatoshis"):
+        value = getattr(value, "millisatoshis", None)
+    if isinstance(value, str):
+        value = value.strip()
+        if value.endswith("msat"):
+            value = value[:-4]
+        if not value:
+            return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _bounded_historical_fee_ppm(value: Any, cap_ppm: float) -> float:
@@ -3326,13 +3351,9 @@ class RebalanceEngine:
         safe — the original insert failed, so no duplicate row can exist —
         and idempotent (runs once per execution outcome).
 
-        Escalates at error level either way: the budget hold is keyed to the
-        synthetic reservation id, which no history row can ever match, so
-        the P4-015 stale-sweep exemption cannot protect it — the 4h sweep
-        WILL release the hold even though the HTLC may still settle. The
-        recovered row at least gets the fee into rebalance_costs when the
-        payment completes (and blocks re-filling the dest meanwhile via the
-        pending-settlement dest guard).
+        The recovered row records the synthetic reservation id explicitly so
+        restart reconciliation and stale-reservation protection continue to
+        address the original hold rather than assuming history-id equality.
         """
         if self.database is None or result is None or pair is None:
             return
@@ -3354,6 +3375,7 @@ class RebalanceEngine:
                     status="pending",
                     rebalance_type="normal",
                     reason_code=pair.reason_code or "ev_positive",
+                    reservation_id=reservation_id,
                 )
             )
             self.database.update_rebalance_result(
@@ -3378,9 +3400,8 @@ class RebalanceEngine:
             f"pending-row insert had failed for "
             f"{pair.source_channel_id}->{pair.dest_channel_id}; recovered a "
             f"sweepable pending_settlement row id={late_id} for "
-            f"payment_hash={payment_hash}. NOTE: the budget hold sits under "
-            f"synthetic reservation {reservation_id}, which the stale sweep "
-            f"can release before the payment resolves.",
+            f"payment_hash={payment_hash}; linked synthetic reservation "
+            f"{reservation_id} for restart-safe reconciliation.",
             level="error",
         )
 
@@ -3642,18 +3663,27 @@ class RebalanceEngine:
         if rebalance_id <= 0 or not payment_hash:
             return False
         response = self.plugin.rpc.call("listsendpays", {"payment_hash": payment_hash})
-        payments = response.get("payments", []) if isinstance(response, dict) else []
-        payments = [p for p in payments if isinstance(p, dict)]
-        statuses = {str(p.get("status") or "") for p in payments}
+        if not isinstance(response, dict) or not isinstance(
+            response.get("payments"), list
+        ):
+            raise ValueError("malformed listsendpays response")
+        payments = response["payments"]
+        if any(not isinstance(payment, dict) for payment in payments):
+            raise ValueError("malformed listsendpays payment entry")
+        statuses = {str(payment.get("status") or "") for payment in payments}
+        if not statuses.issubset({"pending", "complete", "failed"}):
+            raise ValueError("malformed listsendpays payment status")
 
         if "pending" in statuses:
             return False
 
-        reservation_id = str(rebalance_id)
+        reservation_id = str(row.get("reservation_id") or rebalance_id)
         if "complete" in statuses:
             settled = next(p for p in payments if str(p.get("status")) == "complete")
-            amount_msat = parse_msat(settled.get("amount_msat"))
-            sent_msat = parse_msat(settled.get("amount_sent_msat"))
+            amount_msat = _strict_nonnegative_msat(settled.get("amount_msat"))
+            sent_msat = _strict_nonnegative_msat(settled.get("amount_sent_msat"))
+            if amount_msat is None or sent_msat is None or sent_msat < amount_msat:
+                raise ValueError("malformed listsendpays complete amounts")
             fee_msat = max(0, sent_msat - amount_msat)
             fee_sats = base_to_sats_ceil(fee_msat)
             dest_channel = str(row.get("to_channel") or "")
@@ -3662,8 +3692,8 @@ class RebalanceEngine:
             # sendpay entry is the amount delivered to the destination
             # (amount_sent_msat includes routing fees), so it is the true
             # filled amount. Correct the history row and cost attribution
-            # with it; if it is missing/unparseable (0), keep the original
-            # planned amount rather than zeroing the anchor.
+            # with it; a legitimate zero amount keeps the original planned
+            # amount rather than zeroing the anchor.
             settled_amount_sats = base_to_sats_floor(amount_msat)
             if settled_amount_sats <= 0:
                 settled_amount_sats = int(row.get("amount_sats") or 0)

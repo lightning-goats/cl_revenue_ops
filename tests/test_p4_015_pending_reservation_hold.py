@@ -114,3 +114,29 @@ def test_unlinked_stale_reservation_still_released(tmp_path):
     _insert_reservation(db, "orphan", 400, stale_at)
     assert db.cleanup_stale_reservations(max_age_seconds=4 * 3600) == 1
     assert _status(db, "orphan") == "released"
+
+
+def test_recovered_pending_row_protects_synthetic_unified_reservation(tmp_path):
+    db = _make_db(tmp_path)
+    now = int(time.time())
+    stale_at = now - 5 * 3600
+    synthetic_id = "v2-synthetic-pending"
+    rid = _insert_rebalance(db, "pending_settlement", "ef" * 32, stale_at)
+    conn = db._get_connection()
+    conn.execute(
+        "UPDATE rebalance_history SET reservation_id = ? WHERE id = ?",
+        (synthetic_id, rid),
+    )
+    conn.execute(
+        "INSERT INTO spend_reservations "
+        "(reservation_id, category, reserved_sats, reserved_at, status) "
+        "VALUES (?, 'rebalance', 500, ?, 'active')",
+        (synthetic_id, stale_at),
+    )
+
+    assert db.cleanup_stale_reservations(max_age_seconds=4 * 3600) == 0
+    row = conn.execute(
+        "SELECT status FROM spend_reservations WHERE reservation_id = ?",
+        (synthetic_id,),
+    ).fetchone()
+    assert row[0] == "active"

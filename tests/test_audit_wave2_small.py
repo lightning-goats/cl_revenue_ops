@@ -214,6 +214,8 @@ def test_recovers_pending_row_after_failed_insert(mock_plugin, mock_database):
              if c.args[:2] == (55, "pending_settlement")]
     assert len(calls) == 1
     assert calls[0].kwargs.get("payment_hash") == "hash-xyz"
+    recovery_call = mock_database.record_rebalance.call_args_list[1]
+    assert recovery_call.kwargs["reservation_id"].startswith("v2-")
     # Operator signal: error-level log carrying the payment hash.
     error_logs = [m for (m, lvl) in
                   [(c.args[0], c.kwargs.get("level", c.args[1] if len(c.args) > 1 else "info"))
