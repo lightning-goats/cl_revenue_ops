@@ -83,7 +83,7 @@ forced payment through each contender and client family before releasing path
 selection.
 
 Capture every directed policy on the original three routers and set their
-outbound proportional fee to 2,000 ppm for the scored windows. Their routes are
+outbound proportional fee to 10,000 ppm for the scored windows. Their routes are
 fallbacks, not silent third competitors. Restore all captured policies and
 remove only the two temporary contenders in cleanup. Do not stop, recreate, or
 open another Polar application window.
@@ -259,6 +259,40 @@ Each candidate carries a specific next experiment and promotion gate. Apply one
 change at a time and start a new frozen three-replica tournament. Preserve a
 winning setting when the score finds no regression; do not tune merely because
 a knob exists.
+
+## Live shakeout findings (2026-08-27)
+
+Replica-1 provisioning and bounded traffic exposed and fixed five harness
+defects before scoring: the official CLN entrypoint was invoked twice, v26
+returns `p2tr` from `newaddr`, one wallet UTXO could not fund two outbound
+channels, partial opens were not individually checkpointed, and reverse traffic
+lacked enough seed balance to cover the channel reserve. The runner now uses
+the image entrypoint correctly, accepts both address shapes, funds two confirmed
+UTXOs, checkpoints every open, reconciles all non-terminal channels during
+cleanup, and seeds 25,000 sats once per client family while interleaving
+directions.
+
+Polar's payment bridge consistently returned its known post-dispatch UI 500
+even when payment succeeded. The runner now dispatches exactly once, derives
+the payment hash with CLN v26 `decode`, and accepts the result only after the
+sink reports the exact invoice settled. It never retries an ambiguous payment.
+
+The originally planned 2,000-ppm background fee still attracted 7 of 12 smoke
+payments because client route-probability history outweighed the fee delta.
+At 10,000 ppm, a reserve-buffered 12-payment block used contenders exclusively,
+so 10,000 ppm replaces 2,000 ppm as the frozen fallback policy. Exact original
+CLN and LND policies are captured before isolation and restored by cleanup.
+
+The first fully isolated smoke block was 12/12 settled: CLBOSS forwarded all 12
+payments while `cl_revenue_ops` forwarded none. This is not a tournament
+verdict, but it exposes a high-value cold-start gap. CLBOSS advertised 1--15 ppm
+immediately; revenue-ops advertised 39--69 ppm and its diagnostics reported all
+four channels waiting for either three forwards or 0.25 hours. With zero route
+share, the forward-count condition cannot become true, leaving only the time
+gate. The higher-duration native-timer block must determine whether revenue-ops
+recovers after that gate. If it does not, the first improvement experiment is a
+bounded cold-start/no-route-share exploration rule, evaluated against fee yield
+and safety rather than blindly restoring the deprecated gossip-price floor.
 
 ## Module and failure coverage
 

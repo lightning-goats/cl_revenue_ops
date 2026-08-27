@@ -95,6 +95,7 @@ def test_plan_pins_equal_cln_and_exact_controller_sources():
     assert plan["versions"]["xrebalance"]["commit"] == tool.XREBALANCE_COMMIT
     assert plan["controller_contract"]["native_timers_only"] is True
     assert plan["replication"]["identity_crossover_required"] is True
+    assert plan["topology"]["background_router_policy_ppm"] == 10_000
 
 
 def test_score_declares_revenue_ops_winner_only_after_all_gates():

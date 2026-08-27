@@ -95,7 +95,7 @@ def build_plan(network_id: int, revenue_commit: str) -> dict[str, Any]:
                 "contender -> cln-sink",
             ],
             "initial_local_outbound_sats_per_contender": 2_000_000,
-            "background_router_policy_ppm": 2_000,
+            "background_router_policy_ppm": 10_000,
             "background_routes_are_fallback_only": True,
         },
         "controller_contract": {
