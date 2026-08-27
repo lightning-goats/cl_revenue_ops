@@ -777,11 +777,22 @@ class FlowAnalyzer:
         # are atomic). Writes are protected by _analysis_lock.
         self._flow_cache: Dict[str, FlowMetrics] = {}
         self._flow_cache_timestamp: int = 0
-        # >= the hourly flow loop cadence: the 900s rebalance cycle forced
-        # "genuine" refreshes ~4x/hour, consuming Kalman observations at ~5x
-        # the designed rate (uncertainty collapse the docstring at
-        # analyze_all_channels warns about).
-        self._flow_cache_ttl: int = 1800  # seconds (configurable attribute)
+        # Keep the cache shorter than the configured flow loop.  The previous
+        # fixed 1800s TTL made valid sub-30-minute `flow_interval` settings
+        # silently reuse stale state.  Half an interval preserves intra-cycle
+        # de-duplication (capital/rebalance consumers call repeatedly) while
+        # guaranteeing the next jittered scheduled cycle can refresh.  The
+        # production 3600s default retains the historical 1800s TTL.
+        configured_interval = getattr(config, "flow_interval", 3600)
+        if not isinstance(configured_interval, (int, float, str)):
+            configured_interval = 3600
+        try:
+            configured_interval = int(configured_interval)
+        except (TypeError, ValueError, OverflowError):
+            configured_interval = 3600
+        self._flow_cache_ttl: int = min(
+            1800, max(1, configured_interval // 2)
+        )
         self._analysis_lock = threading.Lock()  # Prevent analysis stampede
 
         # One-time purge v2: clear Kalman states missing observation_count.
@@ -1336,15 +1347,15 @@ class FlowAnalyzer:
 
         This is the main entry point, called periodically by the timer and
         re-invoked by capital-efficiency consumers several times per cycle.
-        A TTL result cache (default 300s) serves those repeat callers without
+        A cadence-aware TTL result cache serves those repeat callers without
         re-running the full RPC fetch + Kalman update + DB write pipeline.
 
         CRITICAL: Kalman state updates and DB writes only happen on a genuine
         refresh, never on cache hits — re-running the filter on the same data
         would double-consume observations and shrink uncertainty artificially.
 
-        The hourly flow-analysis loop always gets a genuine refresh because
-        the cache TTL is far shorter than the loop interval.
+        The flow-analysis loop gets a genuine refresh because the cache TTL is
+        at most half of its configured interval.
 
         Args:
             force: If True, bypass the cache TTL and always run fresh analysis.

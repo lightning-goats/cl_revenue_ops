@@ -148,12 +148,13 @@ class FakeDatabaseWithBatch(FakeDatabase):
             self.temporal_profiles[row["channel_id"]] = row["profile_json"]
 
 
-def make_analyzer(database, channels=None, flow_window_days=7):
+def make_analyzer(database, channels=None, flow_window_days=7, flow_interval=3600):
     plugin = MagicMock()
     config = MagicMock()
     config.source_threshold = 0.5
     config.sink_threshold = -0.5
     config.flow_window_days = flow_window_days
+    config.flow_interval = flow_interval
     config.htlc_congestion_threshold = 0.8
     analyzer = FlowAnalyzer(plugin, config, database)
     if channels is not None:
@@ -261,6 +262,19 @@ class TestAnalyzeAllChannelsCache:
         time.sleep(1.1)
         analyzer.analyze_all_channels()
         assert analyzer._get_channels.call_count == 2
+
+    def test_ttl_scales_below_short_configured_flow_interval(self):
+        scid = "100x1x0"
+        db = FakeDatabase(
+            daily_buckets=seeded_daily_buckets(scid),
+            net_flows=seeded_net_flows(scid),
+        )
+
+        analyzer = make_analyzer(
+            db, channels=[make_channel(scid)], flow_interval=60
+        )
+
+        assert analyzer._flow_cache_ttl == 30
 
     def test_concurrent_caller_gets_cache_not_duplicate_run(self):
         analyzer, db, scid = self._fresh()
