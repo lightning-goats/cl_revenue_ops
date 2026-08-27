@@ -128,14 +128,27 @@ def test_wallet_funding_leaves_emergency_reserve_and_fee_headroom(monkeypatch):
 
 def test_totals_delta_counts_policy_change_without_inventing_rebalance_cost():
     runner = load_runner()
-    before = runner.Totals(2, 20_000, 20, 500_000, (("1x1x1", 1, 10),))
-    after = runner.Totals(5, 65_000, 65, 490_000, (("1x1x1", 1, 15),))
+    before = runner.Totals(
+        2, 20_000, 20, 500_000, (("1x1x1", 1, 10),),
+        min_local_balance_ppm=400_000,
+        max_local_balance_ppm=600_000,
+        worst_channel_imbalance_ppm=200_000,
+    )
+    after = runner.Totals(
+        5, 65_000, 65, 490_000, (("1x1x1", 1, 15),),
+        min_local_balance_ppm=70_000,
+        max_local_balance_ppm=910_000,
+        worst_channel_imbalance_ppm=860_000,
+    )
 
     assert runner.totals_delta(before, after) == {
         "forward_count": 3,
         "volume_msat": 45_000,
         "routing_fee_msat": 45,
         "mean_local_liquidity_sats": 495_000,
+        "ending_min_local_balance_ppm": 70_000,
+        "ending_max_local_balance_ppm": 910_000,
+        "ending_worst_channel_imbalance_ppm": 860_000,
         "policy_changes": 1,
         "rebalance_cost_msat": 0,
     }
@@ -147,6 +160,43 @@ def test_totals_delta_accounts_for_completed_circular_payment_cost():
     after = runner.Totals(0, 0, 0, 500_000, (), rebalance_cost_msat=375)
 
     assert runner.totals_delta(before, after)["rebalance_cost_msat"] == 275
+
+
+def test_contender_totals_normalizes_channel_depletion_by_capacity(monkeypatch):
+    runner = load_runner()
+    channels = [
+        {
+            "short_channel_id": "1x1x0",
+            "to_us_msat": 100_000,
+            "total_msat": 1_000_000,
+            "updates": {"local": {"fee_base_msat": 1, "fee_proportional_millionths": 5}},
+        },
+        {
+            "short_channel_id": "1x1x1",
+            "to_us_msat": 1_800_000,
+            "total_msat": 2_000_000,
+            "updates": {"local": {"fee_base_msat": 1, "fee_proportional_millionths": 10}},
+        },
+    ]
+
+    def rpc(_container, method, *_args):
+        if method == "listforwards":
+            return {"forwards": []}
+        if method == "getinfo":
+            return {"id": "node-id"}
+        if method == "listsendpays":
+            return {"payments": []}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(runner, "active_channels", lambda _container: channels)
+
+    totals = runner.contender_totals("polar-n4-clboss-r1-identity-a")
+
+    assert totals.mean_local_liquidity_sats == 950
+    assert totals.min_local_balance_ppm == 100_000
+    assert totals.max_local_balance_ppm == 900_000
+    assert totals.worst_channel_imbalance_ppm == 800_000
 
 
 def test_rebalance_cost_counts_only_completed_self_payments(monkeypatch):
@@ -437,6 +487,9 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
             "volume_msat": 0,
             "routing_fee_msat": 0,
             "mean_local_liquidity_sats": 500_000,
+            "ending_min_local_balance_ppm": 0,
+            "ending_max_local_balance_ppm": 0,
+            "ending_worst_channel_imbalance_ppm": 0,
             "policy_changes": 0,
             "rebalance_cost_msat": 0,
         },
@@ -445,6 +498,9 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
             "volume_msat": 0,
             "routing_fee_msat": 0,
             "mean_local_liquidity_sats": 500_000,
+            "ending_min_local_balance_ppm": 0,
+            "ending_max_local_balance_ppm": 0,
+            "ending_worst_channel_imbalance_ppm": 0,
             "policy_changes": 0,
             "rebalance_cost_msat": 0,
         },

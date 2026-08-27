@@ -399,6 +399,12 @@ showed why a mean-liquidity metric alone is insufficient: CLBOSS ended with
 sink-facing local balances near 5% and 32%, while the four-channel mean stayed
 near 50% because payer-facing balances increased by the same amount.
 
+Pressure-block scoring therefore also records each contender's ending minimum
+and maximum capacity-normalized local-balance ratio and its worst per-channel
+deviation from 50%. These end-state metrics make severe one-way depletion
+visible even when conservation of liquidity leaves the aggregate mean
+unchanged.
+
 Revenue-ops correctly found a profitable destination at 7.3% local liquidity,
 selected a 227,317-sat refill, and had sufficient budget, but its CLN 26 route
 quote initially failed. Two compatibility bugs were reproduced and fixed:
@@ -420,6 +426,59 @@ exactly 12 sats: the destination rose to 300,000 sats local, the source fell to
 remained, and 988 sats of the tournament allowance remained. This proves route
 quote, execution, settlement, actual-cost accounting, and budget reconciliation
 on CLN 26 without converting an uneconomic forced action into tournament score.
+
+### Final-image replica 9 validation
+
+Replica 9 used only the immutable `cl-revenue-ops-polar-clboss:d47819f`
+image, crossed revenue-ops onto identity A, and gave both controllers exactly
+1,000 sats of rebalance budget above their measured baselines. Its balanced
+block settled all 80 payments. CLBOSS carried 320,000,000 msat and earned
+3,574 msat; revenue-ops carried 27,433,823 msat and earned 389 msat. This is
+about 92.1% versus 7.9% of measured contender volume. Revenue-ops incorporated
+fresh flow evidence and changed policy once, but neither controller spent on a
+rebalance.
+
+The subsequent 70-payment, 20,000-sat one-way block also settled completely.
+CLBOSS carried 1,320,000,000 msat and earned 2,640 msat; revenue-ops carried
+80,000,000 msat and earned 1,480 msat. Revenue-ops therefore earned much more
+per routed sat, but CLBOSS still won 94.3% of route share. Revenue-ops raised
+its observed earning lane from 18 to 19 ppm while CLBOSS retained 2-ppm
+acquisition lanes. The other revenue-ops lane pair remained unused and ended
+at 0%/100% local liquidity. This confirms that the primary deficit is market
+acquisition and lane activation, not fee yield on traffic already won.
+
+The autonomous rebalancer did not reach route pricing: both depleted channels
+were `neutral`, so the conservative destination value gate reported
+`dest_not_valuable`. This is intentional fail-closed behavior, but it creates a
+cold-start loop in a competitive market: an unused lane cannot gain value
+evidence, and the controller will not spend to make that lane usable. The gate
+must not simply be removed. The next experiment should be opt-in and bounded:
+
+- select only one zero/low-evidence lane per controller at a time;
+- quote a short-lived acquisition fee treatment against 2, 5, and 10 ppm,
+  while leaving other lanes as controls;
+- cap experiment duration, routed volume, fee opportunity cost, and any
+  speculative refill spend independently of the normal value budget;
+- promote a lane only when incremental retained fee income exceeds refill and
+  opportunity costs over crossed identities and repeated replicas;
+- abandon and restore policy automatically when the evidence threshold or
+  experiment cap is reached.
+
+A non-scored live module check then moved 200,000 sats from the 90.7%-local
+lane into the 9.3%-local lane. The final image quoted and completed the native
+CLN 26 circular route without force for 12 sats: the source ended at 70.7%, the
+destination at 29.3%, the self-payment delivered 200,000,000 msat and sent
+200,011,806 msat, the unified total-cost view recorded 12 rebalance sats plus
+369 opening sats, no reservation survived, and 988 sats remained. A second
+attempt capped at 1 sat returned `no_route`, created no payment, spent nothing,
+and left no reservation. Read-only health, dashboard, profitability, report,
+capex, economic snapshot, budget, total-cost, and generic-ledger RPCs all
+returned valid schemas without changing policies or payment count.
+
+The runner now includes ending minimum/maximum capacity-normalized local
+balance and worst-channel imbalance in every complete or partial block. This
+made the untouched 0% lane visible even though each contender's four-channel
+mean remained almost exactly 50%.
 
 ## Module and failure coverage
 

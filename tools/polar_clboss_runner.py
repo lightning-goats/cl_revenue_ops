@@ -840,6 +840,9 @@ class Totals:
     mean_local_liquidity_sats: int
     policy_fingerprint: tuple[tuple[str, int, int], ...]
     rebalance_cost_msat: int = 0
+    min_local_balance_ppm: int = 0
+    max_local_balance_ppm: int = 0
+    worst_channel_imbalance_ppm: int = 0
 
 
 def msat_value(value: Any) -> int:
@@ -936,9 +939,15 @@ def contender_totals(container: str) -> Totals:
     settled = [row for row in forwards if isinstance(row, dict) and row.get("status") == "settled"]
     channels = active_channels(container)
     local_sats = []
+    local_balance_ppm = []
     policies = []
     for row in channels:
-        local_sats.append(msat_value(row.get("to_us_msat", 0)) // 1000)
+        to_us_msat = msat_value(row.get("to_us_msat", 0))
+        total_msat = msat_value(row.get("total_msat", 0))
+        if total_msat <= 0 or to_us_msat > total_msat:
+            raise RunnerError(f"invalid channel balance on {container}")
+        local_sats.append(to_us_msat // 1000)
+        local_balance_ppm.append(to_us_msat * 1_000_000 // total_msat)
         update = (row.get("updates") or {}).get("local") or {}
         policies.append(
             (
@@ -956,6 +965,11 @@ def contender_totals(container: str) -> Totals:
         mean_local_liquidity_sats=sum(local_sats) // len(local_sats),
         policy_fingerprint=tuple(sorted(policies)),
         rebalance_cost_msat=rebalance_cost_msat(container),
+        min_local_balance_ppm=min(local_balance_ppm),
+        max_local_balance_ppm=max(local_balance_ppm),
+        worst_channel_imbalance_ppm=max(
+            abs((2 * ratio) - 1_000_000) for ratio in local_balance_ppm
+        ),
     )
 
 
@@ -971,6 +985,9 @@ def totals_delta(before: Totals, after: Totals) -> dict[str, int]:
     values["mean_local_liquidity_sats"] = (
         before.mean_local_liquidity_sats + after.mean_local_liquidity_sats
     ) // 2
+    values["ending_min_local_balance_ppm"] = after.min_local_balance_ppm
+    values["ending_max_local_balance_ppm"] = after.max_local_balance_ppm
+    values["ending_worst_channel_imbalance_ppm"] = after.worst_channel_imbalance_ppm
     values["policy_changes"] = int(before.policy_fingerprint != after.policy_fingerprint)
     return values
 
@@ -1129,6 +1146,9 @@ def run_smoke(
                 "volume_msat": totals.volume_msat,
                 "routing_fee_msat": totals.routing_fee_msat,
                 "mean_local_liquidity_sats": totals.mean_local_liquidity_sats,
+                "min_local_balance_ppm": totals.min_local_balance_ppm,
+                "max_local_balance_ppm": totals.max_local_balance_ppm,
+                "worst_channel_imbalance_ppm": totals.worst_channel_imbalance_ppm,
                 "policy_fingerprint": totals.policy_fingerprint,
             }
             for name, totals in before.items()
