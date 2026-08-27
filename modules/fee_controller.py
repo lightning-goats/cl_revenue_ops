@@ -5879,6 +5879,7 @@ class FeeController:
         guard_streak: Optional[int] = None,
         downshift_streak: Optional[int] = None,
         rate_is_meaningful: Optional[bool] = None,
+        cold_start_no_earning_evidence: bool = False,
     ) -> Tuple[int, Optional[str]]:
         """Prevent stale DTS belief from raising fees during current silence."""
         try:
@@ -5897,6 +5898,20 @@ class FeeController:
         if rate_is_meaningful is False and rate > 0:
             rate = 0.0
             forwards = 0
+
+        # A fresh channel has no profitable-history belief worth protecting.
+        # Letting a prior-only Thompson sample raise its fee before the channel
+        # has won a single forward creates a self-reinforcing cold-start trap:
+        # the higher fee loses routes, so the controller never observes the
+        # demand needed to correct the sample.  Hold at the live fee (or the
+        # hard economic floor) until the first earning signal arrives.  This
+        # is intentionally narrower than the established-channel silence
+        # guard below, whose slower cadence protects sparse earners.
+        if cold_start_no_earning_evidence and rate == 0.0 and forwards == 0:
+            guarded = max(floor, min(target, current))
+            if guarded > current:
+                return guarded, "zero_flow_floor_override"
+            return guarded, "cold_start_zero_flow_guard"
 
         guard_thresh = (
             int(guard_streak) if guard_streak else self.ZERO_FLOW_GUARD_STREAK
@@ -7400,6 +7415,10 @@ class FeeController:
                 guard_streak=guard_streak,
                 downshift_streak=downshift_streak,
                 rate_is_meaningful=rate_is_meaningful,
+                cold_start_no_earning_evidence=(
+                    float(ts_state.thompson.positive_rate_ref or 0.0) <= 0.0
+                    and earning_anchor_ppm is None
+                ),
             )
             if zero_flow_guard_reason:
                 zero_flow_guard_target_ppm = blended_target_ppm

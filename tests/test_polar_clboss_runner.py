@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -185,6 +186,69 @@ def test_reconciled_traffic_preserves_unknown_operation(monkeypatch):
     assert caught.value.records == []
     assert caught.value.operation["outcome"] == "unknown_do_not_retry"
     assert caught.value.operation["payment_hash"] == "payment-hash"
+
+
+def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatch, tmp_path):
+    runner = load_runner()
+    state_file = runner.state_path(tmp_path, 1)
+    runner.write_json_atomic(
+        state_file,
+        {
+            "schema": runner.SCHEMA,
+            "status": "smoke_complete",
+            "events": [],
+            "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+            "contenders": {
+                "identity-a": {"container": "polar-n4-clboss-r1-identity-a"},
+                "identity-b": {"container": "polar-n4-clboss-r1-identity-b"},
+            },
+        },
+    )
+    totals = runner.Totals(0, 0, 0, 500_000, ())
+    monkeypatch.setattr(runner, "contender_totals", lambda _container: totals)
+    monkeypatch.setattr(
+        runner,
+        "traffic_schedule",
+        lambda _rounds, _amount: (("cln", "forward", 5_000), ("cln", "reverse", 5_000)),
+    )
+    monkeypatch.setattr(runner, "select_traffic_lanes", lambda direction, _family: ((direction, "sink"),))
+    completed = {
+        "round": 0,
+        "payer": "forward",
+        "sink": "sink",
+        "amount_sats": 5_000,
+        "payment": {"success": True},
+    }
+    calls = iter(
+        (
+            [completed],
+            runner.ReconciliationError(
+                "unknown", [], {"payment_hash": "hash", "outcome": "unknown_do_not_retry"}
+            ),
+        )
+    )
+
+    def traffic(*_args, **_kwargs):
+        result = next(calls)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(runner, "run_reconciled_traffic", traffic)
+
+    with pytest.raises(runner.ReconciliationError):
+        runner.run_smoke(
+            object(), replica=1, results_dir=tmp_path, rounds=1, amount_sats=5_000,
+            pause_seconds=0,
+        )
+
+    state = runner.read_state(state_file)
+    result = state["events"][-1]["result"]
+    assert state["status"] == "traffic_outcome_unknown"
+    assert result["completed_count"] == 1
+    progress = json.loads(Path(result["progress_file"]).read_text(encoding="utf-8"))
+    assert progress["records"] == [completed]
+    assert progress["uncertain_operation"]["payment_hash"] == "hash"
 
 
 def test_traffic_schedule_interleaves_directions_and_seeds_reserve_once():

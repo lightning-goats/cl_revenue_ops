@@ -294,6 +294,34 @@ recovers after that gate. If it does not, the first improvement experiment is a
 bounded cold-start/no-route-share exploration rule, evaluated against fee yield
 and safety rather than blindly restoring the deprecated gossip-price floor.
 
+The first native-timer endurance attempt ran until a reverse 100,000-sat payment
+exhausted usable path liquidity and ended in `WIRE_MPP_TIMEOUT`. The exact
+invoice remained unpaid and was never retried. Cumulative contender totals
+across the shakeouts and endurance traffic at that boundary were 38 forwards /
+472,031,315 msat / 23,018 msat fees for revenue-ops and 134 forwards /
+12,248,968,685 msat / 93,555 msat fees for CLBOSS (the totals include the
+earlier shakeouts). CLN's
+attempt history showed temporary channel failures on both revenue-ops paths,
+making liquidity exhaustion a real tournament result rather than a bridge-only
+failure.
+
+The first natural revenue-ops fee cycle ran after its jittered 1,848-second
+sleep. It raised every channel: 39->51, 40->77, 69->92, and 62->69 ppm. Two
+channels had zero forwards in the observation window, yet prior-only Thompson
+samples still raised them while CLBOSS advertised 1--15 ppm. The controller now
+applies a cold-start zero-flow guard when it has neither current forwards nor
+earning evidence: a prior-only sample cannot raise the live fee, although hard
+economic floors still win. Established sparse earners retain the slower cadence-
+scaled silence guard and downshift behavior.
+
+The endurance failure also exposed evidence-integrity defects in the runner.
+Each block now writes an atomic progress artifact before traffic begins and
+after every settled schedule entry, records its starting counters, preserves
+all prior successes when a later dispatch is uncertain, and changes state to
+`traffic_outcome_unknown` so another block cannot silently overlap it. Docker
+status also fails closed on daemon permission errors instead of reporting live
+containers as stopped.
+
 ## Module and failure coverage
 
 The same run must prove all retained `cl_revenue_ops` modules remain coherent:

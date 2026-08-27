@@ -1204,6 +1204,42 @@ def test_dry_run_load_initializes_unknown_broadcast_from_live_policy(
 
 
 class TestZeroFlowRatchetGuard:
+    def test_cold_start_without_earning_evidence_blocks_first_raise(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=20,
+            target_fee=100,
+            min_fee=15,
+            zero_revenue_streak=0,
+            forwards_since_update=0,
+            revenue_rate=0.0,
+            cold_start_no_earning_evidence=True,
+        )
+
+        assert guarded == 20
+        assert reason == "cold_start_zero_flow_guard"
+
+    def test_cold_start_guard_still_honors_hard_economic_floor(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
+
+        guarded, reason = fc._apply_zero_flow_ratchet_guard(
+            current_fee=10,
+            target_fee=100,
+            min_fee=15,
+            zero_revenue_streak=0,
+            forwards_since_update=0,
+            revenue_rate=0.0,
+            cold_start_no_earning_evidence=True,
+        )
+
+        assert guarded == 15
+        assert reason == "zero_flow_floor_override"
+
     def test_moderate_stall_blocks_upward_target(self, mock_plugin, mock_database):
         fc, _cfg = _make_fc_for_dts_pid(mock_plugin, mock_database)
 

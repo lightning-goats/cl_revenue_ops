@@ -904,25 +904,61 @@ def run_smoke(
     }
     before = {name: contender_totals(container) for name, container in controller_containers.items()}
     started = time.time()
+    block_id = f"smoke-{int(started)}"
+    progress_path = path.parent / f"{block_id}-progress.json"
+    progress: dict[str, Any] = {
+        "schema": "polar-clboss-traffic-progress-v1",
+        "block": block_id,
+        "replica": f"replica-{replica}",
+        "status": "running",
+        "before": {
+            name: {
+                "forward_count": totals.forward_count,
+                "volume_msat": totals.volume_msat,
+                "routing_fee_msat": totals.routing_fee_msat,
+                "mean_local_liquidity_sats": totals.mean_local_liquidity_sats,
+                "policy_fingerprint": totals.policy_fingerprint,
+            }
+            for name, totals in before.items()
+        },
+        "records": [],
+    }
+    write_json_atomic(progress_path, progress)
+    state["status"] = "smoke_running"
+    _checkpoint(
+        path,
+        state,
+        "smoke_started",
+        block=block_id,
+        progress_file=str(progress_path),
+    )
     records: list[dict[str, Any]] = []
     try:
         for family, direction, traffic_amount in traffic_schedule(rounds, amount_sats):
-            records.extend(
-                run_reconciled_traffic(
-                    bridge,
-                    network_id=NETWORK_ID,
-                    rounds=1,
-                    amount_sats=traffic_amount,
-                    pause_seconds=pause_seconds,
-                    lanes=select_traffic_lanes(direction, family),
-                )
+            completed = run_reconciled_traffic(
+                bridge,
+                network_id=NETWORK_ID,
+                rounds=1,
+                amount_sats=traffic_amount,
+                pause_seconds=pause_seconds,
+                lanes=select_traffic_lanes(direction, family),
             )
+            records.extend(completed)
+            progress["records"] = records
+            write_json_atomic(progress_path, progress)
     except ReconciliationError as exc:
+        records.extend(exc.records)
         result = {
             "status": "traffic_outcome_unknown",
-            "completed": exc.records,
+            "completed_count": len(records),
             "uncertain_operation": exc.operation,
+            "progress_file": str(progress_path),
         }
+        progress["status"] = "traffic_outcome_unknown"
+        progress["records"] = records
+        progress["uncertain_operation"] = exc.operation
+        write_json_atomic(progress_path, progress)
+        state["status"] = "traffic_outcome_unknown"
         _checkpoint(path, state, "traffic_unknown_do_not_retry", result=result)
         raise
     after = {name: contender_totals(container) for name, container in controller_containers.items()}
@@ -930,7 +966,7 @@ def run_smoke(
         "schema": "polar-clboss-smoke-v1",
         "replica": f"replica-{replica}",
         "league": "fee_only",
-        "block": f"smoke-{int(started)}",
+        "block": block_id,
         "duration_seconds": max(1.0, time.time() - started),
         "traffic": {
             "attempted": len(records),
@@ -943,6 +979,9 @@ def run_smoke(
             name: totals_delta(before[name], after[name]) for name in controller_containers
         },
     }
+    progress["status"] = "complete"
+    progress["records"] = records
+    write_json_atomic(progress_path, progress)
     state["status"] = "smoke_complete"
     _checkpoint(path, state, "smoke_complete", block=block)
     write_json_atomic(path.parent / f"{block['block']}.json", block)
