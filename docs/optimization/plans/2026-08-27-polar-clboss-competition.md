@@ -480,6 +480,81 @@ balance and worst-channel imbalance in every complete or partial block. This
 made the untouched 0% lane visible even though each contender's four-channel
 mean remained almost exactly 50%.
 
+### Bounded acquisition tournament and fix
+
+Replicas 11--13 executed the bounded per-lane experiment above with one
+sink-facing CLN lane treated and the sink-facing LND lane pinned as a control.
+Each scored block used 20 balanced rounds (80 reconciled payments), fresh
+wallets and channels, 5,000-sat nominal payments, isolated background routers,
+crossed identities, and equal 1,000-sat controller spend caps. Per-channel
+forward counters made the treatment effect observable independently of the
+other three contender lanes.
+
+Replica 11 tested the lowest value the global `min_fee_ppm` configuration
+accepted, 5 ppm. Revenue-ops carried 10,000,000 of 350,000,000 measured msat
+in two forwards, all on the treatment lane, and earned 50 msat. CLBOSS carried
+340,000,000 msat in 58 forwards and earned 2,680 msat. Its two sink-facing
+lanes were at 1 ppm, so the global 5-ppm floor prevented the experiment from
+matching the live market.
+
+That failed treatment exposed two runner recovery bugs: a rejected
+`revenue-config` mutation was treated as success, and a treatment checkpointed
+as `captured` could not be restored after a later mutation failed. RPC error
+responses are now validated, both `captured` and `active` treatments restore
+their peer policies and captured configuration, and cleanup invokes that
+restoration before stopping the controllers. The malformed 2-ppm attempt was
+restored and discarded without traffic.
+
+The plugin already had a safer class-specific mechanism:
+`min_fee_ppm_saturated` may lower the floor only for source/high-outbound
+channels while the normal 5-ppm global rail remains intact. Static peer policy
+execution nevertheless compared and clamped against the global floor, so it
+could not use that mechanism. Commit `9a1dba7` fixes static policy comparison
+and execution to pass the channel's class-aware effective floor. The full
+suite passed after the fix (3,826 passed, 5 skipped, 2 expected xfails), and a
+new immutable CLN 26.06.6 image read back a 1-ppm treatment without changing
+the 50-ppm node-wide minimum.
+
+Replica 12 then tested 1 ppm. All 80 payments settled, but revenue-ops carried
+no measured forwards; CLBOSS carried all 350,000,000 msat and earned 1,790
+msat. CLBOSS's two acquisition lanes were also 1 ppm. An exact proportional
+fee tie is therefore insufficient in this topology: path probability and tie
+breaking still select CLBOSS.
+
+Replica 13 tested the supported 0-ppm saturated-lane floor, the only bounded
+price undercut remaining. Revenue-ops carried 87,347,519 of 387,347,519
+measured contender-forward msat (22.55%) in 18 forwards and earned 388 msat.
+The treated CLN lane won 50,000,000 of the 125,000,000 CLN forward msat (40%)
+at zero fee; another revenue-ops lane carried 37,347,519 msat of monetized
+reverse traffic. CLBOSS still carried 300,000,000 measured msat in 50 forwards
+and earned 2,440 msat. Neither controller spent on rebalancing. Zero-price
+acquisition materially improves activation, but it does not by itself beat
+CLBOSS and it sacrifices direct income on the acquired direction.
+
+The actionable product change is therefore not a lower global fee. Add an
+opt-in, short-lived acquisition state for one source/high-outbound lane at a
+time. It may quote 0 ppm only when the observed competing floor is 1 ppm,
+retain the normal global floor on every other channel, and stop on independent
+duration, volume, opportunity-cost, and liquidity caps. Promotion must require
+incremental reverse-direction or later paid routing income to exceed the free
+egress opportunity cost plus any refill cost. A 1-ppm tie should not be
+promoted, and a zero-price treatment that cannot win route share should be
+abandoned automatically.
+
+Price is no longer the only measured deficit: even a strict 0-versus-1-ppm
+undercut won only 40% of the treated CLN market. The next tournament phase
+should rank channel placement and route quality (reliability history, CLTV,
+base fee, capacity, age, and payer reachability), repeat the 0-ppm treatment on
+both client families across crossed replicas, then apply one-way pressure and
+score whether acquired traffic can be retained at a positive fee after a
+bounded refill. That phase, rather than a more expensive 5/10-ppm sweep, is the
+remaining path to determining whether revenue-ops can surpass CLBOSS.
+
+The runner also now journals the real global round, client family, and traffic
+direction in restartable progress files and reports per-outgoing-channel
+volume, fees, and settled forward parts. This prevents partial blocks and
+within-node treatment/control effects from being hidden by aggregate totals.
+
 ## Module and failure coverage
 
 The same run must prove all retained `cl_revenue_ops` modules remain coherent:

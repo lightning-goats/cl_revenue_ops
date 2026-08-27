@@ -44,7 +44,7 @@ FUNDING_UTXO_SATS = 1_100_000
 # buffer still leaves the sink unable to spend the newly received balance.
 REVERSE_FEE_BUFFER_SATS = 25_000
 TOURNAMENT_CYCLE_SECONDS = 60
-ACQUISITION_MIN_PPM = 1
+ACQUISITION_MIN_PPM = 0
 BASELINE_POLL_SECONDS = 5.0
 BASELINE_POLL_ATTEMPTS = 19
 CONTAINER_RE = re.compile(r"^polar-n[1-9][0-9]*-clboss-r[1-9][0-9]*-identity-[ab]$")
@@ -80,6 +80,16 @@ def positive_int(value: str | int) -> int:
         raise argparse.ArgumentTypeError("must be a positive integer") from exc
     if parsed <= 0 or str(parsed) != str(value).strip():
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def nonnegative_arg(value: str | int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from exc
+    if parsed < 0 or str(parsed) != str(value).strip():
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
     return parsed
 
 
@@ -718,7 +728,11 @@ def _policy_write(
     ]
     if action == "set":
         arguments.extend(
-            ["strategy=static", f"fee_ppm={positive_int(fee_ppm)}", "expires_in_hours=1"]
+            [
+                "strategy=static",
+                f"fee_ppm={nonnegative_int(fee_ppm, 'acquisition fee')}",
+                "expires_in_hours=1",
+            ]
         )
     response = cln_rpc(container, *arguments)
     if response.get("error") or response.get("status") == "error":
@@ -739,7 +753,7 @@ def apply_acquisition_treatment(
     """Pin one revenue lane to a bounded acquisition fee and its peer as control."""
     if family not in {"cln", "lnd"}:
         raise RunnerError(f"unsupported acquisition family: {family!r}")
-    fee_ppm = positive_int(fee_ppm)
+    fee_ppm = nonnegative_int(fee_ppm, "acquisition fee")
     if fee_ppm < ACQUISITION_MIN_PPM:
         raise RunnerError(
             f"acquisition fee must respect the {ACQUISITION_MIN_PPM}-ppm absolute rail"
@@ -1627,7 +1641,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--background-ppm", type=positive_int, default=10_000)
     parser.add_argument("--spend-cap-sats", type=positive_int, default=1_000)
     parser.add_argument("--acquisition-family", choices=("cln", "lnd"), default="cln")
-    parser.add_argument("--acquisition-ppm", type=positive_int, default=2)
+    parser.add_argument("--acquisition-ppm", type=nonnegative_arg, default=2)
     parser.add_argument("--apply", action="store_true")
     return parser
 

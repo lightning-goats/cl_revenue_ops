@@ -449,14 +449,14 @@ def test_acquisition_treatment_pins_one_lane_and_restores_controls(monkeypatch, 
     monkeypatch.setattr(runner, "active_channels", lambda _container: rows)
 
     active = runner.apply_acquisition_treatment(
-        replica=1, results_dir=tmp_path, family="cln", fee_ppm=5
+        replica=1, results_dir=tmp_path, family="cln", fee_ppm=0
     )
 
     assert active["status"] == "acquisition_ready"
     assert active["acquisition_treatment"]["treatment_lane"]["fee_ppm"] == 18
     assert runtime == {
         "min_fee_ppm_saturated": 0,
-        "policies": {cln_peer: 5, lnd_peer: 15},
+        "policies": {cln_peer: 0, lnd_peer: 15},
     }
 
     restored = runner.restore_acquisition(replica=1, results_dir=tmp_path)
@@ -466,12 +466,12 @@ def test_acquisition_treatment_pins_one_lane_and_restores_controls(monkeypatch, 
     assert runtime == {"min_fee_ppm_saturated": 0, "policies": {}}
 
 
-def test_acquisition_treatment_requires_positive_fee(tmp_path):
+def test_acquisition_treatment_rejects_negative_fee(tmp_path):
     runner = load_runner()
 
-    with pytest.raises(runner.argparse.ArgumentTypeError, match="positive integer"):
+    with pytest.raises(runner.RunnerError, match="nonnegative integer"):
         runner.apply_acquisition_treatment(
-            replica=1, results_dir=tmp_path, family="cln", fee_ppm=0
+            replica=1, results_dir=tmp_path, family="cln", fee_ppm=-1
         )
 
 
@@ -630,7 +630,19 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
     }
     progress = json.loads(Path(result["progress_file"]).read_text(encoding="utf-8"))
     assert progress["records"] == [completed]
+    assert progress["records"][0] | {"payment": {}} == {
+        "round": 0,
+        "family": "cln",
+        "direction": "forward",
+        "payer": "forward",
+        "sink": "sink",
+        "amount_sats": 5_000,
+        "payment": {},
+    }
     assert progress["uncertain_operation"]["payment_hash"] == "hash"
+    assert progress["uncertain_operation"]["family"] == "cln"
+    assert progress["uncertain_operation"]["direction"] == "reverse"
+    assert progress["uncertain_operation"]["round"] == 0
     assert progress["partial_contenders"] == result["partial_contenders"]
 
 
