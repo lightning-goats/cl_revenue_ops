@@ -948,15 +948,25 @@ def run_smoke(
             write_json_atomic(progress_path, progress)
     except ReconciliationError as exc:
         records.extend(exc.records)
+        partial_after = {
+            name: contender_totals(container)
+            for name, container in controller_containers.items()
+        }
+        partial_contenders = {
+            name: totals_delta(before[name], partial_after[name])
+            for name in controller_containers
+        }
         result = {
             "status": "traffic_outcome_unknown",
             "completed_count": len(records),
             "uncertain_operation": exc.operation,
             "progress_file": str(progress_path),
+            "partial_contenders": partial_contenders,
         }
         progress["status"] = "traffic_outcome_unknown"
         progress["records"] = records
         progress["uncertain_operation"] = exc.operation
+        progress["partial_contenders"] = partial_contenders
         write_json_atomic(progress_path, progress)
         state["status"] = "traffic_outcome_unknown"
         _checkpoint(path, state, "traffic_unknown_do_not_retry", result=result)

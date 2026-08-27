@@ -246,9 +246,28 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
     result = state["events"][-1]["result"]
     assert state["status"] == "traffic_outcome_unknown"
     assert result["completed_count"] == 1
+    assert result["partial_contenders"] == {
+        "revenue_ops": {
+            "forward_count": 0,
+            "volume_msat": 0,
+            "routing_fee_msat": 0,
+            "mean_local_liquidity_sats": 500_000,
+            "policy_changes": 0,
+            "rebalance_cost_msat": 0,
+        },
+        "clboss": {
+            "forward_count": 0,
+            "volume_msat": 0,
+            "routing_fee_msat": 0,
+            "mean_local_liquidity_sats": 500_000,
+            "policy_changes": 0,
+            "rebalance_cost_msat": 0,
+        },
+    }
     progress = json.loads(Path(result["progress_file"]).read_text(encoding="utf-8"))
     assert progress["records"] == [completed]
     assert progress["uncertain_operation"]["payment_hash"] == "hash"
+    assert progress["partial_contenders"] == result["partial_contenders"]
 
 
 def test_traffic_schedule_interleaves_directions_and_seeds_reserve_once():

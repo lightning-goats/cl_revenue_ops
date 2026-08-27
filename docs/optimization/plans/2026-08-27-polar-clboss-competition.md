@@ -322,6 +322,25 @@ all prior successes when a later dispatch is uncertain, and changes state to
 status also fails closed on daemon permission errors instead of reporting live
 containers as stopped.
 
+Replica 2 crossed the identities and ran the patched controller from commit
+`e045430`. The first fee cycle emitted `cold_start_zero_flow_guard` and held a
+zero-flow source channel at 10 ppm; another zero-flow channel moved only to its
+15-ppm hard floor instead of following its 56-ppm prior-only blended target.
+Before reverse-path liquidity fragmented, 25 payments settled with no fallback:
+revenue-ops carried 186,718,637 of 675,000,000 msat (27.7%) and earned 1,898
+msat, while CLBOSS carried 488,281,363 msat and earned 5,195 msat. That is a
+material route-share improvement over replica 1's fully isolated zero-share
+smoke, but CLBOSS still led both volume and fees.
+
+The next reverse payment remained unpaid after the combined per-path spendable
+balance fragmented below a reliable 25,000-sat route. This is a fee-only league
+liquidity result: dynamic `htlc_max` correctly reflected each path's actual
+spendable balance, while neither controller was allowed to rebalance. In runner
+evidence, `forward_count` therefore means settled HTLC parts (MPP can make it
+larger than payment count); economic comparisons use routed volume and fees.
+Unknown blocks now persist partial contender volume, fee, liquidity, policy,
+and forwarding-part deltas in addition to the exact completed payment journal.
+
 ## Module and failure coverage
 
 The same run must prove all retained `cl_revenue_ops` modules remain coherent:
