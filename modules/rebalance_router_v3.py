@@ -414,8 +414,6 @@ class RebalanceRouterV3:
         # Re-probe live layers each call so layers created after engine
         # startup are picked up without a plugin restart.
         layers = list(self._probe_layers(layer_names_override))
-        if "auto.no_mpp_support" not in layers:
-            layers.append("auto.no_mpp_support")
         # The middle askrene query is source_peer -> dest_peer. If we leave
         # our pinned first/last-hop channels available, askrene can pick a
         # degenerate path that routes source_peer -> us -> dest_peer. That is
@@ -484,6 +482,11 @@ class RebalanceRouterV3:
                 "layers": layers,
                 "maxfee_msat": maxfee_msat,
                 "final_cltv": required_final_cltv,
+                # CLN 26 exposes single-part routing as a getroutes parameter.
+                # `auto.no_mpp_support` is an xpay-internal layer name, not a
+                # public Askrene layer; passing it on a plain CLN node fails
+                # the entire rebalance quote as unknown_layer.
+                "maxparts": 1,
             }
             if self.data_service is not None:
                 # timeout extends the RPC proxy ceiling only; DataService
