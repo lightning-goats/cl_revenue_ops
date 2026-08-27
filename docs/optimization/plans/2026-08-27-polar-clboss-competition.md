@@ -390,6 +390,37 @@ without reverse reserve seeding. Pressure blocks are separate from balanced
 fee blocks and must score recovered liquidity, actual circular-payment cost,
 post-rebalance routing income, and cap compliance.
 
+The first `forward-pressure` block sent 35 CLN and 35 LND payments at 20,000
+sats in one direction; all 70 settled. CLBOSS carried 1,340,000,000 of
+1,400,000,000 msat and earned 1,340 msat (exactly 1 ppm), while revenue-ops
+carried 60,000,000 msat and earned 300 msat at the experimental 5-ppm rail.
+Neither controller rebalanced during the scored block. Channel-level evidence
+showed why a mean-liquidity metric alone is insufficient: CLBOSS ended with
+sink-facing local balances near 5% and 32%, while the four-channel mean stayed
+near 50% because payer-facing balances increased by the same amount.
+
+Revenue-ops correctly found a profitable destination at 7.3% local liquidity,
+selected a 227,317-sat refill, and had sufficient budget, but its CLN 26 route
+quote initially failed. Two compatibility bugs were reproduced and fixed:
+
+- the router passed xpay's private/nonexistent `auto.no_mpp_support` name as an
+  Askrene layer; it now requests a single route through the public
+  `getroutes maxparts=1` parameter;
+- CLN 26 path hops use `node_id_out`, `amount_in_msat` / `amount_out_msat`, and
+  `cltv_out` instead of the older `next_node_id`, `amount_msat`, and `delay`
+  shape; the router now normalizes both schemas.
+
+With both fixes hot-deployed to the disposable contender, the same candidate
+produced a valid four-hop quote with 59.7% probability and 12-sat cost. The
+autonomous controller then held it as `below_hold_margin`, which is the correct
+economic decision at the temporary 5-ppm rail. A clearly non-scored,
+force-authorized executor check completed the 227,317-sat circular payment for
+exactly 12 sats: the destination rose to 300,000 sats local, the source fell to
+772,671 sats, the unified ledger recorded 12 rebalance sats, no reservation
+remained, and 988 sats of the tournament allowance remained. This proves route
+quote, execution, settlement, actual-cost accounting, and budget reconciliation
+on CLN 26 without converting an uneconomic forced action into tournament score.
+
 ## Module and failure coverage
 
 The same run must prove all retained `cl_revenue_ops` modules remain coherent:

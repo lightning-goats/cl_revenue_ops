@@ -113,18 +113,27 @@ def _translate_getroutes_error(error: str) -> Tuple[str, str]:
 def _translate_getroutes_hop_to_sendpay(hop: Dict[str, Any]) -> Dict[str, Any]:
     """Convert a getroutes path hop to sendpay route format.
 
-    getroutes uses `short_channel_id_dir` ("SCID/dir") + `next_node_id`,
-    while sendpay expects `channel` + `direction` + `id`. See research
-    Section 1.4 for the schema delta.
+    Older getroutes used `next_node_id` / `amount_msat` / `delay`. CLN 26
+    returns the explicit edge fields `node_id_out` / `amount_out_msat` /
+    `cltv_out`. Normalize either shape to sendpay's route contract.
     """
     scidd = hop["short_channel_id_dir"]
     scid, direction = scidd.rsplit("/", 1)
+    next_node_id = hop.get("next_node_id") or hop.get("node_id_out")
+    amount_msat = hop.get("amount_msat")
+    if amount_msat is None:
+        amount_msat = hop.get("amount_out_msat")
+    delay = hop.get("delay")
+    if delay is None:
+        delay = hop.get("cltv_out")
+    if next_node_id is None or amount_msat is None or delay is None:
+        raise KeyError("getroutes hop lacks next-node, amount, or delay fields")
     return {
-        "id": hop["next_node_id"],
+        "id": next_node_id,
         "channel": scid,
         "direction": int(direction),
-        "amount_msat": _parse_msat(hop["amount_msat"]),
-        "delay": int(hop["delay"]),
+        "amount_msat": _parse_msat(amount_msat),
+        "delay": int(delay),
         "style": "tlv",
     }
 
@@ -152,10 +161,10 @@ def _validate_getroutes_middle_path(
     """
     if not path:
         return False, "path_loops_through_us"
-    if path[-1]["next_node_id"] != dest_peer_id:
+    if (path[-1].get("next_node_id") or path[-1].get("node_id_out")) != dest_peer_id:
         return False, "path_loops_through_us"
     for hop in path:
-        if hop["next_node_id"] == our_node_id:
+        if (hop.get("next_node_id") or hop.get("node_id_out")) == our_node_id:
             return False, "path_loops_through_us"
     return True, ""
 
@@ -621,7 +630,12 @@ class RebalanceRouterV3:
         path = route.get("path", [])
         if not path:
             return 10**18
-        first_amt = _parse_msat(path[0]["amount_msat"])
+        first_raw = path[0].get("amount_msat")
+        if first_raw is None:
+            first_raw = path[0].get("amount_in_msat")
+        if first_raw is None:
+            return 10**18
+        first_amt = _parse_msat(first_raw)
         delivered = _parse_msat(route.get("amount_msat", 0))
         return max(0, first_amt - delivered)
 

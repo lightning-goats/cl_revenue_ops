@@ -283,6 +283,35 @@ def test_translate_hop_msat_string_input():
     assert out["amount_msat"] == 1000343
 
 
+def test_translate_hop_accepts_cln26_edge_schema():
+    from modules.rebalance_router_v3 import _translate_getroutes_hop_to_sendpay
+    hop = {
+        "short_channel_id_dir": "796x1x0/0",
+        "node_id_in": SRC_PEER,
+        "node_id_out": DST_PEER,
+        "amount_in_msat": 227_328_958,
+        "amount_out_msat": 227_327_731,
+        "cltv_in": 102,
+        "cltv_out": 22,
+    }
+
+    out = _translate_getroutes_hop_to_sendpay(hop)
+
+    assert out["id"] == DST_PEER
+    assert out["amount_msat"] == 227_327_731
+    assert out["delay"] == 22
+
+
+def test_route_fee_accepts_cln26_amount_in_schema():
+    from modules.rebalance_router_v3 import RebalanceRouterV3
+    route = {
+        "amount_msat": 227_320_000,
+        "path": [{"amount_in_msat": 227_328_958}],
+    }
+
+    assert RebalanceRouterV3._route_fee_msat(route) == 8_958
+
+
 # ---------------------------------------------------------------------------
 # Task 6: middle-path validator
 # ---------------------------------------------------------------------------
@@ -299,6 +328,24 @@ def test_validate_middle_accepts_clean_peer_to_peer():
     ok, reason = _validate_getroutes_middle_path(
         path, our_node_id=our_id, dest_peer_id=dst_peer
     )
+    assert ok is True
+    assert reason == ""
+
+
+def test_validate_middle_accepts_cln26_node_id_out_schema():
+    from modules.rebalance_router_v3 import _validate_getroutes_middle_path
+    path = [
+        {
+            "short_channel_id_dir": "100x1x0/0",
+            "node_id_in": SRC_PEER,
+            "node_id_out": DST_PEER,
+        }
+    ]
+
+    ok, reason = _validate_getroutes_middle_path(
+        path, our_node_id=OUR_ID, dest_peer_id=DST_PEER
+    )
+
     assert ok is True
     assert reason == ""
 
