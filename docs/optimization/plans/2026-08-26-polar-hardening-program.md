@@ -59,7 +59,8 @@ real Askrene below/at/above-ceiling and negative/positive-EV cases passed**.
 The first live positive-EV attempt proved route-failure cleanup and cooldown;
 the seeded retry proved alternate-route success, exact balance movement,
 reservation cleanup, and durable-failure clearing. Pending-settlement and
-restart cases remain.
+restart cases are now complete, including malformed-response fail-closed
+coverage and recovered synthetic-reservation linkage.
 
 For both payer families and real quoted routes, cover:
 
@@ -77,8 +78,11 @@ atomic settlement, released remainder, fresh reporting, and clean reconcile.
 
 ## Phase 4 — automation and soak
 
-Status: **deterministic MCP traffic driver hardened against ambiguous bridge
-failures; long-running simulation soak remains**.
+Status: **complete for the bounded acceptance soak**. The deterministic MCP
+driver is hardened against ambiguous bridge failures, and the client-
+stratified scorecard passed a 60-payment bidirectional soak across six observed
+amounts. Longer wall-clock endurance runs remain optional operational soak,
+not a release blocker for this change set.
 
 Run deterministic MCP bursts before and after longer Polar Simulation Designer
 activity windows. Vary payment sizes, direction, cadence, and client family;
@@ -87,10 +91,29 @@ that rejects cache-dependent or one-client-only improvements.
 
 ## Phase 5 — compatibility and release gate
 
-Status: **current bundled CLN campaign active; custom-image compatibility and
-release soak remain**.
+Status: **complete**. The bundled CLN 25.12 mixed-client campaign passed, and
+exact plugin commit `9a79eac` passed the retained-module and paused-cycle smoke
+matrix on the official Core Lightning v26.06.6 image. Polar's local version
+catalog stops at 25.12, so the recent-image node was attached temporarily to
+the existing Polar Docker network and removed after the smoke.
 
 Repeat the smoke subset with a custom current-CLN image after the bundled CLN
 25.12 campaign is stable. A change may advance only when focused tests and the
 full Python 3.11 suite pass, deployed source hashes match, all Polar cleanup
 rails read back correctly, and compact findings are committed.
+
+## 2026-08-26 completion addendum
+
+- `listsendpays` evidence is now strict at the settlement boundary. A
+  malformed root, payments collection, entry, status, or complete-payment
+  amount leaves the row and reservation pending for a later sweep.
+- Recovered pending rows persist their explicit synthetic reservation id;
+  restart reconciliation and stale cleanup no longer assume that every
+  reservation id equals the generated history id.
+- Live restart fault injection used one already-complete Polar payment and one
+  nonexistent payment hash. Both five-hour-old reservations survived restart;
+  the live sweep atomically produced `success/spent` and `failed/released`,
+  then reconciliation returned no divergences.
+- `tools/polar_soak_scorecard.py` captures all three router totals and retained
+  plugin modules, then rejects one-client, one-direction, one-size, ambiguous,
+  unattributed, or unsafe-final-state runs.

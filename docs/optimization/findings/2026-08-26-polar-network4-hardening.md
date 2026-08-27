@@ -132,8 +132,86 @@ sources at their native base 1,000 msat / 1 ppm. Every edge was active.
 
 ## Remaining high-value work
 
-1. Cover pending settlement, restart reconciliation, malformed
-   evidence, and reservation cleanup.
-2. Run longer client-stratified Polar Simulation Designer soaks, then restore
-   competitor policies and require a clean final reconciliation.
-3. Repeat the smoke matrix with the selected custom recent-CLN image.
+The three original follow-ups were completed in the continuation below.
+
+## Pending settlement and restart hardening
+
+Code review found two coupled restart hazards. First, a malformed but
+non-exceptional `listsendpays` payload was normalized to an empty payment list,
+which terminally failed the row and released its reservation despite ambiguous
+evidence. Second, when the initial history insert failed, the recovery row used
+a new numeric id while the actual reservation remained under a synthetic id.
+The stale sweep and reconciliation path assumed those ids were equal, so the
+real hold could be released or stranded.
+
+Settlement evidence now requires an object response, a list of object payment
+entries, known statuses, and parseable nonnegative complete-payment amounts
+with `amount_sent_msat >= amount_msat`. Malformed evidence logs a warning and
+leaves the row and reservation untouched. `rebalance_history` now has an
+additive nullable `reservation_id`; ordinary rows retain the legacy id fallback,
+while recovered rows persist the synthetic link. Both legacy and unified stale
+cleanup queries protect that explicit link.
+
+Focused recovery, reservation, atomic-settlement, replay, and reconciliation
+suites passed 99 tests; the broader rebalance/database/operator suite passed
+251 tests. The full Python 3.11 suite at that commit passed 3,749 tests, with
+five expected skips and two expected xfails.
+
+Exact commit `9a79eac680d2020d93840d5902415c255b9d48c2` was deployed over the
+existing network-4 database. Two ledger-backed reservations were linked to
+five-hour-old pending rows: one used the already-complete 49,996-sat Polar
+payment and one used a nonexistent hash. Both remained active across plugin
+restart and the stale cleanup boundary. One bounded live cycle had no
+executable candidates; its reconciliation sweep changed the rows to
+`success/spent` at zero fee and `failed/released`, respectively. The final
+econ reconcile reported zero divergences. The plugin was restarted dry-run,
+paused, with budget zero.
+
+## Mixed-client MCP soak
+
+`tools/polar_soak_scorecard.py` adds read-only before/after router snapshots
+and retained-module health checks. Its score rejects ambiguous payments,
+one-client or one-direction coverage, fewer than three payment sizes,
+incomplete router attribution, active reservations, dirty reconciliation, or
+unsafe final controls.
+
+The MCP driver settled all 60 payments: 30 per client family, with 15 forward
+and 15 reverse payments per family. The nominal 5,000, 15,000, and 35,000-sat
+matrix plus explicit return-liquidity buffers produced six observed amounts.
+
+| payer family | revenue node | CLN competitor | LND competitor |
+|---|---:|---:|---:|
+| LND | 30 (100%) | 0 | 0 |
+| CLN | 7 (23.3%) | 15 (50.0%) | 8 (26.7%) |
+
+The revenue node earned 9,280 msat during the LND phase and 2,457 msat during
+the CLN phase. The split at equal policies confirms that fee tuning must remain
+client-stratified; aggregate route share would conceal materially different
+client behavior. Fee, rebalance, profitability, budget, status, and economic
+reconciliation surfaces all remained readable. Final state was paused,
+dry-run, budget zero, zero active reservations, and zero divergences.
+
+Polar v4's MCP catalog exposes invoice/payment and node/network operations but
+does not expose Simulation Designer activity rules. The completed soak
+therefore used deterministic MCP-issued Polar payments rather than UI-only
+rules, preserving exact client, direction, size, cadence, and ambiguity
+evidence.
+
+## Recent Core Lightning compatibility
+
+Polar's local catalog ends at CLN 25.12. The latest official stable release at
+test time was Core Lightning v26.06.6, so a fresh official-image node was
+attached temporarily to network 4 without cloning the funded revenue identity.
+Exact plugin commit `9a79eac` started under Python 3.11 with dry-run, budget
+zero, and persisted pause. `revenue-status`, config, fee debug, rebalance debug,
+profitability, total-cost/capex budget, and econ reconcile all returned valid
+empty-node results. A paused rebalance-cycle action returned
+`suppressed/paused`, `safety_block=true`, and zero candidates/executions. The
+temporary v26.06.6 container and source archive were removed afterward.
+
+## Remaining optional endurance work
+
+No correctness or compatibility blocker remains from this program. An
+overnight or multi-day Simulation Designer run can still improve confidence in
+long-horizon controller convergence, but Polar does not currently expose those
+UI rules through MCP and the bounded client-stratified acceptance gates pass.
