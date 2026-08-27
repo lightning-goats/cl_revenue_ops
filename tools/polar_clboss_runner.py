@@ -143,11 +143,29 @@ def _json(command: Sequence[str], *, timeout: float = 120) -> dict[str, Any]:
     return payload
 
 
+def docker_exists(name: str) -> bool:
+    completed = _run(["docker", "inspect", name], check=False)
+    if completed.returncode == 0:
+        return True
+    detail = (completed.stderr or completed.stdout or "").casefold()
+    if "no such object" in detail or "no such container" in detail:
+        return False
+    raise RunnerError(f"cannot inspect Docker container {name!r}: {detail.strip()}")
+
+
 def docker_running(name: str) -> bool:
     completed = _run(
         ["docker", "inspect", "--format", "{{.State.Running}}", name], check=False
     )
-    return completed.returncode == 0 and completed.stdout.strip() == "true"
+    if completed.returncode == 0:
+        value = completed.stdout.strip()
+        if value in {"true", "false"}:
+            return value == "true"
+        raise RunnerError(f"Docker returned an invalid running state for {name!r}: {value!r}")
+    detail = (completed.stderr or completed.stdout or "").casefold()
+    if "no such object" in detail or "no such container" in detail:
+        return False
+    raise RunnerError(f"cannot inspect Docker container {name!r}: {detail.strip()}")
 
 
 def cln_rpc(container: str, *arguments: object) -> dict[str, Any]:
@@ -239,7 +257,7 @@ def _checkpoint(path: Path, state: dict[str, Any], event: str, **details: Any) -
 def launch_contender(
     *, name: str, identity: str, data_dir: Path, image: str, network_id: int
 ) -> None:
-    if docker_running(name) or _run(["docker", "inspect", name], check=False).returncode == 0:
+    if docker_exists(name):
         raise RunnerError(f"fresh-only setup refused because {name} already exists")
     data_dir.mkdir(parents=True, exist_ok=False)
     # The official entrypoint watches this directory before foregrounding
@@ -1038,7 +1056,7 @@ def cleanup(bridge: PolarMcp, *, replica: int, results_dir: Path) -> dict[str, A
         raise RunnerError(f"cleanup refused to remove containers with active channels: {remaining}")
     for row in state.get("contenders", {}).values():
         name = row["container"]
-        if _run(["docker", "inspect", name], check=False).returncode == 0:
+        if docker_exists(name):
             _run(["docker", "rm", "--force", name])
     state["status"] = "cleaned"
     _checkpoint(path, state, "cleanup_complete")

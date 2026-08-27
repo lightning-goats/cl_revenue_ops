@@ -40,6 +40,30 @@ def test_container_name_is_narrowly_scoped():
         runner.container_name(4, 2, "../backend1")
 
 
+def test_docker_running_fails_closed_when_daemon_is_unavailable(monkeypatch):
+    runner = load_runner()
+    result = type(
+        "Result",
+        (),
+        {"returncode": 1, "stdout": "", "stderr": "permission denied connecting to Docker"},
+    )()
+    monkeypatch.setattr(runner, "_run", lambda *_args, **_kwargs: result)
+
+    with pytest.raises(runner.RunnerError, match="cannot inspect Docker"):
+        runner.docker_running("polar-n4-clboss-r1-identity-a")
+
+
+def test_docker_running_reports_only_a_known_missing_container_as_absent(monkeypatch):
+    runner = load_runner()
+    result = type(
+        "Result", (), {"returncode": 1, "stdout": "", "stderr": "No such object: missing"}
+    )()
+    monkeypatch.setattr(runner, "_run", lambda *_args, **_kwargs: result)
+
+    assert runner.docker_running("missing") is False
+    assert runner.docker_exists("missing") is False
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [(123, 123), ("123msat", 123), ({"msat": 123}, 123), ({"msat": "123msat"}, 123)],
@@ -197,10 +221,11 @@ def test_launch_uses_official_entrypoint_contract(monkeypatch, tmp_path):
 
     def fake_run(command, **_kwargs):
         commands.append(command)
-        return type("Result", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+        return type(
+            "Result", (), {"returncode": 1, "stdout": "", "stderr": "No such object: test"}
+        )()
 
     monkeypatch.setattr(runner, "_run", fake_run)
-    monkeypatch.setattr(runner, "docker_running", lambda _name: False)
     data_dir = tmp_path / "lightning"
 
     runner.launch_contender(
