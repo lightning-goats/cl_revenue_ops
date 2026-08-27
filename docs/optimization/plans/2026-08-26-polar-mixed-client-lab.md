@@ -266,3 +266,9 @@ This plan explicitly excludes cl-hive, cl-mycelium, Sling, channel opening or
 closing by the plugin, swaps, and any production mutation. The old tournament
 harness may remain historical evidence, but it is not the acceptance harness
 for this standalone plugin until its retired cl-hive path is removed.
+
+The standalone head-to-head extension is specified in
+[`2026-08-27-polar-clboss-competition.md`](2026-08-27-polar-clboss-competition.md).
+It uses fresh equal-version contender identities, native controller timers,
+identity crossover, equal rebalance spend caps, and a capital-normalized paired
+score instead of the legacy tournament's observer-only CLBOSS mode.
