@@ -78,6 +78,18 @@ def positive_int(value: str | int) -> int:
     return parsed
 
 
+def nonnegative_int(value: object, label: str) -> int:
+    if isinstance(value, bool):
+        raise RunnerError(f"{label} must be a nonnegative integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RunnerError(f"{label} must be a nonnegative integer") from exc
+    if parsed < 0 or str(parsed) != str(value).strip():
+        raise RunnerError(f"{label} must be a nonnegative integer")
+    return parsed
+
+
 def assignment_for(replica: int) -> dict[str, str]:
     """Cross identities deterministically between replicas."""
     positive_int(replica)
@@ -583,6 +595,83 @@ def restore_background(state: dict[str, Any]) -> bool:
     return True
 
 
+def enable_full_stack(
+    *, replica: int, results_dir: Path, spend_cap_sats: int
+) -> dict[str, Any]:
+    """Enable equal rebalance authority without reopening topology authority."""
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if state.get("status") not in {"isolated_fee_only_ready", "smoke_complete"}:
+        raise RunnerError(f"replica is not eligible for full-stack mode: {state.get('status')}")
+    if state.get("background_restored") is True:
+        raise RunnerError("full-stack mode requires isolated background routes")
+
+    assignment = state["assignment"]
+    contenders = state["contenders"]
+    revenue_container = contenders[assignment["revenue_ops"]]["container"]
+    clboss_container = contenders[assignment["clboss"]]["container"]
+
+    revenue_debug = cln_rpc(
+        revenue_container, "revenue-rebalance-debug", "summary_only=true"
+    )
+    breakdown = (
+        revenue_debug.get("capital_controls", {})
+        .get("total_liquidity_breakdown", {})
+        .get("actual_spent_by_category", {})
+    )
+    if not isinstance(breakdown, dict):
+        raise RunnerError("revenue_ops lacks unified spend-category readback")
+    baseline_non_rebalance_sats = sum(
+        nonnegative_int(value, f"revenue spend category {key}")
+        for key, value in breakdown.items()
+        if key != "rebalance"
+    )
+    revenue_budget_sats = baseline_non_rebalance_sats + positive_int(spend_cap_sats)
+    cln_rpc(
+        revenue_container,
+        "revenue-config", "set", "daily_budget_sats", str(revenue_budget_sats),
+    )
+    revenue_status = cln_rpc(revenue_container, "revenue-status")
+    controls = revenue_status.get("operator_controls", {}).get("values", {})
+    if (
+        controls.get("paused") is not False
+        or controls.get("daily_budget_sats") != revenue_budget_sats
+    ):
+        raise RunnerError("revenue_ops full-stack budget readback mismatch")
+
+    for key, value in (
+        ("clboss-xrebalance-gain", "1"),
+        ("clboss-xrebalance-grant", "0"),
+        ("clboss-xrebalance-route-cost-floor", "auto"),
+    ):
+        cln_rpc(clboss_container, "setconfig", key, value)
+    cln_rpc(clboss_container, "setconfig", "clboss-rebalance-mode", "xrebalance")
+    configs = cln_rpc(clboss_container, "listconfigs").get("configs", {})
+    expected = {
+        "clboss-rebalance-mode": "xrebalance",
+        "clboss-xrebalance-gain": "1",
+        "clboss-xrebalance-grant": "0",
+        "clboss-xrebalance-route-cost-floor": "auto",
+    }
+    for key, value in expected.items():
+        row = configs.get(key, {}) if isinstance(configs, dict) else {}
+        if str(row.get("value_str")) != value:
+            raise RunnerError(f"CLBOSS full-stack readback mismatch for {key}")
+
+    state["league"] = "full_stack"
+    state["full_stack"] = {
+        "spend_cap_sats_per_controller": spend_cap_sats,
+        "revenue_baseline_non_rebalance_sats": baseline_non_rebalance_sats,
+        "revenue_runtime_budget_sats": revenue_budget_sats,
+        "revenue_rebalance_cost_baseline_msat": rebalance_cost_msat(revenue_container),
+        "clboss_rebalance_cost_baseline_msat": rebalance_cost_msat(clboss_container),
+        "clboss": expected,
+    }
+    state["status"] = "isolated_full_stack_ready"
+    _checkpoint(path, state, "full_stack_enabled", controls=state["full_stack"])
+    return state
+
+
 def start_revenue(container: str) -> dict[str, Any]:
     cln_rpc(
         container, "-k", "plugin", "subcommand=start", f"plugin={REVENUE_PLUGIN}",
@@ -708,6 +797,7 @@ class Totals:
     routing_fee_msat: int
     mean_local_liquidity_sats: int
     policy_fingerprint: tuple[tuple[str, int, int], ...]
+    rebalance_cost_msat: int = 0
 
 
 def msat_value(value: Any) -> int:
@@ -726,6 +816,30 @@ def msat_value(value: Any) -> int:
     if parsed < 0:
         raise RunnerError(f"negative msat value: {value!r}")
     return parsed
+
+
+def rebalance_cost_msat(container: str) -> int:
+    """Return fees spent by completed circular payments from this contender."""
+    node_id = str(cln_rpc(container, "getinfo").get("id") or "")
+    if not node_id:
+        raise RunnerError(f"getinfo returned no node id for {container}")
+    payments = cln_rpc(container, "listsendpays").get("payments", [])
+    if not isinstance(payments, list):
+        raise RunnerError(f"listsendpays returned no payment list for {container}")
+    cost = 0
+    for row in payments:
+        if (
+            not isinstance(row, dict)
+            or row.get("status") != "complete"
+            or row.get("destination") != node_id
+        ):
+            continue
+        sent = msat_value(row.get("amount_sent_msat", 0))
+        delivered = msat_value(row.get("amount_msat", 0))
+        if sent < delivered:
+            raise RunnerError(f"circular payment cost regressed on {container}")
+        cost += sent - delivered
+    return cost
 
 
 def contender_totals(container: str) -> Totals:
@@ -752,6 +866,7 @@ def contender_totals(container: str) -> Totals:
         routing_fee_msat=sum(msat_value(row.get("fee_msat", 0)) for row in settled),
         mean_local_liquidity_sats=sum(local_sats) // len(local_sats),
         policy_fingerprint=tuple(sorted(policies)),
+        rebalance_cost_msat=rebalance_cost_msat(container),
     )
 
 
@@ -760,6 +875,7 @@ def totals_delta(before: Totals, after: Totals) -> dict[str, int]:
         "forward_count": after.forward_count - before.forward_count,
         "volume_msat": after.volume_msat - before.volume_msat,
         "routing_fee_msat": after.routing_fee_msat - before.routing_fee_msat,
+        "rebalance_cost_msat": after.rebalance_cost_msat - before.rebalance_cost_msat,
     }
     if any(value < 0 for value in values.values()):
         raise RunnerError("contender cumulative counters regressed")
@@ -767,7 +883,6 @@ def totals_delta(before: Totals, after: Totals) -> dict[str, int]:
         before.mean_local_liquidity_sats + after.mean_local_liquidity_sats
     ) // 2
     values["policy_changes"] = int(before.policy_fingerprint != after.policy_fingerprint)
-    values["rebalance_cost_msat"] = 0
     return values
 
 
@@ -894,7 +1009,8 @@ def run_smoke(
     path = state_path(results_dir, replica)
     state = read_state(path)
     if state.get("status") not in {
-        "fee_only_ready", "smoke_complete", "isolated_fee_only_ready"
+        "fee_only_ready", "smoke_complete", "isolated_fee_only_ready",
+        "isolated_full_stack_ready",
     }:
         raise RunnerError(f"replica is not traffic-ready: {state.get('status')}")
     assignment = state["assignment"]
@@ -975,7 +1091,7 @@ def run_smoke(
     block = {
         "schema": "polar-clboss-smoke-v1",
         "replica": f"replica-{replica}",
-        "league": "fee_only",
+        "league": str(state.get("league") or "fee_only"),
         "block": block_id,
         "duration_seconds": max(1.0, time.time() - started),
         "traffic": {
@@ -1116,7 +1232,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("preflight", "setup", "isolate", "retune", "smoke", "status", "cleanup"),
+        choices=(
+            "preflight", "setup", "isolate", "retune", "full-stack", "smoke",
+            "status", "cleanup",
+        ),
     )
     parser.add_argument("--network-id", type=positive_int, default=NETWORK_ID)
     parser.add_argument("--replica", type=positive_int, default=1)
@@ -1126,6 +1245,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amount-sats", type=positive_int, default=5_000)
     parser.add_argument("--pause-seconds", type=float, default=0.1)
     parser.add_argument("--background-ppm", type=positive_int, default=10_000)
+    parser.add_argument("--spend-cap-sats", type=positive_int, default=1_000)
     parser.add_argument("--apply", action="store_true")
     return parser
 
@@ -1138,7 +1258,9 @@ def main() -> int:
     if args.command == "preflight":
         result = preflight(bridge, args.network_id, args.image)
     else:
-        if args.command in {"setup", "isolate", "retune", "smoke", "cleanup"} and not args.apply:
+        if args.command in {
+            "setup", "isolate", "retune", "full-stack", "smoke", "cleanup"
+        } and not args.apply:
             raise RunnerError(f"{args.command} mutates the fake-sat lab; pass --apply")
         if args.command == "setup":
             result = setup(
@@ -1154,6 +1276,12 @@ def main() -> int:
             result = retune_background(
                 replica=args.replica, results_dir=args.results_dir,
                 background_ppm=args.background_ppm,
+            )
+        elif args.command == "full-stack":
+            result = enable_full_stack(
+                replica=args.replica,
+                results_dir=args.results_dir,
+                spend_cap_sats=args.spend_cap_sats,
             )
         elif args.command == "smoke":
             if args.pause_seconds < 0:

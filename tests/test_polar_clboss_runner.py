@@ -121,6 +121,43 @@ def test_totals_delta_counts_policy_change_without_inventing_rebalance_cost():
     }
 
 
+def test_totals_delta_accounts_for_completed_circular_payment_cost():
+    runner = load_runner()
+    before = runner.Totals(0, 0, 0, 500_000, (), rebalance_cost_msat=100)
+    after = runner.Totals(0, 0, 0, 500_000, (), rebalance_cost_msat=375)
+
+    assert runner.totals_delta(before, after)["rebalance_cost_msat"] == 275
+
+
+def test_rebalance_cost_counts_only_completed_self_payments(monkeypatch):
+    runner = load_runner()
+
+    def rpc(_container, method, *_args):
+        if method == "getinfo":
+            return {"id": "our-node"}
+        assert method == "listsendpays"
+        return {
+            "payments": [
+                {
+                    "status": "complete", "destination": "our-node",
+                    "amount_msat": "100000msat", "amount_sent_msat": "100250msat",
+                },
+                {
+                    "status": "pending", "destination": "our-node",
+                    "amount_msat": 100000, "amount_sent_msat": 100999,
+                },
+                {
+                    "status": "complete", "destination": "someone-else",
+                    "amount_msat": 100000, "amount_sent_msat": 100999,
+                },
+            ]
+        }
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+
+    assert runner.rebalance_cost_msat("polar-n4-clboss-r1-identity-a") == 250
+
+
 def test_totals_delta_fails_closed_on_counter_regression():
     runner = load_runner()
     before = runner.Totals(2, 20_000, 20, 500_000, ())
@@ -282,6 +319,71 @@ def test_traffic_schedule_interleaves_directions_and_seeds_reserve_once():
         ("cln", "reverse", 5_000),
         ("lnd", "forward", 5_000),
         ("lnd", "reverse", 5_000),
+    )
+
+
+def test_full_stack_offsets_revenue_setup_spend_and_pins_clboss_controls(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 2)
+    runner.write_json_atomic(
+        path,
+        {
+            "schema": runner.SCHEMA,
+            "status": "isolated_fee_only_ready",
+            "events": [],
+            "assignment": {"revenue_ops": "identity-b", "clboss": "identity-a"},
+            "contenders": {
+                "identity-a": {"container": "polar-n4-clboss-r2-identity-a"},
+                "identity-b": {"container": "polar-n4-clboss-r2-identity-b"},
+            },
+        },
+    )
+    calls = []
+    expected = {
+        "clboss-rebalance-mode": "xrebalance",
+        "clboss-xrebalance-gain": "1",
+        "clboss-xrebalance-grant": "0",
+        "clboss-xrebalance-route-cost-floor": "auto",
+    }
+
+    def rpc(container, method, *args):
+        calls.append((container, method, args))
+        if method == "revenue-rebalance-debug":
+            return {
+                "capital_controls": {
+                    "total_liquidity_breakdown": {
+                        "actual_spent_by_category": {
+                            "rebalance": 0, "open": 369, "close": 0, "boltz": 0,
+                        }
+                    }
+                }
+            }
+        if method == "revenue-status":
+            return {
+                "operator_controls": {
+                    "values": {"paused": False, "daily_budget_sats": 1_369}
+                }
+            }
+        if method == "listconfigs":
+            return {"configs": {key: {"value_str": value} for key, value in expected.items()}}
+        return {}
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(runner, "rebalance_cost_msat", lambda _container: 0)
+
+    state = runner.enable_full_stack(replica=2, results_dir=tmp_path, spend_cap_sats=1_000)
+
+    assert state["status"] == "isolated_full_stack_ready"
+    assert state["full_stack"]["revenue_runtime_budget_sats"] == 1_369
+    assert any(
+        method == "revenue-config" and args[-1] == "1369"
+        for _container, method, args in calls
+    )
+    assert any(
+        method == "setconfig" and args == ("clboss-rebalance-mode", "xrebalance")
+        for _container, method, args in calls
     )
 
 
