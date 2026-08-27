@@ -392,7 +392,9 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
     monkeypatch.setattr(
         runner,
         "traffic_schedule",
-        lambda _rounds, _amount: (("cln", "forward", 5_000), ("cln", "reverse", 5_000)),
+        lambda _rounds, _amount, _pattern: (
+            ("cln", "forward", 5_000), ("cln", "reverse", 5_000)
+        ),
     )
     monkeypatch.setattr(runner, "select_traffic_lanes", lambda direction, _family: ((direction, "sink"),))
     completed = {
@@ -465,6 +467,17 @@ def test_traffic_schedule_interleaves_directions_and_seeds_reserve_once():
         ("cln", "reverse", 5_000),
         ("lnd", "forward", 5_000),
         ("lnd", "reverse", 5_000),
+    )
+
+
+def test_forward_pressure_schedule_is_one_way_without_reserve_seed():
+    runner = load_runner()
+
+    assert runner.traffic_schedule(2, 10_000, "forward-pressure") == (
+        ("cln", "forward", 10_000),
+        ("lnd", "forward", 10_000),
+        ("cln", "forward", 10_000),
+        ("lnd", "forward", 10_000),
     )
 
 

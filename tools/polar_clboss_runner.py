@@ -1070,14 +1070,19 @@ def run_reconciled_traffic(
 
 
 def traffic_schedule(
-    rounds: int, amount_sats: int
+    rounds: int, amount_sats: int, pattern: str = "balanced"
 ) -> tuple[tuple[str, str, int], ...]:
-    """Interleave directions and seed each family reserve exactly once."""
+    """Build balanced competition or one-way liquidity-pressure traffic."""
     if rounds <= 0 or amount_sats <= 0:
         raise RunnerError("traffic rounds and amount must be positive")
+    if pattern not in {"balanced", "forward-pressure"}:
+        raise RunnerError(f"unknown traffic pattern: {pattern}")
     schedule = []
     for round_index in range(rounds):
         for family in ("cln", "lnd"):
+            if pattern == "forward-pressure":
+                schedule.append((family, "forward", amount_sats))
+                continue
             forward_amount = amount_sats + (
                 REVERSE_FEE_BUFFER_SATS if round_index == 0 else 0
             )
@@ -1094,6 +1099,7 @@ def run_smoke(
     rounds: int,
     amount_sats: int,
     pause_seconds: float,
+    traffic_pattern: str = "balanced",
 ) -> dict[str, Any]:
     path = state_path(results_dir, replica)
     state = read_state(path)
@@ -1116,6 +1122,7 @@ def run_smoke(
         "block": block_id,
         "replica": f"replica-{replica}",
         "status": "running",
+        "traffic_pattern": traffic_pattern,
         "before": {
             name: {
                 "forward_count": totals.forward_count,
@@ -1139,7 +1146,9 @@ def run_smoke(
     )
     records: list[dict[str, Any]] = []
     try:
-        for family, direction, traffic_amount in traffic_schedule(rounds, amount_sats):
+        for family, direction, traffic_amount in traffic_schedule(
+            rounds, amount_sats, traffic_pattern
+        ):
             completed = run_reconciled_traffic(
                 bridge,
                 network_id=NETWORK_ID,
@@ -1194,6 +1203,7 @@ def run_smoke(
         "block": block_id,
         "duration_seconds": max(1.0, time.time() - started),
         "traffic": {
+            "pattern": traffic_pattern,
             "attempted": len(records),
             "settled": sum(
                 1 for row in records
@@ -1343,6 +1353,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rounds", type=positive_int, default=2)
     parser.add_argument("--amount-sats", type=positive_int, default=5_000)
     parser.add_argument("--pause-seconds", type=float, default=0.1)
+    parser.add_argument(
+        "--traffic-pattern",
+        choices=("balanced", "forward-pressure"),
+        default="balanced",
+    )
     parser.add_argument("--background-ppm", type=positive_int, default=10_000)
     parser.add_argument("--spend-cap-sats", type=positive_int, default=1_000)
     parser.add_argument("--apply", action="store_true")
@@ -1389,6 +1404,7 @@ def main() -> int:
                 bridge, replica=args.replica, results_dir=args.results_dir,
                 rounds=args.rounds, amount_sats=args.amount_sats,
                 pause_seconds=args.pause_seconds,
+                traffic_pattern=args.traffic_pattern,
             )
         elif args.command == "status":
             result = status(args.replica, args.results_dir)

@@ -341,6 +341,55 @@ larger than payment count); economic comparisons use routed volume and fees.
 Unknown blocks now persist partial contender volume, fee, liquidity, policy,
 and forwarding-part deltas in addition to the exact completed payment journal.
 
+### Full-stack calibration results
+
+Replica 5 completed the first repeatable 80-payment / 5,000-sat full-stack
+block with every payment reconciled. CLBOSS carried 345,000,000 of
+350,000,000 msat (98.6%) and earned 3,705 msat; revenue-ops carried
+5,000,000 msat and earned 75 msat. Neither controller rebalanced. This run
+exposed two harness fairness defects: revenue-ops still had its production
+3600/1800/900-second flow/fee/rebalance cadences, and late setup-opening costs
+reduced its nominal 1,000-sat rebalance allowance to 690 sats. The runner now
+uses explicit 60-second tournament cadences, waits for the setup spend ledger
+to become nonzero, offsets that exact baseline, and actively disables CLBOSS
+rebalancing when its completed circular-payment fees reach the same cap.
+
+Replica 7 repeated the same block with accelerated loop configuration but the
+pre-fix image. CLBOSS again carried 345,000,000 msat and earned 2,685 msat;
+revenue-ops carried 5,000,000 msat and earned 75 msat. Scheduled flow cycles
+were visibly running every 52--55 seconds, but channel-state timestamps and
+forward counts remained at their pre-traffic values. The cause was a fixed
+1,800-second `FlowAnalyzer` cache: the supported 60-second flow interval could
+not produce a fresh analysis. The cache TTL now scales to half the configured
+flow interval, capped at the historical 1,800-second default. The complete
+suite passed after the fix (3,817 passed, 5 skipped, 2 expected xfails).
+
+Replica 8 crossed the identities and ran the corrected image at commit
+`f028c0f`. All 80 payments settled. Revenue-ops flow state now incorporated
+four settled forward parts and its policy changed during the block. Route share
+improved to 17,317,016 of 350,000,000 msat (4.95%) with 248 msat earned, but
+CLBOSS still carried 332,682,984 msat and earned 3,616 msat. The causal fee
+readback was decisive: revenue-ops raised the earning sink lane from 15 to 18
+ppm after observing flow, while CLBOSS held the competing cheap lanes at 1 ppm
+and priced its opposite lanes at 29--34 ppm.
+
+A supported 5-ppm hard-rail counterfactual on the same replica did not close
+the gap. Revenue-ops carried only 10,000,000 of 350,000,000 msat (2.9%) and
+earned 50 msat; CLBOSS carried 340,000,000 msat and earned 3,532 msat. A global
+lower fee cap is therefore not the improvement to promote. The result calls for
+a bounded acquisition experiment that can identify a losing route market,
+limit the number/duration/capital exposure of sub-economic quotes, and measure
+incremental retained fee income before promotion. The deprecated remote-peer
+market boundary remains disabled because unrelated remote policies are not a
+safe global price anchor.
+
+Balanced alternating traffic kept both contenders near 50% mean local
+liquidity, so it cannot score rebalancing quality. The runner now also supports
+`--traffic-pattern forward-pressure`, which sends one-way CLN and LND traffic
+without reverse reserve seeding. Pressure blocks are separate from balanced
+fee blocks and must score recovered liquidity, actual circular-payment cost,
+post-rebalance routing income, and cap compliance.
+
 ## Module and failure coverage
 
 The same run must prove all retained `cl_revenue_ops` modules remain coherent:
