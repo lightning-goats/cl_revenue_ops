@@ -47,6 +47,8 @@ TOURNAMENT_CYCLE_SECONDS = 60
 ACQUISITION_MIN_PPM = 0
 BASELINE_POLL_SECONDS = 5.0
 BASELINE_POLL_ATTEMPTS = 19
+NATIVE_CYCLE_POLL_SECONDS = 5.0
+NATIVE_CYCLE_POLL_ATTEMPTS = 37
 CONTAINER_RE = re.compile(r"^polar-n[1-9][0-9]*-clboss-r[1-9][0-9]*-identity-[ab]$")
 EXPECTED_ORIGINALS = (
     "backend1",
@@ -479,6 +481,62 @@ def wait_channels(contenders: dict[str, dict[str, str]], count: int = 4) -> None
     raise RunnerError(f"contender channels did not become active: {last}")
 
 
+def peer_families(network_id: int) -> dict[str, dict[str, str]]:
+    """Return the four original peer IDs that define scored traffic lanes."""
+    return {
+        str(cln_rpc(f"polar-n{network_id}-cln-payer", "getinfo")["id"]): {
+            "family": "cln", "side": "payer",
+        },
+        str(lnd_rpc(f"polar-n{network_id}-lnd-payer", "getinfo")["identity_pubkey"]): {
+            "family": "lnd", "side": "payer",
+        },
+        str(cln_rpc(f"polar-n{network_id}-cln-sink", "getinfo")["id"]): {
+            "family": "cln", "side": "sink",
+        },
+        str(lnd_rpc(f"polar-n{network_id}-lnd-sink", "getinfo")["identity_pubkey"]): {
+            "family": "lnd", "side": "sink",
+        },
+    }
+
+
+def resolve_lane_map(
+    state: dict[str, Any], *, network_id: int = NETWORK_ID
+) -> dict[str, dict[str, dict[str, str]]]:
+    """Map every contender SCID to client family and payer/sink side.
+
+    The mapping is derived from live peer IDs rather than funding-RPC return
+    shapes, which differ between CLN and LND.  Missing or duplicate lanes fail
+    closed so family economics can never be silently misattributed.
+    """
+    peers = peer_families(network_id)
+    lane_map: dict[str, dict[str, dict[str, str]]] = {}
+    contenders = state.get("contenders")
+    if not isinstance(contenders, dict):
+        raise RunnerError("runner state lacks contenders for lane mapping")
+    for identity, contender in contenders.items():
+        container = contender.get("container") if isinstance(contender, dict) else None
+        if not isinstance(container, str) or not container:
+            raise RunnerError(f"contender {identity} lacks a container")
+        mapped: dict[str, dict[str, str]] = {}
+        roles: set[tuple[str, str]] = set()
+        for row in active_channels(container):
+            scid = str(row.get("short_channel_id") or "")
+            peer_id = str(row.get("peer_id") or "")
+            role = peers.get(peer_id)
+            if not scid or role is None:
+                raise RunnerError(f"cannot attribute contender lane {identity}:{scid}")
+            role_key = (role["family"], role["side"])
+            if role_key in roles:
+                raise RunnerError(f"duplicate contender lane role {identity}:{role_key}")
+            roles.add(role_key)
+            mapped[scid] = {**role, "peer_id": peer_id}
+        expected = {(family, side) for family in ("cln", "lnd") for side in ("payer", "sink")}
+        if roles != expected:
+            raise RunnerError(f"incomplete contender lane map for {identity}: {sorted(roles)}")
+        lane_map[str(identity)] = mapped
+    return lane_map
+
+
 def set_initial_fees(contenders: dict[str, dict[str, str]], ppm: int = 10) -> None:
     for row in contenders.values():
         result = cln_rpc(row["container"], "setchannel", "all", 1, ppm)
@@ -740,11 +798,167 @@ def _policy_write(
     return response
 
 
-def _revenue_config_set(container: str, key: str, value: int) -> dict[str, Any]:
-    response = cln_rpc(container, "revenue-config", "set", key, str(value))
+def _revenue_config_set(container: str, key: str, value: int | bool) -> dict[str, Any]:
+    rendered = str(value).lower() if isinstance(value, bool) else str(value)
+    response = cln_rpc(container, "revenue-config", "set", key, rendered)
     if response.get("error") or response.get("status") == "error":
         raise RunnerError(f"revenue-config set {key} failed: {response}")
     return response
+
+
+def _acquisition_rows(container: str) -> list[dict[str, Any]]:
+    rows = cln_rpc(container, "revenue-status").get("acquisition_experiments")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise RunnerError("revenue-status returned malformed acquisition experiments")
+    return rows
+
+
+def start_automatic_acquisition(
+    *, replica: int, results_dir: Path,
+    attempts: int = NATIVE_CYCLE_POLL_ATTEMPTS,
+    poll_seconds: float = NATIVE_CYCLE_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Enable the product's default-off acquisition gate and await native admission."""
+    if attempts <= 0 or poll_seconds < 0:
+        raise RunnerError("invalid automatic acquisition polling bounds")
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if state.get("status") not in {"isolated_full_stack_ready", "smoke_complete"}:
+        raise RunnerError(f"replica is not automatic-acquisition-ready: {state.get('status')}")
+    if "automatic_acquisition" in state or "acquisition_treatment" in state:
+        raise RunnerError("an acquisition treatment capture already exists")
+    identity = state["assignment"]["revenue_ops"]
+    container = state["contenders"][identity]["container"]
+    lanes = acquisition_lanes(state)
+    policies = cln_rpc(container, "revenue-policy", "list").get("policies")
+    if not isinstance(policies, list):
+        raise RunnerError("revenue-policy list returned malformed policies")
+    lane_peers = {lane["peer_id"] for lane in lanes.values()}
+    if any(
+        isinstance(row, dict) and row.get("peer_id") in lane_peers for row in policies
+    ):
+        raise RunnerError("automatic acquisition refuses explicit sink-lane policies")
+    controls = (
+        cln_rpc(container, "revenue-status")
+        .get("operator_controls", {})
+        .get("values", {})
+    )
+    original_enabled = controls.get("acquisition_experiment_enabled")
+    if not isinstance(original_enabled, bool):
+        raise RunnerError("automatic acquisition lacks boolean gate readback")
+    original_min = nonnegative_int(
+        controls.get("min_fee_ppm_saturated"),
+        "revenue saturated-channel minimum fee",
+    )
+    state["automatic_acquisition"] = {
+        "status": "captured",
+        "previous_status": state["status"],
+        "original_acquisition_experiment_enabled": original_enabled,
+        "original_min_fee_ppm_saturated": original_min,
+        "lanes_before": lanes,
+    }
+    _checkpoint(path, state, "automatic_acquisition_captured")
+    _revenue_config_set(container, "min_fee_ppm_saturated", 0)
+    _revenue_config_set(container, "acquisition_experiment_enabled", True)
+    last_rows: list[dict[str, Any]] = []
+    for attempt in range(attempts):
+        last_rows = _acquisition_rows(container)
+        active = [row for row in last_rows if row.get("state") == "active"]
+        if len(active) > 1:
+            raise RunnerError("automatic acquisition admitted more than one active lane")
+        if active:
+            episode = active[0]
+            matching = [
+                lane for lane in acquisition_lanes(state).values()
+                if lane["channel_id"] == str(episode.get("channel_id"))
+            ]
+            if len(matching) != 1:
+                raise RunnerError("automatic acquisition selected an unscored lane")
+            lane = matching[0]
+            target_ppm = nonnegative_int(
+                episode.get("target_fee_ppm"), "automatic acquisition target fee"
+            )
+            if lane["fee_ppm"] == target_ppm:
+                state["automatic_acquisition"].update(
+                    status="active", episode=episode, lane=lane,
+                )
+                state["status"] = "automatic_acquisition_ready"
+                _checkpoint(path, state, "automatic_acquisition_active")
+                return state
+        if attempt + 1 < attempts:
+            time.sleep(poll_seconds)
+    state["status"] = "automatic_acquisition_waiting"
+    _checkpoint(path, state, "automatic_acquisition_timeout", rows=last_rows)
+    raise RunnerError("native fee cycles did not admit an acquisition lane before timeout")
+
+
+def start_retention_treatment(
+    *, replica: int, results_dir: Path, fee_ppm: int,
+    attempts: int = NATIVE_CYCLE_POLL_ATTEMPTS,
+    poll_seconds: float = NATIVE_CYCLE_POLL_SECONDS,
+) -> dict[str, Any]:
+    """End automatic acquisition and price its proven lane above zero."""
+    fee_ppm = nonnegative_int(fee_ppm, "retention fee")
+    if fee_ppm <= ACQUISITION_MIN_PPM:
+        raise RunnerError("retention fee must be above the acquisition price")
+    if attempts <= 0 or poll_seconds < 0:
+        raise RunnerError("invalid retention polling bounds")
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    automatic = state.get("automatic_acquisition")
+    if state.get("status") != "smoke_complete" or not isinstance(automatic, dict):
+        raise RunnerError("retention requires a completed automatic-acquisition smoke block")
+    if automatic.get("status") != "active" or "retention_treatment" in state:
+        raise RunnerError("retention requires one active, untreated acquisition episode")
+    identity = state["assignment"]["revenue_ops"]
+    container = state["contenders"][identity]["container"]
+    episode = automatic.get("episode")
+    lane = automatic.get("lane")
+    if not isinstance(episode, dict) or not isinstance(lane, dict):
+        raise RunnerError("retention lacks captured acquisition evidence")
+    experiment_id = nonnegative_int(episode.get("id"), "acquisition experiment id")
+    baseline_ppm = nonnegative_int(
+        episode.get("baseline_fee_ppm"), "acquisition baseline fee"
+    )
+    _revenue_config_set(container, "acquisition_experiment_enabled", False)
+    completed: dict[str, Any] | None = None
+    for attempt in range(attempts):
+        rows = _acquisition_rows(container)
+        completed = next(
+            (row for row in rows if row.get("id") == experiment_id and row.get("state") == "completed"),
+            None,
+        )
+        live_lane = next(
+            (row for row in acquisition_lanes(state).values() if row["channel_id"] == lane["channel_id"]),
+            None,
+        )
+        if completed is not None and live_lane is not None and live_lane["fee_ppm"] == baseline_ppm:
+            break
+        if attempt + 1 < attempts:
+            time.sleep(poll_seconds)
+    else:
+        raise RunnerError("automatic acquisition did not restore its captured baseline")
+    _policy_write(container, "set", lane["peer_id"], fee_ppm=fee_ppm)
+    for attempt in range(attempts):
+        live_lane = next(
+            (row for row in acquisition_lanes(state).values() if row["channel_id"] == lane["channel_id"]),
+            None,
+        )
+        if live_lane is not None and live_lane["fee_ppm"] == fee_ppm:
+            state["retention_treatment"] = {
+                "status": "active",
+                "fee_ppm": fee_ppm,
+                "baseline_fee_ppm": baseline_ppm,
+                "lane": live_lane,
+                "completed_acquisition": completed,
+            }
+            automatic["status"] = "completed"
+            state["status"] = "retention_ready"
+            _checkpoint(path, state, "retention_treatment_active")
+            return state
+        if attempt + 1 < attempts:
+            time.sleep(poll_seconds)
+    raise RunnerError("native fee cycles did not apply the retention price before timeout")
 
 
 def apply_acquisition_treatment(
@@ -865,6 +1079,50 @@ def restore_acquisition(*, replica: int, results_dir: Path) -> dict[str, Any]:
     if not restore_acquisition_treatment(state):
         raise RunnerError("no active acquisition treatment to restore")
     _checkpoint(path, state, "acquisition_treatment_restored")
+    return state
+
+
+def restore_automatic_treatments(state: dict[str, Any]) -> bool:
+    """Restore automatic-acquisition controls and remove paid-retention policy."""
+    automatic = state.get("automatic_acquisition")
+    retention = state.get("retention_treatment")
+    if not isinstance(automatic, dict):
+        return False
+    identity = state["assignment"]["revenue_ops"]
+    container = state["contenders"][identity]["container"]
+    if isinstance(retention, dict) and retention.get("status") == "active":
+        lane = retention.get("lane")
+        if not isinstance(lane, dict) or not lane.get("peer_id"):
+            raise RunnerError("retention restoration lacks captured lane state")
+        _policy_write(container, "delete", str(lane["peer_id"]))
+        retention["status"] = "restored"
+    # Disable first so an active persisted episode selects its exact captured
+    # baseline on the forced cleanup cycle. Scored phases never force cycles.
+    _revenue_config_set(container, "acquisition_experiment_enabled", False)
+    cln_rpc(container, "revenue-fee-cycle")
+    _revenue_config_set(
+        container,
+        "min_fee_ppm_saturated",
+        nonnegative_int(
+            automatic.get("original_min_fee_ppm_saturated"),
+            "captured saturated-channel minimum fee",
+        ),
+    )
+    original_enabled = automatic.get("original_acquisition_experiment_enabled")
+    if not isinstance(original_enabled, bool):
+        raise RunnerError("automatic acquisition lacks captured boolean gate")
+    _revenue_config_set(container, "acquisition_experiment_enabled", original_enabled)
+    automatic["status"] = "restored"
+    return True
+
+
+def restore_automatic(*, replica: int, results_dir: Path) -> dict[str, Any]:
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if not restore_automatic_treatments(state):
+        raise RunnerError("no automatic acquisition treatment to restore")
+    state["status"] = "isolated_full_stack_ready"
+    _checkpoint(path, state, "automatic_acquisition_restored")
     return state
 
 
@@ -1012,6 +1270,8 @@ def setup(
         _checkpoint(path, state, "channels_open_dispatched", count=len(state["channels"]))
         wait_channels(state["contenders"])
         _checkpoint(path, state, "channels_active")
+        state["lane_map"] = resolve_lane_map(state, network_id=network_id)
+        _checkpoint(path, state, "lane_map_captured", lane_map=state["lane_map"])
         set_initial_fees(state["contenders"])
         _checkpoint(path, state, "initial_fees_set", fee_ppm=10)
 
@@ -1226,6 +1486,50 @@ def totals_delta(before: Totals, after: Totals) -> dict[str, Any]:
     return values
 
 
+def family_metrics(
+    contender_delta: dict[str, Any], lane_map: dict[str, dict[str, str]]
+) -> dict[str, dict[str, int]]:
+    """Aggregate a contender delta by the outgoing channel's client family."""
+    result = {
+        family: {"forward_count": 0, "volume_msat": 0, "routing_fee_msat": 0}
+        for family in ("cln", "lnd")
+    }
+    channels = contender_delta.get("channels")
+    if not isinstance(channels, dict):
+        raise RunnerError("contender delta lacks per-channel metrics")
+    for scid, row in channels.items():
+        lane = lane_map.get(str(scid))
+        if lane is None:
+            raise RunnerError(f"cannot attribute nonzero channel metrics for {scid}")
+        family = lane.get("family")
+        if family not in result or not isinstance(row, dict):
+            raise RunnerError(f"malformed family attribution for {scid}")
+        for metric in ("forward_count", "volume_msat", "routing_fee_msat"):
+            result[family][metric] += nonnegative_int(
+                row.get(metric), f"{scid}.{metric}"
+            )
+    for metric in ("forward_count", "volume_msat", "routing_fee_msat"):
+        if sum(result[family][metric] for family in result) != contender_delta[metric]:
+            raise RunnerError(f"family {metric} does not reconcile to contender total")
+    return result
+
+
+def block_safety_violations(
+    before: dict[str, Totals], after: dict[str, Totals]
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Detect scored-window topology changes and unsupported counter shapes."""
+    overall: list[str] = []
+    by_contender: dict[str, list[str]] = {name: [] for name in before}
+    for name in before:
+        old_scids = {row[0] for row in before[name].policy_fingerprint}
+        new_scids = {row[0] for row in after[name].policy_fingerprint}
+        if old_scids != new_scids:
+            violation = f"{name}:active_channel_set_changed"
+            overall.append(violation)
+            by_contender[name].append("active_channel_set_changed")
+    return overall, by_contender
+
+
 def _invoice_hash(invoice: str) -> str:
     payload = cln_rpc(f"polar-n{NETWORK_ID}-cln-payer", "decode", invoice)
     payment_hash = payload.get("payment_hash")
@@ -1312,6 +1616,7 @@ def run_reconciled_traffic(
                     "payer": payer,
                     "sink": sink,
                     "amount_sats": amount_sats,
+                    "payment_hash": payment_hash,
                     "payment": payment,
                 }
             )
@@ -1357,6 +1662,7 @@ def run_smoke(
     if state.get("status") not in {
         "fee_only_ready", "smoke_complete", "isolated_fee_only_ready",
         "isolated_full_stack_ready", "acquisition_ready",
+        "automatic_acquisition_ready", "retention_ready",
     }:
         raise RunnerError(f"replica is not traffic-ready: {state.get('status')}")
     assignment = state["assignment"]
@@ -1364,6 +1670,10 @@ def run_smoke(
         controller: state["contenders"][identity]["container"]
         for controller, identity in assignment.items()
     }
+    cache_mode = "warm" if any(
+        event.get("event") == "smoke_complete"
+        for event in state.get("events", []) if isinstance(event, dict)
+    ) else "cold"
     before = {name: contender_totals(container) for name, container in controller_containers.items()}
     started = time.time()
     block_id = f"smoke-{int(started)}"
@@ -1393,6 +1703,12 @@ def run_smoke(
     treatment = state.get("acquisition_treatment")
     if isinstance(treatment, dict) and treatment.get("status") == "active":
         progress["acquisition_treatment"] = treatment
+    automatic = state.get("automatic_acquisition")
+    if isinstance(automatic, dict) and automatic.get("status") == "active":
+        progress["automatic_acquisition"] = automatic
+    retention = state.get("retention_treatment")
+    if isinstance(retention, dict) and retention.get("status") == "active":
+        progress["retention_treatment"] = retention
     write_json_atomic(progress_path, progress)
     state["status"] = "smoke_running"
     _checkpoint(
@@ -1472,26 +1788,76 @@ def run_smoke(
         _checkpoint(path, state, "traffic_unknown_do_not_retry", result=result)
         raise
     after = {name: contender_totals(container) for name, container in controller_containers.items()}
+    lane_map = state.get("lane_map")
+    if not isinstance(lane_map, dict):
+        lane_map = resolve_lane_map(state, network_id=NETWORK_ID)
+        state["lane_map"] = lane_map
+        _checkpoint(path, state, "lane_map_captured", lane_map=lane_map)
+    controller_lane_maps = {}
+    for controller, identity in assignment.items():
+        mapped = lane_map.get(identity)
+        if not isinstance(mapped, dict):
+            raise RunnerError(f"lane map missing for {controller}")
+        controller_lane_maps[controller] = mapped
+    contender_deltas = {
+        name: totals_delta(before[name], after[name]) for name in controller_containers
+    }
+    family_deltas = {
+        name: family_metrics(contender_deltas[name], controller_lane_maps[name])
+        for name in controller_containers
+    }
+    safety_violations, contender_violations = block_safety_violations(before, after)
+    for name, violations in contender_violations.items():
+        contender_deltas[name]["safety_violations"] = violations
+    family_rows = {}
+    for family in ("cln", "lnd"):
+        family_records = [row for row in records if row.get("family") == family]
+        family_rows[family] = {
+            "attempted": len(family_records),
+            "settled": sum(
+                1 for row in family_records
+                if isinstance(row.get("payment"), dict)
+                and row["payment"].get("success") is True
+            ),
+            "contenders": {
+                name: family_deltas[name][family] for name in controller_containers
+            },
+        }
+    settled_count = sum(row["settled"] for row in family_rows.values())
+    contender_forward_count = sum(
+        delta["forward_count"] for delta in contender_deltas.values()
+    )
+    fallback_settled = max(0, settled_count - contender_forward_count)
+    if contender_forward_count > settled_count:
+        safety_violations.append("unattributed_extra_contender_forwards")
     block = {
         "schema": "polar-clboss-smoke-v1",
         "replica": f"replica-{replica}",
         "league": str(state.get("league") or "fee_only"),
         "block": block_id,
         "duration_seconds": max(1.0, time.time() - started),
+        "cache_mode": cache_mode,
         "traffic": {
             "pattern": traffic_pattern,
             "attempted": len(records),
-            "settled": sum(
-                1 for row in records
-                if isinstance(row.get("payment"), dict) and row["payment"].get("success") is True
-            ),
+            "settled": settled_count,
+            "fallback_settled": fallback_settled,
         },
-        "contenders": {
-            name: totals_delta(before[name], after[name]) for name in controller_containers
-        },
+        "families": family_rows,
+        "contenders": contender_deltas,
+        "safety_violations": safety_violations,
     }
     if isinstance(treatment, dict) and treatment.get("status") == "active":
         block["acquisition_treatment"] = treatment
+        block["phase"] = "manual_acquisition"
+    elif isinstance(automatic, dict) and automatic.get("status") == "active":
+        block["automatic_acquisition"] = automatic
+        block["phase"] = "automatic_acquisition"
+    elif isinstance(retention, dict) and retention.get("status") == "active":
+        block["retention_treatment"] = retention
+        block["phase"] = "paid_retention"
+    else:
+        block["phase"] = "baseline"
     progress["status"] = "complete"
     progress["records"] = records
     write_json_atomic(progress_path, progress)
@@ -1546,6 +1912,8 @@ def _stop_plugins(state: dict[str, Any]) -> None:
 def cleanup(bridge: PolarMcp, *, replica: int, results_dir: Path) -> dict[str, Any]:
     path = state_path(results_dir, replica)
     state = read_state(path)
+    if restore_automatic_treatments(state):
+        _checkpoint(path, state, "automatic_acquisition_restored")
     if restore_acquisition_treatment(state):
         _checkpoint(path, state, "acquisition_treatment_restored")
     _stop_plugins(state)
@@ -1623,7 +1991,8 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         choices=(
             "preflight", "setup", "isolate", "retune", "full-stack",
-            "acquire", "restore-acquire", "smoke", "status", "cleanup",
+            "acquire", "restore-acquire", "auto-acquire", "retain",
+            "restore-auto", "smoke", "status", "cleanup",
         ),
     )
     parser.add_argument("--network-id", type=positive_int, default=NETWORK_ID)
@@ -1642,6 +2011,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spend-cap-sats", type=positive_int, default=1_000)
     parser.add_argument("--acquisition-family", choices=("cln", "lnd"), default="cln")
     parser.add_argument("--acquisition-ppm", type=nonnegative_arg, default=2)
+    parser.add_argument("--retention-ppm", type=positive_int, default=1)
     parser.add_argument("--apply", action="store_true")
     return parser
 
@@ -1656,7 +2026,8 @@ def main() -> int:
     else:
         if args.command in {
             "setup", "isolate", "retune", "full-stack", "acquire",
-            "restore-acquire", "smoke", "cleanup"
+            "restore-acquire", "auto-acquire", "retain", "restore-auto",
+            "smoke", "cleanup"
         } and not args.apply:
             raise RunnerError(f"{args.command} mutates the fake-sat lab; pass --apply")
         if args.command == "setup":
@@ -1689,6 +2060,22 @@ def main() -> int:
             )
         elif args.command == "restore-acquire":
             result = restore_acquisition(
+                replica=args.replica,
+                results_dir=args.results_dir,
+            )
+        elif args.command == "auto-acquire":
+            result = start_automatic_acquisition(
+                replica=args.replica,
+                results_dir=args.results_dir,
+            )
+        elif args.command == "retain":
+            result = start_retention_treatment(
+                replica=args.replica,
+                results_dir=args.results_dir,
+                fee_ppm=args.retention_ppm,
+            )
+        elif args.command == "restore-auto":
+            result = restore_automatic(
                 replica=args.replica,
                 results_dir=args.results_dir,
             )

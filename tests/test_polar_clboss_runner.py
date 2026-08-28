@@ -484,6 +484,170 @@ def test_totals_delta_fails_closed_on_counter_regression():
         runner.totals_delta(before, after)
 
 
+def test_family_metrics_reconcile_by_scored_lane():
+    runner = load_runner()
+    delta = {
+        "forward_count": 3,
+        "volume_msat": 30_000,
+        "routing_fee_msat": 30,
+        "channels": {
+            "1x1x0": {"forward_count": 2, "volume_msat": 20_000, "routing_fee_msat": 20},
+            "1x1x1": {"forward_count": 1, "volume_msat": 10_000, "routing_fee_msat": 10},
+        },
+    }
+    lanes = {
+        "1x1x0": {"family": "cln", "side": "sink"},
+        "1x1x1": {"family": "lnd", "side": "payer"},
+    }
+
+    assert runner.family_metrics(delta, lanes) == {
+        "cln": {"forward_count": 2, "volume_msat": 20_000, "routing_fee_msat": 20},
+        "lnd": {"forward_count": 1, "volume_msat": 10_000, "routing_fee_msat": 10},
+    }
+
+
+def test_family_metrics_fail_closed_on_unmapped_nonzero_channel():
+    runner = load_runner()
+    delta = {
+        "forward_count": 1,
+        "volume_msat": 10_000,
+        "routing_fee_msat": 10,
+        "channels": {
+            "unknown": {"forward_count": 1, "volume_msat": 10_000, "routing_fee_msat": 10},
+        },
+    }
+
+    with pytest.raises(runner.RunnerError, match="cannot attribute"):
+        runner.family_metrics(delta, {})
+
+
+def test_resolve_lane_map_requires_each_family_and_side(monkeypatch):
+    runner = load_runner()
+    peers = {
+        "cln-payer-id": {"family": "cln", "side": "payer"},
+        "cln-sink-id": {"family": "cln", "side": "sink"},
+        "lnd-payer-id": {"family": "lnd", "side": "payer"},
+        "lnd-sink-id": {"family": "lnd", "side": "sink"},
+    }
+    rows = [
+        {"short_channel_id": f"1x1x{i}", "peer_id": peer_id}
+        for i, peer_id in enumerate(peers)
+    ]
+    state = {"contenders": {"identity-a": {"container": "contender"}}}
+    monkeypatch.setattr(runner, "peer_families", lambda _network_id: peers)
+    monkeypatch.setattr(runner, "active_channels", lambda _container: rows)
+
+    mapped = runner.resolve_lane_map(state)
+
+    assert {tuple((row["family"], row["side"])) for row in mapped["identity-a"].values()} == {
+        ("cln", "payer"), ("cln", "sink"), ("lnd", "payer"), ("lnd", "sink"),
+    }
+
+
+def test_automatic_acquisition_waits_for_native_episode_without_forced_cycle(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 1)
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "status": "isolated_full_stack_ready",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+    })
+    lane_before = {
+        "cln": {"family": "cln", "channel_id": "a", "peer_id": "pa", "fee_ppm": 15},
+        "lnd": {"family": "lnd", "channel_id": "b", "peer_id": "pb", "fee_ppm": 15},
+    }
+    lane_active = {**lane_before, "cln": {**lane_before["cln"], "fee_ppm": 0}}
+    lane_calls = iter((lane_before, lane_active))
+    rpc_calls = []
+
+    def rpc(_container, method, *args):
+        rpc_calls.append((method, args))
+        if method == "revenue-policy":
+            return {"policies": []}
+        if method == "revenue-status":
+            return {"operator_controls": {"values": {
+                "acquisition_experiment_enabled": False,
+                "min_fee_ppm_saturated": 5,
+            }}}
+        if method == "revenue-config":
+            return {"status": "success"}
+        raise AssertionError((method, args))
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(runner, "acquisition_lanes", lambda _state: next(lane_calls))
+    monkeypatch.setattr(runner, "_acquisition_rows", lambda _container: [{
+        "id": 9, "state": "active", "channel_id": "a",
+        "baseline_fee_ppm": 15, "target_fee_ppm": 0,
+    }])
+
+    state = runner.start_automatic_acquisition(
+        replica=1, results_dir=tmp_path, attempts=1, poll_seconds=0,
+    )
+
+    assert state["status"] == "automatic_acquisition_ready"
+    assert state["automatic_acquisition"]["lane"]["family"] == "cln"
+    assert all(method != "revenue-fee-cycle" for method, _args in rpc_calls)
+
+
+def test_retention_waits_for_restore_then_prices_lane_without_forced_cycle(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 2)
+    episode = {
+        "id": 11, "state": "active", "channel_id": "b",
+        "baseline_fee_ppm": 15, "target_fee_ppm": 0,
+    }
+    lane = {"family": "lnd", "channel_id": "b", "peer_id": "pb", "fee_ppm": 0}
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "status": "smoke_complete",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-b", "clboss": "identity-a"},
+        "contenders": {
+            "identity-a": {"container": "clboss"},
+            "identity-b": {"container": "revenue"},
+        },
+        "automatic_acquisition": {"status": "active", "episode": episode, "lane": lane},
+    })
+    runtime = {"fee": 15}
+    rpc_calls = []
+    monkeypatch.setattr(runner, "_revenue_config_set", lambda *_args: {"status": "success"})
+    monkeypatch.setattr(runner, "_acquisition_rows", lambda _container: [{
+        **episode, "state": "completed", "restored_fee_ppm": 15,
+    }])
+    monkeypatch.setattr(runner, "acquisition_lanes", lambda _state: {
+        "cln": {"family": "cln", "channel_id": "a", "peer_id": "pa", "fee_ppm": 15},
+        "lnd": {**lane, "fee_ppm": runtime["fee"]},
+    })
+
+    def policy(_container, action, peer_id, *, fee_ppm=None):
+        assert (action, peer_id) == ("set", "pb")
+        runtime["fee"] = fee_ppm
+        return {"status": "success"}
+
+    monkeypatch.setattr(runner, "_policy_write", policy)
+    monkeypatch.setattr(
+        runner, "cln_rpc",
+        lambda _container, method, *_args: rpc_calls.append(method) or {},
+    )
+
+    state = runner.start_retention_treatment(
+        replica=2, results_dir=tmp_path, fee_ppm=1, attempts=1, poll_seconds=0,
+    )
+
+    assert state["status"] == "retention_ready"
+    assert state["retention_treatment"]["fee_ppm"] == 1
+    assert "revenue-fee-cycle" not in rpc_calls
+
+
 def test_reconciled_traffic_never_retries_ambiguous_payment(monkeypatch):
     runner = load_runner()
 
@@ -644,6 +808,88 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
     assert progress["uncertain_operation"]["direction"] == "reverse"
     assert progress["uncertain_operation"]["round"] == 0
     assert progress["partial_contenders"] == result["partial_contenders"]
+
+
+def test_completed_smoke_emits_strict_family_economics(monkeypatch, tmp_path):
+    runner = load_runner()
+    import polar_clboss_competition as competition
+
+    state_file = runner.state_path(tmp_path, 1)
+    revenue_scids = ("1x1x0", "1x1x1", "1x1x2", "1x1x3")
+    clboss_scids = ("2x1x0", "2x1x1", "2x1x2", "2x1x3")
+    roles = (
+        ("cln", "payer"), ("cln", "sink"),
+        ("lnd", "payer"), ("lnd", "sink"),
+    )
+    runner.write_json_atomic(state_file, {
+        "schema": runner.SCHEMA,
+        "status": "isolated_full_stack_ready",
+        "league": "full_stack",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "lane_map": {
+            "identity-a": {
+                scid: {"family": family, "side": side}
+                for scid, (family, side) in zip(revenue_scids, roles)
+            },
+            "identity-b": {
+                scid: {"family": family, "side": side}
+                for scid, (family, side) in zip(clboss_scids, roles)
+            },
+        },
+    })
+    revenue_policy = tuple((scid, 0, 1) for scid in revenue_scids)
+    clboss_policy = tuple((scid, 0, 1) for scid in clboss_scids)
+    samples = {
+        "revenue": iter((
+            runner.Totals(0, 0, 0, 500_000, revenue_policy),
+            runner.Totals(
+            1, 10_000_000, 10, 500_000, revenue_policy,
+            channel_metrics=(("1x1x0", 1, 10_000_000, 10),),
+            ),
+        )),
+        "clboss": iter((
+            runner.Totals(0, 0, 0, 500_000, clboss_policy),
+            runner.Totals(
+            1, 10_000_000, 10, 500_000, clboss_policy,
+            channel_metrics=(("2x1x2", 1, 10_000_000, 10),),
+            ),
+        )),
+    }
+    monkeypatch.setattr(
+        runner, "contender_totals", lambda container: next(samples[container])
+    )
+    monkeypatch.setattr(runner, "enforce_clboss_spend_cap", lambda _state: None)
+    monkeypatch.setattr(
+        runner, "run_reconciled_traffic",
+        lambda *_args, **_kwargs: [{
+            "round": 0, "payer": "payer", "sink": "sink",
+            "amount_sats": 5_000, "payment_hash": "hash",
+            "payment": {"success": True},
+        }],
+    )
+
+    block = runner.run_smoke(
+        object(), replica=1, results_dir=tmp_path, rounds=1,
+        amount_sats=5_000, pause_seconds=0, traffic_pattern="forward-pressure",
+    )
+
+    assert block["cache_mode"] == "cold"
+    assert block["traffic"]["fallback_settled"] == 0
+    assert block["families"]["cln"]["contenders"]["revenue_ops"]["forward_count"] == 1
+    assert block["families"]["lnd"]["contenders"]["clboss"]["forward_count"] == 1
+    competition.validate_evidence({
+        "schema": competition.SCHEMA_EVIDENCE,
+        "assignments": [{
+            "replica": "replica-1",
+            "controllers": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        }],
+        "blocks": [block],
+    })
 
 
 def test_traffic_schedule_interleaves_directions_and_seeds_reserve_once():
