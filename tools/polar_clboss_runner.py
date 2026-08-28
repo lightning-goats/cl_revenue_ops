@@ -30,7 +30,8 @@ from polar_mixed_client_lab import (  # noqa: E402
 
 
 SCHEMA = "polar-clboss-runner-state-v1"
-IMAGE = "cl-revenue-ops-polar-clboss:9d9ed85"
+EXPECTED_REVENUE_REVISION = "1fac39306ecca9031f539be885b4d5ea8a72c1d2"
+IMAGE = f"cl-revenue-ops-polar-clboss:{EXPECTED_REVENUE_REVISION[:7]}"
 NETWORK_ID = 4
 DOCKER_NETWORK = "polar-network-4_default"
 BACKEND = "polar-n4-backend1"
@@ -265,8 +266,14 @@ def preflight(bridge: PolarMcp, network_id: int, image: str) -> dict[str, Any]:
     if not isinstance(inspected, list) or len(inspected) != 1:
         raise RunnerError(f"image inspect was malformed for {image}")
     image_labels = (inspected[0].get("Config") or {}).get("Labels") or {}
-    if not image_labels.get("org.opencontainers.image.revision.revenue_ops"):
+    revenue_revision = image_labels.get("org.opencontainers.image.revision.revenue_ops")
+    if not revenue_revision:
         raise RunnerError("competition image lacks a pinned revenue_ops revision label")
+    if image == IMAGE and revenue_revision != EXPECTED_REVENUE_REVISION:
+        raise RunnerError(
+            "default competition image has unexpected revenue_ops revision: "
+            f"{revenue_revision}"
+        )
     return {
         "polar_health": health,
         "network_id": network_id,

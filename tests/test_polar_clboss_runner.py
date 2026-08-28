@@ -1145,11 +1145,52 @@ def test_cleanup_refuses_container_removal_while_channels_remain(monkeypatch, tm
 
 
 def test_competition_image_pins_all_source_revisions():
+    runner = load_runner()
     dockerfile = (ROOT / "tools" / "polar-clboss" / "Dockerfile").read_text(encoding="utf-8")
 
+    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:1fac393"
+    assert runner.EXPECTED_REVENUE_REVISION.startswith("1fac393")
     assert "elementsproject/lightningd:v26.06.6" in dockerfile
     assert "CLBOSS_COMMIT=8cb4e9215eba58b049375f234f5f073d0c7fc622" in dockerfile
     assert "XREBALANCE_COMMIT=fb70bf13cd9f3f79b14100bfdb8f2966884a4142" in dockerfile
     assert 'test "$(git -C /src/clboss rev-parse HEAD)" = "${CLBOSS_COMMIT}"' in dockerfile
     assert 'test "$(git -C /src/xrebalance rev-parse HEAD)" = "${XREBALANCE_COMMIT}"' in dockerfile
     assert "cargo build --release --locked" in dockerfile
+
+
+def test_preflight_rejects_wrong_revision_behind_default_image(monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner, "network_record", lambda *_args: {
+        "id": 4,
+        "name": "lab",
+        "status": "Started",
+        "nodes": {"lightning": []},
+    })
+    monkeypatch.setattr(runner, "docker_running", lambda _name: True)
+    monkeypatch.setattr(
+        runner,
+        "_run",
+        lambda _command: type(
+            "Result",
+            (),
+            {
+                "stdout": json.dumps([{
+                    "Id": "sha256:stale",
+                    "Config": {"Labels": {
+                        "org.opencontainers.image.revision.revenue_ops": "stale",
+                    }},
+                }]),
+            },
+        )(),
+    )
+
+    class Bridge:
+        def health(self):
+            return {"status": "ok"}
+
+        def call(self, method, _params):
+            assert method == "list_networks"
+            return {"networks": [{"id": 4, "status": "Started"}]}
+
+    with pytest.raises(runner.RunnerError, match="unexpected revenue_ops revision"):
+        runner.preflight(Bridge(), 4, runner.IMAGE)
