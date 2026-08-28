@@ -1117,6 +1117,75 @@ def test_negative_ev_pair_is_rejected_at_default_hold_margin(
     assert debug["considered_candidates"][0]["score_decomposition"]["final_score"] < 0.0
 
 
+def test_negative_ev_top_pair_falls_through_to_cheaper_source(
+    mock_plugin, mock_database
+):
+    """A pre-route winner must not monopolize a destination after losing EV."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+    from modules.rebalance_types_v2 import PairCandidate, SkipRecord
+
+    cfg = Config(dry_run=True, rebalance_router="v3")
+    engine = RebalanceEngine(mock_plugin, cfg, mock_database)
+    engine.router_v3 = MagicMock(name="market_router")
+    engine._audit = MagicMock()
+    engine._build_snapshot = MagicMock(return_value=SimpleNamespace(
+        channels=[object()], valuable_channel_count=1,
+        total_remaining_budget_sats=100,
+    ))
+    top = PairCandidate(
+        source_channel_id="100x1x0", dest_channel_id="300x3x0",
+        source_peer_id="03" + "1" * 64, dest_peer_id="03" + "3" * 64,
+        amount_sats=50_000, pair_budget_sats=100,
+        source_capacity_sats=1_000_000, dest_capacity_sats=1_000_000,
+        source_out_fee_ppm=150, dest_out_fee_ppm=150,
+        source_local_ratio=1.0, dest_local_ratio=0.25, score=0.9,
+        planner_selected=True,
+    )
+    fallback = PairCandidate(
+        source_channel_id="200x2x0", dest_channel_id="300x3x0",
+        source_peer_id="03" + "2" * 64, dest_peer_id="03" + "3" * 64,
+        amount_sats=50_000, pair_budget_sats=100,
+        source_capacity_sats=1_000_000, dest_capacity_sats=1_000_000,
+        source_out_fee_ppm=150, dest_out_fee_ppm=150,
+        source_local_ratio=0.75, dest_local_ratio=0.25, score=0.8,
+        planner_rejection_reason="dest_already_paired",
+    )
+    engine.router_v3.price_pair.side_effect = (
+        SimpleNamespace(
+            success=True, route_cost_sats=50,
+            route=[{"channel": "expensive"}], probability_ppm=990_000, error="",
+        ),
+        SimpleNamespace(
+            success=True, route_cost_sats=0,
+            route=[{"channel": "free"}], probability_ppm=990_000, error="",
+        ),
+    )
+
+    with patch("modules.rebalance_engine_v2.RebalancePlanner") as planner_cls:
+        planner_cls.return_value.plan.return_value = SimpleNamespace(
+            selected=[top], generated=[top, fallback],
+            skipped=[SkipRecord(
+                channel_id=fallback.source_channel_id,
+                reason="outcompeted", detail="lower-scoring pairs selected",
+            )],
+        )
+        selected = engine.find_candidates()
+
+    assert selected == [fallback]
+    assert engine.router_v3.price_pair.call_count == 2
+    debug = engine.get_last_cycle_debug()
+    by_source = {
+        row["source_channel_id"]: row for row in debug["considered_candidates"]
+    }
+    assert by_source[top.source_channel_id]["rejection_reason"] == "below_hold_margin"
+    assert by_source[fallback.source_channel_id]["planner_selected"] is True
+    assert by_source[fallback.source_channel_id][
+        "planner_rejection_reason"
+    ] == "route_economic_fallback"
+    assert debug["selected_candidates"][0]["source_channel_id"] == "200x2x0"
+
+
 def test_engine_layer_preserves_route_success_fee_and_penalty_terms(
     mock_plugin, mock_database
 ):

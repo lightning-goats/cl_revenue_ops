@@ -1563,6 +1563,43 @@ class RebalanceEngine:
                 kept_selected.append(pair)
             plan.selected = kept_selected
 
+        # The pure planner ranks before route economics are available and
+        # reserves one source/destination pair. Price one lower-ranked source
+        # for the same destination as a bounded fallback: if the top route is
+        # unavailable, over budget, or loses to do-nothing, the cheaper route
+        # may still be positive EV. At most one fallback per selected
+        # destination bounds router work; post-price source/destination
+        # deduplication below still guarantees one execution per channel.
+        selected_keys = {self._pair_key(pair) for pair in plan.selected}
+        route_fallbacks: List[PairCandidate] = []
+        for selected_pair in list(plan.selected):
+            fallback = next(
+                (
+                    pair for pair in generated
+                    if self._pair_key(pair) not in selected_keys
+                    and pair.dest_channel_id == selected_pair.dest_channel_id
+                ),
+                None,
+            )
+            if fallback is None:
+                continue
+            fallback.planner_selected = True
+            fallback.planner_rejection_reason = "route_economic_fallback"
+            selected_keys.add(self._pair_key(fallback))
+            route_fallbacks.append(fallback)
+            debug_fallback = considered_lookup.get(self._pair_key(fallback))
+            if debug_fallback is not None:
+                debug_fallback.planner_selected = True
+                debug_fallback.planner_rejection_reason = "route_economic_fallback"
+            plan.skipped = [
+                skip for skip in plan.skipped
+                if not (
+                    skip.channel_id == fallback.source_channel_id
+                    and skip.reason == "outcompeted"
+                )
+            ]
+        plan.selected.extend(route_fallbacks)
+
         for pair in plan.selected:
             self._route_decision_for_pair(pair)
             self._update_pair_score_decomposition(pair, route_status="planned")
@@ -1581,6 +1618,9 @@ class RebalanceEngine:
         if plan.selected:
             router = self._cycle_router
             priced = []
+            priced_sources: set[str] = set()
+            priced_dests: set[str] = set()
+            price_limit = self._max_concurrent_jobs(cfg)
             router_begin = getattr(router, "begin_cycle", None)
             if callable(router_begin):
                 router_begin()
@@ -1588,6 +1628,21 @@ class RebalanceEngine:
                 for pair in plan.selected:
                     pair_key = self._pair_key(pair)
                     debug_pair = considered_lookup.get(pair_key)
+                    if (
+                        len(priced) >= price_limit
+                        or pair.source_channel_id in priced_sources
+                        or pair.dest_channel_id in priced_dests
+                    ):
+                        plan.skipped.append(SkipRecord(
+                            channel_id=pair.dest_channel_id,
+                            reason="post_price_outcompeted",
+                            value_class="valuable",
+                            remaining_budget_sats=int(
+                                getattr(pair, "pair_budget_sats", 0) or 0
+                            ),
+                            detail=f"src={pair.source_channel_id}",
+                        ))
+                        continue
                     cooldown = self._get_persisted_pair_cooldown(
                         pair.source_channel_id, pair.dest_channel_id
                     )
@@ -1752,6 +1807,8 @@ class RebalanceEngine:
                                 ))
                                 continue
                             priced.append(pair)
+                            priced_sources.add(pair.source_channel_id)
+                            priced_dests.add(pair.dest_channel_id)
                             self._audit.log_pick(
                                 pair.source_channel_id,
                                 pair.dest_channel_id,

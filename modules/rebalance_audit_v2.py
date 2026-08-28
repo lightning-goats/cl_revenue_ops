@@ -35,6 +35,8 @@ VALID_SKIP_REASONS: frozenset[str] = frozenset({
     "no_budget",
     "max_pairs_reached",
     "outcompeted",
+    # A route-priced winner already claimed this source or destination.
+    "post_price_outcompeted",
     # Planner eligibility fallbacks (RA2-1) when the state layer supplies
     # no specific source/dest reason
     "source_ineligible",
