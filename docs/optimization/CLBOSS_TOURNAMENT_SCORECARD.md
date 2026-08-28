@@ -1,17 +1,17 @@
 # CLBOSS tournament scorecard
 
-Coverage: 16 replicas, 30 blocks, 1490 attempted / 1490 settled payments. Enhanced strict-schema blocks: 13; safety-eligible: 9.
+Coverage: 17 replicas, 34 blocks, 1570 attempted / 1570 settled payments. Enhanced strict-schema blocks: 17; safety-eligible: 12.
 
 | Comparable area | Revenue Ops | CLBOSS | Current leader |
 |---|---:|---:|---|
-| Routing volume (msat) | 1997282244 | 14766242767 | clboss |
-| Forward count | 286 | 1052 | clboss |
-| Gross routing fees (msat) | 78495 | 108355 | clboss |
+| Routing volume (msat) | 2284647561 | 14978877450 | clboss |
+| Forward count | 334 | 1085 | clboss |
+| Gross routing fees (msat) | 80221 | 110503 | clboss |
 | Rebalance cost (msat) | 0 | 0 | tie |
-| Net routing profit (msat) | 78495 | 108355 | clboss |
-| Gross yield (ppm) | 39.301 | 7.338 | revenue_ops |
-| Volume share (%) | 11.914 | 88.086 | clboss |
-| Mean worst imbalance (ppm; lower is better) | 664180.9 | 590734.3 | clboss |
+| Net routing profit (msat) | 80221 | 110503 | clboss |
+| Gross yield (ppm) | 35.113 | 7.377 | revenue_ops |
+| Volume share (%) | 13.234 | 86.766 | clboss |
+| Mean worst imbalance (ppm; lower is better) | 703689.0 | 638883.2 | clboss |
 
 Formal verdict: **not ready**. It requires at least three fresh replicas and six enhanced cold/warm blocks per league per replica.
 
@@ -24,6 +24,8 @@ contender-level safety violations contribute here.
 
 | Profile / phase / scope | Revenue volume (msat) | CLBOSS volume (msat) | Revenue net (msat) | CLBOSS net (msat) | Current result |
 |---|---:|---:|---:|---:|---|
+| `acquisition` / native positive-base retention / CLN | 90000000 | 160000000 | 767 | 1590 | CLBOSS wins combined volume, routes, and profit across two paid blocks |
+| `acquisition` / mixed acquisition-to-retention transition / CLN | 120000000 | 5000000 | 628 | 5 | Revenue wins, but the in-window phase transition makes this diagnostic only |
 | `acquisition` / native paid retention / CLN | 45000000 | 80000000 | 275 | 632 | Forward routes tie 5-5; CLBOSS wins weighted volume and profit |
 | `acquisition` / paid retention / LND | 255000000 | 195000000 | 2225 | 1419 | Revenue wins volume and profit |
 | `acquisition` / paid retention / CLN | 10000000 | 115000000 | 60 | 943 | CLBOSS wins volume and profit |
@@ -66,12 +68,12 @@ and restore the exact captured base and proportional fees on exit.
 - Revenue Ops extracts more fee per routed sat, but CLBOSS wins far more routing volume. The main economic gap is conversion and retained demand, not fee arithmetic alone.
 - Under realistic one-way pressure, Revenue Ops earned 19.7x CLBOSS' net routing fees from 13.1% of the volume. Global fee cuts would sacrifice the strongest demonstrated advantage; improvements must target missed lanes selectively.
 - The crossed realistic CLN block repeated the profit result: Revenue earned 2.25x CLBOSS' fees from one of ten routes. On the LND corridor, however, Revenue won no routes at either 150 ppm or the 50-ppm safety floor while CLBOSS quoted 1 ppm. The 50-ppm cut therefore produced no conversion benefit.
-- Native paid retention is mechanically verified but not a decisive strategy. In replica 39, Revenue Ops autonomously moved one CLN lane from 0 to the observed 1-ppm floor after exactly 50,000 acquired sats, persisted the phase, and restored its captured baseline during cleanup. The safety-eligible paid block split forward routes 5-5, while CLBOSS won weighted volume 80M to 45M msat and net fees 632 to 275 msat. Earlier manual retention won the LND block in replica 27 but lost the crossed CLN block in replica 34.
+- Native paid retention is mechanically verified but not a decisive strategy. In replica 39, Revenue Ops autonomously moved one CLN lane from 0 to the observed 1-ppm floor after exactly 50,000 acquired sats, persisted the phase, and restored its captured baseline during cleanup. The safety-eligible paid block split forward routes 5-5, while CLBOSS won weighted volume 80M to 45M msat and net fees 632 to 275 msat. Replica 40 then tested a strict positive-base undercut: Revenue moved from 0 to 4 msat + 0 ppm against 1 ppm, but across two paid blocks the treated lane split routes 8-12 and fees 32-110 msat; whole-contender profit was 767-1590 msat. The implementation and exact restoration are sound, but the economic hypothesis is not supported. Earlier manual retention won the LND block in replica 27 but lost the crossed CLN block in replica 34.
 - A bounded 0-ppm acquisition quote can win a lane, but placement matters: observed lane share has ranged from 40% to 100% across client and peer identities.
 - A 1-ppm tie did not acquire traffic in an earlier round. A zero-fee quote acquired 80% of the treated lane in replica 25 at an opportunity cost of 1.5 sats, then restored the captured 15-ppm baseline exactly.
 - Autonomous rebalancing correctly refused uneconomic routes below its contribution-margin hold. Forced route checks proved CLN 26 route compatibility and budget reconciliation, so weakening the margin rail is not justified by current evidence.
 - Tournament preflight now pins the default image to the verified Revenue Ops revision and rejects a mismatched label before scored traffic; an unscored replica exposed the stale default tag.
-- Product revision `9d5d8f7` and harness revision `ab38081` add restart-safe native paid retention and exact phase validation. Full tests passed before replica 39 (3856 passed, 5 skipped, 2 xfailed).
+- Product revision `21de69a` and harness revision `7bd8b79` add restart-safe positive-base retention, exact base/rate phase validation, and exact baseline restoration. Full tests passed before replica 40 (3859 passed, 5 skipped, 2 xfailed).
 
 ## Active improvement loop
 
@@ -80,6 +82,7 @@ and restore the exact captured base and proportional fees on exit.
 | Family attribution | CLN versus LND volume, fees, and forwards | Runner blocks map every contender SCID to a client family and fail closed on unmapped activity. |
 | Automatic acquisition | Whether the default-off product selects and wins a natural lane | Enable the gate and wait for native fee cycles; never force a scored fee cycle. |
 | Paid retention | Whether a positive base-fee undercut converts the 1-ppm tie into retained volume and profit | Keep experimental until positive lift repeats across crossed identities and both client families. |
+| Retention curve | Whether any paid quote beats free acquisition on net profit under CLN route randomization | Measure multiple bounded price points with enough routes for confidence; optimize net contribution, not raw route count. |
 | Liquidity pressure | Whether each controller restores depleted earning liquidity profitably | Run one-way traffic with equal spend caps; compare net fees, cost, and ending imbalance. |
 | Product change | Repeatable positive net lift across crossed identities and clients | Promote only treatments with replicated safety-eligible evidence. |
 
