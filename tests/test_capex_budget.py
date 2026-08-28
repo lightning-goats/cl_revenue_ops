@@ -254,6 +254,61 @@ class TestPerChannelBudget:
         assert b.tier_ppm == 500
         assert b.budget_sats > 0
 
+    def test_young_early_earner_gets_only_revenue_backed_budget(self):
+        """A profitable young channel must not wait for an arbitrary fifth
+        forward, but its early allowance stays bounded by realized income."""
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=92_000,
+                    fees_earned_msat=92_000,
+                    total_forward_count=4,
+                    days_open=0,
+                    capacity_sats=1_000_000,
+                    classification="profitable",
+                ),
+            },
+        )
+
+        b = engine.compute_allocations().channel_budgets["100x1x0"]
+
+        assert b.tier == "active"
+        assert b.tier_ppm == 250
+        assert b.priority_class == "growth"
+        assert b.budget_sats == 46
+
+    def test_young_channel_with_forwards_but_no_contribution_stays_blocked(self):
+        engine = _make_engine(
+            channel_profitabilities={
+                "100x1x0": _make_mock_profitability(
+                    contribution_msat=0,
+                    total_forward_count=4,
+                    days_open=0,
+                ),
+            },
+        )
+
+        b = engine.compute_allocations().channel_budgets["100x1x0"]
+
+        assert b.tier == "blocked"
+        assert b.budget_sats == 0
+
+    def test_malformed_early_channel_evidence_fails_closed_without_crash(self):
+        prof = _make_mock_profitability(
+            contribution_msat=0,
+            total_forward_count=0,
+            days_open=0,
+        )
+        prof.revenue.total_contribution_msat = "malformed"
+        prof.revenue.total_forward_count = {"bad": "count"}
+        prof.contribution_30d_msat = "malformed"
+        engine = _make_engine(channel_profitabilities={"100x1x0": prof})
+
+        b = engine.compute_allocations().channel_budgets["100x1x0"]
+
+        assert b.tier == "blocked"
+        assert b.budget_sats == 0
+
     def test_bootstrap_channel(self):
         """Channel past grace period with zero history."""
         engine = _make_engine(

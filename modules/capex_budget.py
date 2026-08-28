@@ -32,6 +32,14 @@ def _classify(obj) -> str:
     return str(obj).rsplit('.', 1)[-1].lower()
 
 
+def _safe_int(value, default: int = 0) -> int:
+    """Normalize untrusted analyzer fields without crashing a budget cycle."""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+
+
 def _has_30d_window(prof) -> bool:
     """Whether the prof object carries trailing-30d windowed fields (audit F1).
 
@@ -185,7 +193,9 @@ class CapexBudgetEngine:
             except (TypeError, ValueError):
                 capacity_sats = 0
             total_capacity_sats += capacity_sats
-            contribution_msat = prof.revenue.total_contribution_msat
+            contribution_msat = _safe_int(
+                getattr(prof.revenue, 'total_contribution_msat', 0)
+            )
             # Audit F1(d): fleet budgets are debited by 30d spend, so they must
             # be FUNDED by 30d revenue (exit fees only), not lifetime totals.
             total_fleet_contribution_msat += _windowed_msat(
@@ -331,7 +341,9 @@ class CapexBudgetEngine:
     ) -> ChannelCapexBudget:
         """Compute budget for a single channel (all arithmetic in msat)."""
         classification = _classify(prof.classification)
-        contribution_msat = prof.revenue.total_contribution_msat
+        contribution_msat = _safe_int(
+            getattr(prof.revenue, 'total_contribution_msat', 0)
+        )
         # Audit F1: budgets are debited by 30d spend, so the funding side must
         # also be the trailing-30d contribution. Funding from LIFETIME
         # contribution let decayed channels (50k sats lifetime, ~100 sats/30d)
@@ -340,8 +352,8 @@ class CapexBudgetEngine:
         contribution_30d_msat = _windowed_msat(
             prof, 'contribution_30d_msat', contribution_msat
         )
-        total_fwd = prof.revenue.total_forward_count
-        days_open = prof.days_open
+        total_fwd = max(0, _safe_int(getattr(prof.revenue, 'total_forward_count', 0)))
+        days_open = max(0, _safe_int(getattr(prof, 'days_open', 0)))
         marginal_roi = getattr(prof, 'marginal_roi', 0.0)
 
         # Blocked channels
@@ -418,6 +430,23 @@ class CapexBudgetEngine:
                 raw_budget_msat = max(proven_budget_msat, max(0, bootstrap_budget_msat - total_capex_30d_msat))
             else:
                 raw_budget_msat = max(0, bootstrap_budget_msat - total_capex_30d_msat)
+        elif total_fwd > 0 and contribution_30d_msat > 0:
+            # A young channel with a small number of real forwards used to
+            # fall through to ``blocked`` until it crossed either the >5
+            # forward gate or the >100-sat proven gate. That cliff can deny a
+            # profitable, already-depleted channel any refill budget even
+            # though canonical contribution evidence exists. Admit an early
+            # active tier, but fund it only from the normal reinvestment share
+            # of realized 30d contribution and cap it by the bootstrap rail.
+            # There is no speculative floor: malformed, absent, zero, or
+            # negative contribution still grants nothing.
+            tier = "active"
+            tier_ppm = 250
+            priority = "growth"
+            raw_budget_msat = min(
+                proven_budget_msat,
+                max(0, bootstrap_budget_msat - total_capex_30d_msat),
+            )
         elif days_open >= cfg.capex_grace_days:
             tier = "bootstrap"
             tier_ppm = 250
