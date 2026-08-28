@@ -30,7 +30,7 @@ from polar_mixed_client_lab import (  # noqa: E402
 
 
 SCHEMA = "polar-clboss-runner-state-v1"
-EXPECTED_REVENUE_REVISION = "9805b04018ad9d18d3d508102a1ac23e4bfa89ca"
+EXPECTED_REVENUE_REVISION = "4c26e1153c2c619fa55a490276c5973742522986"
 IMAGE = f"cl-revenue-ops-polar-clboss:{EXPECTED_REVENUE_REVISION[:7]}"
 NETWORK_ID = 4
 DOCKER_NETWORK = "polar-network-4_default"
@@ -684,6 +684,7 @@ def prepare_controlled_depletion(
     replica: int,
     results_dir: Path,
     amount_sats: int = CONTROLLED_DEPLETION_SATS,
+    fixture_fee_ppm: int | None = None,
 ) -> dict[str, Any]:
     """Create equal source/depleted CLN pairs while both controllers are held."""
     path = state_path(results_dir, replica)
@@ -726,6 +727,24 @@ def prepare_controlled_depletion(
         raise RunnerError("CLBOSS did not pause for controlled depletion")
 
     before = controlled_depletion_snapshot(state)
+    if fixture_fee_ppm is not None:
+        fixture_fee_ppm = nonnegative_int(
+            fixture_fee_ppm, "controlled depletion fixture fee"
+        )
+        for controller in ("revenue_ops", "clboss"):
+            identity = assignment[controller]
+            container = contenders[identity]["container"]
+            scid = before[controller]["depleted"]["short_channel_id"]
+            result = cln_rpc(container, "setchannel", scid, 0, fixture_fee_ppm)
+            channels = result.get("channels")
+            if not isinstance(channels, list) or len(channels) != 1:
+                raise RunnerError(
+                    f"controlled depletion fixture fee did not update {controller}:{scid}"
+                )
+        # The payer prices the downstream contender->sink hop from gossip.
+        # Give both equal updates one short Polar propagation window before
+        # creating contribution evidence; controller loops remain held.
+        time.sleep(5)
     payments = []
     for controller in ("revenue_ops", "clboss"):
         payments.append(
@@ -747,6 +766,7 @@ def prepare_controlled_depletion(
         "family": "cln",
         "amount_sats_per_controller": amount_sats,
         "controllers_held": True,
+        "fixture_fee_ppm": fixture_fee_ppm,
         "before": before,
         "after": after,
         "payments": payments,
@@ -2376,12 +2396,28 @@ def run_smoke(
 ) -> dict[str, Any]:
     path = state_path(results_dir, replica)
     state = read_state(path)
+    entry_status = state.get("status")
     if state.get("status") not in {
         "fee_only_ready", "smoke_complete", "isolated_fee_only_ready",
         "isolated_full_stack_ready", "acquisition_ready",
         "automatic_acquisition_ready", "retention_ready",
+        "post_rebalance_ready",
     }:
         raise RunnerError(f"replica is not traffic-ready: {state.get('status')}")
+    if entry_status == "post_rebalance_ready":
+        observation = state.get("last_rebalance_observation")
+        retired = state.get("return_paths_retired")
+        held = state.get("post_rebalance_controllers_held")
+        if not isinstance(observation, str) or not observation:
+            raise RunnerError("post-rebalance traffic lacks observation lineage")
+        if not isinstance(retired, dict) or retired.get("confirmed_absent") is not True:
+            raise RunnerError("post-rebalance traffic requires retired return paths")
+        if not isinstance(held, dict) or any(
+            held.get(controller) is not True for controller in ("revenue_ops", "clboss")
+        ):
+            raise RunnerError("post-rebalance traffic requires both controllers held")
+        if held.get("forced_cycles") is not False:
+            raise RunnerError("post-rebalance traffic has invalid controller-hold lineage")
     refresh_automatic_acquisition_phase(state)
     assignment = state["assignment"]
     if amount_profile == "auto":
@@ -2583,7 +2619,21 @@ def run_smoke(
         "contenders": contender_deltas,
         "safety_violations": safety_violations,
     }
-    if isinstance(treatment, dict) and treatment.get("status") == "active":
+    if entry_status == "post_rebalance_ready":
+        observation = state.get("last_rebalance_observation")
+        retired = state.get("return_paths_retired")
+        block["phase"] = "post_rebalance_demand"
+        block["post_rebalance"] = {
+            "observation_block": observation,
+            "return_paths_retired": retired,
+            "controllers_held": state.get("post_rebalance_controllers_held"),
+            "controlled_start": (
+                state.get("controlled_depletion", {}).get("after")
+                if isinstance(state.get("controlled_depletion"), dict)
+                else None
+            ),
+        }
+    elif isinstance(treatment, dict) and treatment.get("status") == "active":
         block["acquisition_treatment"] = treatment
         block["phase"] = "manual_acquisition"
     elif isinstance(automatic, dict) and automatic.get("status") == "active":
@@ -2814,9 +2864,99 @@ def observe_rebalances(
     }
     state["status"] = "rebalance_observed"
     block_id = f"rebalance-{int(started)}"
+    state["last_rebalance_observation"] = block_id
     _checkpoint(path, state, "rebalance_observed", block=block_id, result=result)
     write_json_atomic(path.parent / f"{block_id}.json", result)
     return result
+
+
+def retire_return_paths(
+    bridge: PolarMcp,
+    *,
+    replica: int,
+    results_dir: Path,
+    timeout_seconds: float = 60,
+) -> dict[str, Any]:
+    """Remove the direct fixture bypass before post-rebalance scored demand."""
+    if timeout_seconds < 0:
+        raise RunnerError("return-path retirement timeout must be nonnegative")
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if state.get("status") != "rebalance_observed":
+        raise RunnerError(
+            f"return paths can be retired only after observation: {state.get('status')}"
+        )
+    observation = state.get("last_rebalance_observation")
+    if not isinstance(observation, str) or not observation:
+        raise RunnerError("return-path retirement lacks rebalance observation lineage")
+    assignment = state.get("assignment")
+    contenders = state.get("contenders")
+    if not isinstance(assignment, dict) or not isinstance(contenders, dict):
+        raise RunnerError("post-rebalance transition lacks controller assignment")
+    try:
+        revenue_container = contenders[assignment["revenue_ops"]]["container"]
+        clboss_container = contenders[assignment["clboss"]]["container"]
+    except (KeyError, TypeError) as exc:
+        raise RunnerError("post-rebalance transition has malformed contenders") from exc
+    # Freeze the completed native observation before removing fixture paths.
+    # A delayed circular payment must not overlap scored customer demand,
+    # where its forwards would be indistinguishable from routed traffic.
+    cln_rpc(revenue_container, "revenue-config", "set", "paused", "true")
+    revenue_controls = (
+        cln_rpc(revenue_container, "revenue-status")
+        .get("operator_controls", {})
+        .get("values", {})
+    )
+    if revenue_controls.get("paused") is not True:
+        raise RunnerError("Revenue Ops did not hold after rebalance observation")
+    cln_rpc(clboss_container, "setconfig", "clboss-rebalance-mode", "off")
+    clboss_mode = (
+        cln_rpc(clboss_container, "clboss-status")
+        .get("rebalance_mode", {})
+        .get("mode")
+    )
+    if clboss_mode != "off":
+        raise RunnerError("CLBOSS did not hold after rebalance observation")
+    state["post_rebalance_controllers_held"] = {
+        "revenue_ops": True,
+        "clboss": True,
+        "forced_cycles": False,
+        "at": int(time.time()),
+    }
+    _checkpoint(
+        path,
+        state,
+        "post_rebalance_controllers_held_for_scoring",
+        result=state["post_rebalance_controllers_held"],
+    )
+    if _close_return_paths(state):
+        _checkpoint(path, state, "return_path_closes_dispatched_for_scoring")
+    if state.get("return_path_closes_dispatched") is not True:
+        raise RunnerError("return-path close dispatch was not checkpointed")
+    _mine(bridge, int(state["network_id"]), 6)
+    deadline = time.monotonic() + timeout_seconds
+    remaining = _live_return_paths(state)
+    while remaining and time.monotonic() < deadline:
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+        remaining = _live_return_paths(state)
+    if remaining:
+        raise RunnerError(
+            f"direct return paths remain live; post-rebalance scoring blocked: {remaining}"
+        )
+    state["return_paths_retired"] = {
+        "confirmed_absent": True,
+        "at": int(time.time()),
+        "observation_block": observation,
+        "purpose": "prevent direct fixture bypass during post-rebalance demand",
+    }
+    state["status"] = "post_rebalance_ready"
+    _checkpoint(
+        path,
+        state,
+        "return_paths_retired_for_scoring",
+        result=state["return_paths_retired"],
+    )
+    return state
 
 
 def _stop_plugins(state: dict[str, Any]) -> None:
@@ -3044,7 +3184,7 @@ def build_parser() -> argparse.ArgumentParser:
             "preflight", "setup", "isolate", "retune", "full-stack",
             "acquire", "restore-acquire", "auto-acquire", "retain",
             "restore-auto", "accelerate", "smoke", "return-path", "observe-rebalance",
-            "deplete", "status", "cleanup",
+            "retire-return-paths", "deplete", "status", "cleanup",
         ),
     )
     parser.add_argument("--network-id", type=positive_int, default=NETWORK_ID)
@@ -3087,6 +3227,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--depletion-sats", type=positive_int, default=CONTROLLED_DEPLETION_SATS,
     )
+    parser.add_argument(
+        "--fixture-fee-ppm", type=nonnegative_arg,
+        help=(
+            "optional equal outgoing CLN fee on both controlled destinations; "
+            "use only to test a specific evidence band"
+        ),
+    )
     parser.add_argument("--observe-seconds", type=float, default=360.0)
     parser.add_argument("--acquisition-family", choices=("cln", "lnd"), default="cln")
     parser.add_argument("--acquisition-ppm", type=nonnegative_arg, default=2)
@@ -3106,7 +3253,8 @@ def main() -> int:
         if args.command in {
             "setup", "isolate", "retune", "full-stack", "acquire",
             "restore-acquire", "auto-acquire", "retain", "restore-auto", "accelerate",
-            "smoke", "return-path", "observe-rebalance", "deplete", "cleanup"
+            "smoke", "return-path", "observe-rebalance", "retire-return-paths",
+            "deplete", "cleanup"
         } and not args.apply:
             raise RunnerError(f"{args.command} mutates the fake-sat lab; pass --apply")
         if args.command == "setup":
@@ -3188,12 +3336,19 @@ def main() -> int:
                 replica=args.replica,
                 results_dir=args.results_dir,
                 amount_sats=args.depletion_sats,
+                fixture_fee_ppm=args.fixture_fee_ppm,
             )
         elif args.command == "observe-rebalance":
             result = observe_rebalances(
                 replica=args.replica,
                 results_dir=args.results_dir,
                 observe_seconds=args.observe_seconds,
+            )
+        elif args.command == "retire-return-paths":
+            result = retire_return_paths(
+                bridge,
+                replica=args.replica,
+                results_dir=args.results_dir,
             )
         elif args.command == "status":
             result = status(args.replica, args.results_dir)

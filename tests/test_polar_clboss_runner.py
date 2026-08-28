@@ -190,6 +190,7 @@ def test_contender_totals_normalizes_channel_depletion_by_capacity(monkeypatch):
         raise AssertionError(method)
 
     monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(runner, "active_channels", lambda _container: channels)
 
     totals = runner.contender_totals("polar-n4-clboss-r1-identity-a")
@@ -1300,9 +1301,12 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
             return {"operator_controls": {"values": {"paused": True}}}
         if method == "clboss-status":
             return {"rebalance_mode": {"mode": "off"}}
+        if method == "setchannel":
+            return {"channels": [{}]}
         return {}
 
     monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
         runner, "controlled_depletion_snapshot", lambda _state: next(snapshots)
     )
@@ -1315,7 +1319,8 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
     )
 
     state = runner.prepare_controlled_depletion(
-        object(), replica=9, results_dir=tmp_path, amount_sats=750_000
+        object(), replica=9, results_dir=tmp_path, amount_sats=750_000,
+        fixture_fee_ppm=120,
     )
 
     assert state["status"] == "controlled_depletion_ready"
@@ -1323,6 +1328,15 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
     assert [row["label"] for row in routed] == ["revenue_ops", "clboss"]
     assert [row["target_scid"] for row in routed] == ["1x1x0", "3x1x0"]
     assert all(row["amount_sats"] == 750_000 for row in routed)
+    assert state["controlled_depletion"]["fixture_fee_ppm"] == 120
+    assert {
+        (container, args)
+        for container, method, args in calls
+        if method == "setchannel"
+    } == {
+        ("revenue", ("2x1x0", 0, 120)),
+        ("clboss", ("4x1x0", 0, 120)),
+    }
     assert any(
         method == "setconfig" and args == ("clboss-rebalance-mode", "off")
         for _container, method, args in calls
@@ -1685,11 +1699,198 @@ def test_observe_rebalances_uses_native_cycles_and_records_balance_improvement(
         "worst_imbalance_improvement_ppm"
     ] == 400_000
     assert result["clboss_spend_policy"] == "native_unbounded"
+    saved = runner.read_state(path)
+    assert saved["status"] == "rebalance_observed"
+    assert saved["last_rebalance_observation"].startswith("rebalance-")
     assert all(method != "revenue-rebalance-cycle" for _container, method, _args in rpc_calls)
     assert all(
         not (method == "setconfig" and args == ("clboss-rebalance-mode", "off"))
         for _container, method, args in rpc_calls
     )
+
+
+def test_retire_return_paths_confirms_direct_bypass_absent(monkeypatch, tmp_path):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 6)
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "network_id": 4,
+        "status": "rebalance_observed",
+        "events": [],
+        "last_rebalance_observation": "rebalance-123",
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "return_paths": [{"family": "cln"}, {"family": "lnd"}],
+    })
+    mines = []
+    live = iter(({"cln": ["1x1x0"]}, {}))
+
+    def close(state):
+        state["return_path_closes_dispatched"] = True
+        return True
+
+    monkeypatch.setattr(runner, "_close_return_paths", close)
+    monkeypatch.setattr(
+        runner,
+        "cln_rpc",
+        lambda container, method, *args: (
+            {"operator_controls": {"values": {"paused": True}}}
+            if method == "revenue-status"
+            else {"rebalance_mode": {"mode": "off"}}
+            if method == "clboss-status"
+            else {}
+        ),
+    )
+    monkeypatch.setattr(runner, "_mine", lambda *args: mines.append(args))
+    monkeypatch.setattr(runner, "_live_return_paths", lambda _state: next(live))
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    state = runner.retire_return_paths(
+        object(), replica=6, results_dir=tmp_path, timeout_seconds=1
+    )
+
+    assert len(mines) == 1
+    assert mines[0][1:] == (4, 6)
+    assert state["status"] == "post_rebalance_ready"
+    assert state["post_rebalance_controllers_held"]["forced_cycles"] is False
+    assert state["return_paths_retired"] == {
+        "confirmed_absent": True,
+        "at": state["return_paths_retired"]["at"],
+        "observation_block": "rebalance-123",
+        "purpose": "prevent direct fixture bypass during post-rebalance demand",
+    }
+    assert state["events"][-1]["event"] == "return_paths_retired_for_scoring"
+
+
+def test_post_rebalance_smoke_requires_retired_paths_and_records_lineage(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 8)
+    roles = (
+        ("cln", "payer"), ("cln", "sink"),
+        ("lnd", "payer"), ("lnd", "sink"),
+    )
+    state = {
+        "schema": runner.SCHEMA,
+        "network_id": 4,
+        "status": "post_rebalance_ready",
+        "league": "full_stack",
+        "market_profile": "realistic",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "lane_map": {
+            identity: {
+                f"{prefix}x1x{index}": {"family": family, "side": side}
+                for index, (family, side) in enumerate(roles)
+            }
+            for identity, prefix in (("identity-a", 1), ("identity-b", 2))
+        },
+        "last_rebalance_observation": "rebalance-456",
+        "return_paths_retired": {"confirmed_absent": True, "at": 456},
+        "post_rebalance_controllers_held": {
+            "revenue_ops": True,
+            "clboss": True,
+            "forced_cycles": False,
+            "at": 456,
+        },
+        "controlled_depletion": {"after": {"revenue_ops": {}, "clboss": {}}},
+    }
+    runner.write_json_atomic(path, state)
+    policies = {
+        "revenue": tuple((f"1x1x{i}", 0, 150) for i in range(4)),
+        "clboss": tuple((f"2x1x{i}", 0, 1) for i in range(4)),
+    }
+    samples = {
+        "revenue": iter((
+            runner.Totals(0, 0, 0, 500_000, policies["revenue"]),
+            runner.Totals(
+                1, 5_000_000, 750, 500_000, policies["revenue"],
+                channel_metrics=(("1x1x1", 1, 5_000_000, 750),),
+            ),
+        )),
+        "clboss": iter((
+            runner.Totals(0, 0, 0, 500_000, policies["clboss"]),
+            runner.Totals(0, 0, 0, 500_000, policies["clboss"]),
+        )),
+    }
+    monkeypatch.setattr(
+        runner, "contender_totals", lambda container: next(samples[container])
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_reconciled_traffic",
+        lambda *_args, **_kwargs: [{
+            "round": 0, "payer": "payer", "sink": "sink",
+            "amount_sats": 5_000, "payment_hash": "hash",
+            "payment": {"success": True},
+        }],
+    )
+
+    block = runner.run_smoke(
+        object(), replica=8, results_dir=tmp_path, rounds=1,
+        amount_sats=5_000, pause_seconds=0,
+        traffic_pattern="forward-pressure", traffic_family="cln",
+    )
+
+    assert block["phase"] == "post_rebalance_demand"
+    assert block["post_rebalance"]["observation_block"] == "rebalance-456"
+    assert block["post_rebalance"]["return_paths_retired"]["confirmed_absent"] is True
+    assert block["traffic"]["fallback_settled"] == 0
+
+
+def test_post_rebalance_smoke_rejects_malformed_hold_before_traffic(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    runner.write_json_atomic(runner.state_path(tmp_path, 9), {
+        "schema": runner.SCHEMA,
+        "status": "post_rebalance_ready",
+        "events": [],
+        "last_rebalance_observation": "rebalance-789",
+        "return_paths_retired": {"confirmed_absent": True, "at": 789},
+        "post_rebalance_controllers_held": {
+            "revenue_ops": True,
+            "clboss": False,
+            "forced_cycles": False,
+        },
+    })
+    dispatched = []
+    monkeypatch.setattr(
+        runner,
+        "run_reconciled_traffic",
+        lambda *_args, **_kwargs: dispatched.append(True),
+    )
+
+    with pytest.raises(runner.RunnerError, match="both controllers held"):
+        runner.run_smoke(
+            object(), replica=9, results_dir=tmp_path, rounds=1,
+            amount_sats=5_000, pause_seconds=0,
+        )
+
+    assert dispatched == []
+
+
+def test_rebalance_observation_is_not_directly_traffic_ready(tmp_path):
+    runner = load_runner()
+    runner.write_json_atomic(runner.state_path(tmp_path, 10), {
+        "schema": runner.SCHEMA,
+        "status": "rebalance_observed",
+        "events": [],
+    })
+
+    with pytest.raises(runner.RunnerError, match="not traffic-ready"):
+        runner.run_smoke(
+            object(), replica=10, results_dir=tmp_path, rounds=1,
+            amount_sats=5_000, pause_seconds=0,
+        )
 
 
 def test_return_path_cleanup_dispatches_exact_cln_and_lnd_closes(monkeypatch):
@@ -1725,8 +1926,8 @@ def test_competition_image_pins_all_source_revisions():
     runner = load_runner()
     dockerfile = (ROOT / "tools" / "polar-clboss" / "Dockerfile").read_text(encoding="utf-8")
 
-    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:9805b04"
-    assert runner.EXPECTED_REVENUE_REVISION.startswith("9805b04")
+    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:4c26e11"
+    assert runner.EXPECTED_REVENUE_REVISION.startswith("4c26e11")
     assert "elementsproject/lightningd:v26.06.6" in dockerfile
     assert "CLBOSS_COMMIT=8cb4e9215eba58b049375f234f5f073d0c7fc622" in dockerfile
     assert "XREBALANCE_COMMIT=fb70bf13cd9f3f79b14100bfdb8f2966884a4142" in dockerfile

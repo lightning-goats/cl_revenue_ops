@@ -57,6 +57,7 @@ def load_blocks(results_dir: Path) -> list[dict[str, Any]]:
 def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
     totals = {name: defaultdict(int) for name in CONTROLLERS}
     phases: dict[str, dict[str, defaultdict[str, int]]] = {}
+    eligible_phases: dict[str, dict[str, defaultdict[str, int]]] = {}
     market_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
     eligible_market_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
     attempted = settled = fallback = 0
@@ -101,10 +102,14 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             and block_fallback == 0
         )
         eligible_rows = None
+        eligible_phase_rows = None
         if eligible:
             eligible_blocks += 1
             eligible_rows = eligible_market_profiles.setdefault(
                 market_profile, {name: defaultdict(int) for name in CONTROLLERS}
+            )
+            eligible_phase_rows = eligible_phases.setdefault(
+                phase, {name: defaultdict(int) for name in CONTROLLERS}
             )
         for name in CONTROLLERS:
             row = block["contenders"][name]
@@ -117,6 +122,7 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
                 profile_rows[name][metric] += value
                 if eligible_rows is not None:
                     eligible_rows[name][metric] += value
+                    eligible_phase_rows[name][metric] += value
             worst = _integer(
                 row.get("ending_worst_channel_imbalance_ppm", 0),
                 f"{name}.ending_worst_channel_imbalance_ppm",
@@ -130,6 +136,8 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             if eligible_rows is not None:
                 eligible_rows[name]["worst_imbalance_sum_ppm"] += worst
                 eligible_rows[name]["worst_imbalance_samples"] += 1
+                eligible_phase_rows[name]["worst_imbalance_sum_ppm"] += worst
+                eligible_phase_rows[name]["worst_imbalance_samples"] += 1
 
     def finalize(rows: dict[str, defaultdict[str, int]]) -> dict[str, dict[str, Any]]:
         output = {}
@@ -175,6 +183,9 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "overall": overall,
         "by_phase": {phase: finalize(rows) for phase, rows in sorted(phases.items())},
+        "eligible_by_phase": {
+            phase: finalize(rows) for phase, rows in sorted(eligible_phases.items())
+        },
         "by_market_profile": {
             profile: finalize(rows)
             for profile, rows in sorted(market_profiles.items())
@@ -243,6 +254,23 @@ def markdown(scorecard: dict[str, Any]) -> str:
     for profile, rows in scorecard["eligible_by_market_profile"].items():
         lines.extend([
             f"### {profile}",
+            "",
+            "| Metric | Revenue Ops | CLBOSS |",
+            "|---|---:|---:|",
+            f"| Routing volume (msat) | {rows['revenue_ops']['volume_msat']} | {rows['clboss']['volume_msat']} |",
+            f"| Net routing profit (msat) | {rows['revenue_ops']['net_profit_msat']} | {rows['clboss']['net_profit_msat']} |",
+            f"| Gross yield (ppm) | {rows['revenue_ops']['gross_yield_ppm']} | {rows['clboss']['gross_yield_ppm']} |",
+            "",
+        ])
+    lines.extend([
+        "## Eligible results by phase",
+        "",
+        "This view isolates treatments and post-rebalance demand from historical baselines.",
+        "",
+    ])
+    for phase, rows in scorecard["eligible_by_phase"].items():
+        lines.extend([
+            f"### {phase}",
             "",
             "| Metric | Revenue Ops | CLBOSS |",
             "|---|---:|---:|",

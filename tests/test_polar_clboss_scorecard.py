@@ -75,9 +75,14 @@ def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming()
         ]
         == 100_000.0
     )
+    assert result["eligible_by_phase"]["paid_retention"]["revenue_ops"][
+        "net_profit_msat"
+    ] == 100
     rendered = mod.markdown(result)
     assert "Formal verdict: **not ready**" in rendered
     assert "### acquisition" in rendered
+    assert "## Eligible results by phase" in rendered
+    assert "### paid_retention" in rendered
 
 
 def test_scorecard_keeps_unsafe_enhanced_block_out_of_eligible_profile_results():
@@ -90,6 +95,7 @@ def test_scorecard_keeps_unsafe_enhanced_block_out_of_eligible_profile_results()
     assert result["coverage"]["enhanced_blocks"] == 1
     assert result["coverage"]["eligible_blocks"] == 0
     assert result["eligible_by_market_profile"] == {}
+    assert result["eligible_by_phase"] == {}
     assert result["by_market_profile"]["acquisition"]["revenue_ops"][
         "net_profit_msat"
     ] == 100
