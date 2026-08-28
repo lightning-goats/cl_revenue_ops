@@ -30,7 +30,7 @@ from polar_mixed_client_lab import (  # noqa: E402
 
 
 SCHEMA = "polar-clboss-runner-state-v1"
-EXPECTED_REVENUE_REVISION = "21de69a0a225f1a0b36ae4389a5e16badd0c523b"
+EXPECTED_REVENUE_REVISION = "3df9ad303ad0cb029403b0b3afcc0bd27445e087"
 IMAGE = f"cl-revenue-ops-polar-clboss:{EXPECTED_REVENUE_REVISION[:7]}"
 NETWORK_ID = 4
 DOCKER_NETWORK = "polar-network-4_default"
