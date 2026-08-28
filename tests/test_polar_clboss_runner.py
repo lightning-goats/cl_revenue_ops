@@ -583,6 +583,10 @@ def test_automatic_acquisition_waits_for_native_episode_without_forced_cycle(
             "identity-a": {"container": "revenue"},
             "identity-b": {"container": "clboss"},
         },
+        "automatic_acquisition": {
+            "status": "restored",
+            "episode": {"id": 8},
+        },
     })
     lane_before = {
         "cln": {
@@ -624,6 +628,9 @@ def test_automatic_acquisition_waits_for_native_episode_without_forced_cycle(
 
     assert state["status"] == "automatic_acquisition_ready"
     assert state["automatic_acquisition"]["lane"]["family"] == "cln"
+    assert state["automatic_acquisition_history"] == [{
+        "status": "restored", "episode": {"id": 8},
+    }]
     assert all(method != "revenue-fee-cycle" for method, _args in rpc_calls)
 
 

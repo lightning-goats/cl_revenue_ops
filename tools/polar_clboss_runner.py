@@ -850,7 +850,14 @@ def start_automatic_acquisition(
     state = read_state(path)
     if state.get("status") not in {"isolated_full_stack_ready", "smoke_complete"}:
         raise RunnerError(f"replica is not automatic-acquisition-ready: {state.get('status')}")
-    if "automatic_acquisition" in state or "acquisition_treatment" in state:
+    prior_automatic = state.get("automatic_acquisition")
+    if isinstance(prior_automatic, dict) and prior_automatic.get("status") == "restored":
+        history = state.setdefault("automatic_acquisition_history", [])
+        if not isinstance(history, list):
+            raise RunnerError("automatic acquisition history is malformed")
+        history.append(prior_automatic)
+        del state["automatic_acquisition"]
+    elif "automatic_acquisition" in state or "acquisition_treatment" in state:
         raise RunnerError("an acquisition treatment capture already exists")
     identity = state["assignment"]["revenue_ops"]
     container = state["contenders"][identity]["container"]
