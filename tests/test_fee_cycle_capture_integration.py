@@ -56,6 +56,7 @@ EVIDENCE_OPERATION_CONTRACT = {
     "node_channels",
     "acquisition_active",
     "acquisition_cooldown",
+    "acquisition_forward_evidence",
 }
 DECISION_CALL_CONTRACT = {
     "decision_now": Counter(

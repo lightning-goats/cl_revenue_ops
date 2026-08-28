@@ -965,15 +965,31 @@ def refresh_automatic_acquisition_phase(state: dict[str, Any]) -> str | None:
         raise RunnerError("automatic acquisition phase selected an unscored lane")
     lane = matching_lanes[0]
     target_key = "retention_fee_ppm" if phase == "retention" else "target_fee_ppm"
+    base_target_key = (
+        "retention_base_fee_msat"
+        if phase == "retention"
+        else "target_base_fee_msat"
+    )
     target_ppm = nonnegative_int(
         live_episode.get(target_key), f"automatic {phase} target fee"
     )
-    if phase == "retention" and target_ppm <= ACQUISITION_MIN_PPM:
-        raise RunnerError("automatic paid retention did not expose a positive fee")
+    target_base_msat = nonnegative_int(
+        live_episode.get(base_target_key, 0),
+        f"automatic {phase} target base fee",
+    )
+    if phase == "retention" and (target_ppm != 0 or target_base_msat <= 0):
+        raise RunnerError(
+            "automatic paid retention did not expose a positive base-fee undercut"
+        )
     if lane["fee_ppm"] != target_ppm:
         raise RunnerError(
             f"automatic {phase} fee readback mismatch: "
             f"live={lane['fee_ppm']} target={target_ppm}"
+        )
+    if lane["fee_base_msat"] != target_base_msat:
+        raise RunnerError(
+            f"automatic {phase} base-fee readback mismatch: "
+            f"live={lane['fee_base_msat']} target={target_base_msat}"
         )
     automatic.update(episode=live_episode, lane=lane, phase=phase)
     return phase

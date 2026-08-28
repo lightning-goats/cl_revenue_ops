@@ -706,14 +706,17 @@ def test_refresh_automatic_phase_recognizes_native_paid_retention(monkeypatch):
         "channel_id": "1x1x0",
         "phase": "retention",
         "target_fee_ppm": 0,
-        "retention_fee_ppm": 2,
+        "target_base_fee_msat": 0,
+        "retention_fee_ppm": 0,
+        "retention_base_fee_msat": 4,
     }
     live_lane = {
         "family": "cln",
         "channel_id": "funding-a",
         "short_channel_id": "1x1x0",
         "peer_id": "peer-a",
-        "fee_ppm": 2,
+        "fee_base_msat": 4,
+        "fee_ppm": 0,
     }
     monkeypatch.setattr(runner, "_acquisition_rows", lambda _container: [live_episode])
     monkeypatch.setattr(
@@ -726,6 +729,7 @@ def test_refresh_automatic_phase_recognizes_native_paid_retention(monkeypatch):
                 "channel_id": "funding-b",
                 "short_channel_id": "2x1x0",
                 "peer_id": "peer-b",
+                "fee_base_msat": 0,
                 "fee_ppm": 15,
             },
         },

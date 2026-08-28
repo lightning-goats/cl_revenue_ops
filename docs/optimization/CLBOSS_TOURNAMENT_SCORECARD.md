@@ -55,9 +55,11 @@ Revenue Ops' bounded acquisition experiment remains default-off and may quote
 0 ppm on only one capped episode. It now admits competitor observations from
 1 through 10 ppm instead of requiring exactly 1 ppm; all duration, volume,
 opportunity-cost, liquidity, and cooldown rails remain unchanged. After 50,000
-acquired sats it may now run a one-hour, 250,000-sat paid validation phase at
-the observed 1--10 ppm competitor floor. Both phases share the 25-sat
-opportunity-cost cap and restore the exact captured baseline on exit.
+acquired sats it may run a one-hour, 250,000-sat paid validation phase at
+0 ppm plus a positive base fee one millisatoshi below the competitor's
+proportional charge at the smallest acquired payment. If no positive strict
+undercut exists, it exits. Both phases share the 25-sat opportunity-cost cap
+and restore the exact captured base and proportional fees on exit.
 
 ## What the tournament has established
 
@@ -77,7 +79,7 @@ opportunity-cost cap and restore the exact captured baseline on exit.
 |---|---|---|
 | Family attribution | CLN versus LND volume, fees, and forwards | Runner blocks map every contender SCID to a client family and fail closed on unmapped activity. |
 | Automatic acquisition | Whether the default-off product selects and wins a natural lane | Enable the gate and wait for native fee cycles; never force a scored fee cycle. |
-| Paid retention | Whether acquired flow remains at 1, 2, or 5 ppm | Keep experimental until positive lift repeats across crossed identities and both client families. |
+| Paid retention | Whether a positive base-fee undercut converts the 1-ppm tie into retained volume and profit | Keep experimental until positive lift repeats across crossed identities and both client families. |
 | Liquidity pressure | Whether each controller restores depleted earning liquidity profitably | Run one-way traffic with equal spend caps; compare net fees, cost, and ending imbalance. |
 | Product change | Repeatable positive net lift across crossed identities and clients | Promote only treatments with replicated safety-eligible evidence. |
 

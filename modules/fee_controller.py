@@ -2586,6 +2586,7 @@ class FeeController:
     # Default-off market-acquisition rollout. These are fixed safety rails,
     # not tuning knobs: the first production surface exposes only enable/off.
     ACQUISITION_TARGET_FEE_PPM = 0
+    ACQUISITION_TARGET_BASE_FEE_MSAT = 0
     # Public routing markets frequently cluster at a few ppm on the cheapest
     # lanes. Requiring an exact 1-ppm observation made the bounded experiment
     # fail to start when an otherwise equivalent competitor quoted 2 ppm. A
@@ -2597,12 +2598,14 @@ class FeeController:
     ACQUISITION_VOLUME_CAP_SATS = 250_000
     ACQUISITION_OPPORTUNITY_COST_CAP_SATS = 25.0
     # A free quote is only useful if it answers whether demand exists.  Once
-    # enough demand is observed, validate that demand at the peer-local paid
-    # floor rather than restoring blindly.  This phase is part of the same
-    # default-off, one-lane loss budget and cannot outlive its own caps.
+    # enough demand is observed, validate it with a positive base-fee quote
+    # that is strictly cheaper than the peer-local proportional floor at the
+    # smallest acquired payment.  This phase is part of the same default-off,
+    # one-lane loss budget and cannot outlive its own caps.
     ACQUISITION_RETENTION_MIN_VOLUME_SATS = 50_000
     ACQUISITION_RETENTION_DURATION_SECONDS = 3600
     ACQUISITION_RETENTION_VOLUME_CAP_SATS = 250_000
+    ACQUISITION_RETENTION_BASE_FEE_CAP_MSAT = 1_000
     ACQUISITION_START_OUTBOUND_RATIO = 0.85
     ACQUISITION_EXIT_OUTBOUND_RATIO = 0.70
     ACQUISITION_IDLE_SECONDS = 24 * 3600
@@ -2949,7 +2952,7 @@ class FeeController:
         if not callable(start_episode) or not callable(cooldown):
             return {}
 
-        candidates: list[tuple[float, str, str, int, int]] = []
+        candidates: list[tuple[float, str, str, int, int, int]] = []
         for state in channel_states:
             if not isinstance(state, dict):
                 continue
@@ -2963,6 +2966,7 @@ class FeeController:
                 spendable = base_to_sats_floor(parse_msat(info.get("spendable_msat", 0)))
                 ratio = spendable / capacity if capacity > 0 else 0.0
                 baseline_fee = int(info.get("fee_proportional_millionths", 0) or 0)
+                baseline_base_fee = parse_msat(info.get("fee_base_msat", 0))
             except (TypeError, ValueError, OverflowError):
                 continue
             if ratio < self.ACQUISITION_START_OUTBOUND_RATIO or baseline_fee <= 0:
@@ -3016,9 +3020,23 @@ class FeeController:
                 continue
             if not self._acquisition_competitor_floor_qualifies(competitor_floor):
                 continue
-            candidates.append((ratio, channel_id, peer_id, baseline_fee, competitor_floor))
+            candidates.append((
+                ratio,
+                channel_id,
+                peer_id,
+                baseline_fee,
+                max(0, int(baseline_base_fee)),
+                competitor_floor,
+            ))
 
-        for ratio, channel_id, peer_id, baseline_fee, competitor_floor in sorted(
+        for (
+            ratio,
+            channel_id,
+            peer_id,
+            baseline_fee,
+            baseline_base_fee,
+            competitor_floor,
+        ) in sorted(
             candidates, key=lambda row: (-row[0], row[1])
         ):
             try:
@@ -3027,6 +3045,8 @@ class FeeController:
                     peer_id=peer_id,
                     baseline_fee_ppm=baseline_fee,
                     target_fee_ppm=self.ACQUISITION_TARGET_FEE_PPM,
+                    baseline_base_fee_msat=baseline_base_fee,
+                    target_base_fee_msat=self.ACQUISITION_TARGET_BASE_FEE_MSAT,
                     starting_outbound_ratio=ratio,
                     competitor_floor_ppm=competitor_floor,
                     started_at=now,
@@ -3067,6 +3087,37 @@ class FeeController:
             <= cls.ACQUISITION_MAX_COMPETITOR_FLOOR_PPM
         )
 
+    @classmethod
+    def _positive_retention_base_fee_msat(
+        cls, minimum_out_msat: Any, competitor_fee_ppm: Any
+    ) -> Optional[int]:
+        """Return a positive quote strictly below the observed proportional fee.
+
+        The minimum acquired payment is the conservative anchor: if the quote
+        undercuts there, it also undercuts the same proportional policy for
+        every larger observed payment.  There is no positive integer-msat
+        undercut when the competitor charge is at most one millisatoshi.
+        """
+        if isinstance(minimum_out_msat, bool):
+            return None
+        try:
+            amount_msat = int(minimum_out_msat)
+            fee_ppm = int(competitor_fee_ppm)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if amount_msat <= 0 or not cls._acquisition_competitor_floor_qualifies(fee_ppm):
+            return None
+        # Use floor division deliberately.  It is conservative across routing
+        # implementations that may round proportional fees differently: a
+        # quote below the floored charge is strictly below either convention.
+        competitor_charge_msat = amount_msat * fee_ppm // 1_000_000
+        if competitor_charge_msat <= 1:
+            return None
+        return min(
+            cls.ACQUISITION_RETENTION_BASE_FEE_CAP_MSAT,
+            competitor_charge_msat - 1,
+        )
+
     def _complete_acquisition_experiment(
         self,
         episode: Dict[str, Any],
@@ -3076,6 +3127,7 @@ class FeeController:
         opportunity_cost_sats: float,
         outbound_ratio: float,
         restored_fee_ppm: int,
+        restored_base_fee_msat: int,
         now: int,
     ) -> None:
         complete = getattr(self.database, "complete_acquisition_experiment", None)
@@ -3089,6 +3141,7 @@ class FeeController:
                 opportunity_cost_sats=opportunity_cost_sats,
                 ending_outbound_ratio=outbound_ratio,
                 restored_fee_ppm=restored_fee_ppm,
+                restored_base_fee_msat=restored_base_fee_msat,
                 completed_at=now,
             )
         except Exception as exc:
@@ -3100,7 +3153,7 @@ class FeeController:
                 f"ACQUISITION: completed {str(episode.get('channel_id'))[:12]}... "
                 f"reason={exit_reason}, volume={volume_sats}sats, "
                 f"opportunity_cost={opportunity_cost_sats:.3f}sats, "
-                f"restored={restored_fee_ppm}ppm",
+                f"restored={restored_base_fee_msat}msat+{restored_fee_ppm}ppm",
                 level="info",
             )
 
@@ -3109,7 +3162,9 @@ class FeeController:
         episode: Dict[str, Any],
         *,
         retention_fee_ppm: int,
+        retention_base_fee_msat: int,
         acquired_volume_sats: int,
+        acquired_forward_count: int,
         now: int,
     ) -> bool:
         """Persist the paid-validation phase; failure leaves a retryable episode."""
@@ -3122,7 +3177,9 @@ class FeeController:
             updated = transition(
                 int(episode["id"]),
                 retention_fee_ppm=int(retention_fee_ppm),
+                retention_base_fee_msat=int(retention_base_fee_msat),
                 phase_start_volume_sats=max(0, int(acquired_volume_sats)),
+                phase_start_forward_count=max(0, int(acquired_forward_count)),
                 transitioned_at=int(now),
             )
         except Exception as exc:
@@ -3142,8 +3199,8 @@ class FeeController:
             self._acquisition_cycle_experiments[channel_id] = updated
         self.plugin.log(
             f"ACQUISITION: entered paid retention on {channel_id[:12]}... "
-            f"at {int(retention_fee_ppm)}ppm after "
-            f"{int(acquired_volume_sats)} acquired sats",
+            f"at {int(retention_base_fee_msat)}msat+{int(retention_fee_ppm)}ppm "
+            f"after {int(acquired_volume_sats)} acquired sats",
             level="info",
         )
         return True
@@ -6416,11 +6473,17 @@ class FeeController:
         acquisition_episode = self._acquisition_cycle_experiments.get(channel_id)
         acquisition_exit_reason: Optional[str] = None
         acquisition_volume_sats = 0
+        acquisition_forward_count = 0
+        acquisition_min_out_msat: Optional[int] = None
         acquisition_opportunity_cost_sats = 0.0
         acquisition_competitor_floor_ppm: Optional[int] = None
         acquisition_phase = "acquisition"
         acquisition_phase_volume_sats = 0
+        acquisition_phase_forward_count = 0
+        acquisition_baseline_base_fee_msat = 0
+        acquisition_target_base_fee_msat = self.ACQUISITION_TARGET_BASE_FEE_MSAT
         acquisition_retention_fee_ppm: Optional[int] = None
+        acquisition_retention_base_fee_msat: Optional[int] = None
         acquisition_transition_requested = False
         
         now = decision_now("channel.adjust")
@@ -6826,17 +6889,32 @@ class FeeController:
                 acquisition_target_fee_ppm = int(
                     acquisition_episode["target_fee_ppm"]
                 )
-                acquisition_volume_sats = max(
-                    0,
-                    int(
-                        record_effective_evidence(
-                            "volume_since",
-                            [channel_id, acquisition_started_at],
-                            lambda: self.database.get_volume_since(
-                                channel_id, acquisition_started_at
-                            ),
-                        )
+                acquisition_baseline_base_fee_msat = max(
+                    0, int(acquisition_episode.get("baseline_base_fee_msat") or 0)
+                )
+                acquisition_target_base_fee_msat = max(
+                    0, int(acquisition_episode.get("target_base_fee_msat") or 0)
+                )
+                acquisition_evidence = record_effective_evidence(
+                    "acquisition_forward_evidence",
+                    [channel_id, acquisition_started_at],
+                    lambda: self.database.get_acquisition_forward_evidence_since(
+                        channel_id, acquisition_started_at
                     ),
+                )
+                if not isinstance(acquisition_evidence, dict):
+                    raise ValueError("invalid acquisition forward evidence")
+                acquisition_volume_sats = max(
+                    0, int(acquisition_evidence.get("volume_sats"))
+                )
+                acquisition_forward_count = max(
+                    0, int(acquisition_evidence.get("forward_count"))
+                )
+                raw_min_out_msat = acquisition_evidence.get("min_out_msat")
+                acquisition_min_out_msat = (
+                    None
+                    if raw_min_out_msat is None
+                    else int(raw_min_out_msat)
                 )
                 acquisition_phase = str(
                     acquisition_episode.get("phase") or "acquisition"
@@ -6849,11 +6927,16 @@ class FeeController:
                 phase_start_volume_sats = int(
                     acquisition_episode.get("phase_start_volume_sats") or 0
                 )
+                phase_start_forward_count = int(
+                    acquisition_episode.get("phase_start_forward_count") or 0
+                )
                 if (
                     phase_start_volume_sats < 0
                     or phase_start_volume_sats > acquisition_volume_sats
+                    or phase_start_forward_count < 0
+                    or phase_start_forward_count > acquisition_forward_count
                 ):
-                    raise ValueError("invalid phase-start volume")
+                    raise ValueError("invalid phase-start evidence")
 
                 if acquisition_phase == "retention":
                     if not (
@@ -6865,12 +6948,21 @@ class FeeController:
                     acquisition_retention_fee_ppm = int(
                         acquisition_episode.get("retention_fee_ppm")
                     )
-                    if not self._acquisition_competitor_floor_qualifies(
-                        acquisition_retention_fee_ppm
+                    acquisition_retention_base_fee_msat = int(
+                        acquisition_episode.get("retention_base_fee_msat")
+                    )
+                    if (
+                        acquisition_retention_fee_ppm != 0
+                        or acquisition_retention_base_fee_msat <= 0
+                        or acquisition_retention_base_fee_msat
+                        > self.ACQUISITION_RETENTION_BASE_FEE_CAP_MSAT
                     ):
-                        raise ValueError("invalid retention fee")
+                        raise ValueError("invalid retention quote")
                     acquisition_phase_volume_sats = (
                         acquisition_volume_sats - phase_start_volume_sats
+                    )
+                    acquisition_phase_forward_count = (
+                        acquisition_forward_count - phase_start_forward_count
                     )
                     acquisition_opportunity_cost_sats = (
                         phase_start_volume_sats
@@ -6879,17 +6971,36 @@ class FeeController:
                             acquisition_baseline_fee_ppm
                             - acquisition_target_fee_ppm,
                         )
+                        + phase_start_forward_count
+                        * max(
+                            0,
+                            acquisition_baseline_base_fee_msat
+                            - acquisition_target_base_fee_msat,
+                        )
+                        * 1_000
                         + acquisition_phase_volume_sats
                         * max(
                             0,
                             acquisition_baseline_fee_ppm
                             - acquisition_retention_fee_ppm,
                         )
+                        + acquisition_phase_forward_count
+                        * max(
+                            0,
+                            acquisition_baseline_base_fee_msat
+                            - acquisition_retention_base_fee_msat,
+                        )
+                        * 1_000
                     ) / 1_000_000.0
                 else:
-                    if acquisition_target_fee_ppm != self.ACQUISITION_TARGET_FEE_PPM:
+                    if (
+                        acquisition_target_fee_ppm != self.ACQUISITION_TARGET_FEE_PPM
+                        or acquisition_target_base_fee_msat
+                        != self.ACQUISITION_TARGET_BASE_FEE_MSAT
+                    ):
                         raise ValueError("invalid acquisition target")
                     acquisition_phase_volume_sats = acquisition_volume_sats
+                    acquisition_phase_forward_count = acquisition_forward_count
                     acquisition_opportunity_cost_sats = (
                         acquisition_volume_sats
                         * max(
@@ -6897,8 +7008,14 @@ class FeeController:
                             acquisition_baseline_fee_ppm
                             - acquisition_target_fee_ppm,
                         )
-                        / 1_000_000.0
-                    )
+                        + acquisition_forward_count
+                        * max(
+                            0,
+                            acquisition_baseline_base_fee_msat
+                            - acquisition_target_base_fee_msat,
+                        )
+                        * 1_000
+                    ) / 1_000_000.0
                 acquisition_competitor_floor_ppm = (
                     self._get_neighbor_fee_percentile(peer_id, 0.0, cfg=cfg)
                 )
@@ -6960,11 +7077,21 @@ class FeeController:
                                 "retention_persistence_unavailable"
                             )
                         else:
-                            acquisition_retention_fee_ppm = int(
-                                acquisition_competitor_floor_ppm
+                            acquisition_retention_base_fee_msat = (
+                                self._positive_retention_base_fee_msat(
+                                    acquisition_min_out_msat,
+                                    acquisition_competitor_floor_ppm,
+                                )
                             )
-                            acquisition_transition_requested = True
-                            acquisition_phase_volume_sats = 0
+                            if acquisition_retention_base_fee_msat is None:
+                                acquisition_exit_reason = (
+                                    "retention_positive_undercut_unavailable"
+                                )
+                            else:
+                                acquisition_retention_fee_ppm = 0
+                                acquisition_transition_requested = True
+                                acquisition_phase_volume_sats = 0
+                                acquisition_phase_forward_count = 0
             except Exception as exc:
                 # A malformed row or stale/unavailable evidence must never
                 # leave a 0-ppm quote running indefinitely.
@@ -6982,7 +7109,9 @@ class FeeController:
                 acquisition_target_fee_ppm = self.ACQUISITION_TARGET_FEE_PPM
                 acquisition_phase = "acquisition"
                 acquisition_phase_volume_sats = 0
+                acquisition_phase_forward_count = 0
                 acquisition_retention_fee_ppm = None
+                acquisition_retention_base_fee_msat = None
                 acquisition_transition_requested = False
                 acquisition_exit_reason = "evidence_unavailable"
                 self.plugin.log(
@@ -7998,6 +8127,16 @@ class FeeController:
         htlcmin_msat = None
         current_base_fee_msat = parse_msat(channel_info.get("fee_base_msat", 0))
         target_base_fee_msat = self._resolve_base_fee_msat(peer_id, cfg)
+        if acquisition_episode is not None:
+            if acquisition_exit_reason is not None:
+                target_base_fee_msat = acquisition_baseline_base_fee_msat
+            elif (
+                acquisition_phase == "retention"
+                or acquisition_transition_requested
+            ):
+                target_base_fee_msat = int(acquisition_retention_base_fee_msat)
+            else:
+                target_base_fee_msat = acquisition_target_base_fee_msat
         base_fee_policy_change = int(current_base_fee_msat) != int(target_base_fee_msat)
         current_htlcmin_msat = parse_msat(
             channel_info.get("htlc_minimum_msat", channel_info.get("htlc_min_msat", 0))
@@ -8233,6 +8372,8 @@ class FeeController:
                 f"volume={acquisition_volume_sats}sats, "
                 f"opportunity_cost={acquisition_opportunity_cost_sats:.3f}sats, "
                 f"competitor_floor={acquisition_competitor_floor_ppm}ppm, "
+                f"quote={acquisition_target_base_fee_msat}msat+"
+                f"{acquisition_target_fee_ppm}ppm, "
                 f"{common_reason_suffix}"
             )
         elif decision_reason == "ACQUISITION_RETENTION":
@@ -8241,7 +8382,8 @@ class FeeController:
                 f"discovery, phase_volume={acquisition_phase_volume_sats}sats, "
                 f"total_volume={acquisition_volume_sats}sats, "
                 f"opportunity_cost={acquisition_opportunity_cost_sats:.3f}sats, "
-                f"retention_fee={acquisition_retention_fee_ppm}ppm, "
+                f"retention_fee={acquisition_retention_base_fee_msat}msat+"
+                f"{acquisition_retention_fee_ppm}ppm, "
                 f"{common_reason_suffix}"
             )
         elif decision_reason == "ACQUISITION_EXIT":
@@ -8305,7 +8447,11 @@ class FeeController:
                 self._transition_acquisition_to_retention(
                     acquisition_episode,
                     retention_fee_ppm=int(acquisition_retention_fee_ppm),
+                    retention_base_fee_msat=int(
+                        acquisition_retention_base_fee_msat
+                    ),
                     acquired_volume_sats=acquisition_volume_sats,
+                    acquired_forward_count=acquisition_forward_count,
                     now=now,
                 )
             if acquisition_episode is not None and acquisition_exit_reason is not None:
@@ -8316,6 +8462,7 @@ class FeeController:
                     opportunity_cost_sats=acquisition_opportunity_cost_sats,
                     outbound_ratio=outbound_ratio,
                     restored_fee_ppm=raw_chain_fee,
+                    restored_base_fee_msat=int(current_base_fee_msat),
                     now=now,
                 )
             return None
@@ -8359,12 +8506,19 @@ class FeeController:
             dry_run_proposal = bool(result.get("dry_run"))
             # Read back actual fee (may have been clamped by set_channel_fee)
             new_fee_ppm = result.get("fee_ppm", new_fee_ppm)
+            applied_base_fee_msat = result.get(
+                "base_fee_msat", target_base_fee_msat
+            )
 
             if acquisition_transition_requested and not dry_run_proposal:
                 self._transition_acquisition_to_retention(
                     acquisition_episode,
                     retention_fee_ppm=int(acquisition_retention_fee_ppm),
+                    retention_base_fee_msat=int(
+                        acquisition_retention_base_fee_msat
+                    ),
                     acquired_volume_sats=acquisition_volume_sats,
+                    acquired_forward_count=acquisition_forward_count,
                     now=now,
                 )
 
@@ -8380,6 +8534,7 @@ class FeeController:
                     opportunity_cost_sats=acquisition_opportunity_cost_sats,
                     outbound_ratio=outbound_ratio,
                     restored_fee_ppm=int(new_fee_ppm),
+                    restored_base_fee_msat=int(applied_base_fee_msat),
                     now=now,
                 )
 
@@ -8491,8 +8646,13 @@ class FeeController:
                         else acquisition_phase
                     ),
                     "acquisition_phase_volume_sats": acquisition_phase_volume_sats,
+                    "acquisition_phase_forward_count": acquisition_phase_forward_count,
                     "acquisition_retention_fee_ppm": acquisition_retention_fee_ppm,
+                    "acquisition_retention_base_fee_msat": (
+                        acquisition_retention_base_fee_msat
+                    ),
                     "acquisition_volume_sats": acquisition_volume_sats,
+                    "acquisition_forward_count": acquisition_forward_count,
                     "acquisition_opportunity_cost_sats": acquisition_opportunity_cost_sats,
                     "acquisition_competitor_floor_ppm": acquisition_competitor_floor_ppm,
                     # L6: honest attribution — the floor and the nudge are

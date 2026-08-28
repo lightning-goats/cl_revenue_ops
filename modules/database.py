@@ -877,6 +877,8 @@ class Database:
                 started_at INTEGER NOT NULL,
                 baseline_fee_ppm INTEGER NOT NULL,
                 target_fee_ppm INTEGER NOT NULL,
+                baseline_base_fee_msat INTEGER NOT NULL DEFAULT 0,
+                target_base_fee_msat INTEGER NOT NULL DEFAULT 0,
                 starting_outbound_ratio REAL NOT NULL,
                 competitor_floor_ppm INTEGER NOT NULL,
                 completed_at INTEGER,
@@ -885,10 +887,13 @@ class Database:
                 opportunity_cost_sats REAL NOT NULL DEFAULT 0.0,
                 ending_outbound_ratio REAL,
                 restored_fee_ppm INTEGER,
+                restored_base_fee_msat INTEGER,
                 phase TEXT NOT NULL DEFAULT 'acquisition',
                 phase_started_at INTEGER NOT NULL DEFAULT 0,
                 phase_start_volume_sats INTEGER NOT NULL DEFAULT 0,
-                retention_fee_ppm INTEGER
+                phase_start_forward_count INTEGER NOT NULL DEFAULT 0,
+                retention_fee_ppm INTEGER,
+                retention_base_fee_msat INTEGER
             )
         """)
         conn.execute("""
@@ -906,7 +911,12 @@ class Database:
             "phase TEXT NOT NULL DEFAULT 'acquisition'",
             "phase_started_at INTEGER NOT NULL DEFAULT 0",
             "phase_start_volume_sats INTEGER NOT NULL DEFAULT 0",
+            "phase_start_forward_count INTEGER NOT NULL DEFAULT 0",
             "retention_fee_ppm INTEGER",
+            "baseline_base_fee_msat INTEGER NOT NULL DEFAULT 0",
+            "target_base_fee_msat INTEGER NOT NULL DEFAULT 0",
+            "retention_base_fee_msat INTEGER",
+            "restored_base_fee_msat INTEGER",
         ):
             try:
                 conn.execute(
@@ -2275,6 +2285,8 @@ class Database:
         starting_outbound_ratio: float,
         competitor_floor_ppm: int,
         started_at: Optional[int] = None,
+        baseline_base_fee_msat: int = 0,
+        target_base_fee_msat: int = 0,
     ) -> Optional[Dict[str, Any]]:
         """Persist one active episode, returning None if another is active."""
         conn = self._get_connection()
@@ -2284,11 +2296,14 @@ class Database:
                 INSERT INTO acquisition_experiments (
                     channel_id, peer_id, state, started_at,
                     baseline_fee_ppm, target_fee_ppm,
+                    baseline_base_fee_msat, target_base_fee_msat,
                     starting_outbound_ratio, competitor_floor_ppm
-                ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
             """, (
                 str(channel_id), str(peer_id), now,
                 int(baseline_fee_ppm), int(target_fee_ppm),
+                max(0, int(baseline_base_fee_msat)),
+                max(0, int(target_base_fee_msat)),
                 float(starting_outbound_ratio), int(competitor_floor_ppm),
             ))
         except sqlite3.IntegrityError:
@@ -2329,24 +2344,30 @@ class Database:
         experiment_id: int,
         *,
         retention_fee_ppm: int,
+        retention_base_fee_msat: int,
         phase_start_volume_sats: int,
+        phase_start_forward_count: int,
         transitioned_at: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """Atomically persist the paid phase before treating it as durable."""
         conn = self._get_connection()
         now = int(time.time()) if transitioned_at is None else int(transitioned_at)
         fee_ppm = int(retention_fee_ppm)
-        if fee_ppm <= 0:
+        base_fee_msat = int(retention_base_fee_msat)
+        if fee_ppm < 0 or base_fee_msat <= 0:
             return None
         cursor = conn.execute("""
             UPDATE acquisition_experiments
             SET phase = 'retention', phase_started_at = ?,
-                phase_start_volume_sats = ?, retention_fee_ppm = ?
+                phase_start_volume_sats = ?, phase_start_forward_count = ?,
+                retention_fee_ppm = ?, retention_base_fee_msat = ?
             WHERE id = ? AND state = 'active' AND phase = 'acquisition'
         """, (
             now,
             max(0, int(phase_start_volume_sats)),
+            max(0, int(phase_start_forward_count)),
             fee_ppm,
+            base_fee_msat,
             int(experiment_id),
         ))
         if cursor.rowcount != 1:
@@ -2376,6 +2397,7 @@ class Database:
         opportunity_cost_sats: float,
         ending_outbound_ratio: float,
         restored_fee_ppm: int,
+        restored_base_fee_msat: int = 0,
         completed_at: Optional[int] = None,
     ) -> bool:
         """Atomically mark an active episode complete after fee restoration."""
@@ -2385,13 +2407,15 @@ class Database:
             UPDATE acquisition_experiments
             SET state = 'completed', completed_at = ?, exit_reason = ?,
                 observed_volume_sats = ?, opportunity_cost_sats = ?,
-                ending_outbound_ratio = ?, restored_fee_ppm = ?
+                ending_outbound_ratio = ?, restored_fee_ppm = ?,
+                restored_base_fee_msat = ?
             WHERE id = ? AND state = 'active'
         """, (
             now, str(exit_reason), max(0, int(observed_volume_sats)),
             max(0.0, float(opportunity_cost_sats)),
             max(0.0, min(1.0, float(ending_outbound_ratio))),
-            max(0, int(restored_fee_ppm)), int(experiment_id),
+            max(0, int(restored_fee_ppm)),
+            max(0, int(restored_base_fee_msat)), int(experiment_id),
         ))
         return cursor.rowcount == 1
     
@@ -5802,6 +5826,40 @@ class Database:
         """, (channel_id, timestamp)).fetchone()
 
         return row['forward_count'] if row else 0
+
+    def get_acquisition_forward_evidence_since(
+        self, channel_id: str, timestamp: int
+    ) -> Dict[str, Optional[int]]:
+        """Return coherent volume/count/minimum evidence for one episode.
+
+        A single aggregate query prevents the acquisition transition from
+        mixing three different database moments.  The minimum, rather than
+        the average, anchors a positive base-fee quote that remains below the
+        observed proportional competitor for every acquired payment size.
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT COALESCE(SUM(out_msat), 0) AS total_out_msat,
+                   COUNT(*) AS forward_count,
+                   MIN(out_msat) AS min_out_msat
+            FROM forwards
+            WHERE out_channel = ? AND timestamp > ? AND out_msat > 0
+        """, (channel_id, timestamp)).fetchone()
+        if row is None:
+            return {
+                "volume_sats": 0,
+                "forward_count": 0,
+                "min_out_msat": None,
+            }
+        minimum = row["min_out_msat"]
+        minimum_value = int(minimum) if minimum is not None else None
+        return {
+            "volume_sats": base_to_sats_floor(int(row["total_out_msat"] or 0)),
+            "forward_count": int(row["forward_count"] or 0),
+            "min_out_msat": (
+                minimum_value if minimum_value is not None and minimum_value > 0 else None
+            ),
+        }
 
     def get_all_channel_flow_windows(
         self, since_timestamp: int
