@@ -1270,6 +1270,7 @@ class RebalanceEngine:
             # override below — two point queries per cooled channel doubled
             # the snapshot's DB cost at scale.
             cooldown = False
+            last_ts: Optional[int] = None
             anchor: Optional[Dict[str, Any]] = None
             if self.database and cooldown_secs > 0:
                 try:
@@ -1312,6 +1313,18 @@ class RebalanceEngine:
                         if anchor_ratio - current_ratio >= drift_threshold:
                             cooldown_override = True
 
+            # A successful payment can settle faster than the shared channel
+            # snapshot refreshes.  During this short window the emergency
+            # floor would otherwise see the stale pre-payment balance and
+            # schedule the same destination again on the next 15-second lab
+            # cycle.  Keep ordinary cooldown and anchor-drift behavior intact;
+            # suppress only the local-ratio emergency shortcut for 60 seconds.
+            emergency_override_allowed = True
+            if cooldown and last_ts is not None:
+                emergency_override_allowed = (
+                    int(time.time()) - int(last_ts)
+                ) >= 60
+
             normalized.append({
                 "channel_id": scid,
                 "peer_id": peer_id,
@@ -1321,6 +1334,7 @@ class RebalanceEngine:
                 "local_out_fee_ppm": local_out_fee_ppm,
                 "cooldown_active": cooldown,
                 "cooldown_override": cooldown_override,
+                "emergency_override_allowed": emergency_override_allowed,
                 **profitability_evidence,
             })
 

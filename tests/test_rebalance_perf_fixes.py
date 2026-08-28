@@ -119,6 +119,50 @@ def test_build_snapshot_anchor_drives_both_cooldown_and_drift(mock_plugin):
     assert db.anchor_calls == 1
 
 
+def test_build_snapshot_recent_success_suppresses_emergency_shortcut(mock_plugin):
+    """The live engine marks a just-settled destination so stale cached local
+    balance cannot bypass cooldown and launch a duplicate refill."""
+    db = _AnchorCountingDb(
+        last_ts=int(time.time()) - 30,
+        anchor={"post_local_ratio": 0.30, "amount_sats": 155_000},
+    )
+    engine = _snapshot_engine(mock_plugin, db)
+    captured = {}
+    import modules.rebalance_engine_v2 as engine_mod
+
+    real_builder = engine_mod.build_state_snapshot
+
+    def capture(normalized, *args, **kwargs):
+        captured["normalized"] = normalized
+        return real_builder(normalized, *args, **kwargs)
+
+    with patch.object(engine_mod, "build_state_snapshot", side_effect=capture):
+        engine._build_snapshot()
+
+    assert captured["normalized"][0]["emergency_override_allowed"] is False
+
+
+def test_build_snapshot_older_success_reenables_emergency_shortcut(mock_plugin):
+    db = _AnchorCountingDb(
+        last_ts=int(time.time()) - 61,
+        anchor={"post_local_ratio": 0.30, "amount_sats": 155_000},
+    )
+    engine = _snapshot_engine(mock_plugin, db)
+    captured = {}
+    import modules.rebalance_engine_v2 as engine_mod
+
+    real_builder = engine_mod.build_state_snapshot
+
+    def capture(normalized, *args, **kwargs):
+        captured["normalized"] = normalized
+        return real_builder(normalized, *args, **kwargs)
+
+    with patch.object(engine_mod, "build_state_snapshot", side_effect=capture):
+        engine._build_snapshot()
+
+    assert captured["normalized"][0]["emergency_override_allowed"] is True
+
+
 def test_build_snapshot_no_anchor_query_when_not_cooled(mock_plugin):
     """Channels outside the base cooldown window never pay the point query."""
     db = _AnchorCountingDb(last_ts=None, anchor=None)

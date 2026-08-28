@@ -36,6 +36,10 @@ class ChannelInput:
     # from rebalance-history anchor state). When True the destination cooldown
     # gate is skipped regardless of local_ratio vs target_emergency_low.
     cooldown_override: bool = False
+    # A just-settled refill may not yet be visible through cached channel data.
+    # The engine temporarily disables only the emergency override so a stale
+    # pre-payment balance cannot schedule an immediate duplicate refill.
+    emergency_override_allowed: bool = True
 
 
 @dataclass(frozen=True)
@@ -150,6 +154,9 @@ def _normalize_channel_input(value: Any) -> ChannelInput:
             is_active=_as_bool(value.get("is_active", False)),
             cooldown_active=_as_bool(value.get("cooldown_active", False)),
             cooldown_override=_as_bool(value.get("cooldown_override", False)),
+            emergency_override_allowed=_as_bool(
+                value.get("emergency_override_allowed", True)
+            ),
         )
     raise TypeError(f"Unsupported channel input type: {type(value)!r}")
 
@@ -351,6 +358,7 @@ def build_state_snapshot(
         cooldown_active = bool(channel.cooldown_active)
         emergency_override = (
             cooldown_active
+            and bool(channel.emergency_override_allowed)
             and target_emergency_low > 0.0
             and local_ratio < target_emergency_low
         )

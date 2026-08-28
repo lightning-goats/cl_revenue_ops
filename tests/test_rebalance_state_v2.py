@@ -381,6 +381,40 @@ def test_default_emergency_floor_keeps_twenty_percent_boundary_cooled():
     assert channel.dest_reason == "cooldown"
 
 
+def test_recent_settlement_grace_blocks_stale_emergency_balance():
+    """A caller can suppress only the emergency shortcut while a just-settled
+    refill propagates; value, budget, and the ordinary cooldown stay intact."""
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "100x1x0": ChannelCapexBudget(
+                channel_id="100x1x0", budget_msat=30_000
+            ),
+        }
+    )
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="100x1x0",
+                peer_id="02" + "f" * 64,
+                capacity_sats=1_000_000,
+                local_sats=145_000,
+                is_profitable=True,
+                is_active=True,
+                cooldown_active=True,
+                emergency_override_allowed=False,
+            ),
+        ],
+        allocations,
+    )
+
+    channel = state.channels[0]
+    assert channel.dest_eligible is False
+    assert channel.dest_reason == "cooldown"
+
+
 def test_explicit_cooldown_override_input_overrides_dest_cooldown():
     """Phase 3.3: when the engine has computed a drift override from anchor
     state, it can pass cooldown_override=True on the channel input. The
