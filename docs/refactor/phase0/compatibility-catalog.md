@@ -29,7 +29,7 @@ Owner: `modules/config.py` — a single `Config` dataclass (102 fields)
 plus the `config_overrides` table (`revenue-config set` persists
 overrides; precedence documented in README.md §revenue-config).
 
-- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (37, listed below).
+- Runtime-settable keys: `PUBLIC_RUNTIME_KEYS` (38, listed below).
 - Immutable at runtime: `db_path`, `dry_run` (`IMMUTABLE_CONFIG_KEYS` —
   dry_run is immutable so enabling it cannot HIDE actions).
 - Version 3.0.0 intentionally removes the planner, Boltz, and LN+ option
@@ -59,7 +59,7 @@ cannot schedule work or authorize action.
 
 ---
 
-### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 37)
+### Runtime-settable keys (PUBLIC_RUNTIME_KEYS, 38)
 
 - `paused`
 - `daily_budget_sats`
@@ -71,6 +71,7 @@ cannot schedule work or authorize action.
 - `growth_budget_hard_ceiling_sats`
 - `min_fee_ppm`
 - `min_fee_ppm_saturated`
+- `acquisition_experiment_enabled`
 - `max_fee_ppm`
 - `fee_profile`
 - `fee_market_boundary_enabled`
@@ -99,7 +100,7 @@ cannot schedule work or authorize action.
 - `authority_level` (added 2026-07-13, Phase 4 Workstream I; observe/fees/liquidity/capital, default `capital`)
 - `risk_profile` (added 2026-07-13, Phase D PR 7; default `custom`)
 
-### Full Config dataclass surface (103 fields with defaults)
+### Full Config dataclass surface (104 fields with defaults)
 
 | Field | Default | Runtime-settable |
 |---|---|---|
@@ -140,6 +141,7 @@ cannot schedule work or authorize action.
 | `sink_threshold` | `-0.05` |  |
 | `min_fee_ppm` | `50` | yes |
 | `min_fee_ppm_saturated` | `0` | yes |
+| `acquisition_experiment_enabled` | `False` | yes |
 | `max_fee_ppm` | `2000` | yes |
 | `base_fee_msat` | `0` |  |
 | `base_fee_policy` | `'off'` |  |

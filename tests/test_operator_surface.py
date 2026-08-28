@@ -35,6 +35,7 @@ def test_public_runtime_keys_are_safety_only():
         "min_fee_ppm",
         # E-2 (2026-07 econ audit): class-aware saturated/source floor
         "min_fee_ppm_saturated",
+        "acquisition_experiment_enabled",
         "max_fee_ppm",
         "fee_profile",
         "fee_market_boundary_enabled",
@@ -90,6 +91,7 @@ def test_public_runtime_dict_returns_only_public_keys():
         "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 15,
         "min_fee_ppm_saturated": 0,
+        "acquisition_experiment_enabled": False,
         "max_fee_ppm": 2500,
         "fee_profile": "active",
         "fee_market_boundary_enabled": False,
@@ -627,6 +629,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
     result = mod.revenue_config(mod.plugin, "list-mutable")
 
     assert result["mutable_keys"] == [
+        "acquisition_experiment_enabled",
         "authority_level",
         "capex_probability_budget_bonus",
         "daily_budget_sats",
@@ -665,7 +668,7 @@ def test_revenue_config_list_mutable_returns_public_controls_only():
         "risk_profile",
         "weekly_budget_sats",
     ]
-    assert result["count"] == 37
+    assert result["count"] == 38
 
 
 def test_revenue_config_get_without_key_returns_public_controls_only():
@@ -684,6 +687,7 @@ def test_revenue_config_get_without_key_returns_public_controls_only():
         "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 15,
         "min_fee_ppm_saturated": 0,
+        "acquisition_experiment_enabled": False,
         "max_fee_ppm": 2500,
         "fee_profile": "active",
         "fee_market_boundary_enabled": False,
@@ -1195,6 +1199,7 @@ def test_revenue_status_operator_controls_hide_internal_knob_dump():
         "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 15,
         "min_fee_ppm_saturated": 0,
+        "acquisition_experiment_enabled": False,
         "max_fee_ppm": 2500,
         "fee_profile": "active",
         "fee_market_boundary_enabled": False,

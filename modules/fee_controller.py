@@ -230,6 +230,8 @@ class FeeReasonCode(Enum):
     ZERO_FEE_PROBE_SUCCESS = "zero_fee_probe_success" # Legacy 0-fee probe success reason
     LOW_FEE_EXPLORATION = "low_fee_exploration"       # Bounded low-fee exploration
     LOW_FEE_EXPLORATION_SUCCESS = "low_fee_exploration_success"  # Exploration saw traffic
+    ACQUISITION_EXPERIMENT = "acquisition_experiment"  # Bounded sub-economic quote
+    ACQUISITION_EXIT = "acquisition_exit"              # Baseline restoration after experiment
     CONGESTION = "congestion"                         # Congestion-based fee surge
     GOSSIP_REFRESH = "gossip_refresh"                 # Minimal nudge to refresh channel_update
     CHANNEL_OPEN = "channel_open"                     # Initial fee set on channel open
@@ -2580,6 +2582,18 @@ class FeeController:
     EXPLORATION_HEADROOM_RATIO = 0.35
     EXPLORATION_SPARSE_HEADROOM_RATIO = 0.50
 
+    # Default-off market-acquisition rollout. These are fixed safety rails,
+    # not tuning knobs: the first production surface exposes only enable/off.
+    ACQUISITION_TARGET_FEE_PPM = 0
+    ACQUISITION_COMPETITOR_FLOOR_PPM = 1
+    ACQUISITION_DURATION_SECONDS = 3600
+    ACQUISITION_VOLUME_CAP_SATS = 250_000
+    ACQUISITION_OPPORTUNITY_COST_CAP_SATS = 25.0
+    ACQUISITION_START_OUTBOUND_RATIO = 0.85
+    ACQUISITION_EXIT_OUTBOUND_RATIO = 0.70
+    ACQUISITION_IDLE_SECONDS = 24 * 3600
+    ACQUISITION_COOLDOWN_SECONDS = 7 * 24 * 3600
+
     # ==========================================================================
     # Audit F5 (2026-06): initial-fee prior seeding of the PERSISTENT state
     # ==========================================================================
@@ -2886,6 +2900,176 @@ class FeeController:
             return sat_floor
         return base
 
+    def _prepare_acquisition_experiments(
+        self,
+        channel_states: List[Dict[str, Any]],
+        channels: Dict[str, Dict[str, Any]],
+        cfg: Any,
+        now: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Load the active episode or start one fail-closed qualifying lane."""
+        get_active = getattr(self.database, "get_active_acquisition_experiments", None)
+        if not callable(get_active):
+            return {}
+        try:
+            active_rows = record_effective_evidence(
+                "acquisition_active", [], get_active
+            )
+        except Exception as exc:
+            self.plugin.log(f"ACQUISITION: active-state read failed: {exc}", level="warn")
+            return {}
+        if not isinstance(active_rows, list):
+            return {}
+        active = {
+            str(row.get("channel_id")): row
+            for row in active_rows
+            if isinstance(row, dict) and row.get("channel_id")
+        }
+        if active or not _cfg_bool(cfg, "acquisition_experiment_enabled", False):
+            return active
+        if int(getattr(cfg, "min_fee_ppm_saturated", 0) or 0) > 0:
+            return {}
+
+        start_episode = getattr(self.database, "start_acquisition_experiment", None)
+        cooldown = getattr(self.database, "channel_acquisition_on_cooldown", None)
+        if not callable(start_episode) or not callable(cooldown):
+            return {}
+
+        candidates: list[tuple[float, str, str, int, int]] = []
+        for state in channel_states:
+            if not isinstance(state, dict):
+                continue
+            channel_id = str(state.get("channel_id") or "")
+            peer_id = str(state.get("peer_id") or "")
+            info = channels.get(channel_id)
+            if not channel_id or not peer_id or not isinstance(info, dict):
+                continue
+            try:
+                capacity = int(info.get("capacity") or 0)
+                spendable = base_to_sats_floor(parse_msat(info.get("spendable_msat", 0)))
+                ratio = spendable / capacity if capacity > 0 else 0.0
+                baseline_fee = int(info.get("fee_proportional_millionths", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if ratio < self.ACQUISITION_START_OUTBOUND_RATIO or baseline_fee <= 0:
+                continue
+            if self._effective_min_fee_ppm(
+                cfg,
+                flow_state=str(state.get("state") or "balanced"),
+                outbound_ratio=ratio,
+                channel_id=channel_id,
+                capacity_sats=capacity,
+            ) != self.ACQUISITION_TARGET_FEE_PPM:
+                continue
+            if self.temporary_fee_overlay_active is not None:
+                try:
+                    if self.temporary_fee_overlay_active(channel_id):
+                        continue
+                except Exception:
+                    continue
+            if self.policy_manager is not None:
+                try:
+                    if self.policy_manager.get_policy(peer_id).strategy != FeeStrategy.DYNAMIC:
+                        continue
+                except Exception:
+                    continue
+            try:
+                if record_effective_evidence(
+                    "exploration_flag", [channel_id],
+                    lambda: self.database.get_channel_probe(channel_id),
+                ) is not None:
+                    continue
+                if record_effective_evidence(
+                    "acquisition_cooldown",
+                    [channel_id, now, self.ACQUISITION_COOLDOWN_SECONDS],
+                    lambda: cooldown(
+                        channel_id,
+                        now=now,
+                        cooldown_seconds=self.ACQUISITION_COOLDOWN_SECONDS,
+                    ),
+                ):
+                    continue
+                if record_effective_evidence(
+                    "forward_count_since",
+                    [channel_id, now - self.ACQUISITION_IDLE_SECONDS],
+                    lambda: self.database.get_forward_count_since(
+                        channel_id, now - self.ACQUISITION_IDLE_SECONDS
+                    ),
+                ) > 0:
+                    continue
+                competitor_floor = self._get_neighbor_fee_percentile(peer_id, 0.0, cfg=cfg)
+            except Exception:
+                continue
+            if competitor_floor != self.ACQUISITION_COMPETITOR_FLOOR_PPM:
+                continue
+            candidates.append((ratio, channel_id, peer_id, baseline_fee, competitor_floor))
+
+        for ratio, channel_id, peer_id, baseline_fee, competitor_floor in sorted(
+            candidates, key=lambda row: (-row[0], row[1])
+        ):
+            try:
+                episode = start_episode(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    baseline_fee_ppm=baseline_fee,
+                    target_fee_ppm=self.ACQUISITION_TARGET_FEE_PPM,
+                    starting_outbound_ratio=ratio,
+                    competitor_floor_ppm=competitor_floor,
+                    started_at=now,
+                )
+            except Exception as exc:
+                self.plugin.log(
+                    f"ACQUISITION: failed to start {channel_id[:12]}...: {exc}",
+                    level="warn",
+                )
+                return {}
+            if isinstance(episode, dict):
+                self.plugin.log(
+                    f"ACQUISITION: started bounded 0-ppm episode on "
+                    f"{channel_id[:12]}... (baseline={baseline_fee}ppm, "
+                    f"outbound={ratio:.1%}, competitor_floor={competitor_floor}ppm)",
+                    level="info",
+                )
+                return {channel_id: episode}
+        return {}
+
+    def _complete_acquisition_experiment(
+        self,
+        episode: Dict[str, Any],
+        *,
+        exit_reason: str,
+        volume_sats: int,
+        opportunity_cost_sats: float,
+        outbound_ratio: float,
+        restored_fee_ppm: int,
+        now: int,
+    ) -> None:
+        complete = getattr(self.database, "complete_acquisition_experiment", None)
+        if not callable(complete):
+            return
+        try:
+            completed = complete(
+                int(episode["id"]),
+                exit_reason=exit_reason,
+                observed_volume_sats=volume_sats,
+                opportunity_cost_sats=opportunity_cost_sats,
+                ending_outbound_ratio=outbound_ratio,
+                restored_fee_ppm=restored_fee_ppm,
+                completed_at=now,
+            )
+        except Exception as exc:
+            self.plugin.log(f"ACQUISITION: completion write failed: {exc}", level="error")
+            return
+        if completed:
+            self._acquisition_cycle_experiments.pop(str(episode.get("channel_id")), None)
+            self.plugin.log(
+                f"ACQUISITION: completed {str(episode.get('channel_id'))[:12]}... "
+                f"reason={exit_reason}, volume={volume_sats}sats, "
+                f"opportunity_cost={opportunity_cost_sats:.3f}sats, "
+                f"restored={restored_fee_ppm}ppm",
+                level="info",
+            )
+
     # =========================================================================
     # E-1 (2026-07 econ audit): dynamic htlc_max valve — live-depletion keying
     # =========================================================================
@@ -3029,6 +3213,7 @@ class FeeController:
 
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
+        self._acquisition_cycle_experiments: Dict[str, Dict[str, Any]] = {}
 
         # PR 3e (gap-closure Phase B): per-cycle observation freeze.
         # Active ({}) only around _adjust_all_fees_inner; None means no
@@ -5037,6 +5222,9 @@ class FeeController:
         self._cycle_batch_active = True
         self._pending_fee_strategy_rows.clear()
         self._cycle_peer_latency_memo.clear()
+        self._acquisition_cycle_experiments = self._prepare_acquisition_experiments(
+            channel_states, channels, cfg, decision_now("acquisition.prepare")
+        )
         try:
             self._adjust_all_fees_channel_loop(
                 channel_states=channel_states,
@@ -5050,6 +5238,7 @@ class FeeController:
                 node_drain_pressure_value=node_drain_pressure_value,
             )
         finally:
+            self._acquisition_cycle_experiments = {}
             self._cycle_batch_active = False
             self._flush_pending_fee_strategy_rows()
 
@@ -5348,7 +5537,11 @@ class FeeController:
                     # of issuing the identical query a second time.
                     forward_count_hint = pre_forward_count
 
-                force_reprice_reason = None
+                force_reprice_reason = (
+                    "acquisition_experiment"
+                    if channel_id in self._acquisition_cycle_experiments
+                    else None
+                )
 
                 adjustment = self._adjust_channel_fee(
                     channel_id=channel_id,
@@ -6142,6 +6335,11 @@ class FeeController:
             "exploration_flag", [channel_id], exploration_flag is not None
         )
         is_under_exploration = (exploration_flag is not None)
+        acquisition_episode = self._acquisition_cycle_experiments.get(channel_id)
+        acquisition_exit_reason: Optional[str] = None
+        acquisition_volume_sats = 0
+        acquisition_opportunity_cost_sats = 0.0
+        acquisition_competitor_floor_ppm: Optional[int] = None
         
         now = decision_now("channel.adjust")
 
@@ -6150,7 +6348,11 @@ class FeeController:
         current_fee_ppm = raw_chain_fee
         # If CLN reports 0 and we're not intentionally in an exploration regime,
         # treat it as "unset" and seed to min_fee for sensible initialization.
-        if current_fee_ppm == 0 and not is_under_exploration:
+        if (
+            current_fee_ppm == 0
+            and not is_under_exploration
+            and acquisition_episode is None
+        ):
             current_fee_ppm = cfg.min_fee_ppm
 
         # Load cycle state (Issue #32: pass actual fee for desync detection)
@@ -6526,6 +6728,87 @@ class FeeController:
             if floor_ppm >= ceiling_ppm:
                 # min_fee_ppm dominates a tiny ceiling; keep floor < ceiling.
                 ceiling_ppm = floor_ppm + 10
+
+        # A persisted acquisition episode is intentionally allowed to quote
+        # below cost floors, but only on the single lane selected by the
+        # fail-closed admission checks above.  Every cycle revalidates the
+        # evidence and bounded loss/liquidity budgets.  Exit selects the exact
+        # captured baseline; the database row is completed only after the
+        # policy RPC succeeds (or readback proves it is already restored).
+        if acquisition_episode is not None:
+            try:
+                acquisition_started_at = int(acquisition_episode["started_at"])
+                acquisition_baseline_fee_ppm = max(
+                    0, int(acquisition_episode["baseline_fee_ppm"])
+                )
+                acquisition_target_fee_ppm = int(
+                    acquisition_episode["target_fee_ppm"]
+                )
+                acquisition_volume_sats = max(
+                    0,
+                    int(
+                        record_effective_evidence(
+                            "volume_since",
+                            [channel_id, acquisition_started_at],
+                            lambda: self.database.get_volume_since(
+                                channel_id, acquisition_started_at
+                            ),
+                        )
+                    ),
+                )
+                acquisition_opportunity_cost_sats = (
+                    acquisition_volume_sats
+                    * max(
+                        0,
+                        acquisition_baseline_fee_ppm
+                        - acquisition_target_fee_ppm,
+                    )
+                    / 1_000_000.0
+                )
+                acquisition_competitor_floor_ppm = (
+                    self._get_neighbor_fee_percentile(peer_id, 0.0, cfg=cfg)
+                )
+
+                if not _cfg_bool(cfg, "acquisition_experiment_enabled", False):
+                    acquisition_exit_reason = "disabled"
+                elif is_congested:
+                    acquisition_exit_reason = "congestion"
+                elif (
+                    acquisition_competitor_floor_ppm
+                    != self.ACQUISITION_COMPETITOR_FLOOR_PPM
+                ):
+                    acquisition_exit_reason = "competitor_evidence_changed"
+                elif outbound_ratio <= self.ACQUISITION_EXIT_OUTBOUND_RATIO:
+                    acquisition_exit_reason = "liquidity_floor"
+                elif now - acquisition_started_at >= self.ACQUISITION_DURATION_SECONDS:
+                    acquisition_exit_reason = "duration_cap"
+                elif acquisition_volume_sats >= self.ACQUISITION_VOLUME_CAP_SATS:
+                    acquisition_exit_reason = "volume_cap"
+                elif (
+                    acquisition_opportunity_cost_sats
+                    >= self.ACQUISITION_OPPORTUNITY_COST_CAP_SATS
+                ):
+                    acquisition_exit_reason = "opportunity_cost_cap"
+            except Exception as exc:
+                # A malformed row or stale/unavailable evidence must never
+                # leave a 0-ppm quote running indefinitely.
+                try:
+                    acquisition_baseline_fee_ppm = max(
+                        0, int(acquisition_episode.get("baseline_fee_ppm"))
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    try:
+                        acquisition_baseline_fee_ppm = max(
+                            0, int(getattr(cfg, "min_fee_ppm", 0) or 0)
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        acquisition_baseline_fee_ppm = 0
+                acquisition_target_fee_ppm = self.ACQUISITION_TARGET_FEE_PPM
+                acquisition_exit_reason = "evidence_unavailable"
+                self.plugin.log(
+                    f"ACQUISITION: fail-closed exit for {channel_id[:12]}...: {exc}",
+                    level="warn",
+                )
         
         # Target Decision Block (Fee Priority Chain)
         # Priority: Congestion > bounded low-fee exploration > DTS+PID
@@ -6668,7 +6951,32 @@ class FeeController:
             previous_rate = cycle.last_revenue_rate
             target_found = True
 
-        # Priority 2: Bounded low-fee exploration driven by the legacy probe flag
+        # Priority 2: the explicit, bounded acquisition quote. Congestion
+        # remains Priority 1 and therefore owns the immediate target on a
+        # congested exit; all other exits restore the captured baseline.
+        if acquisition_episode is not None and not target_found:
+            if acquisition_exit_reason is None:
+                new_fee_ppm = acquisition_target_fee_ppm
+                decision_reason = "ACQUISITION_EXPERIMENT"
+                exploration_mode = "bounded_acquisition"
+            else:
+                new_fee_ppm = acquisition_baseline_fee_ppm
+                decision_reason = "ACQUISITION_EXIT"
+                exploration_mode = "acquisition_exit"
+            bounded_target_ppm = new_fee_ppm
+            applied_target_ppm = new_fee_ppm
+            new_direction = (
+                1 if new_fee_ppm > current_fee_ppm
+                else (-1 if new_fee_ppm < current_fee_ppm else 0)
+            )
+            step_ppm = abs(new_fee_ppm - current_fee_ppm)
+            original_step_ppm = step_ppm
+            volatility_reset = False
+            rate_change = 0.0
+            previous_rate = cycle.last_revenue_rate
+            target_found = True
+
+        # Priority 3: Bounded low-fee exploration driven by the legacy probe flag
         if not target_found and is_under_exploration:
             # Calculate current revenue rate (reuse logic from rate calculation below)
             # Reuse volume/forward data already fetched above.
@@ -7718,7 +8026,29 @@ class FeeController:
             f"{marginal_roi_info}"
         )
         if decision_reason == "CONGESTION":
-            reason = f"CONGESTION: bounded emergency override active, {common_reason_suffix}"
+            acquisition_note = (
+                f"; ending acquisition episode ({acquisition_exit_reason})"
+                if acquisition_exit_reason is not None else ""
+            )
+            reason = (
+                f"CONGESTION: bounded emergency override active{acquisition_note}, "
+                f"{common_reason_suffix}"
+            )
+        elif decision_reason == "ACQUISITION_EXPERIMENT":
+            reason = (
+                "ACQUISITION: bounded single-lane market-share quote, "
+                f"volume={acquisition_volume_sats}sats, "
+                f"opportunity_cost={acquisition_opportunity_cost_sats:.3f}sats, "
+                f"competitor_floor={acquisition_competitor_floor_ppm}ppm, "
+                f"{common_reason_suffix}"
+            )
+        elif decision_reason == "ACQUISITION_EXIT":
+            reason = (
+                f"ACQUISITION_EXIT: {acquisition_exit_reason}; restoring captured baseline, "
+                f"volume={acquisition_volume_sats}sats, "
+                f"opportunity_cost={acquisition_opportunity_cost_sats:.3f}sats, "
+                f"{common_reason_suffix}"
+            )
         elif decision_reason in (
             "LOW_FEE_EXPLORATION",
             "LOW_FEE_EXPLORATION_SUCCESS",
@@ -7769,10 +8099,24 @@ class FeeController:
                 f"Observation window reset, no RPC needed.",
                 level='debug'
             )
+            if acquisition_episode is not None and acquisition_exit_reason is not None:
+                self._complete_acquisition_experiment(
+                    acquisition_episode,
+                    exit_reason=acquisition_exit_reason,
+                    volume_sats=acquisition_volume_sats,
+                    opportunity_cost_sats=acquisition_opportunity_cost_sats,
+                    outbound_ratio=outbound_ratio,
+                    restored_fee_ppm=raw_chain_fee,
+                    now=now,
+                )
             return None
         
         # Determine reason_code for this adjustment
-        if decision_reason == "LOW_FEE_EXPLORATION":
+        if decision_reason == "ACQUISITION_EXPERIMENT":
+            fee_reason_code = FeeReasonCode.ACQUISITION_EXPERIMENT.value
+        elif decision_reason == "ACQUISITION_EXIT":
+            fee_reason_code = FeeReasonCode.ACQUISITION_EXIT.value
+        elif decision_reason == "LOW_FEE_EXPLORATION":
             fee_reason_code = FeeReasonCode.LOW_FEE_EXPLORATION.value
         elif decision_reason == "LOW_FEE_EXPLORATION_SUCCESS":
             fee_reason_code = FeeReasonCode.LOW_FEE_EXPLORATION_SUCCESS.value
@@ -7804,6 +8148,21 @@ class FeeController:
             dry_run_proposal = bool(result.get("dry_run"))
             # Read back actual fee (may have been clamped by set_channel_fee)
             new_fee_ppm = result.get("fee_ppm", new_fee_ppm)
+
+            if (
+                acquisition_episode is not None
+                and acquisition_exit_reason is not None
+                and not dry_run_proposal
+            ):
+                self._complete_acquisition_experiment(
+                    acquisition_episode,
+                    exit_reason=acquisition_exit_reason,
+                    volume_sats=acquisition_volume_sats,
+                    opportunity_cost_sats=acquisition_opportunity_cost_sats,
+                    outbound_ratio=outbound_ratio,
+                    restored_fee_ppm=int(new_fee_ppm),
+                    now=now,
+                )
 
             # L1: the upward-probe budget is spent only when the broadcast
             # fee actually crossed the pre-stretch supported cap — i.e. the
@@ -7902,6 +8261,14 @@ class FeeController:
                     "wake_reason": wake_reason,
                     "sparse_data_conservative": sparse_data_conservative,
                     "exploration_mode": exploration_mode,
+                    "acquisition_experiment_id": (
+                        acquisition_episode.get("id")
+                        if acquisition_episode is not None else None
+                    ),
+                    "acquisition_exit_reason": acquisition_exit_reason,
+                    "acquisition_volume_sats": acquisition_volume_sats,
+                    "acquisition_opportunity_cost_sats": acquisition_opportunity_cost_sats,
+                    "acquisition_competitor_floor_ppm": acquisition_competitor_floor_ppm,
                     # L6: honest attribution — the floor and the nudge are
                     # distinct mechanisms (at most one active per cycle).
                     "rebalance_cost_floor_ppm": rebalance_floor_ppm or 0,

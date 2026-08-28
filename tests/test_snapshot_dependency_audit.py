@@ -42,10 +42,13 @@ PATTERNS = {
 PINNED_COUNTS = {
     ("fee", "analyzer_cache"): 1,
     ("fee", "live_rpc"): 9,
-    ("fee", "database"): 27,
+    # +3 bounded-acquisition reads: cold-lane probe/idle qualification and
+    # episode-volume loss accounting. All are replay-captured evidence.
+    ("fee", "database"): 30,
     # Fee replay clock seam: 27 effective reads now use decision_now(),
     # 10 cache-TTL reads remain raw, and one dead contextual read was removed.
-    ("fee", "wall_clock"): 37,
+    # +1 replay-clock read establishes a common acquisition admission time.
+    ("fee", "wall_clock"): 38,
     ("rebalance", "analyzer_cache"): 0,
     ("rebalance", "live_rpc"): 14,
     # 18 -> 20 (audit 2026-08-01 wave2): _recover_missing_pending_row

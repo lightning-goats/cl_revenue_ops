@@ -13,7 +13,7 @@ DATABASE_FILES = (
 )
 
 EXPECTED_TABLES = frozenset({
-    "budget_reservations", "channel_closure_costs", "channel_costs",
+    "acquisition_experiments", "budget_reservations", "channel_closure_costs", "channel_costs",
     "channel_failures", "channel_probes", "channel_states",
     "closed_channels", "config_overrides", "daily_forwarding_stats",
     "daily_forwarding_stats_inbound", "dead_capital_stage", "fee_changes",

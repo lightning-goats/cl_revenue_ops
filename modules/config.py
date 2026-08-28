@@ -40,6 +40,8 @@ PUBLIC_RUNTIME_KEYS = (
     # may advertise below min_fee_ppm (fee-band decompression). 0 = allow
     # true cheap egress on saturated edges (the default).
     'min_fee_ppm_saturated',
+    # Default-off, single-lane bounded zero-fee market-acquisition experiment.
+    'acquisition_experiment_enabled',
     'max_fee_ppm',
     'fee_profile',
     'fee_market_boundary_enabled',
@@ -115,6 +117,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'paused': bool,
     'min_fee_ppm': int,
     'min_fee_ppm_saturated': int,
+    'acquisition_experiment_enabled': bool,
     'max_fee_ppm': int,
     'fee_profile': str,
     'fee_market_boundary_enabled': bool,
@@ -472,6 +475,9 @@ class Config:
     # rebalance-cost floor / chain-cost floor / vegas floor still compose
     # via max() on top — this only replaces the min_fee_ppm term.
     min_fee_ppm_saturated: int = 0
+    # Default-off. The fee controller owns fixed safety caps; this switch is
+    # intentionally the only public tuning surface for the first rollout.
+    acquisition_experiment_enabled: bool = False
     max_fee_ppm: int = 2000        # Ceiling fee in PPM (matches revenue-ops-max-fee-ppm option default; P6-010/DEF-042)
     base_fee_msat: int = 0         # Base fee fallback when base_fee_policy = "off"
 
@@ -1206,6 +1212,7 @@ class ConfigSnapshot:
     # allow true cheap egress). Missing-from-snapshot kills the feature in
     # production (getattr fallback), so it MUST be mirrored here.
     min_fee_ppm_saturated: int = 0
+    acquisition_experiment_enabled: bool = False
     # Version tracking
     version: int = 0
     

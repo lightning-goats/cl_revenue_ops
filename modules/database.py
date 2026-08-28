@@ -864,6 +864,37 @@ class Database:
                 started_at INTEGER NOT NULL
             )
         """)
+
+        # Restart-safe, auditable market-acquisition episodes. A partial
+        # unique index enforces the global one-at-a-time safety invariant in
+        # SQLite rather than relying on an in-process race check.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS acquisition_experiments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('active', 'completed')),
+                started_at INTEGER NOT NULL,
+                baseline_fee_ppm INTEGER NOT NULL,
+                target_fee_ppm INTEGER NOT NULL,
+                starting_outbound_ratio REAL NOT NULL,
+                competitor_floor_ppm INTEGER NOT NULL,
+                completed_at INTEGER,
+                exit_reason TEXT,
+                observed_volume_sats INTEGER NOT NULL DEFAULT 0,
+                opportunity_cost_sats REAL NOT NULL DEFAULT 0.0,
+                ending_outbound_ratio REAL,
+                restored_fee_ppm INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_acquisition_one_active
+            ON acquisition_experiments(state) WHERE state = 'active'
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_acquisition_channel_completed
+            ON acquisition_experiments(channel_id, completed_at)
+        """)
         
         # Ignored peers table (Blacklist)
         # Prevents cl-revenue-ops from managing fees or rebalancing for specific peers
@@ -2210,6 +2241,111 @@ class Database:
         """Clears the bounded-exploration flag for a channel."""
         conn = self._get_connection()
         conn.execute("DELETE FROM channel_probes WHERE channel_id = ?", (channel_id,))
+
+    # =========================================================================
+    # Bounded market-acquisition experiments
+    # =========================================================================
+
+    def start_acquisition_experiment(
+        self,
+        *,
+        channel_id: str,
+        peer_id: str,
+        baseline_fee_ppm: int,
+        target_fee_ppm: int,
+        starting_outbound_ratio: float,
+        competitor_floor_ppm: int,
+        started_at: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Persist one active episode, returning None if another is active."""
+        conn = self._get_connection()
+        now = int(time.time()) if started_at is None else int(started_at)
+        try:
+            cursor = conn.execute("""
+                INSERT INTO acquisition_experiments (
+                    channel_id, peer_id, state, started_at,
+                    baseline_fee_ppm, target_fee_ppm,
+                    starting_outbound_ratio, competitor_floor_ppm
+                ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?)
+            """, (
+                str(channel_id), str(peer_id), now,
+                int(baseline_fee_ppm), int(target_fee_ppm),
+                float(starting_outbound_ratio), int(competitor_floor_ppm),
+            ))
+        except sqlite3.IntegrityError:
+            return None
+        return self.get_acquisition_experiment(int(cursor.lastrowid))
+
+    def get_acquisition_experiment(self, experiment_id: int) -> Optional[Dict[str, Any]]:
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM acquisition_experiments WHERE id = ?",
+            (int(experiment_id),),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_active_acquisition_experiments(self) -> list[Dict[str, Any]]:
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM acquisition_experiments
+            WHERE state = 'active' ORDER BY started_at, id
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_recent_acquisition_experiments(
+        self, limit: int = 10
+    ) -> list[Dict[str, Any]]:
+        """Return recent active/completed episodes for operator evidence."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM acquisition_experiments
+            ORDER BY CASE WHEN state = 'active' THEN 0 ELSE 1 END,
+                     COALESCE(completed_at, started_at) DESC, id DESC
+            LIMIT ?
+        """, (max(1, min(100, int(limit))),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def channel_acquisition_on_cooldown(
+        self, channel_id: str, *, now: Optional[int] = None, cooldown_seconds: int
+    ) -> bool:
+        conn = self._get_connection()
+        observed_at = int(time.time()) if now is None else int(now)
+        row = conn.execute("""
+            SELECT completed_at FROM acquisition_experiments
+            WHERE channel_id = ? AND state = 'completed' AND completed_at IS NOT NULL
+            ORDER BY completed_at DESC LIMIT 1
+        """, (str(channel_id),)).fetchone()
+        if row is None:
+            return False
+        return observed_at - int(row["completed_at"]) < max(0, int(cooldown_seconds))
+
+    def complete_acquisition_experiment(
+        self,
+        experiment_id: int,
+        *,
+        exit_reason: str,
+        observed_volume_sats: int,
+        opportunity_cost_sats: float,
+        ending_outbound_ratio: float,
+        restored_fee_ppm: int,
+        completed_at: Optional[int] = None,
+    ) -> bool:
+        """Atomically mark an active episode complete after fee restoration."""
+        conn = self._get_connection()
+        now = int(time.time()) if completed_at is None else int(completed_at)
+        cursor = conn.execute("""
+            UPDATE acquisition_experiments
+            SET state = 'completed', completed_at = ?, exit_reason = ?,
+                observed_volume_sats = ?, opportunity_cost_sats = ?,
+                ending_outbound_ratio = ?, restored_fee_ppm = ?
+            WHERE id = ? AND state = 'active'
+        """, (
+            now, str(exit_reason), max(0, int(observed_volume_sats)),
+            max(0.0, float(opportunity_cost_sats)),
+            max(0.0, min(1.0, float(ending_outbound_ratio))),
+            max(0, int(restored_fee_ppm)), int(experiment_id),
+        ))
+        return cursor.rowcount == 1
     
     # =========================================================================
     # Fee Strategy State Methods

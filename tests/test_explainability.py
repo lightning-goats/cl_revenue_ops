@@ -143,6 +143,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "min_fee_ppm",
         # E-2 (2026-07 econ audit): class-aware saturated/source floor
         "min_fee_ppm_saturated",
+        "acquisition_experiment_enabled",
         "max_fee_ppm",
         "fee_profile",
         "fee_market_boundary_enabled",
@@ -183,6 +184,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 25,
         "min_fee_ppm_saturated": 0,
+        "acquisition_experiment_enabled": False,
         "max_fee_ppm": 1800,
         "fee_profile": "active",
         "fee_market_boundary_enabled": False,

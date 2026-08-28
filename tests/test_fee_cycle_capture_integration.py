@@ -54,6 +54,8 @@ EVIDENCE_OPERATION_CONTRACT = {
     "temporary_overlay_active",
     "mempool_ma_24h",
     "node_channels",
+    "acquisition_active",
+    "acquisition_cooldown",
 }
 DECISION_CALL_CONTRACT = {
     "decision_now": Counter(
@@ -84,6 +86,7 @@ DECISION_CALL_CONTRACT = {
             "'fee.state_sync'": 1,
             "'failed_forward.record'": 1,
             "'cycle.started_at'": 1,
+            "'acquisition.prepare'": 1,
         }
     ),
     "decision_gauss": Counter(
@@ -115,7 +118,7 @@ def _decision_call_inventory(source):
 def _assert_decision_call_contract(source):
     actual = _decision_call_inventory(source)
     assert {name: sum(counts.values()) for name, counts in actual.items()} == {
-        "decision_now": 28,
+        "decision_now": 29,
         "decision_gauss": 4,
         "decision_random": 1,
     }

@@ -1195,6 +1195,17 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-acquisition-experiment-enabled',
+    default=False,
+    description=(
+        'Enable one bounded zero-fee acquisition experiment on a qualifying '
+        'cold saturated/source channel (default: false)'
+    ),
+    opt_type='bool',
+    dynamic=True,
+)
+
+plugin.add_option(
     name='revenue-ops-fee-profile',
     default='active',
     description="Fee controller profile: 'active' for normal routing nodes, 'conservative' for low-volume nodes"
@@ -1820,6 +1831,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         htlcmax_balanced_pct=_safe_float_opt('revenue-ops-htlcmax-balanced-pct', '0.45'),
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         min_fee_ppm_saturated=_safe_int('revenue-ops-min-fee-ppm-saturated'),
+        acquisition_experiment_enabled=_parse_dynamic_bool(
+            'revenue-ops-acquisition-experiment-enabled',
+            options.get('revenue-ops-acquisition-experiment-enabled', False),
+        ),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
         market_fee_mode=options.get('revenue-ops-market-fee-mode', 'undercut').lower(),
         base_fee_policy=options.get('revenue-ops-base-fee-policy', 'off').lower(),
@@ -3021,6 +3036,12 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
         channel_states = database.get_all_channel_states()
         fee_history = database.get_recent_fee_changes(limit=10)
         rebalance_history = database.get_recent_rebalances(limit=10)
+        acquisition_history_raw = database.get_recent_acquisition_experiments(limit=10)
+        acquisition_history = (
+            acquisition_history_raw
+            if isinstance(acquisition_history_raw, list)
+            else []
+        )
     except Exception as e:
         return {"error": f"Database query failed: {e}"}
 
@@ -3056,6 +3077,7 @@ def revenue_status(plugin: Plugin) -> Dict[str, Any]:
         "channel_states": channel_states,
         "recent_fee_changes": fee_history,
         "recent_rebalances": rebalance_history,
+        "acquisition_experiments": acquisition_history,
     }
 
 
@@ -5868,6 +5890,11 @@ def _refresh_dynamic_config():
             # E-2 (2026-07 econ audit): class-aware saturated/source min-fee
             # floor, dynamic so fee-band decompression is tunable live.
             ("revenue-ops-min-fee-ppm-saturated", "min_fee_ppm_saturated", "int"),
+            (
+                "revenue-ops-acquisition-experiment-enabled",
+                "acquisition_experiment_enabled",
+                "bool",
+            ),
         ):
             _val = configs.get(_opt, {}).get("value_str", "")
             # C-1(b) (2026-07-08 audit): the blanket "skip if empty" guard

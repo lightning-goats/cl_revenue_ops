@@ -68,6 +68,7 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     "econ_cycle_rebalance_enabled": "authority_control",
     "econ_ev_populated": "authority_control",
     "econ_conflict_rules_extended": "authority_control",
+    "acquisition_experiment_enabled": "authority_control",
     # --- safety invariants ---------------------------------------------
     "min_fee_ppm": "safety_invariant",
     "min_fee_ppm_saturated": "safety_invariant",

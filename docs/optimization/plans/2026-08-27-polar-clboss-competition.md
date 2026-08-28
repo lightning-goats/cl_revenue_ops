@@ -541,6 +541,28 @@ egress opportunity cost plus any refill cost. A 1-ppm tie should not be
 promoted, and a zero-price treatment that cannot win route share should be
 abandoned automatically.
 
+Replica 14 crossed the treatment to the sink-facing LND lane while retaining a
+15-ppm CLN control. All 80 payments settled. Revenue-ops carried 252,743,669
+msat in 46 forwards versus CLBOSS's 195,000,000 msat in 34 forwards, so it won
+both contender route volume and forward count for the first time. The treated
+LND lane alone carried all 125,000,000 offered msat at 0 ppm; by contrast, the
+same 0-ppm treatment on the CLN family in replica 13 won only 40% of offered
+volume. Revenue-ops still earned less fee revenue (1,522 msat versus 1,851
+msat), and neither controller rebalanced. The result proves acquisition is
+client/peer-specific and can beat CLBOSS on share, but not yet on net revenue.
+
+The controller now implements that finding as a default-off, restart-safe
+acquisition episode rather than a blanket fee change. SQLite enforces one
+active lane globally. Admission requires a cold source/high-local channel, a
+peer-local 1-ppm competitor floor, no explicit policy/temporary overlay, and a
+class-aware 0-ppm floor. The exact pre-treatment baseline is persisted.
+Independent exits restore it after one hour, 250,000 routed sats, 25 sats of
+opportunity cost, 70% outbound liquidity, congestion, disablement, or
+stale/changed competitor evidence; failed fee RPCs leave the row active so
+rollback retries. A seven-day per-channel cooldown prevents repeated free
+quotes. Episode evidence is visible in `revenue-status` and covered by the fee
+replay evidence seam.
+
 Price is no longer the only measured deficit: even a strict 0-versus-1-ppm
 undercut won only 40% of the treated CLN market. The next tournament phase
 should rank channel placement and route quality (reliability history, CLTV,

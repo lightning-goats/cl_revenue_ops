@@ -239,6 +239,15 @@ method-not-found.
 - `revenue-config reset <key>` removes the DB override, the escape hatch that lets `setconfig`/config-file values govern the field again (some fields apply immediately; others require a plugin restart to re-adopt the file default — the RPC response says which).
 - `revenue-config list-mutable` returns the current set of public runtime keys; only keys in this list can be `set` or `reset` (all others return `"not a public runtime control"`).
 
+The default-off `acquisition_experiment_enabled` control permits one
+restart-safe, one-hour market-acquisition episode at a time. It is restricted
+to a cold source/high-outbound channel with a peer-local 1-ppm competing floor
+and a 0-ppm class-aware floor. The controller captures and restores the exact
+baseline, and exits early on congestion, changed/missing competitor evidence,
+250,000 routed sats, 25 sats of fee opportunity cost, or 70% outbound
+liquidity. `revenue-status.acquisition_experiments` exposes the audit trail.
+Keep it disabled unless intentionally running this bounded experiment.
+
 ## cl_revenue_ops standalone invariant
 
 `cl_revenue_ops` is a fully independent local executor. The former cl-hive/cl-mycelium hint integration was removed entirely in 2026-07 (`docs/audit/HIVE_REMOVAL_PLAN.md`); `tests/test_architecture_guard.py` pins that no hive/fleet coordination code returns.
