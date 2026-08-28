@@ -10,6 +10,12 @@ from modules.config import CONFIG_FIELD_RANGES, Config
 from modules.database import Database
 
 
+def test_operator_can_select_compressed_cycle_intervals():
+    assert CONFIG_FIELD_RANGES["flow_interval"] == (15, 86400)
+    assert CONFIG_FIELD_RANGES["fee_interval"] == (15, 86400)
+    assert CONFIG_FIELD_RANGES["rebalance_interval"] == (15, 86400)
+
+
 def _load(overrides):
     cfg = Config()
     database = MagicMock()

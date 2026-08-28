@@ -2295,7 +2295,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     def flow_analysis_loop():
         """Background loop for flow analysis."""
         # Staggered startup: flow at 30s (was 10s) to avoid thundering herd
-        if shutdown_event.wait(30):
+        _startup_cfg = config.snapshot() if hasattr(config, 'snapshot') else config
+        if shutdown_event.wait(min(30, max(15, _startup_cfg.flow_interval))):
             plugin.log("Flow analysis loop cancelled during startup delay")
             return
         
@@ -2304,7 +2305,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             # the interval/sleep tail) so no exception can kill the thread.
             try:
                 _hb_cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-                _record_loop_heartbeat("flow-analysis", interval_seconds=max(60, _hb_cfg_snap.flow_interval))
+                _record_loop_heartbeat("flow-analysis", interval_seconds=max(15, _hb_cfg_snap.flow_interval))
                 try:
                     plugin.log("Running scheduled flow analysis...")
                     run_flow_analysis()
@@ -2331,7 +2332,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
                 # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
                 cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-                interval = max(60, cfg_snap.flow_interval)
+                interval = max(15, cfg_snap.flow_interval)
                 jitter_seconds = int(interval * 0.2)
                 sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
                 plugin.log(f"Flow analysis sleeping for {sleep_time}s")
@@ -2352,7 +2353,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     def fee_adjustment_loop(scheduled_work=None):
         """Background loop for fee adjustment."""
         # Staggered startup: fees at 90s (was 60s) to avoid thundering herd
-        if shutdown_event.wait(90):
+        _startup_cfg = config.snapshot() if hasattr(config, 'snapshot') else config
+        if shutdown_event.wait(min(90, max(15, _startup_cfg.fee_interval))):
             plugin.log("Fee adjustment loop cancelled during startup delay")
             return
 
@@ -2360,7 +2362,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
             try:
                 _hb_cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-                _record_loop_heartbeat("fee-adjustment", interval_seconds=max(60, _hb_cfg_snap.fee_interval))
+                _record_loop_heartbeat("fee-adjustment", interval_seconds=max(15, _hb_cfg_snap.fee_interval))
 
                 try:
                     plugin.log("Running scheduled fee adjustment...")
@@ -2372,7 +2374,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
                 # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
                 cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-                interval = max(60, cfg_snap.fee_interval)
+                interval = max(15, cfg_snap.fee_interval)
                 jitter_seconds = int(interval * 0.2)
                 sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
                 plugin.log(f"Fee adjustment sleeping for {sleep_time}s")
@@ -2497,7 +2499,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     def rebalance_check_loop():
         """Background loop for rebalance checks."""
         # Staggered startup: rebalance at 180s (was 120s) to avoid thundering herd
-        if shutdown_event.wait(180):
+        _startup_cfg = config.snapshot() if hasattr(config, 'snapshot') else config
+        if shutdown_event.wait(min(180, max(15, _startup_cfg.rebalance_interval))):
             plugin.log("Rebalance check loop cancelled during startup delay")
             return
         
@@ -2505,7 +2508,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             # DD5 / P1-010: canonical guard over the ENTIRE iteration incl. tail.
             try:
                 _hb_cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-                _record_loop_heartbeat("rebalance-check", interval_seconds=max(60, _hb_cfg_snap.rebalance_interval))
+                _record_loop_heartbeat("rebalance-check", interval_seconds=max(15, _hb_cfg_snap.rebalance_interval))
                 try:
                     plugin.log("Running scheduled rebalance check...")
                     run_rebalance_check()
@@ -2516,7 +2519,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
                 # M-3 FIX: Use config snapshot for interval to avoid mid-loop mutation
                 cfg_snap = config.snapshot() if hasattr(config, 'snapshot') else config
-                interval = max(60, cfg_snap.rebalance_interval)
+                interval = max(15, cfg_snap.rebalance_interval)
                 jitter_seconds = int(interval * 0.2)
                 sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
                 plugin.log(f"Rebalance check sleeping for {sleep_time}s")

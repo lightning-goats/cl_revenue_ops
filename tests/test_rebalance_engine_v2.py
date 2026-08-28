@@ -1326,11 +1326,11 @@ def test_snapshot_refreshes_canonical_profitability_on_settled_forward_mismatch(
     )
     _configure_snapshot_channel(mock_plugin)
     mock_database.get_all_channel_flow_windows.return_value = {
-        "100x1x0": (500_000, 0, 8)
+        "100x1x0": (500_000, 0, 1)
     }
     profitability = MagicMock()
     profitability.get_profitability.return_value = _snapshot_profitability()
-    fresh = _snapshot_profitability(forwards=8, contribution_msat=100_000)
+    fresh = _snapshot_profitability(forwards=1, contribution_msat=100_000)
     profitability.analyze_all_channels.return_value = {"100x1x0": fresh}
     capex = MagicMock()
     capex.compute_allocations.return_value = {
@@ -1350,7 +1350,9 @@ def test_snapshot_refreshes_canonical_profitability_on_settled_forward_mismatch(
     profitability.analyze_all_channels.assert_called_once_with(force=True)
     capex.compute_allocations.assert_called_once_with()
     channel = snapshot.channels[0]
-    assert channel.is_active is True
+    # One economically positive forward is profitable immediately; the
+    # separate high-activity class still requires more than five forwards.
+    assert channel.is_active is False
     assert channel.value_class == "profitable"
     assert channel.remaining_budget_sats == 50
     assert channel.dest_eligible is True

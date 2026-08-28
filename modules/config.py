@@ -309,9 +309,12 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'thompson_prior_std_fee': (10, 500),
     # Routing Intelligence Integration
     # Additional range validations
-    'flow_interval': (60, 86400),
-    'fee_interval': (60, 86400),
-    'rebalance_interval': (60, 86400),
+    # Polar and other small fast-settling graphs may safely use compressed
+    # cycles. Production defaults remain unchanged; 15s is an explicit
+    # operator choice, not a new default.
+    'flow_interval': (15, 86400),
+    'fee_interval': (15, 86400),
+    'rebalance_interval': (15, 86400),
     'max_concurrent_jobs': (1, 20),
     'base_fee_msat': (0, 10000),
     'neighbor_median_min_competitors': (2, 50),

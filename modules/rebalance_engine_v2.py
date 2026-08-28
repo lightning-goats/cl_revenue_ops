@@ -1330,9 +1330,9 @@ class RebalanceEngine:
         # The profitability analyzer intentionally caches full-node analysis
         # for 15 minutes, while a rebalance cycle may run sooner.  A settled
         # forwarding burst can therefore be present in the batched local DB
-        # facts while the canonical cache still claims zero forwards.  Use
-        # that contradiction only as a refresh signal: value and budget still
-        # come exclusively from the canonical profitability analyzer.
+        # facts while the canonical cache still trails the settled count.
+        # Use that contradiction only as a refresh signal: value and budget
+        # still come exclusively from the canonical profitability analyzer.
         stale_profitability_channels = []
         if (
             self._profitability
@@ -1342,9 +1342,9 @@ class RebalanceEngine:
                 channel_id = channel.get("channel_id")
                 facts = flow_facts.get(channel_id)
                 if (
-                    int(channel.get("_profitability_forward_count") or 0) == 0
-                    and facts is not None
-                    and facts.forward_count_window > 5
+                    facts is not None
+                    and facts.forward_count_window
+                    > int(channel.get("_profitability_forward_count") or 0)
                     and facts.out_sats_window > 0
                 ):
                     stale_profitability_channels.append(channel_id)
