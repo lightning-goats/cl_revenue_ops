@@ -47,6 +47,46 @@ def load_blocks(results_dir: Path) -> list[dict[str, Any]]:
         contenders = payload.get("contenders")
         if not isinstance(contenders, dict) or set(contenders) != set(CONTROLLERS):
             raise ScorecardError(f"incomplete contenders in {path}")
+        if payload.get("phase") == "post_rebalance_demand":
+            post = payload.get("post_rebalance")
+            observation_id = (
+                post.get("observation_block") if isinstance(post, dict) else None
+            )
+            if not isinstance(observation_id, str) or not observation_id:
+                raise ScorecardError(f"post-rebalance lineage missing in {path}")
+            observation_path = path.parent / f"{observation_id}.json"
+            try:
+                observation = json.loads(observation_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ScorecardError(
+                    f"cannot read linked observation {observation_path}: {exc}"
+                ) from exc
+            if (
+                not isinstance(observation, dict)
+                or observation.get("schema")
+                != "polar-clboss-rebalance-observation-v1"
+                or observation.get("replica") != payload.get("replica")
+            ):
+                raise ScorecardError(
+                    f"linked observation does not match smoke block {path}"
+                )
+            observation_controllers = observation.get("controllers")
+            if (
+                not isinstance(observation_controllers, dict)
+                or set(observation_controllers) != set(CONTROLLERS)
+            ):
+                raise ScorecardError(
+                    f"linked observation has incomplete controllers in {observation_path}"
+                )
+            payload["_linked_rebalance"] = {
+                "source": str(observation_path),
+                "safety_violations": observation.get("safety_violations"),
+                "controllers": {
+                    name: observation_controllers[name].get("circular_payments")
+                    if isinstance(observation_controllers[name], dict) else None
+                    for name in CONTROLLERS
+                },
+            }
         payload["_source"] = str(path)
         blocks.append(payload)
     if not blocks:
@@ -58,6 +98,9 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
     totals = {name: defaultdict(int) for name in CONTROLLERS}
     phases: dict[str, dict[str, defaultdict[str, int]]] = {}
     eligible_phases: dict[str, dict[str, defaultdict[str, int]]] = {}
+    eligible_phase_families: dict[
+        str, dict[str, dict[str, defaultdict[str, int]]]
+    ] = {}
     market_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
     eligible_market_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
     attempted = settled = fallback = 0
@@ -93,6 +136,12 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(block["contenders"].get(name), dict) else None
             for name in CONTROLLERS
         ]
+        linked = block.get("_linked_rebalance")
+        linked_safety = linked.get("safety_violations") if isinstance(linked, dict) else None
+        linked_eligible = (
+            phase != "post_rebalance_demand"
+            or (isinstance(linked_safety, list) and not linked_safety)
+        )
         eligible = (
             "fallback_settled" in traffic
             and isinstance(block_violations, list)
@@ -100,6 +149,7 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             and all(isinstance(rows, list) and not rows for rows in contender_safety)
             and block_attempted == block_settled
             and block_fallback == 0
+            and linked_eligible
         )
         eligible_rows = None
         eligible_phase_rows = None
@@ -111,12 +161,28 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             eligible_phase_rows = eligible_phases.setdefault(
                 phase, {name: defaultdict(int) for name in CONTROLLERS}
             )
+
+        def metric_value(name: str, row: dict[str, Any], metric: str) -> int:
+            value = _integer(row.get(metric, 0), f"{name}.{metric}")
+            if metric != "rebalance_cost_msat" or not isinstance(linked, dict):
+                return value
+            linked_controllers = linked.get("controllers")
+            linked_row = (
+                linked_controllers.get(name)
+                if isinstance(linked_controllers, dict) else None
+            )
+            if not isinstance(linked_row, dict):
+                raise ScorecardError(f"linked rebalance missing {name} in {block['_source']}")
+            return value + _integer(
+                linked_row.get("cost_msat"), f"linked_rebalance.{name}.cost_msat"
+            )
+
         for name in CONTROLLERS:
             row = block["contenders"][name]
             if not isinstance(row, dict):
                 raise ScorecardError(f"malformed {name} metrics in {block['_source']}")
             for metric in METRICS:
-                value = _integer(row.get(metric, 0), f"{name}.{metric}")
+                value = metric_value(name, row, metric)
                 totals[name][metric] += value
                 phase_rows[name][metric] += value
                 profile_rows[name][metric] += value
@@ -138,6 +204,37 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
                 eligible_rows[name]["worst_imbalance_samples"] += 1
                 eligible_phase_rows[name]["worst_imbalance_sum_ppm"] += worst
                 eligible_phase_rows[name]["worst_imbalance_samples"] += 1
+
+        family_scope = traffic.get("family_scope")
+        families = block.get("families")
+        if eligible and family_scope in {"cln", "lnd"}:
+            family = str(family_scope)
+            family_payload = families.get(family) if isinstance(families, dict) else None
+            family_contenders = (
+                family_payload.get("contenders")
+                if isinstance(family_payload, dict) else None
+            )
+            if not isinstance(family_contenders, dict):
+                raise ScorecardError(
+                    f"single-family block lacks {family} attribution in {block['_source']}"
+                )
+            family_rows = eligible_phase_families.setdefault(phase, {}).setdefault(
+                family, {name: defaultdict(int) for name in CONTROLLERS}
+            )
+            for name in CONTROLLERS:
+                family_row = family_contenders.get(name)
+                whole_row = block["contenders"][name]
+                if not isinstance(family_row, dict) or not isinstance(whole_row, dict):
+                    raise ScorecardError(
+                        f"malformed {family} metrics for {name} in {block['_source']}"
+                    )
+                for metric in ("forward_count", "volume_msat", "routing_fee_msat"):
+                    family_rows[name][metric] += _integer(
+                        family_row.get(metric, 0), f"{family}.{name}.{metric}"
+                    )
+                family_rows[name]["rebalance_cost_msat"] += metric_value(
+                    name, whole_row, "rebalance_cost_msat"
+                )
 
     def finalize(rows: dict[str, defaultdict[str, int]]) -> dict[str, dict[str, Any]]:
         output = {}
@@ -185,6 +282,13 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         "by_phase": {phase: finalize(rows) for phase, rows in sorted(phases.items())},
         "eligible_by_phase": {
             phase: finalize(rows) for phase, rows in sorted(eligible_phases.items())
+        },
+        "eligible_by_phase_family": {
+            phase: {
+                family: finalize(rows)
+                for family, rows in sorted(families.items())
+            }
+            for phase, families in sorted(eligible_phase_families.items())
         },
         "by_market_profile": {
             profile: finalize(rows)
@@ -279,6 +383,27 @@ def markdown(scorecard: dict[str, Any]) -> str:
             f"| Gross yield (ppm) | {rows['revenue_ops']['gross_yield_ppm']} | {rows['clboss']['gross_yield_ppm']} |",
             "",
         ])
+    lines.extend([
+        "## Eligible single-family results by phase",
+        "",
+        (
+            "Single-family blocks charge their directly linked native rebalance "
+            "cost to the same client-family phase."
+        ),
+        "",
+    ])
+    for phase, families in scorecard["eligible_by_phase_family"].items():
+        for family, rows in families.items():
+            lines.extend([
+                f"### {phase} / {family}",
+                "",
+                "| Metric | Revenue Ops | CLBOSS |",
+                "|---|---:|---:|",
+                f"| Routing volume (msat) | {rows['revenue_ops']['volume_msat']} | {rows['clboss']['volume_msat']} |",
+                f"| Rebalance cost (msat) | {rows['revenue_ops']['rebalance_cost_msat']} | {rows['clboss']['rebalance_cost_msat']} |",
+                f"| Linked net profit (msat) | {rows['revenue_ops']['net_profit_msat']} | {rows['clboss']['net_profit_msat']} |",
+                "",
+            ])
     return "\n".join(lines)
 
 

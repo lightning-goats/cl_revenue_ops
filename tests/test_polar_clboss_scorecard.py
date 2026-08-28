@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -96,6 +97,7 @@ def test_scorecard_keeps_unsafe_enhanced_block_out_of_eligible_profile_results()
     assert result["coverage"]["eligible_blocks"] == 0
     assert result["eligible_by_market_profile"] == {}
     assert result["eligible_by_phase"] == {}
+    assert result["eligible_by_phase_family"] == {}
     assert result["by_market_profile"]["acquisition"]["revenue_ops"][
         "net_profit_msat"
     ] == 100
@@ -130,3 +132,67 @@ def test_scorecard_rejects_negative_or_malformed_economics():
 
     with pytest.raises(mod.ScorecardError, match="nonnegative integer"):
         mod.summarize([payload])
+
+
+def test_post_rebalance_family_view_charges_linked_native_cost():
+    mod = load_scorecard()
+    payload = block()
+    payload["phase"] = "post_rebalance_demand"
+    payload["traffic"]["family_scope"] = "lnd"
+    payload["families"] = {
+        "lnd": {
+            "attempted": 10,
+            "settled": 10,
+            "contenders": {
+                "revenue_ops": {
+                    "forward_count": 6,
+                    "volume_msat": 60_000,
+                    "routing_fee_msat": 120,
+                },
+                "clboss": {
+                    "forward_count": 4,
+                    "volume_msat": 40_000,
+                    "routing_fee_msat": 100,
+                },
+            },
+        }
+    }
+    payload["_linked_rebalance"] = {
+        "source": "rebalance-fixture",
+        "safety_violations": [],
+        "controllers": {
+            "revenue_ops": {"cost_msat": 30},
+            "clboss": {"cost_msat": 0},
+        },
+    }
+
+    result = mod.summarize([payload])
+
+    rows = result["eligible_by_phase_family"]["post_rebalance_demand"]["lnd"]
+    assert rows["revenue_ops"]["rebalance_cost_msat"] == 50
+    assert rows["revenue_ops"]["net_profit_msat"] == 70
+    assert rows["clboss"]["net_profit_msat"] == 50
+    assert (
+        result["eligible_by_phase"]["post_rebalance_demand"]["revenue_ops"]
+        ["net_profit_msat"]
+        == 70
+    )
+    rendered = mod.markdown(result)
+    assert "### post_rebalance_demand / lnd" in rendered
+    assert "| Linked net profit (msat) | 70 | 50 |" in rendered
+
+
+def test_load_blocks_fails_closed_without_linked_rebalance_observation(tmp_path):
+    mod = load_scorecard()
+    replica = tmp_path / "replica-1"
+    replica.mkdir()
+    payload = block()
+    payload.pop("_source")
+    payload["phase"] = "post_rebalance_demand"
+    payload["post_rebalance"] = {"observation_block": "rebalance-missing"}
+    (replica / "smoke-1.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    with pytest.raises(mod.ScorecardError, match="cannot read linked observation"):
+        mod.load_blocks(tmp_path)

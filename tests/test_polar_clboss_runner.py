@@ -1246,6 +1246,10 @@ def test_accelerate_restarts_revenue_and_leaves_clboss_spending_unbounded(
     assert all(
         method != "revenue-rebalance-cycle" for _container, method, _args in calls
     )
+    assert any(
+        method == "revenue-config" and args == ("set", "paused", "false")
+        for _container, method, args in calls
+    )
     assert not any(
         method == "setconfig" and args == ("clboss-rebalance-mode", "off")
         for _container, method, args in calls
@@ -1308,7 +1312,8 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
     monkeypatch.setattr(runner, "cln_rpc", rpc)
     monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        runner, "controlled_depletion_snapshot", lambda _state: next(snapshots)
+        runner, "controlled_depletion_snapshot",
+        lambda _state, *, family: next(snapshots)
     )
     monkeypatch.setattr(
         runner,
@@ -1325,6 +1330,7 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
 
     assert state["status"] == "controlled_depletion_ready"
     assert state["controlled_depletion"]["controllers_held"] is True
+    assert state["controlled_depletion"]["family"] == "cln"
     assert [row["label"] for row in routed] == ["revenue_ops", "clboss"]
     assert [row["target_scid"] for row in routed] == ["1x1x0", "3x1x0"]
     assert all(row["amount_sats"] == 750_000 for row in routed)
@@ -1342,6 +1348,136 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
         for _container, method, args in calls
     )
     assert all(method != "revenue-rebalance-cycle" for _container, method, _args in calls)
+
+
+def test_controlled_lnd_depletion_uses_exact_lnd_first_hops(monkeypatch, tmp_path):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 10)
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "network_id": 4,
+        "status": "isolated_full_stack_ready",
+        "league": "full_stack",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "lane_map": {},
+    })
+    snapshots = iter((
+        {
+            "revenue_ops": {
+                "source": {"short_channel_id": "11x1x0", "local_balance_ppm": 500_000},
+                "depleted": {"short_channel_id": "12x1x0", "local_balance_ppm": 500_000},
+            },
+            "clboss": {
+                "source": {"short_channel_id": "13x1x0", "local_balance_ppm": 500_000},
+                "depleted": {"short_channel_id": "14x1x0", "local_balance_ppm": 500_000},
+            },
+        },
+        {
+            "revenue_ops": {
+                "source": {"short_channel_id": "11x1x0", "local_balance_ppm": 750_000},
+                "depleted": {"short_channel_id": "12x1x0", "local_balance_ppm": 250_000},
+            },
+            "clboss": {
+                "source": {"short_channel_id": "13x1x0", "local_balance_ppm": 750_000},
+                "depleted": {"short_channel_id": "14x1x0", "local_balance_ppm": 250_000},
+            },
+        },
+    ))
+    snapshot_families = []
+    routed = []
+
+    def rpc(_container, method, *_args):
+        if method == "revenue-status":
+            return {"operator_controls": {"values": {"paused": True}}}
+        if method == "clboss-status":
+            return {"rebalance_mode": {"mode": "off"}}
+        return {}
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(
+        runner,
+        "controlled_depletion_snapshot",
+        lambda _state, *, family: (
+            snapshot_families.append(family) or next(snapshots)
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_directed_lnd_fixture_payment",
+        lambda _bridge, **kwargs: routed.append(kwargs) or {
+            "controller": kwargs["label"], "amount_sats": kwargs["amount_sats"]
+        },
+    )
+
+    state = runner.prepare_controlled_depletion(
+        object(), replica=10, results_dir=tmp_path, amount_sats=750_000,
+        family="lnd",
+    )
+
+    assert snapshot_families == ["lnd", "lnd"]
+    assert state["controlled_depletion"]["family"] == "lnd"
+    assert [row["target_scid"] for row in routed] == ["11x1x0", "13x1x0"]
+    assert all(row["amount_sats"] == 750_000 for row in routed)
+
+
+def test_directed_lnd_fixture_payment_pins_first_and_last_hop(monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner, "_live_lnd_channels", lambda _container: [{
+        "active": True,
+        "scid_str": "21x1x0",
+        "chan_id": "funding-hash",
+        "scid": "2308974418337792",
+        "remote_pubkey": "02contender",
+    }])
+    calls = []
+
+    def rpc(container, *args):
+        calls.append((container, args))
+        return {"status": "SUCCEEDED", "payment_hash": "abcd"}
+
+    class Bridge:
+        def call(self, method, params):
+            assert method == "create_invoice"
+            assert params["nodeName"] == "lnd-sink"
+            assert params["amount"] == 750_000
+            return {"invoice": "lnbcrt-invoice"}
+
+    monkeypatch.setattr(runner, "lnd_rpc", rpc)
+
+    result = runner._directed_lnd_fixture_payment(
+        Bridge(), network_id=4, target_scid="21x1x0",
+        amount_sats=750_000, label="revenue_ops",
+    )
+
+    assert result["payment_hash"] == "abcd"
+    assert calls == [("polar-n4-lnd-payer", (
+        "payinvoice", "--force", "--json", "--fee_limit=1000",
+        "--timeout=30s",
+        "--outgoing_chan_id=2308974418337792",
+        "--last_hop=02contender", "lnbcrt-invoice",
+    ))]
+
+
+def test_directed_lnd_fixture_payment_rejects_malformed_channel(monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner, "_live_lnd_channels", lambda _container: [{
+        "active": True,
+        "scid_str": "21x1x0",
+        "chan_id": "funding-hash",
+        "scid": None,
+        "remote_pubkey": "02contender",
+    }])
+
+    with pytest.raises(runner.RunnerError, match="numeric routing id"):
+        runner._directed_lnd_fixture_payment(
+            object(), network_id=4, target_scid="21x1x0",
+            amount_sats=750_000, label="revenue_ops",
+        )
 
 
 def test_controlled_depletion_resume_uses_native_cycles_only(monkeypatch, tmp_path):

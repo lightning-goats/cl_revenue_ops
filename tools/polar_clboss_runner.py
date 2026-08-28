@@ -585,8 +585,12 @@ def _wait_return_paths(
     raise RunnerError(f"synthetic return paths did not become active: {last}")
 
 
-def controlled_depletion_snapshot(state: dict[str, Any]) -> dict[str, Any]:
-    """Read each controller's CLN source/depleted fixture lanes by live SCID."""
+def controlled_depletion_snapshot(
+    state: dict[str, Any], *, family: str = "cln"
+) -> dict[str, Any]:
+    """Read each controller's selected source/depleted lanes by live SCID."""
+    if family not in {"cln", "lnd"}:
+        raise RunnerError(f"unknown controlled depletion family: {family!r}")
     assignment = state.get("assignment")
     contenders = state.get("contenders")
     lane_map = state.get("lane_map")
@@ -604,7 +608,7 @@ def controlled_depletion_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         }
         roles: dict[str, dict[str, Any]] = {}
         for scid, lane in identity_lanes.items():
-            if not isinstance(lane, dict) or lane.get("family") != "cln":
+            if not isinstance(lane, dict) or lane.get("family") != family:
                 continue
             side = lane.get("side")
             row = live.get(str(scid))
@@ -678,6 +682,67 @@ def _directed_cln_fixture_payment(
     }
 
 
+def _directed_lnd_fixture_payment(
+    bridge: PolarMcp,
+    *,
+    network_id: int,
+    target_scid: str,
+    amount_sats: int,
+    label: str,
+) -> dict[str, Any]:
+    """Pay through one exact LND-payer contender channel and exact last hop."""
+    payer = f"polar-n{network_id}-lnd-payer"
+    matches = [
+        row for row in _live_lnd_channels(payer)
+        if row.get("active") is True and row.get("scid_str") == target_scid
+    ]
+    if len(matches) != 1:
+        raise RunnerError(
+            f"controlled depletion LND target is not uniquely active: {target_scid}"
+        )
+    channel = matches[0]
+    chan_id = channel.get("scid")
+    last_hop = channel.get("remote_pubkey")
+    if not isinstance(chan_id, str) or not chan_id.isdigit():
+        raise RunnerError("controlled depletion LND target lacks numeric routing id")
+    if not isinstance(last_hop, str) or not last_hop:
+        raise RunnerError("controlled depletion LND target lacks last-hop identity")
+    invoice_payload = bridge.call(
+        "create_invoice",
+        {
+            "networkId": network_id,
+            "nodeName": "lnd-sink",
+            "amount": amount_sats,
+            "memo": f"clboss-controlled-depletion-{label}",
+        },
+    )
+    invoice = invoice_payload.get("invoice")
+    if not isinstance(invoice, str) or not invoice:
+        raise RunnerError("controlled depletion LND invoice is missing")
+    payment = lnd_rpc(
+        payer,
+        "payinvoice",
+        "--force",
+        "--json",
+        "--fee_limit=1000",
+        "--timeout=30s",
+        f"--outgoing_chan_id={chan_id}",
+        f"--last_hop={last_hop}",
+        invoice,
+    )
+    if payment.get("status") != "SUCCEEDED":
+        raise RunnerError(f"controlled depletion LND payment did not complete: {label}")
+    return {
+        "controller": label,
+        "target_short_channel_id": target_scid,
+        "target_channel_id": chan_id,
+        "last_hop": last_hop,
+        "amount_sats": amount_sats,
+        "multipart_allowed": True,
+        "payment_hash": payment.get("payment_hash"),
+    }
+
+
 def prepare_controlled_depletion(
     bridge: PolarMcp,
     *,
@@ -685,8 +750,9 @@ def prepare_controlled_depletion(
     results_dir: Path,
     amount_sats: int = CONTROLLED_DEPLETION_SATS,
     fixture_fee_ppm: int | None = None,
+    family: str = "cln",
 ) -> dict[str, Any]:
-    """Create equal source/depleted CLN pairs while both controllers are held."""
+    """Create equal source/depleted client-family pairs while controllers are held."""
     path = state_path(results_dir, replica)
     state = read_state(path)
     if state.get("status") != "isolated_full_stack_ready":
@@ -696,6 +762,8 @@ def prepare_controlled_depletion(
         for event in state.get("events", [])
     ):
         raise RunnerError("controlled depletion refuses a previously scored replica")
+    if family not in {"cln", "lnd"}:
+        raise RunnerError(f"unknown controlled depletion family: {family!r}")
     amount_sats = nonnegative_int(amount_sats, "controlled depletion amount")
     if (
         amount_sats <= CHANNEL_CAPACITY_SATS // 2
@@ -726,7 +794,7 @@ def prepare_controlled_depletion(
     if clboss_mode != "off":
         raise RunnerError("CLBOSS did not pause for controlled depletion")
 
-    before = controlled_depletion_snapshot(state)
+    before = controlled_depletion_snapshot(state, family=family)
     if fixture_fee_ppm is not None:
         fixture_fee_ppm = nonnegative_int(
             fixture_fee_ppm, "controlled depletion fixture fee"
@@ -745,10 +813,15 @@ def prepare_controlled_depletion(
         # Give both equal updates one short Polar propagation window before
         # creating contribution evidence; controller loops remain held.
         time.sleep(5)
+    payment_fn = (
+        _directed_cln_fixture_payment
+        if family == "cln"
+        else _directed_lnd_fixture_payment
+    )
     payments = []
     for controller in ("revenue_ops", "clboss"):
         payments.append(
-            _directed_cln_fixture_payment(
+            payment_fn(
                 bridge,
                 network_id=int(state["network_id"]),
                 target_scid=before[controller]["source"]["short_channel_id"],
@@ -756,14 +829,14 @@ def prepare_controlled_depletion(
                 label=controller,
             )
         )
-    after = controlled_depletion_snapshot(state)
+    after = controlled_depletion_snapshot(state, family=family)
     for controller, lanes in after.items():
         if lanes["source"]["local_balance_ppm"] < 700_000:
             raise RunnerError(f"controlled depletion did not create a source for {controller}")
         if lanes["depleted"]["local_balance_ppm"] > 300_000:
             raise RunnerError(f"controlled depletion did not deplete a sink for {controller}")
     state["controlled_depletion"] = {
-        "family": "cln",
+        "family": family,
         "amount_sats_per_controller": amount_sats,
         "controllers_held": True,
         "fixture_fee_ppm": fixture_fee_ppm,
@@ -1253,6 +1326,10 @@ def accelerate_controllers(*, replica: int, results_dir: Path) -> dict[str, Any]
         row = configs.get(key, {}) if isinstance(configs, dict) else {}
         if str(row.get("value_str")) != str(TOURNAMENT_CYCLE_SECONDS):
             raise RunnerError(f"Revenue cadence restart mismatch for {key}")
+    # ``paused`` is a durable runtime control.  A cadence-only plugin restart
+    # must explicitly release a previously held controller before claiming
+    # acceleration succeeded.
+    cln_rpc(revenue_container, "revenue-config", "set", "paused", "false")
     status = cln_rpc(revenue_container, "revenue-status")
     controls = status.get("operator_controls", {}).get("values", {})
     if controls.get("paused") is not False or controls.get("daily_budget_sats") != budget_sats:
@@ -3228,6 +3305,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--depletion-sats", type=positive_int, default=CONTROLLED_DEPLETION_SATS,
     )
     parser.add_argument(
+        "--depletion-family", choices=("cln", "lnd"), default="cln",
+        help="client-family lanes to place in the equal controlled liquidity state",
+    )
+    parser.add_argument(
         "--fixture-fee-ppm", type=nonnegative_arg,
         help=(
             "optional equal outgoing CLN fee on both controlled destinations; "
@@ -3337,6 +3418,7 @@ def main() -> int:
                 results_dir=args.results_dir,
                 amount_sats=args.depletion_sats,
                 fixture_fee_ppm=args.fixture_fee_ppm,
+                family=args.depletion_family,
             )
         elif args.command == "observe-rebalance":
             result = observe_rebalances(

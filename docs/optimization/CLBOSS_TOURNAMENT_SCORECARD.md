@@ -1,17 +1,17 @@
 # CLBOSS tournament scorecard
 
-Coverage: 30 replicas, 49 blocks, 2297 attempted / 2294 settled payments. Enhanced strict-schema blocks: 32; safety-eligible: 22.
+Coverage: 32 replicas, 51 blocks, 2327 attempted / 2324 settled payments. Enhanced strict-schema blocks: 34; safety-eligible: 24.
 
 | Comparable area | Revenue Ops | CLBOSS | Current leader |
 |---|---:|---:|---|
-| Routing volume (msat) | 12137724010 | 32745803657 | clboss |
-| Forward count | 574 | 1581 | clboss |
-| Gross routing fees (msat) | 1493252 | 279126 | revenue_ops |
-| Rebalance cost (msat) | 0 | 38932 | revenue_ops |
-| Net routing profit (msat) | 1493252 | 240194 | revenue_ops |
-| Gross yield (ppm) | 123.026 | 8.524 | revenue_ops |
-| Volume share (%) | 27.043 | 72.957 | clboss |
-| Mean worst imbalance (ppm; lower is better) | 716264.0 | 744611.0 | revenue_ops |
+| Routing volume (msat) | 12707724010 | 33215803657 | clboss |
+| Forward count | 584 | 1601 | clboss |
+| Gross routing fees (msat) | 1563647 | 335526 | revenue_ops |
+| Rebalance cost (msat) | 10416 | 38932 | revenue_ops |
+| Net routing profit (msat) | 1553231 | 296594 | revenue_ops |
+| Gross yield (ppm) | 123.047 | 10.101 | revenue_ops |
+| Volume share (%) | 27.671 | 72.329 | clboss |
+| Mean worst imbalance (ppm; lower is better) | 727390.9 | 754626.3 | revenue_ops |
 
 Formal verdict: **not ready**. It requires at least three fresh replicas and six enhanced cold/warm blocks per league per replica.
 
@@ -37,6 +37,8 @@ contender-level safety violations contribute here.
 | `realistic` / forward pressure / CLN | 5000000 | 325000000 | 730 | 325 | Revenue wins profit; CLBOSS wins volume/balance |
 | `realistic` / forward pressure / LND | 0 | 330000000 | 0 | 330 | CLBOSS wins volume, profit, and balance |
 | `realistic` / 50-ppm treatment / LND | 0 | 330000000 | 0 | 330 | CLBOSS wins; ordinary floor cut buys no volume |
+| `realistic` / crossed post-refill / LND | 570000000 | 470000000 | 66291 | 56400 | Revenue wins volume and linked net profit |
+| `realistic` / crossed post-refill / CLN | 1140000000 | 940000000 | 155752 | 1645 | Revenue wins volume and linked net profit |
 | `legacy_low_fee` / baseline / both | 5000000 | 445000000 | 75 | 4870 | CLBOSS wins volume and profit |
 
 ## Fee-market regimes
@@ -68,9 +70,10 @@ cycles. Production defaults remain unchanged.
 
 These observations are separate from the aggregate traffic table because the
 fixture payments create the starting liquidity state rather than scored route
-demand. Both controllers start with matching CLN lanes at approximately 75%
-local on the source and 25% local on the destination, receive equal 2M-sat
-neutral return paths, and resume simultaneously. No manual cycle RPC is used.
+demand. Both controllers start with matching selected-family lanes at
+approximately 75% local on the source and 25% local on the destination, receive
+equal 2M-sat neutral return paths, and resume simultaneously. No manual cycle
+RPC is used.
 
 | Replica / identity assignment | Revenue delivered / cost | CLBOSS delivered / cost | Safety | Result |
 |---|---:|---:|---|---|
@@ -82,12 +85,14 @@ neutral return paths, and resume simultaneously. No manual cycle RPC is used.
 | 58 / Revenue B, CLBOSS A | 50,000 sats / 1.052 sats | 0 / 0 | no violations | Crossed fixed-image post-refill volume win |
 | 60 / Revenue B, CLBOSS A | 50,000 sats / 1.052 sats | 0 / 0 | no violations | Exact 90-sat evidence-band validation over 180 seconds |
 | 61 / Revenue A, CLBOSS B | 50,000 sats / 1.052 sats | 0 / 0 | no violations | Crossed exact-band validation |
+| 62 / Revenue B, CLBOSS A / LND | 50,000 sats / 2.052 sats | 0 / 0 | no violations | Native LND-facing refill and post-refill win |
+| 63 / Revenue A, CLBOSS B / LND | 50,000 sats / 2.052 sats | 0 / 0 | no violations | Crossed native LND-facing replication |
 
-Across these eight clean observations Revenue delivered 400,000 sats for 8.416
-sats while uncapped CLBOSS delivered zero. The refill moved each Revenue
-destination from below the 30% threshold into the operating band; untouched
-empty/full LND lanes mean the contender-wide worst-imbalance metric remains
-unsuitable for this fixture.
+Across these ten clean observations Revenue delivered 500,000 sats for 12.520
+sats while uncapped CLBOSS delivered zero. The refill moved each selected
+Revenue destination from below the 30% threshold into the operating band;
+untouched lanes in the other client family mean the contender-wide
+worst-imbalance metric remains unsuitable for this fixture.
 
 The four safety-eligible post-refill demand blocks (54, 55, 57, and 58) then
 routed 1.14B msat through Revenue versus 0.94B through CLBOSS. Revenue's routing
@@ -95,6 +100,15 @@ fees were 159.960 sats versus 1.645 sats. Charging the four linked 1.052-sat
 refills to this phase leaves Revenue at 155.752 sats net versus 1.645 sats for
 CLBOSS. Every block settled 15/15 payments with no fallback, and the 285M/235M
 volume split repeated exactly across both identities and both product images.
+
+The crossed LND-facing replicas 62-63 use the same exact 120-ppm evidence band
+and multipart fixture payments pinned to one outgoing contender and the same
+contender as last hop. Revenue again refilled 50,000 sats while CLBOSS did
+nothing. Their two post-refill LND blocks settled 30/30 without fallback or
+safety violations and repeated the 285M/235M split across identities. Revenue
+earned 70,395 msat gross and 66,291 msat after both linked refills, versus
+56,400 msat for CLBOSS. Across all six eligible post-refill blocks, linked net
+is therefore 222,043 msat for Revenue versus 58,045 msat for CLBOSS.
 
 Revenue Ops' bounded acquisition experiment remains default-off and may quote
 0 ppm on only one capped episode. It now admits competitor observations from
@@ -112,6 +126,8 @@ and restore the exact captured base and proportional fees on exit.
 - Replicas 47-48 add a fresh crossed realistic repeat: Revenue earned 340,545 msat from 2.33B msat while CLBOSS earned 3,870 msat from 3.87B msat. Revenue finished materially better balanced in both runs (270,178 and 130,170 worst-imbalance ppm versus 970,000 for CLBOSS), with zero safety violations. CLBOSS still wins raw volume.
 - Controlled replicas 52-53 establish a crossed native-rebalance win. Revenue completed one positive-EV 50,000-sat refill in each 90-second observation for 1.052 sats; uncapped CLBOSS completed none despite its 120/hour setting. Both runs were safety-clean. This is evidence for execution responsiveness and profitability discipline, not yet long-horizon profit superiority.
 - Replicas 54-55 and fixed-image replicas 57-58 connect that refill to customer demand: Revenue won post-refill volume 285M to 235M msat in every run and linked net profit 155,752 to 1,645 msat across the four eligible blocks. The direct fixture paths were cooperatively closed and confirmed absent before scoring, so no payment bypassed the contenders.
+- Crossed replicas 62-63 extend the same result to LND-facing liquidity. Revenue repeated the 50,000-sat native refill and exact 285M/235M post-refill volume win in both identities; aggregate linked net was 66,291 versus 56,400 msat with 30/30 settlements. This reverses the earlier unrepaired LND corridor loss under a causal liquidity fixture rather than a global fee-floor cut.
+- The scorer now resolves every post-refill smoke block to its exact native observation, fails closed on missing or mismatched lineage, charges the linked rebalance cost, and publishes eligible single-family phase results. Historical aggregate profit no longer silently treats native refills as free.
 - Replica 56 exposed an arbitrary early-channel capex cliff: a channel with four forwards, positive canonical contribution, and a profitable classification received zero budget because it had neither more than five forwards nor more than 100 sats contribution. Revision `4c26e11` now admits an early active tier funded only by the configured reinvestment share of realized 30-day contribution and capped by the existing bootstrap rail. Zero, absent, negative, malformed, and DB-degraded evidence still grants nothing.
 - Replicas 60-61 validate `4c26e11` in the exact repaired band across identities. Equal 120-ppm fixture pricing produced approximately 90 sats of contribution, Revenue received 88 sats of combined allocation and completed the same 50,000-sat/1.052-sat refill, while CLBOSS completed none during each 180-second observation. Both observations were safety-clean.
 - Diagnostic replicas 56, 59, and 60 demand blocks remain excluded: 56 and 60 each had one terminal failed payment, while 59 allowed a delayed CLBOSS circular payment to overlap scored traffic. The runner now freezes both controllers after the native observation and before retiring return paths, preventing later circular forwards from contaminating customer-demand attribution.
@@ -137,9 +153,9 @@ and restore the exact captured base and proportional fees on exit.
 | Paid retention | Whether a positive base-fee undercut converts the 1-ppm tie into retained volume and profit | Keep experimental until positive lift repeats across crossed identities and both client families. |
 | Retention curve | Whether any paid quote beats free acquisition on net profit under CLN route randomization | Measure multiple bounded price points with enough routes for confidence; optimize net contribution, not raw route count. |
 | Liquidity pressure | Whether each controller restores depleted earning liquidity profitably | Run one-way traffic with equal spend caps; compare net fees, cost, and ending imbalance. |
-| Controlled depletion | Whether each native controller repairs the same exact 75/25 liquidity state | Eight clean observations across crossed identities; Revenue leads 8-0 while CLBOSS remains uncapped. |
+| Controlled depletion | Whether each native controller repairs the same exact 75/25 liquidity state | Ten clean observations across CLN/LND and crossed identities; Revenue leads 10-0 while CLBOSS remains uncapped. |
 | Reserved return lane | Whether a controller can complete a profitable circular refill after pressure | Equal post-pressure 2M-sat CLN/LND paths are removed and confirmed absent before demand scoring. |
-| Post-refill demand | Whether repaired liquidity produces more routed volume and linked net profit | Four eligible blocks repeat Revenue's 285M/235M volume win and 155,752/1,645 msat linked net-profit win. Extend to LND and longer warm demand. |
+| Post-refill demand | Whether repaired liquidity produces more routed volume and linked net profit | Six eligible CLN/LND blocks repeat Revenue's 285M/235M volume win; aggregate linked net is 222,043/58,045 msat. Extend to longer warm demand. |
 | Evidence freshness | Whether settled forwards become canonical value/budget evidence before a 15-minute cache TTL expires | Implemented through `0aa7da8`; keep the analyzer refresh canonical, read-only, and backoff protected. |
 | Product change | Repeatable positive net lift across crossed identities and clients | Promote only treatments with replicated safety-eligible evidence. |
 
