@@ -884,7 +884,11 @@ class Database:
                 observed_volume_sats INTEGER NOT NULL DEFAULT 0,
                 opportunity_cost_sats REAL NOT NULL DEFAULT 0.0,
                 ending_outbound_ratio REAL,
-                restored_fee_ppm INTEGER
+                restored_fee_ppm INTEGER,
+                phase TEXT NOT NULL DEFAULT 'acquisition',
+                phase_started_at INTEGER NOT NULL DEFAULT 0,
+                phase_start_volume_sats INTEGER NOT NULL DEFAULT 0,
+                retention_fee_ppm INTEGER
             )
         """)
         conn.execute("""
@@ -895,6 +899,21 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_acquisition_channel_completed
             ON acquisition_experiments(channel_id, completed_at)
         """)
+        # Restart-safe paid-retention phase for databases created before the
+        # acquisition ladder existed.  Each ALTER is independent so a partial
+        # migration resumes cleanly on the next initialize call.
+        for column_sql in (
+            "phase TEXT NOT NULL DEFAULT 'acquisition'",
+            "phase_started_at INTEGER NOT NULL DEFAULT 0",
+            "phase_start_volume_sats INTEGER NOT NULL DEFAULT 0",
+            "retention_fee_ppm INTEGER",
+        ):
+            try:
+                conn.execute(
+                    f"ALTER TABLE acquisition_experiments ADD COLUMN {column_sql}"
+                )
+            except sqlite3.OperationalError:
+                pass  # Column already exists.
         
         # Ignored peers table (Blacklist)
         # Prevents cl-revenue-ops from managing fees or rebalancing for specific peers
@@ -2304,6 +2323,35 @@ class Database:
             LIMIT ?
         """, (max(1, min(100, int(limit))),)).fetchall()
         return [dict(row) for row in rows]
+
+    def transition_acquisition_to_retention(
+        self,
+        experiment_id: int,
+        *,
+        retention_fee_ppm: int,
+        phase_start_volume_sats: int,
+        transitioned_at: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically persist the paid phase before treating it as durable."""
+        conn = self._get_connection()
+        now = int(time.time()) if transitioned_at is None else int(transitioned_at)
+        fee_ppm = int(retention_fee_ppm)
+        if fee_ppm <= 0:
+            return None
+        cursor = conn.execute("""
+            UPDATE acquisition_experiments
+            SET phase = 'retention', phase_started_at = ?,
+                phase_start_volume_sats = ?, retention_fee_ppm = ?
+            WHERE id = ? AND state = 'active' AND phase = 'acquisition'
+        """, (
+            now,
+            max(0, int(phase_start_volume_sats)),
+            fee_ppm,
+            int(experiment_id),
+        ))
+        if cursor.rowcount != 1:
+            return None
+        return self.get_acquisition_experiment(int(experiment_id))
 
     def channel_acquisition_on_cooldown(
         self, channel_id: str, *, now: Optional[int] = None, cooldown_seconds: int

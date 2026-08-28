@@ -241,11 +241,14 @@ method-not-found.
 
 The default-off `acquisition_experiment_enabled` control permits one
 restart-safe, one-hour market-acquisition episode at a time. It is restricted
-to a cold source/high-outbound channel with a peer-local 1-ppm competing floor
-and a 0-ppm class-aware floor. The controller captures and restores the exact
-baseline, and exits early on congestion, changed/missing competitor evidence,
-250,000 routed sats, 25 sats of fee opportunity cost, or 70% outbound
-liquidity. `revenue-status.acquisition_experiments` exposes the audit trail.
+to a cold high-outbound channel with a peer-local 1--10-ppm competing floor
+and a 0-ppm class-aware floor. After 50,000 acquired sats, the same episode may
+enter a one-hour paid-validation phase at the observed competitor floor. Both
+phases share the 25-sat opportunity-cost and 70% outbound-liquidity stops; the
+free phase is additionally capped at 250,000 routed sats and the paid phase at
+250,000 additional sats. Congestion and changed, missing, or malformed evidence
+fail closed. The controller always restores the exact captured baseline, and
+`revenue-status.acquisition_experiments` exposes the phase and audit trail.
 Keep it disabled unless intentionally running this bounded experiment.
 
 ## cl_revenue_ops standalone invariant

@@ -57,6 +57,16 @@ def test_database_enforces_one_active_and_persists_exact_restore(tmp_path):
     restarted = Database(db_path, MagicMock())
     restarted.initialize()
     assert restarted.get_active_acquisition_experiments()[0]["id"] == first["id"]
+    retained = restarted.transition_acquisition_to_retention(
+        first["id"],
+        retention_fee_ppm=2,
+        phase_start_volume_sats=50_000,
+        transitioned_at=1_500,
+    )
+    assert retained["phase"] == "retention"
+    assert retained["target_fee_ppm"] == 0
+    assert retained["retention_fee_ppm"] == 2
+    assert retained["phase_start_volume_sats"] == 50_000
     assert restarted.complete_acquisition_experiment(
         first["id"],
         exit_reason="duration_cap",
@@ -76,6 +86,215 @@ def test_database_enforces_one_active_and_persists_exact_restore(tmp_path):
     assert not restarted.channel_acquisition_on_cooldown(
         "1x1x0", now=2_101, cooldown_seconds=100
     )
+
+
+def test_positive_acquisition_transitions_to_bounded_paid_retention(
+    mock_plugin, mock_database
+):
+    fc, cfg = _make_fc(
+        mock_plugin,
+        mock_database,
+        min_fee_ppm=10,
+        min_fee_ppm_saturated=0,
+        acquisition_experiment_enabled=True,
+    )
+    now = int(time.time())
+    episode = _episode(started_at=now - 10)
+    fc._acquisition_cycle_experiments = {CHANNEL_ID: episode}
+    fc._get_neighbor_fee_percentile = MagicMock(return_value=2)
+    fc._calculate_floor = MagicMock(return_value=10)
+    mock_database.get_volume_since.return_value = (
+        fc.ACQUISITION_RETENTION_MIN_VOLUME_SATS
+    )
+    mock_database.transition_acquisition_to_retention.return_value = {
+        **episode,
+        "phase": "retention",
+        "phase_started_at": now,
+        "phase_start_volume_sats": fc.ACQUISITION_RETENTION_MIN_VOLUME_SATS,
+        "retention_fee_ppm": 2,
+    }
+    fc.set_channel_fee = MagicMock(return_value={"success": True, "fee_ppm": 2})
+    info = _channel_info(0)
+    info["spendable_msat"] = "1900000000msat"
+
+    result = fc._adjust_channel_fee(
+        CHANNEL_ID,
+        PEER_ID,
+        {"state": "source"},
+        info,
+        cfg=cfg,
+        force_reprice_reason="acquisition_experiment",
+    )
+
+    assert result is not None
+    assert result.new_fee_ppm == 2
+    assert result.reason_code == FeeReasonCode.ACQUISITION_RETENTION.value
+    assert result.algorithm_values["acquisition_phase"] == "retention"
+    assert result.algorithm_values["acquisition_phase_volume_sats"] == 0
+    assert result.algorithm_values["acquisition_retention_fee_ppm"] == 2
+    transition = mock_database.transition_acquisition_to_retention.call_args.kwargs
+    assert transition["phase_start_volume_sats"] == 50_000
+    mock_database.complete_acquisition_experiment.assert_not_called()
+
+
+def test_retention_transition_persists_when_paid_fee_is_already_live(
+    mock_plugin, mock_database
+):
+    fc, cfg = _make_fc(
+        mock_plugin,
+        mock_database,
+        min_fee_ppm=10,
+        min_fee_ppm_saturated=0,
+        acquisition_experiment_enabled=True,
+    )
+    now = int(time.time())
+    episode = _episode(started_at=now - 10)
+    fc._acquisition_cycle_experiments = {CHANNEL_ID: episode}
+    fc._get_neighbor_fee_percentile = MagicMock(return_value=2)
+    fc._calculate_floor = MagicMock(return_value=10)
+    mock_database.get_volume_since.return_value = 50_000
+    mock_database.transition_acquisition_to_retention.return_value = {
+        **episode,
+        "phase": "retention",
+        "phase_started_at": now,
+        "phase_start_volume_sats": 50_000,
+        "retention_fee_ppm": 2,
+    }
+    fc.set_channel_fee = MagicMock()
+    info = _channel_info(2)
+    info["spendable_msat"] = "1900000000msat"
+
+    result = fc._adjust_channel_fee(
+        CHANNEL_ID,
+        PEER_ID,
+        {"state": "source"},
+        info,
+        cfg=cfg,
+        force_reprice_reason="acquisition_experiment",
+    )
+
+    assert result is None
+    fc.set_channel_fee.assert_not_called()
+    mock_database.transition_acquisition_to_retention.assert_called_once()
+    mock_database.complete_acquisition_experiment.assert_not_called()
+
+
+def test_paid_retention_duration_restores_baseline_with_exact_cost(
+    mock_plugin, mock_database
+):
+    fc, cfg = _make_fc(
+        mock_plugin,
+        mock_database,
+        min_fee_ppm=10,
+        min_fee_ppm_saturated=0,
+        acquisition_experiment_enabled=True,
+    )
+    now = int(time.time())
+    episode = {
+        **_episode(started_at=now - 4_000, baseline=100),
+        "phase": "retention",
+        "phase_started_at": now - fc.ACQUISITION_RETENTION_DURATION_SECONDS,
+        "phase_start_volume_sats": 50_000,
+        "retention_fee_ppm": 1,
+    }
+    fc._acquisition_cycle_experiments = {CHANNEL_ID: episode}
+    fc._get_neighbor_fee_percentile = MagicMock(return_value=1)
+    fc._calculate_floor = MagicMock(return_value=10)
+    mock_database.get_volume_since.return_value = 70_000
+    fc.set_channel_fee = MagicMock(return_value={"success": True, "fee_ppm": 100})
+    info = _channel_info(1)
+    info["spendable_msat"] = "1900000000msat"
+
+    result = fc._adjust_channel_fee(
+        CHANNEL_ID,
+        PEER_ID,
+        {"state": "source"},
+        info,
+        cfg=cfg,
+        force_reprice_reason="acquisition_experiment",
+    )
+
+    assert result.new_fee_ppm == 100
+    assert result.reason_code == FeeReasonCode.ACQUISITION_EXIT.value
+    complete = mock_database.complete_acquisition_experiment.call_args.kwargs
+    assert complete["exit_reason"] == "retention_duration_cap"
+    assert complete["observed_volume_sats"] == 70_000
+    assert complete["opportunity_cost_sats"] == 6.98
+    assert complete["restored_fee_ppm"] == 100
+
+
+def test_retention_transition_without_persistence_restores_baseline(
+    mock_plugin, mock_database
+):
+    fc, cfg = _make_fc(
+        mock_plugin,
+        mock_database,
+        min_fee_ppm=10,
+        min_fee_ppm_saturated=0,
+        acquisition_experiment_enabled=True,
+    )
+    episode = _episode(started_at=int(time.time()) - 10)
+    fc._acquisition_cycle_experiments = {CHANNEL_ID: episode}
+    fc._get_neighbor_fee_percentile = MagicMock(return_value=1)
+    fc._calculate_floor = MagicMock(return_value=10)
+    mock_database.get_volume_since.return_value = 50_000
+    mock_database.transition_acquisition_to_retention = None
+    fc.set_channel_fee = MagicMock(return_value={"success": True, "fee_ppm": 100})
+    info = _channel_info(0)
+    info["spendable_msat"] = "1900000000msat"
+
+    result = fc._adjust_channel_fee(
+        CHANNEL_ID,
+        PEER_ID,
+        {"state": "source"},
+        info,
+        cfg=cfg,
+        force_reprice_reason="acquisition_experiment",
+    )
+
+    assert result.new_fee_ppm == 100
+    complete = mock_database.complete_acquisition_experiment.call_args.kwargs
+    assert complete["exit_reason"] == "retention_persistence_unavailable"
+
+
+def test_malformed_retention_state_fails_closed_without_crashing(
+    mock_plugin, mock_database
+):
+    fc, cfg = _make_fc(
+        mock_plugin,
+        mock_database,
+        min_fee_ppm=10,
+        min_fee_ppm_saturated=0,
+        acquisition_experiment_enabled=True,
+    )
+    episode = {
+        **_episode(started_at=int(time.time()) - 10, baseline=100),
+        "phase": "retention",
+        "phase_started_at": "bad-time",
+        "phase_start_volume_sats": 50_000,
+        "retention_fee_ppm": "bad-fee",
+    }
+    fc._acquisition_cycle_experiments = {CHANNEL_ID: episode}
+    fc._calculate_floor = MagicMock(return_value=10)
+    mock_database.get_volume_since.return_value = 50_000
+    fc.set_channel_fee = MagicMock(return_value={"success": True, "fee_ppm": 100})
+    info = _channel_info(1)
+    info["spendable_msat"] = "1900000000msat"
+
+    result = fc._adjust_channel_fee(
+        CHANNEL_ID,
+        PEER_ID,
+        {"state": "source"},
+        info,
+        cfg=cfg,
+        force_reprice_reason="acquisition_experiment",
+    )
+
+    assert result.new_fee_ppm == 100
+    assert result.reason_code == FeeReasonCode.ACQUISITION_EXIT.value
+    complete = mock_database.complete_acquisition_experiment.call_args.kwargs
+    assert complete["exit_reason"] == "evidence_unavailable"
+    assert complete["restored_fee_ppm"] == 100
 
 
 def test_prepare_is_default_off_and_selects_only_one_best_lane(

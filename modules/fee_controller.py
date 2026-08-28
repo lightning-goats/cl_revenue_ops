@@ -231,6 +231,7 @@ class FeeReasonCode(Enum):
     LOW_FEE_EXPLORATION = "low_fee_exploration"       # Bounded low-fee exploration
     LOW_FEE_EXPLORATION_SUCCESS = "low_fee_exploration_success"  # Exploration saw traffic
     ACQUISITION_EXPERIMENT = "acquisition_experiment"  # Bounded sub-economic quote
+    ACQUISITION_RETENTION = "acquisition_retention"      # Paid validation after acquisition
     ACQUISITION_EXIT = "acquisition_exit"              # Baseline restoration after experiment
     CONGESTION = "congestion"                         # Congestion-based fee surge
     GOSSIP_REFRESH = "gossip_refresh"                 # Minimal nudge to refresh channel_update
@@ -2595,6 +2596,13 @@ class FeeController:
     ACQUISITION_DURATION_SECONDS = 3600
     ACQUISITION_VOLUME_CAP_SATS = 250_000
     ACQUISITION_OPPORTUNITY_COST_CAP_SATS = 25.0
+    # A free quote is only useful if it answers whether demand exists.  Once
+    # enough demand is observed, validate that demand at the peer-local paid
+    # floor rather than restoring blindly.  This phase is part of the same
+    # default-off, one-lane loss budget and cannot outlive its own caps.
+    ACQUISITION_RETENTION_MIN_VOLUME_SATS = 50_000
+    ACQUISITION_RETENTION_DURATION_SECONDS = 3600
+    ACQUISITION_RETENTION_VOLUME_CAP_SATS = 250_000
     ACQUISITION_START_OUTBOUND_RATIO = 0.85
     ACQUISITION_EXIT_OUTBOUND_RATIO = 0.70
     ACQUISITION_IDLE_SECONDS = 24 * 3600
@@ -3095,6 +3103,50 @@ class FeeController:
                 f"restored={restored_fee_ppm}ppm",
                 level="info",
             )
+
+    def _transition_acquisition_to_retention(
+        self,
+        episode: Dict[str, Any],
+        *,
+        retention_fee_ppm: int,
+        acquired_volume_sats: int,
+        now: int,
+    ) -> bool:
+        """Persist the paid-validation phase; failure leaves a retryable episode."""
+        transition = getattr(
+            self.database, "transition_acquisition_to_retention", None
+        )
+        if not callable(transition):
+            return False
+        try:
+            updated = transition(
+                int(episode["id"]),
+                retention_fee_ppm=int(retention_fee_ppm),
+                phase_start_volume_sats=max(0, int(acquired_volume_sats)),
+                transitioned_at=int(now),
+            )
+        except Exception as exc:
+            self.plugin.log(
+                f"ACQUISITION: retention transition write failed: {exc}",
+                level="error",
+            )
+            return False
+        if not isinstance(updated, dict) or updated.get("phase") != "retention":
+            self.plugin.log(
+                "ACQUISITION: retention transition was not persisted; will retry",
+                level="error",
+            )
+            return False
+        channel_id = str(episode.get("channel_id") or "")
+        if channel_id:
+            self._acquisition_cycle_experiments[channel_id] = updated
+        self.plugin.log(
+            f"ACQUISITION: entered paid retention on {channel_id[:12]}... "
+            f"at {int(retention_fee_ppm)}ppm after "
+            f"{int(acquired_volume_sats)} acquired sats",
+            level="info",
+        )
+        return True
 
     # =========================================================================
     # E-1 (2026-07 econ audit): dynamic htlc_max valve — live-depletion keying
@@ -6366,6 +6418,10 @@ class FeeController:
         acquisition_volume_sats = 0
         acquisition_opportunity_cost_sats = 0.0
         acquisition_competitor_floor_ppm: Optional[int] = None
+        acquisition_phase = "acquisition"
+        acquisition_phase_volume_sats = 0
+        acquisition_retention_fee_ppm: Optional[int] = None
+        acquisition_transition_requested = False
         
         now = decision_now("channel.adjust")
 
@@ -6782,15 +6838,67 @@ class FeeController:
                         )
                     ),
                 )
-                acquisition_opportunity_cost_sats = (
-                    acquisition_volume_sats
-                    * max(
-                        0,
-                        acquisition_baseline_fee_ppm
-                        - acquisition_target_fee_ppm,
-                    )
-                    / 1_000_000.0
+                acquisition_phase = str(
+                    acquisition_episode.get("phase") or "acquisition"
                 )
+                if acquisition_phase not in {"acquisition", "retention"}:
+                    raise ValueError(f"invalid phase {acquisition_phase!r}")
+                phase_started_at = int(
+                    acquisition_episode.get("phase_started_at") or 0
+                )
+                phase_start_volume_sats = int(
+                    acquisition_episode.get("phase_start_volume_sats") or 0
+                )
+                if (
+                    phase_start_volume_sats < 0
+                    or phase_start_volume_sats > acquisition_volume_sats
+                ):
+                    raise ValueError("invalid phase-start volume")
+
+                if acquisition_phase == "retention":
+                    if not (
+                        acquisition_started_at
+                        <= phase_started_at
+                        <= now
+                    ):
+                        raise ValueError("invalid retention start time")
+                    acquisition_retention_fee_ppm = int(
+                        acquisition_episode.get("retention_fee_ppm")
+                    )
+                    if not self._acquisition_competitor_floor_qualifies(
+                        acquisition_retention_fee_ppm
+                    ):
+                        raise ValueError("invalid retention fee")
+                    acquisition_phase_volume_sats = (
+                        acquisition_volume_sats - phase_start_volume_sats
+                    )
+                    acquisition_opportunity_cost_sats = (
+                        phase_start_volume_sats
+                        * max(
+                            0,
+                            acquisition_baseline_fee_ppm
+                            - acquisition_target_fee_ppm,
+                        )
+                        + acquisition_phase_volume_sats
+                        * max(
+                            0,
+                            acquisition_baseline_fee_ppm
+                            - acquisition_retention_fee_ppm,
+                        )
+                    ) / 1_000_000.0
+                else:
+                    if acquisition_target_fee_ppm != self.ACQUISITION_TARGET_FEE_PPM:
+                        raise ValueError("invalid acquisition target")
+                    acquisition_phase_volume_sats = acquisition_volume_sats
+                    acquisition_opportunity_cost_sats = (
+                        acquisition_volume_sats
+                        * max(
+                            0,
+                            acquisition_baseline_fee_ppm
+                            - acquisition_target_fee_ppm,
+                        )
+                        / 1_000_000.0
+                    )
                 acquisition_competitor_floor_ppm = (
                     self._get_neighbor_fee_percentile(peer_id, 0.0, cfg=cfg)
                 )
@@ -6805,15 +6913,58 @@ class FeeController:
                     acquisition_exit_reason = "competitor_evidence_changed"
                 elif outbound_ratio <= self.ACQUISITION_EXIT_OUTBOUND_RATIO:
                     acquisition_exit_reason = "liquidity_floor"
-                elif now - acquisition_started_at >= self.ACQUISITION_DURATION_SECONDS:
-                    acquisition_exit_reason = "duration_cap"
-                elif acquisition_volume_sats >= self.ACQUISITION_VOLUME_CAP_SATS:
-                    acquisition_exit_reason = "volume_cap"
-                elif (
-                    acquisition_opportunity_cost_sats
-                    >= self.ACQUISITION_OPPORTUNITY_COST_CAP_SATS
-                ):
-                    acquisition_exit_reason = "opportunity_cost_cap"
+                elif acquisition_phase == "retention":
+                    if (
+                        acquisition_opportunity_cost_sats
+                        >= self.ACQUISITION_OPPORTUNITY_COST_CAP_SATS
+                    ):
+                        acquisition_exit_reason = "opportunity_cost_cap"
+                    elif (
+                        now - phase_started_at
+                        >= self.ACQUISITION_RETENTION_DURATION_SECONDS
+                    ):
+                        acquisition_exit_reason = "retention_duration_cap"
+                    elif (
+                        acquisition_phase_volume_sats
+                        >= self.ACQUISITION_RETENTION_VOLUME_CAP_SATS
+                    ):
+                        acquisition_exit_reason = "retention_volume_cap"
+                else:
+                    if (
+                        now - acquisition_started_at
+                        >= self.ACQUISITION_DURATION_SECONDS
+                    ):
+                        acquisition_exit_reason = "duration_cap"
+                    elif (
+                        acquisition_volume_sats
+                        >= self.ACQUISITION_VOLUME_CAP_SATS
+                    ):
+                        acquisition_exit_reason = "volume_cap"
+                    elif (
+                        acquisition_opportunity_cost_sats
+                        >= self.ACQUISITION_OPPORTUNITY_COST_CAP_SATS
+                    ):
+                        acquisition_exit_reason = "opportunity_cost_cap"
+                    elif (
+                        acquisition_volume_sats
+                        >= self.ACQUISITION_RETENTION_MIN_VOLUME_SATS
+                    ):
+                        if not callable(
+                            getattr(
+                                self.database,
+                                "transition_acquisition_to_retention",
+                                None,
+                            )
+                        ):
+                            acquisition_exit_reason = (
+                                "retention_persistence_unavailable"
+                            )
+                        else:
+                            acquisition_retention_fee_ppm = int(
+                                acquisition_competitor_floor_ppm
+                            )
+                            acquisition_transition_requested = True
+                            acquisition_phase_volume_sats = 0
             except Exception as exc:
                 # A malformed row or stale/unavailable evidence must never
                 # leave a 0-ppm quote running indefinitely.
@@ -6829,6 +6980,10 @@ class FeeController:
                     except (TypeError, ValueError, OverflowError):
                         acquisition_baseline_fee_ppm = 0
                 acquisition_target_fee_ppm = self.ACQUISITION_TARGET_FEE_PPM
+                acquisition_phase = "acquisition"
+                acquisition_phase_volume_sats = 0
+                acquisition_retention_fee_ppm = None
+                acquisition_transition_requested = False
                 acquisition_exit_reason = "evidence_unavailable"
                 self.plugin.log(
                     f"ACQUISITION: fail-closed exit for {channel_id[:12]}...: {exc}",
@@ -6981,9 +7136,17 @@ class FeeController:
         # congested exit; all other exits restore the captured baseline.
         if acquisition_episode is not None and not target_found:
             if acquisition_exit_reason is None:
-                new_fee_ppm = acquisition_target_fee_ppm
-                decision_reason = "ACQUISITION_EXPERIMENT"
-                exploration_mode = "bounded_acquisition"
+                if (
+                    acquisition_phase == "retention"
+                    or acquisition_transition_requested
+                ):
+                    new_fee_ppm = int(acquisition_retention_fee_ppm)
+                    decision_reason = "ACQUISITION_RETENTION"
+                    exploration_mode = "bounded_paid_retention"
+                else:
+                    new_fee_ppm = acquisition_target_fee_ppm
+                    decision_reason = "ACQUISITION_EXPERIMENT"
+                    exploration_mode = "bounded_acquisition"
             else:
                 new_fee_ppm = acquisition_baseline_fee_ppm
                 decision_reason = "ACQUISITION_EXIT"
@@ -7878,6 +8041,7 @@ class FeeController:
             and not is_congested
             and not channel_policy_change
             and not raw_zero_fee_recovery
+            and not acquisition_transition_requested
         ):
             # CRITICAL: Reset observation timer so the next cycle doesn't
             # double-count the current window's data.  DTS+PID posteriors,
@@ -7951,7 +8115,11 @@ class FeeController:
                              (target_found and last_state_category != current_state_category) or \
                              (not target_found and cycle.last_state == "CONGESTION")
 
-        if not significant_change and not channel_policy_change:
+        if (
+            not significant_change
+            and not channel_policy_change
+            and not acquisition_transition_requested
+        ):
             # P2: persist the suppressed target BEFORE any branch below so the
             # gate becomes a rate limiter, not an absorbing band — the next
             # cycle's blend anchors from this value and deltas accumulate.
@@ -8067,6 +8235,15 @@ class FeeController:
                 f"competitor_floor={acquisition_competitor_floor_ppm}ppm, "
                 f"{common_reason_suffix}"
             )
+        elif decision_reason == "ACQUISITION_RETENTION":
+            reason = (
+                "ACQUISITION_RETENTION: bounded paid validation after demand "
+                f"discovery, phase_volume={acquisition_phase_volume_sats}sats, "
+                f"total_volume={acquisition_volume_sats}sats, "
+                f"opportunity_cost={acquisition_opportunity_cost_sats:.3f}sats, "
+                f"retention_fee={acquisition_retention_fee_ppm}ppm, "
+                f"{common_reason_suffix}"
+            )
         elif decision_reason == "ACQUISITION_EXIT":
             reason = (
                 f"ACQUISITION_EXIT: {acquisition_exit_reason}; restoring captured baseline, "
@@ -8124,6 +8301,13 @@ class FeeController:
                 f"Observation window reset, no RPC needed.",
                 level='debug'
             )
+            if acquisition_transition_requested:
+                self._transition_acquisition_to_retention(
+                    acquisition_episode,
+                    retention_fee_ppm=int(acquisition_retention_fee_ppm),
+                    acquired_volume_sats=acquisition_volume_sats,
+                    now=now,
+                )
             if acquisition_episode is not None and acquisition_exit_reason is not None:
                 self._complete_acquisition_experiment(
                     acquisition_episode,
@@ -8139,6 +8323,8 @@ class FeeController:
         # Determine reason_code for this adjustment
         if decision_reason == "ACQUISITION_EXPERIMENT":
             fee_reason_code = FeeReasonCode.ACQUISITION_EXPERIMENT.value
+        elif decision_reason == "ACQUISITION_RETENTION":
+            fee_reason_code = FeeReasonCode.ACQUISITION_RETENTION.value
         elif decision_reason == "ACQUISITION_EXIT":
             fee_reason_code = FeeReasonCode.ACQUISITION_EXIT.value
         elif decision_reason == "LOW_FEE_EXPLORATION":
@@ -8173,6 +8359,14 @@ class FeeController:
             dry_run_proposal = bool(result.get("dry_run"))
             # Read back actual fee (may have been clamped by set_channel_fee)
             new_fee_ppm = result.get("fee_ppm", new_fee_ppm)
+
+            if acquisition_transition_requested and not dry_run_proposal:
+                self._transition_acquisition_to_retention(
+                    acquisition_episode,
+                    retention_fee_ppm=int(acquisition_retention_fee_ppm),
+                    acquired_volume_sats=acquisition_volume_sats,
+                    now=now,
+                )
 
             if (
                 acquisition_episode is not None
@@ -8291,6 +8485,13 @@ class FeeController:
                         if acquisition_episode is not None else None
                     ),
                     "acquisition_exit_reason": acquisition_exit_reason,
+                    "acquisition_phase": (
+                        "retention"
+                        if acquisition_transition_requested
+                        else acquisition_phase
+                    ),
+                    "acquisition_phase_volume_sats": acquisition_phase_volume_sats,
+                    "acquisition_retention_fee_ppm": acquisition_retention_fee_ppm,
                     "acquisition_volume_sats": acquisition_volume_sats,
                     "acquisition_opportunity_cost_sats": acquisition_opportunity_cost_sats,
                     "acquisition_competitor_floor_ppm": acquisition_competitor_floor_ppm,
