@@ -1226,8 +1226,8 @@ def test_competition_image_pins_all_source_revisions():
     runner = load_runner()
     dockerfile = (ROOT / "tools" / "polar-clboss" / "Dockerfile").read_text(encoding="utf-8")
 
-    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:9d5d8f7"
-    assert runner.EXPECTED_REVENUE_REVISION.startswith("9d5d8f7")
+    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:21de69a"
+    assert runner.EXPECTED_REVENUE_REVISION.startswith("21de69a")
     assert "elementsproject/lightningd:v26.06.6" in dockerfile
     assert "CLBOSS_COMMIT=8cb4e9215eba58b049375f234f5f073d0c7fc622" in dockerfile
     assert "XREBALANCE_COMMIT=fb70bf13cd9f3f79b14100bfdb8f2966884a4142" in dockerfile
