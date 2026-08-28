@@ -58,8 +58,9 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
     totals = {name: defaultdict(int) for name in CONTROLLERS}
     phases: dict[str, dict[str, defaultdict[str, int]]] = {}
     market_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
+    eligible_market_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
     attempted = settled = fallback = 0
-    enhanced = 0
+    enhanced = eligible_blocks = 0
     replicas = set()
     for block in blocks:
         replicas.add(str(block.get("replica") or "unknown"))
@@ -79,6 +80,24 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         profile_rows = market_profiles.setdefault(
             market_profile, {name: defaultdict(int) for name in CONTROLLERS}
         )
+        block_violations = block.get("safety_violations")
+        contender_safety = [
+            block["contenders"][name].get("safety_violations")
+            if isinstance(block["contenders"].get(name), dict) else None
+            for name in CONTROLLERS
+        ]
+        eligible = (
+            "fallback_settled" in traffic
+            and isinstance(block_violations, list)
+            and not block_violations
+            and all(isinstance(rows, list) and not rows for rows in contender_safety)
+        )
+        eligible_rows = None
+        if eligible:
+            eligible_blocks += 1
+            eligible_rows = eligible_market_profiles.setdefault(
+                market_profile, {name: defaultdict(int) for name in CONTROLLERS}
+            )
         for name in CONTROLLERS:
             row = block["contenders"][name]
             if not isinstance(row, dict):
@@ -88,6 +107,8 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
                 totals[name][metric] += value
                 phase_rows[name][metric] += value
                 profile_rows[name][metric] += value
+                if eligible_rows is not None:
+                    eligible_rows[name][metric] += value
             worst = _integer(
                 row.get("ending_worst_channel_imbalance_ppm", 0),
                 f"{name}.ending_worst_channel_imbalance_ppm",
@@ -98,6 +119,9 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             phase_rows[name]["worst_imbalance_samples"] += 1
             profile_rows[name]["worst_imbalance_sum_ppm"] += worst
             profile_rows[name]["worst_imbalance_samples"] += 1
+            if eligible_rows is not None:
+                eligible_rows[name]["worst_imbalance_sum_ppm"] += worst
+                eligible_rows[name]["worst_imbalance_samples"] += 1
 
     def finalize(rows: dict[str, defaultdict[str, int]]) -> dict[str, dict[str, Any]]:
         output = {}
@@ -131,7 +155,8 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         "schema": "polar-clboss-scorecard-v1",
         "coverage": {
             "replicas": len(replicas), "blocks": len(blocks),
-            "enhanced_blocks": enhanced, "attempted": attempted, "settled": settled,
+            "enhanced_blocks": enhanced, "eligible_blocks": eligible_blocks,
+            "attempted": attempted, "settled": settled,
             "fallback_settled_in_enhanced_blocks": fallback,
             "market_profiles": sorted(market_profiles),
             "formal_verdict_ready": False,
@@ -146,6 +171,10 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             profile: finalize(rows)
             for profile, rows in sorted(market_profiles.items())
         },
+        "eligible_by_market_profile": {
+            profile: finalize(rows)
+            for profile, rows in sorted(eligible_market_profiles.items())
+        },
         "area_leaders": areas,
     }
 
@@ -159,7 +188,8 @@ def markdown(scorecard: dict[str, Any]) -> str:
         (
             f"Coverage: {coverage['replicas']} replicas, {coverage['blocks']} blocks, "
             f"{coverage['attempted']} attempted / {coverage['settled']} settled payments. "
-            f"Enhanced strict-schema blocks: {coverage['enhanced_blocks']}."
+            f"Enhanced strict-schema blocks: {coverage['enhanced_blocks']}; "
+            f"safety-eligible: {coverage['eligible_blocks']}."
         ),
         "",
         "| Comparable area | Revenue Ops | CLBOSS | Current leader |",
@@ -193,8 +223,16 @@ def markdown(scorecard: dict[str, Any]) -> str:
         "This table describes observed lab outcomes; it does not treat historical smoke blocks as decisive evidence.",
         "",
     ])
-    lines.extend(["## Results by market profile", ""])
-    for profile, rows in scorecard["by_market_profile"].items():
+    lines.extend([
+        "## Eligible results by market profile",
+        "",
+        (
+            "Only enhanced blocks with no block-level or contender-level safety "
+            "violations appear below."
+        ),
+        "",
+    ])
+    for profile, rows in scorecard["eligible_by_market_profile"].items():
         lines.extend([
             f"### {profile}",
             "",
