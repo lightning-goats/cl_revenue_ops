@@ -765,7 +765,7 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
     monkeypatch.setattr(
         runner,
         "traffic_schedule",
-        lambda _rounds, _amount, _pattern, _amount_profile: (
+        lambda _rounds, _amount, _pattern, _amount_profile, _traffic_family: (
             ("cln", "forward", 5_000), ("cln", "reverse", 5_000)
         ),
     )
@@ -972,6 +972,19 @@ def test_realistic_amount_profile_cycles_market_sized_payments():
         ("lnd", "forward", 35_000),
         ("cln", "forward", 100_000),
         ("lnd", "forward", 100_000),
+    )
+
+
+def test_family_scoped_schedule_excludes_unrelated_client_family():
+    runner = load_runner()
+
+    assert runner.traffic_schedule(
+        2, 5_000, traffic_family="cln"
+    ) == (
+        ("cln", "forward", 5_000 + runner.REVERSE_FEE_BUFFER_SATS),
+        ("cln", "reverse", 5_000),
+        ("cln", "forward", 5_000),
+        ("cln", "reverse", 5_000),
     )
 
 

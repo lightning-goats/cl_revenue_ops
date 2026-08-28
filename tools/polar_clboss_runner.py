@@ -1673,6 +1673,7 @@ def traffic_schedule(
     amount_sats: int,
     pattern: str = "balanced",
     amount_profile: str = "fixed",
+    traffic_family: str = "both",
 ) -> tuple[tuple[str, str, int], ...]:
     """Build balanced competition or one-way liquidity-pressure traffic."""
     if rounds <= 0 or amount_sats <= 0:
@@ -1681,6 +1682,9 @@ def traffic_schedule(
         raise RunnerError(f"unknown traffic pattern: {pattern}")
     if amount_profile not in {"fixed", "realistic"}:
         raise RunnerError(f"unknown amount profile: {amount_profile}")
+    if traffic_family not in {"both", "cln", "lnd"}:
+        raise RunnerError(f"unknown traffic family: {traffic_family}")
+    families = ("cln", "lnd") if traffic_family == "both" else (traffic_family,)
     schedule = []
     for round_index in range(rounds):
         round_amount = (
@@ -1690,7 +1694,7 @@ def traffic_schedule(
             if amount_profile == "realistic"
             else amount_sats
         )
-        for family in ("cln", "lnd"):
+        for family in families:
             if pattern == "forward-pressure":
                 schedule.append((family, "forward", round_amount))
                 continue
@@ -1712,6 +1716,7 @@ def run_smoke(
     pause_seconds: float,
     traffic_pattern: str = "balanced",
     amount_profile: str = "auto",
+    traffic_family: str = "both",
 ) -> dict[str, Any]:
     path = state_path(results_dir, replica)
     state = read_state(path)
@@ -1748,6 +1753,7 @@ def run_smoke(
         "replica": f"replica-{replica}",
         "status": "running",
         "traffic_pattern": traffic_pattern,
+        "traffic_family": traffic_family,
         "market_profile": str(state.get("market_profile") or "legacy_low_fee"),
         "amount_profile": effective_amount_profile,
         "before": {
@@ -1786,9 +1792,16 @@ def run_smoke(
     )
     records: list[dict[str, Any]] = []
     try:
-        entries_per_round = 4 if traffic_pattern == "balanced" else 2
+        family_count = 2 if traffic_family == "both" else 1
+        entries_per_round = family_count * (
+            2 if traffic_pattern == "balanced" else 1
+        )
         for schedule_index, (family, direction, traffic_amount) in enumerate(traffic_schedule(
-            rounds, amount_sats, traffic_pattern, effective_amount_profile
+            rounds,
+            amount_sats,
+            traffic_pattern,
+            effective_amount_profile,
+            traffic_family,
         )):
             completed = run_reconciled_traffic(
                 bridge,
@@ -1906,6 +1919,7 @@ def run_smoke(
         "cache_mode": cache_mode,
         "traffic": {
             "pattern": traffic_pattern,
+            "family_scope": traffic_family,
             "amount_profile": effective_amount_profile,
             "amounts_sats": sorted({int(row["amount_sats"]) for row in records}),
             "attempted": len(records),
@@ -2086,6 +2100,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("balanced", "forward-pressure"),
         default="balanced",
     )
+    parser.add_argument(
+        "--traffic-family",
+        choices=("both", "cln", "lnd"),
+        default="both",
+    )
     parser.add_argument("--background-ppm", type=positive_int, default=10_000)
     parser.add_argument("--spend-cap-sats", type=positive_int, default=1_000)
     parser.add_argument("--acquisition-family", choices=("cln", "lnd"), default="cln")
@@ -2168,6 +2187,7 @@ def main() -> int:
                 pause_seconds=args.pause_seconds,
                 traffic_pattern=args.traffic_pattern,
                 amount_profile=args.amount_profile,
+                traffic_family=args.traffic_family,
             )
         elif args.command == "status":
             result = status(args.replica, args.results_dir)
