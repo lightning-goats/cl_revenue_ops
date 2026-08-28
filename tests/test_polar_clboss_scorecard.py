@@ -23,6 +23,7 @@ def block():
         "schema": "polar-clboss-smoke-v1",
         "replica": "replica-1",
         "phase": "paid_retention",
+        "market_profile": "acquisition",
         "traffic": {"attempted": 10, "settled": 10, "fallback_settled": 0},
         "contenders": {
             "revenue_ops": {
@@ -51,8 +52,22 @@ def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming()
     assert result["area_leaders"]["net_profit"] == "revenue_ops"
     assert result["coverage"]["enhanced_blocks"] == 1
     assert result["coverage"]["formal_verdict_ready"] is False
+    assert result["coverage"]["market_profiles"] == ["acquisition"]
+    assert (
+        result["by_market_profile"]["acquisition"]["revenue_ops"][
+            "net_profit_msat"
+        ]
+        == 100
+    )
+    assert (
+        result["by_phase"]["paid_retention"]["revenue_ops"][
+            "mean_ending_worst_imbalance_ppm"
+        ]
+        == 100_000.0
+    )
     rendered = mod.markdown(result)
     assert "Formal verdict: **not ready**" in rendered
+    assert "### acquisition" in rendered
 
 
 def test_scorecard_rejects_negative_or_malformed_economics():

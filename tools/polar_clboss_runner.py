@@ -45,6 +45,14 @@ FUNDING_UTXO_SATS = 1_100_000
 REVERSE_FEE_BUFFER_SATS = 25_000
 TOURNAMENT_CYCLE_SECONDS = 60
 ACQUISITION_MIN_PPM = 0
+MARKET_PROFILES = {
+    # Purpose-built low-fee regime for the bounded acquisition experiment.
+    "acquisition": {"fee_base_msat": 1, "fee_ppm": 10},
+    # Rounded 2026-08-28 public-graph medians (1ML: 0.437 sat / 150 ppm).
+    # Keeping the snapshot explicit makes historical tournament runs auditable.
+    "realistic": {"fee_base_msat": 500, "fee_ppm": 150},
+}
+REALISTIC_TRAFFIC_AMOUNTS_SATS = (5_000, 15_000, 35_000, 100_000)
 BASELINE_POLL_SECONDS = 5.0
 BASELINE_POLL_ATTEMPTS = 19
 NATIVE_CYCLE_POLL_SECONDS = 5.0
@@ -537,9 +545,15 @@ def resolve_lane_map(
     return lane_map
 
 
-def set_initial_fees(contenders: dict[str, dict[str, str]], ppm: int = 10) -> None:
+def set_initial_fees(
+    contenders: dict[str, dict[str, str]], *, fee_base_msat: int, fee_ppm: int
+) -> None:
+    nonnegative_int(fee_base_msat, "initial fee base")
+    nonnegative_int(fee_ppm, "initial fee rate")
     for row in contenders.values():
-        result = cln_rpc(row["container"], "setchannel", "all", 1, ppm)
+        result = cln_rpc(
+            row["container"], "setchannel", "all", fee_base_msat, fee_ppm
+        )
         if len(result.get("channels", [])) != 4:
             raise RunnerError(f"setchannel did not update four channels on {row['container']}")
 
@@ -1088,9 +1102,12 @@ def restore_automatic_treatments(state: dict[str, Any]) -> bool:
     retention = state.get("retention_treatment")
     if not isinstance(automatic, dict):
         return False
+    retention_active = isinstance(retention, dict) and retention.get("status") == "active"
+    if automatic.get("status") == "restored" and not retention_active:
+        return False
     identity = state["assignment"]["revenue_ops"]
     container = state["contenders"][identity]["container"]
-    if isinstance(retention, dict) and retention.get("status") == "active":
+    if retention_active:
         lane = retention.get("lane")
         if not isinstance(lane, dict) or not lane.get("peer_id"):
             raise RunnerError("retention restoration lacks captured lane state")
@@ -1217,11 +1234,15 @@ def setup(
     replica: int,
     image: str,
     results_dir: Path,
+    market_profile: str = "realistic",
 ) -> dict[str, Any]:
     path = state_path(results_dir, replica)
     if path.exists():
         raise RunnerError(f"fresh-only setup refused because state exists: {path}")
     preflight_result = preflight(bridge, network_id, image)
+    market_seed = MARKET_PROFILES.get(market_profile)
+    if market_seed is None:
+        raise RunnerError(f"unknown market profile: {market_profile}")
     assignment = assignment_for(replica)
     state: dict[str, Any] = {
         "schema": SCHEMA,
@@ -1230,6 +1251,8 @@ def setup(
         "assignment": assignment,
         "image": image,
         "preflight": preflight_result,
+        "market_profile": market_profile,
+        "market_seed": dict(market_seed),
         "events": [],
         "contenders": {},
         "channels": [],
@@ -1272,8 +1295,8 @@ def setup(
         _checkpoint(path, state, "channels_active")
         state["lane_map"] = resolve_lane_map(state, network_id=network_id)
         _checkpoint(path, state, "lane_map_captured", lane_map=state["lane_map"])
-        set_initial_fees(state["contenders"])
-        _checkpoint(path, state, "initial_fees_set", fee_ppm=10)
+        set_initial_fees(state["contenders"], **market_seed)
+        _checkpoint(path, state, "initial_fees_set", **market_seed)
 
         revenue_identity = assignment["revenue_ops"]
         revenue_status = start_revenue(state["contenders"][revenue_identity]["container"])
@@ -1626,24 +1649,36 @@ def run_reconciled_traffic(
 
 
 def traffic_schedule(
-    rounds: int, amount_sats: int, pattern: str = "balanced"
+    rounds: int,
+    amount_sats: int,
+    pattern: str = "balanced",
+    amount_profile: str = "fixed",
 ) -> tuple[tuple[str, str, int], ...]:
     """Build balanced competition or one-way liquidity-pressure traffic."""
     if rounds <= 0 or amount_sats <= 0:
         raise RunnerError("traffic rounds and amount must be positive")
     if pattern not in {"balanced", "forward-pressure"}:
         raise RunnerError(f"unknown traffic pattern: {pattern}")
+    if amount_profile not in {"fixed", "realistic"}:
+        raise RunnerError(f"unknown amount profile: {amount_profile}")
     schedule = []
     for round_index in range(rounds):
+        round_amount = (
+            REALISTIC_TRAFFIC_AMOUNTS_SATS[
+                round_index % len(REALISTIC_TRAFFIC_AMOUNTS_SATS)
+            ]
+            if amount_profile == "realistic"
+            else amount_sats
+        )
         for family in ("cln", "lnd"):
             if pattern == "forward-pressure":
-                schedule.append((family, "forward", amount_sats))
+                schedule.append((family, "forward", round_amount))
                 continue
-            forward_amount = amount_sats + (
+            forward_amount = round_amount + (
                 REVERSE_FEE_BUFFER_SATS if round_index == 0 else 0
             )
             schedule.append((family, "forward", forward_amount))
-            schedule.append((family, "reverse", amount_sats))
+            schedule.append((family, "reverse", round_amount))
     return tuple(schedule)
 
 
@@ -1656,6 +1691,7 @@ def run_smoke(
     amount_sats: int,
     pause_seconds: float,
     traffic_pattern: str = "balanced",
+    amount_profile: str = "auto",
 ) -> dict[str, Any]:
     path = state_path(results_dir, replica)
     state = read_state(path)
@@ -1666,6 +1702,14 @@ def run_smoke(
     }:
         raise RunnerError(f"replica is not traffic-ready: {state.get('status')}")
     assignment = state["assignment"]
+    if amount_profile == "auto":
+        effective_amount_profile = (
+            "realistic" if state.get("market_profile") == "realistic" else "fixed"
+        )
+    elif amount_profile in {"fixed", "realistic"}:
+        effective_amount_profile = amount_profile
+    else:
+        raise RunnerError(f"unknown amount profile: {amount_profile}")
     controller_containers = {
         controller: state["contenders"][identity]["container"]
         for controller, identity in assignment.items()
@@ -1684,6 +1728,8 @@ def run_smoke(
         "replica": f"replica-{replica}",
         "status": "running",
         "traffic_pattern": traffic_pattern,
+        "market_profile": str(state.get("market_profile") or "legacy_low_fee"),
+        "amount_profile": effective_amount_profile,
         "before": {
             name: {
                 "forward_count": totals.forward_count,
@@ -1722,7 +1768,7 @@ def run_smoke(
     try:
         entries_per_round = 4 if traffic_pattern == "balanced" else 2
         for schedule_index, (family, direction, traffic_amount) in enumerate(traffic_schedule(
-            rounds, amount_sats, traffic_pattern
+            rounds, amount_sats, traffic_pattern, effective_amount_profile
         )):
             completed = run_reconciled_traffic(
                 bridge,
@@ -1834,11 +1880,14 @@ def run_smoke(
         "schema": "polar-clboss-smoke-v1",
         "replica": f"replica-{replica}",
         "league": str(state.get("league") or "fee_only"),
+        "market_profile": str(state.get("market_profile") or "legacy_low_fee"),
         "block": block_id,
         "duration_seconds": max(1.0, time.time() - started),
         "cache_mode": cache_mode,
         "traffic": {
             "pattern": traffic_pattern,
+            "amount_profile": effective_amount_profile,
+            "amounts_sats": sorted({int(row["amount_sats"]) for row in records}),
             "attempted": len(records),
             "settled": settled_count,
             "fallback_settled": fallback_settled,
@@ -2001,6 +2050,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--results-dir", type=Path, default=Path("results/polar-clboss"))
     parser.add_argument("--rounds", type=positive_int, default=2)
     parser.add_argument("--amount-sats", type=positive_int, default=5_000)
+    parser.add_argument(
+        "--amount-profile",
+        choices=("auto", "fixed", "realistic"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--market-profile",
+        choices=tuple(MARKET_PROFILES),
+        default="realistic",
+    )
     parser.add_argument("--pause-seconds", type=float, default=0.1)
     parser.add_argument(
         "--traffic-pattern",
@@ -2034,6 +2093,7 @@ def main() -> int:
             result = setup(
                 bridge, network_id=args.network_id, replica=args.replica,
                 image=args.image, results_dir=args.results_dir,
+                market_profile=args.market_profile,
             )
         elif args.command == "isolate":
             result = isolate_background(
@@ -2087,6 +2147,7 @@ def main() -> int:
                 rounds=args.rounds, amount_sats=args.amount_sats,
                 pause_seconds=args.pause_seconds,
                 traffic_pattern=args.traffic_pattern,
+                amount_profile=args.amount_profile,
             )
         elif args.command == "status":
             result = status(args.replica, args.results_dir)

@@ -2585,7 +2585,13 @@ class FeeController:
     # Default-off market-acquisition rollout. These are fixed safety rails,
     # not tuning knobs: the first production surface exposes only enable/off.
     ACQUISITION_TARGET_FEE_PPM = 0
-    ACQUISITION_COMPETITOR_FLOOR_PPM = 1
+    # Public routing markets frequently cluster at a few ppm on the cheapest
+    # lanes. Requiring an exact 1-ppm observation made the bounded experiment
+    # fail to start when an otherwise equivalent competitor quoted 2 ppm. A
+    # small positive band preserves the undercut hypothesis while rejecting a
+    # zero-fee peer (nothing to undercut) and ordinary-priced markets.
+    ACQUISITION_MIN_COMPETITOR_FLOOR_PPM = 1
+    ACQUISITION_MAX_COMPETITOR_FLOOR_PPM = 10
     ACQUISITION_DURATION_SECONDS = 3600
     ACQUISITION_VOLUME_CAP_SATS = 250_000
     ACQUISITION_OPPORTUNITY_COST_CAP_SATS = 25.0
@@ -3000,7 +3006,7 @@ class FeeController:
                 competitor_floor = self._get_neighbor_fee_percentile(peer_id, 0.0, cfg=cfg)
             except Exception:
                 continue
-            if competitor_floor != self.ACQUISITION_COMPETITOR_FLOOR_PPM:
+            if not self._acquisition_competitor_floor_qualifies(competitor_floor):
                 continue
             candidates.append((ratio, channel_id, peer_id, baseline_fee, competitor_floor))
 
@@ -3032,6 +3038,26 @@ class FeeController:
                 )
                 return {channel_id: episode}
         return {}
+
+    @classmethod
+    def _acquisition_competitor_floor_qualifies(cls, value: Any) -> bool:
+        """Accept only integral, positive observations in the low-fee band."""
+        if isinstance(value, bool):
+            return False
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        try:
+            if float(value) != parsed:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return (
+            cls.ACQUISITION_MIN_COMPETITOR_FLOOR_PPM
+            <= parsed
+            <= cls.ACQUISITION_MAX_COMPETITOR_FLOOR_PPM
+        )
 
     def _complete_acquisition_experiment(
         self,
@@ -6773,9 +6799,8 @@ class FeeController:
                     acquisition_exit_reason = "disabled"
                 elif is_congested:
                     acquisition_exit_reason = "congestion"
-                elif (
+                elif not self._acquisition_competitor_floor_qualifies(
                     acquisition_competitor_floor_ppm
-                    != self.ACQUISITION_COMPETITOR_FLOOR_PPM
                 ):
                     acquisition_exit_reason = "competitor_evidence_changed"
                 elif outbound_ratio <= self.ACQUISITION_EXIT_OUTBOUND_RATIO:

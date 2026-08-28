@@ -17,6 +17,29 @@ Formal verdict: **not ready**. It requires at least three fresh replicas and six
 
 This table describes observed lab outcomes; it does not treat historical smoke blocks as decisive evidence.
 
+## Fee-market regimes
+
+The tournament no longer treats the original 10-ppm startup policy as a
+general market model. It now records one of two explicit profiles in every new
+traffic block:
+
+| Profile | Initial base / rate | Traffic amounts | Purpose |
+|---|---:|---:|---|
+| `acquisition` | 1 msat / 10 ppm | fixed 5k sat by default | Isolate low-price route acquisition and paid retention. |
+| `realistic` | 500 msat / 150 ppm | deterministic 5k, 15k, 35k, 100k sat mix | Primary fee-setting, liquidity, and net-profit comparison. |
+
+The realistic seed is a rounded, dated snapshot of the public announced graph,
+not a claim that one fee fits every channel. On 2026-08-28, 1ML reported a
+0.437-sat median base fee and a 150-ppm median rate; its 25th, 75th, and 95th
+fee-rate percentiles were approximately 1, 633, and 2,863 ppm. Public graph
+statistics omit private channels, so tournament conclusions must remain robust
+across the full distribution rather than optimize to the median alone.
+
+Revenue Ops' bounded acquisition experiment remains default-off and may quote
+0 ppm on only one capped episode. It now admits competitor observations from
+1 through 10 ppm instead of requiring exactly 1 ppm; all duration, volume,
+opportunity-cost, liquidity, and cooldown rails remain unchanged.
+
 ## What the tournament has established
 
 - Revenue Ops extracts more fee per routed sat, but CLBOSS wins far more routing volume. The main economic gap is conversion and retained demand, not fee arithmetic alone.

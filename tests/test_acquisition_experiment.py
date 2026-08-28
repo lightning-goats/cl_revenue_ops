@@ -125,6 +125,55 @@ def test_prepare_is_default_off_and_selects_only_one_best_lane(
     )
 
 
+def test_prepare_accepts_two_ppm_competitor_but_rejects_outside_low_fee_band(
+    mock_plugin, mock_database
+):
+    fc, cfg = _make_fc(
+        mock_plugin,
+        mock_database,
+        min_fee_ppm_saturated=0,
+        acquisition_experiment_enabled=True,
+    )
+    now = int(time.time())
+    states = [{"channel_id": CHANNEL_ID, "peer_id": PEER_ID, "state": "source"}]
+    channels = {
+        CHANNEL_ID: {
+            "capacity": 1_000_000,
+            "spendable_msat": 900_000_000,
+            "fee_proportional_millionths": 50,
+        }
+    }
+    mock_database.get_active_acquisition_experiments.return_value = []
+    mock_database.channel_acquisition_on_cooldown.return_value = False
+    mock_database.get_channel_probe.return_value = None
+    mock_database.get_forward_count_since.return_value = 0
+    mock_database.start_acquisition_experiment.return_value = {
+        "id": 1,
+        "channel_id": CHANNEL_ID,
+    }
+    fc._effective_min_fee_ppm = MagicMock(return_value=0)
+    fc._get_neighbor_fee_percentile = MagicMock(return_value=2)
+
+    active = fc._prepare_acquisition_experiments(states, channels, cfg, now)
+    assert set(active) == {CHANNEL_ID}
+    assert (
+        mock_database.start_acquisition_experiment.call_args.kwargs[
+            "competitor_floor_ppm"
+        ]
+        == 2
+    )
+
+    for outside in (0, fc.ACQUISITION_MAX_COMPETITOR_FLOOR_PPM + 1, None, "bad"):
+        mock_database.reset_mock()
+        mock_database.get_active_acquisition_experiments.return_value = []
+        mock_database.channel_acquisition_on_cooldown.return_value = False
+        mock_database.get_channel_probe.return_value = None
+        mock_database.get_forward_count_since.return_value = 0
+        fc._get_neighbor_fee_percentile.return_value = outside
+        assert fc._prepare_acquisition_experiments(states, channels, cfg, now) == {}
+        mock_database.start_acquisition_experiment.assert_not_called()
+
+
 def test_active_episode_quotes_zero_then_restores_baseline_on_disable(
     mock_plugin, mock_database
 ):
@@ -175,6 +224,56 @@ def test_active_episode_quotes_zero_then_restores_baseline_on_disable(
     complete = mock_database.complete_acquisition_experiment.call_args.kwargs
     assert complete["exit_reason"] == "disabled"
     assert complete["restored_fee_ppm"] == 100
+
+
+def test_active_episode_survives_low_fee_drift_and_exits_above_band(
+    mock_plugin, mock_database
+):
+    fc, cfg = _make_fc(
+        mock_plugin,
+        mock_database,
+        min_fee_ppm=10,
+        min_fee_ppm_saturated=0,
+        acquisition_experiment_enabled=True,
+    )
+    episode = _episode(started_at=int(time.time()) - 10)
+    fc._acquisition_cycle_experiments = {CHANNEL_ID: episode}
+    fc._get_neighbor_fee_percentile = MagicMock(return_value=2)
+    fc._calculate_floor = MagicMock(return_value=10)
+    fc.set_channel_fee = MagicMock(return_value={"success": True, "fee_ppm": 0})
+    mock_database.get_volume_since.return_value = 0
+    info = _channel_info(100)
+    info["spendable_msat"] = "1900000000msat"
+
+    result = fc._adjust_channel_fee(
+        CHANNEL_ID,
+        PEER_ID,
+        {"state": "source"},
+        info,
+        cfg=cfg,
+        force_reprice_reason="acquisition_experiment",
+    )
+    assert result.new_fee_ppm == 0
+    mock_database.complete_acquisition_experiment.assert_not_called()
+
+    fc._get_neighbor_fee_percentile.return_value = (
+        fc.ACQUISITION_MAX_COMPETITOR_FLOOR_PPM + 1
+    )
+    fc.set_channel_fee = MagicMock(return_value={"success": True, "fee_ppm": 100})
+    info["fee_proportional_millionths"] = 0
+    result = fc._adjust_channel_fee(
+        CHANNEL_ID,
+        PEER_ID,
+        {"state": "source"},
+        info,
+        cfg=cfg,
+        force_reprice_reason="acquisition_experiment",
+    )
+    assert result.new_fee_ppm == 100
+    assert (
+        mock_database.complete_acquisition_experiment.call_args.kwargs["exit_reason"]
+        == "competitor_evidence_changed"
+    )
 
 
 def test_volume_cap_exit_retries_until_baseline_rpc_succeeds(

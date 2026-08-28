@@ -57,6 +57,7 @@ def load_blocks(results_dir: Path) -> list[dict[str, Any]]:
 def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
     totals = {name: defaultdict(int) for name in CONTROLLERS}
     phases: dict[str, dict[str, defaultdict[str, int]]] = {}
+    market_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
     attempted = settled = fallback = 0
     enhanced = 0
     replicas = set()
@@ -74,6 +75,10 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         phase_rows = phases.setdefault(
             phase, {name: defaultdict(int) for name in CONTROLLERS}
         )
+        market_profile = str(block.get("market_profile") or "legacy_low_fee")
+        profile_rows = market_profiles.setdefault(
+            market_profile, {name: defaultdict(int) for name in CONTROLLERS}
+        )
         for name in CONTROLLERS:
             row = block["contenders"][name]
             if not isinstance(row, dict):
@@ -82,12 +87,17 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
                 value = _integer(row.get(metric, 0), f"{name}.{metric}")
                 totals[name][metric] += value
                 phase_rows[name][metric] += value
+                profile_rows[name][metric] += value
             worst = _integer(
                 row.get("ending_worst_channel_imbalance_ppm", 0),
                 f"{name}.ending_worst_channel_imbalance_ppm",
             )
             totals[name]["worst_imbalance_sum_ppm"] += worst
             totals[name]["worst_imbalance_samples"] += 1
+            phase_rows[name]["worst_imbalance_sum_ppm"] += worst
+            phase_rows[name]["worst_imbalance_samples"] += 1
+            profile_rows[name]["worst_imbalance_sum_ppm"] += worst
+            profile_rows[name]["worst_imbalance_samples"] += 1
 
     def finalize(rows: dict[str, defaultdict[str, int]]) -> dict[str, dict[str, Any]]:
         output = {}
@@ -123,6 +133,7 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             "replicas": len(replicas), "blocks": len(blocks),
             "enhanced_blocks": enhanced, "attempted": attempted, "settled": settled,
             "fallback_settled_in_enhanced_blocks": fallback,
+            "market_profiles": sorted(market_profiles),
             "formal_verdict_ready": False,
             "formal_verdict_blocker": (
                 "requires at least 3 fresh replicas and 6 enhanced cold/warm blocks "
@@ -131,6 +142,10 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "overall": overall,
         "by_phase": {phase: finalize(rows) for phase, rows in sorted(phases.items())},
+        "by_market_profile": {
+            profile: finalize(rows)
+            for profile, rows in sorted(market_profiles.items())
+        },
         "area_leaders": areas,
     }
 
@@ -178,6 +193,18 @@ def markdown(scorecard: dict[str, Any]) -> str:
         "This table describes observed lab outcomes; it does not treat historical smoke blocks as decisive evidence.",
         "",
     ])
+    lines.extend(["## Results by market profile", ""])
+    for profile, rows in scorecard["by_market_profile"].items():
+        lines.extend([
+            f"### {profile}",
+            "",
+            "| Metric | Revenue Ops | CLBOSS |",
+            "|---|---:|---:|",
+            f"| Routing volume (msat) | {rows['revenue_ops']['volume_msat']} | {rows['clboss']['volume_msat']} |",
+            f"| Net routing profit (msat) | {rows['revenue_ops']['net_profit_msat']} | {rows['clboss']['net_profit_msat']} |",
+            f"| Gross yield (ppm) | {rows['revenue_ops']['gross_yield_ppm']} | {rows['clboss']['gross_yield_ppm']} |",
+            "",
+        ])
     return "\n".join(lines)
 
 

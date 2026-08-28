@@ -375,6 +375,31 @@ def test_start_revenue_uses_accelerated_tournament_cadences(monkeypatch):
         assert f"{key}={runner.TOURNAMENT_CYCLE_SECONDS}" in start_args
 
 
+def test_market_profiles_seed_explicit_realistic_and_acquisition_fees(monkeypatch):
+    runner = load_runner()
+    calls = []
+
+    def rpc(container, method, *args):
+        calls.append((container, method, args))
+        return {"channels": [{}, {}, {}, {}]}
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    contenders = {
+        "identity-a": {"container": "a"},
+        "identity-b": {"container": "b"},
+    }
+    runner.set_initial_fees(contenders, **runner.MARKET_PROFILES["realistic"])
+
+    assert calls == [
+        ("a", "setchannel", ("all", 500, 150)),
+        ("b", "setchannel", ("all", 500, 150)),
+    ]
+    assert runner.MARKET_PROFILES["acquisition"] == {
+        "fee_base_msat": 1,
+        "fee_ppm": 10,
+    }
+
+
 def test_acquisition_treatment_pins_one_lane_and_restores_controls(monkeypatch, tmp_path):
     runner = load_runner()
     state_file = runner.state_path(tmp_path, 1)
@@ -727,7 +752,7 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
     monkeypatch.setattr(
         runner,
         "traffic_schedule",
-        lambda _rounds, _amount, _pattern: (
+        lambda _rounds, _amount, _pattern, _amount_profile: (
             ("cln", "forward", 5_000), ("cln", "reverse", 5_000)
         ),
     )
@@ -916,6 +941,35 @@ def test_forward_pressure_schedule_is_one_way_without_reserve_seed():
         ("cln", "forward", 10_000),
         ("lnd", "forward", 10_000),
     )
+
+
+def test_realistic_amount_profile_cycles_market_sized_payments():
+    runner = load_runner()
+
+    schedule = runner.traffic_schedule(
+        4, 999, "forward-pressure", amount_profile="realistic"
+    )
+
+    assert schedule == (
+        ("cln", "forward", 5_000),
+        ("lnd", "forward", 5_000),
+        ("cln", "forward", 15_000),
+        ("lnd", "forward", 15_000),
+        ("cln", "forward", 35_000),
+        ("lnd", "forward", 35_000),
+        ("cln", "forward", 100_000),
+        ("lnd", "forward", 100_000),
+    )
+
+
+def test_automatic_treatment_restore_is_idempotent():
+    runner = load_runner()
+    state = {
+        "automatic_acquisition": {"status": "restored"},
+        "retention_treatment": {"status": "restored"},
+    }
+
+    assert runner.restore_automatic_treatments(state) is False
 
 
 def test_full_stack_offsets_revenue_setup_spend_and_pins_clboss_controls(
