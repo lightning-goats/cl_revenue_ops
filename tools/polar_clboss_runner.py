@@ -30,7 +30,7 @@ from polar_mixed_client_lab import (  # noqa: E402
 
 
 SCHEMA = "polar-clboss-runner-state-v1"
-EXPECTED_REVENUE_REVISION = "1fac39306ecca9031f539be885b4d5ea8a72c1d2"
+EXPECTED_REVENUE_REVISION = "9d5d8f71ae1dac93118e8a501ae0fb4a557a4887"
 IMAGE = f"cl-revenue-ops-polar-clboss:{EXPECTED_REVENUE_REVISION[:7]}"
 NETWORK_ID = 4
 DOCKER_NETWORK = "polar-network-4_default"
@@ -933,6 +933,52 @@ def start_automatic_acquisition(
     raise RunnerError("native fee cycles did not admit an acquisition lane before timeout")
 
 
+def refresh_automatic_acquisition_phase(state: dict[str, Any]) -> str | None:
+    """Read back a native acquisition/retention phase before scoring traffic."""
+    automatic = state.get("automatic_acquisition")
+    if not isinstance(automatic, dict) or automatic.get("status") != "active":
+        return None
+    episode = automatic.get("episode")
+    if not isinstance(episode, dict):
+        raise RunnerError("automatic acquisition lacks captured episode evidence")
+    experiment_id = nonnegative_int(
+        episode.get("id"), "automatic acquisition experiment id"
+    )
+    identity = state["assignment"]["revenue_ops"]
+    container = state["contenders"][identity]["container"]
+    matching_rows = [
+        row for row in _acquisition_rows(container)
+        if row.get("id") == experiment_id and row.get("state") == "active"
+    ]
+    if len(matching_rows) != 1:
+        raise RunnerError("automatic acquisition is no longer exactly one active episode")
+    live_episode = matching_rows[0]
+    phase = str(live_episode.get("phase") or "acquisition")
+    if phase not in {"acquisition", "retention"}:
+        raise RunnerError(f"automatic acquisition returned invalid phase {phase!r}")
+    lanes = acquisition_lanes(state)
+    matching_lanes = [
+        lane for lane in lanes.values()
+        if _lane_matches_channel_identifier(lane, live_episode.get("channel_id"))
+    ]
+    if len(matching_lanes) != 1:
+        raise RunnerError("automatic acquisition phase selected an unscored lane")
+    lane = matching_lanes[0]
+    target_key = "retention_fee_ppm" if phase == "retention" else "target_fee_ppm"
+    target_ppm = nonnegative_int(
+        live_episode.get(target_key), f"automatic {phase} target fee"
+    )
+    if phase == "retention" and target_ppm <= ACQUISITION_MIN_PPM:
+        raise RunnerError("automatic paid retention did not expose a positive fee")
+    if lane["fee_ppm"] != target_ppm:
+        raise RunnerError(
+            f"automatic {phase} fee readback mismatch: "
+            f"live={lane['fee_ppm']} target={target_ppm}"
+        )
+    automatic.update(episode=live_episode, lane=lane, phase=phase)
+    return phase
+
+
 def start_retention_treatment(
     *, replica: int, results_dir: Path, fee_ppm: int,
     attempts: int = NATIVE_CYCLE_POLL_ATTEMPTS,
@@ -1733,6 +1779,7 @@ def run_smoke(
         "automatic_acquisition_ready", "retention_ready",
     }:
         raise RunnerError(f"replica is not traffic-ready: {state.get('status')}")
+    refresh_automatic_acquisition_phase(state)
     assignment = state["assignment"]
     if amount_profile == "auto":
         effective_amount_profile = (
@@ -1942,7 +1989,11 @@ def run_smoke(
         block["phase"] = "manual_acquisition"
     elif isinstance(automatic, dict) and automatic.get("status") == "active":
         block["automatic_acquisition"] = automatic
-        block["phase"] = "automatic_acquisition"
+        block["phase"] = (
+            "automatic_retention"
+            if automatic.get("phase") == "retention"
+            else "automatic_acquisition"
+        )
     elif isinstance(retention, dict) and retention.get("status") == "active":
         block["retention_treatment"] = retention
         block["phase"] = "paid_retention"

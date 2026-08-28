@@ -686,6 +686,80 @@ def test_retention_waits_for_restore_then_prices_lane_without_forced_cycle(
     assert "revenue-fee-cycle" not in rpc_calls
 
 
+def test_refresh_automatic_phase_recognizes_native_paid_retention(monkeypatch):
+    runner = load_runner()
+    state = {
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "automatic_acquisition": {
+            "status": "active",
+            "episode": {"id": 7, "state": "active", "channel_id": "1x1x0"},
+            "lane": {"channel_id": "funding-a", "short_channel_id": "1x1x0"},
+        },
+    }
+    live_episode = {
+        "id": 7,
+        "state": "active",
+        "channel_id": "1x1x0",
+        "phase": "retention",
+        "target_fee_ppm": 0,
+        "retention_fee_ppm": 2,
+    }
+    live_lane = {
+        "family": "cln",
+        "channel_id": "funding-a",
+        "short_channel_id": "1x1x0",
+        "peer_id": "peer-a",
+        "fee_ppm": 2,
+    }
+    monkeypatch.setattr(runner, "_acquisition_rows", lambda _container: [live_episode])
+    monkeypatch.setattr(
+        runner,
+        "acquisition_lanes",
+        lambda _state: {
+            "cln": live_lane,
+            "lnd": {
+                "family": "lnd",
+                "channel_id": "funding-b",
+                "short_channel_id": "2x1x0",
+                "peer_id": "peer-b",
+                "fee_ppm": 15,
+            },
+        },
+    )
+
+    assert runner.refresh_automatic_acquisition_phase(state) == "retention"
+    assert state["automatic_acquisition"]["phase"] == "retention"
+    assert state["automatic_acquisition"]["episode"] == live_episode
+    assert state["automatic_acquisition"]["lane"] == live_lane
+
+
+def test_refresh_automatic_phase_fails_closed_after_native_episode_exit(monkeypatch):
+    runner = load_runner()
+    state = {
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "automatic_acquisition": {
+            "status": "active",
+            "episode": {"id": 7, "state": "active", "channel_id": "1x1x0"},
+        },
+    }
+    monkeypatch.setattr(
+        runner,
+        "_acquisition_rows",
+        lambda _container: [{"id": 7, "state": "completed"}],
+    )
+
+    with pytest.raises(runner.RunnerError, match="no longer exactly one active"):
+        runner.refresh_automatic_acquisition_phase(state)
+
+
 def test_reconciled_traffic_never_retries_ambiguous_payment(monkeypatch):
     runner = load_runner()
 
@@ -1148,8 +1222,8 @@ def test_competition_image_pins_all_source_revisions():
     runner = load_runner()
     dockerfile = (ROOT / "tools" / "polar-clboss" / "Dockerfile").read_text(encoding="utf-8")
 
-    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:1fac393"
-    assert runner.EXPECTED_REVENUE_REVISION.startswith("1fac393")
+    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:9d5d8f7"
+    assert runner.EXPECTED_REVENUE_REVISION.startswith("9d5d8f7")
     assert "elementsproject/lightningd:v26.06.6" in dockerfile
     assert "CLBOSS_COMMIT=8cb4e9215eba58b049375f234f5f073d0c7fc622" in dockerfile
     assert "XREBALANCE_COMMIT=fb70bf13cd9f3f79b14100bfdb8f2966884a4142" in dockerfile
