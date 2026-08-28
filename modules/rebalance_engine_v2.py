@@ -213,6 +213,11 @@ class RebalanceEngine:
         self._governed_intent_completions: Dict[str, Tuple[Any, str]] = {}
         self._capex_engine = capex_engine
         self._profitability = profitability
+        # A burst can make the 15-minute profitability cache visibly stale
+        # before the next normal refresh.  Fresh settled-forward facts may
+        # trigger one canonical refresh, with a backoff preventing repeated
+        # full analyses if the refresh cannot advance the snapshot.
+        self._profitability_refresh_backoff_until = 0
         self._data_service = data_service
         self._segment_observation_store = segment_observation_store
         self.global_budget_limit_provider = global_budget_limit_provider
@@ -1113,14 +1118,6 @@ class RebalanceEngine:
             self._log(f"Failed to get channels: {e}", level="warn")
             return None
 
-        # Build capex allocations
-        capex_allocations = None
-        if self._capex_engine:
-            try:
-                capex_allocations = self._capex_engine.compute_allocations()
-            except Exception as e:
-                self._log(f"Capex allocation failed: {e}", level="warn")
-
         # Cooldown inputs are loop-invariant: resolve them once. Prefer the
         # batched last-rebalance-time query (one GROUP BY statement for all
         # channels) over a point query per channel when the database exposes
@@ -1140,6 +1137,72 @@ class RebalanceEngine:
                         f"batch last-rebalance-time lookup failed: {e}",
                         level="debug",
                     )
+
+        def _profitability_evidence(prof: Any) -> Dict[str, Any]:
+            """Normalize one canonical profitability row without raising."""
+            evidence: Dict[str, Any] = {
+                "is_profitable": False,
+                "is_active": False,
+                "historical_direct_fee_ppm": 0.0,
+                "historical_sourced_fee_ppm": 0.0,
+                "_profitability_forward_count": 0,
+            }
+            if prof is None:
+                return evidence
+            try:
+                revenue = getattr(prof, "revenue", None)
+                if revenue is None:
+                    return evidence
+                forward_count = max(
+                    0, int(getattr(revenue, "total_forward_count", 0) or 0)
+                )
+                evidence["_profitability_forward_count"] = forward_count
+                evidence["is_profitable"] = (
+                    _nonnegative_msat_int(
+                        getattr(revenue, "total_contribution_msat", 0)
+                    )
+                    > 0
+                )
+                evidence["is_active"] = forward_count > 5
+                direct_fee_msat = getattr(
+                    revenue,
+                    "fees_earned_msat",
+                    getattr(revenue, "fees_earned_sats", 0) * 1000,
+                )
+                direct_volume_msat = getattr(
+                    revenue,
+                    "volume_routed_msat",
+                    getattr(revenue, "volume_routed_sats", 0) * 1000,
+                )
+                sourced_fee_msat = getattr(
+                    revenue,
+                    "sourced_fee_contribution_msat",
+                    getattr(revenue, "sourced_fee_contribution_sats", 0) * 1000,
+                )
+                sourced_volume_msat = getattr(
+                    revenue,
+                    "sourced_volume_msat",
+                    getattr(revenue, "sourced_volume_sats", 0) * 1000,
+                )
+                evidence["historical_direct_fee_ppm"] = _historical_fee_rate_ppm(
+                    direct_fee_msat,
+                    direct_volume_msat,
+                    historical_fee_cap_ppm,
+                )
+                evidence["historical_sourced_fee_ppm"] = _historical_fee_rate_ppm(
+                    sourced_fee_msat,
+                    sourced_volume_msat,
+                    historical_fee_cap_ppm,
+                )
+            except Exception:
+                return {
+                    "is_profitable": False,
+                    "is_active": False,
+                    "historical_direct_fee_ppm": 0.0,
+                    "historical_sourced_fee_ppm": 0.0,
+                    "_profitability_forward_count": 0,
+                }
+            return evidence
 
         # Normalize channel inputs
         normalized = []
@@ -1188,49 +1251,14 @@ class RebalanceEngine:
                 else ch.get("fee_proportional_millionths", 0)
             )
 
-            # Profitability check
-            is_profitable = False
-            is_active = False
-            historical_direct_fee_ppm = 0.0
-            historical_sourced_fee_ppm = 0.0
+            # Profitability check.  The cached row is canonical, but a later
+            # settled-forward mismatch may trigger one forced canonical
+            # refresh after the cheap flow-fact batch is available.
+            profitability_evidence = _profitability_evidence(None)
             if self._profitability:
                 try:
                     prof = self._profitability.get_profitability(scid)
-                    if prof:
-                        revenue = getattr(prof, 'revenue', None)
-                        if revenue:
-                            is_profitable = getattr(revenue, 'total_contribution_msat', 0) > 0
-                            is_active = getattr(revenue, 'total_forward_count', 0) > 5
-                            direct_fee_msat = getattr(
-                                revenue,
-                                'fees_earned_msat',
-                                getattr(revenue, 'fees_earned_sats', 0) * 1000,
-                            )
-                            direct_volume_msat = getattr(
-                                revenue,
-                                'volume_routed_msat',
-                                getattr(revenue, 'volume_routed_sats', 0) * 1000,
-                            )
-                            sourced_fee_msat = getattr(
-                                revenue,
-                                'sourced_fee_contribution_msat',
-                                getattr(revenue, 'sourced_fee_contribution_sats', 0) * 1000,
-                            )
-                            sourced_volume_msat = getattr(
-                                revenue,
-                                'sourced_volume_msat',
-                                getattr(revenue, 'sourced_volume_sats', 0) * 1000,
-                            )
-                            historical_direct_fee_ppm = _historical_fee_rate_ppm(
-                                direct_fee_msat,
-                                direct_volume_msat,
-                                historical_fee_cap_ppm,
-                            )
-                            historical_sourced_fee_ppm = _historical_fee_rate_ppm(
-                                sourced_fee_msat,
-                                sourced_volume_msat,
-                                historical_fee_cap_ppm,
-                            )
+                    profitability_evidence = _profitability_evidence(prof)
                 except Exception:
                     pass
 
@@ -1291,16 +1319,69 @@ class RebalanceEngine:
                 "local_sats": local_sats,
                 "actual_inbound_fee_ppm": inbound_fee_ppm,
                 "local_out_fee_ppm": local_out_fee_ppm,
-                "historical_direct_fee_ppm": historical_direct_fee_ppm,
-                "historical_sourced_fee_ppm": historical_sourced_fee_ppm,
-                "is_profitable": is_profitable,
-                "is_active": is_active,
                 "cooldown_active": cooldown,
                 "cooldown_override": cooldown_override,
+                **profitability_evidence,
             })
 
         now_ts = int(time.time())
         flow_facts = self._build_flow_facts_map(normalized, cfg, now_ts)
+
+        # The profitability analyzer intentionally caches full-node analysis
+        # for 15 minutes, while a rebalance cycle may run sooner.  A settled
+        # forwarding burst can therefore be present in the batched local DB
+        # facts while the canonical cache still claims zero forwards.  Use
+        # that contradiction only as a refresh signal: value and budget still
+        # come exclusively from the canonical profitability analyzer.
+        stale_profitability_channels = []
+        if (
+            self._profitability
+            and now_ts >= self._profitability_refresh_backoff_until
+        ):
+            for channel in normalized:
+                channel_id = channel.get("channel_id")
+                facts = flow_facts.get(channel_id)
+                if (
+                    int(channel.get("_profitability_forward_count") or 0) == 0
+                    and facts is not None
+                    and facts.forward_count_window > 5
+                    and facts.out_sats_window > 0
+                ):
+                    stale_profitability_channels.append(channel_id)
+
+        if stale_profitability_channels:
+            # Set the backoff before calling the analyzer so exceptions or a
+            # concurrent-analysis cache return cannot cause a refresh storm.
+            self._profitability_refresh_backoff_until = now_ts + 300
+            try:
+                refreshed = self._profitability.analyze_all_channels(force=True)
+                if isinstance(refreshed, dict):
+                    for channel in normalized:
+                        prof = refreshed.get(channel.get("channel_id"))
+                        if prof is not None:
+                            channel.update(_profitability_evidence(prof))
+                    self._log(
+                        "Refreshed canonical profitability after settled-forward "
+                        f"cache mismatch on {len(stale_profitability_channels)} channel(s)",
+                        level="info",
+                    )
+            except Exception as e:
+                self._log(
+                    f"Profitability refresh after settled-forward mismatch failed: {e}",
+                    level="warn",
+                )
+
+        # Compute capex only after any canonical refresh so budget allocation
+        # consumes the same evidence as the snapshot's value classification.
+        capex_allocations = None
+        if self._capex_engine:
+            try:
+                capex_allocations = self._capex_engine.compute_allocations()
+            except Exception as e:
+                self._log(f"Capex allocation failed: {e}", level="warn")
+
+        for channel in normalized:
+            channel.pop("_profitability_forward_count", None)
 
         target_bands = None
         if bool(getattr(cfg, "rebalance_size_tiered_targets", True)):

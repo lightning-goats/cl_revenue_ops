@@ -1281,6 +1281,158 @@ def test_engine_build_snapshot_toggle_on_gives_big_channel_wider_band_than_small
     assert small.target_band_high == cfg.high_liquidity_threshold
 
 
+def _snapshot_profitability(*, forwards=0, contribution_msat=0):
+    return SimpleNamespace(
+        revenue=SimpleNamespace(
+            total_forward_count=forwards,
+            total_contribution_msat=contribution_msat,
+            fees_earned_msat=contribution_msat,
+            volume_routed_msat=500_000_000,
+            sourced_fee_contribution_msat=0,
+            sourced_volume_msat=0,
+        )
+    )
+
+
+def _configure_snapshot_channel(mock_plugin):
+    mock_plugin.rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "state": "CHANNELD_NORMAL",
+                "peer_id": "03" + "b" * 64,
+                "short_channel_id": "100x1x0",
+                "total_msat": "1000000000msat",
+                "our_amount_msat": "100000000msat",
+                "updates": {
+                    "remote": {"fee_proportional_millionths": 25},
+                    "local": {"fee_proportional_millionths": 150},
+                },
+            }
+        ]
+    }
+
+
+def test_snapshot_refreshes_canonical_profitability_on_settled_forward_mismatch(
+    mock_plugin, mock_database
+):
+    """Recent settled forwards may signal staleness, but never supply value."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(
+        dry_run=True,
+        rebalance_router="v3",
+        rebalance_size_tiered_targets=False,
+    )
+    _configure_snapshot_channel(mock_plugin)
+    mock_database.get_all_channel_flow_windows.return_value = {
+        "100x1x0": (500_000, 0, 8)
+    }
+    profitability = MagicMock()
+    profitability.get_profitability.return_value = _snapshot_profitability()
+    fresh = _snapshot_profitability(forwards=8, contribution_msat=100_000)
+    profitability.analyze_all_channels.return_value = {"100x1x0": fresh}
+    capex = MagicMock()
+    capex.compute_allocations.return_value = {
+        "channel_budgets": {"100x1x0": {"budget_sats": 50}}
+    }
+    engine = RebalanceEngine(
+        mock_plugin,
+        cfg,
+        mock_database,
+        capex_engine=capex,
+        profitability=profitability,
+    )
+    mock_plugin.rpc.reset_mock()
+
+    snapshot = engine._build_snapshot()
+
+    profitability.analyze_all_channels.assert_called_once_with(force=True)
+    capex.compute_allocations.assert_called_once_with()
+    channel = snapshot.channels[0]
+    assert channel.is_active is True
+    assert channel.value_class == "profitable"
+    assert channel.remaining_budget_sats == 50
+    assert channel.dest_eligible is True
+    mock_plugin.rpc.sendpay.assert_not_called()
+    mock_plugin.rpc.waitsendpay.assert_not_called()
+
+
+def test_snapshot_profitability_refresh_failure_stays_neutral_and_backs_off(
+    mock_plugin, mock_database
+):
+    """A failed canonical refresh cannot manufacture value or retry-storm."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(
+        dry_run=True,
+        rebalance_router="v3",
+        rebalance_size_tiered_targets=False,
+    )
+    _configure_snapshot_channel(mock_plugin)
+    mock_database.get_all_channel_flow_windows.return_value = {
+        "100x1x0": (500_000, 0, 8)
+    }
+    profitability = MagicMock()
+    profitability.get_profitability.return_value = _snapshot_profitability()
+    profitability.analyze_all_channels.side_effect = RuntimeError("db unavailable")
+    capex = MagicMock()
+    capex.compute_allocations.return_value = {}
+    engine = RebalanceEngine(
+        mock_plugin,
+        cfg,
+        mock_database,
+        capex_engine=capex,
+        profitability=profitability,
+    )
+
+    first = engine._build_snapshot()
+    second = engine._build_snapshot()
+
+    profitability.analyze_all_channels.assert_called_once_with(force=True)
+    for snapshot in (first, second):
+        channel = snapshot.channels[0]
+        assert channel.value_class == "neutral"
+        assert channel.remaining_budget_sats == 0
+        assert channel.dest_eligible is False
+    mock_plugin.rpc.sendpay.assert_not_called()
+    mock_plugin.rpc.waitsendpay.assert_not_called()
+
+
+def test_snapshot_malformed_flow_facts_do_not_trigger_profitability_refresh(
+    mock_plugin, mock_database
+):
+    """Malformed/absent observational rows fail to the neutral snapshot."""
+    from modules.config import Config
+    from modules.rebalance_engine_v2 import RebalanceEngine
+
+    cfg = Config(
+        dry_run=True,
+        rebalance_router="v3",
+        rebalance_size_tiered_targets=False,
+    )
+    _configure_snapshot_channel(mock_plugin)
+    mock_database.get_all_channel_flow_windows.return_value = "malformed"
+    mock_database.get_channel_flow_window.return_value = "malformed"
+    profitability = MagicMock()
+    profitability.get_profitability.return_value = _snapshot_profitability()
+    engine = RebalanceEngine(
+        mock_plugin,
+        cfg,
+        mock_database,
+        profitability=profitability,
+    )
+
+    snapshot = engine._build_snapshot()
+
+    profitability.analyze_all_channels.assert_not_called()
+    assert snapshot.channels[0].value_class == "neutral"
+    assert snapshot.channels[0].dest_eligible is False
+    mock_plugin.rpc.sendpay.assert_not_called()
+    mock_plugin.rpc.waitsendpay.assert_not_called()
+
+
 def test_v2_planner_carries_historical_profitability_role_metrics():
     from modules.rebalance_planner_v2 import RebalancePlanner
     from modules.rebalance_state_v2 import build_state_snapshot
