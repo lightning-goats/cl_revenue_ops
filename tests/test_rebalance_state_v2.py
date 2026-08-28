@@ -313,6 +313,74 @@ def test_emergency_override_does_not_relax_source_cooldown():
     assert channel.source_reason == "cooldown"
 
 
+def test_default_emergency_floor_renews_demand_drained_destination():
+    """Tournament replica 64: a profitable destination fell from 30% to
+    14.5% after settled demand.  The default floor must renew its outbound
+    inventory without waiting out the normal 24-hour cooldown."""
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "4352x1x0": ChannelCapexBudget(
+                channel_id="4352x1x0", budget_msat=30_000
+            ),
+        }
+    )
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="4352x1x0",
+                peer_id="02" + "d" * 64,
+                capacity_sats=1_000_000,
+                local_sats=145_000,
+                is_profitable=True,
+                is_active=True,
+                cooldown_active=True,
+            ),
+        ],
+        allocations,
+    )
+
+    channel = state.channels[0]
+    assert channel.cooldown_active is True
+    assert channel.dest_eligible is True
+    assert channel.dest_reason == ""
+
+
+def test_default_emergency_floor_keeps_twenty_percent_boundary_cooled():
+    """The override is strict-below: the 20% boundary still honors cooldown,
+    preventing ordinary under-band inventory from immediately churning."""
+    from modules.capex_budget import CapexAllocations, ChannelCapexBudget
+    from modules.rebalance_state_v2 import ChannelInput, build_state_snapshot
+
+    allocations = CapexAllocations(
+        channel_budgets={
+            "200x2x0": ChannelCapexBudget(
+                channel_id="200x2x0", budget_msat=30_000
+            ),
+        }
+    )
+    state = build_state_snapshot(
+        [
+            ChannelInput(
+                channel_id="200x2x0",
+                peer_id="02" + "e" * 64,
+                capacity_sats=1_000_000,
+                local_sats=200_000,
+                is_profitable=True,
+                is_active=True,
+                cooldown_active=True,
+            ),
+        ],
+        allocations,
+    )
+
+    channel = state.channels[0]
+    assert channel.dest_eligible is False
+    assert channel.dest_reason == "cooldown"
+
+
 def test_explicit_cooldown_override_input_overrides_dest_cooldown():
     """Phase 3.3: when the engine has computed a drift override from anchor
     state, it can pass cooldown_override=True on the channel input. The

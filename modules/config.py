@@ -534,7 +534,7 @@ class Config:
     # Phase 3 drift override: a destination below this local ratio is still
     # refill-eligible even when the channel-level cooldown is active. Set to
     # 0 to disable the override and keep the strict cooldown gate.
-    rebalance_emergency_local_ratio: float = 0.10
+    rebalance_emergency_local_ratio: float = 0.20
     # Phase 3.3 anchor-state drift override: when a destination's local ratio
     # has dropped by at least this much since the last successful rebalance,
     # the cooldown gate is bypassed. Set to 0 to disable.

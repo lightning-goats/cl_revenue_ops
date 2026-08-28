@@ -256,9 +256,10 @@ def compute_size_tiered_bands(
         )
     return bands
 # Phase 3 emergency-depleted threshold: below this local ratio a cooldown-held
-# destination is still refill-eligible. Default chosen to match the Polar S9
-# 6.6% local case while leaving normal under-band depletion (~10-30%) blocked.
-_DEFAULT_TARGET_EMERGENCY_LOW = 0.10
+# destination is still refill-eligible. Twenty percent preserves a meaningful
+# anti-churn gap below the normal 30% operating band while allowing fresh,
+# revenue-producing demand to renew outbound inventory before it is exhausted.
+_DEFAULT_TARGET_EMERGENCY_LOW = 0.20
 
 
 def _source_eligibility(*, cooldown_active: bool) -> Tuple[bool, str]:

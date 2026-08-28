@@ -1107,7 +1107,7 @@ class RebalanceEngine:
 
         target_band_low = _coerce_float("low_liquidity_threshold", 0.35)
         target_band_high = _coerce_float("high_liquidity_threshold", 0.65)
-        target_emergency_low = _coerce_float("rebalance_emergency_local_ratio", 0.10)
+        target_emergency_low = _coerce_float("rebalance_emergency_local_ratio", 0.20)
 
         try:
             if self._data_service is not None:

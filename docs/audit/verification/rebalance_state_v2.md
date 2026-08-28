@@ -17,7 +17,7 @@ records with value class, role eligibility, drain score, refill urgency, budget 
   (not cooldown or override) — value/budget gates unconditional.
 - **RS2-3 — verified.** `cooldown_override = cooldown_active and (channel.cooldown_override or
   emergency_override)` where `emergency_override = local_ratio < target_emergency_low`
-  (lines 301-309, default 0.10 at line 214); override only skips the cooldown branch
+  (lines 301-309, default 0.20 at line 214); override only skips the cooldown branch
   (line 246), never the value/budget branches.
 - **RS2-4 — verified.** Hive member with zero capex budget receives
   `hive_bootstrap_budget_sats` and `budget_source = "hive_bootstrap"` (lines 293-297).

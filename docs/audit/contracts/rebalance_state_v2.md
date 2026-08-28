@@ -22,7 +22,7 @@ role eligibility (source vs destination gates), drain score, refill urgency, and
   budget > 0, and not in cooldown — destinations authorize spend, sources do not.
 - RS2-3: The cooldown gate on destinations is skipped when `cooldown_override` is set by the
   caller OR the channel is emergency-depleted (`local_ratio < target_emergency_low`, default
-  0.10); the value and budget gates are never skipped.
+  0.20); the value and budget gates are never skipped.
 - RS2-4: A hive member with zero capex budget receives `hive_bootstrap_budget_sats` (when > 0) and
   its `budget_source` is reported as "hive_bootstrap", not "capex".
 - RS2-5: `rebalance_bias` is clamped into [0.85, 1.15]; unparsable bias falls back to 1.0.
