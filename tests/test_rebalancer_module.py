@@ -592,6 +592,19 @@ class TestConfigOptionDefaultAlignment:
         assert Config().max_fee_ppm == option_default
         assert Config().max_fee_ppm == 2000
 
+    def test_emergency_rebalance_floor_default_matches_option(self):
+        """The plugin option wins at startup, so changing only Config leaves
+        production on the stale value even though direct-engine tests pass."""
+        from modules.config import Config
+
+        option_default = float(
+            self._plugin_option_default(
+                "revenue-ops-rebalance-emergency-local-ratio"
+            )
+        )
+        assert Config().rebalance_emergency_local_ratio == option_default
+        assert option_default == 0.20
+
 
 def test_upstream_pattern_defaults():
     from modules.config import Config

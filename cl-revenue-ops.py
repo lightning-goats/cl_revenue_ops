@@ -1300,8 +1300,8 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-rebalance-emergency-local-ratio',
-    default='0.10',
-    description='Local ratio below which a destination bypasses the channel-level rebalance cooldown (Phase 3, default: 0.10; 0 disables)'
+    default='0.20',
+    description='Local ratio below which a destination bypasses the channel-level rebalance cooldown (Phase 3, default: 0.20; 0 disables)'
 )
 
 plugin.add_option(
@@ -1860,7 +1860,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         ),
         rebalance_min_profit=_safe_int('revenue-ops-rebalance-min-profit'),
         rebalance_emergency_local_ratio=_safe_float_opt(
-            'revenue-ops-rebalance-emergency-local-ratio', '0.10'
+            'revenue-ops-rebalance-emergency-local-ratio', '0.20'
         ),
         rebalance_drift_override_ratio=_safe_float_opt(
             'revenue-ops-rebalance-drift-override-ratio', '0.30'
