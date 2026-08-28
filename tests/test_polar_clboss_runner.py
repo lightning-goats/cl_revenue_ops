@@ -585,8 +585,14 @@ def test_automatic_acquisition_waits_for_native_episode_without_forced_cycle(
         },
     })
     lane_before = {
-        "cln": {"family": "cln", "channel_id": "a", "peer_id": "pa", "fee_ppm": 15},
-        "lnd": {"family": "lnd", "channel_id": "b", "peer_id": "pb", "fee_ppm": 15},
+        "cln": {
+            "family": "cln", "channel_id": "a", "short_channel_id": "1x1x0",
+            "peer_id": "pa", "fee_ppm": 15,
+        },
+        "lnd": {
+            "family": "lnd", "channel_id": "b", "short_channel_id": "2x1x0",
+            "peer_id": "pb", "fee_ppm": 15,
+        },
     }
     lane_active = {**lane_before, "cln": {**lane_before["cln"], "fee_ppm": 0}}
     lane_calls = iter((lane_before, lane_active))
@@ -608,7 +614,7 @@ def test_automatic_acquisition_waits_for_native_episode_without_forced_cycle(
     monkeypatch.setattr(runner, "cln_rpc", rpc)
     monkeypatch.setattr(runner, "acquisition_lanes", lambda _state: next(lane_calls))
     monkeypatch.setattr(runner, "_acquisition_rows", lambda _container: [{
-        "id": 9, "state": "active", "channel_id": "a",
+        "id": 9, "state": "active", "channel_id": "1x1x0",
         "baseline_fee_ppm": 15, "target_fee_ppm": 0,
     }])
 

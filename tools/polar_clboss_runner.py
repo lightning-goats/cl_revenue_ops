@@ -827,6 +827,17 @@ def _acquisition_rows(container: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _lane_matches_channel_identifier(lane: dict[str, Any], identifier: object) -> bool:
+    """Match Revenue Ops rows whether they persist a funding id or live SCID."""
+    value = str(identifier or "")
+    if not value:
+        return False
+    return value in {
+        str(lane.get("channel_id") or ""),
+        str(lane.get("short_channel_id") or ""),
+    }
+
+
 def start_automatic_acquisition(
     *, replica: int, results_dir: Path,
     attempts: int = NATIVE_CYCLE_POLL_ATTEMPTS,
@@ -884,7 +895,9 @@ def start_automatic_acquisition(
             episode = active[0]
             matching = [
                 lane for lane in acquisition_lanes(state).values()
-                if lane["channel_id"] == str(episode.get("channel_id"))
+                if _lane_matches_channel_identifier(
+                    lane, episode.get("channel_id")
+                )
             ]
             if len(matching) != 1:
                 raise RunnerError("automatic acquisition selected an unscored lane")
