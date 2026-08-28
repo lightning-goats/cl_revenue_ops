@@ -16,7 +16,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -30,7 +30,7 @@ from polar_mixed_client_lab import (  # noqa: E402
 
 
 SCHEMA = "polar-clboss-runner-state-v1"
-EXPECTED_REVENUE_REVISION = "3df9ad303ad0cb029403b0b3afcc0bd27445e087"
+EXPECTED_REVENUE_REVISION = "9805b04018ad9d18d3d508102a1ac23e4bfa89ca"
 IMAGE = f"cl-revenue-ops-polar-clboss:{EXPECTED_REVENUE_REVISION[:7]}"
 NETWORK_ID = 4
 DOCKER_NETWORK = "polar-network-4_default"
@@ -40,11 +40,15 @@ CLBOSS_PLUGIN = "/usr/local/libexec/clboss"
 XREBALANCE_PLUGIN = "/usr/local/libexec/xrebalance"
 IDENTITIES = ("identity-a", "identity-b")
 CHANNEL_CAPACITY_SATS = 1_000_000
+RETURN_PATH_CAPACITY_SATS = 2_000_000
+CONTROLLED_DEPLETION_SATS = 750_000
+RETURN_PATH_FUNDING_BUFFER_SATS = 100_000
 FUNDING_UTXO_SATS = 1_100_000
 # Covers the 1% reserve on a 1M channel plus route fees.  A smaller fee-only
 # buffer still leaves the sink unable to spend the newly received balance.
 REVERSE_FEE_BUFFER_SATS = 25_000
-TOURNAMENT_CYCLE_SECONDS = 60
+TOURNAMENT_CYCLE_SECONDS = 15
+CLBOSS_REBALANCES_PER_HOUR = 120
 ACQUISITION_MIN_PPM = 0
 MARKET_PROFILES = {
     # Purpose-built low-fee regime for the bounded acquisition experiment.
@@ -469,6 +473,414 @@ def _open_channels(
     return opened
 
 
+def _send_fake_onchain_funds(
+    bridge: PolarMcp, network_id: int, address: str, amount_sats: int
+) -> None:
+    """Fund a lab wallet from the regtest backend and confirm the output."""
+    if not isinstance(address, str) or not address.startswith("bcrt1"):
+        raise RunnerError("return-path wallet returned no regtest address")
+    amount_sats = nonnegative_int(amount_sats, "return-path funding amount")
+    if amount_sats == 0:
+        raise RunnerError("return-path funding amount must be positive")
+    _run(
+        [
+            "docker", "exec", f"polar-n{network_id}-backend1",
+            "bitcoin-cli", "-regtest", "-rpcuser=polaruser", "-rpcpassword=polarpass",
+            "sendtoaddress", address, f"{amount_sats / 100_000_000:.8f}",
+        ]
+    )
+    _mine(bridge, network_id, 6)
+
+
+def ensure_payer_wallet_funds(
+    bridge: PolarMcp,
+    network_id: int,
+    *,
+    minimum_sats: int = (2 * CHANNEL_CAPACITY_SATS) + RETURN_PATH_FUNDING_BUFFER_SATS,
+) -> dict[str, dict[str, int]]:
+    """Top up depleted original payer wallets before contender setup."""
+    minimum_sats = nonnegative_int(minimum_sats, "payer wallet minimum")
+    if minimum_sats == 0:
+        raise RunnerError("payer wallet minimum must be positive")
+    cln_payer = f"polar-n{network_id}-cln-payer"
+    lnd_payer = f"polar-n{network_id}-lnd-payer"
+    outputs = cln_rpc(cln_payer, "listfunds").get("outputs")
+    if not isinstance(outputs, list):
+        raise RunnerError("CLN payer listfunds is malformed")
+    cln_confirmed = sum(
+        msat_value(row.get("amount_msat", 0)) // 1000
+        for row in outputs
+        if isinstance(row, dict) and row.get("status") == "confirmed"
+    )
+    lnd_balance = lnd_rpc(lnd_payer, "walletbalance")
+    lnd_confirmed = nonnegative_int(
+        lnd_balance.get("confirmed_balance"), "LND payer confirmed balance"
+    )
+    result = {
+        "cln": {"before_sats": cln_confirmed, "topup_sats": 0},
+        "lnd": {"before_sats": lnd_confirmed, "topup_sats": 0},
+    }
+    if cln_confirmed < minimum_sats:
+        topup = minimum_sats - cln_confirmed
+        address = onchain_address(cln_rpc(cln_payer, "newaddr"))
+        _send_fake_onchain_funds(bridge, network_id, address, topup)
+        result["cln"]["topup_sats"] = topup
+    if lnd_confirmed < minimum_sats:
+        topup = minimum_sats - lnd_confirmed
+        address = lnd_rpc(lnd_payer, "newaddress", "p2tr").get("address")
+        _send_fake_onchain_funds(bridge, network_id, str(address or ""), topup)
+        result["lnd"]["topup_sats"] = topup
+    return result
+
+
+def _live_lnd_channels(container: str) -> list[dict[str, Any]]:
+    rows = lnd_rpc(container, "listchannels").get("channels")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise RunnerError(f"listchannels malformed for {container}")
+    return rows
+
+
+def _wait_return_paths(
+    paths: list[dict[str, Any]], *, timeout_seconds: float = 120
+) -> list[dict[str, Any]]:
+    """Resolve the exact active SCID/channel point for each synthetic path."""
+    deadline = time.monotonic() + timeout_seconds
+    last: dict[str, str] = {}
+    while time.monotonic() < deadline:
+        resolved: list[dict[str, Any]] = []
+        for path in paths:
+            family = path.get("family")
+            source = path.get("source_container")
+            peer_id = path.get("peer_id")
+            if not all(isinstance(value, str) and value for value in (family, source, peer_id)):
+                raise RunnerError("malformed return-path checkpoint")
+            if family == "cln":
+                matches = [
+                    row for row in active_channels(source)
+                    if row.get("peer_id") == peer_id
+                    and row.get("channel_id") == path.get("channel_id")
+                ]
+                if len(matches) != 1:
+                    last[family] = f"active matches={len(matches)}"
+                    break
+                resolved.append({**path, "short_channel_id": matches[0]["short_channel_id"]})
+            elif family == "lnd":
+                matches = [
+                    row for row in _live_lnd_channels(source)
+                    if row.get("remote_pubkey") == peer_id and row.get("active") is True
+                ]
+                if len(matches) != 1:
+                    last[family] = f"active matches={len(matches)}"
+                    break
+                point = matches[0].get("channel_point")
+                scid = matches[0].get("scid_str")
+                if not isinstance(point, str) or not point or not isinstance(scid, str) or not scid:
+                    raise RunnerError("active LND return path lacks channel identifiers")
+                resolved.append({**path, "channel_point": point, "short_channel_id": scid})
+            else:
+                raise RunnerError(f"unknown return-path family: {family!r}")
+        if len(resolved) == len(paths):
+            return resolved
+        time.sleep(2)
+    raise RunnerError(f"synthetic return paths did not become active: {last}")
+
+
+def controlled_depletion_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    """Read each controller's CLN source/depleted fixture lanes by live SCID."""
+    assignment = state.get("assignment")
+    contenders = state.get("contenders")
+    lane_map = state.get("lane_map")
+    if not all(isinstance(value, dict) for value in (assignment, contenders, lane_map)):
+        raise RunnerError("controlled depletion lacks contender lane metadata")
+    result: dict[str, Any] = {}
+    for controller, identity in assignment.items():
+        contender = contenders.get(identity)
+        identity_lanes = lane_map.get(identity)
+        if not isinstance(contender, dict) or not isinstance(identity_lanes, dict):
+            raise RunnerError(f"controlled depletion lacks lanes for {identity}")
+        live = {
+            str(row["short_channel_id"]): row
+            for row in active_channels(str(contender["container"]))
+        }
+        roles: dict[str, dict[str, Any]] = {}
+        for scid, lane in identity_lanes.items():
+            if not isinstance(lane, dict) or lane.get("family") != "cln":
+                continue
+            side = lane.get("side")
+            row = live.get(str(scid))
+            if side not in {"payer", "sink"} or row is None:
+                raise RunnerError(f"controlled depletion cannot resolve {identity}:{scid}")
+            total_msat = msat_value(row.get("total_msat", 0))
+            local_msat = msat_value(row.get("to_us_msat", 0))
+            if total_msat <= 0 or local_msat > total_msat:
+                raise RunnerError(f"controlled depletion found invalid balance on {scid}")
+            roles[str(side)] = {
+                "short_channel_id": str(scid),
+                "local_balance_ppm": local_msat * 1_000_000 // total_msat,
+            }
+        if set(roles) != {"payer", "sink"}:
+            raise RunnerError(f"controlled depletion lacks both CLN roles for {identity}")
+        result[str(controller)] = {
+            "source": roles["payer"],
+            "depleted": roles["sink"],
+        }
+    return result
+
+
+def _directed_cln_fixture_payment(
+    bridge: PolarMcp,
+    *,
+    network_id: int,
+    target_scid: str,
+    amount_sats: int,
+    label: str,
+) -> dict[str, Any]:
+    """Pay once through a selected contender first hop for fixture setup."""
+    payer = f"polar-n{network_id}-cln-payer"
+    payer_scids = {
+        str(row["short_channel_id"]) for row in active_channels(payer)
+    }
+    if target_scid not in payer_scids:
+        raise RunnerError(f"controlled depletion target is not a payer channel: {target_scid}")
+    exclusions = [
+        f"{scid}/{direction}"
+        for scid in sorted(payer_scids - {target_scid})
+        for direction in (0, 1)
+    ]
+    invoice_payload = bridge.call(
+        "create_invoice",
+        {
+            "networkId": network_id,
+            "nodeName": "cln-sink",
+            "amount": amount_sats,
+            "memo": f"clboss-controlled-depletion-{label}",
+        },
+    )
+    invoice = invoice_payload.get("invoice")
+    if not isinstance(invoice, str) or not invoice:
+        raise RunnerError("controlled depletion invoice is missing")
+    payment = cln_rpc(
+        payer,
+        "-k",
+        "pay",
+        f"bolt11={invoice}",
+        "retry_for=30",
+        f"exclude={json.dumps(exclusions)}",
+    )
+    if payment.get("status") != "complete":
+        raise RunnerError(f"controlled depletion payment did not complete: {label}")
+    return {
+        "controller": label,
+        "target_short_channel_id": target_scid,
+        "amount_sats": amount_sats,
+        "excluded_first_hops": exclusions,
+        "payment_hash": payment.get("payment_hash"),
+    }
+
+
+def prepare_controlled_depletion(
+    bridge: PolarMcp,
+    *,
+    replica: int,
+    results_dir: Path,
+    amount_sats: int = CONTROLLED_DEPLETION_SATS,
+) -> dict[str, Any]:
+    """Create equal source/depleted CLN pairs while both controllers are held."""
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if state.get("status") != "isolated_full_stack_ready":
+        raise RunnerError("controlled depletion requires a fresh full-stack replica")
+    if any(
+        isinstance(event, dict) and event.get("event") == "smoke_complete"
+        for event in state.get("events", [])
+    ):
+        raise RunnerError("controlled depletion refuses a previously scored replica")
+    amount_sats = nonnegative_int(amount_sats, "controlled depletion amount")
+    if (
+        amount_sats <= CHANNEL_CAPACITY_SATS // 2
+        or amount_sats >= CHANNEL_CAPACITY_SATS
+    ):
+        raise RunnerError(
+            "controlled depletion amount must be above half and below channel capacity"
+        )
+
+    assignment = state["assignment"]
+    contenders = state["contenders"]
+    revenue_container = contenders[assignment["revenue_ops"]]["container"]
+    clboss_container = contenders[assignment["clboss"]]["container"]
+    cln_rpc(revenue_container, "revenue-config", "set", "paused", "true")
+    revenue_controls = (
+        cln_rpc(revenue_container, "revenue-status")
+        .get("operator_controls", {})
+        .get("values", {})
+    )
+    if revenue_controls.get("paused") is not True:
+        raise RunnerError("Revenue Ops did not pause for controlled depletion")
+    cln_rpc(clboss_container, "setconfig", "clboss-rebalance-mode", "off")
+    clboss_mode = (
+        cln_rpc(clboss_container, "clboss-status")
+        .get("rebalance_mode", {})
+        .get("mode")
+    )
+    if clboss_mode != "off":
+        raise RunnerError("CLBOSS did not pause for controlled depletion")
+
+    before = controlled_depletion_snapshot(state)
+    payments = []
+    for controller in ("revenue_ops", "clboss"):
+        payments.append(
+            _directed_cln_fixture_payment(
+                bridge,
+                network_id=int(state["network_id"]),
+                target_scid=before[controller]["source"]["short_channel_id"],
+                amount_sats=amount_sats,
+                label=controller,
+            )
+        )
+    after = controlled_depletion_snapshot(state)
+    for controller, lanes in after.items():
+        if lanes["source"]["local_balance_ppm"] < 700_000:
+            raise RunnerError(f"controlled depletion did not create a source for {controller}")
+        if lanes["depleted"]["local_balance_ppm"] > 300_000:
+            raise RunnerError(f"controlled depletion did not deplete a sink for {controller}")
+    state["controlled_depletion"] = {
+        "family": "cln",
+        "amount_sats_per_controller": amount_sats,
+        "controllers_held": True,
+        "before": before,
+        "after": after,
+        "payments": payments,
+    }
+    state["status"] = "controlled_depletion_ready"
+    _checkpoint(path, state, "controlled_depletion_ready", fixture=state["controlled_depletion"])
+    return state
+
+
+def provision_return_paths(
+    bridge: PolarMcp,
+    *,
+    replica: int,
+    results_dir: Path,
+    capacity_sats: int = RETURN_PATH_CAPACITY_SATS,
+) -> dict[str, Any]:
+    """Open fresh payer-to-sink liquidity after the scored traffic block.
+
+    These tournament-only channels are deliberately absent during scored
+    payments.  Once opened they provide both controllers with the same fresh
+    circular-return direction without changing either contender's four-channel
+    topology or offering traffic a scoring-time bypass.
+    """
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if (
+        state.get("status") not in {"smoke_complete", "controlled_depletion_ready"}
+        or state.get("league") != "full_stack"
+    ):
+        raise RunnerError(
+            "return paths require a completed full-stack traffic block "
+            "or controlled depletion"
+        )
+    if state.get("return_paths"):
+        raise RunnerError("return paths are already checkpointed")
+    for key in ("acquisition_treatment", "automatic_acquisition", "retention_treatment"):
+        treatment = state.get(key)
+        if isinstance(treatment, dict) and treatment.get("status") == "active":
+            raise RunnerError(f"return paths require restored treatment: {key}")
+    capacity_sats = nonnegative_int(capacity_sats, "return-path capacity")
+    if capacity_sats == 0:
+        raise RunnerError("return-path capacity must be positive")
+    network_id = int(state["network_id"])
+    cln_payer = f"polar-n{network_id}-cln-payer"
+    cln_sink = f"polar-n{network_id}-cln-sink"
+    lnd_payer = f"polar-n{network_id}-lnd-payer"
+    lnd_sink = f"polar-n{network_id}-lnd-sink"
+    cln_sink_id = str(cln_rpc(cln_sink, "getinfo").get("id") or "")
+    lnd_sink_id = str(lnd_rpc(lnd_sink, "getinfo").get("identity_pubkey") or "")
+    if not cln_sink_id or not lnd_sink_id:
+        raise RunnerError("return-path sink identity readback failed")
+    if any(
+        row.get("peer_id") == cln_sink_id and row.get("state") == "CHANNELD_NORMAL"
+        for row in channel_rows(cln_payer)
+    ):
+        raise RunnerError("CLN payer already has an active channel to the CLN sink")
+    if any(
+        row.get("remote_pubkey") == lnd_sink_id
+        for row in _live_lnd_channels(lnd_payer)
+    ):
+        raise RunnerError("LND payer already has a channel to the LND sink")
+
+    funding_sats = capacity_sats + RETURN_PATH_FUNDING_BUFFER_SATS
+    cln_address = onchain_address(cln_rpc(cln_payer, "newaddr"))
+    lnd_address = lnd_rpc(lnd_payer, "newaddress", "p2tr").get("address")
+    _send_fake_onchain_funds(bridge, network_id, cln_address, funding_sats)
+    _checkpoint(path, state, "return_path_cln_wallet_funded", amount_sats=funding_sats)
+    _send_fake_onchain_funds(bridge, network_id, str(lnd_address or ""), funding_sats)
+    _checkpoint(path, state, "return_path_lnd_wallet_funded", amount_sats=funding_sats)
+
+    _connect_cln(cln_payer, cln_sink_id, "cln-sink")
+    cln_open = cln_rpc(cln_payer, "fundchannel", cln_sink_id, capacity_sats)
+    cln_channel_id = cln_open.get("channel_id")
+    if not isinstance(cln_channel_id, str) or not cln_channel_id:
+        raise RunnerError("CLN return-path funding returned no channel id")
+    state["return_paths"] = [{
+        "family": "cln", "source_container": cln_payer,
+        "sink_container": cln_sink, "peer_id": cln_sink_id,
+        "channel_id": cln_channel_id, "capacity_sats": capacity_sats,
+    }]
+    _checkpoint(path, state, "return_path_open_dispatched", family="cln")
+    _mine(bridge, network_id, 6)
+
+    _connect_lnd(lnd_payer, lnd_sink_id, "lnd-sink")
+    lnd_open = lnd_rpc(
+        lnd_payer, "openchannel", "--node_key", lnd_sink_id,
+        "--local_amt", capacity_sats,
+    )
+    state["return_paths"].append({
+        "family": "lnd", "source_container": lnd_payer,
+        "sink_container": lnd_sink, "peer_id": lnd_sink_id,
+        "funding_txid": lnd_open.get("funding_txid"),
+        "capacity_sats": capacity_sats,
+    })
+    _checkpoint(path, state, "return_path_open_dispatched", family="lnd")
+    _mine(bridge, network_id, 6)
+    state["return_paths"] = _wait_return_paths(state["return_paths"])
+    # Use a controlled near-zero-cost fixture: economics remain measured on
+    # contender channels, while this path isolates route availability.
+    cln_rpc(
+        cln_payer, "setchannel", state["return_paths"][0]["short_channel_id"], 1, 1
+    )
+    lnd_row = next(
+        row for row in _live_lnd_channels(lnd_payer)
+        if row.get("channel_point") == state["return_paths"][1]["channel_point"]
+    )
+    edge = lnd_rpc(lnd_payer, "getchaninfo", "--chan_id", lnd_row["scid"])
+    local_id = str(lnd_rpc(lnd_payer, "getinfo")["identity_pubkey"])
+    if edge.get("node1_pub") == local_id:
+        policy = edge.get("node1_policy")
+    elif edge.get("node2_pub") == local_id:
+        policy = edge.get("node2_policy")
+    else:
+        raise RunnerError("LND return-path graph edge lacks the payer node")
+    if not isinstance(policy, dict):
+        raise RunnerError("LND return-path policy readback failed")
+    _set_lnd_policy(lnd_payer, {
+        "channel_point": lnd_row["channel_point"],
+        "fee_base_msat": 1, "fee_ppm": 1,
+        "time_lock_delta": int(policy["time_lock_delta"]),
+        "min_htlc_msat": int(policy["min_htlc"]),
+        "max_htlc_msat": int(policy["max_htlc_msat"]),
+    })
+    state["return_path_fixture"] = {
+        "present_during_scored_traffic": False,
+        "fee_base_msat": 1,
+        "fee_ppm": 1,
+        "purpose": "isolate post-pressure circular-route availability",
+    }
+    state["status"] = "return_paths_ready"
+    _checkpoint(path, state, "return_paths_ready", paths=state["return_paths"])
+    return state
+
+
 def active_channels(container: str) -> list[dict[str, Any]]:
     rows = channel_rows(container)
     return [
@@ -699,7 +1111,12 @@ def restore_background(state: dict[str, Any]) -> bool:
 def enable_full_stack(
     *, replica: int, results_dir: Path, spend_cap_sats: int
 ) -> dict[str, Any]:
-    """Enable equal rebalance authority without reopening topology authority."""
+    """Enable native rebalancing without reopening topology authority.
+
+    ``spend_cap_sats`` is retained as a CLI/API compatibility name but applies
+    only to Revenue Ops' native budget. CLBOSS remains uncapped, matching its
+    ordinary behavior; its actual circular-payment cost is still measured.
+    """
     path = state_path(results_dir, replica)
     state = read_state(path)
     if state.get("status") not in {"isolated_fee_only_ready", "smoke_complete"}:
@@ -730,6 +1147,7 @@ def enable_full_stack(
         ("clboss-xrebalance-gain", "1"),
         ("clboss-xrebalance-grant", "0"),
         ("clboss-xrebalance-route-cost-floor", "auto"),
+        ("clboss-xrebalance-per-hour", str(CLBOSS_REBALANCES_PER_HOUR)),
     ):
         cln_rpc(clboss_container, "setconfig", key, value)
     cln_rpc(clboss_container, "setconfig", "clboss-rebalance-mode", "xrebalance")
@@ -739,6 +1157,7 @@ def enable_full_stack(
         "clboss-xrebalance-gain": "1",
         "clboss-xrebalance-grant": "0",
         "clboss-xrebalance-route-cost-floor": "auto",
+        "clboss-xrebalance-per-hour": str(CLBOSS_REBALANCES_PER_HOUR),
     }
     for key, value in expected.items():
         row = configs.get(key, {}) if isinstance(configs, dict) else {}
@@ -747,15 +1166,95 @@ def enable_full_stack(
 
     state["league"] = "full_stack"
     state["full_stack"] = {
-        "spend_cap_sats_per_controller": spend_cap_sats,
+        "revenue_rebalance_allowance_sats": spend_cap_sats,
+        "clboss_spend_policy": "native_unbounded",
         "revenue_baseline_non_rebalance_sats": baseline_non_rebalance_sats,
         "revenue_runtime_budget_sats": revenue_budget_sats,
         "revenue_rebalance_cost_baseline_msat": rebalance_cost_msat(revenue_container),
         "clboss_rebalance_cost_baseline_msat": rebalance_cost_msat(clboss_container),
         "clboss": expected,
+        "cadence": {
+            "revenue_seconds": TOURNAMENT_CYCLE_SECONDS,
+            "clboss_rebalances_per_hour": CLBOSS_REBALANCES_PER_HOUR,
+        },
     }
     state["status"] = "isolated_full_stack_ready"
     _checkpoint(path, state, "full_stack_enabled", controls=state["full_stack"])
+    return state
+
+
+def accelerate_controllers(*, replica: int, results_dir: Path) -> dict[str, Any]:
+    """Restart Revenue Ops at the lab cadence and retune CLBOSS dynamically."""
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if state.get("status") not in {
+        "isolated_full_stack_ready", "smoke_complete", "return_paths_ready",
+    }:
+        raise RunnerError(f"replica is not cadence-ready: {state.get('status')}")
+    full_stack = state.get("full_stack")
+    if not isinstance(full_stack, dict):
+        raise RunnerError("cadence acceleration requires full-stack controls")
+    assignment = state["assignment"]
+    contenders = state["contenders"]
+    revenue_container = contenders[assignment["revenue_ops"]]["container"]
+    clboss_container = contenders[assignment["clboss"]]["container"]
+    budget_sats = nonnegative_int(
+        full_stack.get("revenue_runtime_budget_sats"), "Revenue runtime budget"
+    )
+    if "revenue_rebalance_allowance_sats" not in full_stack:
+        full_stack["revenue_rebalance_allowance_sats"] = nonnegative_int(
+            full_stack.get("spend_cap_sats_per_controller"),
+            "legacy Revenue rebalance allowance",
+        )
+    full_stack.pop("spend_cap_sats_per_controller", None)
+    stopped = _run(
+        [
+            "docker", "exec", revenue_container, "lightning-cli", "--network=regtest",
+            "-k", "plugin", "subcommand=stop", f"plugin={REVENUE_PLUGIN}",
+        ],
+        check=False,
+    )
+    if stopped.returncode != 0:
+        detail = (stopped.stderr or stopped.stdout or "").strip()
+        raise RunnerError(f"Revenue cadence restart could not stop plugin: {detail}")
+    cln_rpc(
+        revenue_container, "-k", "plugin", "subcommand=start", f"plugin={REVENUE_PLUGIN}",
+        "revenue-ops-dry-run=false",
+        f"revenue-ops-daily-budget-sats={budget_sats}",
+        f"revenue-ops-flow-interval={TOURNAMENT_CYCLE_SECONDS}",
+        f"revenue-ops-fee-interval={TOURNAMENT_CYCLE_SECONDS}",
+        f"revenue-ops-rebalance-interval={TOURNAMENT_CYCLE_SECONDS}",
+    )
+    configs = cln_rpc(revenue_container, "listconfigs").get("configs", {})
+    for key in (
+        "revenue-ops-flow-interval", "revenue-ops-fee-interval",
+        "revenue-ops-rebalance-interval",
+    ):
+        row = configs.get(key, {}) if isinstance(configs, dict) else {}
+        if str(row.get("value_str")) != str(TOURNAMENT_CYCLE_SECONDS):
+            raise RunnerError(f"Revenue cadence restart mismatch for {key}")
+    status = cln_rpc(revenue_container, "revenue-status")
+    controls = status.get("operator_controls", {}).get("values", {})
+    if controls.get("paused") is not False or controls.get("daily_budget_sats") != budget_sats:
+        raise RunnerError("Revenue cadence restart changed operator controls")
+    cln_rpc(
+        clboss_container, "setconfig", "clboss-xrebalance-per-hour",
+        str(CLBOSS_REBALANCES_PER_HOUR),
+    )
+    cln_rpc(clboss_container, "setconfig", "clboss-rebalance-mode", "xrebalance")
+    clboss_configs = cln_rpc(clboss_container, "listconfigs").get("configs", {})
+    cadence_row = (
+        clboss_configs.get("clboss-xrebalance-per-hour", {})
+        if isinstance(clboss_configs, dict) else {}
+    )
+    if str(cadence_row.get("value_str")) != str(CLBOSS_REBALANCES_PER_HOUR):
+        raise RunnerError("CLBOSS accelerated cadence readback mismatch")
+    full_stack["clboss_spend_policy"] = "native_unbounded"
+    full_stack["cadence"] = {
+        "revenue_seconds": TOURNAMENT_CYCLE_SECONDS,
+        "clboss_rebalances_per_hour": CLBOSS_REBALANCES_PER_HOUR,
+    }
+    _checkpoint(path, state, "controllers_accelerated", cadence=full_stack["cadence"])
     return state
 
 
@@ -1377,6 +1876,11 @@ def setup(
             wait_wallet_funds(state["contenders"][identity]["container"])
             _checkpoint(path, state, "wallet_funded", identity=identity)
 
+        state["payer_wallet_topups"] = ensure_payer_wallet_funds(bridge, network_id)
+        _checkpoint(
+            path, state, "payer_wallets_ready", balances=state["payer_wallet_topups"]
+        )
+
         def checkpoint_channel(row: dict[str, Any]) -> None:
             state["channels"].append(row)
             _checkpoint(path, state, "channel_open_dispatched", channel=row)
@@ -1469,51 +1973,39 @@ def rebalance_cost_msat(container: str) -> int:
     return cost
 
 
-def enforce_clboss_spend_cap(state: dict[str, Any]) -> dict[str, Any] | None:
-    """Disable CLBOSS rebalancing once its full-stack budget is exhausted.
-
-    CLBOSS does not expose a native absolute rebalance budget.  The tournament
-    therefore polls completed circular-payment costs between traffic entries
-    and fails closed by switching its rebalance mode off at the configured cap.
-    """
-    controls = state.get("full_stack")
-    if not isinstance(controls, dict):
-        return None
-    cap_msat = nonnegative_int(
-        controls.get("spend_cap_sats_per_controller"),
-        "full-stack spend cap",
-    ) * 1000
-    baseline_msat = nonnegative_int(
-        controls.get("clboss_rebalance_cost_baseline_msat"),
-        "CLBOSS rebalance-cost baseline",
-    )
-    assignment = state.get("assignment")
-    contenders = state.get("contenders")
-    if not isinstance(assignment, dict) or not isinstance(contenders, dict):
-        raise RunnerError("full-stack state is missing contender assignment")
-    identity = assignment.get("clboss")
-    contender = contenders.get(identity) if isinstance(identity, str) else None
-    container = contender.get("container") if isinstance(contender, dict) else None
-    if not isinstance(container, str) or not container:
-        raise RunnerError("full-stack state is missing the CLBOSS container")
-
-    cumulative_msat = rebalance_cost_msat(container)
-    if cumulative_msat < baseline_msat:
-        raise RunnerError("CLBOSS cumulative rebalance cost regressed")
-    spent_msat = cumulative_msat - baseline_msat
-    disabled_now = False
-    if spent_msat >= cap_msat and not controls.get("clboss_spend_cap_enforced"):
-        cln_rpc(container, "setconfig", "clboss-rebalance-mode", "off")
-        controls["clboss_spend_cap_enforced"] = True
-        controls["clboss_spend_cap_enforced_at_msat"] = spent_msat
-        disabled_now = True
-    controls["clboss_rebalance_cost_msat"] = spent_msat
+def rebalance_totals(container: str) -> dict[str, int]:
+    """Return completed circular-payment count, volume, and routing cost."""
+    node_id = str(cln_rpc(container, "getinfo").get("id") or "")
+    payments = cln_rpc(container, "listsendpays").get("payments", [])
+    if not node_id or not isinstance(payments, list):
+        raise RunnerError(f"malformed circular-payment readback for {container}")
+    completed = [
+        row for row in payments
+        if isinstance(row, dict)
+        and row.get("status") == "complete"
+        and row.get("destination") == node_id
+    ]
+    delivered = sum(msat_value(row.get("amount_msat", 0)) for row in completed)
+    sent = sum(msat_value(row.get("amount_sent_msat", 0)) for row in completed)
+    if sent < delivered:
+        raise RunnerError(f"circular payment cost regressed on {container}")
     return {
-        "cap_msat": cap_msat,
-        "spent_msat": spent_msat,
-        "cap_enforced": bool(controls.get("clboss_spend_cap_enforced")),
-        "disabled_now": disabled_now,
+        "completed_count": len(completed),
+        "delivered_msat": delivered,
+        "cost_msat": sent - delivered,
     }
+
+
+def rebalance_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    keys = ("completed_count", "delivered_msat", "cost_msat")
+    delta = {
+        key: nonnegative_int(after.get(key), f"after {key}")
+        - nonnegative_int(before.get(key), f"before {key}")
+        for key in keys
+    }
+    if any(value < 0 for value in delta.values()):
+        raise RunnerError("circular-payment counters regressed")
+    return delta
 
 
 def contender_totals(container: str) -> Totals:
@@ -1984,16 +2476,6 @@ def run_smoke(
                 )
             records.extend(completed)
             progress["records"] = records
-            spend_monitor = enforce_clboss_spend_cap(state)
-            if spend_monitor is not None:
-                progress["clboss_spend_monitor"] = spend_monitor
-                if spend_monitor["disabled_now"]:
-                    _checkpoint(
-                        path,
-                        state,
-                        "clboss_spend_cap_enforced",
-                        monitor=spend_monitor,
-                    )
             write_json_atomic(progress_path, progress)
             if has_terminal_payment_failure(completed):
                 break
@@ -2141,6 +2623,202 @@ def status(replica: int, results_dir: Path) -> dict[str, Any]:
     return {"state": state, "live": live}
 
 
+def return_path_snapshot(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    paths = state.get("return_paths")
+    if not isinstance(paths, list) or len(paths) != 2:
+        raise RunnerError("runner state lacks exactly two return paths")
+    snapshot: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        if not isinstance(path, dict):
+            raise RunnerError("malformed return-path state")
+        family = path.get("family")
+        source = path.get("source_container")
+        if not isinstance(family, str) or not isinstance(source, str):
+            raise RunnerError("malformed return-path identity")
+        if family == "cln":
+            matches = [
+                row for row in channel_rows(source)
+                if row.get("channel_id") == path.get("channel_id")
+            ]
+            if len(matches) != 1:
+                raise RunnerError("CLN return-path snapshot is not unique")
+            row = matches[0]
+            snapshot[family] = {
+                "active": row.get("state") == "CHANNELD_NORMAL",
+                "short_channel_id": row.get("short_channel_id"),
+                "local_balance_sats": msat_value(
+                    row.get("to_us_msat", row.get("our_amount_msat", 0))
+                ) // 1000,
+                "capacity_sats": msat_value(
+                    row.get("total_msat", row.get("amount_msat", 0))
+                ) // 1000,
+            }
+        elif family == "lnd":
+            matches = [
+                row for row in _live_lnd_channels(source)
+                if row.get("channel_point") == path.get("channel_point")
+            ]
+            if len(matches) != 1:
+                raise RunnerError("LND return-path snapshot is not unique")
+            row = matches[0]
+            snapshot[family] = {
+                "active": row.get("active") is True,
+                "short_channel_id": row.get("scid_str"),
+                "local_balance_sats": nonnegative_int(
+                    row.get("local_balance"), "LND return local balance"
+                ),
+                "capacity_sats": nonnegative_int(
+                    row.get("capacity"), "LND return capacity"
+                ),
+            }
+        else:
+            raise RunnerError(f"unknown return-path family: {family!r}")
+    if set(snapshot) != {"cln", "lnd"}:
+        raise RunnerError("return-path snapshot lacks both client families")
+    return snapshot
+
+
+def resume_controlled_depletion_controllers(
+    path: Path, state: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Release a prepared fixture without forcing either rebalance cycle."""
+    fixture = state.get("controlled_depletion")
+    if not isinstance(fixture, dict) or fixture.get("controllers_held") is not True:
+        return None
+    assignment = state["assignment"]
+    contenders = state["contenders"]
+    revenue_container = contenders[assignment["revenue_ops"]]["container"]
+    clboss_container = contenders[assignment["clboss"]]["container"]
+    cln_rpc(revenue_container, "revenue-config", "set", "paused", "false")
+    controls = (
+        cln_rpc(revenue_container, "revenue-status")
+        .get("operator_controls", {})
+        .get("values", {})
+    )
+    if controls.get("paused") is not False:
+        raise RunnerError("Revenue Ops did not resume for controlled observation")
+    cln_rpc(
+        clboss_container,
+        "setconfig",
+        "clboss-xrebalance-per-hour",
+        str(CLBOSS_REBALANCES_PER_HOUR),
+    )
+    cln_rpc(clboss_container, "setconfig", "clboss-rebalance-mode", "xrebalance")
+    status = cln_rpc(clboss_container, "clboss-status")
+    if status.get("rebalance_mode", {}).get("mode") != "xrebalance":
+        raise RunnerError("CLBOSS did not resume for controlled observation")
+    fixture["controllers_held"] = False
+    fixture["controllers_resumed_at"] = int(time.time())
+    activation = {
+        "revenue_ops": "native_unpaused",
+        "clboss": "native_xrebalance_unbounded",
+        "forced_cycles": False,
+        "at": fixture["controllers_resumed_at"],
+    }
+    _checkpoint(path, state, "controlled_depletion_controllers_resumed", activation=activation)
+    return activation
+
+
+def observe_rebalances(
+    *, replica: int, results_dir: Path, observe_seconds: float
+) -> dict[str, Any]:
+    """Measure autonomous controllers after synthetic return liquidity appears."""
+    if observe_seconds < 0:
+        raise RunnerError("observation seconds must be nonnegative")
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if state.get("status") != "return_paths_ready":
+        raise RunnerError(f"replica is not ready for rebalance observation: {state.get('status')}")
+    assignment = state.get("assignment")
+    contenders = state.get("contenders")
+    if not isinstance(assignment, dict) or not isinstance(contenders, dict):
+        raise RunnerError("runner state lacks controller assignment")
+    containers = {
+        controller: contenders[identity]["container"]
+        for controller, identity in assignment.items()
+    }
+    before_totals = {
+        controller: contender_totals(container)
+        for controller, container in containers.items()
+    }
+    before_rebalances = {
+        controller: rebalance_totals(container)
+        for controller, container in containers.items()
+    }
+    return_before = return_path_snapshot(state)
+    activation = resume_controlled_depletion_controllers(path, state)
+    diagnostics_before = {
+        "revenue_ops": cln_rpc(
+            containers["revenue_ops"], "revenue-rebalance-debug", "summary_only=true"
+        ),
+        "clboss": cln_rpc(containers["clboss"], "clboss-status"),
+    }
+    started = time.time()
+    deadline = time.monotonic() + observe_seconds
+    while time.monotonic() < deadline:
+        time.sleep(min(NATIVE_CYCLE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+    after_totals = {
+        controller: contender_totals(container)
+        for controller, container in containers.items()
+    }
+    after_rebalances = {
+        controller: rebalance_totals(container)
+        for controller, container in containers.items()
+    }
+    return_after = return_path_snapshot(state)
+    diagnostics_after = {
+        "revenue_ops": cln_rpc(
+            containers["revenue_ops"], "revenue-rebalance-debug", "summary_only=true"
+        ),
+        "clboss": cln_rpc(containers["clboss"], "clboss-status"),
+    }
+    full_stack = state.get("full_stack")
+    if not isinstance(full_stack, dict):
+        raise RunnerError("rebalance observation lacks full-stack controls")
+    allowance_sats = nonnegative_int(
+        full_stack.get("revenue_rebalance_allowance_sats"),
+        "Revenue rebalance allowance",
+    )
+    if allowance_sats == 0:
+        raise RunnerError("Revenue rebalance allowance must be positive")
+    controller_rows = {}
+    safety_violations = []
+    for controller in containers:
+        movement = rebalance_delta(before_rebalances[controller], after_rebalances[controller])
+        if (
+            controller == "revenue_ops"
+            and movement["cost_msat"] > allowance_sats * 1000
+        ):
+            safety_violations.append("revenue_ops:native_budget_exceeded")
+        controller_rows[controller] = {
+            "circular_payments": movement,
+            "balance_before": asdict(before_totals[controller]),
+            "balance_after": asdict(after_totals[controller]),
+            "worst_imbalance_improvement_ppm": (
+                before_totals[controller].worst_channel_imbalance_ppm
+                - after_totals[controller].worst_channel_imbalance_ppm
+            ),
+        }
+    result = {
+        "schema": "polar-clboss-rebalance-observation-v1",
+        "replica": f"replica-{replica}",
+        "duration_seconds": max(0.0, time.time() - started),
+        "fixture": state.get("return_path_fixture"),
+        "controlled_depletion": state.get("controlled_depletion"),
+        "controller_activation": activation,
+        "return_paths": {"before": return_before, "after": return_after},
+        "controllers": controller_rows,
+        "diagnostics": {"before": diagnostics_before, "after": diagnostics_after},
+        "clboss_spend_policy": "native_unbounded",
+        "safety_violations": safety_violations,
+    }
+    state["status"] = "rebalance_observed"
+    block_id = f"rebalance-{int(started)}"
+    _checkpoint(path, state, "rebalance_observed", block=block_id, result=result)
+    write_json_atomic(path.parent / f"{block_id}.json", result)
+    return result
+
+
 def _stop_plugins(state: dict[str, Any]) -> None:
     assignment = state.get("assignment", {})
     contenders = state.get("contenders", {})
@@ -2167,6 +2845,102 @@ def _stop_plugins(state: dict[str, Any]) -> None:
                 pass
 
 
+def _close_return_paths(state: dict[str, Any]) -> bool:
+    """Dispatch cooperative closes for checkpointed synthetic lab channels."""
+    paths = state.get("return_paths")
+    if not isinstance(paths, list) or state.get("return_path_closes_dispatched") is True:
+        return False
+    for path in paths:
+        if not isinstance(path, dict):
+            raise RunnerError("malformed return path during cleanup")
+        family = path.get("family")
+        source = path.get("source_container")
+        if not isinstance(source, str):
+            raise RunnerError("return path lacks cleanup source")
+        if family == "cln":
+            channel_id = path.get("short_channel_id") or path.get("channel_id")
+            if not isinstance(channel_id, str) or not channel_id:
+                raise RunnerError("CLN return path lacks cleanup channel id")
+            matches = [
+                row for row in channel_rows(source)
+                if row.get("channel_id") == path.get("channel_id")
+            ]
+            if len(matches) != 1:
+                raise RunnerError("CLN return path lacks unique cleanup state")
+            if matches[0].get("state") not in {
+                "CLOSINGD_COMPLETE", "ONCHAIN", "CLOSED",
+            }:
+                result = _run(
+                    [
+                        "docker", "exec", "-u", "clightning", source,
+                        "lightning-cli", "--network=regtest", "close", channel_id,
+                    ],
+                    check=False,
+                    timeout=60,
+                )
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout or "").strip()
+                    raise RunnerError(f"CLN return-path cooperative close failed: {detail}")
+        elif family == "lnd":
+            channel_point = path.get("channel_point")
+            if not isinstance(channel_point, str) or not channel_point:
+                # A funding RPC can be checkpointed before the active channel
+                # is resolved. Recover its exact point from the live peer.
+                matches = [
+                    row for row in _live_lnd_channels(source)
+                    if row.get("remote_pubkey") == path.get("peer_id")
+                ]
+                if len(matches) != 1 or not isinstance(matches[0].get("channel_point"), str):
+                    raise RunnerError("LND return path lacks unique cleanup channel point")
+                channel_point = matches[0]["channel_point"]
+            result = _run(
+                [
+                    "docker", "exec", "-u", "lnd", source,
+                    "lncli", "--network=regtest", "closechannel",
+                    "--chan_point", channel_point,
+                ],
+                check=False,
+                timeout=60,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()
+                raise RunnerError(f"LND return-path cooperative close failed: {detail}")
+        else:
+            raise RunnerError(f"unknown return-path family during cleanup: {family!r}")
+    state["return_path_closes_dispatched"] = True
+    return True
+
+
+def _live_return_paths(state: dict[str, Any]) -> dict[str, list[str]]:
+    live: dict[str, list[str]] = {}
+    for path in state.get("return_paths", []):
+        if not isinstance(path, dict):
+            live.setdefault("malformed", []).append("unknown")
+            continue
+        family = str(path.get("family") or "unknown")
+        source = path.get("source_container")
+        if not isinstance(source, str):
+            live.setdefault(family, []).append("missing-source")
+            continue
+        if family == "cln":
+            matches = [
+                row for row in channel_rows(source)
+                if row.get("channel_id") == path.get("channel_id")
+                and row.get("state") not in {"ONCHAIN", "CLOSED"}
+            ]
+            live[family] = [
+                str(row.get("short_channel_id") or row.get("channel_id") or "unknown")
+                for row in matches
+            ]
+        elif family == "lnd":
+            live[family] = [
+                str(row.get("channel_point") or "unknown")
+                for row in _live_lnd_channels(source)
+                if row.get("channel_point") == path.get("channel_point")
+            ]
+    return {family: rows for family, rows in live.items() if rows}
+
+
 def cleanup(bridge: PolarMcp, *, replica: int, results_dir: Path) -> dict[str, Any]:
     path = state_path(results_dir, replica)
     state = read_state(path)
@@ -2176,12 +2950,17 @@ def cleanup(bridge: PolarMcp, *, replica: int, results_dir: Path) -> dict[str, A
         _checkpoint(path, state, "acquisition_treatment_restored")
     _stop_plugins(state)
     _checkpoint(path, state, "controllers_stopped_or_paused")
+    if _close_return_paths(state):
+        _checkpoint(path, state, "return_path_closes_dispatched")
     if restore_background(state):
         _checkpoint(path, state, "background_policies_restored")
     # Confirm any recently dispatched funding transaction before classifying
     # channels.  AWAITING_LOCKIN is still live state and must never be hidden
     # by the active-channel filter used by traffic readiness.
     if any(docker_running(row["container"]) for row in state.get("contenders", {}).values()):
+        _mine(bridge, int(state["network_id"]), 6)
+        time.sleep(3)
+    if state.get("return_path_closes_dispatched") is True:
         _mine(bridge, int(state["network_id"]), 6)
         time.sleep(3)
     remaining: dict[str, list[str]] = {}
@@ -2234,6 +3013,20 @@ def cleanup(bridge: PolarMcp, *, replica: int, results_dir: Path) -> dict[str, A
         state["status"] = "cleanup_incomplete"
         _checkpoint(path, state, "cleanup_incomplete", remaining=remaining)
         raise RunnerError(f"cleanup refused to remove containers with active channels: {remaining}")
+    return_path_deadline = time.monotonic() + 60
+    return_paths_remaining = _live_return_paths(state)
+    while return_paths_remaining and time.monotonic() < return_path_deadline:
+        time.sleep(2)
+        return_paths_remaining = _live_return_paths(state)
+    if return_paths_remaining:
+        state["status"] = "cleanup_incomplete"
+        _checkpoint(
+            path, state, "cleanup_incomplete",
+            return_paths_remaining=return_paths_remaining,
+        )
+        raise RunnerError(
+            f"cleanup found active synthetic return paths: {return_paths_remaining}"
+        )
     for row in state.get("contenders", {}).values():
         name = row["container"]
         if docker_exists(name):
@@ -2250,7 +3043,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "preflight", "setup", "isolate", "retune", "full-stack",
             "acquire", "restore-acquire", "auto-acquire", "retain",
-            "restore-auto", "smoke", "status", "cleanup",
+            "restore-auto", "accelerate", "smoke", "return-path", "observe-rebalance",
+            "deplete", "status", "cleanup",
         ),
     )
     parser.add_argument("--network-id", type=positive_int, default=NETWORK_ID)
@@ -2281,7 +3075,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="both",
     )
     parser.add_argument("--background-ppm", type=positive_int, default=10_000)
-    parser.add_argument("--spend-cap-sats", type=positive_int, default=1_000)
+    parser.add_argument(
+        "--revenue-rebalance-budget-sats", "--spend-cap-sats",
+        dest="spend_cap_sats", type=positive_int, default=1_000,
+        help="Revenue Ops-only native rebalance allowance; CLBOSS remains uncapped",
+    )
+    parser.add_argument(
+        "--return-capacity-sats", type=positive_int,
+        default=RETURN_PATH_CAPACITY_SATS,
+    )
+    parser.add_argument(
+        "--depletion-sats", type=positive_int, default=CONTROLLED_DEPLETION_SATS,
+    )
+    parser.add_argument("--observe-seconds", type=float, default=360.0)
     parser.add_argument("--acquisition-family", choices=("cln", "lnd"), default="cln")
     parser.add_argument("--acquisition-ppm", type=nonnegative_arg, default=2)
     parser.add_argument("--retention-ppm", type=positive_int, default=1)
@@ -2299,8 +3105,8 @@ def main() -> int:
     else:
         if args.command in {
             "setup", "isolate", "retune", "full-stack", "acquire",
-            "restore-acquire", "auto-acquire", "retain", "restore-auto",
-            "smoke", "cleanup"
+            "restore-acquire", "auto-acquire", "retain", "restore-auto", "accelerate",
+            "smoke", "return-path", "observe-rebalance", "deplete", "cleanup"
         } and not args.apply:
             raise RunnerError(f"{args.command} mutates the fake-sat lab; pass --apply")
         if args.command == "setup":
@@ -2353,6 +3159,11 @@ def main() -> int:
                 replica=args.replica,
                 results_dir=args.results_dir,
             )
+        elif args.command == "accelerate":
+            result = accelerate_controllers(
+                replica=args.replica,
+                results_dir=args.results_dir,
+            )
         elif args.command == "smoke":
             if args.pause_seconds < 0:
                 raise RunnerError("pause seconds must be nonnegative")
@@ -2363,6 +3174,26 @@ def main() -> int:
                 traffic_pattern=args.traffic_pattern,
                 amount_profile=args.amount_profile,
                 traffic_family=args.traffic_family,
+            )
+        elif args.command == "return-path":
+            result = provision_return_paths(
+                bridge,
+                replica=args.replica,
+                results_dir=args.results_dir,
+                capacity_sats=args.return_capacity_sats,
+            )
+        elif args.command == "deplete":
+            result = prepare_controlled_depletion(
+                bridge,
+                replica=args.replica,
+                results_dir=args.results_dir,
+                amount_sats=args.depletion_sats,
+            )
+        elif args.command == "observe-rebalance":
+            result = observe_rebalances(
+                replica=args.replica,
+                results_dir=args.results_dir,
+                observe_seconds=args.observe_seconds,
             )
         elif args.command == "status":
             result = status(args.replica, args.results_dir)

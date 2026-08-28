@@ -249,68 +249,6 @@ def test_rebalance_cost_counts_only_completed_self_payments(monkeypatch):
     assert runner.rebalance_cost_msat("polar-n4-clboss-r1-identity-a") == 250
 
 
-def test_clboss_spend_cap_disables_rebalancing_at_limit(monkeypatch):
-    runner = load_runner()
-    state = {
-        "assignment": {"clboss": "identity-a"},
-        "contenders": {
-            "identity-a": {"container": "polar-n4-clboss-r1-identity-a"},
-        },
-        "full_stack": {
-            "spend_cap_sats_per_controller": 1_000,
-            "clboss_rebalance_cost_baseline_msat": 250,
-        },
-    }
-    calls = []
-    monkeypatch.setattr(runner, "rebalance_cost_msat", lambda _container: 1_000_250)
-    monkeypatch.setattr(
-        runner, "cln_rpc", lambda container, method, *args: calls.append((container, method, args)) or {}
-    )
-
-    monitor = runner.enforce_clboss_spend_cap(state)
-
-    assert monitor == {
-        "cap_msat": 1_000_000,
-        "spent_msat": 1_000_000,
-        "cap_enforced": True,
-        "disabled_now": True,
-    }
-    assert calls == [
-        (
-            "polar-n4-clboss-r1-identity-a",
-            "setconfig",
-            ("clboss-rebalance-mode", "off"),
-        )
-    ]
-    assert state["full_stack"]["clboss_spend_cap_enforced_at_msat"] == 1_000_000
-
-
-def test_clboss_spend_cap_does_not_disable_below_limit(monkeypatch):
-    runner = load_runner()
-    state = {
-        "assignment": {"clboss": "identity-b"},
-        "contenders": {
-            "identity-b": {"container": "polar-n4-clboss-r2-identity-b"},
-        },
-        "full_stack": {
-            "spend_cap_sats_per_controller": 1_000,
-            "clboss_rebalance_cost_baseline_msat": 500,
-        },
-    }
-    monkeypatch.setattr(runner, "rebalance_cost_msat", lambda _container: 999_500)
-    monkeypatch.setattr(
-        runner,
-        "cln_rpc",
-        lambda *_args: pytest.fail("CLBOSS must stay enabled below the cap"),
-    )
-
-    monitor = runner.enforce_clboss_spend_cap(state)
-
-    assert monitor["spent_msat"] == 999_000
-    assert monitor["cap_enforced"] is False
-    assert monitor["disabled_now"] is False
-
-
 def test_setup_spend_baseline_waits_for_late_accounting(monkeypatch):
     runner = load_runner()
     samples = iter((0, 0, 310))
@@ -1076,7 +1014,6 @@ def test_completed_smoke_emits_strict_family_economics(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runner, "contender_totals", lambda container: next(samples[container])
     )
-    monkeypatch.setattr(runner, "enforce_clboss_spend_cap", lambda _state: None)
     monkeypatch.setattr(
         runner, "run_reconciled_traffic",
         lambda *_args, **_kwargs: [{
@@ -1197,6 +1134,7 @@ def test_full_stack_offsets_revenue_setup_spend_and_pins_clboss_controls(
         "clboss-xrebalance-gain": "1",
         "clboss-xrebalance-grant": "0",
         "clboss-xrebalance-route-cost-floor": "auto",
+        "clboss-xrebalance-per-hour": str(runner.CLBOSS_REBALANCES_PER_HOUR),
     }
 
     def rpc(container, method, *args):
@@ -1228,10 +1166,198 @@ def test_full_stack_offsets_revenue_setup_spend_and_pins_clboss_controls(
 
     assert state["status"] == "isolated_full_stack_ready"
     assert state["full_stack"]["revenue_runtime_budget_sats"] == 1_369
+    assert state["full_stack"]["revenue_rebalance_allowance_sats"] == 1_000
+    assert state["full_stack"]["clboss_spend_policy"] == "native_unbounded"
     assert any(
         method == "revenue-config" and args[-1] == "1369"
         for _container, method, args in calls
     )
+    assert any(
+        method == "setconfig" and args == ("clboss-rebalance-mode", "xrebalance")
+        for _container, method, args in calls
+    )
+
+
+def test_accelerate_restarts_revenue_and_leaves_clboss_spending_unbounded(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 7)
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "network_id": 4,
+        "status": "return_paths_ready",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "full_stack": {
+            "revenue_runtime_budget_sats": 1_310,
+            "spend_cap_sats_per_controller": 1_000,
+        },
+    })
+    calls = []
+
+    def rpc(container, method, *args):
+        calls.append((container, method, args))
+        if method == "listconfigs":
+            if container == "revenue":
+                return {"configs": {
+                    key: {"value_str": str(runner.TOURNAMENT_CYCLE_SECONDS)}
+                    for key in (
+                        "revenue-ops-flow-interval", "revenue-ops-fee-interval",
+                        "revenue-ops-rebalance-interval",
+                    )
+                }}
+            return {"configs": {
+                "clboss-xrebalance-per-hour": {
+                    "value_str": str(runner.CLBOSS_REBALANCES_PER_HOUR)
+                }
+            }}
+        if method == "revenue-status":
+            return {"operator_controls": {"values": {
+                "paused": False, "daily_budget_sats": 1_310,
+            }}}
+        return {}
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(
+        runner, "_run",
+        lambda *_args, **_kwargs: type(
+            "Result", (), {"returncode": 0, "stdout": "", "stderr": ""}
+        )(),
+    )
+
+    state = runner.accelerate_controllers(replica=7, results_dir=tmp_path)
+
+    assert state["full_stack"]["clboss_spend_policy"] == "native_unbounded"
+    assert state["full_stack"]["revenue_rebalance_allowance_sats"] == 1_000
+    assert "spend_cap_sats_per_controller" not in state["full_stack"]
+    assert state["full_stack"]["cadence"] == {
+        "revenue_seconds": runner.TOURNAMENT_CYCLE_SECONDS,
+        "clboss_rebalances_per_hour": runner.CLBOSS_REBALANCES_PER_HOUR,
+    }
+    start = next(args for container, method, args in calls
+                 if container == "revenue" and method == "-k")
+    assert "revenue-ops-daily-budget-sats=1310" in start
+    assert all(
+        method != "revenue-rebalance-cycle" for _container, method, _args in calls
+    )
+    assert not any(
+        method == "setconfig" and args == ("clboss-rebalance-mode", "off")
+        for _container, method, args in calls
+    )
+
+
+def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 9)
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "network_id": 4,
+        "status": "isolated_full_stack_ready",
+        "league": "full_stack",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "lane_map": {},
+    })
+    snapshots = iter((
+        {
+            "revenue_ops": {
+                "source": {"short_channel_id": "1x1x0", "local_balance_ppm": 500_000},
+                "depleted": {"short_channel_id": "2x1x0", "local_balance_ppm": 500_000},
+            },
+            "clboss": {
+                "source": {"short_channel_id": "3x1x0", "local_balance_ppm": 500_000},
+                "depleted": {"short_channel_id": "4x1x0", "local_balance_ppm": 500_000},
+            },
+        },
+        {
+            "revenue_ops": {
+                "source": {"short_channel_id": "1x1x0", "local_balance_ppm": 750_000},
+                "depleted": {"short_channel_id": "2x1x0", "local_balance_ppm": 250_000},
+            },
+            "clboss": {
+                "source": {"short_channel_id": "3x1x0", "local_balance_ppm": 750_000},
+                "depleted": {"short_channel_id": "4x1x0", "local_balance_ppm": 250_000},
+            },
+        },
+    ))
+    routed = []
+    calls = []
+
+    def rpc(container, method, *args):
+        calls.append((container, method, args))
+        if method == "revenue-status":
+            return {"operator_controls": {"values": {"paused": True}}}
+        if method == "clboss-status":
+            return {"rebalance_mode": {"mode": "off"}}
+        return {}
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(
+        runner, "controlled_depletion_snapshot", lambda _state: next(snapshots)
+    )
+    monkeypatch.setattr(
+        runner,
+        "_directed_cln_fixture_payment",
+        lambda _bridge, **kwargs: routed.append(kwargs) or {
+            "controller": kwargs["label"], "amount_sats": kwargs["amount_sats"]
+        },
+    )
+
+    state = runner.prepare_controlled_depletion(
+        object(), replica=9, results_dir=tmp_path, amount_sats=750_000
+    )
+
+    assert state["status"] == "controlled_depletion_ready"
+    assert state["controlled_depletion"]["controllers_held"] is True
+    assert [row["label"] for row in routed] == ["revenue_ops", "clboss"]
+    assert [row["target_scid"] for row in routed] == ["1x1x0", "3x1x0"]
+    assert all(row["amount_sats"] == 750_000 for row in routed)
+    assert any(
+        method == "setconfig" and args == ("clboss-rebalance-mode", "off")
+        for _container, method, args in calls
+    )
+    assert all(method != "revenue-rebalance-cycle" for _container, method, _args in calls)
+
+
+def test_controlled_depletion_resume_uses_native_cycles_only(monkeypatch, tmp_path):
+    runner = load_runner()
+    path = tmp_path / "state.json"
+    state = {
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "controlled_depletion": {"controllers_held": True},
+    }
+    calls = []
+
+    def rpc(container, method, *args):
+        calls.append((container, method, args))
+        if method == "revenue-status":
+            return {"operator_controls": {"values": {"paused": False}}}
+        if method == "clboss-status":
+            return {"rebalance_mode": {"mode": "xrebalance"}}
+        return {}
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    activation = runner.resume_controlled_depletion_controllers(path, state)
+
+    assert activation["forced_cycles"] is False
+    assert state["controlled_depletion"]["controllers_held"] is False
+    assert all(method != "revenue-rebalance-cycle" for _container, method, _args in calls)
     assert any(
         method == "setconfig" and args == ("clboss-rebalance-mode", "xrebalance")
         for _container, method, args in calls
@@ -1319,12 +1445,288 @@ def test_cleanup_refuses_container_removal_while_channels_remain(monkeypatch, tm
     assert removed == []
 
 
+def test_return_paths_require_completed_full_stack_block(tmp_path):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 3)
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "network_id": 4,
+        "status": "isolated_full_stack_ready",
+        "league": "full_stack",
+        "events": [],
+    })
+
+    with pytest.raises(runner.RunnerError, match="completed full-stack"):
+        runner.provision_return_paths(
+            object(), replica=3, results_dir=tmp_path, capacity_sats=2_000_000
+        )
+
+
+def test_payer_wallet_topup_is_bounded_to_confirmed_shortfall(monkeypatch):
+    runner = load_runner()
+    funded = []
+
+    def cln(_container, method, *_args):
+        if method == "listfunds":
+            return {"outputs": [
+                {"status": "confirmed", "amount_msat": 2_500_000_000},
+                {"status": "unconfirmed", "amount_msat": 9_000_000_000},
+            ]}
+        raise AssertionError(method)
+
+    def lnd(_container, method, *_args):
+        if method == "walletbalance":
+            return {"confirmed_balance": "300000"}
+        if method == "newaddress":
+            return {"address": "bcrt1plnd"}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(runner, "cln_rpc", cln)
+    monkeypatch.setattr(runner, "lnd_rpc", lnd)
+    monkeypatch.setattr(
+        runner, "_send_fake_onchain_funds",
+        lambda _bridge, _network, address, amount: funded.append((address, amount)),
+    )
+
+    result = runner.ensure_payer_wallet_funds(object(), 4)
+
+    assert result == {
+        "cln": {"before_sats": 2_500_000, "topup_sats": 0},
+        "lnd": {"before_sats": 300_000, "topup_sats": 1_800_000},
+    }
+    assert funded == [("bcrt1plnd", 1_800_000)]
+
+
+def test_payer_wallet_topup_fails_closed_on_malformed_lnd_balance(monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner, "cln_rpc", lambda *_args: {"outputs": []})
+    monkeypatch.setattr(
+        runner, "lnd_rpc", lambda *_args: {"confirmed_balance": "unknown"}
+    )
+
+    with pytest.raises(runner.RunnerError, match="nonnegative integer"):
+        runner.ensure_payer_wallet_funds(object(), 4)
+
+
+def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 4)
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "network_id": 4,
+        "status": "smoke_complete",
+        "league": "full_stack",
+        "events": [],
+    })
+    calls = []
+    funded = []
+    lnd_rows = iter(([], [{
+        "active": True,
+        "remote_pubkey": "lnd-sink-id",
+        "channel_point": "funding:1",
+        "scid": "123",
+        "scid_str": "1x1x1",
+    }]))
+
+    def cln(container, method, *args):
+        calls.append((container, method, args))
+        if method == "getinfo":
+            return {"id": "cln-sink-id"}
+        if method == "newaddr":
+            return {"p2tr": "bcrt1ptest"}
+        if method == "fundchannel":
+            return {"channel_id": "cln-channel-id"}
+        if method == "setchannel":
+            return {"channels": [{}]}
+        return {}
+
+    def lnd(container, method, *args):
+        calls.append((container, method, args))
+        if method == "getinfo":
+            return {
+                "identity_pubkey": (
+                    "lnd-sink-id" if container.endswith("lnd-sink") else "lnd-payer-id"
+                )
+            }
+        if method == "newaddress":
+            return {"address": "bcrt1plnd"}
+        if method == "openchannel":
+            return {"funding_txid": "funding"}
+        if method == "getchaninfo":
+            return {
+                "node1_pub": "lnd-payer-id",
+                "node1_policy": {
+                    "time_lock_delta": 40,
+                    "min_htlc": "1",
+                    "max_htlc_msat": "1980000000",
+                },
+            }
+        return {}
+
+    monkeypatch.setattr(runner, "cln_rpc", cln)
+    monkeypatch.setattr(runner, "lnd_rpc", lnd)
+    monkeypatch.setattr(runner, "channel_rows", lambda _container: [])
+    monkeypatch.setattr(runner, "_live_lnd_channels", lambda _container: next(lnd_rows))
+    monkeypatch.setattr(
+        runner, "_send_fake_onchain_funds",
+        lambda _bridge, _network, address, amount: funded.append((address, amount)),
+    )
+    monkeypatch.setattr(runner, "_mine", lambda *_args: None)
+    monkeypatch.setattr(
+        runner, "_wait_return_paths", lambda paths: [
+            {**paths[0], "short_channel_id": "1x1x0"},
+            {**paths[1], "short_channel_id": "1x1x1", "channel_point": "funding:1"},
+        ],
+    )
+
+    state = runner.provision_return_paths(
+        object(), replica=4, results_dir=tmp_path, capacity_sats=2_000_000
+    )
+
+    assert state["status"] == "return_paths_ready"
+    assert state["return_path_fixture"]["present_during_scored_traffic"] is False
+    assert {row["family"] for row in state["return_paths"]} == {"cln", "lnd"}
+    assert funded == [
+        ("bcrt1ptest", 2_100_000),
+        ("bcrt1plnd", 2_100_000),
+    ]
+    assert all(method not in {"revenue-rebalance-cycle", "revenue-rebalance"}
+               for _container, method, _args in calls)
+
+
+def test_return_path_snapshot_fails_closed_on_malformed_lnd_balance(
+    monkeypatch
+):
+    runner = load_runner()
+    state = {"return_paths": [
+        {
+            "family": "cln", "source_container": "cln-payer",
+            "channel_id": "a",
+        },
+        {
+            "family": "lnd", "source_container": "lnd-payer",
+            "channel_point": "b:1",
+        },
+    ]}
+    monkeypatch.setattr(runner, "channel_rows", lambda _container: [{
+        "channel_id": "a", "state": "CHANNELD_NORMAL", "short_channel_id": "1x1x0",
+        "to_us_msat": 1_000, "total_msat": 2_000,
+    }])
+    monkeypatch.setattr(runner, "_live_lnd_channels", lambda _container: [{
+        "channel_point": "b:1", "active": True, "scid_str": "1x1x1",
+        "local_balance": "malformed", "capacity": "2000000",
+    }])
+
+    with pytest.raises(runner.RunnerError, match="nonnegative integer"):
+        runner.return_path_snapshot(state)
+
+
+def test_observe_rebalances_uses_native_cycles_and_records_balance_improvement(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 5)
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "network_id": 4,
+        "status": "return_paths_ready",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "full_stack": {
+            "revenue_rebalance_allowance_sats": 1_000,
+            "clboss_rebalance_cost_baseline_msat": 0,
+        },
+        "return_paths": [{"family": "cln"}, {"family": "lnd"}],
+    })
+    totals = {
+        "revenue": iter((
+            runner.Totals(0, 0, 0, 500_000, (), worst_channel_imbalance_ppm=900_000),
+            runner.Totals(0, 0, 0, 500_000, (), worst_channel_imbalance_ppm=500_000),
+        )),
+        "clboss": iter((
+            runner.Totals(0, 0, 0, 500_000, (), worst_channel_imbalance_ppm=900_000),
+            runner.Totals(0, 0, 0, 500_000, (), worst_channel_imbalance_ppm=900_000),
+        )),
+    }
+    circular = {
+        "revenue": iter((
+            {"completed_count": 0, "delivered_msat": 0, "cost_msat": 0},
+            {"completed_count": 1, "delivered_msat": 200_000_000, "cost_msat": 2_000},
+        )),
+        "clboss": iter((
+            {"completed_count": 0, "delivered_msat": 0, "cost_msat": 0},
+            {"completed_count": 0, "delivered_msat": 0, "cost_msat": 0},
+        )),
+    }
+    rpc_calls = []
+    monkeypatch.setattr(runner, "contender_totals", lambda container: next(totals[container]))
+    monkeypatch.setattr(runner, "rebalance_totals", lambda container: next(circular[container]))
+    monkeypatch.setattr(runner, "return_path_snapshot", lambda _state: {
+        "cln": {"active": True}, "lnd": {"active": True},
+    })
+    monkeypatch.setattr(
+        runner, "cln_rpc",
+        lambda container, method, *args: rpc_calls.append((container, method, args)) or {},
+    )
+    result = runner.observe_rebalances(
+        replica=5, results_dir=tmp_path, observe_seconds=0
+    )
+
+    assert result["controllers"]["revenue_ops"]["circular_payments"] == {
+        "completed_count": 1, "delivered_msat": 200_000_000, "cost_msat": 2_000,
+    }
+    assert result["controllers"]["revenue_ops"][
+        "worst_imbalance_improvement_ppm"
+    ] == 400_000
+    assert result["clboss_spend_policy"] == "native_unbounded"
+    assert all(method != "revenue-rebalance-cycle" for _container, method, _args in rpc_calls)
+    assert all(
+        not (method == "setconfig" and args == ("clboss-rebalance-mode", "off"))
+        for _container, method, args in rpc_calls
+    )
+
+
+def test_return_path_cleanup_dispatches_exact_cln_and_lnd_closes(monkeypatch):
+    runner = load_runner()
+    state = {"return_paths": [
+        {
+            "family": "cln", "source_container": "polar-n4-cln-payer",
+            "short_channel_id": "1x1x0", "channel_id": "cln-funding-id",
+        },
+        {
+            "family": "lnd", "source_container": "polar-n4-lnd-payer",
+            "channel_point": "funding:1",
+        },
+    ]}
+    shell_calls = []
+    monkeypatch.setattr(runner, "channel_rows", lambda _container: [{
+        "channel_id": "cln-funding-id", "state": "CHANNELD_NORMAL",
+    }])
+    monkeypatch.setattr(
+        runner, "_run",
+        lambda command, **_kwargs: shell_calls.append(command) or type(
+            "Result", (), {"returncode": 0, "stdout": "", "stderr": ""}
+        )(),
+    )
+
+    assert runner._close_return_paths(state) is True
+    assert shell_calls[0][-2:] == ["close", "1x1x0"]
+    assert shell_calls[1][-3:] == ["closechannel", "--chan_point", "funding:1"]
+    assert state["return_path_closes_dispatched"] is True
+
+
 def test_competition_image_pins_all_source_revisions():
     runner = load_runner()
     dockerfile = (ROOT / "tools" / "polar-clboss" / "Dockerfile").read_text(encoding="utf-8")
 
-    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:3df9ad3"
-    assert runner.EXPECTED_REVENUE_REVISION.startswith("3df9ad3")
+    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:9805b04"
+    assert runner.EXPECTED_REVENUE_REVISION.startswith("9805b04")
     assert "elementsproject/lightningd:v26.06.6" in dockerfile
     assert "CLBOSS_COMMIT=8cb4e9215eba58b049375f234f5f073d0c7fc622" in dockerfile
     assert "XREBALANCE_COMMIT=fb70bf13cd9f3f79b14100bfdb8f2966884a4142" in dockerfile
