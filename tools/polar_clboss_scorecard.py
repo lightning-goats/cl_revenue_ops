@@ -67,10 +67,16 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         traffic = block.get("traffic")
         if not isinstance(traffic, dict):
             raise ScorecardError(f"traffic missing in {block['_source']}")
-        attempted += _integer(traffic.get("attempted"), "traffic.attempted")
-        settled += _integer(traffic.get("settled"), "traffic.settled")
+        block_attempted = _integer(traffic.get("attempted"), "traffic.attempted")
+        block_settled = _integer(traffic.get("settled"), "traffic.settled")
+        attempted += block_attempted
+        settled += block_settled
+        block_fallback = None
         if "fallback_settled" in traffic:
-            fallback += _integer(traffic.get("fallback_settled"), "traffic.fallback_settled")
+            block_fallback = _integer(
+                traffic.get("fallback_settled"), "traffic.fallback_settled"
+            )
+            fallback += block_fallback
             enhanced += 1
         phase = str(block.get("phase") or "historical_unlabelled")
         phase_rows = phases.setdefault(
@@ -91,6 +97,8 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             and isinstance(block_violations, list)
             and not block_violations
             and all(isinstance(rows, list) and not rows for rows in contender_safety)
+            and block_attempted == block_settled
+            and block_fallback == 0
         )
         eligible_rows = None
         if eligible:

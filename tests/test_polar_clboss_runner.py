@@ -795,6 +795,98 @@ def test_reconciled_traffic_never_retries_ambiguous_payment(monkeypatch):
     assert records[0]["payment"]["reconciled_after_mcp_error"] is True
 
 
+def test_reconciled_traffic_records_authoritative_terminal_failure_without_retry(
+    monkeypatch,
+):
+    runner = load_runner()
+
+    class Bridge:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, tool, arguments):
+            self.calls.append((tool, arguments))
+            if tool == "create_invoice":
+                return {"invoice": "bolt11-redacted"}
+            raise runner.PolarMcpError("post-dispatch timeout")
+
+    bridge = Bridge()
+    monkeypatch.setattr(runner, "_invoice_hash", lambda _invoice: "payment-hash")
+    monkeypatch.setattr(
+        runner, "payment_outcome", lambda _payer, _sink, _hash: "failed"
+    )
+
+    records = runner.run_reconciled_traffic(
+        bridge,
+        network_id=4,
+        rounds=1,
+        amount_sats=5_000,
+        pause_seconds=0,
+        lanes=(("cln-payer", "cln-sink"),),
+        reconciliation_attempts=1,
+        reconciliation_poll_seconds=0,
+    )
+
+    assert [tool for tool, _arguments in bridge.calls] == [
+        "create_invoice", "pay_invoice"
+    ]
+    assert records[0]["payment"] == {
+        "success": False,
+        "reconciled_terminal_failure": True,
+        "bridge_error": "post-dispatch timeout",
+    }
+
+
+@pytest.mark.parametrize(
+    ("payer", "payload", "expected"),
+    [
+        ("cln-payer", {"pays": [{"payment_hash": "hash", "status": "complete"}]}, "settled"),
+        ("cln-payer", {"pays": [{"payment_hash": "hash", "status": "pending"}]}, "pending"),
+        ("cln-payer", {"pays": [{"payment_hash": "hash", "status": "failed"}]}, "failed"),
+        ("cln-payer", {"pays": "malformed"}, "unknown"),
+        ("lnd-payer", {"payments": [{"payment_hash": "HASH", "status": "SUCCEEDED"}]}, "settled"),
+        ("lnd-payer", {"payments": [{"payment_hash": "hash", "status": "IN_FLIGHT"}]}, "pending"),
+        ("lnd-payer", {"payments": [{"payment_hash": "hash", "status": "FAILED"}]}, "failed"),
+        ("lnd-payer", {"payments": None}, "unknown"),
+    ],
+)
+def test_payer_payment_outcome_is_aggregate_and_malformed_safe(
+    monkeypatch, payer, payload, expected,
+):
+    runner = load_runner()
+    monkeypatch.setattr(runner, "cln_rpc", lambda *_args: payload)
+    monkeypatch.setattr(runner, "lnd_rpc", lambda *_args: payload)
+
+    assert runner.payer_payment_outcome(payer, "hash") == expected
+
+
+def test_payment_outcome_treats_rpc_errors_as_unknown(monkeypatch):
+    runner = load_runner()
+
+    def broken(*_args):
+        raise runner.RunnerError("read failed")
+
+    monkeypatch.setattr(runner, "invoice_settled", broken)
+    monkeypatch.setattr(runner, "cln_rpc", broken)
+
+    assert runner.payment_outcome("cln-payer", "cln-sink", "hash") == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("records", "expected"),
+    [
+        ([{"payment": {"success": True}}], False),
+        ([{"payment": {"success": False}}], True),
+        ([{"payment": "malformed"}], True),
+        (["malformed"], True),
+    ],
+)
+def test_terminal_payment_failure_stops_depleted_block(records, expected):
+    runner = load_runner()
+
+    assert runner.has_terminal_payment_failure(records) is expected
+
+
 def test_reconciled_traffic_preserves_unknown_operation(monkeypatch):
     runner = load_runner()
 
@@ -805,7 +897,9 @@ def test_reconciled_traffic_preserves_unknown_operation(monkeypatch):
             raise runner.PolarMcpError("post-dispatch UI failure")
 
     monkeypatch.setattr(runner, "_invoice_hash", lambda _invoice: "payment-hash")
-    monkeypatch.setattr(runner, "invoice_settled", lambda _sink, _hash: False)
+    monkeypatch.setattr(
+        runner, "payment_outcome", lambda _payer, _sink, _hash: "pending"
+    )
     monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
 
     with pytest.raises(runner.ReconciliationError) as caught:
@@ -816,9 +910,12 @@ def test_reconciled_traffic_preserves_unknown_operation(monkeypatch):
             amount_sats=5_000,
             pause_seconds=0,
             lanes=(("lnd-payer", "lnd-sink"),),
+            reconciliation_attempts=2,
+            reconciliation_poll_seconds=0,
         )
     assert caught.value.records == []
     assert caught.value.operation["outcome"] == "unknown_do_not_retry"
+    assert caught.value.operation["last_observed_outcome"] == "pending"
     assert caught.value.operation["payment_hash"] == "payment-hash"
 
 

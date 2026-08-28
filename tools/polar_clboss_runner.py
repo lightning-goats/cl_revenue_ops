@@ -58,6 +58,11 @@ BASELINE_POLL_SECONDS = 5.0
 BASELINE_POLL_ATTEMPTS = 19
 NATIVE_CYCLE_POLL_SECONDS = 5.0
 NATIVE_CYCLE_POLL_ATTEMPTS = 37
+# Polar's UI-facing payment call can time out while the underlying CLN/LND
+# payment is still resolving.  Wait long enough to observe an authoritative
+# payer-side terminal state, but never dispatch the same invoice again.
+PAYMENT_RECONCILIATION_POLL_SECONDS = 1.0
+PAYMENT_RECONCILIATION_POLL_ATTEMPTS = 90
 CONTAINER_RE = re.compile(r"^polar-n[1-9][0-9]*-clboss-r[1-9][0-9]*-identity-[ab]$")
 EXPECTED_ORIGINALS = (
     "backend1",
@@ -1663,6 +1668,86 @@ def invoice_settled(sink: str, payment_hash: str) -> bool:
     return invoice.get("state") == "SETTLED" or invoice.get("settled") is True
 
 
+def payer_payment_outcome(payer: str, payment_hash: str) -> str:
+    """Return a payer's authoritative aggregate outcome, or ``unknown``.
+
+    Part-level CLN ``listsendpays`` rows are not terminal evidence: the pay
+    plugin can create another part after all currently visible parts fail.
+    ``listpays`` provides the aggregate state.  LND exposes the corresponding
+    aggregate state through ``listpayments --include_incomplete``.
+    """
+    if not isinstance(payment_hash, str) or not payment_hash:
+        return "unknown"
+    container = f"polar-n{NETWORK_ID}-{payer}"
+    try:
+        if payer.startswith("cln-"):
+            payload = cln_rpc(
+                container, "-k", "listpays", f"payment_hash={payment_hash}"
+            )
+            rows = payload.get("pays")
+            if not isinstance(rows, list):
+                return "unknown"
+            matches = [
+                row for row in rows
+                if isinstance(row, dict)
+                and row.get("payment_hash") == payment_hash
+            ]
+            statuses = {
+                str(row.get("status") or "").casefold() for row in matches
+            }
+            if "complete" in statuses:
+                return "settled"
+            if "pending" in statuses:
+                return "pending"
+            if matches and statuses == {"failed"}:
+                return "failed"
+            return "unknown"
+        if payer.startswith("lnd-"):
+            payload = lnd_rpc(container, "listpayments", "--include_incomplete")
+            rows = payload.get("payments")
+            if not isinstance(rows, list):
+                return "unknown"
+            matches = [
+                row for row in rows
+                if isinstance(row, dict)
+                and str(row.get("payment_hash") or "").casefold()
+                == payment_hash.casefold()
+            ]
+            statuses = {
+                str(row.get("status") or "").casefold() for row in matches
+            }
+            if "succeeded" in statuses:
+                return "settled"
+            if "in_flight" in statuses:
+                return "pending"
+            if matches and statuses == {"failed"}:
+                return "failed"
+            return "unknown"
+    except RunnerError:
+        return "unknown"
+    return "unknown"
+
+
+def payment_outcome(payer: str, sink: str, payment_hash: str) -> str:
+    """Reconcile destination and payer evidence without raising on bad RPC data."""
+    try:
+        if invoice_settled(sink, payment_hash):
+            return "settled"
+    except RunnerError:
+        pass
+    return payer_payment_outcome(payer, payment_hash)
+
+
+def has_terminal_payment_failure(records: list[dict[str, Any]]) -> bool:
+    """Stop a traffic block after a proven failure; never retry depleted paths."""
+    return any(
+        not isinstance(row, dict)
+        or not isinstance(row.get("payment"), dict)
+        or row["payment"].get("success") is not True
+        for row in records
+    )
+
+
 def run_reconciled_traffic(
     bridge: PolarMcp,
     *,
@@ -1671,8 +1756,12 @@ def run_reconciled_traffic(
     amount_sats: int,
     pause_seconds: float,
     lanes: tuple[tuple[str, str], ...],
+    reconciliation_attempts: int = PAYMENT_RECONCILIATION_POLL_ATTEMPTS,
+    reconciliation_poll_seconds: float = PAYMENT_RECONCILIATION_POLL_SECONDS,
 ) -> list[dict[str, Any]]:
     """Dispatch each payment once and reconcile Polar's known post-pay UI 500."""
+    if reconciliation_attempts <= 0 or reconciliation_poll_seconds < 0:
+        raise RunnerError("invalid payment reconciliation polling bounds")
     records: list[dict[str, Any]] = []
     for round_index in range(rounds):
         for payer, sink in lanes:
@@ -1695,16 +1784,14 @@ def run_reconciled_traffic(
                     {"networkId": network_id, "fromNode": payer, "invoice": invoice},
                 )
             except PolarMcpError as exc:
-                settled = False
-                for _ in range(10):
-                    try:
-                        if invoice_settled(sink, payment_hash):
-                            settled = True
-                            break
-                    except RunnerError:
-                        pass
-                    time.sleep(0.5)
-                if not settled:
+                outcome = "unknown"
+                for attempt in range(reconciliation_attempts):
+                    outcome = payment_outcome(payer, sink, payment_hash)
+                    if outcome in {"settled", "failed"}:
+                        break
+                    if attempt + 1 < reconciliation_attempts:
+                        time.sleep(reconciliation_poll_seconds)
+                if outcome not in {"settled", "failed"}:
                     operation = {
                         "round": round_index,
                         "payer": payer,
@@ -1712,16 +1799,24 @@ def run_reconciled_traffic(
                         "amount_sats": amount_sats,
                         "payment_hash": payment_hash,
                         "outcome": "unknown_do_not_retry",
+                        "last_observed_outcome": outcome,
                         "error": str(exc),
                     }
                     raise ReconciliationError(
                         "payment dispatch could not be reconciled", list(records), operation
                     ) from exc
-                payment = {
-                    "success": True,
-                    "reconciled_after_mcp_error": True,
-                    "bridge_error": str(exc),
-                }
+                if outcome == "settled":
+                    payment = {
+                        "success": True,
+                        "reconciled_after_mcp_error": True,
+                        "bridge_error": str(exc),
+                    }
+                else:
+                    payment = {
+                        "success": False,
+                        "reconciled_terminal_failure": True,
+                        "bridge_error": str(exc),
+                    }
             records.append(
                 {
                     "round": round_index,
@@ -1900,6 +1995,8 @@ def run_smoke(
                         monitor=spend_monitor,
                     )
             write_json_atomic(progress_path, progress)
+            if has_terminal_payment_failure(completed):
+                break
     except ReconciliationError as exc:
         for row in exc.records:
             row.update(
@@ -1977,6 +2074,10 @@ def run_smoke(
         delta["forward_count"] for delta in contender_deltas.values()
     )
     fallback_settled = max(0, settled_count - contender_forward_count)
+    if settled_count != len(records):
+        safety_violations.append("unsettled_payments")
+    if fallback_settled:
+        safety_violations.append("fallback_settled")
     if contender_forward_count > settled_count:
         safety_violations.append("unattributed_extra_contender_forwards")
     block = {

@@ -95,6 +95,28 @@ def test_scorecard_keeps_unsafe_enhanced_block_out_of_eligible_profile_results()
     ] == 100
 
 
+@pytest.mark.parametrize(
+    ("traffic_update", "expected_attempted", "expected_settled"),
+    [
+        ({"attempted": 10, "settled": 9}, 10, 9),
+        ({"fallback_settled": 1}, 10, 10),
+    ],
+)
+def test_scorecard_excludes_unsettled_or_fallback_traffic_from_eligible_results(
+    traffic_update, expected_attempted, expected_settled,
+):
+    mod = load_scorecard()
+    payload = block()
+    payload["traffic"].update(traffic_update)
+
+    result = mod.summarize([payload])
+
+    assert result["coverage"]["attempted"] == expected_attempted
+    assert result["coverage"]["settled"] == expected_settled
+    assert result["coverage"]["eligible_blocks"] == 0
+    assert result["eligible_by_market_profile"] == {}
+
+
 def test_scorecard_rejects_negative_or_malformed_economics():
     mod = load_scorecard()
     payload = block()
