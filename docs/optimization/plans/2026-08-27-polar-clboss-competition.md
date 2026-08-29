@@ -577,6 +577,57 @@ direction in restartable progress files and reports per-outgoing-channel
 volume, fees, and settled forward parts. This prevents partial blocks and
 within-node treatment/control effects from being hidden by aggregate totals.
 
+### Material-evidence acquisition wake validation
+
+Revision `565cd0f` removes the production-scale delay between material settled
+forward evidence and the next acquisition/retention decision. The notification
+path still persists the forward first and performs no mutation itself. It
+coalesces a wake only after an active episode accumulates another 50,000 sats
+or five sats of estimated opportunity cost; the existing governed fee loop
+then performs the normal decision, policy write, and audit. Missing, malformed,
+disabled, or unavailable persistence remains neutral, and the ordinary fee
+interval is unchanged.
+
+Crossed replica 94 placed Revenue Ops on identity B. Its CLN acquisition lane
+received settled 30,000-, 15,000-, and 5,000-sat HTLCs. The third resolved at
+`1788033870.612`; the persisted episode entered paid retention at
+`1788033871`, less than one second later and exactly at 50,000 acquired sats.
+The live quote became 4 msat + 0 ppm. That lifecycle block is excluded because
+the policy changed inside its window. A following phase-stable four-payment
+block remained in episode 1 and was safety-clean: Revenue Ops carried 35M msat
+and earned 819 msat versus CLBOSS's 30M and 377 msat. After exact baseline
+restoration, an ordinary 40-payment CLN block remained safety-clean but showed
+the unresolved breadth tradeoff: Revenue Ops earned 29,449 msat on 182.9M msat,
+while CLBOSS earned 17,464 msat on 1.392B msat.
+
+Replica 95 crossed Revenue Ops to identity A. The CLN lane crossed its threshold
+at 65,000 sats and entered 29-msat + 0-ppm retention within 0.3 seconds of the
+threshold HTLC. A later 100,000-sat HTLC reached the 25-sat opportunity-cost
+cap; the controller restored the exact 500-msat + 150-ppm baseline seven seconds
+after retention began and autonomously rotated to the LND lane. The LND lane
+then entered 14-msat + 0-ppm retention after 80,000 acquired sats and restored
+its exact 0-msat + 132-ppm baseline at the same bounded cap. Mixed lifecycle,
+fallback, and in-window restoration blocks are retained as causal evidence but
+excluded from the scorecard.
+
+The crossed ordinary CLN diagnostic also found a separate lab interaction. A
+35,000-sat reverse payment repeatedly decomposed into many MPP parts and failed
+with `WIRE_TEMPORARY_CHANNEL_FAILURE` on Revenue Ops' low-outbound payer lane,
+then `WIRE_MPP_TIMEOUT`. Gossip truthfully advertised a 12,642,358-msat maximum
+against 14,873,363 msat locally spendable. The block stopped without retry and
+is excluded; it does not establish controller-attributable reliability because
+the shared sender selected the multipart composition. It does establish the
+next controlled target: test whether bounded, positive-EV refill of an earning
+but low-outbound payer lane improves route breadth and avoids pathological MPP
+composition without raising the admission ceiling above real spendable
+liquidity. Lowering ordinary fee floors is not supported by this evidence.
+
+The generated scorecard now emits a reproducible functional comparison for fee
+setting, route breadth, post-refill conversion, liquidity balance, reliability,
+and intentionally non-comparable channel opening/closing. This prevents a
+regeneration from erasing the qualitative standings while keeping the formal
+verdict not ready until fresh per-league coverage gates pass.
+
 ## Module and failure coverage
 
 The same run must prove all retained `cl_revenue_ops` modules remain coherent:

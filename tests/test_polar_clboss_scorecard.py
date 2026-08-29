@@ -81,6 +81,11 @@ def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming()
     ] == 100
     rendered = mod.markdown(result)
     assert "Formal verdict: **not ready**" in rendered
+    assert "## Current functional comparison" in rendered
+    assert "| Fee setting | 100 msat net at 2000.0 ppm yield" in rendered
+    assert "| Route acquisition / breadth | 60000 msat, 60.0% share" in rendered
+    assert "| Reliability | Strict safety-gated blocks only; shared traffic settled 10/10 payments" in rendered
+    assert "| Channel open / close management | Intentionally absent" in rendered
     assert "### acquisition" in rendered
     assert "## Eligible results by phase" in rendered
     assert "### paid_retention" in rendered

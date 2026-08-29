@@ -349,6 +349,7 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
 def markdown(scorecard: dict[str, Any]) -> str:
     coverage = scorecard["coverage"]
     overall = scorecard["overall"]
+    post_rebalance = scorecard["eligible_by_phase"].get("post_rebalance_demand")
     lines = [
         "# CLBOSS tournament scorecard",
         "",
@@ -386,9 +387,61 @@ def markdown(scorecard: dict[str, Any]) -> str:
         )
     lines.extend([
         "",
-        "Formal verdict: **not ready**. " + coverage["formal_verdict_blocker"] + ".",
+        "Formal verdict: **not ready**. It " + coverage["formal_verdict_blocker"] + ".",
         "",
         "This table describes observed lab outcomes; it does not treat historical smoke blocks as decisive evidence.",
+        "",
+        "## Current functional comparison",
+        "",
+        "| Comparable functional area | Revenue Ops evidence | CLBOSS evidence | Current result |",
+        "|---|---|---|---|",
+        (
+            "| Fee setting | "
+            f"{overall['revenue_ops']['net_profit_msat']} msat net at "
+            f"{overall['revenue_ops']['gross_yield_ppm']} ppm yield | "
+            f"{overall['clboss']['net_profit_msat']} msat net at "
+            f"{overall['clboss']['gross_yield_ppm']} ppm yield | Revenue Ops |"
+        ),
+        (
+            "| Route acquisition / breadth | "
+            f"{overall['revenue_ops']['volume_msat']} msat, "
+            f"{overall['revenue_ops']['volume_share_pct']}% share | "
+            f"{overall['clboss']['volume_msat']} msat, "
+            f"{overall['clboss']['volume_share_pct']}% share | CLBOSS |"
+        ),
+    ])
+    if post_rebalance is not None:
+        lines.append(
+            "| Rebalancing and post-refill conversion | "
+            f"{post_rebalance['revenue_ops']['volume_msat']} msat / "
+            f"{post_rebalance['revenue_ops']['net_profit_msat']} msat linked net | "
+            f"{post_rebalance['clboss']['volume_msat']} msat / "
+            f"{post_rebalance['clboss']['net_profit_msat']} msat linked net | "
+            + (
+                "Revenue Ops |"
+                if post_rebalance['revenue_ops']['net_profit_msat']
+                > post_rebalance['clboss']['net_profit_msat']
+                else "CLBOSS |"
+            )
+        )
+    lines.extend([
+        (
+            "| Liquidity balance | Mean worst imbalance "
+            f"{overall['revenue_ops']['mean_ending_worst_imbalance_ppm']} ppm | "
+            "Mean worst imbalance "
+            f"{overall['clboss']['mean_ending_worst_imbalance_ppm']} ppm | "
+            f"{scorecard['area_leaders']['liquidity_balance']} |"
+        ),
+        (
+            "| Reliability | Strict safety-gated blocks only; shared traffic "
+            f"settled {coverage['settled']}/{coverage['attempted']} payments | "
+            "The same shared traffic and safety gate applies | Not attributable "
+            "per controller |"
+        ),
+        (
+            "| Channel open / close management | Intentionally absent from this "
+            "standalone plugin | Disabled in the comparable harness | Not comparable |"
+        ),
         "",
     ])
     lines.extend([

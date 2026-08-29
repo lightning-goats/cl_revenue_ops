@@ -90,6 +90,36 @@
       "replica": "replica-93",
       "block": "smoke-1788031323",
       "reason": "Causal lifecycle traffic crossed the native free-acquisition exit inside the scored window; the following exact-volume blocks are the steady-state post-acquisition comparison."
+    },
+    {
+      "replica": "replica-94",
+      "block": "smoke-1788033843",
+      "reason": "Causal lifecycle traffic crossed from native free acquisition to paid retention inside the block; direct timing evidence is retained, but the mixed-policy window is not scored."
+    },
+    {
+      "replica": "replica-95",
+      "block": "smoke-1788034236",
+      "reason": "Causal CLN lifecycle traffic crossed acquisition, paid retention, opportunity-cost restoration, and autonomous LND rollover inside one block."
+    },
+    {
+      "replica": "replica-95",
+      "block": "smoke-1788034300",
+      "reason": "Causal LND lifecycle traffic crossed acquisition into paid retention and included 55,000,000 msat of fallback traffic; not an attributable scored comparison."
+    },
+    {
+      "replica": "replica-95",
+      "block": "smoke-1788034356",
+      "reason": "The LND paid-retention episode reached its opportunity-cost cap and restored baseline inside the block, so the mixed-policy window is excluded despite exact attribution."
+    },
+    {
+      "replica": "replica-95",
+      "block": "smoke-1788034417",
+      "reason": "Ordinary CLN diagnostic stopped on a terminal 35,000-sat reverse payment failure after 21 settlements; no retry was issued."
+    },
+    {
+      "replica": "replica-95",
+      "block": "smoke-1788034616",
+      "reason": "Short ordinary CLN diagnostic reproduced the terminal 35,000-sat reverse MPP failure after five settlements; no retry was issued."
     }
   ]
 }
