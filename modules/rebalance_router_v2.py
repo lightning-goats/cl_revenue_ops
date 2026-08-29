@@ -181,16 +181,30 @@ class RebalanceRouter:
         return None
 
     @staticmethod
-    def _compute_final_hop_fee_sats(
+    def _compute_final_hop_fee_msat(
         amount_sats: int,
         fee_ppm: int,
         fee_base_msat: int = 0,
     ) -> int:
-        """Compute the fee in sats for the final hop at the given PPM rate."""
-        fee_msat = int(fee_base_msat or 0) + math.ceil(
+        """Compute the exact millisatoshi fee for the final hop."""
+        return int(fee_base_msat or 0) + math.ceil(
             (amount_sats * 1000) * int(fee_ppm or 0) / 1_000_000
         )
-        return math.ceil(fee_msat / 1000)
+
+    @classmethod
+    def _compute_final_hop_fee_sats(
+        cls,
+        amount_sats: int,
+        fee_ppm: int,
+        fee_base_msat: int = 0,
+    ) -> int:
+        """Compute the sat-ceiling used only by sat-denominated budgets."""
+        return math.ceil(
+            cls._compute_final_hop_fee_msat(
+                amount_sats, fee_ppm, fee_base_msat
+            )
+            / 1000
+        )
 
     @staticmethod
     def _route_fee_sats(route: List[Dict[str, Any]], amount_sats: int) -> int:
@@ -408,7 +422,7 @@ class RebalanceRouter:
         final_hop_fee_ppm = int(final_hop_policy["fee_ppm"])
         final_hop_fee_base_msat = int(final_hop_policy.get("fee_base_msat", 0) or 0)
 
-        final_hop_fee_sats = self._compute_final_hop_fee_sats(
+        final_hop_fee_msat = self._compute_final_hop_fee_msat(
             amount_sats,
             final_hop_fee_ppm,
             final_hop_fee_base_msat,
@@ -422,7 +436,7 @@ class RebalanceRouter:
         middle_route: List[Dict[str, Any]] = []
 
         if source_peer_id != dest_peer_id:
-            route_amount_msat = (amount_sats + final_hop_fee_sats) * 1000
+            route_amount_msat = amount_sats * 1000 + final_hop_fee_msat
             try:
                 getroute_kwargs: Dict[str, Any] = {
                     "node_id": dest_peer_id,
@@ -489,7 +503,7 @@ class RebalanceRouter:
                 first_middle_policy["cltv_delta"]
             )
         else:
-            total_forward_msat = (amount_sats + final_hop_fee_sats) * 1000
+            total_forward_msat = amount_sats * 1000 + final_hop_fee_msat
             first_hop_delay = required_final_cltv
         first_hop = {
             "id": source_peer_id,

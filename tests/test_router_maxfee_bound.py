@@ -100,6 +100,17 @@ def test_maxfee_bound_subtracts_final_hop_fee():
     assert kwargs["maxfee_msat"] == 5_000
 
 
+def test_maxfee_bound_subtracts_exact_sub_sat_final_hop_fee():
+    plugin = _make_plugin(final_fee_ppm=1, final_base_msat=1_000)
+    router = _make_router(plugin)
+
+    _price(router, amount_sats=155_000, maxfee_sats=4)
+
+    kwargs = plugin.rpc.getroutes.call_args.kwargs
+    assert kwargs["amount_msat"] == 155_001_155
+    assert kwargs["maxfee_msat"] == 2_845
+
+
 def test_maxfee_bound_never_negative():
     plugin = _make_plugin(final_fee_ppm=100_000)  # final fee 10 sats
     router = _make_router(plugin)

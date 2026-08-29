@@ -639,6 +639,52 @@ def test_price_pair_includes_final_hop_base_fee_in_getroutes_amount():
     assert result.route_cost_sats == 1
 
 
+def test_price_pair_preserves_sub_sat_final_hop_fee_precision():
+    """The tournament's 1,155-msat last hop must not become 2,000 msat."""
+    exact_route_amount_msat = 155_001_155
+    plugin = _make_plugin_with_listchannels_fee(
+        fee_ppm=1,
+        fee_base_msat=1_000,
+        source_fee_ppm=0,
+        source_base_msat=0,
+        source_cltv=0,
+    )
+    plugin.rpc.getroutes.return_value = {
+        "routes": [{
+            "probability_ppm": 990000,
+            "amount_msat": exact_route_amount_msat,
+            "final_cltv": 58,
+            "path": [
+                {
+                    "short_channel_id_dir": "111x1x1/0",
+                    "next_node_id": "03" + "x" * 64,
+                    "amount_msat": exact_route_amount_msat,
+                    "delay": 124,
+                },
+                {
+                    "short_channel_id_dir": "222x2x2/0",
+                    "next_node_id": DST_PEER,
+                    "amount_msat": exact_route_amount_msat,
+                    "delay": 58,
+                },
+            ],
+        }],
+    }
+
+    result = _make_v3_router(plugin).price_pair(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x2x0",
+        source_peer_id=SRC_PEER,
+        dest_peer_id=DST_PEER,
+        amount_sats=155_000,
+    )
+
+    assert result.success is True
+    assert plugin.rpc.getroutes.call_args.kwargs["amount_msat"] == exact_route_amount_msat
+    assert result.route[0]["amount_msat"] == exact_route_amount_msat
+    assert result.route_cost_sats == 2
+
+
 def test_price_pair_uses_invoice_cltv_and_explicit_synthetic_hops():
     plugin = _make_plugin_with_listchannels_fee(fee_ppm=0, cltv=40)
     plugin.rpc.getroutes.return_value = {

@@ -173,6 +173,34 @@ class TestFinalHopFeeFromListpeerchannels:
         assert plugin.rpc.getroute.call_args.kwargs["amount_msat"] == 50_001_000
         assert result.route_cost_sats == 1
 
+    def test_router_preserves_sub_sat_final_hop_fee_precision(self):
+        """Do not turn a 1,155-msat forwarding fee into 2,000 msat."""
+        amount_sats = 155_000
+        exact_route_amount_msat = 155_001_155
+        plugin = _make_plugin(
+            peer_channels_by_id={
+                DEST_PEER: _dest_peer_channels(fee_ppm=1, fee_base_msat=1_000),
+                SOURCE_PEER: _source_peer_channels(),
+            },
+            list_channels=_middle_edge_channels(DEST_PEER),
+            getroute={"route": [{
+                "id": DEST_PEER,
+                "channel": "300x1x0",
+                "amount_msat": exact_route_amount_msat,
+                "delay": 40,
+            }]},
+        )
+        router = RebalanceRouter(plugin, OUR_ID)
+
+        result = router.price_pair(
+            SOURCE_SCID, DEST_SCID, SOURCE_PEER, DEST_PEER, amount_sats
+        )
+
+        assert result.success is True
+        assert plugin.rpc.getroute.call_args.kwargs["amount_msat"] == exact_route_amount_msat
+        assert result.route[0]["amount_msat"] == exact_route_amount_msat
+        assert result.route_cost_sats == 2
+
     def test_router_does_not_call_listpeerchannels_with_legacy_id_kwarg(self):
         """Regression test: earlier versions passed id= which raised
         TypeError on pyln.client.LightningRpc.listpeerchannels. Live nexus-01
@@ -350,8 +378,8 @@ class TestFullRoute:
         assert result.success is True
         # Middle amount is repriced from the final-hop fee budget before the
         # source peer's forwarding fee is added.
-        assert result.route[0]["amount_msat"] == 50_024_002
-        assert result.route_cost_sats == 25
+        assert result.route[0]["amount_msat"] == 50_023_752
+        assert result.route_cost_sats == 24
         plugin.rpc.listchannels.assert_called_with(short_channel_id="300x1x0")
 
     def test_first_hop_delay_includes_cltv_delta_for_first_middle_edge(self):

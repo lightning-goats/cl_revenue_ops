@@ -397,13 +397,13 @@ class RebalanceRouterV3:
             )
         invoice_final_cltv = self._v2_helpers._get_invoice_final_cltv()
         required_final_cltv = dest_cltv + invoice_final_cltv
-        final_hop_fee_sats = self._v2_helpers._compute_final_hop_fee_sats(
+        final_hop_fee_msat = self._v2_helpers._compute_final_hop_fee_msat(
             amount_sats,
             final_hop_fee_ppm,
             final_hop_fee_base_msat,
         )
 
-        route_amount_msat = (amount_sats + final_hop_fee_sats) * 1000
+        route_amount_msat = amount_sats * 1000 + final_hop_fee_msat
         # Audit wave2 FIX 4: constrain askrene's MCF by the engine's
         # acceptance bound instead of allowing 100% of the amount as fee.
         # ``maxfee_sats`` is the TOTAL circular route cost the engine's
@@ -413,16 +413,19 @@ class RebalanceRouterV3:
         # counted as fee. The first-middle-hop fee is unknown until a route
         # returns and is >= 0, so this cap never excludes a route the gate
         # would have accepted (the gate compares ceil'd sats, and the
-        # final-hop fee enters the gate's cost at exactly
-        # final_hop_fee_sats * 1000 msat — the subtraction is msat-exact,
-        # no rounding slack needed). The gate stays authoritative; this is
+        # final-hop fee enters the route at exact msat precision. The gate
+        # still compares the ceil'd total in sats, so the exact admissible
+        # middle-path ceiling is maxfee_sats * 1000 - final_hop_fee_msat.
+        # The gate stays authoritative; this is
         # both a correctness fix (no more high-reliability routes priced
         # over budget while a cheaper in-budget route exists) and a runtime
         # fix (the unconstrained solve took 6-16s on large amounts).
         maxfee_msat = route_amount_msat
         if maxfee_sats is not None:
-            middle_fee_budget_sats = max(0, int(maxfee_sats) - final_hop_fee_sats)
-            maxfee_msat = min(route_amount_msat, middle_fee_budget_sats * 1000)
+            middle_fee_budget_msat = max(
+                0, int(maxfee_sats) * 1000 - final_hop_fee_msat
+            )
+            maxfee_msat = min(route_amount_msat, middle_fee_budget_msat)
         # Re-probe live layers each call so layers created after engine
         # startup are picked up without a plugin restart.
         layers = list(self._probe_layers(layer_names_override))
@@ -549,7 +552,7 @@ class RebalanceRouterV3:
         # Wrap the middle path with our own first and last hops to produce
         # a full circular sendpay route: us → peer_A → ... → peer_B → us.
         # v2's executor expects sendpay format (channel, direction, id, amount, delay).
-        final_hop_fee_sats = self._v2_helpers._compute_final_hop_fee_sats(
+        final_hop_fee_msat = self._v2_helpers._compute_final_hop_fee_msat(
             amount_sats,
             final_hop_fee_ppm,
             final_hop_fee_base_msat,
@@ -582,7 +585,7 @@ class RebalanceRouterV3:
                 first_middle_policy["cltv_delta"]
             )
         else:
-            total_forward_msat = (amount_sats + final_hop_fee_sats) * 1000
+            total_forward_msat = amount_sats * 1000 + final_hop_fee_msat
             first_hop_delay = required_final_cltv
 
         first_hop = {
