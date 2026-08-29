@@ -688,6 +688,134 @@ def controlled_depletion_snapshot(
     return result
 
 
+def _short_channel_id_int(scid: object) -> int:
+    """Convert a canonical blockxtxxout SCID to LND's packed integer form."""
+    parts = str(scid).split("x")
+    if len(parts) != 3:
+        raise RunnerError(f"invalid short channel id: {scid!r}")
+    try:
+        block, transaction, output = (int(part) for part in parts)
+    except (TypeError, ValueError) as exc:
+        raise RunnerError(f"invalid short channel id: {scid!r}") from exc
+    if not (0 <= block < 2**24 and 0 <= transaction < 2**24 and 0 <= output < 2**16):
+        raise RunnerError(f"short channel id component out of range: {scid!r}")
+    return (block << 40) | (transaction << 16) | output
+
+
+def _prepare_lnd_counterflow_admission(
+    state: dict[str, Any],
+    before: dict[str, Any],
+    *,
+    amount_sats: int,
+    attempts: int = GOSSIP_POLICY_POLL_ATTEMPTS,
+    poll_seconds: float = GOSSIP_POLICY_POLL_SECONDS,
+) -> list[dict[str, Any]]:
+    """Make a paused LND counterflow routable without overstating liquidity.
+
+    Payer-depletion first moves liquidity into each contender's payer-facing
+    channel.  Revenue Ops may still advertise its truthful startup floor until
+    the next scheduled admission refresh, but the fixture deliberately holds
+    both controllers before that cycle.  Apply the same spendable-backed
+    ceiling formula to both contenders and require the LND source's graph to
+    observe it before dispatching the earning payments.
+    """
+    required_msat = nonnegative_int(amount_sats, "counterflow amount") * 1000
+    assignment = state.get("assignment")
+    contenders = state.get("contenders")
+    if not isinstance(assignment, dict) or not isinstance(contenders, dict):
+        raise RunnerError("counterflow admission lacks contender metadata")
+    prepared: list[dict[str, Any]] = []
+    for controller in ("revenue_ops", "clboss"):
+        identity = assignment.get(controller)
+        contender = contenders.get(identity) if isinstance(identity, str) else None
+        lanes = before.get(controller)
+        depleted = lanes.get("depleted") if isinstance(lanes, dict) else None
+        if not isinstance(contender, dict) or not isinstance(depleted, dict):
+            raise RunnerError(f"counterflow admission lacks {controller} lane")
+        container = str(contender.get("container") or "")
+        source = str(contender.get("node_id") or "")
+        scid = str(depleted.get("short_channel_id") or "")
+        matches = [
+            row for row in active_channels(container)
+            if str(row.get("short_channel_id") or "") == scid
+        ]
+        if len(matches) != 1 or not source:
+            raise RunnerError(f"counterflow admission cannot resolve {controller}:{scid}")
+        row = matches[0]
+        local = (row.get("updates") or {}).get("local")
+        if not isinstance(local, dict):
+            raise RunnerError(f"counterflow admission lacks local policy for {controller}")
+        try:
+            fee_base_msat = nonnegative_int(local.get("fee_base_msat"), "fee base")
+            fee_ppm = nonnegative_int(
+                local.get("fee_proportional_millionths"), "fee ppm"
+            )
+            htlc_min_msat = nonnegative_int(
+                local.get("htlc_minimum_msat"), "HTLC minimum"
+            )
+            current_htlc_max_msat = nonnegative_int(
+                local.get("htlc_maximum_msat"), "HTLC maximum"
+            )
+            spendable_msat = msat_value(row.get("spendable_msat"))
+        except (TypeError, ValueError) as exc:
+            raise RunnerError(
+                f"counterflow admission has malformed {controller} policy"
+            ) from exc
+        if spendable_msat < required_msat:
+            raise RunnerError(
+                f"counterflow admission exceeds {controller} spendable liquidity"
+            )
+        target_htlc_max_msat = spendable_msat
+        result = cln_rpc(
+            container, "setchannel", scid, fee_base_msat, fee_ppm,
+            htlc_min_msat, target_htlc_max_msat,
+        )
+        if len(result.get("channels", [])) != 1:
+            raise RunnerError(f"counterflow admission did not update {controller}:{scid}")
+        prepared.append({
+            "controller": controller,
+            "short_channel_id": scid,
+            "required_msat": required_msat,
+            "previous_htlc_max_msat": current_htlc_max_msat,
+            "applied_htlc_max_msat": target_htlc_max_msat,
+            "spendable_msat": spendable_msat,
+            "source": source,
+        })
+
+    observer = f"polar-n{int(state['network_id'])}-lnd-sink"
+    pending = {row["controller"]: row for row in prepared}
+    last = "policy absent"
+    for attempt in range(attempts):
+        for controller, expected in list(pending.items()):
+            try:
+                edge = lnd_rpc(
+                    observer, "getchaninfo", "--chan_id",
+                    _short_channel_id_int(expected["short_channel_id"]),
+                )
+                if edge.get("node1_pub") == expected["source"]:
+                    policy = edge.get("node1_policy")
+                elif edge.get("node2_pub") == expected["source"]:
+                    policy = edge.get("node2_policy")
+                else:
+                    policy = None
+                observed = (
+                    nonnegative_int(policy.get("max_htlc_msat"), "gossip HTLC maximum")
+                    if isinstance(policy, dict) else None
+                )
+                if observed == expected["applied_htlc_max_msat"]:
+                    expected["gossip_verified"] = True
+                    pending.pop(controller)
+                else:
+                    last = f"{controller} observed htlcmax={observed!r}"
+            except (RunnerError, TypeError, ValueError) as exc:
+                last = str(exc)
+        if not pending:
+            return prepared
+        if attempt + 1 < attempts:
+            time.sleep(poll_seconds)
+    raise RunnerError(f"LND counterflow admission gossip readback failed: {last}")
+
+
 def _directed_cln_fixture_payment(
     bridge: PolarMcp,
     *,
@@ -923,19 +1051,40 @@ def prepare_controlled_depletion(
             )
         )
     counterflow_amount_sats = 0
+    counterflow_admission = []
+    counterflow_parts_sats: list[int] = []
     if depleted_side == "payer":
         counterflow_amount_sats = 2 * amount_sats - CHANNEL_CAPACITY_SATS
-        for controller in ("revenue_ops", "clboss"):
-            payments.append(
-                payment_fn(
-                    bridge,
-                    network_id=int(state["network_id"]),
-                    target_scid=before[controller]["source"]["short_channel_id"],
-                    amount_sats=counterflow_amount_sats,
-                    label=f"payer-depletion-{controller}",
-                    direction="reverse",
-                )
+        # The controller's active profile deliberately requires three settled
+        # forwards before closing a sub-15-minute observation window.  Split
+        # the fixed counterflow total into exactly three payments so the
+        # accelerated lab cadence exercises that real evidence threshold
+        # without changing liquidity, quoted fees, or either contender's
+        # economic opportunity.
+        if family == "lnd":
+            quotient, remainder = divmod(counterflow_amount_sats, 3)
+            counterflow_parts_sats = [
+                quotient + (1 if index < remainder else 0)
+                for index in range(3)
+            ]
+        else:
+            counterflow_parts_sats = [counterflow_amount_sats]
+        if family == "lnd":
+            counterflow_admission = _prepare_lnd_counterflow_admission(
+                state, before, amount_sats=max(counterflow_parts_sats),
             )
+        for controller in ("revenue_ops", "clboss"):
+            for part_index, part_sats in enumerate(counterflow_parts_sats, start=1):
+                payments.append(
+                    payment_fn(
+                        bridge,
+                        network_id=int(state["network_id"]),
+                        target_scid=before[controller]["source"]["short_channel_id"],
+                        amount_sats=part_sats,
+                        label=f"payer-depletion-{controller}-{part_index}",
+                        direction="reverse",
+                    )
+                )
     after = (
         controlled_depletion_snapshot(state, family=family)
         if depleted_side == "sink"
@@ -953,6 +1102,8 @@ def prepare_controlled_depletion(
         "depleted_side": depleted_side,
         "amount_sats_per_controller": amount_sats,
         "counterflow_amount_sats_per_controller": counterflow_amount_sats,
+        "counterflow_parts_sats_per_controller": counterflow_parts_sats,
+        "counterflow_admission": counterflow_admission,
         "controllers_held": True,
         "fixture_fee_ppm": fixture_fee_ppm,
         "before": before,

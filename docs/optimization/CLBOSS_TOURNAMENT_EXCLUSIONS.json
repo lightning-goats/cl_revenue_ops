@@ -120,6 +120,11 @@
       "replica": "replica-95",
       "block": "smoke-1788034616",
       "reason": "Short ordinary CLN diagnostic reproduced the terminal 35,000-sat reverse MPP failure after five settlements; no retry was issued."
+    },
+    {
+      "replica": "replica-102",
+      "block": "smoke-1788040269",
+      "reason": "Protocol invocation used two payments instead of two repetitions of the four-amount realistic profile; retained as a guard smoke but excluded from the valid eight-payment crossed treatment."
     }
   ]
 }

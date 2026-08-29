@@ -689,3 +689,15 @@ cannot prove those conditions is a failed run.
 Raw manifests and evidence stay in ignored `results/polar-lab/`. Commit only
 the scorer, tests, compact findings, and any verified plugin fixes. No Polar
 result changes a production configuration automatically.
+
+## Deferred xrebalance tournament
+
+After the Revenue Ops versus CLBOSS tournament reaches its completion gate,
+run a separate crossed Revenue Ops versus standalone xrebalance tournament.
+Analyze xrebalance's route search, scheduling, retry, and cost-control behavior;
+adapt only the parts that improve Revenue Ops' risk-adjusted net profit without
+weakening its budget or settlement-safety invariants. The tournament must also
+test the alternative architecture of using xrebalance as Revenue Ops' execution
+backend instead of the native rebalancer. Compare both designs on delivered
+liquidity, total route cost, post-refill net profit, failure recovery, and
+operational complexity before choosing either implementation.

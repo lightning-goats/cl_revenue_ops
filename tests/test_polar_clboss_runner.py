@@ -1913,36 +1913,164 @@ def test_controlled_payer_depletion_adds_equal_reverse_earning_traffic(
     )
     monkeypatch.setattr(
         runner,
-        "_directed_cln_fixture_payment",
+        "_directed_lnd_fixture_payment",
         lambda _bridge, **kwargs: routed.append(kwargs) or {
             "controller": kwargs["label"],
             "amount_sats": kwargs["amount_sats"],
             "direction": kwargs.get("direction", "forward"),
         },
     )
+    admissions = []
+    monkeypatch.setattr(
+        runner,
+        "_prepare_lnd_counterflow_admission",
+        lambda _state, _before, **kwargs: admissions.append(kwargs) or [
+            {"controller": "revenue_ops"}, {"controller": "clboss"}
+        ],
+    )
 
     state = runner.prepare_controlled_depletion(
         object(), replica=11, results_dir=tmp_path, amount_sats=750_000,
-        family="cln", depleted_side="payer",
+        family="lnd", depleted_side="payer",
     )
 
     assert snapshot_calls == [
-        {"family": "cln", "depleted_side": "payer"},
-        {"family": "cln", "depleted_side": "payer"},
+        {"family": "lnd", "depleted_side": "payer"},
+        {"family": "lnd", "depleted_side": "payer"},
     ]
     assert [row["target_scid"] for row in routed] == [
-        "1x1x0", "3x1x0", "2x1x0", "4x1x0",
+        "1x1x0", "3x1x0",
+        "2x1x0", "2x1x0", "2x1x0",
+        "4x1x0", "4x1x0", "4x1x0",
     ]
     assert [row.get("direction", "forward") for row in routed] == [
-        "forward", "forward", "reverse", "reverse",
+        "forward", "forward",
+        "reverse", "reverse", "reverse",
+        "reverse", "reverse", "reverse",
     ]
     assert [row["amount_sats"] for row in routed] == [
-        750_000, 750_000, 500_000, 500_000,
+        750_000, 750_000,
+        166_667, 166_667, 166_666,
+        166_667, 166_667, 166_666,
     ]
+    assert admissions == [{"amount_sats": 166_667}]
     fixture = state["controlled_depletion"]
     assert fixture["depleted_side"] == "payer"
     assert fixture["counterflow_amount_sats_per_controller"] == 500_000
+    assert fixture["counterflow_parts_sats_per_controller"] == [
+        166_667, 166_667, 166_666,
+    ]
+    assert fixture["counterflow_admission"] == [
+        {"controller": "revenue_ops"}, {"controller": "clboss"},
+    ]
     assert fixture["controllers_held"] is True
+
+
+def test_lnd_counterflow_admission_uses_equal_spendable_backed_ceilings(
+    monkeypatch,
+):
+    runner = load_runner()
+    state = {
+        "network_id": 4,
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {
+                "container": "revenue", "node_id": "revenue-id",
+            },
+            "identity-b": {
+                "container": "clboss", "node_id": "clboss-id",
+            },
+        },
+    }
+    before = {
+        "revenue_ops": {"depleted": {"short_channel_id": "11x1x0"}},
+        "clboss": {"depleted": {"short_channel_id": "12x1x0"}},
+    }
+    rows = {
+        "revenue": [{
+            "short_channel_id": "11x1x0",
+            "spendable_msat": "740000000msat",
+            "updates": {"local": {
+                "fee_base_msat": 0,
+                "fee_proportional_millionths": 800,
+                "htlc_minimum_msat": 1,
+                "htlc_maximum_msat": 10000000,
+            }},
+        }],
+        "clboss": [{
+            "short_channel_id": "12x1x0",
+            "spendable_msat": 740000000,
+            "updates": {"local": {
+                "fee_base_msat": 0,
+                "fee_proportional_millionths": 800,
+                "htlc_minimum_msat": 1,
+                "htlc_maximum_msat": 990000000,
+            }},
+        }],
+    }
+    setchannel_calls = []
+
+    def cln(container, method, *args):
+        assert method == "setchannel"
+        setchannel_calls.append((container, args))
+        return {"channels": [{}]}
+
+    scids = {
+        runner._short_channel_id_int("11x1x0"): "revenue-id",
+        runner._short_channel_id_int("12x1x0"): "clboss-id",
+    }
+
+    def lnd(container, method, *args):
+        assert container == "polar-n4-lnd-sink"
+        assert method == "getchaninfo"
+        source = scids[args[-1]]
+        return {
+            "node1_pub": source,
+            "node1_policy": {"max_htlc_msat": "740000000"},
+        }
+
+    monkeypatch.setattr(runner, "active_channels", lambda container: rows[container])
+    monkeypatch.setattr(runner, "cln_rpc", cln)
+    monkeypatch.setattr(runner, "lnd_rpc", lnd)
+
+    prepared = runner._prepare_lnd_counterflow_admission(
+        state, before, amount_sats=500_000, attempts=1, poll_seconds=0,
+    )
+
+    assert setchannel_calls == [
+        ("revenue", ("11x1x0", 0, 800, 1, 740000000)),
+        ("clboss", ("12x1x0", 0, 800, 1, 740000000)),
+    ]
+    assert [row["applied_htlc_max_msat"] for row in prepared] == [
+        740000000, 740000000,
+    ]
+    assert all(row["gossip_verified"] is True for row in prepared)
+
+
+def test_lnd_counterflow_admission_fails_closed_on_malformed_policy(monkeypatch):
+    runner = load_runner()
+    state = {
+        "network_id": 4,
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue", "node_id": "revenue-id"},
+            "identity-b": {"container": "clboss", "node_id": "clboss-id"},
+        },
+    }
+    before = {
+        "revenue_ops": {"depleted": {"short_channel_id": "11x1x0"}},
+        "clboss": {"depleted": {"short_channel_id": "12x1x0"}},
+    }
+    monkeypatch.setattr(runner, "active_channels", lambda container: [{
+        "short_channel_id": "11x1x0" if container == "revenue" else "12x1x0",
+        "spendable_msat": 740000000,
+        "updates": {"local": {"fee_base_msat": 0}},
+    }])
+
+    with pytest.raises(runner.RunnerError, match="fee ppm"):
+        runner._prepare_lnd_counterflow_admission(
+            state, before, amount_sats=500_000, attempts=1, poll_seconds=0,
+        )
 
 
 def test_runner_parser_accepts_payer_depletion_side():
