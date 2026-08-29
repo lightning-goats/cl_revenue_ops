@@ -100,6 +100,7 @@ RPC is used.
 | 73 / Revenue A, CLBOSS B / 10-ppm route, 120-ppm market | 0 / 0 | 0 / 0 | no violations | Revenue repeated 120→118 ppm and rejected a borderline −0.025-sat planner score |
 | 74 / Revenue B, CLBOSS A / 10-ppm route, 150-ppm market | 50,000 sats / 3.001 sats | 0 / 0 | no violations | Revenue moved 150→147 ppm and restored the earned destination from 25% to exactly 30%; uncapped CLBOSS did nothing |
 | 75 / Revenue A, CLBOSS B / crossed 10-ppm route, 150-ppm market | 50,000 sats / 3.001 sats | 0 / 0 | no violations | Crossed replication: Revenue repeated 150→147 ppm, exact 25%→30% refill, and the post-refill demand win; uncapped CLBOSS again did nothing |
+| 76 / Revenue B, CLBOSS A / warm 155k renewal | first 50,000 sats / 3.001 sats; warm 155,000 sats / 4.051 sats | warm 155,000 sats / 3.205 sats | no violations | Revenue renewed exactly once from 14.5%→30%, but CLBOSS matched the warm refill for 0.846 sats less; diagnostic equal-pressure epoch |
 
 Across these ten clean observations Revenue delivered 500,000 sats for 12.520
 sats while uncapped CLBOSS delivered zero. The refill moved each selected
@@ -162,6 +163,18 @@ Revenue's refill. The crossed end-to-end result is now replicated; longer warm
 windows and the formal multi-block coverage threshold still prevent a decisive
 all-area verdict.
 
+Replica 76 extends the same image into a held equal-pressure renewal epoch.
+After the first 50,000-sat Revenue refill, identical 155,000-sat demand placed
+Revenue at 14.5% and CLBOSS at 9.5%. Both controllers then autonomously restored
+exactly 155,000 sats once. Revenue paid 4.051 sats versus CLBOSS's 3.205 sats,
+so CLBOSS retains a 0.846-sat execution-cost advantage on an equal refill.
+Revenue's targeted demand earned 22.785 sats gross versus CLBOSS's 23.250 sats;
+after charging the warm refill, CLBOSS therefore leads this noncompetitive
+epoch by 1.311 sats net. This is evidence to improve route-cost selection, not
+to loosen Revenue's EV or budget gates. The observation also caught a host
+wall-clock step: the runner now reports interval duration from the monotonic
+scheduler clock while preserving wall time only for block identity.
+
 The four safety-eligible post-refill demand blocks (54, 55, 57, and 58) then
 routed 1.14B msat through Revenue versus 0.94B through CLBOSS. Revenue's routing
 fees were 159.960 sats versus 1.645 sats. Charging the four linked 1.052-sat
@@ -199,6 +212,7 @@ and restore the exact captured base and proportional fees on exit.
 - Corrected crossed replicas 66-67 also show the current fee-setting loss directly: CLBOSS at 120 ppm won every offered LND demand payment against Revenue near 133 ppm. The next fee experiment must improve conversion without returning to globally unrealistic fee floors.
 - Replicas 69-75 implement and validate that bounded fee experiment without lowering global floors. Fresh canonical ROI and fresh directional gossip are required; the profitable conversion ceiling repeated at 108/108/135/135 ppm in replicas 72-75, with bounded applied moves to 118/118/147/147 ppm and no safety violations.
 - Replicas 72-75 also separate profit discipline from raw activity. Revenue rejected 9-sat and 4-sat routes when their complete modeled scores were negative, then executed the 150-ppm lane once the measured 3.001-sat cost cleared the opportunity gate. Crossed replicas 74-75 each moved the destination from 25% to exactly 30%; uncapped CLBOSS did nothing. With fixture paths absent, Revenue repeated the exact 12-3 route, 285M-235M msat, and 38.894-35.250 sats linked-net win across both identities.
+- Replica 76 confirms that emergency renewal is single-shot and exact after a profitable lane is drained from 30% to 14.5%, but CLBOSS routes the equal 155,000-sat refill 0.846 sats more cheaply. Route-cost selection—not refill size, cadence, or safety—is the next rebalancing optimization target.
 - The scorer now resolves every post-refill smoke block to its exact native observation, fails closed on missing or mismatched lineage, charges the linked rebalance cost, and publishes eligible single-family phase results. Historical aggregate profit no longer silently treats native refills as free.
 - Replica 56 exposed an arbitrary early-channel capex cliff: a channel with four forwards, positive canonical contribution, and a profitable classification received zero budget because it had neither more than five forwards nor more than 100 sats contribution. Revision `4c26e11` now admits an early active tier funded only by the configured reinvestment share of realized 30-day contribution and capped by the existing bootstrap rail. Zero, absent, negative, malformed, and DB-degraded evidence still grants nothing.
 - Replicas 60-61 validate `4c26e11` in the exact repaired band across identities. Equal 120-ppm fixture pricing produced approximately 90 sats of contribution, Revenue received 88 sats of combined allocation and completed the same 50,000-sat/1.052-sat refill, while CLBOSS completed none during each 180-second observation. Both observations were safety-clean.
@@ -228,7 +242,7 @@ and restore the exact captured base and proportional fees on exit.
 | Controlled depletion | Whether each native controller repairs the same exact 75/25 liquidity state | Ten clean observations across CLN/LND and crossed identities; Revenue leads 10-0 while CLBOSS remains uncapped. |
 | Reserved return lane | Whether a controller can complete a profitable circular refill after pressure | Equal post-pressure 2M-sat CLN/LND paths are removed and confirmed absent before demand scoring. |
 | Post-refill demand | Whether repaired liquidity produces more routed volume and linked net profit | Six eligible CLN/LND blocks repeat Revenue's 285M/235M volume win; aggregate linked net is 222,043/58,045 msat. Extend to longer warm demand. |
-| Warm renewal | Whether profitable outbound inventory renews inside the normal 24-hour cooldown without duplicate spend | `f201b22` passes one final equal-pressure epoch: exact 155k refill to 30%, one payment, clean safety. Cross the final image and extend to multiple epochs. |
+| Warm renewal | Whether profitable outbound inventory renews inside the normal 24-hour cooldown without duplicate spend | Replica 76 renews exactly once from 14.5%→30% with clean safety, but costs 4.051 sats versus CLBOSS's 3.205. Compare route decomposition and improve selection before another crossed warm epoch. |
 | Fee conversion | Whether Revenue can beat CLBOSS's earned LND quote without a global low-fee policy | `fdbecc4` repeats fresh p25/ROI conversion in replicas 72-75 and applies 120→118, 120→118, 150→147, and 150→147 ppm. The post-refill win is crossed; extend it across multiple warm demand epochs. |
 | Profit threshold | Whether Revenue spends only when the full refill economics clear opportunity cost | Replicas 72-73 hold negative 9-sat/4-sat routes; crossed replicas 74-75 each spend 3.001 sats on the clearly positive 150-ppm lane while uncapped CLBOSS remains idle. Extend the demand and renewal window. |
 | CLN 26.06.7 compatibility | Whether both contenders and all read-only/action surfaces remain compatible with the 2026-08-28 security point release | Official source and Docker image are embargoed/unavailable; build an equal-runtime lane immediately when official artifacts appear. Do not treat 26.06.6 as the production recommendation. |

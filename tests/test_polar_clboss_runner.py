@@ -2179,6 +2179,8 @@ def test_observe_rebalances_uses_native_cycles_and_records_balance_improvement(
         runner, "cln_rpc",
         lambda container, method, *args: rpc_calls.append((container, method, args)) or {},
     )
+    wall_clock = iter((1_000.0, 5_000.0, 5_000.0))
+    monkeypatch.setattr(runner.time, "time", lambda: next(wall_clock))
     result = runner.observe_rebalances(
         replica=5, results_dir=tmp_path, observe_seconds=0
     )
@@ -2190,6 +2192,7 @@ def test_observe_rebalances_uses_native_cycles_and_records_balance_improvement(
         "worst_imbalance_improvement_ppm"
     ] == 400_000
     assert result["clboss_spend_policy"] == "native_unbounded"
+    assert result["duration_seconds"] < 1.0
     saved = runner.read_state(path)
     assert saved["status"] == "rebalance_observed"
     assert saved["last_rebalance_observation"].startswith("rebalance-")

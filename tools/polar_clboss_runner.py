@@ -3288,7 +3288,8 @@ def observe_rebalances(
         "clboss": cln_rpc(containers["clboss"], "clboss-status"),
     }
     started = time.time()
-    deadline = time.monotonic() + observe_seconds
+    monotonic_started = time.monotonic()
+    deadline = monotonic_started + observe_seconds
     while time.monotonic() < deadline:
         time.sleep(min(NATIVE_CYCLE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
     after_totals = {
@@ -3336,7 +3337,10 @@ def observe_rebalances(
     result = {
         "schema": "polar-clboss-rebalance-observation-v1",
         "replica": f"replica-{replica}",
-        "duration_seconds": max(0.0, time.time() - started),
+        # Wall time can step under NTP while a compressed tournament epoch is
+        # running. Keep the wall timestamp for block identity, but measure the
+        # interval on the monotonic clock used by the scheduler itself.
+        "duration_seconds": max(0.0, time.monotonic() - monotonic_started),
         "fixture": state.get("return_path_fixture"),
         "controlled_depletion": state.get("controlled_depletion"),
         "targeted_pressure": state.get("targeted_pressure"),
