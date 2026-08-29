@@ -133,6 +133,24 @@ class TestNeighborFeePercentile:
         fc.data_service.get_channels = MagicMock(return_value={"channels": []})
         assert fc._get_neighbor_fee_percentile("02peer", 0.25) == 50
 
+    def test_force_refresh_bypasses_derived_and_gossip_caches(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        old_channels = self._make_channels([50, 100, 200])
+        fresh_channels = self._make_channels([120, 120, 120])
+        fc = self._setup_fc(
+            mock_plugin, mock_config, mock_database, old_channels
+        )
+        fc._cycle_observations = {}
+
+        assert fc._get_neighbor_fee_percentile("02peer", 0.25) == 50
+        fc.data_service.get_channels.return_value = {"channels": fresh_channels}
+
+        assert fc._get_neighbor_fee_percentile(
+            "02peer", 0.25, force_refresh=True
+        ) == 120
+        assert fc.data_service.get_channels.call_count == 2
+
 
 class TestUndercutExplorationThreshold:
     """Phase B.3 (2026-04-23): variance-gated undercut.

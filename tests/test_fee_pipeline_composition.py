@@ -731,6 +731,45 @@ class TestMedianPullModeGating:
 class TestProfitableConversionRetention:
     """Tournament regression: keep an earned corridor edge without a low floor."""
 
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"current_fee_ppm": 50},
+            {"outbound_ratio": float("nan")},
+            {"outbound_ratio": 0.19},
+            {"emergency_outbound_ratio": "malformed"},
+            {"forward_count": 0},
+            {"revenue_rate": 0.0},
+            {"profitability_positive": False},
+            {"posterior_exploring": True},
+        ],
+    )
+    def test_refresh_eligibility_fails_closed_without_earned_window(self, override):
+        evidence = {
+            "current_fee_ppm": 120,
+            "floor_ppm": 50,
+            "outbound_ratio": 0.24,
+            "emergency_outbound_ratio": 0.20,
+            "forward_count": 3,
+            "revenue_rate": 100.0,
+            "profitability_positive": True,
+            "posterior_exploring": False,
+        }
+        evidence.update(override)
+        assert not FeeController._profitable_conversion_refresh_eligible(**evidence)
+
+    def test_refresh_eligibility_accepts_profitable_settled_window(self):
+        assert FeeController._profitable_conversion_refresh_eligible(
+            current_fee_ppm=120,
+            floor_ppm=50,
+            outbound_ratio=0.24,
+            emergency_outbound_ratio=0.20,
+            forward_count=3,
+            revenue_rate=100.0,
+            profitability_positive=True,
+            posterior_exploring=False,
+        )
+
     def test_helper_targets_ten_percent_below_cheap_quartile(self):
         target = FeeController._profitable_conversion_ceiling(
             current_fee_ppm=120,
@@ -818,7 +857,8 @@ class TestProfitableConversionRetention:
         fc._get_rebalance_cost_floor = lambda *a, **k: None
         fc._get_channel_rebalance_cost_ppm = lambda *a, **k: 0
         fc._get_neighbor_fee_median = lambda *a, **k: 150
-        fc._get_neighbor_fee_percentile = lambda *a, **k: 120
+        percentile = MagicMock(return_value=120)
+        fc._get_neighbor_fee_percentile = percentile
         fc._get_competitive_undercut_pct = lambda *a, **k: 0.10
 
         chain = {"fee": 120}
@@ -848,6 +888,10 @@ class TestProfitableConversionRetention:
         assert result.algorithm_values["profitable_conversion_ceiling_ppm"] == 108
         assert result.algorithm_values["competitive_cheap_quartile_ppm"] == 120
         assert result.algorithm_values["floor_ppm"] >= 50
+        assert any(
+            call.kwargs.get("force_refresh") is True
+            for call in percentile.call_args_list
+        ), "earned conversion evidence must bypass a stale gossip percentile"
 
 
 class TestPolicyFeeMultiplierBounds:

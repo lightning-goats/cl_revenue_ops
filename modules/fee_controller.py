@@ -2822,6 +2822,49 @@ class FeeController:
     # non-exploring posterior. The composed floor still wins downstream.
     PROFITABLE_CONVERSION_EDGE_RATIO = 0.10
 
+    @staticmethod
+    def _profitable_conversion_refresh_eligible(
+        *,
+        current_fee_ppm: Any,
+        floor_ppm: Any,
+        outbound_ratio: Any,
+        emergency_outbound_ratio: Any,
+        forward_count: Any,
+        revenue_rate: Any,
+        profitability_positive: bool,
+        posterior_exploring: bool,
+    ) -> bool:
+        """Return whether earned local evidence justifies fresh gossip.
+
+        Compressed test networks can change materially inside the normal
+        gossip-cache TTL. A refresh is nevertheless reserved for a lane
+        that could actually qualify for profitable conversion retention;
+        empty, malformed, unprofitable, exploring, or liquidity-stressed
+        windows continue to use the ordinary cache and fail closed.
+        """
+        if profitability_positive is not True or posterior_exploring is True:
+            return False
+        try:
+            current = int(current_fee_ppm)
+            floor = int(floor_ppm)
+            local_ratio = float(outbound_ratio)
+            emergency_ratio = float(emergency_outbound_ratio)
+            forwards = int(forward_count)
+            earned_rate = float(revenue_rate)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not all(math.isfinite(value) for value in (
+            local_ratio, emergency_ratio, earned_rate
+        )):
+            return False
+        return (
+            current > floor
+            and forwards > 0
+            and earned_rate > 0.0
+            and 0.0 <= emergency_ratio <= 1.0
+            and local_ratio >= emergency_ratio
+        )
+
     @classmethod
     def _profitable_conversion_ceiling(
         cls,
@@ -3761,7 +3804,7 @@ class FeeController:
                                    ttl_seconds: int = 1800,
                                    force_refresh: bool = False) -> list:
         return self._frozen_observation(
-            ("inbound_channels", str(peer_id)),
+            ("inbound_channels", str(peer_id), bool(force_refresh)),
             lambda: record_effective_evidence(
                 "gossip_channels", [peer_id],
                 lambda: self._get_peer_inbound_channels_live(
@@ -3779,13 +3822,19 @@ class FeeController:
             ))
 
     def _get_neighbor_fee_percentile(self, peer_id: str, pct: float,
-                                     cfg: Optional[Any] = None) -> int | None:
+                                     cfg: Optional[Any] = None,
+                                     force_refresh: bool = False) -> int | None:
         return self._frozen_observation(
-            ("neighbor_pct", str(peer_id), float(pct)),
+            ("neighbor_pct", str(peer_id), float(pct), bool(force_refresh)),
             lambda: record_effective_evidence(
                 "neighbor_fee_percentile", [peer_id, pct],
-                lambda: self._get_neighbor_fee_percentile_live(
-                    peer_id, pct, cfg),
+                lambda: (
+                    self._get_neighbor_fee_percentile_live(
+                        peer_id, pct, cfg, force_refresh=True
+                    )
+                    if force_refresh
+                    else self._get_neighbor_fee_percentile_live(peer_id, pct, cfg)
+                ),
             ))
 
     def _get_dynamic_chain_costs(self) -> Optional[Dict[str, int]]:
@@ -4048,7 +4097,13 @@ class FeeController:
             base = ch.get("fee_base_msat")
         return base == 1000
 
-    def _get_neighbor_fee_percentile_live(self, peer_id: str, pct: float, cfg: Optional[Any] = None) -> int | None:
+    def _get_neighbor_fee_percentile_live(
+        self,
+        peer_id: str,
+        pct: float,
+        cfg: Optional[Any] = None,
+        force_refresh: bool = False,
+    ) -> int | None:
         """Return the `pct`-th percentile of competitor fees for this peer.
 
         Phase D.1 (2026-04-23): competition_aware originally preserved DTS
@@ -4063,14 +4118,24 @@ class FeeController:
         """
         cache_key = f"neighbor_fee_p{int(pct * 100):02d}_{peer_id}"
         cached = self._neighbor_fee_cache.get(cache_key)
-        if cached and (time.time() - cached["ts"]) < 1800:
+        if (
+            not force_refresh
+            and cached
+            and (time.time() - cached["ts"]) < 1800
+        ):
             return cached["value"]
 
         try:
             our_id = self._get_our_id()
-            peer_channels = self._get_peer_inbound_channels(
-                peer_id, ttl_seconds=self._gossip_cache_ttl_seconds(cfg)
-            )
+            gossip_ttl = self._gossip_cache_ttl_seconds(cfg)
+            if force_refresh:
+                peer_channels = self._get_peer_inbound_channels(
+                    peer_id, ttl_seconds=gossip_ttl, force_refresh=True
+                )
+            else:
+                peer_channels = self._get_peer_inbound_channels(
+                    peer_id, ttl_seconds=gossip_ttl
+                )
             fees = []
             for ch in peer_channels:
                 if ch.get("source") == our_id:
@@ -7783,13 +7848,24 @@ class FeeController:
             # positive canonical ROI, and liquidity above the emergency-refill
             # boundary. It may only pull down; the full floor stack below wins.
             mode = getattr(cfg, 'market_fee_mode', 'undercut') if cfg else 'undercut'
+            emergency_outbound_ratio = getattr(
+                cfg, 'rebalance_emergency_local_ratio', 0.20
+            )
             if (
-                neighbor_market_usable
-                and mode in ('undercut', 'competition_aware')
-                and not median_pull_exploring
+                mode in ('undercut', 'competition_aware')
+                and self._profitable_conversion_refresh_eligible(
+                    current_fee_ppm=current_fee_ppm,
+                    floor_ppm=floor_ppm,
+                    outbound_ratio=outbound_ratio,
+                    emergency_outbound_ratio=emergency_outbound_ratio,
+                    forward_count=forward_count,
+                    revenue_rate=current_revenue_rate,
+                    profitability_positive=profitability_positive,
+                    posterior_exploring=bool(median_pull_exploring),
+                )
             ):
                 competitive_cheap_quartile_ppm = self._get_neighbor_fee_percentile(
-                    peer_id, 0.25, cfg=cfg
+                    peer_id, 0.25, cfg=cfg, force_refresh=True
                 )
                 profitable_conversion_ceiling_ppm = (
                     self._profitable_conversion_ceiling(
@@ -7797,9 +7873,7 @@ class FeeController:
                         cheap_quartile_ppm=competitive_cheap_quartile_ppm,
                         floor_ppm=floor_ppm,
                         outbound_ratio=outbound_ratio,
-                        emergency_outbound_ratio=getattr(
-                            cfg, 'rebalance_emergency_local_ratio', 0.20
-                        ),
+                        emergency_outbound_ratio=emergency_outbound_ratio,
                         forward_count=forward_count,
                         revenue_rate=current_revenue_rate,
                         profitability_positive=profitability_positive,
