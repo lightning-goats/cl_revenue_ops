@@ -234,6 +234,7 @@ class FeeReasonCode(Enum):
     ACQUISITION_RETENTION = "acquisition_retention"      # Paid validation after acquisition
     ACQUISITION_EXIT = "acquisition_exit"              # Baseline restoration after experiment
     CONGESTION = "congestion"                         # Congestion-based fee surge
+    ADMISSION_POLICY = "admission_policy"             # Liquidity-responsive HTLC valve
     GOSSIP_REFRESH = "gossip_refresh"                 # Minimal nudge to refresh channel_update
     CHANNEL_OPEN = "channel_open"                     # Initial fee set on channel open
 
@@ -3429,6 +3430,132 @@ class FeeController:
         """Phase 3A: delegating shim (see modules/admission_policy.py)."""
         from .admission_policy import delta_exceeds_deadband
         return delta_exceeds_deadband(new_msat, current_msat)
+
+    def _refresh_dynamic_htlcmax_if_needed(
+        self,
+        channel_id: str,
+        peer_id: str,
+        state: Dict[str, Any],
+        channel_info: Dict[str, Any],
+        cfg: Any,
+    ) -> Optional[FeeAdjustment]:
+        """Refresh admission capacity without consuming the fee-learning window.
+
+        Economic repricing deliberately waits for a mature time/forward sample.
+        The liquidity-backed HTLC maximum cannot share that gate: a settled
+        rebalance can materially change forwarding capacity immediately.  This
+        path preserves the currently advertised base/proportional fees exactly
+        and changes only ``htlcmax`` when the existing admission deadband says a
+        broadcast is warranted.
+
+        Missing or malformed live policy fields fail neutral.  That is safer
+        than guessing a companion fee/base value for an admission-only update.
+        """
+        try:
+            def _strict_msat(value: Any) -> int:
+                if isinstance(value, bool) or value is None:
+                    raise ValueError("invalid msat value")
+                if hasattr(value, "millisatoshis"):
+                    value = value.millisatoshis
+                if isinstance(value, str):
+                    value = value.strip()
+                    if value.endswith("msat"):
+                        value = value[:-4]
+                parsed = int(value)
+                if parsed < 0:
+                    raise ValueError("negative msat value")
+                return parsed
+
+            if not isinstance(state, dict) or not isinstance(channel_info, dict):
+                return None
+            flow_state = state.get("state", "balanced")
+            if flow_state not in ("source", "sink", "balanced", "congested"):
+                return None
+            if "fee_proportional_millionths" not in channel_info:
+                return None
+            if "fee_base_msat" not in channel_info:
+                return None
+            htlcmax_keys = ("htlc_maximum_msat", "htlc_max_msat")
+            if not any(key in channel_info for key in htlcmax_keys):
+                return None
+
+            if isinstance(channel_info["fee_proportional_millionths"], bool):
+                return None
+            current_fee_ppm = int(channel_info["fee_proportional_millionths"])
+            current_base_fee_msat = _strict_msat(channel_info["fee_base_msat"])
+            current_htlcmax_msat = _strict_msat(
+                channel_info.get(
+                    "htlc_maximum_msat", channel_info.get("htlc_max_msat")
+                )
+            )
+            _strict_msat(channel_info.get("spendable_msat"))
+            capacity_sats = channel_info.get("capacity")
+            if isinstance(capacity_sats, bool) or int(capacity_sats) <= 0:
+                return None
+            if current_fee_ppm < 0 or current_base_fee_msat < 0:
+                return None
+
+            target_htlcmax_msat = self._compute_dynamic_htlcmax_msat(
+                cfg, channel_info, flow_state
+            )
+            if target_htlcmax_msat is None:
+                return None
+            target_htlcmax_msat = int(target_htlcmax_msat)
+            if not self._htlcmax_delta_exceeds_deadband(
+                target_htlcmax_msat, current_htlcmax_msat
+            ):
+                return None
+
+            reason = (
+                "ADMISSION_POLICY: refresh liquidity-backed HTLC maximum "
+                "without repricing"
+            )
+            result = self.set_channel_fee(
+                channel_id=channel_id,
+                fee_ppm=current_fee_ppm,
+                reason=reason,
+                reason_code=FeeReasonCode.ADMISSION_POLICY.value,
+                enforce_limits=False,
+                channel_info=channel_info,
+                htlcmax_msat=target_htlcmax_msat,
+                base_fee_msat_override=current_base_fee_msat,
+            )
+            if not isinstance(result, dict) or not result.get("success"):
+                return None
+
+            applied_htlcmax_msat = parse_msat(
+                result.get("applied_htlcmax_msat", target_htlcmax_msat)
+            )
+            self.plugin.log(
+                f"ADMISSION_POLICY: {channel_id[:12]}... htlcmax "
+                f"{base_to_sats_floor(current_htlcmax_msat):,}->"
+                f"{base_to_sats_floor(applied_htlcmax_msat):,} sats; "
+                "fee observation window preserved",
+                level="debug",
+            )
+            return FeeAdjustment(
+                channel_id=channel_id,
+                peer_id=peer_id,
+                old_fee_ppm=current_fee_ppm,
+                new_fee_ppm=int(result.get("fee_ppm", current_fee_ppm)),
+                reason=reason,
+                algorithm_values={
+                    "admission_only": True,
+                    "current_htlcmax_msat": current_htlcmax_msat,
+                    "target_htlcmax_msat": target_htlcmax_msat,
+                    "applied_htlcmax_msat": applied_htlcmax_msat,
+                    "fee_window_consumed": False,
+                    "dry_run_proposal": bool(result.get("dry_run")),
+                },
+                reason_code=FeeReasonCode.ADMISSION_POLICY.value,
+            )
+        except Exception as exc:
+            self.plugin.log(
+                f"ADMISSION_POLICY: refresh skipped for {str(channel_id)[:12]}...: "
+                f"{exc}",
+                level="debug",
+            )
+            return None
 
     # =============================================================================
     # GOSSIP REFRESH FOR FROZEN CHANNEL DETECTION
@@ -6830,7 +6957,13 @@ class FeeController:
                         f"(wake in {(_sleep_until - now) // 60} min)",
                         level='debug'
                     )
-                    return None
+                    return self._refresh_dynamic_htlcmax_if_needed(
+                        channel_id=channel_id,
+                        peer_id=peer_id,
+                        state=state,
+                        channel_info=channel_info,
+                        cfg=cfg,
+                    )
         
         # RATE-BASED FEEDBACK: Get volume SINCE LAST FEE CHANGE (not 7-day average)
         # This eliminates the lag from averaging that made the controller blind
@@ -6929,7 +7062,13 @@ class FeeController:
                     f"profile={fee_profile_name})",
                     level='debug'
                 )
-                return None
+                return self._refresh_dynamic_htlcmax_if_needed(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    state=state,
+                    channel_info=channel_info,
+                    cfg=cfg,
+                )
 
         # First run initialization
         if hours_elapsed <= 0:

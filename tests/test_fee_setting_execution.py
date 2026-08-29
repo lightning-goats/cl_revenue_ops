@@ -1333,3 +1333,191 @@ class TestSetInitialFeePersistentPriorSeeding:
         if state is not None:
             assert state.thompson.prior_mean_fee == 200
             assert state.thompson.posterior_bias == []
+
+
+class TestAdmissionRefreshWhileFeeWindowWaits:
+    CHANNEL_ID = "123x456x0"
+    PEER_ID = "02" + "d" * 64
+
+    def _make_controller(self, mock_plugin, mock_database):
+        from modules.config import Config
+        from modules.fee_controller import FeeController
+
+        now = int(time.time())
+        state = _fee_strategy_state_dict()
+        state.update({
+            "last_update": now - 60,
+            "last_fee_ppm": 129,
+            "last_broadcast_fee_ppm": 129,
+        })
+        mock_database.get_fee_strategy_state.return_value = state
+        mock_database.get_channel_probe.return_value = None
+        mock_database.get_volume_since.return_value = 0
+        mock_database.get_forward_count_since.return_value = 0
+        mock_database.record_fee_change = MagicMock()
+        mock_database.update_fee_strategy_state = MagicMock()
+
+        cfg = Config(
+            min_fee_ppm=10,
+            max_fee_ppm=5000,
+            base_fee_msat=0,
+            dry_run=False,
+            enable_dynamic_htlcmax=True,
+            htlcmax_source_pct=0.50,
+        )
+        fc = FeeController(
+            mock_plugin,
+            cfg,
+            mock_database,
+            fee_authority_gate=FeeAuthorityGate(),
+        )
+        fc.data_service = _make_data_service(mock_plugin)
+        return fc, cfg, now - 60
+
+    def _channel_info(self, current_htlcmax_msat=10_000_000):
+        return {
+            "channel_id": self.CHANNEL_ID,
+            "short_channel_id": self.CHANNEL_ID,
+            "peer_id": self.PEER_ID,
+            "capacity": 1_000_000,
+            "spendable_msat": 285_000_000,
+            "receivable_msat": 690_000_000,
+            "fee_base_msat": 0,
+            "fee_proportional_millionths": 129,
+            "htlc_maximum_msat": current_htlcmax_msat,
+            "opener": "local",
+        }
+
+    def test_waiting_fee_window_refreshes_htlcmax_without_repricing(
+        self, mock_plugin, mock_database
+    ):
+        from modules.fee_controller import FeeReasonCode
+
+        fc, cfg, original_cursor = self._make_controller(
+            mock_plugin, mock_database
+        )
+        channel_info = self._channel_info()
+        target_msat = 242_250_000
+        mock_plugin.rpc.setchannel.return_value = {
+            "channels": [{
+                "short_channel_id": self.CHANNEL_ID,
+                "fee_proportional_millionths": 129,
+                "maximum_htlc_out_msat": target_msat,
+            }]
+        }
+
+        adjustment = fc._adjust_channel_fee(
+            self.CHANNEL_ID,
+            self.PEER_ID,
+            {"state": "source"},
+            channel_info,
+            cfg=cfg.snapshot(),
+        )
+
+        assert adjustment is not None
+        assert adjustment.reason_code == FeeReasonCode.ADMISSION_POLICY.value
+        assert adjustment.old_fee_ppm == adjustment.new_fee_ppm == 129
+        assert adjustment.algorithm_values["fee_window_consumed"] is False
+        assert adjustment.algorithm_values["applied_htlcmax_msat"] == target_msat
+        kwargs = _setchannel_kwargs(mock_plugin)
+        assert kwargs["feeppm"] == 129
+        assert kwargs["feebase"] == 0
+        assert kwargs["htlcmax"] == f"{target_msat}msat"
+        assert fc._cycle_states[self.CHANNEL_ID].last_update == original_cursor
+
+    def test_waiting_fee_window_respects_htlcmax_deadband(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg, _ = self._make_controller(mock_plugin, mock_database)
+
+        adjustment = fc._adjust_channel_fee(
+            self.CHANNEL_ID,
+            self.PEER_ID,
+            {"state": "source"},
+            self._channel_info(current_htlcmax_msat=230_000_000),
+            cfg=cfg.snapshot(),
+        )
+
+        assert adjustment is None
+        mock_plugin.rpc.setchannel.assert_not_called()
+
+    def test_sleeping_fee_controller_still_refreshes_admission(
+        self, mock_plugin, mock_database
+    ):
+        from modules.fee_controller import FeeReasonCode
+
+        fc, cfg, original_cursor = self._make_controller(
+            mock_plugin, mock_database
+        )
+        persisted = dict(mock_database.get_fee_strategy_state.return_value)
+        persisted.update({
+            "is_sleeping": 1,
+            "sleep_until": int(time.time()) + 3600,
+            "last_revenue_rate": 0.0,
+        })
+        mock_database.get_fee_strategy_state.return_value = persisted
+        target_msat = 242_250_000
+        mock_plugin.rpc.setchannel.return_value = {
+            "channels": [{
+                "short_channel_id": self.CHANNEL_ID,
+                "fee_proportional_millionths": 129,
+                "maximum_htlc_out_msat": target_msat,
+            }]
+        }
+
+        adjustment = fc._adjust_channel_fee(
+            self.CHANNEL_ID,
+            self.PEER_ID,
+            {"state": "source"},
+            self._channel_info(),
+            cfg=cfg.snapshot(),
+        )
+
+        assert adjustment is not None
+        assert adjustment.reason_code == FeeReasonCode.ADMISSION_POLICY.value
+        assert fc._cycle_states[self.CHANNEL_ID].last_update == original_cursor
+        assert _setchannel_kwargs(mock_plugin)["htlcmax"] == f"{target_msat}msat"
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("fee_base_msat", "not-msat"),
+            ("spendable_msat", {"bad": "shape"}),
+            ("capacity", 0),
+            ("htlc_maximum_msat", None),
+        ],
+    )
+    def test_malformed_live_policy_is_neutral_and_does_not_act(
+        self, mock_plugin, mock_database, field, value
+    ):
+        fc, cfg, _ = self._make_controller(mock_plugin, mock_database)
+        channel_info = self._channel_info()
+        channel_info[field] = value
+
+        adjustment = fc._refresh_dynamic_htlcmax_if_needed(
+            self.CHANNEL_ID,
+            self.PEER_ID,
+            {"state": "source"},
+            channel_info,
+            cfg.snapshot(),
+        )
+
+        assert adjustment is None
+        mock_plugin.rpc.setchannel.assert_not_called()
+
+    def test_admission_refresh_rpc_error_is_neutral(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg, _ = self._make_controller(mock_plugin, mock_database)
+        mock_plugin.rpc.setchannel.side_effect = RuntimeError("rpc unavailable")
+
+        adjustment = fc._refresh_dynamic_htlcmax_if_needed(
+            self.CHANNEL_ID,
+            self.PEER_ID,
+            {"state": "source"},
+            self._channel_info(),
+            cfg.snapshot(),
+        )
+
+        assert adjustment is None
+        mock_plugin.rpc.setchannel.assert_called_once()
