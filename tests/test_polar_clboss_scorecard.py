@@ -58,6 +58,15 @@ def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming()
     assert result["coverage"]["eligible_blocks"] == 1
     assert result["coverage"]["formal_verdict_ready"] is False
     assert result["coverage"]["market_profiles"] == ["acquisition"]
+    assert result["tournament_priority"] == {
+        "primary_metric": "net_profit_msat",
+        "economic_leader": "revenue_ops",
+        "revenue_to_clboss_net_profit_ratio": 2.0,
+        "hard_gates": [
+            "reliability", "budget_compliance", "truthful_admission", "safety"
+        ],
+        "raw_volume_role": "diagnostic_not_an_objective",
+    }
     assert (
         result["by_market_profile"]["acquisition"]["revenue_ops"][
             "net_profit_msat"
@@ -81,9 +90,12 @@ def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming()
     ] == 100
     rendered = mod.markdown(result)
     assert "Formal verdict: **not ready**" in rendered
+    assert "leads the primary net-profit objective" in rendered
+    assert "Raw volume and forward count are diagnostics, not objectives" in rendered
     assert "## Current functional comparison" in rendered
     assert "| Fee setting | 100 msat net at 2000.0 ppm yield" in rendered
     assert "| Route acquisition / breadth | 60000 msat, 60.0% share" in rendered
+    assert "CLBOSS (diagnostic)" in rendered
     assert "| Reliability | Strict safety-gated blocks only; shared traffic settled 10/10 payments" in rendered
     assert "| Channel open / close management | Intentionally absent" in rendered
     assert "### acquisition" in rendered

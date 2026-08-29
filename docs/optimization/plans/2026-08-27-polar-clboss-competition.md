@@ -622,6 +622,15 @@ but low-outbound payer lane improves route breadth and avoids pathological MPP
 composition without raising the admission ceiling above real spendable
 liquidity. Lowering ordinary fee floors is not supported by this evidence.
 
+The tournament's economic ordering is explicit: risk-adjusted net profit is
+primary, subject to reliability, budget, truthful-admission, and safety gates.
+Capital-normalized profit and profitable route coverage are secondary. Raw
+volume and forward count are diagnostics, not objectives. CLBOSS can therefore
+lead raw volume by buying marginal traffic at very low fees while losing the
+economic contest. A breadth experiment is promotable only if its incremental
+traffic increases net profit after rebalance and capital costs; it must not
+optimize route share for its own sake.
+
 The generated scorecard now emits a reproducible functional comparison for fee
 setting, route breadth, post-refill conversion, liquidity balance, reliability,
 and intentionally non-comparable channel opening/closing. This prevents a

@@ -1843,6 +1843,96 @@ def test_controlled_lnd_depletion_uses_exact_lnd_first_hops(monkeypatch, tmp_pat
     assert all(row["amount_sats"] == 750_000 for row in routed)
 
 
+def test_controlled_payer_depletion_adds_equal_reverse_earning_traffic(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 11)
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "network_id": 4,
+        "status": "isolated_full_stack_ready",
+        "league": "full_stack",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "lane_map": {},
+    })
+    snapshots = iter((
+        {
+            "revenue_ops": {
+                "source": {"short_channel_id": "2x1x0", "local_balance_ppm": 500_000},
+                "depleted": {"short_channel_id": "1x1x0", "local_balance_ppm": 500_000},
+            },
+            "clboss": {
+                "source": {"short_channel_id": "4x1x0", "local_balance_ppm": 500_000},
+                "depleted": {"short_channel_id": "3x1x0", "local_balance_ppm": 500_000},
+            },
+        },
+        {
+            "revenue_ops": {
+                "source": {"short_channel_id": "2x1x0", "local_balance_ppm": 750_000},
+                "depleted": {"short_channel_id": "1x1x0", "local_balance_ppm": 250_000},
+            },
+            "clboss": {
+                "source": {"short_channel_id": "4x1x0", "local_balance_ppm": 750_000},
+                "depleted": {"short_channel_id": "3x1x0", "local_balance_ppm": 250_000},
+            },
+        },
+    ))
+    snapshot_calls = []
+    routed = []
+
+    def rpc(_container, method, *_args):
+        if method == "revenue-status":
+            return {"operator_controls": {"values": {"paused": True}}}
+        if method == "clboss-status":
+            return {"rebalance_mode": {"mode": "off"}}
+        return {}
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(
+        runner,
+        "controlled_depletion_snapshot",
+        lambda _state, **kwargs: snapshot_calls.append(kwargs) or next(snapshots),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_directed_cln_fixture_payment",
+        lambda _bridge, **kwargs: routed.append(kwargs) or {
+            "controller": kwargs["label"],
+            "amount_sats": kwargs["amount_sats"],
+            "direction": kwargs.get("direction", "forward"),
+        },
+    )
+
+    state = runner.prepare_controlled_depletion(
+        object(), replica=11, results_dir=tmp_path, amount_sats=750_000,
+        family="cln", depleted_side="payer",
+    )
+
+    assert snapshot_calls == [
+        {"family": "cln", "depleted_side": "payer"},
+        {"family": "cln", "depleted_side": "payer"},
+    ]
+    assert [row["target_scid"] for row in routed] == [
+        "1x1x0", "3x1x0", "2x1x0", "4x1x0",
+    ]
+    assert [row.get("direction", "forward") for row in routed] == [
+        "forward", "forward", "reverse", "reverse",
+    ]
+    assert [row["amount_sats"] for row in routed] == [
+        750_000, 750_000, 500_000, 500_000,
+    ]
+    fixture = state["controlled_depletion"]
+    assert fixture["depleted_side"] == "payer"
+    assert fixture["counterflow_amount_sats_per_controller"] == 500_000
+    assert fixture["controllers_held"] is True
+
+
 def test_directed_lnd_fixture_payment_pins_first_and_last_hop(monkeypatch):
     runner = load_runner()
     monkeypatch.setattr(runner, "_live_lnd_channels", lambda _container: [{
@@ -1878,6 +1968,65 @@ def test_directed_lnd_fixture_payment_pins_first_and_last_hop(monkeypatch):
         "--timeout=30s",
         "--outgoing_chan_id=2308974418337792",
         "--last_hop=02contender", "lnbcrt-invoice",
+    ))]
+
+
+def test_directed_reverse_fixture_payments_pin_sink_first_hops(monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(
+        runner,
+        "active_channels",
+        lambda container: [
+            {"short_channel_id": "21x1x0"},
+            {"short_channel_id": "22x1x0"},
+        ] if container == "polar-n4-cln-sink" else [],
+    )
+    monkeypatch.setattr(runner, "_live_lnd_channels", lambda container: [{
+        "active": True,
+        "scid_str": "31x1x0",
+        "scid": "3408486046105600",
+        "remote_pubkey": "02contender",
+    }] if container == "polar-n4-lnd-sink" else [])
+    cln_calls = []
+    lnd_calls = []
+
+    def cln_rpc(container, *args):
+        cln_calls.append((container, args))
+        return {"status": "complete", "payment_hash": "cln-hash"}
+
+    def lnd_rpc(container, *args):
+        lnd_calls.append((container, args))
+        return {"status": "SUCCEEDED", "payment_hash": "lnd-hash"}
+
+    class Bridge:
+        def call(self, method, params):
+            assert method == "create_invoice"
+            assert params["nodeName"] in {"cln-payer", "lnd-payer"}
+            return {"invoice": f"invoice-{params['nodeName']}"}
+
+    monkeypatch.setattr(runner, "cln_rpc", cln_rpc)
+    monkeypatch.setattr(runner, "lnd_rpc", lnd_rpc)
+
+    cln_result = runner._directed_cln_fixture_payment(
+        Bridge(), network_id=4, target_scid="21x1x0",
+        amount_sats=500_000, label="payer-depletion-revenue_ops",
+        direction="reverse",
+    )
+    lnd_result = runner._directed_lnd_fixture_payment(
+        Bridge(), network_id=4, target_scid="31x1x0",
+        amount_sats=500_000, label="payer-depletion-revenue_ops",
+        direction="reverse",
+    )
+
+    assert cln_result["direction"] == "reverse"
+    assert cln_calls[0][0] == "polar-n4-cln-sink"
+    assert "bolt11=invoice-cln-payer" in cln_calls[0][1]
+    assert 'exclude=["22x1x0/0", "22x1x0/1"]' in cln_calls[0][1]
+    assert lnd_result["direction"] == "reverse"
+    assert lnd_calls == [("polar-n4-lnd-sink", (
+        "payinvoice", "--force", "--json", "--fee_limit=1000",
+        "--timeout=30s", "--outgoing_chan_id=3408486046105600",
+        "--last_hop=02contender", "invoice-lnd-payer",
     ))]
 
 
@@ -2194,8 +2343,15 @@ def test_payer_wallet_topup_fails_closed_on_malformed_lnd_balance(monkeypatch):
         runner.ensure_payer_wallet_funds(object(), 4)
 
 
+@pytest.mark.parametrize(
+    ("depleted_side", "source_role", "destination_role", "direction"),
+    [
+        ("sink", "payer", "sink", "payer_to_sink"),
+        ("payer", "sink", "payer", "sink_to_payer"),
+    ],
+)
 def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, depleted_side, source_role, destination_role, direction
 ):
     runner = load_runner()
     path = runner.state_path(tmp_path, 4)
@@ -2205,6 +2361,7 @@ def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
         "status": "smoke_complete",
         "league": "full_stack",
         "events": [],
+        "controlled_depletion": {"depleted_side": depleted_side},
         "contenders": {
             "identity-a": {"container": "a"},
             "identity-b": {"container": "b"},
@@ -2213,9 +2370,10 @@ def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
     calls = []
     funded = []
     gossip = []
+    lnd_destination_id = f"lnd-{destination_role}-id"
     lnd_rows = iter(([], [{
         "active": True,
-        "remote_pubkey": "lnd-sink-id",
+        "remote_pubkey": lnd_destination_id,
         "channel_point": "funding:1",
         "scid": "123",
         "scid_str": "1x1x1",
@@ -2249,8 +2407,11 @@ def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
         if method == "openchannel":
             return {"funding_txid": "funding"}
         if method == "getchaninfo":
+            local_id = (
+                "lnd-sink-id" if container.endswith("lnd-sink") else "lnd-payer-id"
+            )
             return {
-                "node1_pub": "lnd-payer-id",
+                "node1_pub": local_id,
                 "node1_policy": {
                     "time_lock_delta": 40,
                     "min_htlc": "1",
@@ -2289,17 +2450,19 @@ def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
         "present_during_scored_traffic": False,
         "fee_base_msat": runner.RETURN_PATH_FEE_BASE_MSAT,
         "fee_ppm": runner.RETURN_PATH_FEE_PPM,
+        "direction": direction,
+        "depleted_side": depleted_side,
         "purpose": "isolate post-pressure circular-route availability",
     }
     assert gossip[0][1] == [
         {
             "short_channel_id": "1x1x0",
-            "source": "cln-payer-id",
+            "source": f"cln-{source_role}-id",
             "fee_ppm": runner.RETURN_PATH_FEE_PPM,
         },
         {
             "short_channel_id": "1x1x1",
-            "source": "lnd-payer-id",
+            "source": f"lnd-{source_role}-id",
             "fee_ppm": runner.RETURN_PATH_FEE_PPM,
         },
     ]
@@ -2308,6 +2471,14 @@ def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
         ("bcrt1ptest", 2_100_000),
         ("bcrt1plnd", 2_100_000),
     ]
+    assert (
+        f"polar-n4-cln-{source_role}", "fundchannel",
+        (f"cln-{destination_role}-id", 2_000_000),
+    ) in calls
+    assert (
+        f"polar-n4-lnd-{source_role}", "openchannel",
+        ("--node_key", f"lnd-{destination_role}-id", "--local_amt", 2_000_000),
+    ) in calls
     assert all(method not in {"revenue-rebalance-cycle", "revenue-rebalance"}
                for _container, method, _args in calls)
 

@@ -15,6 +15,8 @@ Coverage: 51 replicas, 88 blocks, 3209 attempted / 3206 settled payments. Enhanc
 
 Formal verdict: **not ready**. It requires at least 3 fresh replicas and 6 enhanced cold/warm blocks per league per replica.
 
+Economic standing: **Revenue Ops leads the primary net-profit objective** at 3.099x CLBOSS net profit. Raw volume and forward count are diagnostics, not objectives; they matter only when the incremental traffic is profitable.
+
 This table describes observed lab outcomes; it does not treat historical smoke blocks as decisive evidence.
 
 ## Current functional comparison
@@ -22,7 +24,7 @@ This table describes observed lab outcomes; it does not treat historical smoke b
 | Comparable functional area | Revenue Ops evidence | CLBOSS evidence | Current result |
 |---|---|---|---|
 | Fee setting | 2552086 msat net at 117.377 ppm yield | 823646 msat net at 20.934 ppm yield | Revenue Ops |
-| Route acquisition / breadth | 22234581928 msat, 34.452% share | 42303945739 msat, 65.548% share | CLBOSS |
+| Route acquisition / breadth | 22234581928 msat, 34.452% share | 42303945739 msat, 65.548% share | CLBOSS (diagnostic) |
 | Rebalancing and post-refill conversion | 4305000000 msat / 553785 msat linked net | 4065000000 msat / 418223 msat linked net | Revenue Ops |
 | Liquidity balance | Mean worst imbalance 838557.7 ppm | Mean worst imbalance 856371.6 ppm | revenue_ops |
 | Reliability | Strict safety-gated blocks only; shared traffic settled 3206/3209 payments | The same shared traffic and safety gate applies | Not attributable per controller |

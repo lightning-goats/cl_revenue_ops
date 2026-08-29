@@ -640,11 +640,13 @@ def _wait_lnd_local_policy(
 
 
 def controlled_depletion_snapshot(
-    state: dict[str, Any], *, family: str = "cln"
+    state: dict[str, Any], *, family: str = "cln", depleted_side: str = "sink"
 ) -> dict[str, Any]:
     """Read each controller's selected source/depleted lanes by live SCID."""
     if family not in {"cln", "lnd"}:
         raise RunnerError(f"unknown controlled depletion family: {family!r}")
+    if depleted_side not in {"payer", "sink"}:
+        raise RunnerError(f"unknown controlled depleted side: {depleted_side!r}")
     assignment = state.get("assignment")
     contenders = state.get("contenders")
     lane_map = state.get("lane_map")
@@ -678,9 +680,10 @@ def controlled_depletion_snapshot(
             }
         if set(roles) != {"payer", "sink"}:
             raise RunnerError(f"controlled depletion lacks both CLN roles for {identity}")
+        source_side = "payer" if depleted_side == "sink" else "sink"
         result[str(controller)] = {
-            "source": roles["payer"],
-            "depleted": roles["sink"],
+            "source": roles[source_side],
+            "depleted": roles[depleted_side],
         }
     return result
 
@@ -692,24 +695,31 @@ def _directed_cln_fixture_payment(
     target_scid: str,
     amount_sats: int,
     label: str,
+    direction: str = "forward",
 ) -> dict[str, Any]:
     """Pay once through a selected contender first hop for fixture setup."""
-    payer = f"polar-n{network_id}-cln-payer"
-    payer_scids = {
-        str(row["short_channel_id"]) for row in active_channels(payer)
+    if direction not in {"forward", "reverse"}:
+        raise RunnerError(f"unknown controlled CLN direction: {direction!r}")
+    source_role = "cln-payer" if direction == "forward" else "cln-sink"
+    destination_role = "cln-sink" if direction == "forward" else "cln-payer"
+    source = f"polar-n{network_id}-{source_role}"
+    source_scids = {
+        str(row["short_channel_id"]) for row in active_channels(source)
     }
-    if target_scid not in payer_scids:
-        raise RunnerError(f"controlled depletion target is not a payer channel: {target_scid}")
+    if target_scid not in source_scids:
+        raise RunnerError(
+            f"controlled depletion target is not a {source_role} channel: {target_scid}"
+        )
     exclusions = [
-        f"{scid}/{direction}"
-        for scid in sorted(payer_scids - {target_scid})
-        for direction in (0, 1)
+        f"{scid}/{channel_direction}"
+        for scid in sorted(source_scids - {target_scid})
+        for channel_direction in (0, 1)
     ]
     invoice_payload = bridge.call(
         "create_invoice",
         {
             "networkId": network_id,
-            "nodeName": "cln-sink",
+            "nodeName": destination_role,
             "amount": amount_sats,
             "memo": f"clboss-controlled-depletion-{label}",
         },
@@ -718,7 +728,7 @@ def _directed_cln_fixture_payment(
     if not isinstance(invoice, str) or not invoice:
         raise RunnerError("controlled depletion invoice is missing")
     payment = cln_rpc(
-        payer,
+        source,
         "-k",
         "pay",
         f"bolt11={invoice}",
@@ -731,6 +741,7 @@ def _directed_cln_fixture_payment(
         "controller": label,
         "target_short_channel_id": target_scid,
         "amount_sats": amount_sats,
+        "direction": direction,
         "excluded_first_hops": exclusions,
         "payment_hash": payment.get("payment_hash"),
     }
@@ -743,11 +754,16 @@ def _directed_lnd_fixture_payment(
     target_scid: str,
     amount_sats: int,
     label: str,
+    direction: str = "forward",
 ) -> dict[str, Any]:
     """Pay through one exact LND-payer contender channel and exact last hop."""
-    payer = f"polar-n{network_id}-lnd-payer"
+    if direction not in {"forward", "reverse"}:
+        raise RunnerError(f"unknown controlled LND direction: {direction!r}")
+    source_role = "lnd-payer" if direction == "forward" else "lnd-sink"
+    destination_role = "lnd-sink" if direction == "forward" else "lnd-payer"
+    source = f"polar-n{network_id}-{source_role}"
     matches = [
-        row for row in _live_lnd_channels(payer)
+        row for row in _live_lnd_channels(source)
         if row.get("active") is True and row.get("scid_str") == target_scid
     ]
     if len(matches) != 1:
@@ -765,7 +781,7 @@ def _directed_lnd_fixture_payment(
         "create_invoice",
         {
             "networkId": network_id,
-            "nodeName": "lnd-sink",
+            "nodeName": destination_role,
             "amount": amount_sats,
             "memo": f"clboss-controlled-depletion-{label}",
         },
@@ -774,7 +790,7 @@ def _directed_lnd_fixture_payment(
     if not isinstance(invoice, str) or not invoice:
         raise RunnerError("controlled depletion LND invoice is missing")
     payment = lnd_rpc(
-        payer,
+        source,
         "payinvoice",
         "--force",
         "--json",
@@ -792,6 +808,7 @@ def _directed_lnd_fixture_payment(
         "target_channel_id": chan_id,
         "last_hop": last_hop,
         "amount_sats": amount_sats,
+        "direction": direction,
         "multipart_allowed": True,
         "payment_hash": payment.get("payment_hash"),
     }
@@ -805,6 +822,7 @@ def prepare_controlled_depletion(
     amount_sats: int = CONTROLLED_DEPLETION_SATS,
     fixture_fee_ppm: int | None = None,
     family: str = "cln",
+    depleted_side: str = "sink",
 ) -> dict[str, Any]:
     """Create equal source/depleted client-family pairs while controllers are held."""
     path = state_path(results_dir, replica)
@@ -818,6 +836,8 @@ def prepare_controlled_depletion(
         raise RunnerError("controlled depletion refuses a previously scored replica")
     if family not in {"cln", "lnd"}:
         raise RunnerError(f"unknown controlled depletion family: {family!r}")
+    if depleted_side not in {"payer", "sink"}:
+        raise RunnerError(f"unknown controlled depleted side: {depleted_side!r}")
     amount_sats = nonnegative_int(amount_sats, "controlled depletion amount")
     if (
         amount_sats <= CHANNEL_CAPACITY_SATS // 2
@@ -848,7 +868,13 @@ def prepare_controlled_depletion(
     if clboss_mode != "off":
         raise RunnerError("CLBOSS did not pause for controlled depletion")
 
-    before = controlled_depletion_snapshot(state, family=family)
+    before = (
+        controlled_depletion_snapshot(state, family=family)
+        if depleted_side == "sink"
+        else controlled_depletion_snapshot(
+            state, family=family, depleted_side=depleted_side
+        )
+    )
     if fixture_fee_ppm is not None:
         fixture_fee_ppm = nonnegative_int(
             fixture_fee_ppm, "controlled depletion fixture fee"
@@ -882,16 +908,41 @@ def prepare_controlled_depletion(
     )
     payments = []
     for controller in ("revenue_ops", "clboss"):
+        forward_target = (
+            before[controller]["source"]
+            if depleted_side == "sink"
+            else before[controller]["depleted"]
+        )
         payments.append(
             payment_fn(
                 bridge,
                 network_id=int(state["network_id"]),
-                target_scid=before[controller]["source"]["short_channel_id"],
+                target_scid=forward_target["short_channel_id"],
                 amount_sats=amount_sats,
                 label=controller,
             )
         )
-    after = controlled_depletion_snapshot(state, family=family)
+    counterflow_amount_sats = 0
+    if depleted_side == "payer":
+        counterflow_amount_sats = 2 * amount_sats - CHANNEL_CAPACITY_SATS
+        for controller in ("revenue_ops", "clboss"):
+            payments.append(
+                payment_fn(
+                    bridge,
+                    network_id=int(state["network_id"]),
+                    target_scid=before[controller]["source"]["short_channel_id"],
+                    amount_sats=counterflow_amount_sats,
+                    label=f"payer-depletion-{controller}",
+                    direction="reverse",
+                )
+            )
+    after = (
+        controlled_depletion_snapshot(state, family=family)
+        if depleted_side == "sink"
+        else controlled_depletion_snapshot(
+            state, family=family, depleted_side=depleted_side
+        )
+    )
     for controller, lanes in after.items():
         if lanes["source"]["local_balance_ppm"] < 700_000:
             raise RunnerError(f"controlled depletion did not create a source for {controller}")
@@ -899,7 +950,9 @@ def prepare_controlled_depletion(
             raise RunnerError(f"controlled depletion did not deplete a sink for {controller}")
     state["controlled_depletion"] = {
         "family": family,
+        "depleted_side": depleted_side,
         "amount_sats_per_controller": amount_sats,
+        "counterflow_amount_sats_per_controller": counterflow_amount_sats,
         "controllers_held": True,
         "fixture_fee_ppm": fixture_fee_ppm,
         "before": before,
@@ -1005,12 +1058,13 @@ def provision_return_paths(
     capacity_sats: int = RETURN_PATH_CAPACITY_SATS,
     fee_ppm: int = RETURN_PATH_FEE_PPM,
 ) -> dict[str, Any]:
-    """Open fresh payer-to-sink liquidity after the scored traffic block.
+    """Open fresh return liquidity toward the controlled depleted lane.
 
     These tournament-only channels are deliberately absent during scored
-    payments.  Once opened they provide both controllers with the same fresh
-    circular-return direction without changing either contender's four-channel
-    topology or offering traffic a scoring-time bypass.
+    payments. Once opened they provide both controllers with the same fresh
+    circular-return direction: payer-to-sink for the historical sink-depleted
+    fixture, or sink-to-payer for a payer-depleted fixture. They do not change
+    either contender's four-channel topology or offer a scoring-time bypass.
     """
     path = state_path(results_dir, replica)
     state = read_state(path)
@@ -1067,53 +1121,81 @@ def provision_return_paths(
     lnd_sink = f"polar-n{network_id}-lnd-sink"
     cln_payer_id = str(cln_rpc(cln_payer, "getinfo").get("id") or "")
     cln_sink_id = str(cln_rpc(cln_sink, "getinfo").get("id") or "")
+    lnd_payer_id = str(lnd_rpc(lnd_payer, "getinfo").get("identity_pubkey") or "")
     lnd_sink_id = str(lnd_rpc(lnd_sink, "getinfo").get("identity_pubkey") or "")
-    if not cln_payer_id or not cln_sink_id or not lnd_sink_id:
+    if not cln_payer_id or not cln_sink_id or not lnd_payer_id or not lnd_sink_id:
         raise RunnerError("return-path endpoint identity readback failed")
+    controlled = state.get("controlled_depletion")
+    depleted_side = (
+        str(controlled.get("depleted_side") or "sink")
+        if isinstance(controlled, dict)
+        else "sink"
+    )
+    if depleted_side not in {"payer", "sink"}:
+        raise RunnerError(f"return path has invalid depleted side: {depleted_side!r}")
+    if depleted_side == "payer":
+        cln_source, cln_destination = cln_sink, cln_payer
+        cln_source_id, cln_destination_id = cln_sink_id, cln_payer_id
+        cln_destination_alias = "cln-payer"
+        lnd_source, lnd_destination = lnd_sink, lnd_payer
+        lnd_source_id, lnd_destination_id = lnd_sink_id, lnd_payer_id
+        lnd_destination_alias = "lnd-payer"
+        return_direction = "sink_to_payer"
+    else:
+        cln_source, cln_destination = cln_payer, cln_sink
+        cln_source_id, cln_destination_id = cln_payer_id, cln_sink_id
+        cln_destination_alias = "cln-sink"
+        lnd_source, lnd_destination = lnd_payer, lnd_sink
+        lnd_source_id, lnd_destination_id = lnd_payer_id, lnd_sink_id
+        lnd_destination_alias = "lnd-sink"
+        return_direction = "payer_to_sink"
     if resume_partial:
         state["return_paths"] = _wait_return_paths(existing_paths)
         _checkpoint(path, state, "return_paths_reconciled_after_partial_open")
     else:
         if any(
-            row.get("peer_id") == cln_sink_id and row.get("state") == "CHANNELD_NORMAL"
-            for row in channel_rows(cln_payer)
+            row.get("peer_id") == cln_destination_id
+            and row.get("state") == "CHANNELD_NORMAL"
+            for row in channel_rows(cln_source)
         ):
-            raise RunnerError("CLN payer already has an active channel to the CLN sink")
+            raise RunnerError("CLN return source already has an active destination channel")
         if any(
-            row.get("remote_pubkey") == lnd_sink_id
-            for row in _live_lnd_channels(lnd_payer)
+            row.get("remote_pubkey") == lnd_destination_id
+            for row in _live_lnd_channels(lnd_source)
         ):
-            raise RunnerError("LND payer already has an active channel to the LND sink")
+            raise RunnerError("LND return source already has an active destination channel")
 
         funding_sats = capacity_sats + RETURN_PATH_FUNDING_BUFFER_SATS
-        cln_address = onchain_address(cln_rpc(cln_payer, "newaddr"))
-        lnd_address = lnd_rpc(lnd_payer, "newaddress", "p2tr").get("address")
+        cln_address = onchain_address(cln_rpc(cln_source, "newaddr"))
+        lnd_address = lnd_rpc(lnd_source, "newaddress", "p2tr").get("address")
         _send_fake_onchain_funds(bridge, network_id, cln_address, funding_sats)
         _checkpoint(path, state, "return_path_cln_wallet_funded", amount_sats=funding_sats)
         _send_fake_onchain_funds(bridge, network_id, str(lnd_address or ""), funding_sats)
         _checkpoint(path, state, "return_path_lnd_wallet_funded", amount_sats=funding_sats)
 
-        _connect_cln(cln_payer, cln_sink_id, "cln-sink")
-        cln_open = cln_rpc(cln_payer, "fundchannel", cln_sink_id, capacity_sats)
+        _connect_cln(cln_source, cln_destination_id, cln_destination_alias)
+        cln_open = cln_rpc(
+            cln_source, "fundchannel", cln_destination_id, capacity_sats
+        )
         cln_channel_id = cln_open.get("channel_id")
         if not isinstance(cln_channel_id, str) or not cln_channel_id:
             raise RunnerError("CLN return-path funding returned no channel id")
         state["return_paths"] = [{
-            "family": "cln", "source_container": cln_payer,
-            "sink_container": cln_sink, "peer_id": cln_sink_id,
+            "family": "cln", "source_container": cln_source,
+            "sink_container": cln_destination, "peer_id": cln_destination_id,
             "channel_id": cln_channel_id, "capacity_sats": capacity_sats,
         }]
         _checkpoint(path, state, "return_path_open_dispatched", family="cln")
         _mine(bridge, network_id, 6)
 
-        _connect_lnd(lnd_payer, lnd_sink_id, "lnd-sink")
+        _connect_lnd(lnd_source, lnd_destination_id, lnd_destination_alias)
         lnd_open = lnd_rpc(
-            lnd_payer, "openchannel", "--node_key", lnd_sink_id,
+            lnd_source, "openchannel", "--node_key", lnd_destination_id,
             "--local_amt", capacity_sats,
         )
         state["return_paths"].append({
-            "family": "lnd", "source_container": lnd_payer,
-            "sink_container": lnd_sink, "peer_id": lnd_sink_id,
+            "family": "lnd", "source_container": lnd_source,
+            "sink_container": lnd_destination, "peer_id": lnd_destination_id,
             "funding_txid": lnd_open.get("funding_txid"),
             "capacity_sats": capacity_sats,
         })
@@ -1125,16 +1207,18 @@ def provision_return_paths(
     # realistic corridor band. Explicit cheap-route lanes remain positive-fee,
     # crossed, and read back from both contenders before controller release.
     cln_rpc(
-        cln_payer, "setchannel", state["return_paths"][0]["short_channel_id"],
+        cln_source, "setchannel", state["return_paths"][0]["short_channel_id"],
         RETURN_PATH_FEE_BASE_MSAT, fee_ppm,
     )
     lnd_row = next(
-        row for row in _live_lnd_channels(lnd_payer)
+        row for row in _live_lnd_channels(lnd_source)
         if row.get("channel_point") == state["return_paths"][1]["channel_point"]
     )
-    local_id = str(lnd_rpc(lnd_payer, "getinfo")["identity_pubkey"])
-    policy = _wait_lnd_local_policy(lnd_payer, lnd_row["scid"], local_id)
-    _set_lnd_policy(lnd_payer, {
+    local_id = str(lnd_rpc(lnd_source, "getinfo")["identity_pubkey"])
+    if local_id != lnd_source_id:
+        raise RunnerError("LND return-path source identity changed during setup")
+    policy = _wait_lnd_local_policy(lnd_source, lnd_row["scid"], local_id)
+    _set_lnd_policy(lnd_source, {
         "channel_point": lnd_row["channel_point"],
         "fee_base_msat": RETURN_PATH_FEE_BASE_MSAT,
         "fee_ppm": fee_ppm,
@@ -1145,7 +1229,7 @@ def provision_return_paths(
     wait_gossip_policies(state["contenders"], [
         {
             "short_channel_id": state["return_paths"][0]["short_channel_id"],
-            "source": cln_payer_id,
+            "source": cln_source_id,
             "fee_ppm": fee_ppm,
         },
         {
@@ -1158,6 +1242,8 @@ def provision_return_paths(
         "present_during_scored_traffic": False,
         "fee_base_msat": RETURN_PATH_FEE_BASE_MSAT,
         "fee_ppm": fee_ppm,
+        "direction": return_direction,
+        "depleted_side": depleted_side,
         "purpose": "isolate post-pressure circular-route availability",
     }
     state["status"] = "return_paths_ready"
@@ -3869,6 +3955,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="client-family lanes to place in the equal controlled liquidity state",
     )
     parser.add_argument(
+        "--depletion-side", choices=("payer", "sink"), default="sink",
+        help=(
+            "contender lane role to leave below 30% local; payer-side depletion "
+            "also adds equal reverse earning traffic before controller release"
+        ),
+    )
+    parser.add_argument(
         "--fixture-fee-ppm", type=nonnegative_arg,
         help=(
             "optional equal outgoing CLN fee on both controlled destinations; "
@@ -3980,6 +4073,7 @@ def main() -> int:
                 amount_sats=args.depletion_sats,
                 fixture_fee_ppm=args.fixture_fee_ppm,
                 family=args.depletion_family,
+                depleted_side=args.depletion_side,
             )
         elif args.command == "target-pressure":
             result = apply_equal_targeted_pressure(

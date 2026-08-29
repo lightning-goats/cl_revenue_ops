@@ -307,6 +307,8 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             CONTROLLERS, key=lambda name: overall[name]["mean_ending_worst_imbalance_ppm"]
         ),
     }
+    clboss_net = overall["clboss"]["net_profit_msat"]
+    revenue_net = overall["revenue_ops"]["net_profit_msat"]
     return {
         "schema": "polar-clboss-scorecard-v1",
         "coverage": {
@@ -343,6 +345,17 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             for profile, rows in sorted(eligible_market_profiles.items())
         },
         "area_leaders": areas,
+        "tournament_priority": {
+            "primary_metric": "net_profit_msat",
+            "economic_leader": areas["net_profit"],
+            "revenue_to_clboss_net_profit_ratio": (
+                None if clboss_net == 0 else round(revenue_net / clboss_net, 3)
+            ),
+            "hard_gates": [
+                "reliability", "budget_compliance", "truthful_admission", "safety"
+            ],
+            "raw_volume_role": "diagnostic_not_an_objective",
+        },
     }
 
 
@@ -350,6 +363,7 @@ def markdown(scorecard: dict[str, Any]) -> str:
     coverage = scorecard["coverage"]
     overall = scorecard["overall"]
     post_rebalance = scorecard["eligible_by_phase"].get("post_rebalance_demand")
+    priority = scorecard["tournament_priority"]
     lines = [
         "# CLBOSS tournament scorecard",
         "",
@@ -389,6 +403,21 @@ def markdown(scorecard: dict[str, Any]) -> str:
         "",
         "Formal verdict: **not ready**. It " + coverage["formal_verdict_blocker"] + ".",
         "",
+        (
+            "Economic standing: **"
+            + ("Revenue Ops" if priority["economic_leader"] == "revenue_ops" else "CLBOSS")
+            + " leads the primary net-profit objective**"
+            + (
+                " at "
+                f"{priority['revenue_to_clboss_net_profit_ratio']}x CLBOSS net profit"
+                if priority["economic_leader"] == "revenue_ops"
+                and priority["revenue_to_clboss_net_profit_ratio"] is not None
+                else ""
+            )
+            + ". Raw volume and forward count are diagnostics, not objectives; "
+            "they matter only when the incremental traffic is profitable."
+        ),
+        "",
         "This table describes observed lab outcomes; it does not treat historical smoke blocks as decisive evidence.",
         "",
         "## Current functional comparison",
@@ -407,7 +436,7 @@ def markdown(scorecard: dict[str, Any]) -> str:
             f"{overall['revenue_ops']['volume_msat']} msat, "
             f"{overall['revenue_ops']['volume_share_pct']}% share | "
             f"{overall['clboss']['volume_msat']} msat, "
-            f"{overall['clboss']['volume_share_pct']}% share | CLBOSS |"
+            f"{overall['clboss']['volume_share_pct']}% share | CLBOSS (diagnostic) |"
         ),
     ])
     if post_rebalance is not None:
