@@ -2658,6 +2658,13 @@ class FeeController:
     # temporal, not price elasticity. Soft: never raises a fee, and DTS
     # remains free to choose lower targets on its own evidence.
     ZERO_FLOW_ANCHOR_FLOOR_FRAC = 0.5
+    # A settled, positive-ROI window is direct evidence that the live quote
+    # works. DTS must not infer a new optimum from one large payment, but it
+    # also must not discard a profitable quote by a normal 15-35% blended
+    # exploration step before another market window can validate the move.
+    # Limit only that cycle's downward move; subsequent quiet/unprofitable
+    # windows retain the ordinary exploration and zero-flow recovery paths.
+    PROFITABLE_WINDOW_MAX_DOWNSHIFT_RATIO = 0.05
     # Cadence scaling for the streak thresholds (2026-07-03 floor-pinning
     # fix): a channel that earns every ~24h is not "stalled" after 4 quiet
     # hours. Thresholds stretch to multiples of the observed meaningful-
@@ -3006,6 +3013,51 @@ class FeeController:
         # Never cut a quote that already has the requested edge. Holding the
         # locally proven price is sufficient and avoids a ratchet to zero.
         return min(current, corridor_ceiling)
+
+    @classmethod
+    def _cap_profitable_window_downshift(
+        cls,
+        *,
+        current_fee_ppm: Any,
+        target_fee_ppm: Any,
+        forward_count: Any,
+        revenue_rate: Any,
+        profitability_positive: bool,
+        rate_is_meaningful: Any,
+    ) -> Tuple[Any, Optional[str]]:
+        """Rate-limit abandonment of a quote that just earned net revenue.
+
+        This is deliberately a one-cycle retention guard, not an earning
+        anchor or posterior observation. It therefore cannot make DTS chase
+        a one-off whale upward. Complete local evidence is required; absent,
+        malformed, trickle-only, or non-positive-ROI input returns the
+        ordinary target unchanged.
+        """
+        original_target = target_fee_ppm
+        if profitability_positive is not True or rate_is_meaningful is not True:
+            return original_target, None
+        if isinstance(current_fee_ppm, bool) or isinstance(target_fee_ppm, bool):
+            return original_target, None
+        try:
+            current = int(current_fee_ppm)
+            target = int(target_fee_ppm)
+            forwards = int(forward_count)
+            earned_rate = float(revenue_rate)
+        except (TypeError, ValueError, OverflowError):
+            return original_target, None
+        if not math.isfinite(earned_rate):
+            return original_target, None
+        if current <= 0 or target >= current or forwards <= 0 or earned_rate <= 0.0:
+            return target, None
+
+        max_downshift_ppm = max(
+            1,
+            int(math.ceil(current * cls.PROFITABLE_WINDOW_MAX_DOWNSHIFT_RATIO)),
+        )
+        guarded_target = max(target, current - max_downshift_ppm)
+        if guarded_target == target:
+            return target, None
+        return guarded_target, "profitable_window_downshift_cap"
 
     # E-2 (2026-07 econ audit): "saturated" balance-class boundary. Single
     # source of truth shared by the DTS context bucket
@@ -6960,6 +7012,8 @@ class FeeController:
         applied_target_ppm = None
         zero_flow_guard_reason = None
         zero_flow_guard_target_ppm = None
+        profitable_downshift_guard_reason = None
+        profitable_downshift_guard_target_ppm = None
         zero_revenue_streak = None
         supported_cap_ppm = None
         competitive_cheap_quartile_ppm = None
@@ -8674,6 +8728,25 @@ class FeeController:
                     f"current={current_fee_ppm}ppm, floor={floor_ppm}ppm",
                     level='debug',
                 )
+            blended_target_ppm, profitable_downshift_guard_reason = (
+                self._cap_profitable_window_downshift(
+                    current_fee_ppm=current_fee_ppm,
+                    target_fee_ppm=blended_target_ppm,
+                    forward_count=forward_count,
+                    revenue_rate=adjusted_revenue_rate,
+                    profitability_positive=profitability_positive,
+                    rate_is_meaningful=rate_is_meaningful,
+                )
+            )
+            if profitable_downshift_guard_reason:
+                profitable_downshift_guard_target_ppm = blended_target_ppm
+                self.plugin.log(
+                    f"PROFITABLE_WINDOW_GUARD: {channel_id[:12]}... "
+                    f"target={pre_guard_blended_target_ppm}->{blended_target_ppm}ppm, "
+                    f"current={current_fee_ppm}ppm, "
+                    f"rate={adjusted_revenue_rate:.2f}sats/hr",
+                    level='debug',
+                )
             new_fee_ppm, damping_info = self._apply_damped_fee_target(
                 current_fee_ppm=current_fee_ppm,
                 target_fee_ppm=blended_target_ppm,
@@ -8691,9 +8764,13 @@ class FeeController:
             zero_flow_tag = (
                 f", guard={zero_flow_guard_reason}" if zero_flow_guard_reason else ""
             )
+            profitable_window_tag = (
+                f", profitable_guard={profitable_downshift_guard_reason}"
+                if profitable_downshift_guard_reason else ""
+            )
             decision_reason = (
                 f"dts_pid (dts={dts_fee}, pid={pid_multiplier:.2f}, "
-                f"flow={flow_state_str}{zero_flow_tag})"
+                f"flow={flow_state_str}{zero_flow_tag}{profitable_window_tag})"
             )
 
             # Update volume tracking
@@ -8951,7 +9028,8 @@ class FeeController:
             f"conversion_ceiling:{profitable_conversion_ceiling_ppm}, "
             f"blend:{target_blend_ratio:.2f}, bound:{bound_reason}, cap:{delta_cap_reason}({delta_cap_ppm}ppm), "
             f"wake:{wake_reason}, sparse:{sparse_data_conservative}, exploration:{exploration_mode}, "
-            f"zero_flow_guard:{zero_flow_guard_reason or 'none'}"
+            f"zero_flow_guard:{zero_flow_guard_reason or 'none'}, "
+            f"profitable_downshift_guard:{profitable_downshift_guard_reason or 'none'}"
             f"{rebal_cost_tag}"
             if raw_dts_target_ppm is not None else
             f"targets=n/a, blend:{target_blend_ratio:.2f}, wake:{wake_reason}, "
@@ -9225,6 +9303,8 @@ class FeeController:
                     "post_pid_target_ppm": post_pid_target_ppm,
                     "zero_flow_guard_reason": zero_flow_guard_reason,
                     "zero_flow_guard_target_ppm": zero_flow_guard_target_ppm,
+                    "profitable_downshift_guard_reason": profitable_downshift_guard_reason,
+                    "profitable_downshift_guard_target_ppm": profitable_downshift_guard_target_ppm,
                     "zero_revenue_streak": zero_revenue_streak,
                     "supported_fee_ceiling_ppm": supported_cap_ppm,
                     "competitive_cheap_quartile_ppm": competitive_cheap_quartile_ppm,

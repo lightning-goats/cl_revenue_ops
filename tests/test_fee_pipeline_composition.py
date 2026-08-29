@@ -1722,3 +1722,95 @@ class TestGossipGatePendingTarget:
         result = self._run_cycle(fc, cfg, chain, ts_state)
         assert result is None
         assert broadcasts == []
+
+
+class TestProfitableWindowDownshiftGuard:
+    """Tournament regression: profitable volume must not be repriced away."""
+
+    def test_helper_caps_one_profitable_downshift_to_five_percent(self):
+        target, reason = FeeController._cap_profitable_window_downshift(
+            current_fee_ppm=800,
+            target_fee_ppm=683,
+            forward_count=66,
+            revenue_rate=15_000.0,
+            profitability_positive=True,
+            rate_is_meaningful=True,
+        )
+        assert target == 760
+        assert reason == "profitable_window_downshift_cap"
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"forward_count": 0},
+            {"forward_count": "malformed"},
+            {"revenue_rate": 0.0},
+            {"revenue_rate": float("nan")},
+            {"profitability_positive": False},
+            {"rate_is_meaningful": False},
+            {"rate_is_meaningful": None},
+            {"current_fee_ppm": "malformed"},
+            {"target_fee_ppm": "malformed"},
+        ],
+    )
+    def test_helper_neutral_without_complete_earned_evidence(self, override):
+        evidence = {
+            "current_fee_ppm": 800,
+            "target_fee_ppm": 683,
+            "forward_count": 3,
+            "revenue_rate": 100.0,
+            "profitability_positive": True,
+            "rate_is_meaningful": True,
+        }
+        evidence.update(override)
+        target, reason = FeeController._cap_profitable_window_downshift(**evidence)
+        assert target == evidence["target_fee_ppm"]
+        assert reason is None
+
+    def test_pipeline_preserves_more_of_positive_roi_quote(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database, min_fee_ppm=50)
+        row = dict(mock_database.get_fee_strategy_state.return_value)
+        row.update({
+            "last_fee_ppm": 150,
+            "last_broadcast_fee_ppm": 150,
+            "last_revenue_rate": 0.0,
+            "last_update": int(time.time()) - 7200,
+        })
+        mock_database.get_fee_strategy_state.return_value = row
+        mock_database.get_volume_since.return_value = 500_000
+        mock_database.get_forward_count_since.return_value = 66
+        fc.profitability = MagicMock()
+        fc.profitability.get_profitability.return_value = MagicMock(
+            window_30d_available=True,
+            forward_count_30d=66,
+            sourced_forward_count_30d=0,
+            marginal_roi_percent=100.0,
+        )
+        fc._calculate_floor = lambda *a, **k: 50
+        fc._get_rebalance_cost_floor = lambda *a, **k: None
+        fc._get_channel_rebalance_cost_ppm = lambda *a, **k: 0
+        fc._get_neighbor_fee_median = lambda *a, **k: 10
+
+        chain = {"fee": 800}
+        _stub_broadcasts(fc, chain)
+        ts_state = _prepare_dts_stubs(
+            fc, chain_fee=800, sampled_fee=199, posterior_std=100.0
+        )
+        ts_state.thompson.supported_fee_ceiling = lambda **k: 1000
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID,
+            PEER_ID,
+            {"state": "source", "forward_count": 66},
+            _channel_info(800),
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.new_fee_ppm == 760
+        assert (
+            result.algorithm_values["profitable_downshift_guard_reason"]
+            == "profitable_window_downshift_cap"
+        )
