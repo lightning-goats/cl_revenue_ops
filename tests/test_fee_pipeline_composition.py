@@ -731,6 +731,69 @@ class TestMedianPullModeGating:
 class TestProfitableConversionRetention:
     """Tournament regression: keep an earned corridor edge without a low floor."""
 
+    @staticmethod
+    def _profitability_snapshot(*, forwards, roi):
+        snapshot = MagicMock()
+        snapshot.window_30d_available = True
+        snapshot.forward_count_30d = forwards
+        snapshot.sourced_forward_count_30d = 0
+        snapshot.marginal_roi_percent = roi
+        return snapshot
+
+    def test_settled_flow_refreshes_stale_canonical_profitability(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+        stale = self._profitability_snapshot(forwards=0, roi=0.0)
+        fresh = self._profitability_snapshot(forwards=4, roi=100.0)
+        fc.profitability = MagicMock()
+        fc.profitability.get_profitability.return_value = stale
+        fc.profitability.analyze_all_channels.return_value = {
+            CHANNEL_ID: fresh
+        }
+
+        result = fc._get_fee_profitability_snapshot(
+            CHANNEL_ID, settled_forward_count=4, now=1_000
+        )
+
+        assert result is fresh
+        fc.profitability.analyze_all_channels.assert_called_once_with(force=True)
+
+    @pytest.mark.parametrize("settled", [0, None, "malformed"])
+    def test_absent_or_malformed_settled_flow_does_not_refresh(
+        self, mock_plugin, mock_database, settled
+    ):
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+        stale = self._profitability_snapshot(forwards=0, roi=0.0)
+        fc.profitability = MagicMock()
+        fc.profitability.get_profitability.return_value = stale
+
+        assert fc._get_fee_profitability_snapshot(
+            CHANNEL_ID, settled_forward_count=settled, now=1_000
+        ) is stale
+        fc.profitability.analyze_all_channels.assert_not_called()
+
+    def test_refresh_failure_stays_canonical_and_backs_off(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+        stale = self._profitability_snapshot(forwards=0, roi=0.0)
+        fc.profitability = MagicMock()
+        fc.profitability.get_profitability.return_value = stale
+        fc.profitability.analyze_all_channels.side_effect = RuntimeError(
+            "database unavailable"
+        )
+
+        first = fc._get_fee_profitability_snapshot(
+            CHANNEL_ID, settled_forward_count=4, now=1_000
+        )
+        second = fc._get_fee_profitability_snapshot(
+            CHANNEL_ID, settled_forward_count=4, now=1_001
+        )
+
+        assert first is stale and second is stale
+        fc.profitability.analyze_all_channels.assert_called_once_with(force=True)
+
     @pytest.mark.parametrize(
         "override",
         [

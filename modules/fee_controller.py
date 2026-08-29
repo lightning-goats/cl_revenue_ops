@@ -2821,6 +2821,81 @@ class FeeController:
     # usable liquidity above the configured emergency-refill boundary, and a
     # non-exploring posterior. The composed floor still wins downstream.
     PROFITABLE_CONVERSION_EDGE_RATIO = 0.10
+    PROFITABILITY_REFRESH_BACKOFF_SECONDS = 300
+
+    def _get_fee_profitability_snapshot(
+        self,
+        channel_id: str,
+        *,
+        settled_forward_count: Any,
+        now: Any,
+    ) -> Any:
+        """Return canonical profitability, refreshing one stale snapshot.
+
+        The analyzer intentionally caches its full-node pass for 15 minutes.
+        A fee window can close sooner after settled traffic.  When that local
+        fact contradicts a real canonical 30-day snapshot containing zero
+        forwards, refresh the analyzer once before using ROI.  The settled
+        count is only a staleness signal; all value still comes from the
+        canonical analyzer result.
+        """
+        analyzer = self.profitability
+        if analyzer is None:
+            return None
+        try:
+            snapshot = analyzer.get_profitability(channel_id)
+        except Exception as exc:
+            self.plugin.log(
+                f"Fee profitability lookup failed for {channel_id}: {exc}",
+                level='debug',
+            )
+            return None
+
+        try:
+            settled = int(settled_forward_count)
+            decision_ts = int(now)
+            real_window = (
+                getattr(snapshot, "window_30d_available", False) is True
+            )
+            canonical_forwards = max(
+                0,
+                int(getattr(snapshot, "forward_count_30d", 0) or 0),
+                int(getattr(snapshot, "sourced_forward_count_30d", 0) or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return snapshot
+        if (
+            settled <= 0
+            or not real_window
+            or canonical_forwards > 0
+            or decision_ts < self._profitability_refresh_backoff_until
+        ):
+            return snapshot
+
+        self._profitability_refresh_backoff_until = (
+            decision_ts + self.PROFITABILITY_REFRESH_BACKOFF_SECONDS
+        )
+        refresh = getattr(analyzer, "analyze_all_channels", None)
+        if not callable(refresh):
+            return snapshot
+        try:
+            refreshed = refresh(force=True)
+            if isinstance(refreshed, dict):
+                fresh_snapshot = refreshed.get(normalize_scid(channel_id))
+                if fresh_snapshot is not None:
+                    self.plugin.log(
+                        "Refreshed canonical fee profitability after "
+                        f"settled-forward cache mismatch on {channel_id}",
+                        level='debug',
+                    )
+                    return fresh_snapshot
+        except Exception as exc:
+            self.plugin.log(
+                "Fee profitability refresh after settled-forward mismatch "
+                f"failed for {channel_id}: {exc}",
+                level='debug',
+            )
+        return snapshot
 
     @staticmethod
     def _profitable_conversion_refresh_eligible(
@@ -3459,6 +3534,10 @@ class FeeController:
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
         self._acquisition_cycle_experiments: Dict[str, Dict[str, Any]] = {}
+        # A settled-forward contradiction may trigger one expensive canonical
+        # profitability refresh. Back off failures/concurrent-cache returns so
+        # compressed fee cycles cannot create a refresh storm.
+        self._profitability_refresh_backoff_until: int = 0
 
         # PR 3e (gap-closure Phase B): per-cycle observation freeze.
         # Active ({}) only around _adjust_all_fees_inner; None means no
@@ -6888,7 +6967,11 @@ class FeeController:
         profitability_positive = False
         if self.profitability:
             try:
-                prof_data = self.profitability.get_profitability(channel_id)
+                prof_data = self._get_fee_profitability_snapshot(
+                    channel_id,
+                    settled_forward_count=forward_count,
+                    now=now,
+                )
                 roi_value = getattr(prof_data, "marginal_roi_percent", None)
                 record_effective_evidence_result(
                     "marginal_roi_percent", [channel_id], roi_value,
