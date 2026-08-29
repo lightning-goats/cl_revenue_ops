@@ -2798,6 +2798,118 @@ class RebalanceEngine:
     def _executor_unavailable_reason(self) -> tuple[str, str]:
         return "native_unavailable", "native route executor RPC surface unavailable"
 
+    def _try_frugal_requote(self, pair: PairCandidate) -> bool:
+        """Replace a selected Askrene route with a strictly cheaper quote.
+
+        Askrene's single-path solver starts strongly probability-weighted.  A
+        route can therefore sit comfortably below the planner's economic
+        ceiling while a cheaper route with equal modeled reliability remains
+        undiscovered.  Once per *selected* pair, lower maxfee_sats by exactly
+        one sat and retain the result only when all of these remain true:
+
+        * the router explicitly supports an enforced fee cap;
+        * the original probability is present and well formed;
+        * the replacement is strictly cheaper;
+        * replacement probability is no lower than the original; and
+        * the original economic ceiling still accepts it.
+
+        Pricing failures, malformed responses, missing evidence, and routers
+        without the capability are neutral: the already accepted route is
+        preserved.  This bounds the optimization to one extra getroutes call
+        for an execution winner, not one call for every planner candidate.
+        """
+        try:
+            original_cost = int(getattr(pair, "route_cost_sats", 0) or 0)
+            decomposition = getattr(pair, "score_decomposition", {}) or {}
+            inputs = decomposition.get("inputs", {})
+            if not isinstance(inputs, dict):
+                return False
+            original_probability = int(
+                inputs.get("probability_ppm", 0) or 0
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+        # A one-sat cap reduction cannot improve a free/one-sat route, and
+        # absent probability evidence cannot prove reliability preservation.
+        if original_cost <= 1 or not (0 < original_probability <= 1_000_000):
+            return False
+
+        router = self._cycle_router or self._active_router()
+        if router is None or not bool(getattr(router, "supports_fee_cap", False)):
+            return False
+
+        target_cap = original_cost - 1
+        try:
+            candidate = self._market_price_pair(
+                router,
+                pair,
+                exclude=None,
+                maxfee_sats=target_cap,
+            )
+            if not bool(getattr(candidate, "success", False)):
+                return False
+            candidate_cost = int(getattr(candidate, "route_cost_sats", 0) or 0)
+            candidate_probability = int(
+                getattr(candidate, "probability_ppm", 0) or 0
+            )
+            candidate_route = list(getattr(candidate, "route", []) or [])
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            self._log(f"Frugal route re-quote ignored malformed result: {exc}", level="warn")
+            return False
+        except Exception as exc:
+            self._log(f"Frugal route re-quote failed neutrally: {exc}", level="debug")
+            return False
+
+        if (
+            not candidate_route
+            or candidate_cost < 0
+            or candidate_cost >= original_cost
+            or candidate_probability < original_probability
+            or candidate_probability > 1_000_000
+        ):
+            return False
+
+        original_ceiling = getattr(pair, "effective_budget_sats", None)
+        if original_ceiling is None:
+            original_ceiling = self._probability_adjusted_budget(
+                int(getattr(pair, "pair_budget_sats", 0) or 0),
+                original_probability,
+            )
+            original_ceiling = self._per_attempt_fee_ceiling(
+                int(getattr(pair, "amount_sats", 0) or 0),
+                original_ceiling,
+            )
+        try:
+            original_ceiling = max(0, int(original_ceiling))
+        except (TypeError, ValueError):
+            return False
+        if candidate_cost > original_ceiling:
+            return False
+
+        pair.route = candidate_route
+        pair.route_cost_sats = candidate_cost
+        decomposition = getattr(pair, "score_decomposition", None)
+        if not isinstance(decomposition, dict):
+            decomposition = {}
+            pair.score_decomposition = decomposition
+        decomposition["frugal_requote"] = {
+            "original_route_cost_sats": original_cost,
+            "route_cost_sats": candidate_cost,
+            "saved_sats_ceiling": original_cost - candidate_cost,
+            "original_probability_ppm": original_probability,
+            "probability_ppm": candidate_probability,
+            "maxfee_sats": target_cap,
+        }
+        self._log(
+            f"Selected cheaper equally-reliable rebalance route "
+            f"{pair.source_channel_id}->{pair.dest_channel_id}: "
+            f"cost {original_cost}->{candidate_cost} sats, "
+            f"probability {original_probability}->{candidate_probability} ppm",
+            level="debug",
+        )
+        return True
+
     def _retry_native_pair_with_exclusions(
         self,
         pair: PairCandidate,
@@ -3235,6 +3347,10 @@ class RebalanceEngine:
                 error=f"policy_blocked: {policy_reason}",
                 route_type="native",
             )
+        # The pair already won planning and has an accepted route.  Give only
+        # this execution winner one stricter quote before any history/budget
+        # mutation; every failure mode preserves the original route.
+        self._try_frugal_requote(pair)
         # Stage 2D Defect 3 fix: the v2 engine used to leave ``rebalance_history``
         # empty on automatic cycles, which made ``revenue-status.rebalance_decision.
         # action == 'rebalance'`` reachable alongside ``recent_rebalances == []``.

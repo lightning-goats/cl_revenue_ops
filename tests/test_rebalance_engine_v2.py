@@ -2164,6 +2164,156 @@ def test_engine_native_executor_consumes_priced_route(mock_plugin, mock_database
     assert executor.execute.call_args.kwargs["route"] == priced_route
 
 
+def test_engine_frugal_requote_executes_strictly_cheaper_equally_reliable_route(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_executor_v2 import ExecutionResult
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    original_route = [{"channel": "100x1x0", "amount_msat": 50_004_001}]
+    cheaper_route = [{"channel": "100x1x0", "amount_msat": 50_003_100}]
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=20,
+        route=original_route,
+        route_cost_sats=5,
+        score_decomposition={"inputs": {"probability_ppm": 990_000}},
+    )
+    pair.effective_budget_sats = 20
+    router = MagicMock()
+    router.supports_fee_cap = True
+    router.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=4,
+        probability_ppm=995_000,
+        route=cheaper_route,
+        error="",
+    )
+    engine._cycle_router = router
+    executor = MagicMock()
+    executor.execute.return_value = ExecutionResult(
+        success=True,
+        amount_sats=50_000,
+        fee_sats=4,
+        fee_msat=3_100,
+        route_type="native",
+    )
+
+    result = engine._execute_pair(pair, executor)
+
+    assert result.success is True
+    assert pair.route == cheaper_route
+    assert pair.route_cost_sats == 4
+    assert pair.score_decomposition["frugal_requote"] == {
+        "original_route_cost_sats": 5,
+        "route_cost_sats": 4,
+        "saved_sats_ceiling": 1,
+        "original_probability_ppm": 990_000,
+        "probability_ppm": 995_000,
+        "maxfee_sats": 4,
+    }
+    assert router.price_pair.call_args.kwargs["maxfee_sats"] == 4
+    assert executor.execute.call_args.kwargs["route"] == cheaper_route
+
+
+def test_engine_frugal_requote_preserves_route_when_probability_would_drop(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    original_route = [{"channel": "100x1x0"}]
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=20,
+        route=original_route,
+        route_cost_sats=5,
+        score_decomposition={"inputs": {"probability_ppm": 990_000}},
+    )
+    router = MagicMock()
+    router.supports_fee_cap = True
+    router.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats=4,
+        probability_ppm=989_999,
+        route=[{"channel": "cheaper"}],
+    )
+    engine._cycle_router = router
+
+    assert engine._try_frugal_requote(pair) is False
+    assert pair.route == original_route
+    assert pair.route_cost_sats == 5
+    assert "frugal_requote" not in pair.score_decomposition
+
+
+def test_engine_frugal_requote_missing_probability_is_neutral(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=20,
+        route=[{"channel": "original"}],
+        route_cost_sats=5,
+        score_decomposition={"inputs": {"probability_ppm": 0}},
+    )
+    router = MagicMock()
+    router.supports_fee_cap = True
+    engine._cycle_router = router
+
+    assert engine._try_frugal_requote(pair) is False
+    router.price_pair.assert_not_called()
+    assert pair.route == [{"channel": "original"}]
+
+
+def test_engine_frugal_requote_malformed_response_is_neutral(
+    mock_plugin, mock_database
+):
+    from modules.rebalance_types_v2 import PairCandidate
+
+    engine = _make_engine(mock_plugin, mock_database)
+    original_route = [{"channel": "original"}]
+    pair = PairCandidate(
+        source_channel_id="100x1x0",
+        dest_channel_id="200x1x0",
+        source_peer_id="02" + "b" * 64,
+        dest_peer_id="02" + "c" * 64,
+        amount_sats=50_000,
+        pair_budget_sats=20,
+        route=original_route,
+        route_cost_sats=5,
+        score_decomposition={"inputs": {"probability_ppm": 990_000}},
+    )
+    router = MagicMock()
+    router.supports_fee_cap = True
+    router.price_pair.return_value = SimpleNamespace(
+        success=True,
+        route_cost_sats="not-a-number",
+        probability_ppm={"bad": "shape"},
+        route=[{"channel": "bad"}],
+    )
+    engine._cycle_router = router
+
+    assert engine._try_frugal_requote(pair) is False
+    assert pair.route == original_route
+    assert pair.route_cost_sats == 5
+
+
 def test_engine_native_executor_retries_with_failed_segment_excluded(
     mock_plugin, mock_database
 ):

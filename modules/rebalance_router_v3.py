@@ -193,6 +193,9 @@ class RebalanceRouterV3:
     # Monotonic counter for exclude layer names. itertools.count so that
     # concurrent workers can never mint duplicate names.
     _exclude_counter = itertools.count(1)
+    # Capability marker consumed by the execution sink.  Only routers that
+    # enforce maxfee_sats may receive the bounded frugal re-quote.
+    supports_fee_cap = True
 
     def __init__(
         self,
