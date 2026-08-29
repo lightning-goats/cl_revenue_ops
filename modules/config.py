@@ -63,10 +63,9 @@ PUBLIC_RUNTIME_KEYS = (
     'drain_fee_discount_max',
     'node_drain_bias_enabled',
     'node_drain_bias_max',
-    # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit): scales each
-    # channel's max HTLC by flow state so sinks throttle drain-through.
-    # CLN has no negative inbound fees; this is the inbound-side control
-    # surface. Default off.
+    # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit): defaults to a
+    # truthful live-spendable cap, with optional flow-class shaping. Default
+    # on; fee-controller and config validation fail closed on bad evidence.
     'enable_dynamic_htlcmax',
     'htlcmax_source_pct',
     'htlcmax_sink_pct',
@@ -421,15 +420,17 @@ class Config:
     node_drain_bias_max: float = 0.3
     # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit). Phase B
     # (2026-08-01 surface reduction): default ON — prod-proven, bounded
-    # valve. Max HTLC = capacity * pct by flow state (sinks tightest:
-    # throttle drain-through; CLN's only inbound-side control surface).
-    # Bounds in fee_controller keep it >= 10k sats. The CLN option
+    # valve. Defaults advertise the same 85%-of-capacity ceiling for every
+    # flow class, while the live-depletion cap still limits the result to 85%
+    # of spendable outbound. This avoids understating a healthy channel's
+    # routable capacity to probabilistic pathfinders. Operators may still
+    # apply class-specific caps. Bounds keep it >= 10k sats. The CLN option
     # revenue-ops-enable-dynamic-htlcmax feeds this at plugin init and
     # shares this default.
     enable_dynamic_htlcmax: bool = True
-    htlcmax_source_pct: float = 0.50
-    htlcmax_sink_pct: float = 0.25
-    htlcmax_balanced_pct: float = 0.45
+    htlcmax_source_pct: float = 0.85
+    htlcmax_sink_pct: float = 0.85
+    htlcmax_balanced_pct: float = 0.85
     # econ_* rollout flags — Phase B (2026-08-01 surface reduction, section
     # 2e/3): all 12 default TRUE so fresh nodes run the governed paths that
     # scheduled for removal (with the legacy branches) after one stable
@@ -1197,9 +1198,9 @@ class ConfigSnapshot:
     # Dynamic htlc_max flow valve (H-2, 2026-07-03 audit). Phase B
     # (2026-08-01 surface reduction): default ON, mirroring Config.
     enable_dynamic_htlcmax: bool = True
-    htlcmax_source_pct: float = 0.50
-    htlcmax_sink_pct: float = 0.25
-    htlcmax_balanced_pct: float = 0.45
+    htlcmax_source_pct: float = 0.85
+    htlcmax_sink_pct: float = 0.85
+    htlcmax_balanced_pct: float = 0.85
     # econ_* rollout flags — mirrored from Config (a key missing from the
     # snapshot reads as absent in production). Phase B: default TRUE.
     econ_shadow_enabled: bool = True

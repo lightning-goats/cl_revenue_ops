@@ -45,8 +45,11 @@ class TestDynamicHtlcmaxConfig:
             val = getattr(snap, key)
             assert isinstance(val, float)
             assert 0.0 < val <= 1.0
-        # Sinks get the tightest valve: smaller max HTLC slows drain-through.
-        assert snap.htlcmax_sink_pct <= snap.htlcmax_balanced_pct <= snap.htlcmax_source_pct
+        # Defaults do not understate otherwise healthy capacity to probabilistic
+        # pathfinders; the live-spendable depletion cap remains authoritative.
+        assert snap.htlcmax_source_pct == 0.85
+        assert snap.htlcmax_sink_pct == 0.85
+        assert snap.htlcmax_balanced_pct == 0.85
 
     def test_keys_registered_for_validation(self):
         assert CONFIG_FIELD_TYPES["enable_dynamic_htlcmax"] is bool

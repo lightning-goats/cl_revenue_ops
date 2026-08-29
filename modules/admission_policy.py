@@ -15,12 +15,44 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .utils import parse_msat, sats_to_base
+from .utils import sats_to_base
 
 # E-1 valve constants (moved from FeeController, values unchanged).
 DEPLETION_SPENDABLE_FRACTION = 0.85
 FLOOR_MSAT = 10_000_000  # 10k sats — existing valve floor
 UPDATE_DEADBAND_FRAC = 0.10
+
+
+def _strict_nonnegative_int(value: Any, *, msat_suffix: bool = False) -> Optional[int]:
+    """Parse authoritative capacity evidence without converting bad data to zero."""
+    if value is None or isinstance(value, bool):
+        return None
+    if hasattr(value, "millisatoshis"):
+        value = value.millisatoshis
+    if isinstance(value, str):
+        value = value.strip()
+        if msat_suffix and value.endswith("msat"):
+            value = value[:-4]
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    try:
+        if float(value) != parsed:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _strict_fraction(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if 0.0 < parsed <= 1.0 else None
 
 
 def compute_htlcmax_msat(cfg: Any, channel_info: Dict[str, Any],
@@ -37,19 +69,25 @@ def compute_htlcmax_msat(cfg: Any, channel_info: Dict[str, Any],
         enabled = enabled is True
     if not enabled:
         return None
-    capacity_msat = sats_to_base(channel_info.get("capacity", 0))
-    if capacity_msat <= 0:
+    capacity_sats = _strict_nonnegative_int(channel_info.get("capacity"))
+    spendable_msat = _strict_nonnegative_int(
+        channel_info.get("spendable_msat"), msat_suffix=True
+    )
+    if not capacity_sats or spendable_msat is None:
         return None
+    capacity_msat = sats_to_base(capacity_sats)
     if flow_state == "source":
-        target_msat = int(capacity_msat * cfg.htlcmax_source_pct)
+        fraction = _strict_fraction(getattr(cfg, "htlcmax_source_pct", None))
     elif flow_state == "sink":
-        target_msat = int(capacity_msat * cfg.htlcmax_sink_pct)
+        fraction = _strict_fraction(getattr(cfg, "htlcmax_sink_pct", None))
     else:
-        target_msat = int(capacity_msat * cfg.htlcmax_balanced_pct)
+        fraction = _strict_fraction(getattr(cfg, "htlcmax_balanced_pct", None))
+    if fraction is None:
+        return None
+    target_msat = int(capacity_msat * fraction)
 
     # E-1: live-depletion cap — spendable outbound is what can actually
     # forward; advertising more invites doomed HTLCs.
-    spendable_msat = parse_msat(channel_info.get("spendable_msat", 0))
     depletion_cap_msat = int(spendable_msat * DEPLETION_SPENDABLE_FRACTION)
     target_msat = min(target_msat, depletion_cap_msat)
 

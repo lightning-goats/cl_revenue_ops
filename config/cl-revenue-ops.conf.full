@@ -216,23 +216,22 @@
 # ============================================================================
 # DYNAMIC HTLCMAX (Flow Valve)
 # ============================================================================
-# Scales each channel's advertised htlc_max by its flow classification
-# (source/sink/balanced), tightest on sinks. Live-depletion-keyed: htlc_max
-# is additionally capped to a fraction of the channel's current spendable
-# balance (floored at 10k sats) so a near-drained channel never advertises
-# an htlc_max large enough to invite doomed HTLCs.
+# Defaults every flow class to the same 85%-of-capacity ceiling and then caps
+# that target to 85% of current spendable balance. This advertises credible
+# routable capacity while a near-drained channel remains tightly bounded.
+# Operators can still set class-specific ceilings.
 
 # Enable the dynamic htlc_max flow valve.
-#revenue-ops-enable-dynamic-htlcmax=false
+#revenue-ops-enable-dynamic-htlcmax=true
 
 # Max HTLC as a fraction of capacity for SOURCE channels (0.01-1.0).
-#revenue-ops-htlcmax-source-pct=0.50
+#revenue-ops-htlcmax-source-pct=0.85
 
 # Max HTLC as a fraction of capacity for SINK channels (0.01-1.0).
-#revenue-ops-htlcmax-sink-pct=0.25
+#revenue-ops-htlcmax-sink-pct=0.85
 
 # Max HTLC as a fraction of capacity for balanced channels (0.01-1.0).
-#revenue-ops-htlcmax-balanced-pct=0.45
+#revenue-ops-htlcmax-balanced-pct=0.85
 
 # ============================================================================
 # DRAIN BIAS / RECEIVABLE RATIO

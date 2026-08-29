@@ -103,7 +103,7 @@ These retained subsystems are documented in [config/cl-revenue-ops.conf.full](co
 
 - **Hot-channel protection** widens a profitable, fast-draining channel rebalance budget within its configured caps.
 - **Growth budget** can add a bounded, profit-funded uplift to the base rebalance budget; it is disabled by default.
-- **Dynamic htlcmax** adjusts advertised `htlc_max` from local flow and spendable-balance evidence with a gossip-churn deadband.
+- **Dynamic htlcmax** defaults to a truthful 85%-of-live-spendable admission ceiling for every flow class, with operator-tunable class caps and a gossip-churn deadband.
 - **Fee replay capture** is default-off observational instrumentation for offline Rust parity work. It never starts a fee cycle.
 - **Drain-bias / receivable-ratio** may bias fees on over-local channels; circular rebalancing remains the only liquidity execution mechanism.
 
@@ -243,12 +243,11 @@ The default-off `acquisition_experiment_enabled` control permits one
 restart-safe, one-hour market-acquisition episode at a time. It is restricted
 to a cold high-outbound channel with a peer-local 1--10-ppm competing floor
 and a 0-ppm class-aware floor. After 50,000 acquired sats, the same episode may
-enter a one-hour paid-validation phase at 0 ppm plus a positive base fee. New
-transitions charge no more than half the competitor's proportional fee at the
-smallest acquired payment (and remain capped at 1,000 msat), so the paid quote
-keeps a material conversion edge while earning on every retained route. It
-remains strictly cheaper across the observed payment range. If no positive
-integer-millisatoshi undercut exists, the episode exits.
+enter a one-hour paid-validation phase at 0 ppm plus a positive base fee. The
+base fee is one millisatoshi below the competitor's proportional charge at the
+smallest acquired payment (and capped at 1,000 msat), so it earns on every
+retained route while remaining strictly cheaper across the observed payment
+range. If no positive integer-millisatoshi undercut exists, the episode exits.
 Both phases share the 25-sat opportunity-cost and 70% outbound-liquidity stops;
 the free phase is additionally capped at 250,000 routed sats and the paid phase
 at 250,000 additional sats. Congestion and changed, missing, or malformed

@@ -271,13 +271,23 @@ Revenue Ops' bounded acquisition experiment remains default-off and may quote
 1 through 10 ppm instead of requiring exactly 1 ppm; all duration, volume,
 opportunity-cost, liquidity, and cooldown rails remain unchanged. After 50,000
 acquired sats it may run a one-hour, 250,000-sat paid validation phase at
-0 ppm plus a positive base fee. New transitions charge no more than half the
-competitor's proportional fee at the smallest acquired payment. If no positive
-strict undercut exists, it exits. Both phases share the 25-sat opportunity-cost
-cap and restore the exact captured base and proportional fees on exit.
+0 ppm plus a positive base fee one millisatoshi below the competitor's
+proportional charge at the smallest acquired payment. If no positive strict
+undercut exists, it exits. Both phases share the 25-sat opportunity-cost cap
+and restore the exact captured base and proportional fees on exit.
 
 ## What the tournament has established
 
+- Replica 85 is diagnostic and excluded from aggregate scoring because early
+  10-ppm background paths caused fallback traffic and unequal later liquidity.
+  It exposed a causal admission gap: Revenue's free lane advertised only a
+  250M-msat `htlc_max` against CLBOSS' 990M and initially won 3/20 routes. With
+  background paths truly isolated and only the Revenue cap changed to 85% of
+  live spendable (825.09M msat), the next clean block won 15/20 routes; native
+  retention then won 16/20 and 32/20 msat of fees. The half-price retention
+  candidate remains unpromoted and has been rolled back. The next bounded
+  contender changes only truthful default admission caps; fresh crossed rounds
+  are required before promotion.
 - Revenue Ops extracts more fee per routed sat, but CLBOSS wins far more routing volume. The main economic gap is conversion and retained demand, not fee arithmetic alone.
 - Replicas 47-48 add a fresh crossed realistic repeat: Revenue earned 340,545 msat from 2.33B msat while CLBOSS earned 3,870 msat from 3.87B msat. Revenue finished materially better balanced in both runs (270,178 and 130,170 worst-imbalance ppm versus 970,000 for CLBOSS), with zero safety violations. CLBOSS still wins raw volume.
 - Controlled replicas 52-53 establish a crossed native-rebalance win. Revenue completed one positive-EV 50,000-sat refill in each 90-second observation for 1.052 sats; uncapped CLBOSS completed none despite its 120/hour setting. Both runs were safety-clean. This is evidence for execution responsiveness and profitability discipline, not yet long-horizon profit superiority.

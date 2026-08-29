@@ -1617,24 +1617,24 @@ plugin.add_option(
 plugin.add_option(
     name='revenue-ops-enable-dynamic-htlcmax',
     default='true',
-    description='Enable the dynamic htlc_max flow valve: scale each channel max HTLC by flow state (sinks tightest). Default: true'
+    description='Enable dynamic htlc_max: advertise no more than 85% of live spendable outbound by default, with optional flow-class caps. Default: true'
 )
 
 plugin.add_option(
     name='revenue-ops-htlcmax-source-pct',
-    default='0.50',
+    default='0.85',
     description='Max HTLC as a fraction of capacity for SOURCE channels when dynamic htlcmax is enabled (0.01-1.0)'
 )
 
 plugin.add_option(
     name='revenue-ops-htlcmax-sink-pct',
-    default='0.25',
+    default='0.85',
     description='Max HTLC as a fraction of capacity for SINK channels when dynamic htlcmax is enabled (0.01-1.0)'
 )
 
 plugin.add_option(
     name='revenue-ops-htlcmax-balanced-pct',
-    default='0.45',
+    default='0.85',
     description='Max HTLC as a fraction of capacity for balanced channels when dynamic htlcmax is enabled (0.01-1.0)'
 )
 
@@ -1826,9 +1826,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         node_drain_bias_enabled=options.get('revenue-ops-node-drain-bias-enabled', 'false').lower() == 'true',
         node_drain_bias_max=_safe_float_opt('revenue-ops-node-drain-bias-max', '0.3'),
         enable_dynamic_htlcmax=options.get('revenue-ops-enable-dynamic-htlcmax', 'true').lower() == 'true',
-        htlcmax_source_pct=_safe_float_opt('revenue-ops-htlcmax-source-pct', '0.50'),
-        htlcmax_sink_pct=_safe_float_opt('revenue-ops-htlcmax-sink-pct', '0.25'),
-        htlcmax_balanced_pct=_safe_float_opt('revenue-ops-htlcmax-balanced-pct', '0.45'),
+        htlcmax_source_pct=_safe_float_opt('revenue-ops-htlcmax-source-pct', '0.85'),
+        htlcmax_sink_pct=_safe_float_opt('revenue-ops-htlcmax-sink-pct', '0.85'),
+        htlcmax_balanced_pct=_safe_float_opt('revenue-ops-htlcmax-balanced-pct', '0.85'),
         min_fee_ppm=_safe_int('revenue-ops-min-fee-ppm'),
         min_fee_ppm_saturated=_safe_int('revenue-ops-min-fee-ppm-saturated'),
         acquisition_experiment_enabled=_parse_dynamic_bool(

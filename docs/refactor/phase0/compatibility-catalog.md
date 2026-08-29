@@ -124,9 +124,9 @@ cannot schedule work or authorize action.
 | `node_drain_bias_enabled` | `False` | yes |
 | `node_drain_bias_max` | `0.3` | yes |
 | `enable_dynamic_htlcmax` | `True` | yes |
-| `htlcmax_source_pct` | `0.5` | yes |
-| `htlcmax_sink_pct` | `0.25` | yes |
-| `htlcmax_balanced_pct` | `0.45` | yes |
+| `htlcmax_source_pct` | `0.85` | yes |
+| `htlcmax_sink_pct` | `0.85` | yes |
+| `htlcmax_balanced_pct` | `0.85` | yes |
 | `econ_shadow_enabled` | `True` | yes |
 | `econ_governor_rebalance_enabled` | `True` | yes |
 | `econ_governor_fees_enabled` | `True` | yes |

@@ -31,7 +31,7 @@ def test_module_is_pure_of_plugin_dependencies():
                     if line.startswith(("import ", "from "))]
     allowed = {"from __future__ import annotations",
                "from typing import Any, Dict, Optional",
-               "from .utils import parse_msat, sats_to_base"}
+               "from .utils import sats_to_base"}
     assert set(import_lines) <= allowed, import_lines
 
 
@@ -71,3 +71,31 @@ def test_core_semantics_direct():
     assert result == 500_000_000
     assert admission_policy.delta_exceeds_deadband(500, 500) is False
     assert admission_policy.delta_exceeds_deadband(500, 0) is True
+
+
+def test_default_policy_advertises_truthful_live_spendable_capacity_for_all_classes():
+    from modules.config import Config
+
+    channel = {"capacity": 1_000_000, "spendable_msat": "970000000msat"}
+    expected = int(970_000_000 * admission_policy.DEPLETION_SPENDABLE_FRACTION)
+    for state in ("source", "sink", "balanced"):
+        assert admission_policy.compute_htlcmax_msat(Config(), channel, state) == expected
+
+
+def test_missing_or_malformed_admission_evidence_is_neutral():
+    good = {"capacity": 1_000_000, "spendable_msat": "970000000msat"}
+    assert admission_policy.compute_htlcmax_msat(_cfg(), {}, "sink") is None
+    assert admission_policy.compute_htlcmax_msat(
+        _cfg(), {"capacity": 1_000_000}, "sink"
+    ) is None
+    for bad in (None, True, -1, 1.5, "bad"):
+        assert admission_policy.compute_htlcmax_msat(
+            _cfg(), {**good, "capacity": bad}, "sink"
+        ) is None
+        assert admission_policy.compute_htlcmax_msat(
+            _cfg(), {**good, "spendable_msat": bad}, "sink"
+        ) is None
+    for bad in (None, True, 0, -1, 1.01, float("nan"), "bad"):
+        assert admission_policy.compute_htlcmax_msat(
+            _cfg(htlcmax_sink_pct=bad), good, "sink"
+        ) is None
