@@ -239,7 +239,7 @@ method-not-found.
 - `revenue-config reset <key>` removes the DB override, the escape hatch that lets `setconfig`/config-file values govern the field again (some fields apply immediately; others require a plugin restart to re-adopt the file default — the RPC response says which).
 - `revenue-config list-mutable` returns the current set of public runtime keys; only keys in this list can be `set` or `reset` (all others return `"not a public runtime control"`).
 
-The default-off `acquisition_experiment_enabled` control permits one
+The default-on `acquisition_experiment_enabled` control permits one
 restart-safe, one-hour market-acquisition episode at a time. It is restricted
 to a cold high-outbound channel with a peer-local 1--10-ppm competing floor
 and a 0-ppm class-aware floor. After 50,000 acquired sats, the same episode may
@@ -254,7 +254,10 @@ at 250,000 additional sats. Congestion and changed, missing, or malformed
 evidence fail closed. The controller always restores the exact captured base
 and proportional fees, and `revenue-status.acquisition_experiments` exposes the
 phase and audit trail.
-Keep it disabled unless intentionally running this bounded experiment.
+Crossed CLN/LND tournament evidence promoted the bounded controller to
+default-on. Set the control to `false` to opt out; missing or malformed market,
+capacity, profitability, persistence, or fee evidence still prevents entry or
+restores the captured policy fail-closed.
 
 ## cl_revenue_ops standalone invariant
 

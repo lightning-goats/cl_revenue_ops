@@ -184,7 +184,7 @@ def test_revenue_status_reports_operator_controls_not_full_config():
         "growth_budget_hard_ceiling_sats": 10000,
         "min_fee_ppm": 25,
         "min_fee_ppm_saturated": 0,
-        "acquisition_experiment_enabled": False,
+        "acquisition_experiment_enabled": True,
         "max_fee_ppm": 1800,
         "fee_profile": "active",
         "fee_market_boundary_enabled": False,

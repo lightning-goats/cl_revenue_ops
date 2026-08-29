@@ -782,15 +782,15 @@ def test_malformed_persisted_episode_fails_closed_without_crashing(
     assert complete["restored_fee_ppm"] == 10
 
 
-def test_acquisition_plugin_option_is_dynamic_default_off():
+def test_acquisition_plugin_option_is_dynamic_default_on():
     from tests.plugin_test_utils import load_plugin_module
 
     mod = load_plugin_module()
     option = mod.plugin.options["revenue-ops-acquisition-experiment-enabled"]
-    assert option["default"] is False
+    assert option["default"] is True
     assert option["opt_type"] == "bool"
     assert option["dynamic"] is True
-    assert Config().acquisition_experiment_enabled is False
+    assert Config().acquisition_experiment_enabled is True
 
 
 def test_setconfig_refresh_updates_acquisition_gate():

@@ -141,7 +141,7 @@ cannot schedule work or authorize action.
 | `sink_threshold` | `-0.05` |  |
 | `min_fee_ppm` | `50` | yes |
 | `min_fee_ppm_saturated` | `0` | yes |
-| `acquisition_experiment_enabled` | `False` | yes |
+| `acquisition_experiment_enabled` | `True` | yes |
 | `max_fee_ppm` | `2000` | yes |
 | `base_fee_msat` | `0` |  |
 | `base_fee_policy` | `'off'` |  |

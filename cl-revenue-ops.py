@@ -1196,10 +1196,10 @@ plugin.add_option(
 
 plugin.add_option(
     name='revenue-ops-acquisition-experiment-enabled',
-    default=False,
+    default=True,
     description=(
         'Enable one bounded zero-fee acquisition experiment on a qualifying '
-        'cold saturated/source channel (default: false)'
+        'cold saturated/source channel (default: true)'
     ),
     opt_type='bool',
     dynamic=True,
@@ -1833,7 +1833,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         min_fee_ppm_saturated=_safe_int('revenue-ops-min-fee-ppm-saturated'),
         acquisition_experiment_enabled=_parse_dynamic_bool(
             'revenue-ops-acquisition-experiment-enabled',
-            options.get('revenue-ops-acquisition-experiment-enabled', False),
+            options.get('revenue-ops-acquisition-experiment-enabled', True),
         ),
         max_fee_ppm=_safe_int('revenue-ops-max-fee-ppm'),
         market_fee_mode=options.get('revenue-ops-market-fee-mode', 'undercut').lower(),

@@ -107,6 +107,11 @@ Use these decision rules:
    - Preserve a realistic global operating floor. Use bounded, channel-local
      acquisition/market-boundary mechanisms for conversion rather than a
      network-wide race to 0 or 1 ppm.
+   - The bounded one-lane acquisition controller is now default-on after
+     crossed CLN/LND validation. Keep
+     `acquisition_experiment_enabled=true` unless live evidence identifies a
+     concrete reason to opt out; do not loosen its fixed duration, volume,
+     opportunity-cost, liquidity, restoration, or cooldown rails.
    - Set `min_fee_ppm`, `min_fee_ppm_saturated`, `max_fee_ppm`, fee profile,
      market-boundary values, and related fee controls only from observed bands
      and explicit cost-recovery requirements.

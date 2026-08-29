@@ -53,6 +53,13 @@
 # cannot drain them, so they keep the normal min-fee-ppm floor.
 #revenue-ops-min-fee-ppm-saturated=0
 
+# One safety-capped cold-lane acquisition episode is enabled by default. It
+# may quote 0 ppm on one qualifying 1-10-ppm corridor, then validates retained
+# demand with a positive base fee. Fixed volume, opportunity-cost, liquidity,
+# duration, restoration, and seven-day cooldown rails remain enforced.
+# Set false to opt out.
+#revenue-ops-acquisition-experiment-enabled=true
+
 # Fee ceiling - maximum fee rate
 # RECOMMENDATION: 1500-2500 ppm for most routing nodes; raise only for special positioning
 #revenue-ops-max-fee-ppm=2000
