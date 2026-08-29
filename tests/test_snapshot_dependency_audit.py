@@ -28,6 +28,10 @@ PATTERNS = {
         r"self\.(profitability|flow_analyzer|flow)\.\w+\("
         r"|(?<!self\.)\bprofitability\.\w+\("
         r"|\bflow_analyzer\.\w+\("
+        # fee_controller's guarded canonical refresh first binds
+        # self.profitability to a local variable; keep that mutable-source
+        # read visible to the dependency pin instead of silently lowering it.
+        r"|\banalyzer\.get_profitability\("
     ),
     "live_rpc": (
         r"data_service\.(get|list)\w*\("

@@ -30,7 +30,7 @@ from polar_mixed_client_lab import (  # noqa: E402
 
 
 SCHEMA = "polar-clboss-runner-state-v1"
-EXPECTED_REVENUE_REVISION = "f201b2241a7be5c51c9e91c8388c15ebf8340e00"
+EXPECTED_REVENUE_REVISION = "fdbecc4f7dd83c7c0c4bcce8d5356ed2bebbd6d8"
 IMAGE = f"cl-revenue-ops-polar-clboss:{EXPECTED_REVENUE_REVISION[:7]}"
 NETWORK_ID = 4
 DOCKER_NETWORK = "polar-network-4_default"
@@ -43,6 +43,11 @@ CHANNEL_CAPACITY_SATS = 1_000_000
 RETURN_PATH_CAPACITY_SATS = 2_000_000
 CONTROLLED_DEPLETION_SATS = 750_000
 RETURN_PATH_FUNDING_BUFFER_SATS = 100_000
+# Synthetic return liquidity participates in the same public gossip pool that
+# Revenue Ops uses for market pricing.  Keep it in the controlled corridor's
+# realistic band instead of advertising an artificial 1-ppm outlier.
+RETURN_PATH_FEE_BASE_MSAT = 500
+RETURN_PATH_FEE_PPM = 120
 FUNDING_UTXO_SATS = 1_100_000
 # Covers the 1% reserve on a 1M channel plus route fees.  A smaller fee-only
 # buffer still leaves the sink unable to spend the newly received balance.
@@ -60,6 +65,8 @@ MARKET_PROFILES = {
 REALISTIC_TRAFFIC_AMOUNTS_SATS = (5_000, 15_000, 35_000, 100_000)
 BASELINE_POLL_SECONDS = 5.0
 BASELINE_POLL_ATTEMPTS = 19
+GOSSIP_POLICY_POLL_SECONDS = 1.0
+GOSSIP_POLICY_POLL_ATTEMPTS = 31
 NATIVE_CYCLE_POLL_SECONDS = 5.0
 NATIVE_CYCLE_POLL_ATTEMPTS = 37
 # Polar's UI-facing payment call can time out while the underlying CLN/LND
@@ -585,6 +592,36 @@ def _wait_return_paths(
     raise RunnerError(f"synthetic return paths did not become active: {last}")
 
 
+def _wait_lnd_local_policy(
+    container: str,
+    scid: object,
+    local_id: str,
+    *,
+    attempts: int = GOSSIP_POLICY_POLL_ATTEMPTS,
+    poll_seconds: float = GOSSIP_POLICY_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Wait for LND's public graph to expose its exact local direction."""
+    last = "policy absent"
+    for attempt in range(attempts):
+        try:
+            edge = lnd_rpc(container, "getchaninfo", "--chan_id", scid)
+            if edge.get("node1_pub") == local_id:
+                policy = edge.get("node1_policy")
+            elif edge.get("node2_pub") == local_id:
+                policy = edge.get("node2_policy")
+            else:
+                policy = None
+                last = "graph edge lacks payer identity"
+            if isinstance(policy, dict):
+                return policy
+            last = "local directional policy absent"
+        except RunnerError as exc:
+            last = str(exc)
+        if attempt + 1 < attempts:
+            time.sleep(poll_seconds)
+    raise RunnerError(f"LND return-path policy readback failed: {last}")
+
+
 def controlled_depletion_snapshot(
     state: dict[str, Any], *, family: str = "cln"
 ) -> dict[str, Any]:
@@ -799,9 +836,13 @@ def prepare_controlled_depletion(
         fixture_fee_ppm = nonnegative_int(
             fixture_fee_ppm, "controlled depletion fixture fee"
         )
+        expected_fixture_policies = []
         for controller in ("revenue_ops", "clboss"):
             identity = assignment[controller]
             container = contenders[identity]["container"]
+            source = str(contenders[identity].get("node_id") or "")
+            if not source:
+                raise RunnerError(f"controlled depletion lacks {controller} node identity")
             scid = before[controller]["depleted"]["short_channel_id"]
             result = cln_rpc(container, "setchannel", scid, 0, fixture_fee_ppm)
             channels = result.get("channels")
@@ -809,10 +850,14 @@ def prepare_controlled_depletion(
                 raise RunnerError(
                     f"controlled depletion fixture fee did not update {controller}:{scid}"
                 )
-        # The payer prices the downstream contender->sink hop from gossip.
-        # Give both equal updates one short Polar propagation window before
-        # creating contribution evidence; controller loops remain held.
-        time.sleep(5)
+            expected_fixture_policies.append({
+                "short_channel_id": scid,
+                "source": source,
+                "fee_ppm": fixture_fee_ppm,
+            })
+        # The payer and both controllers price the downstream hop from gossip.
+        # Verify exact crossed readback rather than relying on a fixed sleep.
+        wait_gossip_policies(contenders, expected_fixture_policies)
     payment_fn = (
         _directed_cln_fixture_payment
         if family == "cln"
@@ -941,6 +986,7 @@ def provision_return_paths(
     replica: int,
     results_dir: Path,
     capacity_sats: int = RETURN_PATH_CAPACITY_SATS,
+    fee_ppm: int = RETURN_PATH_FEE_PPM,
 ) -> dict[str, Any]:
     """Open fresh payer-to-sink liquidity after the scored traffic block.
 
@@ -963,9 +1009,29 @@ def provision_return_paths(
             "return paths require a completed full-stack traffic block "
             "or controlled depletion"
         )
-    if state.get("return_paths"):
+    existing_paths = state.get("return_paths")
+    resume_partial = (
+        isinstance(existing_paths, list)
+        and len(existing_paths) == 2
+        and {row.get("family") for row in existing_paths if isinstance(row, dict)}
+        == {"cln", "lnd"}
+        and all(
+            isinstance(row, dict) and not row.get("short_channel_id")
+            for row in existing_paths
+        )
+        and all(
+            any(
+                isinstance(event, dict)
+                and event.get("event") == "return_path_open_dispatched"
+                and event.get("family") == family
+                for event in state.get("events", [])
+            )
+            for family in ("cln", "lnd")
+        )
+    )
+    if existing_paths and not resume_partial:
         prepare_return_path_renewal(path, state)
-    if state.get("return_paths"):
+    if state.get("return_paths") and not resume_partial:
         raise RunnerError("return paths are already checkpointed")
     for key in ("acquisition_treatment", "automatic_acquisition", "retention_treatment"):
         treatment = state.get(key)
@@ -974,91 +1040,107 @@ def provision_return_paths(
     capacity_sats = nonnegative_int(capacity_sats, "return-path capacity")
     if capacity_sats == 0:
         raise RunnerError("return-path capacity must be positive")
+    fee_ppm = nonnegative_int(fee_ppm, "return-path fee")
+    if fee_ppm == 0:
+        raise RunnerError("return-path fee must be positive")
     network_id = int(state["network_id"])
     cln_payer = f"polar-n{network_id}-cln-payer"
     cln_sink = f"polar-n{network_id}-cln-sink"
     lnd_payer = f"polar-n{network_id}-lnd-payer"
     lnd_sink = f"polar-n{network_id}-lnd-sink"
+    cln_payer_id = str(cln_rpc(cln_payer, "getinfo").get("id") or "")
     cln_sink_id = str(cln_rpc(cln_sink, "getinfo").get("id") or "")
     lnd_sink_id = str(lnd_rpc(lnd_sink, "getinfo").get("identity_pubkey") or "")
-    if not cln_sink_id or not lnd_sink_id:
-        raise RunnerError("return-path sink identity readback failed")
-    if any(
-        row.get("peer_id") == cln_sink_id and row.get("state") == "CHANNELD_NORMAL"
-        for row in channel_rows(cln_payer)
-    ):
-        raise RunnerError("CLN payer already has an active channel to the CLN sink")
-    if any(
-        row.get("remote_pubkey") == lnd_sink_id
-        for row in _live_lnd_channels(lnd_payer)
-    ):
-        raise RunnerError("LND payer already has a channel to the LND sink")
+    if not cln_payer_id or not cln_sink_id or not lnd_sink_id:
+        raise RunnerError("return-path endpoint identity readback failed")
+    if resume_partial:
+        state["return_paths"] = _wait_return_paths(existing_paths)
+        _checkpoint(path, state, "return_paths_reconciled_after_partial_open")
+    else:
+        if any(
+            row.get("peer_id") == cln_sink_id and row.get("state") == "CHANNELD_NORMAL"
+            for row in channel_rows(cln_payer)
+        ):
+            raise RunnerError("CLN payer already has an active channel to the CLN sink")
+        if any(
+            row.get("remote_pubkey") == lnd_sink_id
+            for row in _live_lnd_channels(lnd_payer)
+        ):
+            raise RunnerError("LND payer already has an active channel to the LND sink")
 
-    funding_sats = capacity_sats + RETURN_PATH_FUNDING_BUFFER_SATS
-    cln_address = onchain_address(cln_rpc(cln_payer, "newaddr"))
-    lnd_address = lnd_rpc(lnd_payer, "newaddress", "p2tr").get("address")
-    _send_fake_onchain_funds(bridge, network_id, cln_address, funding_sats)
-    _checkpoint(path, state, "return_path_cln_wallet_funded", amount_sats=funding_sats)
-    _send_fake_onchain_funds(bridge, network_id, str(lnd_address or ""), funding_sats)
-    _checkpoint(path, state, "return_path_lnd_wallet_funded", amount_sats=funding_sats)
+        funding_sats = capacity_sats + RETURN_PATH_FUNDING_BUFFER_SATS
+        cln_address = onchain_address(cln_rpc(cln_payer, "newaddr"))
+        lnd_address = lnd_rpc(lnd_payer, "newaddress", "p2tr").get("address")
+        _send_fake_onchain_funds(bridge, network_id, cln_address, funding_sats)
+        _checkpoint(path, state, "return_path_cln_wallet_funded", amount_sats=funding_sats)
+        _send_fake_onchain_funds(bridge, network_id, str(lnd_address or ""), funding_sats)
+        _checkpoint(path, state, "return_path_lnd_wallet_funded", amount_sats=funding_sats)
 
-    _connect_cln(cln_payer, cln_sink_id, "cln-sink")
-    cln_open = cln_rpc(cln_payer, "fundchannel", cln_sink_id, capacity_sats)
-    cln_channel_id = cln_open.get("channel_id")
-    if not isinstance(cln_channel_id, str) or not cln_channel_id:
-        raise RunnerError("CLN return-path funding returned no channel id")
-    state["return_paths"] = [{
-        "family": "cln", "source_container": cln_payer,
-        "sink_container": cln_sink, "peer_id": cln_sink_id,
-        "channel_id": cln_channel_id, "capacity_sats": capacity_sats,
-    }]
-    _checkpoint(path, state, "return_path_open_dispatched", family="cln")
-    _mine(bridge, network_id, 6)
+        _connect_cln(cln_payer, cln_sink_id, "cln-sink")
+        cln_open = cln_rpc(cln_payer, "fundchannel", cln_sink_id, capacity_sats)
+        cln_channel_id = cln_open.get("channel_id")
+        if not isinstance(cln_channel_id, str) or not cln_channel_id:
+            raise RunnerError("CLN return-path funding returned no channel id")
+        state["return_paths"] = [{
+            "family": "cln", "source_container": cln_payer,
+            "sink_container": cln_sink, "peer_id": cln_sink_id,
+            "channel_id": cln_channel_id, "capacity_sats": capacity_sats,
+        }]
+        _checkpoint(path, state, "return_path_open_dispatched", family="cln")
+        _mine(bridge, network_id, 6)
 
-    _connect_lnd(lnd_payer, lnd_sink_id, "lnd-sink")
-    lnd_open = lnd_rpc(
-        lnd_payer, "openchannel", "--node_key", lnd_sink_id,
-        "--local_amt", capacity_sats,
-    )
-    state["return_paths"].append({
-        "family": "lnd", "source_container": lnd_payer,
-        "sink_container": lnd_sink, "peer_id": lnd_sink_id,
-        "funding_txid": lnd_open.get("funding_txid"),
-        "capacity_sats": capacity_sats,
-    })
-    _checkpoint(path, state, "return_path_open_dispatched", family="lnd")
-    _mine(bridge, network_id, 6)
-    state["return_paths"] = _wait_return_paths(state["return_paths"])
-    # Use a controlled near-zero-cost fixture: economics remain measured on
-    # contender channels, while this path isolates route availability.
+        _connect_lnd(lnd_payer, lnd_sink_id, "lnd-sink")
+        lnd_open = lnd_rpc(
+            lnd_payer, "openchannel", "--node_key", lnd_sink_id,
+            "--local_amt", capacity_sats,
+        )
+        state["return_paths"].append({
+            "family": "lnd", "source_container": lnd_payer,
+            "sink_container": lnd_sink, "peer_id": lnd_sink_id,
+            "funding_txid": lnd_open.get("funding_txid"),
+            "capacity_sats": capacity_sats,
+        })
+        _checkpoint(path, state, "return_path_open_dispatched", family="lnd")
+        _mine(bridge, network_id, 6)
+        state["return_paths"] = _wait_return_paths(state["return_paths"])
+    # This public channel is tournament plumbing, but it still participates in
+    # Revenue Ops' real market-gossip inputs.  The default prices it in the
+    # realistic corridor band. Explicit cheap-route lanes remain positive-fee,
+    # crossed, and read back from both contenders before controller release.
     cln_rpc(
-        cln_payer, "setchannel", state["return_paths"][0]["short_channel_id"], 1, 1
+        cln_payer, "setchannel", state["return_paths"][0]["short_channel_id"],
+        RETURN_PATH_FEE_BASE_MSAT, fee_ppm,
     )
     lnd_row = next(
         row for row in _live_lnd_channels(lnd_payer)
         if row.get("channel_point") == state["return_paths"][1]["channel_point"]
     )
-    edge = lnd_rpc(lnd_payer, "getchaninfo", "--chan_id", lnd_row["scid"])
     local_id = str(lnd_rpc(lnd_payer, "getinfo")["identity_pubkey"])
-    if edge.get("node1_pub") == local_id:
-        policy = edge.get("node1_policy")
-    elif edge.get("node2_pub") == local_id:
-        policy = edge.get("node2_policy")
-    else:
-        raise RunnerError("LND return-path graph edge lacks the payer node")
-    if not isinstance(policy, dict):
-        raise RunnerError("LND return-path policy readback failed")
+    policy = _wait_lnd_local_policy(lnd_payer, lnd_row["scid"], local_id)
     _set_lnd_policy(lnd_payer, {
         "channel_point": lnd_row["channel_point"],
-        "fee_base_msat": 1, "fee_ppm": 1,
+        "fee_base_msat": RETURN_PATH_FEE_BASE_MSAT,
+        "fee_ppm": fee_ppm,
         "time_lock_delta": int(policy["time_lock_delta"]),
         "min_htlc_msat": int(policy["min_htlc"]),
         "max_htlc_msat": int(policy["max_htlc_msat"]),
     })
+    wait_gossip_policies(state["contenders"], [
+        {
+            "short_channel_id": state["return_paths"][0]["short_channel_id"],
+            "source": cln_payer_id,
+            "fee_ppm": fee_ppm,
+        },
+        {
+            "short_channel_id": state["return_paths"][1]["short_channel_id"],
+            "source": local_id,
+            "fee_ppm": fee_ppm,
+        },
+    ])
     state["return_path_fixture"] = {
         "present_during_scored_traffic": False,
-        "fee_base_msat": 1,
-        "fee_ppm": 1,
+        "fee_base_msat": RETURN_PATH_FEE_BASE_MSAT,
+        "fee_ppm": fee_ppm,
         "purpose": "isolate post-pressure circular-route availability",
     }
     state["status"] = "return_paths_ready"
@@ -1158,6 +1240,83 @@ def peer_families(network_id: int) -> dict[str, dict[str, str]]:
     }
 
 
+def original_peer_hosts(network_id: int) -> dict[str, str]:
+    """Map the four fixed mixed-client peer identities to Docker DNS names."""
+    return {
+        str(cln_rpc(f"polar-n{network_id}-cln-payer", "getinfo")["id"]):
+            "cln-payer",
+        str(lnd_rpc(f"polar-n{network_id}-lnd-payer", "getinfo")["identity_pubkey"]):
+            "lnd-payer",
+        str(cln_rpc(f"polar-n{network_id}-cln-sink", "getinfo")["id"]):
+            "cln-sink",
+        str(lnd_rpc(f"polar-n{network_id}-lnd-sink", "getinfo")["identity_pubkey"]):
+            "lnd-sink",
+    }
+
+
+def wait_gossip_policies(
+    contenders: dict[str, dict[str, str]],
+    expected: Sequence[dict[str, Any]],
+    *,
+    attempts: int = GOSSIP_POLICY_POLL_ATTEMPTS,
+    poll_seconds: float = GOSSIP_POLICY_POLL_SECONDS,
+) -> dict[str, dict[str, int]]:
+    """Fail closed until both contenders see exact directional fee policies."""
+    attempts = nonnegative_int(attempts, "gossip policy poll attempts")
+    if attempts == 0:
+        raise RunnerError("gossip policy poll attempts must be positive")
+    if poll_seconds < 0:
+        raise RunnerError("gossip policy poll seconds must be nonnegative")
+    if not isinstance(contenders, dict) or len(contenders) != 2:
+        raise RunnerError("gossip verification requires exactly two contenders")
+    normalized: list[tuple[str, str, int]] = []
+    for row in expected:
+        if not isinstance(row, dict):
+            raise RunnerError("malformed expected gossip policy")
+        scid = str(row.get("short_channel_id") or "")
+        source = str(row.get("source") or "")
+        ppm = nonnegative_int(row.get("fee_ppm"), "expected gossip fee")
+        if not scid or not source:
+            raise RunnerError("expected gossip policy lacks channel identity")
+        normalized.append((scid, source, ppm))
+    if not normalized:
+        raise RunnerError("gossip verification requires at least one policy")
+
+    last: dict[str, dict[str, int]] = {}
+    for attempt in range(attempts):
+        last = {}
+        complete = True
+        for identity, contender in contenders.items():
+            container = str(contender.get("container") or "")
+            rows = cln_rpc(container, "listchannels").get("channels")
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise RunnerError(f"malformed gossip readback from {identity}")
+            observed: dict[tuple[str, str], int] = {}
+            for row in rows:
+                try:
+                    observed[(
+                        str(row.get("short_channel_id") or ""),
+                        str(row.get("source") or ""),
+                    )] = int(row.get("fee_per_millionth"))
+                except (TypeError, ValueError):
+                    continue
+            identity_result: dict[str, int] = {}
+            for scid, source, ppm in normalized:
+                value = observed.get((scid, source))
+                if value is None:
+                    complete = False
+                    continue
+                identity_result[f"{scid}:{source}"] = value
+                if value != ppm:
+                    complete = False
+            last[str(identity)] = identity_result
+        if complete:
+            return last
+        if attempt + 1 < attempts:
+            time.sleep(poll_seconds)
+    raise RunnerError(f"gossip policies did not converge: {last}")
+
+
 def resolve_lane_map(
     state: dict[str, Any], *, network_id: int = NETWORK_ID
 ) -> dict[str, dict[str, dict[str, str]]]:
@@ -1211,14 +1370,27 @@ def set_initial_fees(
 
 def capture_background_policies(network_id: int) -> dict[str, Any]:
     captured: dict[str, Any] = {"cln": {}, "lnd": []}
+    hosts = original_peer_hosts(network_id)
     for role in ("revenue-node", "cln-competitor"):
         container = f"polar-n{network_id}-{role}"
+        source = str(cln_rpc(container, "getinfo").get("id") or "")
+        if not source:
+            raise RunnerError(f"cannot identify background router {role}")
         policies = []
         for row in active_channels(container):
             update = (row.get("updates") or {}).get("local") or {}
+            peer_id = str(row.get("peer_id") or "")
+            peer_host = hosts.get(peer_id)
+            if peer_host is None:
+                raise RunnerError(
+                    f"cannot map background peer {role}:{peer_id} to a fixed host"
+                )
             policies.append(
                 {
                     "short_channel_id": row["short_channel_id"],
+                    "source": source,
+                    "peer_id": peer_id,
+                    "peer_host": peer_host,
                     "fee_base_msat": int(update["fee_base_msat"]),
                     "fee_ppm": int(update["fee_proportional_millionths"]),
                 }
@@ -1268,7 +1440,9 @@ def _set_lnd_policy(container: str, row: dict[str, Any], *, ppm: int | None = No
     )
 
 
-def apply_background_ppm(state: dict[str, Any], background_ppm: int) -> None:
+def apply_background_ppm(
+    state: dict[str, Any], background_ppm: int
+) -> dict[str, dict[str, int]]:
     if background_ppm <= 0:
         raise RunnerError("background ppm must be positive")
     captured = state.get("background_policies")
@@ -1277,6 +1451,10 @@ def apply_background_ppm(state: dict[str, Any], background_ppm: int) -> None:
     for role, policies in captured["cln"].items():
         container = f"polar-n{state['network_id']}-{role}"
         for row in policies:
+            # A setchannel update on an entirely disconnected CLN node remains
+            # local.  Reconnect first so the exact directional policy reaches
+            # both contenders' gossip views before a scored controller cycle.
+            _connect_cln(container, row["peer_id"], row["peer_host"])
             cln_rpc(
                 container, "setchannel", row["short_channel_id"],
                 row["fee_base_msat"], background_ppm,
@@ -1284,6 +1462,16 @@ def apply_background_ppm(state: dict[str, Any], background_ppm: int) -> None:
     lnd_container = f"polar-n{state['network_id']}-lnd-competitor"
     for row in captured["lnd"]:
         _set_lnd_policy(lnd_container, row, ppm=background_ppm)
+    expected = [
+        {
+            "short_channel_id": row["short_channel_id"],
+            "source": row["source"],
+            "fee_ppm": background_ppm,
+        }
+        for policies in captured["cln"].values()
+        for row in policies
+    ]
+    return wait_gossip_policies(state["contenders"], expected)
 
 
 def isolate_background(
@@ -1298,9 +1486,12 @@ def isolate_background(
     captured = capture_background_policies(int(state["network_id"]))
     state["background_policies"] = captured
     _checkpoint(path, state, "background_policies_captured")
-    apply_background_ppm(state, background_ppm)
+    gossip = apply_background_ppm(state, background_ppm)
     state["status"] = "isolated_fee_only_ready"
-    _checkpoint(path, state, "background_isolated", fee_ppm=background_ppm)
+    _checkpoint(
+        path, state, "background_isolated", fee_ppm=background_ppm,
+        gossip_verified=gossip,
+    )
     return state
 
 
@@ -1311,9 +1502,12 @@ def retune_background(
     state = read_state(path)
     if state.get("status") not in {"isolated_fee_only_ready", "smoke_complete"}:
         raise RunnerError(f"replica is not isolated: {state.get('status')}")
-    apply_background_ppm(state, background_ppm)
+    gossip = apply_background_ppm(state, background_ppm)
     state["status"] = "isolated_fee_only_ready"
-    _checkpoint(path, state, "background_retuned", fee_ppm=background_ppm)
+    _checkpoint(
+        path, state, "background_retuned", fee_ppm=background_ppm,
+        gossip_verified=gossip,
+    )
     return state
 
 
@@ -1324,6 +1518,8 @@ def restore_background(state: dict[str, Any]) -> bool:
     for role, policies in captured.get("cln", {}).items():
         container = f"polar-n{state['network_id']}-{role}"
         for row in policies:
+            if row.get("peer_id") and row.get("peer_host"):
+                _connect_cln(container, row["peer_id"], row["peer_host"])
             cln_rpc(
                 container, "setchannel", row["short_channel_id"],
                 row["fee_base_msat"], row["fee_ppm"],
@@ -3514,6 +3710,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=RETURN_PATH_CAPACITY_SATS,
     )
     parser.add_argument(
+        "--return-fee-ppm", type=positive_int, default=RETURN_PATH_FEE_PPM,
+        help=(
+            "synthetic return-path proportional fee; the 120-ppm default is "
+            "the realistic corridor fixture, while explicit cheap-route lanes "
+            "must keep the same crossed policy readback invariant"
+        ),
+    )
+    parser.add_argument(
         "--depletion-sats", type=positive_int, default=CONTROLLED_DEPLETION_SATS,
     )
     parser.add_argument(
@@ -3622,6 +3826,7 @@ def main() -> int:
                 replica=args.replica,
                 results_dir=args.results_dir,
                 capacity_sats=args.return_capacity_sats,
+                fee_ppm=args.return_fee_ppm,
             )
         elif args.command == "deplete":
             result = prepare_controlled_depletion(

@@ -24,7 +24,8 @@ the smoke checklist below.
 | `v25.05` | Pass | askrene layer creation passes; plugin starts with documented dependencies; `revenue-status`, `revenue-rebalance-debug`, and fresh live `hive-export-hints` consumption respond. |
 | `v25.09.3` | Pass | askrene layer creation/removal passes; plugin starts after adding a Python runtime to the Polar image; `revenue-status` and `revenue-rebalance-debug` respond. |
 | `v25.12` | Pass | askrene layer creation passes; plugin starts after adding a Python runtime to the Polar image; `revenue-status`, `revenue-rebalance-debug`, and fresh live `hive-export-hints` consumption respond. |
-| `v26.06.6` | Pass | Exact revision `4c6ec87` ran on a fresh official image with four funded public channels. A mixed CLN/LND Polar matrix settled 60/60 payments and the node forwarded 49 with no failed forwards. Fee, rebalance, profitability, budget, and reconciliation surfaces passed before and after plugin restart. |
+| `v26.06.6` | Pass, superseded for production | Exact revision `4c6ec87` ran on a fresh official image with four funded public channels. A mixed CLN/LND Polar matrix settled 60/60 payments and the node forwarded 49 with no failed forwards. Fee, rebalance, profitability, budget, and reconciliation surfaces passed before and after plugin restart. The later `v26.06.7` security release means this is retained as compatibility evidence, not a production recommendation. |
+| [`v26.06.7`](https://github.com/ElementsProject/lightning/releases/tag/v26.06.7) | Mandatory lane pending official artifacts | Core Lightning published the embargoed security point release on 2026-08-28. Equal-runtime source and Docker tournament artifacts were not yet publicly available during the 2026-08-28 rounds. Run the complete smoke and crossed CLBOSS lane as soon as official artifacts are available; do not infer compatibility from `v26.06.6`. |
 
 ## Real-Channel Askrene Smoke
 

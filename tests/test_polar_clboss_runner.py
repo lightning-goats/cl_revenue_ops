@@ -339,6 +339,113 @@ def test_market_profiles_seed_explicit_realistic_and_acquisition_fees(monkeypatc
     }
 
 
+def test_wait_gossip_policies_requires_exact_directional_crossed_readback(
+    monkeypatch,
+):
+    runner = load_runner()
+    calls = []
+    rounds = {"a": 0, "b": 0}
+    contenders = {
+        "identity-a": {"container": "a"},
+        "identity-b": {"container": "b"},
+    }
+
+    def rpc(container, method, *args):
+        assert method == "listchannels"
+        assert not args
+        calls.append(container)
+        rounds[container] += 1
+        ppm = 10_000 if rounds[container] > 1 else 10
+        return {"channels": [{
+            "short_channel_id": "1x1x0",
+            "source": "background-id",
+            "fee_per_millionth": ppm,
+        }]}
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    result = runner.wait_gossip_policies(
+        contenders,
+        [{
+            "short_channel_id": "1x1x0",
+            "source": "background-id",
+            "fee_ppm": 10_000,
+        }],
+        attempts=2,
+        poll_seconds=0,
+    )
+
+    assert calls == ["a", "b", "a", "b"]
+    assert all(
+        row["1x1x0:background-id"] == 10_000 for row in result.values()
+    )
+
+
+def test_apply_background_reconnects_before_policy_and_verifies_gossip(monkeypatch):
+    runner = load_runner()
+    calls = []
+    verified = []
+    state = {
+        "network_id": 4,
+        "contenders": {
+            "identity-a": {"container": "a"},
+            "identity-b": {"container": "b"},
+        },
+        "background_policies": {
+            "cln": {"revenue-node": [{
+                "short_channel_id": "1x1x0",
+                "source": "background-id",
+                "peer_id": "sink-id",
+                "peer_host": "lnd-sink",
+                "fee_base_msat": 1,
+                "fee_ppm": 10,
+            }]},
+            "lnd": [{
+                "channel_point": "funding:0",
+                "fee_base_msat": 1,
+                "fee_ppm": 10,
+                "time_lock_delta": 40,
+                "min_htlc_msat": 1,
+                "max_htlc_msat": 1_000_000,
+            }],
+        },
+    }
+    monkeypatch.setattr(
+        runner, "_connect_cln",
+        lambda *args: calls.append(("connect", *args)),
+    )
+    monkeypatch.setattr(
+        runner, "cln_rpc",
+        lambda *args: calls.append(("rpc", *args)) or {"channels": [{}]},
+    )
+    monkeypatch.setattr(
+        runner, "_set_lnd_policy",
+        lambda *args, **kwargs: calls.append(("lnd", *args, kwargs)),
+    )
+    monkeypatch.setattr(
+        runner, "wait_gossip_policies",
+        lambda contenders, expected: verified.append((contenders, expected)) or {
+            "identity-a": {}, "identity-b": {}
+        },
+    )
+
+    result = runner.apply_background_ppm(state, 10_000)
+
+    assert calls[0] == (
+        "connect", "polar-n4-revenue-node", "sink-id", "lnd-sink"
+    )
+    assert calls[1] == (
+        "rpc", "polar-n4-revenue-node", "setchannel", "1x1x0", 1, 10_000
+    )
+    assert verified[0][1] == [{
+        "short_channel_id": "1x1x0",
+        "source": "background-id",
+        "fee_ppm": 10_000,
+    }]
+    assert set(result) == {"identity-a", "identity-b"}
+
+
 def test_acquisition_treatment_pins_one_lane_and_restores_controls(monkeypatch, tmp_path):
     runner = load_runner()
     state_file = runner.state_path(tmp_path, 1)
@@ -519,8 +626,8 @@ def test_automatic_acquisition_waits_for_native_episode_without_forced_cycle(
         "events": [],
         "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
         "contenders": {
-            "identity-a": {"container": "revenue"},
-            "identity-b": {"container": "clboss"},
+            "identity-a": {"container": "revenue", "node_id": "revenue-id"},
+            "identity-b": {"container": "clboss", "node_id": "clboss-id"},
         },
         "automatic_acquisition": {
             "status": "restored",
@@ -1269,8 +1376,8 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
         "events": [],
         "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
         "contenders": {
-            "identity-a": {"container": "revenue"},
-            "identity-b": {"container": "clboss"},
+            "identity-a": {"container": "revenue", "node_id": "revenue-id"},
+            "identity-b": {"container": "clboss", "node_id": "clboss-id"},
         },
         "lane_map": {},
     })
@@ -1298,6 +1405,7 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
     ))
     routed = []
     calls = []
+    gossip = []
 
     def rpc(container, method, *args):
         calls.append((container, method, args))
@@ -1310,7 +1418,10 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
         return {}
 
     monkeypatch.setattr(runner, "cln_rpc", rpc)
-    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runner, "wait_gossip_policies",
+        lambda contenders, expected: gossip.append((contenders, expected)) or {},
+    )
     monkeypatch.setattr(
         runner, "controlled_depletion_snapshot",
         lambda _state, *, family: next(snapshots)
@@ -1335,6 +1446,10 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
     assert [row["target_scid"] for row in routed] == ["1x1x0", "3x1x0"]
     assert all(row["amount_sats"] == 750_000 for row in routed)
     assert state["controlled_depletion"]["fixture_fee_ppm"] == 120
+    assert gossip[0][1] == [
+        {"short_channel_id": "2x1x0", "source": "revenue-id", "fee_ppm": 120},
+        {"short_channel_id": "4x1x0", "source": "clboss-id", "fee_ppm": 120},
+    ]
     assert {
         (container, args)
         for container, method, args in calls
@@ -1787,9 +1902,14 @@ def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
         "status": "smoke_complete",
         "league": "full_stack",
         "events": [],
+        "contenders": {
+            "identity-a": {"container": "a"},
+            "identity-b": {"container": "b"},
+        },
     })
     calls = []
     funded = []
+    gossip = []
     lnd_rows = iter(([], [{
         "active": True,
         "remote_pubkey": "lnd-sink-id",
@@ -1801,7 +1921,10 @@ def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
     def cln(container, method, *args):
         calls.append((container, method, args))
         if method == "getinfo":
-            return {"id": "cln-sink-id"}
+            return {
+                "id": "cln-payer-id" if container.endswith("cln-payer")
+                else "cln-sink-id"
+            }
         if method == "newaddr":
             return {"p2tr": "bcrt1ptest"}
         if method == "fundchannel":
@@ -1848,6 +1971,10 @@ def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
             {**paths[1], "short_channel_id": "1x1x1", "channel_point": "funding:1"},
         ],
     )
+    monkeypatch.setattr(
+        runner, "wait_gossip_policies",
+        lambda contenders, expected: gossip.append((contenders, expected)) or {},
+    )
 
     state = runner.provision_return_paths(
         object(), replica=4, results_dir=tmp_path, capacity_sats=2_000_000
@@ -1855,6 +1982,24 @@ def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
 
     assert state["status"] == "return_paths_ready"
     assert state["return_path_fixture"]["present_during_scored_traffic"] is False
+    assert state["return_path_fixture"] == {
+        "present_during_scored_traffic": False,
+        "fee_base_msat": runner.RETURN_PATH_FEE_BASE_MSAT,
+        "fee_ppm": runner.RETURN_PATH_FEE_PPM,
+        "purpose": "isolate post-pressure circular-route availability",
+    }
+    assert gossip[0][1] == [
+        {
+            "short_channel_id": "1x1x0",
+            "source": "cln-payer-id",
+            "fee_ppm": runner.RETURN_PATH_FEE_PPM,
+        },
+        {
+            "short_channel_id": "1x1x1",
+            "source": "lnd-payer-id",
+            "fee_ppm": runner.RETURN_PATH_FEE_PPM,
+        },
+    ]
     assert {row["family"] for row in state["return_paths"]} == {"cln", "lnd"}
     assert funded == [
         ("bcrt1ptest", 2_100_000),
@@ -1862,6 +2007,98 @@ def test_return_paths_open_only_after_score_and_checkpoint_exact_channels(
     ]
     assert all(method not in {"revenue-rebalance-cycle", "revenue-rebalance"}
                for _container, method, _args in calls)
+
+
+def test_return_path_resume_reconciles_partial_open_without_refunding(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 5)
+    partial = [
+        {
+            "family": "cln", "source_container": "cln-payer",
+            "sink_container": "cln-sink", "peer_id": "cln-sink-id",
+            "channel_id": "cln-channel-id", "capacity_sats": 2_000_000,
+        },
+        {
+            "family": "lnd", "source_container": "lnd-payer",
+            "sink_container": "lnd-sink", "peer_id": "lnd-sink-id",
+            "funding_txid": "funding", "capacity_sats": 2_000_000,
+        },
+    ]
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "network_id": 4,
+        "status": "controlled_depletion_ready",
+        "league": "full_stack",
+        "events": [
+            {"event": "return_path_open_dispatched", "family": "cln"},
+            {"event": "return_path_open_dispatched", "family": "lnd"},
+        ],
+        "contenders": {
+            "identity-a": {"container": "a"},
+            "identity-b": {"container": "b"},
+        },
+        "return_paths": partial,
+    })
+    calls = []
+
+    def cln(container, method, *args):
+        calls.append((container, method, args))
+        if method == "getinfo":
+            return {"id": "cln-payer-id" if container.endswith("payer") else "cln-sink-id"}
+        if method == "setchannel":
+            return {"channels": [{}]}
+        raise AssertionError((container, method, args))
+
+    def lnd(container, method, *args):
+        calls.append((container, method, args))
+        if method == "getinfo":
+            return {"identity_pubkey": "lnd-payer-id" if container.endswith("payer") else "lnd-sink-id"}
+        raise AssertionError((container, method, args))
+
+    monkeypatch.setattr(runner, "cln_rpc", cln)
+    monkeypatch.setattr(runner, "lnd_rpc", lnd)
+    monkeypatch.setattr(
+        runner, "_wait_return_paths", lambda paths: [
+            {**paths[0], "short_channel_id": "1x1x0"},
+            {**paths[1], "short_channel_id": "1x1x1", "channel_point": "funding:1"},
+        ],
+    )
+    monkeypatch.setattr(runner, "_live_lnd_channels", lambda _container: [{
+        "channel_point": "funding:1", "scid": "123",
+    }])
+    monkeypatch.setattr(
+        runner, "_wait_lnd_local_policy", lambda *_args: {
+            "time_lock_delta": 40, "min_htlc": "1", "max_htlc_msat": "1980000000",
+        },
+    )
+    monkeypatch.setattr(runner, "_set_lnd_policy", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "wait_gossip_policies", lambda *_args, **_kwargs: {})
+
+    state = runner.provision_return_paths(
+        object(), replica=5, results_dir=tmp_path, fee_ppm=10
+    )
+
+    assert state["status"] == "return_paths_ready"
+    assert state["return_path_fixture"]["fee_ppm"] == 10
+    assert any(
+        event["event"] == "return_paths_reconciled_after_partial_open"
+        for event in state["events"]
+    )
+    assert all(method not in {"newaddr", "fundchannel", "openchannel"}
+               for _container, method, _args in calls)
+
+
+def test_lnd_policy_wait_fails_closed_on_malformed_or_absent_graph(monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner, "lnd_rpc", lambda *_args: {"node1_pub": "other"})
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(runner.RunnerError, match="policy readback failed"):
+        runner._wait_lnd_local_policy(
+            "polar-n4-lnd-payer", "123", "payer", attempts=2, poll_seconds=0
+        )
 
 
 def test_return_path_snapshot_fails_closed_on_malformed_lnd_balance(
@@ -2180,8 +2417,8 @@ def test_competition_image_pins_all_source_revisions():
     runner = load_runner()
     dockerfile = (ROOT / "tools" / "polar-clboss" / "Dockerfile").read_text(encoding="utf-8")
 
-    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:f201b22"
-    assert runner.EXPECTED_REVENUE_REVISION.startswith("f201b22")
+    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:fdbecc4"
+    assert runner.EXPECTED_REVENUE_REVISION.startswith("fdbecc4")
     assert "elementsproject/lightningd:v26.06.6" in dockerfile
     assert "CLBOSS_COMMIT=8cb4e9215eba58b049375f234f5f073d0c7fc622" in dockerfile
     assert "XREBALANCE_COMMIT=fb70bf13cd9f3f79b14100bfdb8f2966884a4142" in dockerfile
