@@ -2420,8 +2420,8 @@ def test_competition_image_pins_all_source_revisions():
     runner = load_runner()
     dockerfile = (ROOT / "tools" / "polar-clboss" / "Dockerfile").read_text(encoding="utf-8")
 
-    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:70e26c8"
-    assert runner.EXPECTED_REVENUE_REVISION.startswith("70e26c8")
+    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:5db4588"
+    assert runner.EXPECTED_REVENUE_REVISION.startswith("5db4588")
     assert "elementsproject/lightningd:v26.06.6" in dockerfile
     assert "clightning-v26.06.7-Ubuntu-22.04-amd64.tar.xz" in dockerfile
     assert runner.EXPECTED_CLN_ARTIFACT_DIGEST in dockerfile
