@@ -49,6 +49,8 @@ def test_registered_method_inventory_contains_retained_core():
 )
 def test_read_only_surfaces_degrade_without_mutation(name, kwargs, monkeypatch):
     mod = load_plugin_module()
+    wake = MagicMock()
+    monkeypatch.setattr(mod, "_request_fee_adjustment_wake", wake)
     for attr in (
         "database", "config", "fee_controller", "rebalancer",
         "profitability_analyzer", "policy_manager", "capex_engine",
@@ -67,6 +69,7 @@ def test_read_only_surfaces_degrade_without_mutation(name, kwargs, monkeypatch):
     assert isinstance(result, dict)
     for mutation in mutation_names:
         getattr(mod.plugin.rpc, mutation).assert_not_called()
+    wake.assert_not_called()
 
 
 def test_generic_no_close_tag_survives_database_reload(tmp_path):

@@ -2584,8 +2584,8 @@ class FeeController:
     EXPLORATION_HEADROOM_RATIO = 0.35
     EXPLORATION_SPARSE_HEADROOM_RATIO = 0.50
 
-    # Default-off market-acquisition rollout. These are fixed safety rails,
-    # not tuning knobs: the first production surface exposes only enable/off.
+    # Default-on market-acquisition rollout. These are fixed safety rails,
+    # not tuning knobs: the production surface exposes only enable/off.
     ACQUISITION_TARGET_FEE_PPM = 0
     ACQUISITION_TARGET_BASE_FEE_MSAT = 0
     # Public routing markets frequently cluster at a few ppm on the cheapest
@@ -2601,9 +2601,17 @@ class FeeController:
     # A free quote is only useful if it answers whether demand exists.  Once
     # enough demand is observed, validate it with a positive base-fee quote
     # that is strictly cheaper than the peer-local proportional floor at the
-    # smallest acquired payment.  This phase is part of the same default-off,
+    # smallest acquired payment.  This phase is part of the same default-on,
     # one-lane loss budget and cannot outlive its own caps.
     ACQUISITION_RETENTION_MIN_VOLUME_SATS = 50_000
+    # Wake the ordinary governed fee loop only after enough new evidence can
+    # change a lifecycle decision.  The loss step is one fifth of the fixed
+    # 25-sat cap, so at most five opportunity-cost wakes are useful before
+    # restoration.  These are internal enforcement-latency bounds, not knobs.
+    ACQUISITION_MONITOR_WAKE_VOLUME_MSAT = (
+        ACQUISITION_RETENTION_MIN_VOLUME_SATS * 1_000
+    )
+    ACQUISITION_MONITOR_WAKE_OPPORTUNITY_COST_MSAT = 5_000
     ACQUISITION_RETENTION_DURATION_SECONDS = 3600
     ACQUISITION_RETENTION_VOLUME_CAP_SATS = 250_000
     ACQUISITION_RETENTION_BASE_FEE_CAP_MSAT = 1_000
@@ -3314,6 +3322,156 @@ class FeeController:
             competitor_charge_msat - 1,
         )
 
+    def _sync_acquisition_monitor_episodes(
+        self,
+        episodes: Dict[str, Dict[str, Any]],
+        *,
+        reset_pending: bool = False,
+    ) -> None:
+        """Publish a validated active-episode snapshot to the forward hook.
+
+        A fee cycle calls this before reading per-channel evidence.  Clearing
+        pending counters there means only forwards that may arrive after the
+        cycle snapshot can request another cycle.  Phase/id changes also reset
+        counters so acquisition evidence cannot leak into retention.
+        """
+        normalized: Dict[str, Dict[str, Any]] = {}
+        if isinstance(episodes, dict):
+            for raw_channel_id, row in episodes.items():
+                channel_id = str(raw_channel_id or "")
+                if channel_id and isinstance(row, dict):
+                    normalized[channel_id] = dict(row)
+        with self._acquisition_monitor_lock:
+            previous = self._acquisition_monitor_episodes
+            retained_pending: Dict[str, Tuple[int, int]] = {}
+            if not reset_pending:
+                for channel_id, row in normalized.items():
+                    old = previous.get(channel_id)
+                    if (
+                        isinstance(old, dict)
+                        and old.get("id") == row.get("id")
+                        and old.get("phase", "acquisition")
+                        == row.get("phase", "acquisition")
+                    ):
+                        retained_pending[channel_id] = (
+                            self._acquisition_monitor_pending.get(
+                                channel_id, (0, 0)
+                            )
+                        )
+            self._acquisition_monitor_episodes = normalized
+            self._acquisition_monitor_pending = retained_pending
+            self._acquisition_monitor_initialized = True
+
+    def _prime_acquisition_monitor_if_needed(self) -> None:
+        """Perform one restart-safe local DB read before the first cycle."""
+        with self._acquisition_monitor_lock:
+            if self._acquisition_monitor_initialized:
+                return
+            get_active = getattr(
+                self.database, "get_active_acquisition_experiments", None
+            )
+            try:
+                rows = get_active() if callable(get_active) else []
+            except Exception as exc:
+                self.plugin.log(
+                    f"ACQUISITION_MONITOR: active-state read failed: {exc}",
+                    level="debug",
+                )
+                rows = []
+            if not isinstance(rows, list):
+                rows = []
+            episodes = {
+                str(row.get("channel_id")): dict(row)
+                for row in rows
+                if isinstance(row, dict) and row.get("channel_id")
+            }
+            self._acquisition_monitor_episodes = episodes
+            self._acquisition_monitor_pending = {}
+            # Fail neutral after an error instead of querying SQLite on every
+            # forward.  The next ordinary fee cycle resynchronizes this cache.
+            self._acquisition_monitor_initialized = True
+
+    def should_wake_acquisition_cycle(
+        self, channel_id: Any, out_msat: Any
+    ) -> bool:
+        """Coalesce material settled evidence for an active episode.
+
+        Notification-safe: no CLN RPC and no fee mutation.  True means either
+        the paid-retention volume threshold or one fifth of the shared
+        opportunity-cost cap accrued since the last wake/cycle.
+        """
+        try:
+            if isinstance(out_msat, bool):
+                return False
+            amount_msat = int(out_msat)
+            if amount_msat <= 0 or float(out_msat) != amount_msat:
+                return False
+            normalized_channel_id = str(channel_id or "")
+            if not normalized_channel_id:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+        self._prime_acquisition_monitor_if_needed()
+        with self._acquisition_monitor_lock:
+            episode = self._acquisition_monitor_episodes.get(
+                normalized_channel_id
+            )
+            if not isinstance(episode, dict):
+                return False
+            try:
+                phase = str(episode.get("phase") or "acquisition")
+                baseline_fee_ppm = int(episode["baseline_fee_ppm"])
+                baseline_base_fee_msat = int(
+                    episode.get("baseline_base_fee_msat", 0)
+                )
+                if phase == "retention":
+                    active_fee_ppm = int(episode["retention_fee_ppm"])
+                    active_base_fee_msat = int(
+                        episode["retention_base_fee_msat"]
+                    )
+                elif phase == "acquisition":
+                    active_fee_ppm = int(episode["target_fee_ppm"])
+                    active_base_fee_msat = int(
+                        episode.get("target_base_fee_msat", 0)
+                    )
+                else:
+                    return False
+                if min(
+                    baseline_fee_ppm,
+                    baseline_base_fee_msat,
+                    active_fee_ppm,
+                    active_base_fee_msat,
+                ) < 0:
+                    return False
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+
+            lost_msat = max(
+                0, baseline_base_fee_msat - active_base_fee_msat
+            ) + (
+                amount_msat * max(0, baseline_fee_ppm - active_fee_ppm)
+            ) // 1_000_000
+            pending_volume_msat, pending_lost_msat = (
+                self._acquisition_monitor_pending.get(
+                    normalized_channel_id, (0, 0)
+                )
+            )
+            pending_volume_msat += amount_msat
+            pending_lost_msat += lost_msat
+            should_wake = (
+                pending_volume_msat
+                >= self.ACQUISITION_MONITOR_WAKE_VOLUME_MSAT
+                or pending_lost_msat
+                >= self.ACQUISITION_MONITOR_WAKE_OPPORTUNITY_COST_MSAT
+            )
+            self._acquisition_monitor_pending[normalized_channel_id] = (
+                (0, 0)
+                if should_wake
+                else (pending_volume_msat, pending_lost_msat)
+            )
+            return should_wake
+
     def _complete_acquisition_experiment(
         self,
         episode: Dict[str, Any],
@@ -3344,7 +3502,11 @@ class FeeController:
             self.plugin.log(f"ACQUISITION: completion write failed: {exc}", level="error")
             return
         if completed:
-            self._acquisition_cycle_experiments.pop(str(episode.get("channel_id")), None)
+            channel_id = str(episode.get("channel_id") or "")
+            self._acquisition_cycle_experiments.pop(channel_id, None)
+            with self._acquisition_monitor_lock:
+                self._acquisition_monitor_episodes.pop(channel_id, None)
+                self._acquisition_monitor_pending.pop(channel_id, None)
             self.plugin.log(
                 f"ACQUISITION: completed {str(episode.get('channel_id'))[:12]}... "
                 f"reason={exit_reason}, volume={volume_sats}sats, "
@@ -3393,6 +3555,9 @@ class FeeController:
         channel_id = str(episode.get("channel_id") or "")
         if channel_id:
             self._acquisition_cycle_experiments[channel_id] = updated
+            self._sync_acquisition_monitor_episodes(
+                {channel_id: updated}, reset_pending=True
+            )
         self.plugin.log(
             f"ACQUISITION: entered paid retention on {channel_id[:12]}... "
             f"at {int(retention_base_fee_msat)}msat+{int(retention_fee_ppm)}ppm "
@@ -3671,6 +3836,13 @@ class FeeController:
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
         self._acquisition_cycle_experiments: Dict[str, Dict[str, Any]] = {}
+        # Compact active-episode state survives between fee cycles so settled
+        # evidence can wake the governed loop.  It performs no CLN RPCs or fee
+        # writes and uses its own lock rather than the cycle-wide state lock.
+        self._acquisition_monitor_lock = threading.Lock()
+        self._acquisition_monitor_episodes: Dict[str, Dict[str, Any]] = {}
+        self._acquisition_monitor_pending: Dict[str, Tuple[int, int]] = {}
+        self._acquisition_monitor_initialized = False
         # A settled-forward contradiction may trigger one expensive canonical
         # profitability refresh. Back off failures/concurrent-cache returns so
         # compressed fee cycles cannot create a refresh storm.
@@ -5707,6 +5879,10 @@ class FeeController:
         self._cycle_peer_latency_memo.clear()
         self._acquisition_cycle_experiments = self._prepare_acquisition_experiments(
             channel_states, channels, cfg, decision_now("acquisition.prepare")
+        )
+        self._sync_acquisition_monitor_episodes(
+            self._acquisition_cycle_experiments,
+            reset_pending=True,
         )
         try:
             self._adjust_all_fees_channel_loop(

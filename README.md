@@ -254,6 +254,10 @@ at 250,000 additional sats. Congestion and changed, missing, or malformed
 evidence fail closed. The controller always restores the exact captured base
 and proportional fees, and `revenue-status.acquisition_experiments` exposes the
 phase and audit trail.
+Settled forwards on the active lane coalesce into fixed 50,000-sat or 5-sat
+opportunity-cost evidence steps that wake the existing governed fee loop for a
+prompt lifecycle check. This does not change the normal production fee cadence
+and never applies a fee from the notification handler.
 Crossed CLN/LND tournament evidence promoted the bounded controller to
 default-on. Set the control to `false` to opt out; missing or malformed market,
 capacity, profitability, persistence, or fee evidence still prevents entry or

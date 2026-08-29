@@ -56,7 +56,9 @@
 # One safety-capped cold-lane acquisition episode is enabled by default. It
 # may quote 0 ppm on one qualifying 1-10-ppm corridor, then validates retained
 # demand with a positive base fee. Fixed volume, opportunity-cost, liquidity,
-# duration, restoration, and seven-day cooldown rails remain enforced.
+# duration, restoration, and seven-day cooldown rails remain enforced. Material
+# settled evidence wakes a governed lifecycle check without changing the normal
+# fee interval or applying fees in the notification handler.
 # Set false to opt out.
 #revenue-ops-acquisition-experiment-enabled=true
 

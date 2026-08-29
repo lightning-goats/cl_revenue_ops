@@ -22,6 +22,7 @@ import time
 import json
 import random
 import threading
+import queue
 import signal
 import atexit
 import re
@@ -680,6 +681,27 @@ plugin = Plugin()
 # instead of waiting for their sleep timers (which could be 30+ minutes).
 
 shutdown_event = threading.Event()
+# Maxsize one deliberately coalesces burst evidence.  One pending wake is
+# enough because the next fee cycle reads the complete durable forward history.
+# This leaves the steady-state fee cadence unchanged.
+fee_adjustment_wake_queue = queue.Queue(maxsize=1)
+
+
+def _request_fee_adjustment_wake() -> None:
+    """Wake the governed fee loop without blocking a notification thread."""
+    try:
+        fee_adjustment_wake_queue.put_nowait(None)
+    except queue.Full:
+        pass
+
+
+def _wait_for_fee_adjustment_wake(timeout: float) -> bool:
+    """Wait for schedule/wake/shutdown; return true only for shutdown."""
+    try:
+        fee_adjustment_wake_queue.get(timeout=max(0.0, float(timeout)))
+    except queue.Empty:
+        pass
+    return shutdown_event.is_set()
 
 # =============================================================================
 # THREAD-SAFE RPC WRAPPER (High-Uptime Stability)
@@ -1718,6 +1740,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         handler itself.
         """
         shutdown_event.set()
+        _request_fee_adjustment_wake()
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
@@ -1730,6 +1753,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # before tearing down their resources.
         try:
             shutdown_event.set()
+            _request_fee_adjustment_wake()
         except Exception:
             pass
         if safe_plugin and hasattr(safe_plugin, 'rpc'):
@@ -2354,7 +2378,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         """Background loop for fee adjustment."""
         # Staggered startup: fees at 90s (was 60s) to avoid thundering herd
         _startup_cfg = config.snapshot() if hasattr(config, 'snapshot') else config
-        if shutdown_event.wait(min(90, max(15, _startup_cfg.fee_interval))):
+        if _wait_for_fee_adjustment_wake(
+            min(90, max(15, _startup_cfg.fee_interval))
+        ):
             plugin.log("Fee adjustment loop cancelled during startup delay")
             return
 
@@ -2379,8 +2405,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 sleep_time = interval + random.randint(-jitter_seconds, jitter_seconds)
                 plugin.log(f"Fee adjustment sleeping for {sleep_time}s")
 
-                # Interruptible sleep: wait for timeout OR shutdown signal
-                if shutdown_event.wait(sleep_time):
+                # Interruptible sleep: timeout, shutdown, or enough material
+                # acquisition evidence for a governed lifecycle check.
+                if _wait_for_fee_adjustment_wake(sleep_time):
                     plugin.log("Fee adjustment loop stopping due to shutdown signal")
                     break
             except Exception as e:
@@ -6082,6 +6109,24 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
                 resolved_time,
                 resolution_duration,
             )
+
+        # Persist evidence before requesting evaluation.  The notification
+        # handler never mutates fees; it only wakes the existing governed loop
+        # after a fixed active-experiment volume/loss step.
+        if fee_controller is not None:
+            try:
+                if (
+                    _fee_authority_denial("acquisition_monitor_trigger") is None
+                    and fee_controller.should_wake_acquisition_cycle(
+                        out_channel, out_msat
+                    )
+                ):
+                    _request_fee_adjustment_wake()
+            except Exception as exc:
+                plugin.log(
+                    f"ACQUISITION_MONITOR: settled evidence ignored: {exc}",
+                    level="debug",
+                )
 
 
 @plugin.subscribe("connect")

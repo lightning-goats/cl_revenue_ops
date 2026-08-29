@@ -101,6 +101,68 @@ class TestForwardWriteCoalescing:
         db.update_peer_reputation.assert_not_called()
         db.record_forward.assert_called_once()
 
+    def test_settled_forward_wakes_governed_fee_loop_after_persist(self):
+        mod = _module()
+        order = []
+        db = MagicMock(spec=[
+            "record_forward_and_reputation", "record_forward",
+            "update_peer_reputation",
+        ])
+        db.record_forward_and_reputation.side_effect = (
+            lambda *args: order.append("persist")
+        )
+        mod.database = db
+        mod._resolve_scid_to_peer = MagicMock(return_value=PEER)
+        mod.fee_controller = MagicMock()
+        mod.fee_controller.should_wake_acquisition_cycle.side_effect = (
+            lambda *args: order.append("evaluate") or True
+        )
+        mod._request_fee_adjustment_wake = lambda: order.append("wake")
+
+        mod._on_forward_event_impl(_settled_event(), mod.plugin)
+
+        assert order == ["persist", "evaluate", "wake"]
+        mod.fee_controller.should_wake_acquisition_cycle.assert_called_once_with(
+            "200x2x0", 999_000
+        )
+
+    def test_settled_forward_monitor_failure_is_neutral(self):
+        mod = _module()
+        db = MagicMock(spec=[
+            "record_forward_and_reputation", "record_forward",
+            "update_peer_reputation",
+        ])
+        mod.database = db
+        mod._resolve_scid_to_peer = MagicMock(return_value=PEER)
+        mod.fee_controller = MagicMock()
+        mod.fee_controller.should_wake_acquisition_cycle.side_effect = (
+            ValueError("malformed monitor state")
+        )
+        mod._request_fee_adjustment_wake = MagicMock()
+
+        mod._on_forward_event_impl(_settled_event(), mod.plugin)
+
+        db.record_forward_and_reputation.assert_called_once()
+        mod._request_fee_adjustment_wake.assert_not_called()
+
+    def test_disabled_authority_does_not_wake_acquisition_monitor(self):
+        mod = _module()
+        _disable_fee_authority(mod)
+        db = MagicMock(spec=[
+            "record_forward_and_reputation", "record_forward",
+            "update_peer_reputation",
+        ])
+        mod.database = db
+        mod._resolve_scid_to_peer = MagicMock(return_value=PEER)
+        mod.fee_controller = MagicMock()
+        mod._request_fee_adjustment_wake = MagicMock()
+
+        mod._on_forward_event_impl(_settled_event(), mod.plugin)
+
+        db.record_forward_and_reputation.assert_called_once()
+        mod.fee_controller.should_wake_acquisition_cycle.assert_not_called()
+        mod._request_fee_adjustment_wake.assert_not_called()
+
     def test_failed_forward_still_penalizes_reputation_immediately(self):
         mod = _module()
         db = MagicMock(spec=[

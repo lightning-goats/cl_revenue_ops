@@ -43,6 +43,101 @@ def _set_acquisition_evidence(
     }
 
 
+def test_acquisition_monitor_wakes_on_bounded_opportunity_cost_step(
+    mock_plugin, mock_database
+):
+    fc, _ = _make_fc(mock_plugin, mock_database)
+    episode = {
+        **_episode(started_at=int(time.time())),
+        "baseline_fee_ppm": 150,
+        "baseline_base_fee_msat": 500,
+    }
+    fc._sync_acquisition_monitor_episodes(
+        {CHANNEL_ID: episode}, reset_pending=True
+    )
+
+    # Each 5,000-sat HTLC forgoes 1.25 sats (500msat base + 750msat ppm).
+    assert not fc.should_wake_acquisition_cycle(CHANNEL_ID, 5_000_000)
+    assert not fc.should_wake_acquisition_cycle(CHANNEL_ID, 5_000_000)
+    assert not fc.should_wake_acquisition_cycle(CHANNEL_ID, 5_000_000)
+    assert fc.should_wake_acquisition_cycle(CHANNEL_ID, 5_000_000)
+    # The coalescer resets after a wake rather than storming each forward.
+    assert not fc.should_wake_acquisition_cycle(CHANNEL_ID, 5_000_000)
+
+
+def test_acquisition_monitor_wakes_on_retention_volume_threshold(
+    mock_plugin, mock_database
+):
+    fc, _ = _make_fc(mock_plugin, mock_database)
+    episode = {
+        **_episode(started_at=int(time.time()), baseline=1),
+        "baseline_base_fee_msat": 0,
+    }
+    fc._sync_acquisition_monitor_episodes(
+        {CHANNEL_ID: episode}, reset_pending=True
+    )
+
+    assert not fc.should_wake_acquisition_cycle(CHANNEL_ID, 25_000_000)
+    assert fc.should_wake_acquisition_cycle(CHANNEL_ID, 25_000_000)
+
+
+def test_acquisition_monitor_retention_quote_and_phase_reset(
+    mock_plugin, mock_database
+):
+    fc, _ = _make_fc(mock_plugin, mock_database)
+    acquisition = {
+        **_episode(started_at=int(time.time())),
+        "baseline_fee_ppm": 100,
+        "baseline_base_fee_msat": 500,
+    }
+    fc._sync_acquisition_monitor_episodes(
+        {CHANNEL_ID: acquisition}, reset_pending=True
+    )
+    assert not fc.should_wake_acquisition_cycle(CHANNEL_ID, 10_000_000)
+
+    retention = {
+        **acquisition,
+        "phase": "retention",
+        "retention_fee_ppm": 0,
+        "retention_base_fee_msat": 499,
+    }
+    fc._sync_acquisition_monitor_episodes({CHANNEL_ID: retention})
+    # Phase change discards the free-acquisition pending counters.  A 1-msat
+    # base discount needs 5,000 forwards to reach the 5-sat loss step.
+    assert not fc.should_wake_acquisition_cycle(CHANNEL_ID, 1_000_000)
+
+
+def test_acquisition_monitor_absent_and_malformed_evidence_is_neutral(
+    mock_plugin, mock_database
+):
+    fc, _ = _make_fc(mock_plugin, mock_database)
+    malformed = {
+        **_episode(started_at=int(time.time())),
+        "baseline_fee_ppm": "bad",
+    }
+    fc._sync_acquisition_monitor_episodes(
+        {CHANNEL_ID: malformed}, reset_pending=True
+    )
+
+    assert not fc.should_wake_acquisition_cycle("999x1x0", 100_000_000)
+    assert not fc.should_wake_acquisition_cycle(CHANNEL_ID, "bad")
+    assert not fc.should_wake_acquisition_cycle(CHANNEL_ID, 100_000_000)
+
+
+def test_acquisition_monitor_restart_read_failure_does_not_crash_or_storm(
+    mock_plugin, mock_database
+):
+    fc, _ = _make_fc(mock_plugin, mock_database)
+    fc._acquisition_monitor_initialized = False
+    mock_database.get_active_acquisition_experiments.side_effect = RuntimeError(
+        "database unavailable"
+    )
+
+    assert not fc.should_wake_acquisition_cycle(CHANNEL_ID, 100_000_000)
+    assert not fc.should_wake_acquisition_cycle(CHANNEL_ID, 100_000_000)
+    assert mock_database.get_active_acquisition_experiments.call_count == 1
+
+
 def test_database_enforces_one_active_and_persists_exact_restore(tmp_path):
     db_path = str(tmp_path / "acquisition.db")
     db = Database(db_path, MagicMock())

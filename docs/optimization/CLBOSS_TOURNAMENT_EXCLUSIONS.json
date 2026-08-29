@@ -85,6 +85,11 @@
       "replica": "replica-92",
       "block": "smoke-1788029972",
       "reason": "Pre-fix diagnostic used the obsolete one-forward-per-payment gate; a valid 100,000-sat LND payment split into two distinct 50,000-sat HTLCs and the block is superseded by exact-volume block smoke-1788030267."
+    },
+    {
+      "replica": "replica-93",
+      "block": "smoke-1788031323",
+      "reason": "Causal lifecycle traffic crossed the native free-acquisition exit inside the scored window; the following exact-volume blocks are the steady-state post-acquisition comparison."
     }
   ]
 }

@@ -174,6 +174,9 @@ def _build_namespace(event, work_name, work_callable, randint_mock):
     """A controlled global namespace covering every name the loops close over."""
     ns = {}
     ns["shutdown_event"] = event
+    ns["_wait_for_fee_adjustment_wake"] = (
+        lambda timeout: event.wait(timeout)
+    )
     ns["plugin"] = MagicMock()
     ns["time"] = __import__("time")
     ns["traceback"] = __import__("traceback")

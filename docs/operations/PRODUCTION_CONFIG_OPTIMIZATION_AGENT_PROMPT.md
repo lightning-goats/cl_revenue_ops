@@ -112,6 +112,8 @@ Use these decision rules:
      `acquisition_experiment_enabled=true` unless live evidence identifies a
      concrete reason to opt out; do not loosen its fixed duration, volume,
      opportunity-cost, liquidity, restoration, or cooldown rails.
+     Its material-evidence wake path does not justify shortening the configured
+     production fee interval; keep cadence decisions evidence-based.
    - Set `min_fee_ppm`, `min_fee_ppm_saturated`, `max_fee_ppm`, fee profile,
      market-boundary values, and related fee controls only from observed bands
      and explicit cost-recovery requirements.
