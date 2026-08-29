@@ -26,9 +26,21 @@ This table describes observed lab outcomes; it does not treat historical smoke b
 | Fee setting | 2552086 msat net at 117.377 ppm yield | 823646 msat net at 20.934 ppm yield | Revenue Ops |
 | Route acquisition / breadth | 22234581928 msat, 34.452% share | 42303945739 msat, 65.548% share | CLBOSS (diagnostic) |
 | Rebalancing and post-refill conversion | 4305000000 msat / 553785 msat linked net | 4065000000 msat / 418223 msat linked net | Revenue Ops |
+| Selective rebalance economics | 150/120 ppm: 0/2 replicas, 0 sats delivered / 0.000 sats cost; 800/120 ppm: 2/2 replicas, 100000 sats delivered / 14.004 sats cost | 150/120 ppm: 0/2 replicas, 0 sats delivered / 0.000 sats cost; 800/120 ppm: 0/2 replicas, 0 sats delivered / 0.000 sats cost | revenue_ops |
 | Liquidity balance | Mean worst imbalance 838557.7 ppm | Mean worst imbalance 856371.6 ppm | revenue_ops |
 | Reliability | Strict safety-gated blocks only; shared traffic settled 3206/3209 payments | The same shared traffic and safety gate applies | Not attributable per controller |
 | Channel open / close management | Intentionally absent from this standalone plugin | Disabled in the comparable harness | Not comparable |
+
+## Controlled payer-refill economics
+
+Safety-eligible native observations: 4/4. Destination/return fees are shown in ppm; CLBOSS is uncapped.
+
+| Fee band | Controller | Executed replicas | Delivered (sats) | Cost (sats) |
+|---|---|---:|---:|---:|
+| 150/120 | revenue_ops | 0/2 | 0 | 0.000 |
+| 150/120 | clboss | 0/2 | 0 | 0.000 |
+| 800/120 | revenue_ops | 2/2 | 100000 | 14.004 |
+| 800/120 | clboss | 0/2 | 0 | 0.000 |
 
 ## Eligible results by market profile
 

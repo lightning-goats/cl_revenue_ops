@@ -45,6 +45,30 @@ def block():
     }
 
 
+def rebalance_observation(destination_ppm, revenue_delivered_msat, revenue_cost_msat):
+    return {
+        "schema": "polar-clboss-rebalance-observation-v1",
+        "replica": f"replica-{destination_ppm}",
+        "controlled_depletion": {
+            "depleted_side": "payer",
+            "fixture_fee_ppm": destination_ppm,
+        },
+        "fixture": {"depleted_side": "payer", "fee_ppm": 120},
+        "safety_violations": [],
+        "controllers": {
+            "revenue_ops": {"circular_payments": {
+                "completed_count": int(revenue_delivered_msat > 0),
+                "delivered_msat": revenue_delivered_msat,
+                "cost_msat": revenue_cost_msat,
+            }},
+            "clboss": {"circular_payments": {
+                "completed_count": 0, "delivered_msat": 0, "cost_msat": 0,
+            }},
+        },
+        "_source": "fixture",
+    }
+
+
 def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming():
     mod = load_scorecard()
 
@@ -101,6 +125,53 @@ def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming()
     assert "### acquisition" in rendered
     assert "## Eligible results by phase" in rendered
     assert "### paid_retention" in rendered
+
+
+def test_scorecard_tracks_profit_selective_controlled_rebalances():
+    mod = load_scorecard()
+    observations = [
+        rebalance_observation(150, 0, 0),
+        rebalance_observation(800, 50_000_000, 7_002),
+    ]
+
+    result = mod.summarize([block()], observations)
+
+    controlled = result["controlled_rebalance_economics"]
+    assert controlled["observed"] == 2
+    assert controlled["safety_eligible"] == 2
+    assert controlled["delivered_leader"] == "revenue_ops"
+    assert controlled["bands"][0]["controllers"]["revenue_ops"] == {
+        "executed_replicas": 0,
+        "completed_count": 0,
+        "delivered_msat": 0,
+        "cost_msat": 0,
+    }
+    assert controlled["bands"][1]["controllers"]["revenue_ops"] == {
+        "executed_replicas": 1,
+        "completed_count": 1,
+        "delivered_msat": 50_000_000,
+        "cost_msat": 7_002,
+    }
+    rendered = mod.markdown(result)
+    assert "| Selective rebalance economics |" in rendered
+    assert "150/120 ppm: 0/1 replicas" in rendered
+    assert "800/120 ppm: 1/1 replicas, 50000 sats delivered / 7.002 sats cost" in rendered
+    assert "## Controlled payer-refill economics" in rendered
+
+
+def test_load_rebalance_observations_fails_closed_on_incomplete_controllers(tmp_path):
+    mod = load_scorecard()
+    replica = tmp_path / "replica-1"
+    replica.mkdir()
+    payload = rebalance_observation(150, 0, 0)
+    payload.pop("_source")
+    payload["controllers"].pop("clboss")
+    (replica / "rebalance-1.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    with pytest.raises(mod.ScorecardError, match="incomplete rebalance controllers"):
+        mod.load_rebalance_observations(tmp_path)
 
 
 def test_scorecard_keeps_unsafe_enhanced_block_out_of_eligible_profile_results():

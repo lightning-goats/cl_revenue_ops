@@ -631,6 +631,24 @@ economic contest. A breadth experiment is promotable only if its incremental
 traffic increases net profit after rebalance and capital costs; it must not
 optimize route share for its own sake.
 
+Replicas 96-99 tested that ordering directly with crossed identities and no
+forced controller cycles. Each contender received the same payer-side CLN lane
+at 25% local liquidity, the same 500,000 sats of reverse earning evidence, and
+the same 120-ppm sink-to-payer return path. At a 150-ppm destination fee,
+Revenue Ops priced the best 50,000-sat refill at 8 sats and rejected it in both
+replicas (`below_hold_margin`, about -6.36 sats after utilization and
+opportunity costs); uncapped CLBOSS also delivered zero. At an 800-ppm
+high-yield positive control, Revenue Ops autonomously delivered exactly 50,000
+sats for 7.002 sats in each crossed replica, then held after reaching the 30%
+target. CLBOSS again delivered zero. All four observations were safety-clean.
+
+This is evidence for profit selectivity, not a reason to lower ordinary fee
+floors or relax rebalance economics: Revenue Ops declined the low-spread volume
+and acted repeatably when the same topology offered enough expected earnings.
+The next breadth work must measure incremental post-refill net profit; a raw
+volume gain with lower net contribution is a regression even if it narrows
+CLBOSS's route-share lead.
+
 The generated scorecard now emits a reproducible functional comparison for fee
 setting, route breadth, post-refill conversion, liquidity balance, reliability,
 and intentionally non-comparable channel opening/closing. This prevents a

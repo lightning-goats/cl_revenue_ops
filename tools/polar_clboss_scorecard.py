@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a living Revenue Ops vs CLBOSS scorecard from tournament smoke blocks."""
+"""Build a living Revenue Ops vs CLBOSS scorecard from tournament evidence."""
 
 from __future__ import annotations
 
@@ -132,7 +132,125 @@ def load_blocks(
     return blocks
 
 
-def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+def load_rebalance_observations(results_dir: Path) -> list[dict[str, Any]]:
+    """Load native controlled-rebalance observations for economic comparison."""
+    observations = []
+    for path in sorted(results_dir.glob("replica-*/rebalance-*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ScorecardError(f"cannot read {path}: {exc}") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != "polar-clboss-rebalance-observation-v1"
+        ):
+            raise ScorecardError(f"unexpected rebalance schema in {path}")
+        contenders = payload.get("controllers")
+        if not isinstance(contenders, dict) or set(contenders) != set(CONTROLLERS):
+            raise ScorecardError(f"incomplete rebalance controllers in {path}")
+        payload["_source"] = str(path)
+        observations.append(payload)
+    return observations
+
+
+def summarize_controlled_rebalances(
+    observations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate crossed payer-refill bands without treating volume as value."""
+    bands: dict[tuple[int, int], dict[str, Any]] = {}
+    matched = eligible = 0
+    for observation in observations:
+        controlled = observation.get("controlled_depletion")
+        fixture = observation.get("fixture")
+        if (
+            not isinstance(controlled, dict)
+            or controlled.get("depleted_side") != "payer"
+            or not isinstance(fixture, dict)
+            or fixture.get("depleted_side") != "payer"
+        ):
+            continue
+        matched += 1
+        violations = observation.get("safety_violations")
+        if not isinstance(violations, list):
+            raise ScorecardError(
+                f"rebalance safety evidence missing in {observation['_source']}"
+            )
+        if violations:
+            continue
+        eligible += 1
+        destination_ppm = _integer(
+            controlled.get("fixture_fee_ppm"), "controlled.fixture_fee_ppm"
+        )
+        return_ppm = _integer(fixture.get("fee_ppm"), "fixture.fee_ppm")
+        band = bands.setdefault((destination_ppm, return_ppm), {
+            "destination_fee_ppm": destination_ppm,
+            "return_fee_ppm": return_ppm,
+            "replicas": set(),
+            "controllers": {
+                name: {
+                    "executed_replicas": 0,
+                    "completed_count": 0,
+                    "delivered_msat": 0,
+                    "cost_msat": 0,
+                }
+                for name in CONTROLLERS
+            },
+        })
+        band["replicas"].add(str(observation.get("replica") or "unknown"))
+        controllers = observation["controllers"]
+        for name in CONTROLLERS:
+            contender = controllers.get(name)
+            circular = (
+                contender.get("circular_payments")
+                if isinstance(contender, dict) else None
+            )
+            if not isinstance(circular, dict):
+                raise ScorecardError(
+                    f"controlled rebalance lacks {name} payments in "
+                    f"{observation['_source']}"
+                )
+            completed = _integer(
+                circular.get("completed_count"), f"{name}.completed_count"
+            )
+            delivered = _integer(
+                circular.get("delivered_msat"), f"{name}.delivered_msat"
+            )
+            cost = _integer(circular.get("cost_msat"), f"{name}.cost_msat")
+            totals = band["controllers"][name]
+            totals["completed_count"] += completed
+            totals["delivered_msat"] += delivered
+            totals["cost_msat"] += cost
+            if completed > 0:
+                totals["executed_replicas"] += 1
+
+    finalized = []
+    for _key, band in sorted(bands.items()):
+        band["replica_count"] = len(band.pop("replicas"))
+        finalized.append(band)
+    revenue_delivered = sum(
+        band["controllers"]["revenue_ops"]["delivered_msat"]
+        for band in finalized
+    )
+    clboss_delivered = sum(
+        band["controllers"]["clboss"]["delivered_msat"]
+        for band in finalized
+    )
+    leader = (
+        "tie" if revenue_delivered == clboss_delivered
+        else "revenue_ops" if revenue_delivered > clboss_delivered else "clboss"
+    )
+    return {
+        "observed": matched,
+        "safety_eligible": eligible,
+        "bands": finalized,
+        "delivered_leader": leader,
+    }
+
+
+def summarize(
+    blocks: list[dict[str, Any]],
+    rebalance_observations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     totals = {name: defaultdict(int) for name in CONTROLLERS}
     phases: dict[str, dict[str, defaultdict[str, int]]] = {}
     eligible_phases: dict[str, dict[str, defaultdict[str, int]]] = {}
@@ -356,6 +474,9 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             ],
             "raw_volume_role": "diagnostic_not_an_objective",
         },
+        "controlled_rebalance_economics": summarize_controlled_rebalances(
+            rebalance_observations or []
+        ),
     }
 
 
@@ -364,6 +485,7 @@ def markdown(scorecard: dict[str, Any]) -> str:
     overall = scorecard["overall"]
     post_rebalance = scorecard["eligible_by_phase"].get("post_rebalance_demand")
     priority = scorecard["tournament_priority"]
+    controlled = scorecard["controlled_rebalance_economics"]
     lines = [
         "# CLBOSS tournament scorecard",
         "",
@@ -453,6 +575,26 @@ def markdown(scorecard: dict[str, Any]) -> str:
                 else "CLBOSS |"
             )
         )
+    if controlled["bands"]:
+        revenue_parts = []
+        clboss_parts = []
+        for band in controlled["bands"]:
+            label = f"{band['destination_fee_ppm']}/{band['return_fee_ppm']} ppm"
+            replicas = band["replica_count"]
+            for name, parts in (
+                ("revenue_ops", revenue_parts), ("clboss", clboss_parts)
+            ):
+                row = band["controllers"][name]
+                parts.append(
+                    f"{label}: {row['executed_replicas']}/{replicas} replicas, "
+                    f"{row['delivered_msat'] // 1000} sats delivered / "
+                    f"{row['cost_msat'] / 1000:.3f} sats cost"
+                )
+        leader = controlled["delivered_leader"]
+        lines.append(
+            "| Selective rebalance economics | " + "; ".join(revenue_parts)
+            + " | " + "; ".join(clboss_parts) + f" | {leader} |"
+        )
     lines.extend([
         (
             "| Liquidity balance | Mean worst imbalance "
@@ -473,6 +615,29 @@ def markdown(scorecard: dict[str, Any]) -> str:
         ),
         "",
     ])
+    if controlled["bands"]:
+        lines.extend([
+            "## Controlled payer-refill economics",
+            "",
+            (
+                f"Safety-eligible native observations: {controlled['safety_eligible']}/"
+                f"{controlled['observed']}. Destination/return fees are shown in ppm; "
+                "CLBOSS is uncapped."
+            ),
+            "",
+            "| Fee band | Controller | Executed replicas | Delivered (sats) | Cost (sats) |",
+            "|---|---|---:|---:|---:|",
+        ])
+        for band in controlled["bands"]:
+            fee_band = f"{band['destination_fee_ppm']}/{band['return_fee_ppm']}"
+            for name in CONTROLLERS:
+                row = band["controllers"][name]
+                lines.append(
+                    f"| {fee_band} | {name} | {row['executed_replicas']}/"
+                    f"{band['replica_count']} | {row['delivered_msat'] // 1000} | "
+                    f"{row['cost_msat'] / 1000:.3f} |"
+                )
+        lines.append("")
     lines.extend([
         "## Eligible results by market profile",
         "",
@@ -541,7 +706,10 @@ def main() -> int:
     parser.add_argument("--format", choices=("json", "markdown"), default="markdown")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    scorecard = summarize(load_blocks(args.results_dir, load_exclusions(args.exclusions)))
+    scorecard = summarize(
+        load_blocks(args.results_dir, load_exclusions(args.exclusions)),
+        load_rebalance_observations(args.results_dir),
+    )
     rendered = (
         json.dumps(scorecard, indent=2, sort_keys=True) + "\n"
         if args.format == "json" else markdown(scorecard)
