@@ -45,6 +45,46 @@
       "replica": "replica-89",
       "block": "smoke-1788025969",
       "reason": "High-value CLN lifecycle traffic used only to drive native acquisition and retention caps before autonomous channel rotation."
+    },
+    {
+      "replica": "replica-90",
+      "block": "smoke-1788027202",
+      "reason": "Untreated diagnostic baseline stopped on unsettled and unattributed traffic; used only to isolate the cold LND route-history deficit."
+    },
+    {
+      "replica": "replica-90",
+      "block": "smoke-1788027600",
+      "reason": "Post-history causal acquisition diagnostic began only after CLBOSS had already captured the LND sender's route history; not a fresh crossed comparison."
+    },
+    {
+      "replica": "replica-91",
+      "block": "smoke-1788028686",
+      "reason": "High-value CLN lifecycle traffic used only to drive the first native acquisition episode toward autonomous rotation."
+    },
+    {
+      "replica": "replica-91",
+      "block": "smoke-1788028824",
+      "reason": "High-value CLN lifecycle traffic used only to complete native acquisition and retention before autonomous LND rotation."
+    },
+    {
+      "replica": "replica-91",
+      "block": "smoke-1788028968",
+      "reason": "Realistic native LND acquisition block had one fallback settlement; retained as causal evidence but excluded by the safety gate."
+    },
+    {
+      "replica": "replica-92",
+      "block": "smoke-1788029553",
+      "reason": "High-value crossed CLN lifecycle traffic used only to complete native acquisition and retention before autonomous LND rotation."
+    },
+    {
+      "replica": "replica-92",
+      "block": "smoke-1788029805",
+      "reason": "Realistic crossed native LND acquisition block contained unrelated settled contender volume and failed the strict attribution gate."
+    },
+    {
+      "replica": "replica-92",
+      "block": "smoke-1788029972",
+      "reason": "Pre-fix diagnostic used the obsolete one-forward-per-payment gate; a valid 100,000-sat LND payment split into two distinct 50,000-sat HTLCs and the block is superseded by exact-volume block smoke-1788030267."
     }
   ]
 }

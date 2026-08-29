@@ -829,6 +829,8 @@ def test_refresh_automatic_phase_reconciles_native_channel_rollover(monkeypatch)
         "state": "completed",
         "channel_id": "1x1x0",
         "exit_reason": "retention_volume_cap",
+        "baseline_fee_ppm": 15,
+        "baseline_base_fee_msat": 0,
         "restored_fee_ppm": 15,
         "restored_base_fee_msat": 0,
     }
@@ -863,8 +865,68 @@ def test_refresh_automatic_phase_reconciles_native_channel_rollover(monkeypatch)
     assert automatic["rollovers"] == [{
         "completed_episode": completed,
         "restored_lane": restored_lane,
+        "restoration_evidence": {
+            "baseline_fee_ppm": 15,
+            "baseline_base_fee_msat": 0,
+            "restored_fee_ppm": 15,
+            "restored_base_fee_msat": 0,
+            "current_fee_ppm": 15,
+            "current_base_fee_msat": 0,
+        },
         "next_episode_id": 8,
     }]
+
+
+def test_refresh_automatic_rollover_allows_later_ordinary_repricing(monkeypatch):
+    runner = load_runner()
+    state = {
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "automatic_acquisition": {
+            "status": "active",
+            "episode": {"id": 7, "state": "active", "channel_id": "1x1x0"},
+            "lane": {"channel_id": "funding-a", "short_channel_id": "1x1x0"},
+        },
+    }
+    completed = {
+        "id": 7, "state": "completed", "channel_id": "1x1x0",
+        "baseline_fee_ppm": 150, "baseline_base_fee_msat": 500,
+        "restored_fee_ppm": 150, "restored_base_fee_msat": 500,
+    }
+    active = {
+        "id": 8, "state": "active", "channel_id": "2x1x0",
+        "phase": "acquisition", "target_fee_ppm": 0,
+        "target_base_fee_msat": 0,
+    }
+    monkeypatch.setattr(
+        runner, "_acquisition_rows", lambda _container: [active, completed]
+    )
+    monkeypatch.setattr(runner, "acquisition_lanes", lambda _state: {
+        "cln": {
+            "family": "cln", "channel_id": "funding-a", "short_channel_id": "1x1x0",
+            "peer_id": "peer-a", "fee_base_msat": 400, "fee_ppm": 125,
+        },
+        "lnd": {
+            "family": "lnd", "channel_id": "funding-b", "short_channel_id": "2x1x0",
+            "peer_id": "peer-b", "fee_base_msat": 0, "fee_ppm": 0,
+        },
+    })
+
+    assert runner.refresh_automatic_acquisition_phase(state) == "acquisition"
+    evidence = state["automatic_acquisition"]["rollovers"][0][
+        "restoration_evidence"
+    ]
+    assert evidence == {
+        "baseline_fee_ppm": 150,
+        "baseline_base_fee_msat": 500,
+        "restored_fee_ppm": 150,
+        "restored_base_fee_msat": 500,
+        "current_fee_ppm": 125,
+        "current_base_fee_msat": 400,
+    }
 
 
 def test_refresh_automatic_rollover_fails_closed_on_restore_mismatch(monkeypatch):
@@ -884,7 +946,8 @@ def test_refresh_automatic_rollover_fails_closed_on_restore_mismatch(monkeypatch
     monkeypatch.setattr(runner, "_acquisition_rows", lambda _container: [
         {
             "id": 7, "state": "completed", "channel_id": "1x1x0",
-            "restored_fee_ppm": 15, "restored_base_fee_msat": 0,
+            "baseline_fee_ppm": 15, "baseline_base_fee_msat": 0,
+            "restored_fee_ppm": 14, "restored_base_fee_msat": 0,
         },
         {
             "id": 8, "state": "active", "channel_id": "2x1x0",
@@ -1245,6 +1308,149 @@ def test_completed_smoke_emits_strict_family_economics(monkeypatch, tmp_path):
         }],
         "blocks": [block],
     })
+
+
+def test_completed_smoke_accepts_multipart_htlcs_at_exact_traffic_volume(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 93)
+    roles = (("cln", "payer"), ("cln", "sink"), ("lnd", "payer"), ("lnd", "sink"))
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "status": "isolated_full_stack_ready",
+        "league": "full_stack",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "lane_map": {
+            identity: {
+                f"{prefix}x1x{index}": {"family": family, "side": side}
+                for index, (family, side) in enumerate(roles)
+            }
+            for identity, prefix in (("identity-a", 1), ("identity-b", 2))
+        },
+    })
+    revenue_policy = tuple((f"1x1x{i}", 0, 150) for i in range(4))
+    clboss_policy = tuple((f"2x1x{i}", 0, 1) for i in range(4))
+    samples = {
+        "revenue": iter((
+            runner.Totals(0, 0, 0, 500_000, revenue_policy),
+            runner.Totals(
+                2, 50_000_000, 7_500, 500_000, revenue_policy,
+                channel_metrics=(
+                    ("1x1x3", 2, 50_000_000, 7_500),
+                ),
+            ),
+        )),
+        "clboss": iter((
+            runner.Totals(0, 0, 0, 500_000, clboss_policy),
+            runner.Totals(0, 0, 0, 500_000, clboss_policy),
+        )),
+    }
+    monkeypatch.setattr(
+        runner, "contender_totals", lambda container: next(samples[container])
+    )
+    monkeypatch.setattr(
+        runner, "run_reconciled_traffic", lambda *_args, **_kwargs: [{
+            "payer": "payer", "sink": "sink", "amount_sats": 50_000,
+            "payment_hash": "hash", "payment": {"success": True},
+        }]
+    )
+
+    block = runner.run_smoke(
+        object(), replica=93, results_dir=tmp_path, rounds=1,
+        amount_sats=50_000, pause_seconds=0,
+        traffic_pattern="forward-pressure", traffic_family="lnd",
+    )
+
+    assert block["safety_violations"] == []
+    assert block["traffic"] == {
+        **block["traffic"],
+        "fallback_settled": 0,
+        "settled_volume_msat": 50_000_000,
+        "contender_volume_msat": 50_000_000,
+        "fallback_volume_msat": 0,
+        "extra_volume_msat": 0,
+        "contender_forward_count": 2,
+        "multipart_forward_splits": 1,
+        "attribution_method": "exact_family_volume",
+    }
+
+
+@pytest.mark.parametrize(
+    ("contender_volume_msat", "traffic_field", "traffic_value", "violation"),
+    (
+        (
+            60_000_000, "extra_volume_msat", 10_000_000,
+            "unattributed_extra_contender_volume",
+        ),
+        (40_000_000, "fallback_volume_msat", 10_000_000, "fallback_settled"),
+    ),
+)
+def test_completed_smoke_rejects_mismatched_contender_volume(
+    monkeypatch, tmp_path, contender_volume_msat, traffic_field, traffic_value,
+    violation,
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 94)
+    roles = (("cln", "payer"), ("cln", "sink"), ("lnd", "payer"), ("lnd", "sink"))
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "status": "isolated_full_stack_ready",
+        "league": "full_stack",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "lane_map": {
+            identity: {
+                f"{prefix}x1x{index}": {"family": family, "side": side}
+                for index, (family, side) in enumerate(roles)
+            }
+            for identity, prefix in (("identity-a", 1), ("identity-b", 2))
+        },
+    })
+    policies = {
+        "revenue": tuple((f"1x1x{i}", 0, 150) for i in range(4)),
+        "clboss": tuple((f"2x1x{i}", 0, 1) for i in range(4)),
+    }
+    samples = {
+        "revenue": iter((
+            runner.Totals(0, 0, 0, 500_000, policies["revenue"]),
+            runner.Totals(
+                2, contender_volume_msat, 8_000, 500_000, policies["revenue"],
+                channel_metrics=(("1x1x3", 2, contender_volume_msat, 8_000),),
+            ),
+        )),
+        "clboss": iter((
+            runner.Totals(0, 0, 0, 500_000, policies["clboss"]),
+            runner.Totals(0, 0, 0, 500_000, policies["clboss"]),
+        )),
+    }
+    monkeypatch.setattr(
+        runner, "contender_totals", lambda container: next(samples[container])
+    )
+    monkeypatch.setattr(
+        runner, "run_reconciled_traffic", lambda *_args, **_kwargs: [{
+            "payer": "payer", "sink": "sink", "amount_sats": 50_000,
+            "payment_hash": "hash", "payment": {"success": True},
+        }]
+    )
+
+    block = runner.run_smoke(
+        object(), replica=94, results_dir=tmp_path, rounds=1,
+        amount_sats=50_000, pause_seconds=0,
+        traffic_pattern="forward-pressure", traffic_family="lnd",
+    )
+
+    assert block["traffic"][traffic_field] == traffic_value
+    assert block["safety_violations"] == [violation]
 
 
 def test_traffic_schedule_interleaves_directions_and_seeds_reserve_once():
@@ -2517,8 +2723,8 @@ def test_competition_image_pins_all_source_revisions():
     runner = load_runner()
     dockerfile = (ROOT / "tools" / "polar-clboss" / "Dockerfile").read_text(encoding="utf-8")
 
-    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:5db4588"
-    assert runner.EXPECTED_REVENUE_REVISION.startswith("5db4588")
+    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:2d64c8f"
+    assert runner.EXPECTED_REVENUE_REVISION.startswith("2d64c8f")
     assert "elementsproject/lightningd:v26.06.6" in dockerfile
     assert "clightning-v26.06.7-Ubuntu-22.04-amd64.tar.xz" in dockerfile
     assert runner.EXPECTED_CLN_ARTIFACT_DIGEST in dockerfile

@@ -30,7 +30,7 @@ from polar_mixed_client_lab import (  # noqa: E402
 
 
 SCHEMA = "polar-clboss-runner-state-v1"
-EXPECTED_REVENUE_REVISION = "5db4588ca2880f8ed9394fe31423a77dbefd4bf7"
+EXPECTED_REVENUE_REVISION = "2d64c8fd6f4c65c8ab1551927416163294396c31"
 IMAGE = f"cl-revenue-ops-polar-clboss:{EXPECTED_REVENUE_REVISION[:7]}"
 EXPECTED_CLN_VERSION = "v26.06.7"
 EXPECTED_CLN_ARTIFACT_DIGEST = (
@@ -1798,7 +1798,7 @@ def start_automatic_acquisition(
     attempts: int = NATIVE_CYCLE_POLL_ATTEMPTS,
     poll_seconds: float = NATIVE_CYCLE_POLL_SECONDS,
 ) -> dict[str, Any]:
-    """Enable the product's default-off acquisition gate and await native admission."""
+    """Capture the product's acquisition gate and await native admission."""
     if attempts <= 0 or poll_seconds < 0:
         raise RunnerError("invalid automatic acquisition polling bounds")
     path = state_path(results_dir, replica)
@@ -1950,9 +1950,17 @@ def refresh_automatic_acquisition_phase(state: dict[str, Any]) -> str | None:
             completed.get("restored_base_fee_msat"),
             "automatic rollover restored base fee",
         )
+        baseline_ppm = nonnegative_int(
+            completed.get("baseline_fee_ppm"),
+            "automatic rollover baseline fee",
+        )
+        baseline_base_msat = nonnegative_int(
+            completed.get("baseline_base_fee_msat"),
+            "automatic rollover baseline base fee",
+        )
         if (
-            restored_lane["fee_ppm"] != restored_ppm
-            or restored_lane["fee_base_msat"] != restored_base_msat
+            restored_ppm != baseline_ppm
+            or restored_base_msat != baseline_base_msat
         ):
             raise RunnerError(
                 "automatic acquisition rollover did not restore its captured lane"
@@ -1963,6 +1971,14 @@ def refresh_automatic_acquisition_phase(state: dict[str, Any]) -> str | None:
         rollovers.append({
             "completed_episode": completed,
             "restored_lane": restored_lane,
+            "restoration_evidence": {
+                "baseline_fee_ppm": baseline_ppm,
+                "baseline_base_fee_msat": baseline_base_msat,
+                "restored_fee_ppm": restored_ppm,
+                "restored_base_fee_msat": restored_base_msat,
+                "current_fee_ppm": restored_lane["fee_ppm"],
+                "current_base_fee_msat": restored_lane["fee_base_msat"],
+            },
             "next_episode_id": next_id,
         })
         automatic.update(episode=live_episode, lane=next_lane)
@@ -3068,28 +3084,58 @@ def run_smoke(
     family_rows = {}
     for family in ("cln", "lnd"):
         family_records = [row for row in records if row.get("family") == family]
+        settled_records = [
+            row for row in family_records
+            if isinstance(row.get("payment"), dict)
+            and row["payment"].get("success") is True
+        ]
+        settled_volume_msat = sum(
+            nonnegative_int(row.get("amount_sats"), "settled traffic amount") * 1000
+            for row in settled_records
+        )
+        contender_volume_msat = sum(
+            family_deltas[name][family]["volume_msat"]
+            for name in controller_containers
+        )
         family_rows[family] = {
             "attempted": len(family_records),
-            "settled": sum(
-                1 for row in family_records
-                if isinstance(row.get("payment"), dict)
-                and row["payment"].get("success") is True
-            ),
+            "settled": len(settled_records),
+            "settled_volume_msat": settled_volume_msat,
+            "contender_volume_msat": contender_volume_msat,
             "contenders": {
                 name: family_deltas[name][family] for name in controller_containers
             },
         }
     settled_count = sum(row["settled"] for row in family_rows.values())
+    settled_volume_msat = sum(
+        row["settled_volume_msat"] for row in family_rows.values()
+    )
     contender_forward_count = sum(
         delta["forward_count"] for delta in contender_deltas.values()
     )
-    fallback_settled = max(0, settled_count - contender_forward_count)
+    contender_volume_msat = sum(
+        row["contender_volume_msat"] for row in family_rows.values()
+    )
+    fallback_volume_msat = sum(
+        max(0, row["settled_volume_msat"] - row["contender_volume_msat"])
+        for row in family_rows.values()
+    )
+    extra_volume_msat = sum(
+        max(0, row["contender_volume_msat"] - row["settled_volume_msat"])
+        for row in family_rows.values()
+    )
+    # A single Lightning payment may settle through multiple HTLCs. Count
+    # equality therefore rejects valid MPP traffic; exact per-family outgoing
+    # volume remains invariant under splitting and still catches fallback or
+    # unrelated contender traffic. The legacy count-shaped field remains a
+    # conservative gate (zero or at least one), not a claimed exact count.
+    fallback_settled = 1 if fallback_volume_msat else 0
     if settled_count != len(records):
         safety_violations.append("unsettled_payments")
     if fallback_settled:
         safety_violations.append("fallback_settled")
-    if contender_forward_count > settled_count:
-        safety_violations.append("unattributed_extra_contender_forwards")
+    if extra_volume_msat:
+        safety_violations.append("unattributed_extra_contender_volume")
     block = {
         "schema": "polar-clboss-smoke-v1",
         "replica": f"replica-{replica}",
@@ -3106,6 +3152,15 @@ def run_smoke(
             "attempted": len(records),
             "settled": settled_count,
             "fallback_settled": fallback_settled,
+            "settled_volume_msat": settled_volume_msat,
+            "contender_volume_msat": contender_volume_msat,
+            "fallback_volume_msat": fallback_volume_msat,
+            "extra_volume_msat": extra_volume_msat,
+            "contender_forward_count": contender_forward_count,
+            "multipart_forward_splits": max(
+                0, contender_forward_count - settled_count
+            ),
+            "attribution_method": "exact_family_volume",
         },
         "families": family_rows,
         "contenders": contender_deltas,
