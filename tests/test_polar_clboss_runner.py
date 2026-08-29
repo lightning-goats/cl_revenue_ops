@@ -1514,6 +1514,124 @@ def test_controlled_depletion_resume_uses_native_cycles_only(monkeypatch, tmp_pa
     )
 
 
+def test_retired_return_paths_archive_for_one_warm_epoch(monkeypatch, tmp_path):
+    runner = load_runner()
+    path = tmp_path / "state.json"
+    old_paths = [
+        {"family": "cln", "short_channel_id": "1x1x0"},
+        {"family": "lnd", "channel_point": "funding:1"},
+    ]
+    state = {
+        "status": "smoke_complete",
+        "events": [],
+        "return_paths": old_paths,
+        "return_path_closes_dispatched": True,
+        "return_paths_retired": {
+            "confirmed_absent": True,
+            "observation_block": "rebalance-1",
+        },
+        "return_path_fixture": {"fee_ppm": 1},
+    }
+    runner.write_json_atomic(path, state)
+    monkeypatch.setattr(runner, "_live_return_paths", lambda _state: {})
+
+    assert runner.prepare_return_path_renewal(path, state) is True
+
+    assert state["return_paths"] == []
+    assert state["return_path_closes_dispatched"] is False
+    assert "return_paths_retired" not in state
+    assert "return_path_fixture" not in state
+    assert state["return_path_history"] == [{
+        "paths": old_paths,
+        "retired": {
+            "confirmed_absent": True,
+            "observation_block": "rebalance-1",
+        },
+        "fixture": {"fee_ppm": 1},
+    }]
+    assert state["events"][-1]["event"] == "return_paths_archived_for_warm_epoch"
+
+
+def test_return_path_renewal_fails_closed_if_retired_path_is_live(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = tmp_path / "state.json"
+    state = {
+        "status": "smoke_complete",
+        "events": [],
+        "return_paths": [{"family": "lnd", "channel_point": "funding:1"}],
+        "return_path_closes_dispatched": True,
+        "return_paths_retired": {"confirmed_absent": True},
+    }
+    monkeypatch.setattr(
+        runner, "_live_return_paths", lambda _state: {"lnd": ["funding:1"]}
+    )
+
+    with pytest.raises(runner.RunnerError, match="still live"):
+        runner.prepare_return_path_renewal(path, state)
+
+    assert state["return_path_closes_dispatched"] is True
+    assert state["return_paths"] == [
+        {"family": "lnd", "channel_point": "funding:1"}
+    ]
+
+
+def test_post_demand_hold_resumes_once_without_forced_cycles(monkeypatch, tmp_path):
+    runner = load_runner()
+    path = tmp_path / "state.json"
+    state = {
+        "events": [{"at": 20, "event": "smoke_complete"}],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "post_rebalance_controllers_held": {
+            "revenue_ops": True,
+            "clboss": True,
+            "forced_cycles": False,
+            "at": 10,
+        },
+    }
+    calls = []
+
+    def rpc(container, method, *args):
+        calls.append((container, method, args))
+        if method == "revenue-status":
+            return {"operator_controls": {"values": {"paused": False}}}
+        if method == "clboss-status":
+            return {"rebalance_mode": {"mode": "xrebalance"}}
+        return {}
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+
+    activation = runner.resume_post_demand_controllers(path, state)
+
+    assert activation["source"] == "post_rebalance_demand"
+    assert activation["forced_cycles"] is False
+    assert state["post_rebalance_controllers_held"]["revenue_ops"] is False
+    assert state["post_rebalance_controllers_held"]["clboss"] is False
+    assert runner.resume_post_demand_controllers(path, state) is None
+    assert all(method != "revenue-rebalance-cycle" for _container, method, _args in calls)
+
+
+def test_post_demand_hold_requires_newer_completed_demand_block(tmp_path):
+    runner = load_runner()
+    state = {
+        "events": [{"at": 9, "event": "smoke_complete"}],
+        "post_rebalance_controllers_held": {
+            "revenue_ops": True,
+            "clboss": True,
+            "forced_cycles": False,
+            "at": 10,
+        },
+    }
+
+    with pytest.raises(runner.RunnerError, match="completed demand block"):
+        runner.resume_post_demand_controllers(tmp_path / "state.json", state)
+
+
 def test_state_round_trip_is_schema_checked(tmp_path):
     runner = load_runner()
     path = tmp_path / "state.json"
@@ -2062,14 +2180,103 @@ def test_competition_image_pins_all_source_revisions():
     runner = load_runner()
     dockerfile = (ROOT / "tools" / "polar-clboss" / "Dockerfile").read_text(encoding="utf-8")
 
-    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:4c26e11"
-    assert runner.EXPECTED_REVENUE_REVISION.startswith("4c26e11")
+    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:f201b22"
+    assert runner.EXPECTED_REVENUE_REVISION.startswith("f201b22")
     assert "elementsproject/lightningd:v26.06.6" in dockerfile
     assert "CLBOSS_COMMIT=8cb4e9215eba58b049375f234f5f073d0c7fc622" in dockerfile
     assert "XREBALANCE_COMMIT=fb70bf13cd9f3f79b14100bfdb8f2966884a4142" in dockerfile
     assert 'test "$(git -C /src/clboss rev-parse HEAD)" = "${CLBOSS_COMMIT}"' in dockerfile
     assert 'test "$(git -C /src/xrebalance rev-parse HEAD)" = "${XREBALANCE_COMMIT}"' in dockerfile
     assert "cargo build --release --locked" in dockerfile
+
+
+def test_equal_targeted_pressure_is_crossed_checkpointed_and_unscored(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = tmp_path / "replica-67" / "state.json"
+    state = {
+        "status": "post_rebalance_ready",
+        "network_id": 4,
+        "post_rebalance_controllers_held": {
+            "revenue_ops": True,
+            "clboss": True,
+            "forced_cycles": False,
+        },
+    }
+    snapshots = iter([
+        {
+            "revenue_ops": {
+                "source": {"short_channel_id": "1x1x0"},
+                "depleted": {"local_balance_ppm": 300_000},
+            },
+            "clboss": {
+                "source": {"short_channel_id": "2x1x0"},
+                "depleted": {"local_balance_ppm": 250_000},
+            },
+        },
+        {
+            "revenue_ops": {
+                "source": {"short_channel_id": "1x1x0"},
+                "depleted": {"local_balance_ppm": 145_000},
+            },
+            "clboss": {
+                "source": {"short_channel_id": "2x1x0"},
+                "depleted": {"local_balance_ppm": 95_000},
+            },
+        },
+    ])
+    calls = []
+    events = []
+    monkeypatch.setattr(runner, "state_path", lambda *_args: path)
+    monkeypatch.setattr(runner, "read_state", lambda _path: state)
+    monkeypatch.setattr(
+        runner, "controlled_depletion_snapshot", lambda *_args, **_kwargs: next(snapshots)
+    )
+    monkeypatch.setattr(
+        runner,
+        "_directed_lnd_fixture_payment",
+        lambda _bridge, **kwargs: calls.append(kwargs) or {"success": True, **kwargs},
+    )
+    monkeypatch.setattr(
+        runner,
+        "_checkpoint",
+        lambda _path, _state, event, **_kwargs: events.append(event),
+    )
+
+    saved = runner.apply_equal_targeted_pressure(
+        object(), replica=67, results_dir=tmp_path
+    )
+
+    assert [call["label"] for call in calls] == [
+        "targeted-revenue_ops", "targeted-clboss",
+        "targeted-revenue_ops", "targeted-clboss",
+        "targeted-revenue_ops", "targeted-clboss",
+        "targeted-revenue_ops", "targeted-clboss",
+    ]
+    assert saved["targeted_pressure"]["competitive_scoring"] is False
+    assert saved["targeted_pressure"]["total_sats_per_controller"] == 155_000
+    assert saved["status"] == "post_rebalance_ready"
+    assert events == [
+        "equal_targeted_pressure_started", "equal_targeted_pressure_complete"
+    ]
+
+
+def test_equal_targeted_pressure_rejects_malformed_hold(monkeypatch, tmp_path):
+    runner = load_runner()
+    monkeypatch.setattr(
+        runner,
+        "read_state",
+        lambda _path: {
+            "status": "post_rebalance_ready",
+            "post_rebalance_controllers_held": {"revenue_ops": True},
+        },
+    )
+
+    with pytest.raises(runner.RunnerError, match="both controllers held"):
+        runner.apply_equal_targeted_pressure(
+            object(), replica=67, results_dir=tmp_path
+        )
 
 
 def test_preflight_rejects_wrong_revision_behind_default_image(monkeypatch):

@@ -159,7 +159,7 @@ cannot schedule work or authorize action.
 | `low_liquidity_threshold` | `0.3` |  |
 | `high_liquidity_threshold` | `0.7` |  |
 | `rebalance_cooldown_hours` | `24` |  |
-| `rebalance_emergency_local_ratio` | `0.1` |  |
+| `rebalance_emergency_local_ratio` | `0.2` |  |
 | `rebalance_drift_override_ratio` | `0.3` |  |
 | `rebalance_hold_margin` | `0.0` |  |
 | `pair_fee_cap_ppm` | `1000` |  |

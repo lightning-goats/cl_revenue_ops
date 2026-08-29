@@ -30,7 +30,7 @@ from polar_mixed_client_lab import (  # noqa: E402
 
 
 SCHEMA = "polar-clboss-runner-state-v1"
-EXPECTED_REVENUE_REVISION = "4c26e1153c2c619fa55a490276c5973742522986"
+EXPECTED_REVENUE_REVISION = "f201b2241a7be5c51c9e91c8388c15ebf8340e00"
 IMAGE = f"cl-revenue-ops-polar-clboss:{EXPECTED_REVENUE_REVISION[:7]}"
 NETWORK_ID = 4
 DOCKER_NETWORK = "polar-network-4_default"
@@ -849,6 +849,92 @@ def prepare_controlled_depletion(
     return state
 
 
+def apply_equal_targeted_pressure(
+    bridge: PolarMcp,
+    *,
+    replica: int,
+    results_dir: Path,
+    amounts_sats: Sequence[int] = REALISTIC_TRAFFIC_AMOUNTS_SATS,
+) -> dict[str, Any]:
+    """Apply identical, exact-path LND demand to both held controllers.
+
+    This is a functional replenishment lane, not competitive route-share
+    scoring.  It separates controller response from payer path selection after
+    a scored block has established live profitability and a fresh cooldown.
+    """
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if state.get("status") != "post_rebalance_ready":
+        raise RunnerError(
+            "equal targeted pressure requires retired return paths after an observation"
+        )
+    held = state.get("post_rebalance_controllers_held")
+    if not isinstance(held, dict) or any(
+        held.get(controller) is not True for controller in ("revenue_ops", "clboss")
+    ):
+        raise RunnerError("equal targeted pressure requires both controllers held")
+    if held.get("forced_cycles") is not False:
+        raise RunnerError("equal targeted pressure rejects forced-cycle lineage")
+    if state.get("targeted_pressure") is not None:
+        raise RunnerError("equal targeted pressure already completed for this epoch")
+
+    amounts = tuple(nonnegative_int(value, "targeted pressure amount") for value in amounts_sats)
+    if not amounts or any(value <= 0 for value in amounts):
+        raise RunnerError("targeted pressure amounts must be positive")
+    total_sats = sum(amounts)
+    before = controlled_depletion_snapshot(state, family="lnd")
+    state["status"] = "targeted_pressure_running"
+    _checkpoint(
+        path,
+        state,
+        "equal_targeted_pressure_started",
+        amounts_sats=list(amounts),
+    )
+
+    payments = []
+    for amount_sats in amounts:
+        for controller in ("revenue_ops", "clboss"):
+            payments.append(
+                _directed_lnd_fixture_payment(
+                    bridge,
+                    network_id=int(state["network_id"]),
+                    target_scid=before[controller]["source"]["short_channel_id"],
+                    amount_sats=amount_sats,
+                    label=f"targeted-{controller}",
+                )
+            )
+    after = controlled_depletion_snapshot(state, family="lnd")
+    minimum_drop_ppm = total_sats * 900_000 // CHANNEL_CAPACITY_SATS
+    for controller in ("revenue_ops", "clboss"):
+        drop_ppm = (
+            before[controller]["depleted"]["local_balance_ppm"]
+            - after[controller]["depleted"]["local_balance_ppm"]
+        )
+        if drop_ppm < minimum_drop_ppm:
+            raise RunnerError(
+                f"equal targeted pressure did not deplete {controller}: {drop_ppm} ppm"
+            )
+    state["targeted_pressure"] = {
+        "family": "lnd",
+        "competitive_scoring": False,
+        "amounts_sats_per_controller": list(amounts),
+        "total_sats_per_controller": total_sats,
+        "controllers_held": True,
+        "forced_cycles": False,
+        "before": before,
+        "after": after,
+        "payments": payments,
+    }
+    state["status"] = "post_rebalance_ready"
+    _checkpoint(
+        path,
+        state,
+        "equal_targeted_pressure_complete",
+        result=state["targeted_pressure"],
+    )
+    return state
+
+
 def provision_return_paths(
     bridge: PolarMcp,
     *,
@@ -865,14 +951,20 @@ def provision_return_paths(
     """
     path = state_path(results_dir, replica)
     state = read_state(path)
+    targeted_ready = (
+        state.get("status") == "post_rebalance_ready"
+        and isinstance(state.get("targeted_pressure"), dict)
+    )
     if (
         state.get("status") not in {"smoke_complete", "controlled_depletion_ready"}
-        or state.get("league") != "full_stack"
-    ):
+        and not targeted_ready
+    ) or state.get("league") != "full_stack":
         raise RunnerError(
             "return paths require a completed full-stack traffic block "
             "or controlled depletion"
         )
+    if state.get("return_paths"):
+        prepare_return_path_renewal(path, state)
     if state.get("return_paths"):
         raise RunnerError("return paths are already checkpointed")
     for key in ("acquisition_treatment", "automatic_acquisition", "retention_treatment"):
@@ -972,6 +1064,48 @@ def provision_return_paths(
     state["status"] = "return_paths_ready"
     _checkpoint(path, state, "return_paths_ready", paths=state["return_paths"])
     return state
+
+
+def prepare_return_path_renewal(path: Path, state: dict[str, Any]) -> bool:
+    """Archive one confirmed-dead fixture pair before a warm controller epoch."""
+    paths = state.get("return_paths")
+    if not isinstance(paths, list) or not paths:
+        return False
+    retired = state.get("return_paths_retired")
+    renewal_status = state.get("status") == "smoke_complete" or (
+        state.get("status") == "post_rebalance_ready"
+        and isinstance(state.get("targeted_pressure"), dict)
+    )
+    if (
+        not renewal_status
+        or not isinstance(retired, dict)
+        or retired.get("confirmed_absent") is not True
+    ):
+        return False
+    remaining = _live_return_paths(state)
+    if remaining:
+        raise RunnerError(
+            f"return-path renewal found retired fixture still live: {remaining}"
+        )
+    history = state.setdefault("return_path_history", [])
+    if not isinstance(history, list):
+        raise RunnerError("return-path history is malformed")
+    history.append({
+        "paths": paths,
+        "retired": retired,
+        "fixture": state.get("return_path_fixture"),
+    })
+    state["return_paths"] = []
+    state["return_path_closes_dispatched"] = False
+    state.pop("return_paths_retired", None)
+    state.pop("return_path_fixture", None)
+    _checkpoint(
+        path,
+        state,
+        "return_paths_archived_for_warm_epoch",
+        completed_epoch=len(history),
+    )
+    return True
 
 
 def active_channels(container: str) -> list[dict[str, Any]]:
@@ -2846,6 +2980,81 @@ def resume_controlled_depletion_controllers(
     return activation
 
 
+def resume_post_demand_controllers(
+    path: Path, state: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Release a scored-demand hold exactly once for the next native epoch."""
+    held = state.get("post_rebalance_controllers_held")
+    if not isinstance(held, dict) or any(
+        held.get(controller) is not True for controller in ("revenue_ops", "clboss")
+    ):
+        return None
+    if held.get("forced_cycles") is not False:
+        raise RunnerError("warm observation hold has invalid forced-cycle lineage")
+    held_at = nonnegative_int(held.get("at"), "warm observation hold time")
+    demand_events = [
+        event
+        for event in state.get("events", [])
+        if isinstance(event, dict) and event.get("event") in {
+            "smoke_complete", "equal_targeted_pressure_complete"
+        }
+    ]
+    demand_times = [
+        nonnegative_int(event.get("at"), "warm observation demand time")
+        for event in demand_events
+    ]
+    if not demand_times or max(demand_times) < held_at:
+        raise RunnerError("warm observation hold lacks a completed demand block")
+    latest_demand = max(demand_events, key=lambda event: int(event.get("at") or 0))
+    activation_source = (
+        "equal_targeted_pressure"
+        if latest_demand.get("event") == "equal_targeted_pressure_complete"
+        else "post_rebalance_demand"
+    )
+    assignment = state["assignment"]
+    contenders = state["contenders"]
+    revenue_container = contenders[assignment["revenue_ops"]]["container"]
+    clboss_container = contenders[assignment["clboss"]]["container"]
+    cln_rpc(revenue_container, "revenue-config", "set", "paused", "false")
+    controls = (
+        cln_rpc(revenue_container, "revenue-status")
+        .get("operator_controls", {})
+        .get("values", {})
+    )
+    if controls.get("paused") is not False:
+        raise RunnerError("Revenue Ops did not resume for warm observation")
+    cln_rpc(
+        clboss_container,
+        "setconfig",
+        "clboss-xrebalance-per-hour",
+        str(CLBOSS_REBALANCES_PER_HOUR),
+    )
+    cln_rpc(clboss_container, "setconfig", "clboss-rebalance-mode", "xrebalance")
+    status = cln_rpc(clboss_container, "clboss-status")
+    if status.get("rebalance_mode", {}).get("mode") != "xrebalance":
+        raise RunnerError("CLBOSS did not resume for warm observation")
+    resumed_at = int(time.time())
+    held.update({
+        "revenue_ops": False,
+        "clboss": False,
+        "resumed_at": resumed_at,
+    })
+    activation = {
+        "revenue_ops": "native_unpaused",
+        "clboss": "native_xrebalance_unbounded",
+        "forced_cycles": False,
+        "source": activation_source,
+        "at": resumed_at,
+    }
+    _checkpoint(
+        path,
+        state,
+        "post_demand_controllers_resumed_for_warm_epoch",
+        activation=activation,
+    )
+    return activation
+
+
 def observe_rebalances(
     *, replica: int, results_dir: Path, observe_seconds: float
 ) -> dict[str, Any]:
@@ -2874,6 +3083,8 @@ def observe_rebalances(
     }
     return_before = return_path_snapshot(state)
     activation = resume_controlled_depletion_controllers(path, state)
+    if activation is None:
+        activation = resume_post_demand_controllers(path, state)
     diagnostics_before = {
         "revenue_ops": cln_rpc(
             containers["revenue_ops"], "revenue-rebalance-debug", "summary_only=true"
@@ -2932,6 +3143,7 @@ def observe_rebalances(
         "duration_seconds": max(0.0, time.time() - started),
         "fixture": state.get("return_path_fixture"),
         "controlled_depletion": state.get("controlled_depletion"),
+        "targeted_pressure": state.get("targeted_pressure"),
         "controller_activation": activation,
         "return_paths": {"before": return_before, "after": return_after},
         "controllers": controller_rows,
@@ -3261,7 +3473,7 @@ def build_parser() -> argparse.ArgumentParser:
             "preflight", "setup", "isolate", "retune", "full-stack",
             "acquire", "restore-acquire", "auto-acquire", "retain",
             "restore-auto", "accelerate", "smoke", "return-path", "observe-rebalance",
-            "retire-return-paths", "deplete", "status", "cleanup",
+            "retire-return-paths", "deplete", "target-pressure", "status", "cleanup",
         ),
     )
     parser.add_argument("--network-id", type=positive_int, default=NETWORK_ID)
@@ -3335,7 +3547,7 @@ def main() -> int:
             "setup", "isolate", "retune", "full-stack", "acquire",
             "restore-acquire", "auto-acquire", "retain", "restore-auto", "accelerate",
             "smoke", "return-path", "observe-rebalance", "retire-return-paths",
-            "deplete", "cleanup"
+            "deplete", "target-pressure", "cleanup"
         } and not args.apply:
             raise RunnerError(f"{args.command} mutates the fake-sat lab; pass --apply")
         if args.command == "setup":
@@ -3419,6 +3631,12 @@ def main() -> int:
                 amount_sats=args.depletion_sats,
                 fixture_fee_ppm=args.fixture_fee_ppm,
                 family=args.depletion_family,
+            )
+        elif args.command == "target-pressure":
+            result = apply_equal_targeted_pressure(
+                bridge,
+                replica=args.replica,
+                results_dir=args.results_dir,
             )
         elif args.command == "observe-rebalance":
             result = observe_rebalances(

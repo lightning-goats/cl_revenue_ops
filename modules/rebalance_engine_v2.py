@@ -1204,7 +1204,9 @@ class RebalanceEngine:
                 }
             return evidence
 
-        # Normalize channel inputs
+        # Normalize channel inputs. Capture wall time once for both per-channel
+        # settlement grace and the later flow-fact snapshot.
+        now_ts = int(time.time())
         normalized = []
         for ch in channels_raw:
             state = ch.get("state", "")
@@ -1322,7 +1324,7 @@ class RebalanceEngine:
             emergency_override_allowed = True
             if cooldown and last_ts is not None:
                 emergency_override_allowed = (
-                    int(time.time()) - int(last_ts)
+                    now_ts - int(last_ts)
                 ) >= 60
 
             normalized.append({
@@ -1338,7 +1340,6 @@ class RebalanceEngine:
                 **profitability_evidence,
             })
 
-        now_ts = int(time.time())
         flow_facts = self._build_flow_facts_map(normalized, cfg, now_ts)
 
         # The profitability analyzer intentionally caches full-node analysis
