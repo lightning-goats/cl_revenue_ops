@@ -2813,6 +2813,73 @@ class FeeController:
     # and then paid rebalance costs to refill).
     UNDERCUT_MIN_OUTBOUND_RATIO = 0.35
 
+    # Tournament-backed conversion retention (2026-08-28): a lane that has
+    # already earned at a cheap-quartile quote should not immediately surrender
+    # all route share by walking back above the cheapest credible market band.
+    # The edge is deliberately corridor-relative, not a global fee-floor cut.
+    # It is applied only with settled local revenue, positive canonical ROI,
+    # usable liquidity above the configured emergency-refill boundary, and a
+    # non-exploring posterior. The composed floor still wins downstream.
+    PROFITABLE_CONVERSION_EDGE_RATIO = 0.10
+
+    @classmethod
+    def _profitable_conversion_ceiling(
+        cls,
+        *,
+        current_fee_ppm: Any,
+        cheap_quartile_ppm: Any,
+        floor_ppm: Any,
+        outbound_ratio: Any,
+        emergency_outbound_ratio: Any,
+        forward_count: Any,
+        revenue_rate: Any,
+        profitability_positive: bool,
+        posterior_exploring: bool,
+    ) -> Optional[int]:
+        """Return a bounded earned-market ceiling, or ``None`` fail-closed.
+
+        This is retention, not blind acquisition: the current quote must
+        already be at or below the corridor's cheap quartile and must have
+        produced settled revenue. A 10% edge is large enough to survive the
+        controller's normal blend/gossip hysteresis over successive cycles,
+        while the ordinary floor stack protects chain and rebalance costs.
+        """
+        if profitability_positive is not True or posterior_exploring is True:
+            return None
+        try:
+            current = int(current_fee_ppm)
+            cheap_quartile = int(cheap_quartile_ppm)
+            floor = int(floor_ppm)
+            local_ratio = float(outbound_ratio)
+            emergency_ratio = float(emergency_outbound_ratio)
+            forwards = int(forward_count)
+            earned_rate = float(revenue_rate)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not all(math.isfinite(value) for value in (
+            local_ratio, emergency_ratio, earned_rate
+        )):
+            return None
+        if (
+            current <= floor
+            or cheap_quartile <= floor
+            or current > cheap_quartile
+            or forwards <= 0
+            or earned_rate <= 0.0
+            or emergency_ratio < 0.0
+            or emergency_ratio > 1.0
+            or local_ratio < emergency_ratio
+        ):
+            return None
+        edge_ppm = max(
+            1,
+            int(math.ceil(cheap_quartile * cls.PROFITABLE_CONVERSION_EDGE_RATIO)),
+        )
+        corridor_ceiling = max(floor, cheap_quartile - edge_ppm)
+        # Never cut a quote that already has the requested edge. Holding the
+        # locally proven price is sufficient and avoids a ratchet to zero.
+        return min(current, corridor_ceiling)
+
     # E-2 (2026-07 econ audit): "saturated" balance-class boundary. Single
     # source of truth shared by the DTS context bucket
     # (_get_context_with_values) and the class-aware min-fee floor
@@ -6438,6 +6505,8 @@ class FeeController:
         zero_flow_guard_target_ppm = None
         zero_revenue_streak = None
         supported_cap_ppm = None
+        competitive_cheap_quartile_ppm = None
+        profitable_conversion_ceiling_ppm = None
         upward_probe_pre_cap_ppm = None  # L1: set when a probe stretch is granted
         bound_reason = "none"
         delta_cap_reason = "none"
@@ -6751,15 +6820,22 @@ class FeeController:
         
         # Expose marginal ROI in logs when profitability data is available.
         marginal_roi_info = "unknown"
+        profitability_positive = False
         if self.profitability:
-            prof_data = self.profitability.get_profitability(channel_id)
-            record_effective_evidence_result(
-                "marginal_roi_percent",
-                [channel_id],
-                getattr(prof_data, "marginal_roi_percent", None),
-            )
-            if prof_data:
-                marginal_roi_info = f"marginal_roi={prof_data.marginal_roi_percent:.1f}%"
+            try:
+                prof_data = self.profitability.get_profitability(channel_id)
+                roi_value = getattr(prof_data, "marginal_roi_percent", None)
+                record_effective_evidence_result(
+                    "marginal_roi_percent", [channel_id], roi_value,
+                )
+                roi_float = float(roi_value)
+                if math.isfinite(roi_float):
+                    profitability_positive = roi_float > 0.0
+                    marginal_roi_info = f"marginal_roi={roi_float:.1f}%"
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                # Profitability is a gate for the earned conversion edge. Bad
+                # or absent evidence must leave ordinary pricing unchanged.
+                profitability_positive = False
         
         # Calculate Floor and Ceiling
         # E-2: the config min-fee term is class-aware — saturated/source
@@ -7701,6 +7777,50 @@ class FeeController:
                     )
                     post_pid_target_ppm = adjusted
 
+            # Profitable conversion retention. Unlike the retired market
+            # boundary, gossip cannot cap an unproven lane: this path requires
+            # settled local revenue at a quote already in the cheap quartile,
+            # positive canonical ROI, and liquidity above the emergency-refill
+            # boundary. It may only pull down; the full floor stack below wins.
+            mode = getattr(cfg, 'market_fee_mode', 'undercut') if cfg else 'undercut'
+            if (
+                neighbor_market_usable
+                and mode in ('undercut', 'competition_aware')
+                and not median_pull_exploring
+            ):
+                competitive_cheap_quartile_ppm = self._get_neighbor_fee_percentile(
+                    peer_id, 0.25, cfg=cfg
+                )
+                profitable_conversion_ceiling_ppm = (
+                    self._profitable_conversion_ceiling(
+                        current_fee_ppm=current_fee_ppm,
+                        cheap_quartile_ppm=competitive_cheap_quartile_ppm,
+                        floor_ppm=floor_ppm,
+                        outbound_ratio=outbound_ratio,
+                        emergency_outbound_ratio=getattr(
+                            cfg, 'rebalance_emergency_local_ratio', 0.20
+                        ),
+                        forward_count=forward_count,
+                        revenue_rate=current_revenue_rate,
+                        profitability_positive=profitability_positive,
+                        posterior_exploring=bool(median_pull_exploring),
+                    )
+                )
+                if (
+                    profitable_conversion_ceiling_ppm is not None
+                    and post_pid_target_ppm > profitable_conversion_ceiling_ppm
+                ):
+                    pre = post_pid_target_ppm
+                    post_pid_target_ppm = profitable_conversion_ceiling_ppm
+                    self.plugin.log(
+                        f"FEE: {channel_id[:16]}... profitable conversion edge: "
+                        f"{pre}->{post_pid_target_ppm}ppm "
+                        f"(current={current_fee_ppm}, "
+                        f"p25={competitive_cheap_quartile_ppm}, "
+                        f"floor={floor_ppm}, revenue={current_revenue_rate:.2f}sats/hr)",
+                        level='debug'
+                    )
+
             # Sparse channel learning: feed neighbor median as weak DTS
             # observation so the posterior tightens even without forwards.
             # (Deliberately OUTSIDE the L5 mode/exploring gate above: its own
@@ -7774,7 +7894,11 @@ class FeeController:
                     # "cheaper than cheapest" (brittle, almost-never-fires)
                     # to "cheaper than p25" (robust, fires when we have
                     # real competitive margin).
-                    preserve_threshold = self._get_neighbor_fee_percentile(peer_id, 0.25, cfg=cfg)
+                    preserve_threshold = competitive_cheap_quartile_ppm
+                    if preserve_threshold is None:
+                        preserve_threshold = self._get_neighbor_fee_percentile(
+                            peer_id, 0.25, cfg=cfg
+                        )
                     undercut_target = int(neighbor_median * (1.0 - undercut_pct))
                     # E-4.8: composed gate, strict '>' (see helper docstring).
                     exploring = (
@@ -8341,6 +8465,8 @@ class FeeController:
         target_summary = (
             f"targets=dts:{raw_dts_target_ppm}, post_pid:{post_pid_target_ppm}, "
             f"bounded:{bounded_target_ppm}, blended:{blended_target_ppm}, applied:{applied_target_ppm}, "
+            f"conversion_p25:{competitive_cheap_quartile_ppm}, "
+            f"conversion_ceiling:{profitable_conversion_ceiling_ppm}, "
             f"blend:{target_blend_ratio:.2f}, bound:{bound_reason}, cap:{delta_cap_reason}({delta_cap_ppm}ppm), "
             f"wake:{wake_reason}, sparse:{sparse_data_conservative}, exploration:{exploration_mode}, "
             f"zero_flow_guard:{zero_flow_guard_reason or 'none'}"
@@ -8619,6 +8745,8 @@ class FeeController:
                     "zero_flow_guard_target_ppm": zero_flow_guard_target_ppm,
                     "zero_revenue_streak": zero_revenue_streak,
                     "supported_fee_ceiling_ppm": supported_cap_ppm,
+                    "competitive_cheap_quartile_ppm": competitive_cheap_quartile_ppm,
+                    "profitable_conversion_ceiling_ppm": profitable_conversion_ceiling_ppm,
                     "bounded_target_ppm": bounded_target_ppm,
                     "blended_target_ppm": blended_target_ppm if blended_target_ppm is not None else bounded_target_ppm,
                     "applied_target_ppm": applied_target_ppm if applied_target_ppm is not None else new_fee_ppm,

@@ -728,6 +728,128 @@ class TestMedianPullModeGating:
         )
 
 
+class TestProfitableConversionRetention:
+    """Tournament regression: keep an earned corridor edge without a low floor."""
+
+    def test_helper_targets_ten_percent_below_cheap_quartile(self):
+        target = FeeController._profitable_conversion_ceiling(
+            current_fee_ppm=120,
+            cheap_quartile_ppm=120,
+            floor_ppm=50,
+            outbound_ratio=0.24,
+            emergency_outbound_ratio=0.20,
+            forward_count=3,
+            revenue_rate=3375.0,
+            profitability_positive=True,
+            posterior_exploring=False,
+        )
+        assert target == 108
+
+    def test_helper_holds_quote_that_already_has_edge(self):
+        target = FeeController._profitable_conversion_ceiling(
+            current_fee_ppm=100,
+            cheap_quartile_ppm=120,
+            floor_ppm=50,
+            outbound_ratio=0.30,
+            emergency_outbound_ratio=0.20,
+            forward_count=4,
+            revenue_rate=10.0,
+            profitability_positive=True,
+            posterior_exploring=False,
+        )
+        assert target == 100
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"cheap_quartile_ppm": None},
+            {"cheap_quartile_ppm": "malformed"},
+            {"outbound_ratio": float("nan")},
+            {"outbound_ratio": 0.19},
+            {"emergency_outbound_ratio": "malformed"},
+            {"forward_count": 0},
+            {"revenue_rate": 0.0},
+            {"profitability_positive": False},
+            {"posterior_exploring": True},
+            {"current_fee_ppm": 121},
+        ],
+    )
+    def test_helper_fails_closed_without_complete_local_evidence(self, override):
+        evidence = {
+            "current_fee_ppm": 120,
+            "cheap_quartile_ppm": 120,
+            "floor_ppm": 50,
+            "outbound_ratio": 0.24,
+            "emergency_outbound_ratio": 0.20,
+            "forward_count": 3,
+            "revenue_rate": 100.0,
+            "profitability_positive": True,
+            "posterior_exploring": False,
+        }
+        evidence.update(override)
+        assert FeeController._profitable_conversion_ceiling(**evidence) is None
+
+    def test_pipeline_converges_below_competitor_without_lowering_floor(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(
+            mock_plugin,
+            mock_database,
+            min_fee_ppm=50,
+            min_fee_ppm_saturated=50,
+            market_fee_mode="undercut",
+            rebalance_emergency_local_ratio=0.20,
+        )
+        row = dict(mock_database.get_fee_strategy_state.return_value)
+        row.update({
+            "last_fee_ppm": 120,
+            "last_broadcast_fee_ppm": 120,
+            "last_update": int(time.time()) - 7200,
+            "stable_cycles": 0,
+        })
+        mock_database.get_fee_strategy_state.return_value = row
+        mock_database.get_volume_since.return_value = 50_000
+        mock_database.get_forward_count_since.return_value = 3
+        fc.profitability = MagicMock()
+        fc.profitability.get_profitability.return_value = MagicMock(
+            marginal_roi_percent=100.0
+        )
+        fc._calculate_floor = lambda *a, **k: 50
+        fc._get_rebalance_cost_floor = lambda *a, **k: None
+        fc._get_channel_rebalance_cost_ppm = lambda *a, **k: 0
+        fc._get_neighbor_fee_median = lambda *a, **k: 150
+        fc._get_neighbor_fee_percentile = lambda *a, **k: 120
+        fc._get_competitive_undercut_pct = lambda *a, **k: 0.10
+
+        chain = {"fee": 120}
+        broadcasts = _stub_broadcasts(fc, chain)
+        ts_state = _prepare_dts_stubs(
+            fc, chain_fee=120, sampled_fee=200, posterior_std=20.0
+        )
+        ts_state.thompson.supported_fee_ceiling = lambda **k: None
+        result = None
+        for _ in range(10):
+            _open_window(fc)
+            info = _channel_info(chain["fee"], capacity=1_000_000)
+            info["spendable_msat"] = "240000000msat"
+            result = fc._adjust_channel_fee(
+                CHANNEL_ID,
+                PEER_ID,
+                {"state": "source", "forward_count": 3},
+                info,
+                cfg=cfg,
+            )
+            if result is not None:
+                break
+
+        assert broadcasts, "earned conversion target never crossed normal gossip gate"
+        assert result is not None
+        assert 50 <= result.new_fee_ppm < 120
+        assert result.algorithm_values["profitable_conversion_ceiling_ppm"] == 108
+        assert result.algorithm_values["competitive_cheap_quartile_ppm"] == 120
+        assert result.algorithm_values["floor_ppm"] >= 50
+
+
 class TestPolicyFeeMultiplierBounds:
     """Audit M-3b: PeerPolicy fee_multiplier_min/max were settable via RPC,
     documented ('Dynamic fee floor/ceiling multiplier, uses fee_ppm_target
