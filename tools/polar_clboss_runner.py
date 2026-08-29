@@ -3957,7 +3957,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--depletion-side", choices=("payer", "sink"), default="sink",
         help=(
-            "contender lane role to leave below 30% local; payer-side depletion "
+            "contender lane role to leave below 30%% local; payer-side depletion "
             "also adds equal reverse earning traffic before controller release"
         ),
     )

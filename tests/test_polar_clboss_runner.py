@@ -1933,6 +1933,17 @@ def test_controlled_payer_depletion_adds_equal_reverse_earning_traffic(
     assert fixture["controllers_held"] is True
 
 
+def test_runner_parser_accepts_payer_depletion_side():
+    runner = load_runner()
+
+    args = runner.build_parser().parse_args([
+        "--replica", "96", "deplete",
+        "--depletion-side", "payer",
+    ])
+
+    assert args.depletion_side == "payer"
+
+
 def test_directed_lnd_fixture_payment_pins_first_and_last_hop(monkeypatch):
     runner = load_runner()
     monkeypatch.setattr(runner, "_live_lnd_channels", lambda _container: [{
