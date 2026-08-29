@@ -1,5 +1,22 @@
 ARG CLN_IMAGE=elementsproject/lightningd:v26.06.6@sha256:094be3630f865c795649d6063a8796afa0f78e82a0c311bb34f2b0bd570c819a
 
+# The official v26.06.7 release warns that its initially published Docker
+# image reports the new version but does not contain the security fixes.  Use
+# the signed Ubuntu 22.04 amd64 release tarball instead, checksum-pinned to the
+# maintainer-signed SHA256SUMS-v26.06.7 manifest, and overlay it on the known
+# v26.06.6 filesystem base below.
+FROM debian:bookworm AS cln-release
+ADD --checksum=sha256:53ddf124fe7058b6a2fc059d104976cc54ba5be21dc55b295cd82d01cabeb39c \
+    https://github.com/ElementsProject/lightning/releases/download/v26.06.7/clightning-v26.06.7-Ubuntu-22.04-amd64.tar.xz \
+    /tmp/clightning-v26.06.7.tar.xz
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && test "$(dpkg --print-architecture)" = "amd64" \
+    && mkdir /release \
+    && tar -xJf /tmp/clightning-v26.06.7.tar.xz \
+        -C /release --strip-components=2
+
 FROM debian:bookworm AS clboss-builder
 ARG CLBOSS_COMMIT=8cb4e9215eba58b049375f234f5f073d0c7fc622
 RUN apt-get update \
@@ -44,6 +61,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates dnsutils libcurl4 libev4 libsqlite3-0 libunwind8 python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=cln-release /release/ /usr/local/
+RUN test "$(lightningd --version)" = "v26.06.7" \
+    && test "$(lightning-cli --version)" = "v26.06.7"
 COPY --from=clboss-builder /src/clboss/clboss /usr/local/libexec/clboss
 COPY --from=xrebalance-builder /src/xrebalance/target/release/xrebalance /usr/local/libexec/xrebalance
 COPY --from=revenue-builder /src/revenue /opt/cl_revenue_ops
@@ -61,6 +81,10 @@ RUN python3 -m venv /opt/cl_revenue_ops/.venv \
     && rm -rf /opt/cl_revenue_ops/wheels
 LABEL org.opencontainers.image.title="Polar CLBOSS competition contender"
 LABEL org.opencontainers.image.description="Equal CLN runtime containing pinned cl_revenue_ops, CLBOSS, and xrebalance contenders"
+LABEL org.opencontainers.image.version.cln="v26.06.7"
+LABEL org.opencontainers.image.source.cln="https://github.com/ElementsProject/lightning/releases/download/v26.06.7/clightning-v26.06.7-Ubuntu-22.04-amd64.tar.xz"
+LABEL org.opencontainers.image.digest.cln="sha256:53ddf124fe7058b6a2fc059d104976cc54ba5be21dc55b295cd82d01cabeb39c"
+LABEL org.opencontainers.image.base.cln="elementsproject/lightningd:v26.06.6@sha256:094be3630f865c795649d6063a8796afa0f78e82a0c311bb34f2b0bd570c819a"
 LABEL org.opencontainers.image.revision.revenue_ops="${REVENUE_COMMIT}"
 LABEL org.opencontainers.image.revision.clboss="${CLBOSS_COMMIT}"
 LABEL org.opencontainers.image.revision.xrebalance="${XREBALANCE_COMMIT}"

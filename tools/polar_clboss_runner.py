@@ -30,8 +30,12 @@ from polar_mixed_client_lab import (  # noqa: E402
 
 
 SCHEMA = "polar-clboss-runner-state-v1"
-EXPECTED_REVENUE_REVISION = "fdbecc4f7dd83c7c0c4bcce8d5356ed2bebbd6d8"
+EXPECTED_REVENUE_REVISION = "a456e3dda528f2b92bd75314113e9860064cdc99"
 IMAGE = f"cl-revenue-ops-polar-clboss:{EXPECTED_REVENUE_REVISION[:7]}"
+EXPECTED_CLN_VERSION = "v26.06.7"
+EXPECTED_CLN_ARTIFACT_DIGEST = (
+    "sha256:53ddf124fe7058b6a2fc059d104976cc54ba5be21dc55b295cd82d01cabeb39c"
+)
 NETWORK_ID = 4
 DOCKER_NETWORK = "polar-network-4_default"
 BACKEND = "polar-n4-backend1"
@@ -290,6 +294,19 @@ def preflight(bridge: PolarMcp, network_id: int, image: str) -> dict[str, Any]:
             "default competition image has unexpected revenue_ops revision: "
             f"{revenue_revision}"
         )
+    if image == IMAGE:
+        cln_version = image_labels.get("org.opencontainers.image.version.cln")
+        if cln_version != EXPECTED_CLN_VERSION:
+            raise RunnerError(
+                "default competition image lacks verified CLN runtime version: "
+                f"{cln_version!r}"
+            )
+        cln_digest = image_labels.get("org.opencontainers.image.digest.cln")
+        if cln_digest != EXPECTED_CLN_ARTIFACT_DIGEST:
+            raise RunnerError(
+                "default competition image has unexpected CLN artifact digest: "
+                f"{cln_digest!r}"
+            )
     return {
         "polar_health": health,
         "network_id": network_id,

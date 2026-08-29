@@ -26,7 +26,10 @@ SCHEMA_SCORE = "polar-clboss-competition-score-v1"
 CONTROLLERS = ("revenue_ops", "clboss")
 LEAGUES = ("fee_only", "full_stack")
 CLIENT_FAMILIES = ("cln", "lnd")
-CLN_IMAGE = "elementsproject/lightningd:v26.06.6"
+CLN_RUNTIME = (
+    "v26.06.7 official Ubuntu-22.04-amd64 tarball "
+    "sha256:53ddf124fe7058b6a2fc059d104976cc54ba5be21dc55b295cd82d01cabeb39c"
+)
 CLBOSS_VERSION = "v0.17.0-rc3"
 CLBOSS_COMMIT = "8cb4e9215eba58b049375f234f5f073d0c7fc622"
 XREBALANCE_VERSION = "v0.4.6"
@@ -80,7 +83,7 @@ def build_plan(network_id: int, revenue_commit: str) -> dict[str, Any]:
         "network_id": network_id,
         "reuse_running_polar_window": True,
         "versions": {
-            "cln_image_both_contenders": CLN_IMAGE,
+            "cln_image_both_contenders": CLN_RUNTIME,
             "revenue_ops_commit": revenue_commit,
             "clboss": {"version": CLBOSS_VERSION, "commit": CLBOSS_COMMIT},
             "xrebalance": {"version": XREBALANCE_VERSION, "commit": XREBALANCE_COMMIT},
@@ -108,10 +111,7 @@ def build_plan(network_id: int, revenue_commit: str) -> dict[str, Any]:
             "full_stack": {
                 "spend_cap_sats_per_replica": 1_000,
                 "revenue_ops": "daily_budget_sats=1000 with native rebalance timer",
-                "clboss": (
-                    "clboss-rebalance-mode=xrebalance, gain=1, grant=0, "
-                    "route-cost-floor=auto; monitor actual cost and disable at cap"
-                ),
+                "clboss": "clboss-rebalance-mode=xrebalance, native and uncapped",
             },
             "clboss_safety": [
                 "clboss-auto-close=false",

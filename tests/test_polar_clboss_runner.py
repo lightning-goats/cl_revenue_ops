@@ -2420,9 +2420,12 @@ def test_competition_image_pins_all_source_revisions():
     runner = load_runner()
     dockerfile = (ROOT / "tools" / "polar-clboss" / "Dockerfile").read_text(encoding="utf-8")
 
-    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:fdbecc4"
-    assert runner.EXPECTED_REVENUE_REVISION.startswith("fdbecc4")
+    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:a456e3d"
+    assert runner.EXPECTED_REVENUE_REVISION.startswith("a456e3d")
     assert "elementsproject/lightningd:v26.06.6" in dockerfile
+    assert "clightning-v26.06.7-Ubuntu-22.04-amd64.tar.xz" in dockerfile
+    assert runner.EXPECTED_CLN_ARTIFACT_DIGEST in dockerfile
+    assert 'test "$(lightningd --version)" = "v26.06.7"' in dockerfile
     assert "CLBOSS_COMMIT=8cb4e9215eba58b049375f234f5f073d0c7fc622" in dockerfile
     assert "XREBALANCE_COMMIT=fb70bf13cd9f3f79b14100bfdb8f2966884a4142" in dockerfile
     assert 'test "$(git -C /src/clboss rev-parse HEAD)" = "${CLBOSS_COMMIT}"' in dockerfile
@@ -2554,4 +2557,46 @@ def test_preflight_rejects_wrong_revision_behind_default_image(monkeypatch):
             return {"networks": [{"id": 4, "status": "Started"}]}
 
     with pytest.raises(runner.RunnerError, match="unexpected revenue_ops revision"):
+        runner.preflight(Bridge(), 4, runner.IMAGE)
+
+
+def test_preflight_rejects_unverified_cln_artifact_behind_default_image(monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner, "network_record", lambda *_args: {
+        "id": 4,
+        "name": "lab",
+        "status": "Started",
+        "nodes": {"lightning": []},
+    })
+    monkeypatch.setattr(runner, "docker_running", lambda _name: True)
+    monkeypatch.setattr(
+        runner,
+        "_run",
+        lambda _command: type(
+            "Result",
+            (),
+            {
+                "stdout": json.dumps([{
+                    "Id": "sha256:wrong-cln",
+                    "Config": {"Labels": {
+                        "org.opencontainers.image.revision.revenue_ops": (
+                            runner.EXPECTED_REVENUE_REVISION
+                        ),
+                        "org.opencontainers.image.version.cln": "v26.06.7",
+                        "org.opencontainers.image.digest.cln": "sha256:wrong",
+                    }},
+                }]),
+            },
+        )(),
+    )
+
+    class Bridge:
+        def health(self):
+            return {"status": "ok"}
+
+        def call(self, method, _params):
+            assert method == "list_networks"
+            return {"networks": [{"id": 4, "status": "Started"}]}
+
+    with pytest.raises(runner.RunnerError, match="unexpected CLN artifact digest"):
         runner.preflight(Bridge(), 4, runner.IMAGE)

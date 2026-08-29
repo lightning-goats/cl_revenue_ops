@@ -89,7 +89,9 @@ def evidence(revenue_fee: int = 1_300, clboss_fee: int = 1_000) -> dict:
 def test_plan_pins_equal_cln_and_exact_controller_sources():
     tool = load_tool()
     plan = tool.build_plan(4, "abc123")
-    assert plan["versions"]["cln_image_both_contenders"] == "elementsproject/lightningd:v26.06.6"
+    assert plan["versions"]["cln_image_both_contenders"] == tool.CLN_RUNTIME
+    assert "v26.06.7" in tool.CLN_RUNTIME
+    assert "53ddf124" in tool.CLN_RUNTIME
     assert plan["versions"]["revenue_ops_commit"] == "abc123"
     assert plan["versions"]["clboss"]["commit"] == tool.CLBOSS_COMMIT
     assert plan["versions"]["xrebalance"]["commit"] == tool.XREBALANCE_COMMIT
