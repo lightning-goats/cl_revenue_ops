@@ -15,7 +15,7 @@ use it.
 
 import os
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -285,6 +285,7 @@ def _pair():
 
 def test_engine_success_path_settles_atomically(mock_plugin, mock_database):
     engine = _make_engine(mock_plugin, mock_database)
+    engine._data_service = MagicMock()
     executor = MagicMock()
     executor.execute.return_value = ExecutionResult(
         success=True, amount_sats=50_000, fee_sats=3, fee_msat=2_500,
@@ -309,6 +310,10 @@ def test_engine_success_path_settles_atomically(mock_plugin, mock_database):
     mock_database.record_rebalance_cost.assert_not_called()
     mock_database.mark_budget_spent.assert_not_called()
     mock_database.release_budget_reservation.assert_not_called()
+    assert engine._data_service.invalidate.call_args_list == [
+        call("listpeerchannels"),
+        call("listfunds"),
+    ]
 
 
 def test_engine_falls_back_to_legacy_writes_without_atomic_method(
@@ -350,6 +355,7 @@ def test_engine_falls_back_when_atomic_settle_raises(mock_plugin, mock_database)
 
 def test_engine_failure_path_unchanged(mock_plugin, mock_database):
     engine = _make_engine(mock_plugin, mock_database)
+    engine._data_service = MagicMock()
     executor = MagicMock()
     executor.execute.return_value = ExecutionResult(
         success=False, error="retriable_failure: NoRoutes",
@@ -360,6 +366,32 @@ def test_engine_failure_path_unchanged(mock_plugin, mock_database):
 
     mock_database.settle_rebalance_success.assert_not_called()
     mock_database.release_budget_reservation.assert_called_once_with("77")
+    engine._data_service.invalidate.assert_not_called()
+
+
+def test_settled_liquidity_invalidation_is_neutral_when_unavailable(
+    mock_plugin, mock_database
+):
+    engine = _make_engine(mock_plugin, mock_database)
+
+    # Absent data service: production-compatible with legacy construction.
+    engine._data_service = None
+    engine._invalidate_settled_liquidity_snapshot()
+
+    # Malformed and failing collaborators cannot turn a proven settlement
+    # into a crash or trigger any RPC/action fallback.
+    engine._data_service = object()
+    engine._invalidate_settled_liquidity_snapshot()
+    engine._data_service = MagicMock()
+    engine._data_service.invalidate.side_effect = RuntimeError("cache unavailable")
+    engine._invalidate_settled_liquidity_snapshot()
+
+    mock_plugin.rpc.setchannel.assert_not_called()
+    mock_plugin.rpc.sendpay.assert_not_called()
+    mock_plugin.log.assert_any_call(
+        "[EngineV2] settled liquidity cache invalidation skipped: cache unavailable",
+        level="debug",
+    )
 
 
 def test_engine_real_db_success_settlement_end_to_end(tmp_path, mock_plugin):
@@ -407,6 +439,7 @@ def test_reconcile_uses_atomic_settle_with_corrected_amount(
     mock_plugin, mock_database
 ):
     engine = _make_engine(mock_plugin, mock_database)
+    engine._data_service = MagicMock()
     mock_database.get_pending_settlement_rebalances.return_value = [{
         "id": 42,
         "from_channel": "100x1x0",
@@ -443,6 +476,10 @@ def test_reconcile_uses_atomic_settle_with_corrected_amount(
     mock_database.update_rebalance_result.assert_not_called()
     mock_database.record_rebalance_cost.assert_not_called()
     mock_database.mark_budget_spent.assert_not_called()
+    assert engine._data_service.invalidate.call_args_list == [
+        call("listpeerchannels"),
+        call("listfunds"),
+    ]
 
 
 def test_reconcile_atomic_settle_failure_leaves_row_for_next_sweep(

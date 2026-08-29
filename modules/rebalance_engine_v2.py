@@ -382,6 +382,32 @@ class RebalanceEngine:
         """Return the active router currently configured for dispatch."""
         return self.router_v3
 
+    def _invalidate_settled_liquidity_snapshot(self) -> None:
+        """Drop balance caches after a rebalance is proven settled.
+
+        ``listpeerchannels`` and ``listfunds`` are deliberately cached for
+        ordinary analytical reads.  A completed circular payment changes both
+        local channel balances immediately, however.  Leaving the pre-payment
+        snapshot resident can make the admission controller rebroadcast a
+        depleted HTLC maximum after the channel has already been refilled.
+
+        Cache coherence is best-effort and must never change a proven payment
+        outcome.  Missing/legacy data services and malformed invalidators are
+        therefore neutral.
+        """
+        data_service = self._data_service
+        invalidate = getattr(data_service, "invalidate", None)
+        if not callable(invalidate):
+            return
+        try:
+            invalidate("listpeerchannels")
+            invalidate("listfunds")
+        except Exception as exc:
+            self._log(
+                f"settled liquidity cache invalidation skipped: {exc}",
+                level="debug",
+            )
+
     def _max_concurrent_jobs(self, cfg: Optional[Any] = None) -> int:
         """Return the configured automatic rebalance execution cap."""
         if cfg is None:
@@ -3404,6 +3430,13 @@ class RebalanceEngine:
             if result is not None:
                 result = self._retry_native_pair_with_partial_amounts(pair, executor, result)
 
+            # A complete sendpay is authoritative evidence that the source and
+            # destination balances changed.  Invalidate before the next fee /
+            # admission cycle can consume the 30-second analytical snapshot.
+            # Failures and unresolved payments retain the existing cache.
+            if result is not None and getattr(result, "success", False):
+                self._invalidate_settled_liquidity_snapshot()
+
             # Audit wave2 FIX 1: a SUCCESS settles atomically (history
             # 'success' + cost insert + reservation mark-spent in ONE DB
             # transaction). The legacy three-independent-writes sequence is
@@ -4033,6 +4066,7 @@ class RebalanceEngine:
             self._clear_persisted_pair_failure_channels(
                 source_channel, dest_channel
             )
+            self._invalidate_settled_liquidity_snapshot()
             self._log(
                 f"late settlement confirmed for rebalance {rebalance_id}: "
                 f"fee {fee_sats} sats recorded",
