@@ -1894,17 +1894,85 @@ def refresh_automatic_acquisition_phase(state: dict[str, Any]) -> str | None:
     )
     identity = state["assignment"]["revenue_ops"]
     container = state["contenders"][identity]["container"]
+    acquisition_rows = _acquisition_rows(container)
     matching_rows = [
-        row for row in _acquisition_rows(container)
+        row for row in acquisition_rows
         if row.get("id") == experiment_id and row.get("state") == "active"
     ]
-    if len(matching_rows) != 1:
-        raise RunnerError("automatic acquisition is no longer exactly one active episode")
-    live_episode = matching_rows[0]
+    lanes: dict[str, dict[str, Any]] | None = None
+    if len(matching_rows) == 1:
+        live_episode = matching_rows[0]
+    elif not matching_rows:
+        completed_rows = [
+            row for row in acquisition_rows
+            if row.get("id") == experiment_id and row.get("state") == "completed"
+        ]
+        active_rows = [
+            row for row in acquisition_rows if row.get("state") == "active"
+        ]
+        if len(completed_rows) != 1 or len(active_rows) != 1:
+            raise RunnerError(
+                "automatic acquisition is no longer exactly one active episode"
+            )
+        lanes = acquisition_lanes(state)
+        completed = completed_rows[0]
+        live_episode = active_rows[0]
+        next_id = nonnegative_int(
+            live_episode.get("id"), "automatic rollover experiment id"
+        )
+        if next_id == experiment_id:
+            raise RunnerError("automatic acquisition rollover reused an episode id")
+        previous_lane = automatic.get("lane")
+        if not isinstance(previous_lane, dict):
+            raise RunnerError("automatic acquisition rollover lacks captured lane")
+        restored_lanes = [
+            lane for lane in lanes.values()
+            if _lane_matches_channel_identifier(
+                lane, completed.get("channel_id")
+            )
+        ]
+        next_lanes = [
+            lane for lane in lanes.values()
+            if _lane_matches_channel_identifier(
+                lane, live_episode.get("channel_id")
+            )
+        ]
+        if len(restored_lanes) != 1 or len(next_lanes) != 1:
+            raise RunnerError("automatic acquisition rollover selected an unscored lane")
+        restored_lane, next_lane = restored_lanes[0], next_lanes[0]
+        if restored_lane["channel_id"] == next_lane["channel_id"]:
+            raise RunnerError("automatic acquisition rollover ignored channel cooldown")
+        restored_ppm = nonnegative_int(
+            completed.get("restored_fee_ppm"),
+            "automatic rollover restored fee",
+        )
+        restored_base_msat = nonnegative_int(
+            completed.get("restored_base_fee_msat"),
+            "automatic rollover restored base fee",
+        )
+        if (
+            restored_lane["fee_ppm"] != restored_ppm
+            or restored_lane["fee_base_msat"] != restored_base_msat
+        ):
+            raise RunnerError(
+                "automatic acquisition rollover did not restore its captured lane"
+            )
+        rollovers = automatic.setdefault("rollovers", [])
+        if not isinstance(rollovers, list):
+            raise RunnerError("automatic acquisition rollover history is malformed")
+        rollovers.append({
+            "completed_episode": completed,
+            "restored_lane": restored_lane,
+            "next_episode_id": next_id,
+        })
+        automatic.update(episode=live_episode, lane=next_lane)
+    else:
+        raise RunnerError("automatic acquisition has duplicate active episode rows")
     phase = str(live_episode.get("phase") or "acquisition")
     if phase not in {"acquisition", "retention"}:
         raise RunnerError(f"automatic acquisition returned invalid phase {phase!r}")
-    lanes = acquisition_lanes(state)
+    if lanes is None:
+        lanes = acquisition_lanes(state)
     matching_lanes = [
         lane for lane in lanes.values()
         if _lane_matches_channel_identifier(lane, live_episode.get("channel_id"))

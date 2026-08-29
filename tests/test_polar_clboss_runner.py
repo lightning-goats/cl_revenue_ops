@@ -810,6 +810,103 @@ def test_refresh_automatic_phase_fails_closed_after_native_episode_exit(monkeypa
         runner.refresh_automatic_acquisition_phase(state)
 
 
+def test_refresh_automatic_phase_reconciles_native_channel_rollover(monkeypatch):
+    runner = load_runner()
+    state = {
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "automatic_acquisition": {
+            "status": "active",
+            "episode": {"id": 7, "state": "active", "channel_id": "1x1x0"},
+            "lane": {"channel_id": "funding-a", "short_channel_id": "1x1x0"},
+        },
+    }
+    completed = {
+        "id": 7,
+        "state": "completed",
+        "channel_id": "1x1x0",
+        "exit_reason": "retention_volume_cap",
+        "restored_fee_ppm": 15,
+        "restored_base_fee_msat": 0,
+    }
+    active = {
+        "id": 8,
+        "state": "active",
+        "channel_id": "2x1x0",
+        "phase": "acquisition",
+        "target_fee_ppm": 0,
+        "target_base_fee_msat": 0,
+    }
+    restored_lane = {
+        "family": "cln", "channel_id": "funding-a", "short_channel_id": "1x1x0",
+        "peer_id": "peer-a", "fee_base_msat": 0, "fee_ppm": 15,
+    }
+    next_lane = {
+        "family": "lnd", "channel_id": "funding-b", "short_channel_id": "2x1x0",
+        "peer_id": "peer-b", "fee_base_msat": 0, "fee_ppm": 0,
+    }
+    monkeypatch.setattr(
+        runner, "_acquisition_rows", lambda _container: [active, completed]
+    )
+    monkeypatch.setattr(
+        runner, "acquisition_lanes",
+        lambda _state: {"cln": restored_lane, "lnd": next_lane},
+    )
+
+    assert runner.refresh_automatic_acquisition_phase(state) == "acquisition"
+    automatic = state["automatic_acquisition"]
+    assert automatic["episode"] == active
+    assert automatic["lane"] == next_lane
+    assert automatic["rollovers"] == [{
+        "completed_episode": completed,
+        "restored_lane": restored_lane,
+        "next_episode_id": 8,
+    }]
+
+
+def test_refresh_automatic_rollover_fails_closed_on_restore_mismatch(monkeypatch):
+    runner = load_runner()
+    state = {
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "automatic_acquisition": {
+            "status": "active",
+            "episode": {"id": 7, "state": "active", "channel_id": "1x1x0"},
+            "lane": {"channel_id": "funding-a", "short_channel_id": "1x1x0"},
+        },
+    }
+    monkeypatch.setattr(runner, "_acquisition_rows", lambda _container: [
+        {
+            "id": 7, "state": "completed", "channel_id": "1x1x0",
+            "restored_fee_ppm": 15, "restored_base_fee_msat": 0,
+        },
+        {
+            "id": 8, "state": "active", "channel_id": "2x1x0",
+            "phase": "acquisition", "target_fee_ppm": 0,
+            "target_base_fee_msat": 0,
+        },
+    ])
+    monkeypatch.setattr(runner, "acquisition_lanes", lambda _state: {
+        "cln": {
+            "family": "cln", "channel_id": "funding-a", "short_channel_id": "1x1x0",
+            "peer_id": "peer-a", "fee_base_msat": 0, "fee_ppm": 0,
+        },
+        "lnd": {
+            "family": "lnd", "channel_id": "funding-b", "short_channel_id": "2x1x0",
+            "peer_id": "peer-b", "fee_base_msat": 0, "fee_ppm": 0,
+        },
+    })
+
+    with pytest.raises(runner.RunnerError, match="did not restore"):
+        runner.refresh_automatic_acquisition_phase(state)
+
+
 def test_reconciled_traffic_never_retries_ambiguous_payment(monkeypatch):
     runner = load_runner()
 

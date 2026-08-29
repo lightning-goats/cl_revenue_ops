@@ -25,6 +25,26 @@
       "replica": "replica-85",
       "block": "smoke-1788020968",
       "reason": "Manual fake-sat HTLC-cap treatment and unequal liquidity; causal diagnostic only."
+    },
+    {
+      "replica": "replica-88",
+      "block": "smoke-1788024775",
+      "reason": "High-value CLN lifecycle traffic used only to drive native acquisition and retention caps before autonomous channel rotation."
+    },
+    {
+      "replica": "replica-89",
+      "block": "smoke-1788025653",
+      "reason": "High-value CLN lifecycle traffic used only to drive native acquisition and retention caps before autonomous channel rotation."
+    },
+    {
+      "replica": "replica-89",
+      "block": "smoke-1788025790",
+      "reason": "High-value CLN lifecycle traffic used only to drive native acquisition and retention caps before autonomous channel rotation."
+    },
+    {
+      "replica": "replica-89",
+      "block": "smoke-1788025969",
+      "reason": "High-value CLN lifecycle traffic used only to drive native acquisition and retention caps before autonomous channel rotation."
     }
   ]
 }
