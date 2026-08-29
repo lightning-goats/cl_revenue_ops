@@ -2948,7 +2948,7 @@ def traffic_schedule(
     """Build balanced competition or one-way liquidity-pressure traffic."""
     if rounds <= 0 or amount_sats <= 0:
         raise RunnerError("traffic rounds and amount must be positive")
-    if pattern not in {"balanced", "forward-pressure"}:
+    if pattern not in {"balanced", "forward-pressure", "reverse-pressure"}:
         raise RunnerError(f"unknown traffic pattern: {pattern}")
     if amount_profile not in {"fixed", "realistic"}:
         raise RunnerError(f"unknown amount profile: {amount_profile}")
@@ -2965,8 +2965,11 @@ def traffic_schedule(
             else amount_sats
         )
         for family in families:
-            if pattern == "forward-pressure":
-                schedule.append((family, "forward", round_amount))
+            if pattern in {"forward-pressure", "reverse-pressure"}:
+                direction = (
+                    "forward" if pattern == "forward-pressure" else "reverse"
+                )
+                schedule.append((family, direction, round_amount))
                 continue
             forward_amount = round_amount + (
                 REVERSE_FEE_BUFFER_SATS if round_index == 0 else 0
@@ -3921,7 +3924,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pause-seconds", type=float, default=0.1)
     parser.add_argument(
         "--traffic-pattern",
-        choices=("balanced", "forward-pressure"),
+        choices=("balanced", "forward-pressure", "reverse-pressure"),
         default="balanced",
     )
     parser.add_argument(

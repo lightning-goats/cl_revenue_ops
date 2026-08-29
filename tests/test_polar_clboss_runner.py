@@ -1479,6 +1479,18 @@ def test_forward_pressure_schedule_is_one_way_without_reserve_seed():
     )
 
 
+def test_reverse_pressure_schedule_targets_refilled_outbound_family():
+    runner = load_runner()
+
+    assert runner.traffic_schedule(
+        3, 10_000, "reverse-pressure", traffic_family="cln"
+    ) == (
+        ("cln", "reverse", 10_000),
+        ("cln", "reverse", 10_000),
+        ("cln", "reverse", 10_000),
+    )
+
+
 def test_realistic_amount_profile_cycles_market_sized_payments():
     runner = load_runner()
 
