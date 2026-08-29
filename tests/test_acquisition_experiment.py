@@ -197,10 +197,10 @@ def test_positive_acquisition_transitions_to_bounded_paid_retention(
         "phase_start_volume_sats": fc.ACQUISITION_RETENTION_MIN_VOLUME_SATS,
         "phase_start_forward_count": 10,
         "retention_fee_ppm": 0,
-        "retention_base_fee_msat": 9,
+        "retention_base_fee_msat": 5,
     }
     fc.set_channel_fee = MagicMock(
-        return_value={"success": True, "fee_ppm": 0, "base_fee_msat": 9}
+        return_value={"success": True, "fee_ppm": 0, "base_fee_msat": 5}
     )
     info = _channel_info(0)
     info["spendable_msat"] = "1900000000msat"
@@ -220,11 +220,11 @@ def test_positive_acquisition_transitions_to_bounded_paid_retention(
     assert result.algorithm_values["acquisition_phase"] == "retention"
     assert result.algorithm_values["acquisition_phase_volume_sats"] == 0
     assert result.algorithm_values["acquisition_retention_fee_ppm"] == 0
-    assert result.algorithm_values["acquisition_retention_base_fee_msat"] == 9
+    assert result.algorithm_values["acquisition_retention_base_fee_msat"] == 5
     transition = mock_database.transition_acquisition_to_retention.call_args.kwargs
     assert transition["phase_start_volume_sats"] == 50_000
     assert transition["phase_start_forward_count"] == 10
-    assert transition["retention_base_fee_msat"] == 9
+    assert transition["retention_base_fee_msat"] == 5
     mock_database.complete_acquisition_experiment.assert_not_called()
 
 
@@ -275,12 +275,17 @@ def test_retention_requires_a_positive_strict_undercut(
 def test_positive_retention_base_is_bounded_and_malformed_evidence_is_neutral():
     from modules.fee_controller import FeeController
 
-    assert FeeController._positive_retention_base_fee_msat(5_000_000, 2) == 9
+    assert FeeController._positive_retention_base_fee_msat(5_000_000, 2) == 5
+    assert FeeController._positive_retention_base_fee_msat(5_000_000, 1) == 2
+    assert FeeController._positive_retention_base_fee_msat(2_000_000, 1) == 1
     assert FeeController._positive_retention_base_fee_msat(2_000_000_000, 10) == 1_000
     assert FeeController._positive_retention_base_fee_msat(1_000_000, 1) is None
     assert FeeController._positive_retention_base_fee_msat(1_500_000, 1) is None
     for malformed in (None, True, 0, -1, "bad"):
         assert FeeController._positive_retention_base_fee_msat(malformed, 1) is None
+        assert FeeController._positive_retention_base_fee_msat(5_000_000, malformed) is None
+    assert FeeController._positive_retention_base_fee_msat(5_000_000.5, 1) is None
+    assert FeeController._positive_retention_base_fee_msat(5_000_000, 1.5) is None
 
 
 def test_retention_transition_persists_when_paid_fee_is_already_live(
@@ -314,11 +319,11 @@ def test_retention_transition_persists_when_paid_fee_is_already_live(
         "phase_start_volume_sats": 50_000,
         "phase_start_forward_count": 10,
         "retention_fee_ppm": 0,
-        "retention_base_fee_msat": 9,
+        "retention_base_fee_msat": 5,
     }
     fc.set_channel_fee = MagicMock()
     info = _channel_info(0)
-    info["fee_base_msat"] = 9
+    info["fee_base_msat"] = 5
     info["spendable_msat"] = "1900000000msat"
 
     result = fc._adjust_channel_fee(

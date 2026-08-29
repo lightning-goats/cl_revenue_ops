@@ -271,10 +271,10 @@ Revenue Ops' bounded acquisition experiment remains default-off and may quote
 1 through 10 ppm instead of requiring exactly 1 ppm; all duration, volume,
 opportunity-cost, liquidity, and cooldown rails remain unchanged. After 50,000
 acquired sats it may run a one-hour, 250,000-sat paid validation phase at
-0 ppm plus a positive base fee one millisatoshi below the competitor's
-proportional charge at the smallest acquired payment. If no positive strict
-undercut exists, it exits. Both phases share the 25-sat opportunity-cost cap
-and restore the exact captured base and proportional fees on exit.
+0 ppm plus a positive base fee. New transitions charge no more than half the
+competitor's proportional fee at the smallest acquired payment. If no positive
+strict undercut exists, it exits. Both phases share the 25-sat opportunity-cost
+cap and restore the exact captured base and proportional fees on exit.
 
 ## What the tournament has established
 

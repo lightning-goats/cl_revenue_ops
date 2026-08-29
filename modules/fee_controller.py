@@ -2607,6 +2607,13 @@ class FeeController:
     ACQUISITION_RETENTION_DURATION_SECONDS = 3600
     ACQUISITION_RETENTION_VOLUME_CAP_SATS = 250_000
     ACQUISITION_RETENTION_BASE_FEE_CAP_MSAT = 1_000
+    # A one-msat edge at the smallest acquired payment preserved nearly all of
+    # the competitor's price while failing to retain the acquired route share
+    # in crossed tournament traffic.  New paid-validation episodes therefore
+    # keep at least half of the observed proportional charge as customer
+    # savings.  This is still a positive, single-lane, default-off quote and
+    # remains inside the shared opportunity-cost and liquidity rails.
+    ACQUISITION_RETENTION_CHARGE_DIVISOR = 2
     ACQUISITION_START_OUTBOUND_RATIO = 0.85
     ACQUISITION_EXIT_OUTBOUND_RATIO = 0.70
     ACQUISITION_IDLE_SECONDS = 24 * 3600
@@ -3277,21 +3284,33 @@ class FeeController:
     def _positive_retention_base_fee_msat(
         cls, minimum_out_msat: Any, competitor_fee_ppm: Any
     ) -> Optional[int]:
-        """Return a positive quote strictly below the observed proportional fee.
+        """Return a positive half-price quote below the proportional fee.
 
         The minimum acquired payment is the conservative anchor: if the quote
         undercuts there, it also undercuts the same proportional policy for
-        every larger observed payment.  There is no positive integer-msat
-        undercut when the competitor charge is at most one millisatoshi.
+        every larger observed payment.  Taking at most half of the competitor
+        charge makes paid validation a meaningful conversion test instead of
+        the previous one-msat edge.  There is no positive integer-msat undercut
+        when the competitor charge is at most one millisatoshi.
         """
-        if isinstance(minimum_out_msat, bool):
+        if (
+            isinstance(minimum_out_msat, bool)
+            or not cls._acquisition_competitor_floor_qualifies(
+                competitor_fee_ppm
+            )
+        ):
             return None
         try:
             amount_msat = int(minimum_out_msat)
             fee_ppm = int(competitor_fee_ppm)
         except (TypeError, ValueError, OverflowError):
             return None
-        if amount_msat <= 0 or not cls._acquisition_competitor_floor_qualifies(fee_ppm):
+        try:
+            if float(minimum_out_msat) != amount_msat:
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if amount_msat <= 0:
             return None
         # Use floor division deliberately.  It is conservative across routing
         # implementations that may round proportional fees differently: a
@@ -3299,9 +3318,14 @@ class FeeController:
         competitor_charge_msat = amount_msat * fee_ppm // 1_000_000
         if competitor_charge_msat <= 1:
             return None
+        retention_charge_msat = max(
+            1,
+            competitor_charge_msat
+            // cls.ACQUISITION_RETENTION_CHARGE_DIVISOR,
+        )
         return min(
             cls.ACQUISITION_RETENTION_BASE_FEE_CAP_MSAT,
-            competitor_charge_msat - 1,
+            retention_charge_msat,
         )
 
     def _complete_acquisition_experiment(
