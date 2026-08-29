@@ -15,6 +15,7 @@ METRICS = (
     "forward_count", "volume_msat", "routing_fee_msat", "rebalance_cost_msat",
     "policy_changes",
 )
+DEFAULT_EXCLUSIONS = Path("docs/optimization/CLBOSS_TOURNAMENT_EXCLUSIONS.json")
 
 
 class ScorecardError(RuntimeError):
@@ -33,8 +34,40 @@ def _integer(value: Any, label: str) -> int:
     return parsed
 
 
-def load_blocks(results_dir: Path) -> list[dict[str, Any]]:
+def load_exclusions(path: Path | None) -> dict[tuple[str, str], str]:
+    """Load an auditable ledger of diagnostic blocks excluded from all totals."""
+    if path is None or not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ScorecardError(f"cannot read exclusion ledger {path}: {exc}") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != "polar-clboss-scorecard-exclusions-v1"
+        or not isinstance(payload.get("entries"), list)
+    ):
+        raise ScorecardError(f"unexpected exclusion ledger schema in {path}")
+    exclusions: dict[tuple[str, str], str] = {}
+    for index, row in enumerate(payload["entries"]):
+        if not isinstance(row, dict):
+            raise ScorecardError(f"malformed exclusion entry {index} in {path}")
+        replica, block, reason = row.get("replica"), row.get("block"), row.get("reason")
+        if not all(isinstance(value, str) and value.strip() for value in (replica, block, reason)):
+            raise ScorecardError(f"malformed exclusion entry {index} in {path}")
+        key = (replica, block)
+        if key in exclusions:
+            raise ScorecardError(f"duplicate exclusion for {replica}/{block} in {path}")
+        exclusions[key] = reason.strip()
+    return exclusions
+
+
+def load_blocks(
+    results_dir: Path,
+    exclusions: dict[tuple[str, str], str] | None = None,
+) -> list[dict[str, Any]]:
     blocks = []
+    exclusions = exclusions or {}
     for path in sorted(results_dir.glob("replica-*/smoke-*.json")):
         if path.name.endswith("-progress.json"):
             continue
@@ -88,6 +121,11 @@ def load_blocks(results_dir: Path) -> list[dict[str, Any]]:
                 },
             }
         payload["_source"] = str(path)
+        exclusion_reason = exclusions.get(
+            (str(payload.get("replica") or ""), str(payload.get("block") or ""))
+        )
+        if exclusion_reason is not None:
+            payload["_excluded_reason"] = exclusion_reason
         blocks.append(payload)
     if not blocks:
         raise ScorecardError(f"no smoke blocks found below {results_dir}")
@@ -104,9 +142,12 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
     market_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
     eligible_market_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
     attempted = settled = fallback = 0
-    enhanced = eligible_blocks = 0
+    enhanced = eligible_blocks = excluded_blocks = 0
     replicas = set()
     for block in blocks:
+        if isinstance(block.get("_excluded_reason"), str):
+            excluded_blocks += 1
+            continue
         replicas.add(str(block.get("replica") or "unknown"))
         traffic = block.get("traffic")
         if not isinstance(traffic, dict):
@@ -241,6 +282,8 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         combined_volume = sum(rows[name]["volume_msat"] for name in CONTROLLERS)
         for name in CONTROLLERS:
             row = dict(rows[name])
+            for metric in METRICS:
+                row.setdefault(metric, 0)
             volume = row.get("volume_msat", 0)
             gross = row.get("routing_fee_msat", 0)
             cost = row.get("rebalance_cost_msat", 0)
@@ -267,7 +310,8 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "schema": "polar-clboss-scorecard-v1",
         "coverage": {
-            "replicas": len(replicas), "blocks": len(blocks),
+            "replicas": len(replicas), "blocks": len(blocks) - excluded_blocks,
+            "observed_blocks": len(blocks), "excluded_blocks": excluded_blocks,
             "enhanced_blocks": enhanced, "eligible_blocks": eligible_blocks,
             "attempted": attempted, "settled": settled,
             "fallback_settled_in_enhanced_blocks": fallback,
@@ -312,7 +356,8 @@ def markdown(scorecard: dict[str, Any]) -> str:
             f"Coverage: {coverage['replicas']} replicas, {coverage['blocks']} blocks, "
             f"{coverage['attempted']} attempted / {coverage['settled']} settled payments. "
             f"Enhanced strict-schema blocks: {coverage['enhanced_blocks']}; "
-            f"safety-eligible: {coverage['eligible_blocks']}."
+            f"safety-eligible: {coverage['eligible_blocks']}; "
+            f"diagnostic exclusions: {coverage['excluded_blocks']}."
         ),
         "",
         "| Comparable area | Revenue Ops | CLBOSS | Current leader |",
@@ -410,10 +455,11 @@ def markdown(scorecard: dict[str, Any]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-dir", type=Path, default=Path("results/polar-clboss"))
+    parser.add_argument("--exclusions", type=Path, default=DEFAULT_EXCLUSIONS)
     parser.add_argument("--format", choices=("json", "markdown"), default="markdown")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    scorecard = summarize(load_blocks(args.results_dir))
+    scorecard = summarize(load_blocks(args.results_dir, load_exclusions(args.exclusions)))
     rendered = (
         json.dumps(scorecard, indent=2, sort_keys=True) + "\n"
         if args.format == "json" else markdown(scorecard)

@@ -1,17 +1,17 @@
 # CLBOSS tournament scorecard
 
-Coverage: 43 replicas, 71 blocks, 2525 attempted / 2522 settled payments. Enhanced strict-schema blocks: 54; safety-eligible: 41.
+Coverage: 45 scored replicas, 76 scored blocks, 2765 attempted / 2762 settled payments. Enhanced strict-schema blocks: 59; safety-eligible: 44; diagnostic exclusions: 5.
 
 | Comparable area | Revenue Ops | CLBOSS | Current leader |
 |---|---:|---:|---|
-| Routing volume (msat) | 15992724010 | 36555803657 | clboss |
-| Forward count | 701 | 1676 | clboss |
-| Gross routing fees (msat) | 2029312 | 813276 | revenue_ops |
+| Routing volume (msat) | 16852962805 | 37045564862 | clboss |
+| Forward count | 854 | 1765 | clboss |
+| Gross routing fees (msat) | 2035616 | 819719 | revenue_ops |
 | Rebalance cost (msat) | 57732 | 61924 | revenue_ops |
-| Net routing profit (msat) | 1971580 | 751352 | revenue_ops |
-| Gross yield (ppm) | 126.890 | 22.248 | revenue_ops |
-| Volume share (%) | 30.434 | 69.566 | clboss |
-| Mean worst imbalance (ppm; lower is better) | 804182.2 | 823745.6 | revenue_ops |
+| Net routing profit (msat) | 1977884 | 757795 | revenue_ops |
+| Gross yield (ppm) | 120.787 | 22.127 | revenue_ops |
+| Volume share (%) | 31.268 | 68.732 | clboss |
+| Mean worst imbalance (ppm; lower is better) | 817065.0 | 833693.4 | revenue_ops |
 
 Formal verdict: **not ready**. It requires at least three fresh replicas and six enhanced cold/warm blocks per league per replica.
 
@@ -21,14 +21,15 @@ This table describes observed lab outcomes; it does not treat historical smoke b
 
 | Comparable functional area | Revenue Ops evidence | CLBOSS evidence | Current result |
 |---|---|---|---|
-| Fee setting | Higher aggregate yield and profit; final-image post-refill pricing won linked net across both identities | Higher aggregate raw volume; natural low quotes still win untreated and acquisition/retention lanes | Split; Revenue wins controlled monetization, CLBOSS wins aggregate conversion breadth |
+| Fee setting | Higher aggregate yield and profit; truthful-admission final image wins safety-eligible automatic acquisition and retention volume/net | Higher aggregate raw volume and untreated historical breadth | Split; Revenue now wins the controlled acquisition/retention phase, CLBOSS still wins all-history volume breadth |
+| Automatic acquisition/retention | Across all eligible automatic blocks, 805M msat volume and 6,125 msat net; final-image clean retention alone won 495M/180M and 4,165/1,833 msat | 495M msat eligible automatic volume and 4,590 msat net | Revenue Ops in the controlled automatic phase |
 | Cold rebalance responsiveness | 50,000 sats delivered in every crossed 120-second cold window | No delivery in the same windows despite native 120/hour cadence | Revenue Ops |
 | Warm rebalance delivery | Final build delivered 285,000 sats in each eligible warm epoch | Delivered 235,000 sats in the same epochs | Revenue Ops |
 | Warm rebalance efficiency | 4,636 msat for 285,000 sats (16.27 ppm) | 4,085 msat for 235,000 sats (17.38 ppm) | Revenue Ops per delivered sat; CLBOSS lower absolute spend |
 | Liquidity-to-demand conversion | Four final-image blocks won 1.14B/0.94B msat and 155,061/132,830 msat linked net | Lower final-image post-refill volume and linked net | Revenue Ops |
 | Channel open/close management | Intentionally out of scope; no open/close caller | Disabled/unmanaged in the harness to keep shared scope | Not comparable |
 | Budget/safety enforcement | Production budget enforced; all new controlled blocks safety-clean | Intentionally uncapped; all new controlled blocks safety-clean | Different policies; no safety regression |
-| Aggregate net routing profit | 1,971,580 msat | 751,352 msat | Revenue Ops |
+| Aggregate net routing profit | 1,977,884 msat | 757,795 msat | Revenue Ops |
 
 ## Safety-eligible results by market profile
 
@@ -42,6 +43,7 @@ contender-level safety violations contribute here.
 | `realistic` / replica 44 cold pressure / both | 1145000000 | 1955000000 | 163790 | 1955 | Revenue wins profit/balance; CLBOSS wins cold volume |
 | `realistic` / 100-payment crossed cold / both | 1790000000 | 1970000000 | 253755 | 1970 | Near-parity routes; Revenue wins profit and ending balance |
 | `acquisition` / native positive-base retention / CLN | 90000000 | 160000000 | 767 | 1590 | CLBOSS wins combined volume, routes, and profit across two paid blocks |
+| `acquisition` / truthful-admission final image, replicas 86-87 / CLN | 495000000 | 180000000 | 4165 | 1833 | Revenue wins crossed clean retention volume, forwards (89-31), and net fees with zero fallback/spend |
 | `acquisition` / mixed acquisition-to-retention transition / CLN | 120000000 | 5000000 | 628 | 5 | Revenue wins, but the in-window phase transition makes this diagnostic only |
 | `acquisition` / native paid retention / CLN | 45000000 | 80000000 | 275 | 632 | Forward routes tie 5-5; CLBOSS wins weighted volume and profit |
 | `acquisition` / paid retention / LND | 255000000 | 195000000 | 2225 | 1419 | Revenue wins volume and profit |
@@ -285,9 +287,17 @@ and restore the exact captured base and proportional fees on exit.
   background paths truly isolated and only the Revenue cap changed to 85% of
   live spendable (825.09M msat), the next clean block won 15/20 routes; native
   retention then won 16/20 and 32/20 msat of fees. The half-price retention
-  candidate remains unpromoted and has been rolled back. The next bounded
-  contender changes only truthful default admission caps; fresh crossed rounds
-  are required before promotion.
+  candidate remains unpromoted and has been rolled back. Revision `5db4588`
+  changes only truthful default admission caps, validates malformed/missing
+  capacity evidence neutrally, and keeps the original strict paid undercut.
+  Crossed final-image replicas 86-87 then produced three eligible retention
+  blocks: Revenue won 495M/180M msat of volume, 89/31 forwards, and 4,165/1,833
+  msat net with zero fallback, rebalance spend, or safety violations. Two
+  acquisition blocks also favored Revenue but remain excluded because one
+  autonomous CLBOSS circular forward overlapped each attribution window.
+- The exclusion ledger is now machine-readable and fail-closed on malformed or
+  duplicate records. All five replica-85 blocks are absent from aggregate and
+  eligible totals instead of relying on narrative-only exclusion.
 - Revenue Ops extracts more fee per routed sat, but CLBOSS wins far more routing volume. The main economic gap is conversion and retained demand, not fee arithmetic alone.
 - Replicas 47-48 add a fresh crossed realistic repeat: Revenue earned 340,545 msat from 2.33B msat while CLBOSS earned 3,870 msat from 3.87B msat. Revenue finished materially better balanced in both runs (270,178 and 130,170 worst-imbalance ppm versus 970,000 for CLBOSS), with zero safety violations. CLBOSS still wins raw volume.
 - Controlled replicas 52-53 establish a crossed native-rebalance win. Revenue completed one positive-EV 50,000-sat refill in each 90-second observation for 1.052 sats; uncapped CLBOSS completed none despite its 120/hour setting. Both runs were safety-clean. This is evidence for execution responsiveness and profitability discipline, not yet long-horizon profit superiority.
@@ -321,8 +331,8 @@ and restore the exact captured base and proportional fees on exit.
 | Step | Evidence sought | Implementation or decision gate |
 |---|---|---|
 | Family attribution | CLN versus LND volume, fees, and forwards | Runner blocks map every contender SCID to a client family and fail closed on unmapped activity. |
-| Automatic acquisition | Whether the default-off product selects and wins a natural lane | Enable the gate and wait for native fee cycles; never force a scored fee cycle. |
-| Paid retention | Whether a positive base-fee undercut converts the 1-ppm tie into retained volume and profit | Keep experimental until positive lift repeats across crossed identities and both client families. |
+| Automatic acquisition | Whether the default-off product selects and wins a natural lane | Crossed truthful-admission image wins the observed CLN acquisition signal, but both new blocks had one overlapping autonomous CLBOSS forward and remain excluded. Repeat with a clean attribution window and LND. |
+| Paid retention | Whether a positive base-fee undercut converts the low-ppm tie into retained volume and profit | Truthful admission flips eligible automatic retention to 630M/420M volume and 5,207/4,055 msat net. Repeat on LND and longer windows before declaring breadth superiority. |
 | Retention curve | Whether any paid quote beats free acquisition on net profit under CLN route randomization | Measure multiple bounded price points with enough routes for confidence; optimize net contribution, not raw route count. |
 | Liquidity pressure | Whether each controller restores depleted earning liquidity profitably | Run one-way traffic with equal spend caps; compare net fees, cost, and ending imbalance. |
 | Controlled depletion | Whether each native controller repairs the same exact 75/25 liquidity state | Ten clean observations across CLN/LND and crossed identities; Revenue leads 10-0 while CLBOSS remains uncapped. |
@@ -330,11 +340,11 @@ and restore the exact captured base and proportional fees on exit.
 | Post-refill demand | Whether repaired liquidity produces more routed volume and linked net profit | Six eligible CLN/LND blocks repeat Revenue's 285M/235M volume win; aggregate linked net is 222,043/58,045 msat. Extend to longer warm demand. |
 | Warm renewal | Whether profitable outbound inventory renews inside the normal 24-hour cooldown without duplicate spend | Final-image replicas 83-84 deliver 285k versus 235k sats at 16.27/17.38 ppm cost efficiency; replica 83 repeats twice in one process. Extend to more replicas and both client families. |
 | Admission freshness | Whether settled liquidity immediately becomes usable even while fee learning waits | Complete for the observed LND corridor: `502e0ae` invalidates settled-state caches and `f3d2b0e` refreshes only `htlcmax` outside fee windows; live crossed readbacks remained 242,839,900/250,000,000 msat. |
-| Fee conversion | Whether Revenue can beat CLBOSS's earned quote without a global low-fee policy | Four final-image eligible LND blocks win 1.14B/0.94B volume and 155,061/132,830 linked net. Remaining target is untreated CLN/LND breadth plus acquisition/retention, where aggregate CLBOSS volume still leads. |
+| Fee conversion | Whether Revenue can beat CLBOSS's earned quote without a global low-fee policy | Four final-image eligible LND blocks win 1.14B/0.94B post-refill volume; truthful-admission CLN retention wins 495M/180M. Remaining target is untreated CLN/LND breadth and longer-horizon aggregate volume. |
 | Profit threshold | Whether Revenue spends only when the full refill economics clear opportunity cost | Replicas 72-73 hold negative 9-sat/4-sat routes; crossed replicas 74-75 each spend 3.001 sats on the clearly positive 150-ppm lane while uncapped CLBOSS remains idle. Extend the demand and renewal window. |
 | CLN 26.06.7 compatibility | Whether both contenders and all read-only/action surfaces remain compatible with the 2026-08-28 security point release | Complete: signed official amd64 binary overlay, exact digest/version/revision preflight, full tests green, and crossed replicas 77-80 safety-clean. Do not use the release's warned-bad Docker image. |
 | Evidence freshness | Whether settled forwards become canonical value/budget evidence before a 15-minute cache TTL expires | Implemented through `0aa7da8`; keep the analyzer refresh canonical, read-only, and backoff protected. |
-| Product change | Repeatable positive net lift across crossed identities and clients | Admission refresh is promoted by crossed LND evidence; next bounded treatment must target aggregate route breadth or acquisition/retention and repeat across CLN and LND. |
+| Product change | Repeatable positive net lift across crossed identities and clients | Truthful 85%-of-spendable admission is promoted by crossed CLN retention evidence. Next bounded treatment must extend the gain to LND and untreated route breadth without sacrificing realistic fee floors. |
 
 Regenerate the aggregate observation separately before reconciling the narrative table:
 

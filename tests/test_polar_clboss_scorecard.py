@@ -196,3 +196,43 @@ def test_load_blocks_fails_closed_without_linked_rebalance_observation(tmp_path)
 
     with pytest.raises(mod.ScorecardError, match="cannot read linked observation"):
         mod.load_blocks(tmp_path)
+
+
+def test_scorecard_excludes_machine_readable_diagnostics_from_all_totals(tmp_path):
+    mod = load_scorecard()
+    replica = tmp_path / "replica-1"
+    replica.mkdir()
+    payload = block()
+    payload.pop("_source")
+    payload["block"] = "smoke-1"
+    (replica / "smoke-1.json").write_text(json.dumps(payload), encoding="utf-8")
+    ledger = tmp_path / "exclusions.json"
+    ledger.write_text(json.dumps({
+        "schema": "polar-clboss-scorecard-exclusions-v1",
+        "entries": [{
+            "replica": "replica-1", "block": "smoke-1", "reason": "manual treatment",
+        }],
+    }), encoding="utf-8")
+
+    result = mod.summarize(mod.load_blocks(tmp_path, mod.load_exclusions(ledger)))
+
+    assert result["coverage"]["observed_blocks"] == 1
+    assert result["coverage"]["blocks"] == 0
+    assert result["coverage"]["excluded_blocks"] == 1
+    assert result["coverage"]["attempted"] == 0
+    assert result["coverage"]["eligible_blocks"] == 0
+    assert result["overall"]["revenue_ops"]["volume_msat"] == 0
+    assert "diagnostic exclusions: 1" in mod.markdown(result)
+
+
+def test_exclusion_ledger_fails_closed_on_duplicate_entries(tmp_path):
+    mod = load_scorecard()
+    row = {"replica": "replica-1", "block": "smoke-1", "reason": "diagnostic"}
+    ledger = tmp_path / "exclusions.json"
+    ledger.write_text(json.dumps({
+        "schema": "polar-clboss-scorecard-exclusions-v1",
+        "entries": [row, row],
+    }), encoding="utf-8")
+
+    with pytest.raises(mod.ScorecardError, match="duplicate exclusion"):
+        mod.load_exclusions(ledger)

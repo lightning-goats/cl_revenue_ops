@@ -1,0 +1,30 @@
+{
+  "schema": "polar-clboss-scorecard-exclusions-v1",
+  "entries": [
+    {
+      "replica": "replica-85",
+      "block": "smoke-1788020192",
+      "reason": "Diagnostic setup used non-isolated 10-ppm background routes and produced fallback traffic."
+    },
+    {
+      "replica": "replica-85",
+      "block": "smoke-1788020478",
+      "reason": "Diagnostic setup used non-isolated 10-ppm background routes and produced fallback traffic."
+    },
+    {
+      "replica": "replica-85",
+      "block": "smoke-1788020577",
+      "reason": "Diagnostic setup used non-isolated 10-ppm background routes and produced fallback traffic."
+    },
+    {
+      "replica": "replica-85",
+      "block": "smoke-1788020866",
+      "reason": "Manual fake-sat HTLC-cap treatment and unequal liquidity; causal diagnostic only."
+    },
+    {
+      "replica": "replica-85",
+      "block": "smoke-1788020968",
+      "reason": "Manual fake-sat HTLC-cap treatment and unequal liquidity; causal diagnostic only."
+    }
+  ]
+}
