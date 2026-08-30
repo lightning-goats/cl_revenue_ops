@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,107 @@ def evidence(revenue_fee: int = 1_300, clboss_fee: int = 1_000) -> dict:
         "assignments": assignments,
         "blocks": blocks,
     }
+
+
+def write_runner_replica(
+    root: Path,
+    replica: int,
+    assignment: dict[str, str],
+    *,
+    revision: str = "frozen-revision",
+) -> None:
+    replica_dir = root / f"replica-{replica}"
+    replica_dir.mkdir(parents=True)
+    state = {
+        "schema": "polar-clboss-runner-state-v1",
+        "assignment": assignment,
+        "contenders": {
+            "identity-a": {"node_id": f"node-a-{replica}"},
+            "identity-b": {"node_id": f"node-b-{replica}"},
+        },
+        "preflight": {
+            "image_id": "sha256:frozen",
+            "image_labels": {
+                "org.opencontainers.image.revision.revenue_ops": revision,
+            },
+        },
+        "forced_path_readiness": {
+            "scored": False,
+            "payments": [
+                {"direction": direction}
+                for _controller in ("revenue_ops", "clboss")
+                for _family in ("cln", "lnd")
+                for direction in ("forward", "reverse")
+            ],
+        },
+    }
+    (replica_dir / "state.json").write_text(
+        json.dumps(state), encoding="utf-8"
+    )
+    template = evidence()["blocks"]
+    for index, source in enumerate(template):
+        source_replica = int(source["replica"][1:])
+        if source_replica != replica - 200:
+            continue
+        block = dict(source)
+        block.update({
+            "schema": "polar-clboss-smoke-v1",
+            "replica": f"replica-{replica}",
+            "block": f"smoke-{replica}-{index}",
+            "phase": "baseline",
+            "market_profile": "realistic",
+        })
+        (replica_dir / f"smoke-{replica}-{index}.json").write_text(
+            json.dumps(block), encoding="utf-8"
+        )
+
+
+def test_collect_runner_evidence_binds_one_frozen_crossed_series(tmp_path):
+    tool = load_tool()
+    write_runner_replica(
+        tmp_path, 201,
+        {"revenue_ops": "identity-a", "clboss": "identity-b"},
+    )
+    write_runner_replica(
+        tmp_path, 202,
+        {"revenue_ops": "identity-b", "clboss": "identity-a"},
+    )
+    write_runner_replica(
+        tmp_path, 203,
+        {"revenue_ops": "identity-a", "clboss": "identity-b"},
+    )
+
+    payload = tool.collect_runner_evidence(
+        tmp_path, [201, 202, 203], run_id="formal-test",
+    )
+
+    assert payload["run_id"] == "formal-test"
+    assert payload["frozen_runner_evidence"]["revenue_ops_revision"] == (
+        "frozen-revision"
+    )
+    assert len(payload["blocks"]) == 36
+    score = tool.score_evidence(payload, iterations=200)
+    assert score["verdict"] == "revenue_ops_wins"
+    assert score["frozen_runner_evidence"] == payload["frozen_runner_evidence"]
+
+
+def test_collect_runner_evidence_fails_closed_on_revision_drift(tmp_path):
+    tool = load_tool()
+    assignments = [
+        {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        {"revenue_ops": "identity-b", "clboss": "identity-a"},
+        {"revenue_ops": "identity-a", "clboss": "identity-b"},
+    ]
+    for replica, assignment in zip((201, 202, 203), assignments):
+        write_runner_replica(
+            tmp_path, replica, assignment,
+            revision="drifted" if replica == 203 else "frozen-revision",
+        )
+
+    with pytest.raises(tool.CompetitionError, match="one frozen Revenue Ops image"):
+        tool.collect_runner_evidence(
+            tmp_path, [201, 202, 203], run_id="formal-test",
+        )
 
 
 def test_plan_pins_equal_cln_and_exact_controller_sources():

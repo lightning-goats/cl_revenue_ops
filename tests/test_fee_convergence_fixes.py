@@ -1,6 +1,7 @@
 """Tests for fee convergence tuning: sparse blend ratio and observation window."""
 
 import pytest
+from types import SimpleNamespace
 from modules.fee_controller import FeeController, GaussianThompsonState
 
 
@@ -92,6 +93,28 @@ class TestObservationWindow:
 
     def test_min_observation_hours_is_025(self):
         assert FeeController.MIN_OBSERVATION_HOURS == 0.25
+
+    def test_fast_explicit_cadence_uses_three_cycles_with_two_minute_floor(self):
+        profile = FeeController.FEE_PROFILES["active"]
+
+        assert FeeController._effective_min_observation_hours(
+            profile, SimpleNamespace(fee_interval=15),
+        ) == pytest.approx(120 / 3600)
+
+    def test_default_production_cadence_keeps_profile_window(self):
+        profile = FeeController.FEE_PROFILES["active"]
+
+        assert FeeController._effective_min_observation_hours(
+            profile, SimpleNamespace(fee_interval=1800),
+        ) == pytest.approx(0.25)
+
+    @pytest.mark.parametrize("value", [None, "bad", float("nan"), 0, -1])
+    def test_malformed_or_invalid_cadence_fails_closed(self, value):
+        profile = FeeController.FEE_PROFILES["active"]
+
+        assert FeeController._effective_min_observation_hours(
+            profile, SimpleNamespace(fee_interval=value),
+        ) == pytest.approx(0.25)
 
 
 class TestSleepExemption:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -16,10 +17,100 @@ METRICS = (
     "policy_changes",
 )
 DEFAULT_EXCLUSIONS = Path("docs/optimization/CLBOSS_TOURNAMENT_EXCLUSIONS.json")
+FORMAL_SCORE_SCHEMA = "polar-clboss-competition-score-v1"
+FORMAL_LEAGUES = ("fee_only", "full_stack")
+FORMAL_VERDICTS = {"revenue_ops_wins", "clboss_wins", "inconclusive"}
 
 
 class ScorecardError(RuntimeError):
     """An artifact is malformed or cannot be reconciled."""
+
+
+def _finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise ScorecardError(f"{label} must be a finite number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ScorecardError(f"{label} must be a finite number") from exc
+    if not math.isfinite(parsed):
+        raise ScorecardError(f"{label} must be a finite number")
+    return parsed
+
+
+def load_formal_score(path: Path | None) -> dict[str, Any] | None:
+    """Load a self-contained formal score and fail closed on weak provenance."""
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ScorecardError(f"cannot read formal score {path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema") != FORMAL_SCORE_SCHEMA:
+        raise ScorecardError(f"unexpected formal score schema in {path}")
+    run_id = payload.get("evidence_run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ScorecardError(f"formal score lacks an evidence run id in {path}")
+    if payload.get("verdict") not in FORMAL_VERDICTS:
+        raise ScorecardError(f"formal score has an invalid verdict in {path}")
+    frozen = payload.get("frozen_runner_evidence")
+    if not isinstance(frozen, dict):
+        raise ScorecardError(f"formal score lacks frozen runner provenance in {path}")
+    for key in ("image_id", "revenue_ops_revision"):
+        if not isinstance(frozen.get(key), str) or not frozen[key].strip():
+            raise ScorecardError(f"formal score lacks frozen {key} in {path}")
+    replicas = frozen.get("replicas")
+    if (
+        not isinstance(replicas, list)
+        or len(replicas) != 3
+        or any(not isinstance(row, str) or not row.strip() for row in replicas)
+        or len(set(replicas)) != 3
+    ):
+        raise ScorecardError(f"formal score requires three distinct replicas in {path}")
+    leagues = payload.get("leagues")
+    if not isinstance(leagues, dict) or set(leagues) != set(FORMAL_LEAGUES):
+        raise ScorecardError(f"formal score has incomplete leagues in {path}")
+    for league in FORMAL_LEAGUES:
+        row = leagues[league]
+        if not isinstance(row, dict) or row.get("verdict") not in FORMAL_VERDICTS:
+            raise ScorecardError(f"formal score has invalid {league} verdict in {path}")
+        gates = row.get("common_gates")
+        if (
+            not isinstance(gates, dict)
+            or not gates
+            or any(not isinstance(value, bool) for value in gates.values())
+        ):
+            raise ScorecardError(f"formal score has malformed {league} gates in {path}")
+        totals = row.get("controller_totals")
+        if not isinstance(totals, dict) or set(totals) != set(CONTROLLERS):
+            raise ScorecardError(f"formal score has incomplete {league} totals in {path}")
+        for controller in CONTROLLERS:
+            controller_row = totals[controller]
+            if not isinstance(controller_row, dict):
+                raise ScorecardError(
+                    f"formal score has malformed {league}/{controller} totals in {path}"
+                )
+            for metric in ("net_msat", "net_msat_per_million_sat_hour"):
+                value = _finite_number(
+                    controller_row.get(metric), f"{league}.{controller}.{metric}"
+                )
+                if value < 0:
+                    raise ScorecardError(
+                        f"{league}.{controller}.{metric} must be nonnegative"
+                    )
+        _finite_number(
+            row.get("revenue_ops_relative_margin"),
+            f"{league}.revenue_ops_relative_margin",
+        )
+        interval = row.get("paired_rate_difference_ci95")
+        if (
+            not isinstance(interval, list)
+            or len(interval) != 2
+            or _finite_number(interval[0], f"{league}.ci95.lower")
+            > _finite_number(interval[1], f"{league}.ci95.upper")
+        ):
+            raise ScorecardError(f"formal score has malformed {league} CI in {path}")
+    return payload
 
 
 def _integer(value: Any, label: str) -> int:
@@ -250,6 +341,7 @@ def summarize_controlled_rebalances(
 def summarize(
     blocks: list[dict[str, Any]],
     rebalance_observations: list[dict[str, Any]] | None = None,
+    formal_score: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     totals = {name: defaultdict(int) for name in CONTROLLERS}
     phases: dict[str, dict[str, defaultdict[str, int]]] = {}
@@ -427,6 +519,26 @@ def summarize(
     }
     clboss_net = overall["clboss"]["net_profit_msat"]
     revenue_net = overall["revenue_ops"]["net_profit_msat"]
+    formal_ready = False
+    formal_blocker = (
+        "requires a self-contained score from at least 3 fresh replicas and 6 "
+        "enhanced cold/warm blocks per league per replica"
+    )
+    if formal_score is not None:
+        formal_ready = all(
+            all(row["common_gates"].values())
+            for row in formal_score["leagues"].values()
+        )
+        failed = [
+            f"{league}.{gate}"
+            for league, row in formal_score["leagues"].items()
+            for gate, passed in row["common_gates"].items()
+            if not passed
+        ]
+        formal_blocker = (
+            None if formal_ready
+            else "failed formal evidence gates: " + ", ".join(sorted(failed))
+        )
     return {
         "schema": "polar-clboss-scorecard-v1",
         "coverage": {
@@ -436,11 +548,8 @@ def summarize(
             "attempted": attempted, "settled": settled,
             "fallback_settled_in_enhanced_blocks": fallback,
             "market_profiles": sorted(market_profiles),
-            "formal_verdict_ready": False,
-            "formal_verdict_blocker": (
-                "requires at least 3 fresh replicas and 6 enhanced cold/warm blocks "
-                "per league per replica"
-            ),
+            "formal_verdict_ready": formal_ready,
+            "formal_verdict_blocker": formal_blocker,
         },
         "overall": overall,
         "by_phase": {phase: finalize(rows) for phase, rows in sorted(phases.items())},
@@ -477,6 +586,7 @@ def summarize(
         "controlled_rebalance_economics": summarize_controlled_rebalances(
             rebalance_observations or []
         ),
+        "formal_competition": formal_score,
     }
 
 
@@ -486,6 +596,15 @@ def markdown(scorecard: dict[str, Any]) -> str:
     post_rebalance = scorecard["eligible_by_phase"].get("post_rebalance_demand")
     priority = scorecard["tournament_priority"]
     controlled = scorecard["controlled_rebalance_economics"]
+    formal = scorecard.get("formal_competition")
+
+    def verdict_label(verdict: str) -> str:
+        return {
+            "revenue_ops_wins": "Revenue Ops wins",
+            "clboss_wins": "CLBOSS wins",
+            "inconclusive": "Inconclusive",
+        }[verdict]
+
     lines = [
         "# CLBOSS tournament scorecard",
         "",
@@ -521,12 +640,60 @@ def markdown(scorecard: dict[str, Any]) -> str:
         lines.append(
             f"| {label} | {overall['revenue_ops'][key]} | {overall['clboss'][key]} | {leader} |"
         )
+    lines.append("")
+    if formal is None:
+        lines.extend([
+            "Formal verdict: **not ready**. It "
+            + str(coverage["formal_verdict_blocker"]) + ".",
+            "",
+        ])
+    else:
+        verdict = verdict_label(formal["verdict"])
+        run_id = formal["evidence_run_id"]
+        if coverage["formal_verdict_ready"]:
+            gate_note = "All common coverage, reliability, budget, and safety gates passed."
+        else:
+            gate_note = str(coverage["formal_verdict_blocker"]) + "."
+        lines.extend([
+            f"Formal verdict: **{verdict}** from frozen crossed series `{run_id}`. "
+            + gate_note,
+            "",
+            "## Formal frozen-series result",
+            "",
+            (
+                "This formal result controls tournament promotion; the larger historical "
+                "aggregate below remains diagnostic. Frozen Revenue Ops revision: `"
+                + formal["frozen_runner_evidence"]["revenue_ops_revision"]
+                + "`; image: `"
+                + formal["frozen_runner_evidence"]["image_id"]
+                + "`; replicas: "
+                + ", ".join(formal["frozen_runner_evidence"]["replicas"])
+                + "."
+            ),
+            "",
+            "| League | Revenue Ops normalized net | CLBOSS normalized net | Revenue margin | Paired 95% CI | Verdict |",
+            "|---|---:|---:|---:|---:|---|",
+        ])
+        for league in FORMAL_LEAGUES:
+            row = formal["leagues"][league]
+            totals = row["controller_totals"]
+            ci = row["paired_rate_difference_ci95"]
+            lines.append(
+                f"| {league} | "
+                f"{totals['revenue_ops']['net_msat_per_million_sat_hour']} | "
+                f"{totals['clboss']['net_msat_per_million_sat_hour']} | "
+                f"{row['revenue_ops_relative_margin'] * 100:.3f}% | "
+                f"[{ci[0]}, {ci[1]}] | {verdict_label(row['verdict'])} |"
+            )
+        lines.extend(["",])
+    fee_result = (
+        verdict_label(formal["leagues"]["fee_only"]["verdict"])
+        + " (formal)"
+        if formal is not None else "Revenue Ops (historical aggregate)"
+    )
     lines.extend([
-        "",
-        "Formal verdict: **not ready**. It " + coverage["formal_verdict_blocker"] + ".",
-        "",
         (
-            "Economic standing: **"
+            "Historical aggregate economic standing: **"
             + ("Revenue Ops" if priority["economic_leader"] == "revenue_ops" else "CLBOSS")
             + " leads the primary net-profit objective**"
             + (
@@ -551,7 +718,7 @@ def markdown(scorecard: dict[str, Any]) -> str:
             f"{overall['revenue_ops']['net_profit_msat']} msat net at "
             f"{overall['revenue_ops']['gross_yield_ppm']} ppm yield | "
             f"{overall['clboss']['net_profit_msat']} msat net at "
-            f"{overall['clboss']['gross_yield_ppm']} ppm yield | Revenue Ops |"
+            f"{overall['clboss']['gross_yield_ppm']} ppm yield | {fee_result} |"
         ),
         (
             "| Route acquisition / breadth | "
@@ -703,12 +870,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-dir", type=Path, default=Path("results/polar-clboss"))
     parser.add_argument("--exclusions", type=Path, default=DEFAULT_EXCLUSIONS)
+    parser.add_argument(
+        "--formal-score", type=Path,
+        help="self-contained frozen competition score that controls the formal verdict",
+    )
     parser.add_argument("--format", choices=("json", "markdown"), default="markdown")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     scorecard = summarize(
         load_blocks(args.results_dir, load_exclusions(args.exclusions)),
         load_rebalance_observations(args.results_dir),
+        load_formal_score(args.formal_score),
     )
     rendered = (
         json.dumps(scorecard, indent=2, sort_keys=True) + "\n"

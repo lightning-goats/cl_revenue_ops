@@ -640,13 +640,22 @@ def score_evidence(payload: dict[str, Any], *, iterations: int = 10_000) -> dict
         verdict = "clboss_wins"
     else:
         verdict = "inconclusive"
-    return {
+    result = {
         "schema": SCHEMA_SCORE,
         "generated_at": int(time.time()),
         "evidence_run_id": payload.get("run_id"),
         "verdict": verdict,
         "leagues": leagues,
     }
+    frozen_runner_evidence = payload.get("frozen_runner_evidence")
+    if frozen_runner_evidence is not None:
+        if not isinstance(frozen_runner_evidence, dict):
+            raise CompetitionError("frozen runner evidence must be an object")
+        # Keep the formal score self-contained: a living scorecard must be able
+        # to prove which image/revision and exact replicas produced its verdict
+        # without depending on an ignored results directory.
+        result["frozen_runner_evidence"] = dict(frozen_runner_evidence)
+    return result
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -656,6 +665,159 @@ def _load_json(path: Path) -> dict[str, Any]:
         raise CompetitionError(f"could not read {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise CompetitionError(f"{path} must contain a JSON object")
+    return payload
+
+
+def collect_runner_evidence(
+    results_dir: Path,
+    replicas: list[int],
+    *,
+    run_id: str,
+) -> dict[str, Any]:
+    """Bind frozen runner artifacts into the formal competition envelope.
+
+    Only untreated realistic baseline blocks are admissible. The collector
+    requires exactly three fresh replicas, crossed assignments, distinct node
+    identities, and one identical contender image/revision. This prevents a
+    formal score from mixing historical treatments or product revisions.
+    """
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise CompetitionError("run_id must be a non-empty string")
+    if (
+        len(replicas) != 3
+        or len(set(replicas)) != 3
+        or any(replica <= 0 for replica in replicas)
+    ):
+        raise CompetitionError(
+            "collect requires exactly three distinct positive replicas"
+        )
+    assignments: list[dict[str, Any]] = []
+    blocks: list[dict[str, Any]] = []
+    frozen_images: set[tuple[str, str]] = set()
+    node_ids: set[str] = set()
+    for replica in replicas:
+        replica_name = f"replica-{replica}"
+        replica_dir = results_dir / replica_name
+        state = _load_json(replica_dir / "state.json")
+        if state.get("schema") != "polar-clboss-runner-state-v1":
+            raise CompetitionError(
+                f"{replica_name} has unexpected runner state schema"
+            )
+        assignment = state.get("assignment")
+        if (
+            not isinstance(assignment, dict)
+            or set(assignment) != set(CONTROLLERS)
+            or set(assignment.values()) != {"identity-a", "identity-b"}
+        ):
+            raise CompetitionError(
+                f"{replica_name} has malformed crossed assignment"
+            )
+        contenders = state.get("contenders")
+        if (
+            not isinstance(contenders, dict)
+            or set(contenders) != {"identity-a", "identity-b"}
+        ):
+            raise CompetitionError(
+                f"{replica_name} has incomplete contender metadata"
+            )
+        replica_nodes: set[str] = set()
+        for identity in ("identity-a", "identity-b"):
+            row = contenders.get(identity)
+            node_id = (
+                str(row.get("node_id") or "") if isinstance(row, dict) else ""
+            )
+            if not node_id or node_id in node_ids or node_id in replica_nodes:
+                raise CompetitionError(
+                    f"{replica_name} does not prove fresh node identities"
+                )
+            replica_nodes.add(node_id)
+        node_ids.update(replica_nodes)
+        preflight = state.get("preflight")
+        labels = (
+            preflight.get("image_labels") if isinstance(preflight, dict) else None
+        )
+        image_id = (
+            str(preflight.get("image_id") or "")
+            if isinstance(preflight, dict) else ""
+        )
+        revision = (
+            str(labels.get("org.opencontainers.image.revision.revenue_ops") or "")
+            if isinstance(labels, dict) else ""
+        )
+        if not image_id or not revision:
+            raise CompetitionError(
+                f"{replica_name} lacks frozen image evidence"
+            )
+        frozen_images.add((image_id, revision))
+        readiness = state.get("forced_path_readiness")
+        readiness_payments = (
+            readiness.get("payments") if isinstance(readiness, dict) else None
+        )
+        if (
+            not isinstance(readiness_payments, list)
+            or len(readiness_payments) != 8
+            or readiness.get("scored") is not False
+            or any(
+                not isinstance(row, dict)
+                or row.get("direction") not in {"forward", "reverse"}
+                for row in readiness_payments
+            )
+        ):
+            raise CompetitionError(
+                f"{replica_name} lacks eight unscored forced-path readiness proofs"
+            )
+        assignments.append({
+            "replica": replica_name,
+            "controllers": assignment,
+        })
+
+        selected = []
+        for path in sorted(replica_dir.glob("smoke-*.json")):
+            if path.name.endswith("-progress.json"):
+                continue
+            block = _load_json(path)
+            if block.get("schema") != "polar-clboss-smoke-v1":
+                raise CompetitionError(f"unexpected smoke schema in {path}")
+            if block.get("replica") != replica_name:
+                raise CompetitionError(f"{path} belongs to a different replica")
+            if (
+                block.get("phase") == "baseline"
+                and block.get("market_profile") == "realistic"
+            ):
+                selected.append(block)
+        if not selected:
+            raise CompetitionError(
+                f"{replica_name} has no realistic baseline blocks"
+            )
+        blocks.extend(selected)
+    if len(frozen_images) != 1:
+        raise CompetitionError(
+            "selected replicas do not share one frozen Revenue Ops image"
+        )
+    shapes = {
+        (row["controllers"]["revenue_ops"], row["controllers"]["clboss"])
+        for row in assignments
+    }
+    if shapes != {
+        ("identity-a", "identity-b"),
+        ("identity-b", "identity-a"),
+    }:
+        raise CompetitionError(
+            "selected replicas do not cross both identity assignments"
+        )
+    image_id, revision = next(iter(frozen_images))
+    payload = {
+        "schema": SCHEMA_EVIDENCE,
+        "run_id": run_id.strip(),
+        "frozen_runner_evidence": {
+            "image_id": image_id,
+            "revenue_ops_revision": revision,
+            "replicas": [f"replica-{replica}" for replica in replicas],
+        },
+        "assignments": assignments,
+        "blocks": blocks,
+    }
+    validate_evidence(payload)
     return payload
 
 
@@ -676,10 +838,25 @@ def main() -> int:
     score_parser.add_argument("--evidence", type=Path, required=True)
     score_parser.add_argument("--bootstrap-iterations", type=int, default=10_000)
     score_parser.add_argument("--output", type=Path, required=True)
+    collect_parser = subparsers.add_parser("collect")
+    collect_parser.add_argument("--results-dir", type=Path, required=True)
+    collect_parser.add_argument(
+        "--replica", type=int, action="append", required=True
+    )
+    collect_parser.add_argument("--run-id", required=True)
+    collect_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
         if args.command == "plan":
             _emit(build_plan(args.network_id, _git_commit(args.repo_root)), args.output)
+            return 0
+        if args.command == "collect":
+            _emit(
+                collect_runner_evidence(
+                    args.results_dir, args.replica, run_id=args.run_id,
+                ),
+                args.output,
+            )
             return 0
         payload = score_evidence(
             _load_json(args.evidence), iterations=args.bootstrap_iterations

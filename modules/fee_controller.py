@@ -2665,6 +2665,8 @@ class FeeController:
     # Limit only that cycle's downward move; subsequent quiet/unprofitable
     # windows retain the ordinary exploration and zero-flow recovery paths.
     PROFITABLE_WINDOW_MAX_DOWNSHIFT_RATIO = 0.05
+    MIN_CADENCE_OBSERVATION_SECONDS = 120.0
+    MIN_CADENCE_OBSERVATION_CYCLES = 3.0
     # Cadence scaling for the streak thresholds (2026-07-03 floor-pinning
     # fix): a channel that earns every ~24h is not "stalled" after 4 quiet
     # hours. Thresholds stretch to multiples of the observed meaningful-
@@ -6278,7 +6280,6 @@ class FeeController:
                 else:
                     skip_reason = self._classify_no_adjustment_skip_reason(
                         cycle=cycle,
-                        now=now,
                         pre_is_sleeping=pre_is_sleeping,
                         pre_last_update=pre_last_update,
                         pre_hours_elapsed=pre_hours_elapsed,
@@ -6306,7 +6307,6 @@ class FeeController:
     def _classify_no_adjustment_skip_reason(
         self,
         cycle: "ChannelCycleState",
-        now: int,
         pre_is_sleeping: bool,
         pre_last_update: int,
         pre_hours_elapsed: float,
@@ -6317,16 +6317,21 @@ class FeeController:
     ) -> str:
         """Classify scheduler skip reasons without trusting post-call timer resets."""
         _, profile = self._resolve_fee_profile(cfg)
+        effective_min_hours = self._effective_min_observation_hours(profile, cfg)
         if pre_is_sleeping:
             return "sleeping"
 
         if pre_last_update > 0:
-            time_ok = pre_hours_elapsed >= profile.min_observation_hours
+            time_ok = pre_hours_elapsed >= effective_min_hours
             forwards_ok = pre_forward_count >= profile.min_forwards_for_signal
             if not time_ok and not forwards_ok:
                 return "waiting_time"
 
-        if cycle.last_update >= now:
+        # The adjustment path takes its own wall-clock sample. Comparing that
+        # integer timestamp with this caller's sample is racy across a second
+        # boundary; advancement from the channel's pre-call timestamp is the
+        # direct evidence that the observation window was consumed.
+        if cycle.last_update > pre_last_update:
             if (
                 cycle.last_fee_ppm != actual_fee_ppm
                 and cycle.last_broadcast_fee_ppm == pre_last_broadcast_fee_ppm
@@ -6340,6 +6345,33 @@ class FeeController:
             return "alpha_guard"
 
         return "fee_unchanged"
+
+    @classmethod
+    def _effective_min_observation_hours(
+        cls,
+        profile: FeeProfileSettings,
+        cfg: Optional[Any],
+    ) -> float:
+        """Scale only very fast configured cadences without changing defaults.
+
+        The production-default 30-minute fee cadence retains the profile's
+        15-minute active window. Explicit sub-five-minute cadences use at least
+        three controller cycles and never less than two minutes. Missing,
+        malformed, or non-finite cadence evidence fails closed to the profile
+        window instead of shortening it.
+        """
+        profile_hours = float(profile.min_observation_hours)
+        try:
+            interval_seconds = float(getattr(cfg, "fee_interval"))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return profile_hours
+        if not math.isfinite(interval_seconds) or interval_seconds <= 0:
+            return profile_hours
+        cadence_seconds = max(
+            cls.MIN_CADENCE_OBSERVATION_SECONDS,
+            interval_seconds * cls.MIN_CADENCE_OBSERVATION_CYCLES,
+        )
+        return min(profile_hours, cadence_seconds / 3600.0)
 
     def _should_force_gossip_refresh(
         self,
@@ -7263,14 +7295,17 @@ class FeeController:
             # This prevents stagnant channels from waiting forever while still
             # allowing quick reaction when routing data is available.
 
-            time_ok = hours_elapsed >= fee_profile.min_observation_hours
+            effective_min_hours = self._effective_min_observation_hours(
+                fee_profile, cfg,
+            )
+            time_ok = hours_elapsed >= effective_min_hours
             forwards_ok = forward_count >= fee_profile.min_forwards_for_signal
 
             if force_reprice_reason:
                 self.plugin.log(
                     f"DYNAMIC_WINDOW: {channel_id[:12]}... bypassing wait due to {force_reprice_reason} "
                     f"({forward_count}/{fee_profile.min_forwards_for_signal} forwards, "
-                    f"{hours_elapsed:.1f}/{fee_profile.min_observation_hours}h)",
+                    f"{hours_elapsed:.3f}/{effective_min_hours:.3f}h)",
                     level='debug'
                 )
             elif time_ok or forwards_ok:
@@ -7298,7 +7333,7 @@ class FeeController:
                 self.plugin.log(
                     f"DYNAMIC_WINDOW: {channel_id[:12]}... waiting "
                     f"({forward_count}/{fee_profile.min_forwards_for_signal} forwards, "
-                    f"{hours_elapsed:.1f}/{fee_profile.min_observation_hours}h, "
+                    f"{hours_elapsed:.3f}/{effective_min_hours:.3f}h, "
                     f"profile={fee_profile_name})",
                     level='debug'
                 )

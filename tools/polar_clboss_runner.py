@@ -1749,6 +1749,91 @@ def isolate_background(
     return state
 
 
+def prime_forced_paths(
+    bridge: PolarMcp,
+    *,
+    replica: int,
+    results_dir: Path,
+    amount_sats: int = 5_000,
+) -> dict[str, Any]:
+    """Prove every contender/client/direction path before scored selection.
+
+    These equal, exact-path readiness payments are deliberately unscored. They
+    prevent a sender's first automatic route lookup from mistaking an untried
+    contender path for an unavailable one and selecting the expensive fallback
+    router. Both directions keep the readiness transfer approximately neutral.
+    """
+    path = state_path(results_dir, replica)
+    state = read_state(path)
+    if state.get("status") != "isolated_fee_only_ready":
+        raise RunnerError(
+            "forced-path readiness requires fresh isolated fee-only state"
+        )
+    if "forced_path_readiness" in state or any(
+        isinstance(event, dict) and event.get("event") == "smoke_complete"
+        for event in state.get("events", [])
+    ):
+        raise RunnerError(
+            "forced-path readiness refuses prior readiness or scored traffic"
+        )
+    amount_sats = positive_int(amount_sats)
+    # Payer-funded contender channels start with zero local balance. A reverse
+    # proof needs the 1% channel reserve plus the probe amount to be present
+    # first; otherwise the route is correctly unavailable despite healthy
+    # gossip. The 1M-sat formal topology has a 10k-sat reserve plus variable
+    # anchor/commitment-fee headroom. Seed 5% of capacity so the proof remains
+    # valid across the lab's live feerate range.
+    forward_amount_sats = max(amount_sats, CHANNEL_CAPACITY_SATS // 20)
+    lane_map = state.get("lane_map")
+    assignment = state.get("assignment")
+    if not isinstance(lane_map, dict) or not isinstance(assignment, dict):
+        raise RunnerError("forced-path readiness lacks lane metadata")
+    payments: list[dict[str, Any]] = []
+    for controller in ("revenue_ops", "clboss"):
+        identity = assignment.get(controller)
+        lanes = lane_map.get(identity) if isinstance(identity, str) else None
+        if not isinstance(lanes, dict):
+            raise RunnerError(f"forced-path readiness lacks {controller} lanes")
+        by_role = {
+            (row.get("family"), row.get("side")): scid
+            for scid, row in lanes.items() if isinstance(row, dict)
+        }
+        expected = {
+            (family, side)
+            for family in ("cln", "lnd")
+            for side in ("payer", "sink")
+        }
+        if set(by_role) != expected:
+            raise RunnerError(
+                f"forced-path readiness has incomplete {controller} lane roles"
+            )
+        for family in ("cln", "lnd"):
+            payment_fn = (
+                _directed_cln_fixture_payment
+                if family == "cln" else _directed_lnd_fixture_payment
+            )
+            for direction, side in (("forward", "payer"), ("reverse", "sink")):
+                payment_amount_sats = (
+                    forward_amount_sats if direction == "forward" else amount_sats
+                )
+                payments.append(payment_fn(
+                    bridge,
+                    network_id=int(state["network_id"]),
+                    target_scid=by_role[(family, side)],
+                    amount_sats=payment_amount_sats,
+                    label=f"readiness-{controller}-{family}-{direction}",
+                    direction=direction,
+                ))
+    state["forced_path_readiness"] = {
+        "forward_amount_sats": forward_amount_sats,
+        "reverse_amount_sats": amount_sats,
+        "scored": False,
+        "payments": payments,
+    }
+    _checkpoint(path, state, "forced_paths_primed", readiness=state["forced_path_readiness"])
+    return state
+
+
 def retune_background(
     *, replica: int, results_dir: Path, background_ppm: int
 ) -> dict[str, Any]:
@@ -3130,6 +3215,33 @@ def traffic_schedule(
     return tuple(schedule)
 
 
+def _completed_smoke_exists_for_league(replica_dir: Path, league: str) -> bool:
+    """Return whether this replica already has a valid block in ``league``.
+
+    Route-cache state is league-local: switching from fee-only to full-stack
+    starts a new cold observation even though the contender wallets remain the
+    same. Existing artifacts are authoritative and malformed artifacts fail
+    closed instead of silently turning a warm block into a cold one.
+    """
+    if league not in {"fee_only", "full_stack"}:
+        raise RunnerError(f"unknown smoke league: {league!r}")
+    for artifact in sorted(replica_dir.glob("smoke-*.json")):
+        if artifact.name.endswith("-progress.json"):
+            continue
+        try:
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RunnerError(f"cannot read prior smoke artifact {artifact}: {exc}") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != "polar-clboss-smoke-v1"
+        ):
+            raise RunnerError(f"unexpected prior smoke schema in {artifact}")
+        if payload.get("league") == league:
+            return True
+    return False
+
+
 def run_smoke(
     bridge: PolarMcp,
     *,
@@ -3180,10 +3292,12 @@ def run_smoke(
         controller: state["contenders"][identity]["container"]
         for controller, identity in assignment.items()
     }
-    cache_mode = "warm" if any(
-        event.get("event") == "smoke_complete"
-        for event in state.get("events", []) if isinstance(event, dict)
-    ) else "cold"
+    current_league = str(state.get("league") or "fee_only")
+    cache_mode = (
+        "warm"
+        if _completed_smoke_exists_for_league(path.parent, current_league)
+        else "cold"
+    )
     before = {name: contender_totals(container) for name, container in controller_containers.items()}
     started = time.time()
     block_id = f"smoke-{int(started)}"
@@ -3379,7 +3493,7 @@ def run_smoke(
     block = {
         "schema": "polar-clboss-smoke-v1",
         "replica": f"replica-{replica}",
-        "league": str(state.get("league") or "fee_only"),
+        "league": current_league,
         "market_profile": str(state.get("market_profile") or "legacy_low_fee"),
         "block": block_id,
         "duration_seconds": max(1.0, time.time() - started),
@@ -4053,7 +4167,8 @@ def build_parser() -> argparse.ArgumentParser:
             "preflight", "setup", "isolate", "retune", "full-stack",
             "acquire", "restore-acquire", "auto-acquire", "retain",
             "restore-auto", "accelerate", "smoke", "return-path", "observe-rebalance",
-            "retire-return-paths", "deplete", "target-pressure", "status", "cleanup",
+            "retire-return-paths", "deplete", "target-pressure", "prime-paths",
+            "status", "cleanup",
         ),
     )
     parser.add_argument("--network-id", type=positive_int, default=NETWORK_ID)
@@ -4142,7 +4257,7 @@ def main() -> int:
             "setup", "isolate", "retune", "full-stack", "acquire",
             "restore-acquire", "auto-acquire", "retain", "restore-auto", "accelerate",
             "smoke", "return-path", "observe-rebalance", "retire-return-paths",
-            "deplete", "target-pressure", "cleanup"
+            "deplete", "target-pressure", "prime-paths", "cleanup"
         } and not args.apply:
             raise RunnerError(f"{args.command} mutates the fake-sat lab; pass --apply")
         if args.command == "setup":
@@ -4160,6 +4275,13 @@ def main() -> int:
             result = retune_background(
                 replica=args.replica, results_dir=args.results_dir,
                 background_ppm=args.background_ppm,
+            )
+        elif args.command == "prime-paths":
+            result = prime_forced_paths(
+                bridge,
+                replica=args.replica,
+                results_dir=args.results_dir,
+                amount_sats=args.amount_sats,
             )
         elif args.command == "full-stack":
             result = enable_full_stack(

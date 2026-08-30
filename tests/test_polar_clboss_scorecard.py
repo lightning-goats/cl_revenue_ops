@@ -69,6 +69,48 @@ def rebalance_observation(destination_ppm, revenue_delivered_msat, revenue_cost_
     }
 
 
+def formal_score(verdict="clboss_wins"):
+    leagues = {}
+    for league, league_verdict, revenue_rate, clboss_rate, margin, interval in (
+        ("fee_only", "inconclusive", 164_438.6, 267_498.2, -0.385, [-260_285.1, 103_860.3]),
+        ("full_stack", verdict, 121_596.0, 281_690.3, -0.568, [-271_949.1, -26_442.2]),
+    ):
+        leagues[league] = {
+            "verdict": league_verdict,
+            "common_gates": {
+                "coverage": True,
+                "payment_success": True,
+                "fallback_share": True,
+                "safety": True,
+                "spend_cap": True,
+                "fee_only_zero_rebalance_cost": True,
+            },
+            "controller_totals": {
+                "revenue_ops": {
+                    "net_msat": 100,
+                    "net_msat_per_million_sat_hour": revenue_rate,
+                },
+                "clboss": {
+                    "net_msat": 200,
+                    "net_msat_per_million_sat_hour": clboss_rate,
+                },
+            },
+            "revenue_ops_relative_margin": margin,
+            "paired_rate_difference_ci95": interval,
+        }
+    return {
+        "schema": "polar-clboss-competition-score-v1",
+        "evidence_run_id": "formal-unit-test",
+        "verdict": verdict,
+        "frozen_runner_evidence": {
+            "image_id": "sha256:frozen",
+            "revenue_ops_revision": "frozen-revision",
+            "replicas": ["replica-1", "replica-2", "replica-3"],
+        },
+        "leagues": leagues,
+    }
+
+
 def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming():
     mod = load_scorecard()
 
@@ -125,6 +167,38 @@ def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming()
     assert "### acquisition" in rendered
     assert "## Eligible results by phase" in rendered
     assert "### paid_retention" in rendered
+
+
+def test_formal_score_controls_verdict_without_erasing_historical_aggregate(tmp_path):
+    mod = load_scorecard()
+    path = tmp_path / "formal.json"
+    path.write_text(json.dumps(formal_score()), encoding="utf-8")
+
+    frozen = mod.load_formal_score(path)
+    result = mod.summarize([block()], formal_score=frozen)
+
+    assert result["coverage"]["formal_verdict_ready"] is True
+    assert result["coverage"]["formal_verdict_blocker"] is None
+    assert result["formal_competition"]["verdict"] == "clboss_wins"
+    assert result["tournament_priority"]["economic_leader"] == "revenue_ops"
+    rendered = mod.markdown(result)
+    assert "Formal verdict: **CLBOSS wins**" in rendered
+    assert "## Formal frozen-series result" in rendered
+    assert "This formal result controls tournament promotion" in rendered
+    assert "| fee_only | 164438.6 | 267498.2 | -38.500%" in rendered
+    assert "Inconclusive (formal)" in rendered
+    assert "Historical aggregate economic standing" in rendered
+
+
+def test_formal_score_fails_closed_without_frozen_provenance(tmp_path):
+    mod = load_scorecard()
+    payload = formal_score()
+    payload.pop("frozen_runner_evidence")
+    path = tmp_path / "formal.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(mod.ScorecardError, match="lacks frozen runner provenance"):
+        mod.load_formal_score(path)
 
 
 def test_scorecard_tracks_profit_selective_controlled_rebalances():

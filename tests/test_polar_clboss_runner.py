@@ -2084,6 +2084,89 @@ def test_runner_parser_accepts_payer_depletion_side():
     assert args.depletion_side == "payer"
 
 
+def test_smoke_cache_mode_is_cold_once_per_league(tmp_path):
+    runner = load_runner()
+    replica_dir = tmp_path / "replica-1"
+    replica_dir.mkdir()
+
+    assert runner._completed_smoke_exists_for_league(
+        replica_dir, "fee_only"
+    ) is False
+    runner.write_json_atomic(replica_dir / "smoke-1.json", {
+        "schema": "polar-clboss-smoke-v1",
+        "league": "fee_only",
+    })
+
+    assert runner._completed_smoke_exists_for_league(
+        replica_dir, "fee_only"
+    ) is True
+    assert runner._completed_smoke_exists_for_league(
+        replica_dir, "full_stack"
+    ) is False
+
+
+def test_smoke_cache_mode_fails_closed_on_malformed_prior_artifact(tmp_path):
+    runner = load_runner()
+    replica_dir = tmp_path / "replica-1"
+    replica_dir.mkdir()
+    (replica_dir / "smoke-bad.json").write_text("{", encoding="utf-8")
+
+    with pytest.raises(runner.RunnerError, match="cannot read prior smoke artifact"):
+        runner._completed_smoke_exists_for_league(replica_dir, "fee_only")
+
+
+def test_prime_forced_paths_covers_both_controllers_families_and_directions(
+    monkeypatch, tmp_path
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 12)
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "network_id": 4,
+        "status": "isolated_fee_only_ready",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "lane_map": {
+            identity: {
+                f"{base + offset}x1x0": {"family": family, "side": side}
+                for offset, (family, side) in enumerate((
+                    ("cln", "payer"), ("cln", "sink"),
+                    ("lnd", "payer"), ("lnd", "sink"),
+                ))
+            }
+            for identity, base in (("identity-a", 10), ("identity-b", 20))
+        },
+    })
+    routed = []
+
+    def payment(_bridge, **kwargs):
+        routed.append(kwargs)
+        return {
+            "direction": kwargs["direction"],
+            "target_short_channel_id": kwargs["target_scid"],
+        }
+
+    monkeypatch.setattr(runner, "_directed_cln_fixture_payment", payment)
+    monkeypatch.setattr(runner, "_directed_lnd_fixture_payment", payment)
+
+    state = runner.prime_forced_paths(
+        object(), replica=12, results_dir=tmp_path, amount_sats=5_000,
+    )
+
+    assert len(routed) == 8
+    assert {(row["label"].split("-")[1], row["direction"]) for row in routed} == {
+        ("revenue_ops", "forward"), ("revenue_ops", "reverse"),
+        ("clboss", "forward"), ("clboss", "reverse"),
+    }
+    assert [row["amount_sats"] for row in routed] == [
+        50_000, 5_000, 50_000, 5_000,
+        50_000, 5_000, 50_000, 5_000,
+    ]
+    assert state["forced_path_readiness"]["forward_amount_sats"] == 50_000
+    assert state["forced_path_readiness"]["reverse_amount_sats"] == 5_000
+    assert state["forced_path_readiness"]["scored"] is False
+
+
 def test_directed_lnd_fixture_payment_pins_first_and_last_hop(monkeypatch):
     runner = load_runner()
     monkeypatch.setattr(runner, "_live_lnd_channels", lambda _container: [{
