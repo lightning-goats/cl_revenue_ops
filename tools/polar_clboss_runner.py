@@ -3307,10 +3307,10 @@ def traffic_schedule(
     """Build deterministic competition or one-way liquidity-pressure traffic.
 
     A supplied seed shuffles the recorded workload without risking a reverse
-    payment before its family has received reserve liquidity.  The first
-    forward for each family is therefore shuffled only against the other
-    family seed; every remaining family/direction/amount entry is shuffled as
-    one deterministic tail.  ``None`` preserves historical fixture order.
+    payment before its matching forward has supplied liquidity.  Balanced
+    traffic is therefore shuffled as complete forward/reverse pairs, while
+    one-way pressure traffic is shuffled entry-by-entry.  ``None`` preserves
+    historical fixture order.
     """
     if rounds <= 0 or amount_sats <= 0:
         raise RunnerError("traffic rounds and amount must be positive")
@@ -3322,7 +3322,6 @@ def traffic_schedule(
         raise RunnerError(f"unknown traffic family: {traffic_family}")
     families = ("cln", "lnd") if traffic_family == "both" else (traffic_family,)
     schedule: list[tuple[str, str, int]] = []
-    reserve_seeds: list[tuple[str, str, int]] = []
     for round_index in range(rounds):
         round_amount = (
             REALISTIC_TRAFFIC_AMOUNTS_SATS[
@@ -3343,20 +3342,15 @@ def traffic_schedule(
             )
             row = (family, "forward", forward_amount)
             schedule.append(row)
-            if round_index == 0:
-                reserve_seeds.append(row)
             schedule.append((family, "reverse", round_amount))
     if traffic_seed is not None:
         if isinstance(traffic_seed, bool) or not isinstance(traffic_seed, int):
             raise RunnerError("traffic seed must be an integer")
         rng = random.Random(traffic_seed)
         if pattern == "balanced":
-            tail = list(schedule)
-            for row in reserve_seeds:
-                tail.remove(row)
-            rng.shuffle(reserve_seeds)
-            rng.shuffle(tail)
-            schedule = [*reserve_seeds, *tail]
+            pairs = [schedule[index:index + 2] for index in range(0, len(schedule), 2)]
+            rng.shuffle(pairs)
+            schedule = [row for pair in pairs for row in pair]
         else:
             rng.shuffle(schedule)
     return tuple(schedule)

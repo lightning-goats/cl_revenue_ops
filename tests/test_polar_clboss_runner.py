@@ -1642,12 +1642,15 @@ def test_seeded_traffic_schedule_is_deterministic_distinct_and_reserve_safe():
 
     assert first == repeated
     assert first != second
-    assert {family for family, direction, _amount in first[:2]
-            if direction == "forward"} == {"cln", "lnd"}
-    assert all(direction == "forward" for _family, direction, _amount in first[:2])
     assert sorted(first) == sorted(runner.traffic_schedule(
         4, 999, amount_profile="realistic",
     ))
+    for index in range(0, len(first), 2):
+        forward, reverse = first[index:index + 2]
+        assert forward[0] == reverse[0]
+        assert forward[1] == "forward"
+        assert reverse[1] == "reverse"
+        assert forward[2] >= reverse[2]
 
 
 def test_seeded_pressure_schedule_shuffles_without_changing_workload():
