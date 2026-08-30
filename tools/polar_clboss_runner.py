@@ -31,7 +31,7 @@ from polar_mixed_client_lab import (  # noqa: E402
 
 
 SCHEMA = "polar-clboss-runner-state-v1"
-EXPECTED_REVENUE_REVISION = "f74bfffad76a818793642ac3f8b5a3c6c3ad214d"
+EXPECTED_REVENUE_REVISION = "bfc577d0029ff393b21544bfd509a0e5621a796d"
 IMAGE = f"cl-revenue-ops-polar-clboss:{EXPECTED_REVENUE_REVISION[:7]}"
 EXPECTED_CLN_VERSION = "v26.06.7"
 EXPECTED_CLN_ARTIFACT_DIGEST = (
