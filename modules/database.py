@@ -865,9 +865,10 @@ class Database:
             )
         """)
 
-        # Restart-safe, auditable market-acquisition episodes. A partial
-        # unique index enforces the global one-at-a-time safety invariant in
-        # SQLite rather than relying on an in-process race check.
+        # Restart-safe, auditable market-acquisition episodes. SQLite enforces
+        # no duplicate active channel/peer and no more than two active rows;
+        # this keeps the bounded two-market rollout safe across restarts and
+        # concurrent fee-cycle attempts.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS acquisition_experiments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -896,9 +897,37 @@ class Database:
                 retention_base_fee_msat INTEGER
             )
         """)
+        # Migrate the former global one-active index before installing the
+        # bounded two-active invariant. Existing databases can have at most
+        # one active row here, so the new unique indexes are conflict-free.
+        conn.execute("DROP INDEX IF EXISTS idx_acquisition_one_active")
         conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_acquisition_one_active
-            ON acquisition_experiments(state) WHERE state = 'active'
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_acquisition_one_active_channel
+            ON acquisition_experiments(channel_id) WHERE state = 'active'
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_acquisition_one_active_peer
+            ON acquisition_experiments(peer_id) WHERE state = 'active'
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_acquisition_max_two_insert
+            BEFORE INSERT ON acquisition_experiments
+            WHEN NEW.state = 'active'
+             AND (SELECT COUNT(*) FROM acquisition_experiments
+                  WHERE state = 'active') >= 2
+            BEGIN
+                SELECT RAISE(ABORT, 'maximum active acquisition experiments');
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_acquisition_max_two_update
+            BEFORE UPDATE OF state ON acquisition_experiments
+            WHEN NEW.state = 'active' AND OLD.state != 'active'
+             AND (SELECT COUNT(*) FROM acquisition_experiments
+                  WHERE state = 'active') >= 2
+            BEGIN
+                SELECT RAISE(ABORT, 'maximum active acquisition experiments');
+            END
         """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_acquisition_channel_completed
@@ -2288,7 +2317,7 @@ class Database:
         baseline_base_fee_msat: int = 0,
         target_base_fee_msat: int = 0,
     ) -> Optional[Dict[str, Any]]:
-        """Persist one active episode, returning None if another is active."""
+        """Persist an episode, or None when the two-market safety cap blocks it."""
         conn = self._get_connection()
         now = int(time.time()) if started_at is None else int(started_at)
         try:

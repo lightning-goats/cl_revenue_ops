@@ -21,7 +21,7 @@ version gate exists.
 
 | Table | Written by (domain) |
 |---|---|
-| acquisition_experiments | restart-safe single-lane acquisition episodes, baseline restoration, and bounded-loss evidence (fee controller) |
+| acquisition_experiments | restart-safe, at-most-two distinct-peer acquisition episodes, baseline restoration, and bounded-loss evidence (fee controller) |
 | budget_reservations | rebalance budget reservations (database.py `reserve_budget`) |
 | channel_closure_costs | close-cost accounting (planner/profitability) |
 | channel_costs | per-channel open/rebalance cost ledger (profitability) |

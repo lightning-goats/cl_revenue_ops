@@ -2264,6 +2264,18 @@ def test_prime_forced_paths_covers_both_controllers_families_and_directions(
 
     monkeypatch.setattr(runner, "_directed_cln_fixture_payment", payment)
     monkeypatch.setattr(runner, "_directed_lnd_fixture_payment", payment)
+    acquisition_calls = []
+
+    def acquisition_readiness(_state, *, expected_phase, **_kwargs):
+        acquisition_calls.append(expected_phase)
+        return [
+            {"family": family, "phase": expected_phase}
+            for family in ("cln", "lnd")
+        ]
+
+    monkeypatch.setattr(
+        runner, "wait_for_native_acquisition_markets", acquisition_readiness
+    )
 
     state = runner.prime_forced_paths(
         object(), replica=12, results_dir=tmp_path, amount_sats=5_000,
@@ -2281,6 +2293,94 @@ def test_prime_forced_paths_covers_both_controllers_families_and_directions(
     assert state["forced_path_readiness"]["forward_amount_sats"] == 50_000
     assert state["forced_path_readiness"]["reverse_amount_sats"] == 5_000
     assert state["forced_path_readiness"]["scored"] is False
+    assert acquisition_calls == ["acquisition", "retention"]
+    assert {
+        row["family"]
+        for row in state["forced_path_readiness"]["acquisition_after"]
+    } == {"cln", "lnd"}
+
+
+def test_wait_for_native_acquisition_markets_is_read_only_and_family_complete(
+    monkeypatch,
+):
+    runner = load_runner()
+    state = {
+        "assignment": {"revenue_ops": "identity-a"},
+        "contenders": {"identity-a": {"container": "revenue-container"}},
+        "lane_map": {
+            "identity-a": {
+                "10x1x0": {"family": "cln", "side": "sink"},
+                "11x1x0": {"family": "lnd", "side": "sink"},
+                "12x1x0": {"family": "cln", "side": "payer"},
+            }
+        },
+    }
+    monkeypatch.setattr(runner, "_acquisition_rows", lambda _container: [
+        {
+            "id": 1,
+            "channel_id": "10x1x0",
+            "state": "active",
+            "phase": "retention",
+            "retention_fee_ppm": 0,
+            "retention_base_fee_msat": 4,
+        },
+        {
+            "id": 2,
+            "channel_id": "11x1x0",
+            "state": "active",
+            "phase": "retention",
+            "retention_fee_ppm": 0,
+            "retention_base_fee_msat": 7,
+        },
+    ])
+    monkeypatch.setattr(runner, "active_channels", lambda _container: [
+        {
+            "short_channel_id": "10x1x0",
+            "updates": {"local": {
+                "fee_proportional_millionths": 0,
+                "fee_base_msat": 4,
+            }},
+        },
+        {
+            "short_channel_id": "11x1x0",
+            "updates": {"local": {
+                "fee_proportional_millionths": 0,
+                "fee_base_msat": 7,
+            }},
+        },
+    ])
+
+    rows = runner.wait_for_native_acquisition_markets(
+        state, expected_phase="retention", attempts=1, poll_seconds=0
+    )
+
+    assert [(row["family"], row["fee_base_msat"]) for row in rows] == [
+        ("cln", 4), ("lnd", 7)
+    ]
+
+
+def test_wait_for_native_acquisition_markets_fails_closed_on_malformed_rows(
+    monkeypatch,
+):
+    runner = load_runner()
+    state = {
+        "assignment": {"revenue_ops": "identity-a"},
+        "contenders": {"identity-a": {"container": "revenue-container"}},
+        "lane_map": {"identity-a": {
+            "10x1x0": {"family": "cln", "side": "sink"},
+            "11x1x0": {"family": "lnd", "side": "sink"},
+        }},
+    }
+    monkeypatch.setattr(runner, "_acquisition_rows", lambda _container: [
+        {"channel_id": "10x1x0", "state": "active", "phase": "acquisition"},
+        {"channel_id": "11x1x0", "state": "active", "phase": "acquisition"},
+    ])
+    monkeypatch.setattr(runner, "active_channels", lambda _container: [])
+
+    with pytest.raises(runner.RunnerError, match="did not reach acquisition"):
+        runner.wait_for_native_acquisition_markets(
+            state, expected_phase="acquisition", attempts=1, poll_seconds=0
+        )
 
 
 def test_directed_lnd_fixture_payment_pins_first_and_last_hop(monkeypatch):

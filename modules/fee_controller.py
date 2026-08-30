@@ -2585,7 +2585,12 @@ class FeeController:
     EXPLORATION_SPARSE_HEADROOM_RATIO = 0.50
 
     # Default-on market-acquisition rollout. These are fixed safety rails,
-    # not tuning knobs: the production surface exposes only enable/off.
+    # not tuning knobs: the production surface exposes only enable/off. Two
+    # different peer markets may be tested concurrently so a single cheap
+    # market cannot monopolize acquisition learning. The per-episode rails
+    # therefore imply hard node-wide maxima of 500k sats observed volume and
+    # 50 sats opportunity cost.
+    ACQUISITION_MAX_ACTIVE_EXPERIMENTS = 2
     ACQUISITION_TARGET_FEE_PPM = 0
     ACQUISITION_TARGET_BASE_FEE_MSAT = 0
     # Public routing markets frequently cluster at a few ppm on the cheapest
@@ -3190,17 +3195,24 @@ class FeeController:
             for row in active_rows
             if isinstance(row, dict) and row.get("channel_id")
         }
-        if active or not _cfg_bool(cfg, "acquisition_experiment_enabled", False):
+        if not _cfg_bool(cfg, "acquisition_experiment_enabled", False):
+            return active
+        if len(active) >= self.ACQUISITION_MAX_ACTIVE_EXPERIMENTS:
             return active
         if int(getattr(cfg, "min_fee_ppm_saturated", 0) or 0) > 0:
-            return {}
+            return active
 
         start_episode = getattr(self.database, "start_acquisition_experiment", None)
         cooldown = getattr(self.database, "channel_acquisition_on_cooldown", None)
         if not callable(start_episode) or not callable(cooldown):
-            return {}
+            return active
 
         candidates: list[tuple[float, str, str, int, int, int]] = []
+        active_peers = {
+            str(row.get("peer_id"))
+            for row in active.values()
+            if isinstance(row, dict) and row.get("peer_id")
+        }
         for state in channel_states:
             if not isinstance(state, dict):
                 continue
@@ -3208,6 +3220,8 @@ class FeeController:
             peer_id = str(state.get("peer_id") or "")
             info = channels.get(channel_id)
             if not channel_id or not peer_id or not isinstance(info, dict):
+                continue
+            if channel_id in active or peer_id in active_peers:
                 continue
             try:
                 capacity = int(info.get("capacity") or 0)
@@ -3287,6 +3301,10 @@ class FeeController:
         ) in sorted(
             candidates, key=lambda row: (-row[0], row[1])
         ):
+            if len(active) >= self.ACQUISITION_MAX_ACTIVE_EXPERIMENTS:
+                break
+            if peer_id in active_peers:
+                continue
             try:
                 episode = start_episode(
                     channel_id=channel_id,
@@ -3312,8 +3330,9 @@ class FeeController:
                     f"outbound={ratio:.1%}, competitor_floor={competitor_floor}ppm)",
                     level="info",
                 )
-                return {channel_id: episode}
-        return {}
+                active[channel_id] = episode
+                active_peers.add(peer_id)
+        return active
 
     @classmethod
     def _acquisition_competitor_floor_qualifies(cls, value: Any) -> bool:
@@ -9089,7 +9108,7 @@ class FeeController:
             )
         elif decision_reason == "ACQUISITION_EXPERIMENT":
             reason = (
-                "ACQUISITION: bounded single-lane market-share quote, "
+                "ACQUISITION: bounded peer-market-share quote, "
                 f"volume={acquisition_volume_sats}sats, "
                 f"opportunity_cost={acquisition_opportunity_cost_sats:.3f}sats, "
                 f"competitor_floor={acquisition_competitor_floor_ppm}ppm, "

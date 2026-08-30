@@ -40,7 +40,7 @@ PUBLIC_RUNTIME_KEYS = (
     # may advertise below min_fee_ppm (fee-band decompression). 0 = allow
     # true cheap egress on saturated edges (the default).
     'min_fee_ppm_saturated',
-    # Default-off, single-lane bounded zero-fee market-acquisition experiment.
+    # Default-on, bounded two-peer market-acquisition experiment.
     'acquisition_experiment_enabled',
     'max_fee_ppm',
     'fee_profile',

@@ -239,18 +239,22 @@ method-not-found.
 - `revenue-config reset <key>` removes the DB override, the escape hatch that lets `setconfig`/config-file values govern the field again (some fields apply immediately; others require a plugin restart to re-adopt the file default — the RPC response says which).
 - `revenue-config list-mutable` returns the current set of public runtime keys; only keys in this list can be `set` or `reset` (all others return `"not a public runtime control"`).
 
-The default-on `acquisition_experiment_enabled` control permits one
-restart-safe, one-hour market-acquisition episode at a time. It is restricted
-to a cold high-outbound channel with a peer-local 1--10-ppm competing floor
-and a 0-ppm class-aware floor. After 50,000 acquired sats, the same episode may
-enter a one-hour paid-validation phase at 0 ppm plus a positive base fee. The
+The default-on `acquisition_experiment_enabled` control permits at most two
+restart-safe, one-hour market-acquisition episodes at a time, on distinct peer
+markets. Each is restricted to a cold high-outbound channel with a peer-local
+1--10-ppm competing floor and a 0-ppm class-aware floor. After 50,000 acquired
+sats, the same episode may enter a one-hour paid-validation phase at 0 ppm plus
+a positive base fee. The
 base fee is one millisatoshi below the competitor's proportional charge at the
 smallest acquired payment (and capped at 1,000 msat), so it earns on every
 retained route while remaining strictly cheaper across the observed payment
 range. If no positive integer-millisatoshi undercut exists, the episode exits.
-Both phases share the 25-sat opportunity-cost and 70% outbound-liquidity stops;
-the free phase is additionally capped at 250,000 routed sats and the paid phase
-at 250,000 additional sats. Congestion and changed, missing, or malformed
+Both phases share a per-episode 25-sat opportunity-cost and 70%
+outbound-liquidity stop; the free phase is additionally capped at 250,000
+routed sats and the paid phase at 250,000 additional sats. The two-market cap
+therefore bounds concurrent node-wide exposure to 50 sats of opportunity cost
+and 500,000 sats of free-phase routed volume. Congestion and changed, missing,
+or malformed
 evidence fail closed. The controller always restores the exact captured base
 and proportional fees, and `revenue-status.acquisition_experiments` exposes the
 phase and audit trail.

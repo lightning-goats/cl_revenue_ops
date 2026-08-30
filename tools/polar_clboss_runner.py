@@ -73,6 +73,7 @@ GOSSIP_POLICY_POLL_SECONDS = 1.0
 GOSSIP_POLICY_POLL_ATTEMPTS = 31
 NATIVE_CYCLE_POLL_SECONDS = 5.0
 NATIVE_CYCLE_POLL_ATTEMPTS = 37
+EXPECTED_ACQUISITION_MARKETS = 2
 # Polar's UI-facing payment call can time out while the underlying CLN/LND
 # payment is still resolving.  Wait long enough to observe an authoritative
 # payer-side terminal state, but never dispatch the same invoice again.
@@ -1777,6 +1778,9 @@ def prime_forced_paths(
             "forced-path readiness refuses prior readiness or scored traffic"
         )
     amount_sats = positive_int(amount_sats)
+    acquisition_before = wait_for_native_acquisition_markets(
+        state, expected_phase="acquisition"
+    )
     # Payer-funded contender channels start with zero local balance. A reverse
     # proof needs the 1% channel reserve plus the probe amount to be present
     # first; otherwise the route is correctly unavailable despite healthy
@@ -1829,9 +1833,115 @@ def prime_forced_paths(
         "reverse_amount_sats": amount_sats,
         "scored": False,
         "payments": payments,
+        "acquisition_before": acquisition_before,
+        "acquisition_after": wait_for_native_acquisition_markets(
+            state, expected_phase="retention"
+        ),
     }
     _checkpoint(path, state, "forced_paths_primed", readiness=state["forced_path_readiness"])
     return state
+
+
+def wait_for_native_acquisition_markets(
+    state: dict[str, Any],
+    *,
+    expected_phase: str,
+    attempts: int = NATIVE_CYCLE_POLL_ATTEMPTS,
+    poll_seconds: float = NATIVE_CYCLE_POLL_SECONDS,
+) -> list[dict[str, Any]]:
+    """Await two native, paid-lifecycle acquisition markets read-only.
+
+    Formal readiness itself supplies the first 50k-sat demand observation on
+    each sink lane. Waiting for acquisition before those forwards prevents the
+    fixture from suppressing cold-start eligibility; waiting for retention
+    afterwards prevents free readiness traffic from leaking into scoring.
+    No fee/action RPC is used here: the product's native timer and forward wake
+    remain the only decision triggers.
+    """
+    if expected_phase not in {"acquisition", "retention"}:
+        raise RunnerError(f"invalid acquisition readiness phase: {expected_phase!r}")
+    if attempts <= 0 or poll_seconds < 0:
+        raise RunnerError("invalid acquisition readiness polling bounds")
+    assignment = state.get("assignment")
+    contenders = state.get("contenders")
+    lane_map = state.get("lane_map")
+    identity = assignment.get("revenue_ops") if isinstance(assignment, dict) else None
+    contender = contenders.get(identity) if isinstance(contenders, dict) else None
+    container = contender.get("container") if isinstance(contender, dict) else None
+    identity_lanes = lane_map.get(identity) if isinstance(lane_map, dict) else None
+    if not isinstance(container, str) or not isinstance(identity_lanes, dict):
+        raise RunnerError("acquisition readiness lacks Revenue contender lanes")
+    expected_by_scid = {
+        str(scid): str(row.get("family"))
+        for scid, row in identity_lanes.items()
+        if isinstance(row, dict)
+        and row.get("side") == "sink"
+        and row.get("family") in {"cln", "lnd"}
+    }
+    if set(expected_by_scid.values()) != {"cln", "lnd"}:
+        raise RunnerError("acquisition readiness lacks both sink client families")
+
+    last_rows: list[dict[str, Any]] = []
+    for attempt in range(attempts):
+        last_rows = _acquisition_rows(container)
+        active = [row for row in last_rows if row.get("state") == "active"]
+        selected: list[dict[str, Any]] = []
+        live_by_scid = {
+            str(row.get("short_channel_id")): row
+            for row in active_channels(container)
+        }
+        for episode in active:
+            scid = str(episode.get("channel_id") or "")
+            family = expected_by_scid.get(scid)
+            if family is None or episode.get("phase") != expected_phase:
+                continue
+            live = live_by_scid.get(scid)
+            updates = live.get("updates") if isinstance(live, dict) else None
+            local = updates.get("local") if isinstance(updates, dict) else None
+            if expected_phase == "acquisition":
+                ppm_key, base_key = "target_fee_ppm", "target_base_fee_msat"
+            else:
+                ppm_key, base_key = "retention_fee_ppm", "retention_base_fee_msat"
+            try:
+                expected_ppm = nonnegative_int(
+                    episode.get(ppm_key), f"{family} {expected_phase} ppm"
+                )
+                expected_base = nonnegative_int(
+                    episode.get(base_key), f"{family} {expected_phase} base fee"
+                )
+                live_ppm = nonnegative_int(
+                    local.get("fee_proportional_millionths")
+                    if isinstance(local, dict) else None,
+                    f"live {family} acquisition ppm",
+                )
+                live_base = nonnegative_int(
+                    local.get("fee_base_msat") if isinstance(local, dict) else None,
+                    f"live {family} acquisition base fee",
+                )
+            except RunnerError:
+                continue
+            if (live_ppm, live_base) != (expected_ppm, expected_base):
+                continue
+            selected.append({
+                "family": family,
+                "channel_id": scid,
+                "experiment_id": episode.get("id"),
+                "phase": expected_phase,
+                "fee_ppm": live_ppm,
+                "fee_base_msat": live_base,
+            })
+        if (
+            len(active) == EXPECTED_ACQUISITION_MARKETS
+            and len(selected) == EXPECTED_ACQUISITION_MARKETS
+            and {row["family"] for row in selected} == {"cln", "lnd"}
+        ):
+            return sorted(selected, key=lambda row: row["family"])
+        if attempt + 1 < attempts:
+            time.sleep(poll_seconds)
+    raise RunnerError(
+        f"native acquisition did not reach {expected_phase} on both client "
+        f"markets before timeout: {last_rows}"
+    )
 
 
 def retune_background(
