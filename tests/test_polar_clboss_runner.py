@@ -1148,7 +1148,8 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
     monkeypatch.setattr(
         runner,
         "traffic_schedule",
-        lambda _rounds, _amount, _pattern, _amount_profile, _traffic_family: (
+        lambda _rounds, _amount, _pattern, _amount_profile, _traffic_family,
+        _traffic_seed: (
             ("cln", "forward", 5_000), ("cln", "reverse", 5_000)
         ),
     )
@@ -1624,6 +1625,44 @@ def test_realistic_amount_profile_cycles_market_sized_payments():
         ("cln", "forward", 100_000),
         ("lnd", "forward", 100_000),
     )
+
+
+def test_seeded_traffic_schedule_is_deterministic_distinct_and_reserve_safe():
+    runner = load_runner()
+
+    first = runner.traffic_schedule(
+        4, 999, amount_profile="realistic", traffic_seed=101,
+    )
+    repeated = runner.traffic_schedule(
+        4, 999, amount_profile="realistic", traffic_seed=101,
+    )
+    second = runner.traffic_schedule(
+        4, 999, amount_profile="realistic", traffic_seed=202,
+    )
+
+    assert first == repeated
+    assert first != second
+    assert {family for family, direction, _amount in first[:2]
+            if direction == "forward"} == {"cln", "lnd"}
+    assert all(direction == "forward" for _family, direction, _amount in first[:2])
+    assert sorted(first) == sorted(runner.traffic_schedule(
+        4, 999, amount_profile="realistic",
+    ))
+
+
+def test_seeded_pressure_schedule_shuffles_without_changing_workload():
+    runner = load_runner()
+
+    seeded = runner.traffic_schedule(
+        4, 999, "forward-pressure", amount_profile="realistic",
+        traffic_seed=303,
+    )
+    baseline = runner.traffic_schedule(
+        4, 999, "forward-pressure", amount_profile="realistic",
+    )
+
+    assert seeded != baseline
+    assert sorted(seeded) == sorted(baseline)
 
 
 def test_family_scoped_schedule_excludes_unrelated_client_family():

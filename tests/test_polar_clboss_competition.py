@@ -93,6 +93,7 @@ def write_runner_replica(
     assignment: dict[str, str],
     *,
     revision: str = "frozen-revision",
+    traffic_seed: int | None = None,
 ) -> None:
     replica_dir = root / f"replica-{replica}"
     replica_dir.mkdir(parents=True)
@@ -135,6 +136,14 @@ def write_runner_replica(
             "phase": "baseline",
             "market_profile": "realistic",
         })
+        block["traffic"] = dict(block["traffic"])
+        block["traffic"]["seed"] = (
+            replica if traffic_seed is None else traffic_seed
+        )
+        block["traffic"]["amount_profile"] = "realistic"
+        block["traffic"]["profile_amounts_sats"] = [
+            5_000, 15_000, 35_000, 100_000,
+        ]
         (replica_dir / f"smoke-{replica}-{index}.json").write_text(
             json.dumps(block), encoding="utf-8"
         )
@@ -163,6 +172,11 @@ def test_collect_runner_evidence_binds_one_frozen_crossed_series(tmp_path):
     assert payload["frozen_runner_evidence"]["revenue_ops_revision"] == (
         "frozen-revision"
     )
+    assert payload["frozen_runner_evidence"]["traffic_seeds"] == {
+        "replica-201": 201,
+        "replica-202": 202,
+        "replica-203": 203,
+    }
     assert len(payload["blocks"]) == 36
     score = tool.score_evidence(payload, iterations=200)
     assert score["verdict"] == "revenue_ops_wins"
@@ -183,6 +197,46 @@ def test_collect_runner_evidence_fails_closed_on_revision_drift(tmp_path):
         )
 
     with pytest.raises(tool.CompetitionError, match="one frozen Revenue Ops image"):
+        tool.collect_runner_evidence(
+            tmp_path, [201, 202, 203], run_id="formal-test",
+        )
+
+
+def test_collect_runner_evidence_requires_distinct_recorded_traffic_seeds(
+    tmp_path,
+):
+    tool = load_tool()
+    assignments = [
+        {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        {"revenue_ops": "identity-b", "clboss": "identity-a"},
+        {"revenue_ops": "identity-a", "clboss": "identity-b"},
+    ]
+    for replica, assignment in zip((201, 202, 203), assignments):
+        write_runner_replica(
+            tmp_path, replica, assignment, traffic_seed=7,
+        )
+
+    with pytest.raises(tool.CompetitionError, match="distinct recorded"):
+        tool.collect_runner_evidence(
+            tmp_path, [201, 202, 203], run_id="formal-test",
+        )
+
+
+def test_collect_runner_evidence_requires_complete_realistic_profile(tmp_path):
+    tool = load_tool()
+    assignments = [
+        {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        {"revenue_ops": "identity-b", "clboss": "identity-a"},
+        {"revenue_ops": "identity-a", "clboss": "identity-b"},
+    ]
+    for replica, assignment in zip((201, 202, 203), assignments):
+        write_runner_replica(tmp_path, replica, assignment)
+    block = next((tmp_path / "replica-201").glob("smoke-*.json"))
+    payload = json.loads(block.read_text(encoding="utf-8"))
+    payload["traffic"]["profile_amounts_sats"] = [5_000, 15_000]
+    block.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(tool.CompetitionError, match="complete realistic"):
         tool.collect_runner_evidence(
             tmp_path, [201, 202, 203], run_id="formal-test",
         )

@@ -26,6 +26,7 @@ SCHEMA_SCORE = "polar-clboss-competition-score-v1"
 CONTROLLERS = ("revenue_ops", "clboss")
 LEAGUES = ("fee_only", "full_stack")
 CLIENT_FAMILIES = ("cln", "lnd")
+TRAFFIC_AMOUNTS_SATS = (5_000, 15_000, 35_000, 100_000)
 CLN_RUNTIME = (
     "v26.06.7 official Ubuntu-22.04-amd64 tarball "
     "sha256:53ddf124fe7058b6a2fc059d104976cc54ba5be21dc55b295cd82d01cabeb39c"
@@ -126,7 +127,7 @@ def build_plan(network_id: int, revenue_commit: str) -> dict[str, Any]:
             "seed_per_replica": "recorded and deterministic",
             "hourly_block_seconds": 3_600,
             "snapshot_seconds": 300,
-            "amounts_sats": [5_000, 15_000, 35_000, 100_000],
+            "amounts_sats": list(TRAFFIC_AMOUNTS_SATS),
             "families": list(CLIENT_FAMILIES),
             "directions": ["forward", "reverse"],
             "cache_modes": ["cold", "warm"],
@@ -695,6 +696,7 @@ def collect_runner_evidence(
     blocks: list[dict[str, Any]] = []
     frozen_images: set[tuple[str, str]] = set()
     node_ids: set[str] = set()
+    traffic_seeds: dict[str, int] = {}
     for replica in replicas:
         replica_name = f"replica-{replica}"
         replica_dir = results_dir / replica_name
@@ -789,6 +791,28 @@ def collect_runner_evidence(
             raise CompetitionError(
                 f"{replica_name} has no realistic baseline blocks"
             )
+        replica_seeds: set[int] = set()
+        for block in selected:
+            traffic = block.get("traffic")
+            seed = traffic.get("seed") if isinstance(traffic, dict) else None
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise CompetitionError(
+                    f"{replica_name} must record one explicit integer traffic seed"
+                )
+            if (
+                traffic.get("amount_profile") != "realistic"
+                or traffic.get("profile_amounts_sats")
+                != list(TRAFFIC_AMOUNTS_SATS)
+            ):
+                raise CompetitionError(
+                    f"{replica_name} must record the complete realistic amount profile"
+                )
+            replica_seeds.add(seed)
+        if len(replica_seeds) != 1:
+            raise CompetitionError(
+                f"{replica_name} must record one explicit integer traffic seed"
+            )
+        traffic_seeds[replica_name] = next(iter(replica_seeds))
         blocks.extend(selected)
     if len(frozen_images) != 1:
         raise CompetitionError(
@@ -805,6 +829,10 @@ def collect_runner_evidence(
         raise CompetitionError(
             "selected replicas do not cross both identity assignments"
         )
+    if len(set(traffic_seeds.values())) != len(replicas):
+        raise CompetitionError(
+            "selected replicas must use distinct recorded traffic seeds"
+        )
     image_id, revision = next(iter(frozen_images))
     payload = {
         "schema": SCHEMA_EVIDENCE,
@@ -813,6 +841,7 @@ def collect_runner_evidence(
             "image_id": image_id,
             "revenue_ops_revision": revision,
             "replicas": [f"replica-{replica}" for replica in replicas],
+            "traffic_seeds": traffic_seeds,
         },
         "assignments": assignments,
         "blocks": blocks,

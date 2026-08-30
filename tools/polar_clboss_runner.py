@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import subprocess
 import sys
@@ -3301,8 +3302,16 @@ def traffic_schedule(
     pattern: str = "balanced",
     amount_profile: str = "fixed",
     traffic_family: str = "both",
+    traffic_seed: int | None = None,
 ) -> tuple[tuple[str, str, int], ...]:
-    """Build balanced competition or one-way liquidity-pressure traffic."""
+    """Build deterministic competition or one-way liquidity-pressure traffic.
+
+    A supplied seed shuffles the recorded workload without risking a reverse
+    payment before its family has received reserve liquidity.  The first
+    forward for each family is therefore shuffled only against the other
+    family seed; every remaining family/direction/amount entry is shuffled as
+    one deterministic tail.  ``None`` preserves historical fixture order.
+    """
     if rounds <= 0 or amount_sats <= 0:
         raise RunnerError("traffic rounds and amount must be positive")
     if pattern not in {"balanced", "forward-pressure", "reverse-pressure"}:
@@ -3312,7 +3321,8 @@ def traffic_schedule(
     if traffic_family not in {"both", "cln", "lnd"}:
         raise RunnerError(f"unknown traffic family: {traffic_family}")
     families = ("cln", "lnd") if traffic_family == "both" else (traffic_family,)
-    schedule = []
+    schedule: list[tuple[str, str, int]] = []
+    reserve_seeds: list[tuple[str, str, int]] = []
     for round_index in range(rounds):
         round_amount = (
             REALISTIC_TRAFFIC_AMOUNTS_SATS[
@@ -3331,8 +3341,24 @@ def traffic_schedule(
             forward_amount = round_amount + (
                 REVERSE_FEE_BUFFER_SATS if round_index == 0 else 0
             )
-            schedule.append((family, "forward", forward_amount))
+            row = (family, "forward", forward_amount)
+            schedule.append(row)
+            if round_index == 0:
+                reserve_seeds.append(row)
             schedule.append((family, "reverse", round_amount))
+    if traffic_seed is not None:
+        if isinstance(traffic_seed, bool) or not isinstance(traffic_seed, int):
+            raise RunnerError("traffic seed must be an integer")
+        rng = random.Random(traffic_seed)
+        if pattern == "balanced":
+            tail = list(schedule)
+            for row in reserve_seeds:
+                tail.remove(row)
+            rng.shuffle(reserve_seeds)
+            rng.shuffle(tail)
+            schedule = [*reserve_seeds, *tail]
+        else:
+            rng.shuffle(schedule)
     return tuple(schedule)
 
 
@@ -3374,6 +3400,7 @@ def run_smoke(
     traffic_pattern: str = "balanced",
     amount_profile: str = "auto",
     traffic_family: str = "both",
+    traffic_seed: int | None = None,
 ) -> dict[str, Any]:
     path = state_path(results_dir, replica)
     state = read_state(path)
@@ -3432,6 +3459,7 @@ def run_smoke(
         "traffic_family": traffic_family,
         "market_profile": str(state.get("market_profile") or "legacy_low_fee"),
         "amount_profile": effective_amount_profile,
+        "traffic_seed": traffic_seed,
         "before": {
             name: {
                 "forward_count": totals.forward_count,
@@ -3478,6 +3506,7 @@ def run_smoke(
             traffic_pattern,
             effective_amount_profile,
             traffic_family,
+            traffic_seed,
         )):
             completed = run_reconciled_traffic(
                 bridge,
@@ -3657,6 +3686,12 @@ def run_smoke(
             "pattern": traffic_pattern,
             "family_scope": traffic_family,
             "amount_profile": effective_amount_profile,
+            "seed": traffic_seed,
+            "profile_amounts_sats": (
+                list(REALISTIC_TRAFFIC_AMOUNTS_SATS)
+                if effective_amount_profile == "realistic"
+                else [amount_sats]
+            ),
             "amounts_sats": sorted({int(row["amount_sats"]) for row in records}),
             "attempted": len(records),
             "settled": settled_count,
@@ -4363,6 +4398,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("both", "cln", "lnd"),
         default="both",
     )
+    parser.add_argument(
+        "--traffic-seed",
+        type=nonnegative_arg,
+        help=(
+            "recorded deterministic workload seed; formal replicas must use "
+            "one distinct explicit seed each"
+        ),
+    )
     parser.add_argument("--background-ppm", type=positive_int, default=10_000)
     parser.add_argument(
         "--revenue-rebalance-budget-sats", "--spend-cap-sats",
@@ -4497,6 +4540,7 @@ def main() -> int:
                 traffic_pattern=args.traffic_pattern,
                 amount_profile=args.amount_profile,
                 traffic_family=args.traffic_family,
+                traffic_seed=args.traffic_seed,
             )
         elif args.command == "return-path":
             result = provision_return_paths(
