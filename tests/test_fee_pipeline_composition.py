@@ -244,6 +244,213 @@ class TestFloorCeilingInversion:
         assert result.algorithm_values["bounded_target_ppm"] <= 50
         assert result.algorithm_values["effective_min_fee_ppm"] == 0
 
+
+# =============================================================================
+# Extreme-inventory price rails
+# =============================================================================
+
+class TestExtremeInventoryPriceRails:
+
+    @staticmethod
+    def _cfg(**overrides):
+        values = {
+            "min_fee_ppm": 50,
+            "min_fee_ppm_saturated": 0,
+            "max_fee_ppm": 2000,
+            "rebalance_emergency_local_ratio": 0.20,
+        }
+        values.update(overrides)
+        return _make_config_snapshot(**values)
+
+    def test_depleted_floor_widens_curve_within_existing_ceiling(self):
+        floor, ceiling, reason = FeeController._inventory_fee_rails(
+            self._cfg(),
+            outbound_ratio=0.01,
+            floor_ppm=50,
+            ceiling_ppm=2000,
+        )
+
+        assert floor == 1000
+        assert ceiling == 2000
+        assert reason == "depleted_inventory_floor"
+
+    def test_saturated_ceiling_tapers_toward_saturated_minimum(self):
+        floor, ceiling, reason = FeeController._inventory_fee_rails(
+            self._cfg(),
+            outbound_ratio=0.98,
+            floor_ppm=5,
+            ceiling_ppm=2000,
+        )
+
+        assert floor == 5
+        assert ceiling == 5
+        assert reason == "saturated_inventory_ceiling"
+
+    def test_production_fee_range_has_realistic_extreme_quotes(self):
+        cfg = self._cfg(
+            min_fee_ppm=100,
+            min_fee_ppm_saturated=0,
+            max_fee_ppm=1200,
+        )
+
+        depleted = FeeController._inventory_fee_rails(
+            cfg,
+            outbound_ratio=0.14,
+            floor_ppm=100,
+            ceiling_ppm=1200,
+        )
+        saturated = FeeController._inventory_fee_rails(
+            cfg,
+            outbound_ratio=0.90,
+            floor_ppm=5,
+            ceiling_ppm=1200,
+        )
+
+        assert depleted == (401, 1200, "depleted_inventory_floor")
+        assert saturated == (5, 42, "saturated_inventory_ceiling")
+
+    def test_existing_economic_floor_wins_saturated_discount(self):
+        floor, ceiling, reason = FeeController._inventory_fee_rails(
+            self._cfg(),
+            outbound_ratio=0.99,
+            floor_ppm=80,
+            ceiling_ppm=2000,
+        )
+
+        assert (floor, ceiling) == (80, 80)
+        assert reason == "saturated_inventory_ceiling"
+
+    def test_flow_balanced_router_is_exempt_from_saturated_discount(self):
+        assert FeeController._inventory_fee_rails(
+            self._cfg(),
+            outbound_ratio=0.99,
+            floor_ppm=50,
+            ceiling_ppm=2000,
+            flow_balanced_router=True,
+        ) == (50, 2000, "none")
+
+    def test_flow_balanced_router_is_exempt_from_urgent_reprice(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(
+            mock_plugin,
+            mock_database,
+            rebalance_emergency_local_ratio=0.20,
+        )
+        fc._is_flow_balanced_router = MagicMock(return_value=True)
+
+        reason = fc._inventory_reprice_reason(
+            CHANNEL_ID,
+            {
+                "capacity": 1_000_000,
+                "spendable_msat": "900000000msat",
+            },
+            cfg,
+        )
+
+        assert reason is None
+        fc._is_flow_balanced_router.assert_called_once_with(CHANNEL_ID, 1_000_000)
+
+    @pytest.mark.parametrize(
+        "ratio", [None, "bad", object(), True, float("nan"), -0.1, 1.1]
+    )
+    def test_malformed_or_out_of_range_ratio_is_neutral(self, ratio):
+        assert FeeController._inventory_fee_rails(
+            self._cfg(),
+            outbound_ratio=ratio,
+            floor_ppm=50,
+            ceiling_ppm=2000,
+        ) == (50, 2000, "none")
+
+    def test_malformed_config_is_neutral(self):
+        cfg = self._cfg(rebalance_emergency_local_ratio="bad")
+        assert FeeController._inventory_fee_rails(
+            cfg,
+            outbound_ratio=0.01,
+            floor_ppm=50,
+            ceiling_ppm=2000,
+        ) == (50, 2000, "none")
+
+    def test_depleted_pipeline_overrides_earning_cap(self, mock_plugin, mock_database):
+        fc, cfg = _make_fc(
+            mock_plugin,
+            mock_database,
+            min_fee_ppm=50,
+            min_fee_ppm_saturated=0,
+            max_fee_ppm=2000,
+            rebalance_emergency_local_ratio=0.20,
+        )
+        fc._calculate_floor = lambda *a, **k: 50
+        fc._get_rebalance_cost_floor = lambda *a, **k: None
+        fc._get_channel_rebalance_cost_ppm = lambda *a, **k: 0
+        fc._get_neighbor_fee_median = lambda *a, **k: None
+        chain = {"fee": 280}
+        _stub_broadcasts(fc, chain)
+        ts_state = _prepare_dts_stubs(fc, chain_fee=280, sampled_fee=1400)
+        ts_state.thompson.supported_fee_ceiling = lambda **k: 295
+        info = _channel_info(280, capacity=5_000_000)
+        info["spendable_msat"] = "50000000msat"
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID,
+            PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            info,
+            cfg=cfg,
+            force_reprice_reason="depleted_inventory",
+        )
+
+        assert result is not None
+        assert result.algorithm_values["supported_fee_ceiling_ppm"] == 295
+        assert result.algorithm_values["inventory_floor_ppm"] == 1000
+        assert result.algorithm_values["bounded_target_ppm"] == 1000
+        assert result.algorithm_values["inventory_rail_reason"] == (
+            "depleted_inventory_floor"
+        )
+
+    def test_saturated_pipeline_caps_supported_target(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(
+            mock_plugin,
+            mock_database,
+            min_fee_ppm=50,
+            min_fee_ppm_saturated=0,
+            max_fee_ppm=2000,
+            rebalance_emergency_local_ratio=0.20,
+        )
+        fc._calculate_floor = lambda *a, **k: 5
+        fc._get_rebalance_cost_floor = lambda *a, **k: None
+        fc._get_channel_rebalance_cost_ppm = lambda *a, **k: 0
+        fc._get_neighbor_fee_median = lambda *a, **k: None
+        fc.profitability = MagicMock()
+        fc.profitability.get_profitability.return_value = MagicMock(
+            marginal_roi_percent=100.0
+        )
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+        ts_state = _prepare_dts_stubs(fc, chain_fee=150, sampled_fee=1450)
+        ts_state.thompson.supported_fee_ceiling = lambda **k: 187
+        info = _channel_info(150, capacity=5_000_000)
+        info["spendable_msat"] = "4900000000msat"
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID,
+            PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            info,
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.algorithm_values["inventory_ceiling_ppm"] == 5
+        assert result.algorithm_values["bounded_target_ppm"] == 5
+        assert result.algorithm_values["inventory_rail_reason"] == (
+            "saturated_inventory_ceiling"
+        )
+        assert result.algorithm_values["profitable_downshift_guard_reason"] is None
+        assert result.new_fee_ppm == 121
+
 # =============================================================================
 # P5: Kalman demand divisor clamp
 # =============================================================================

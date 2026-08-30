@@ -66,12 +66,19 @@ class TestPIDState:
     def test_depleted_inventory_reprice_reason_uses_live_ratio(self):
         cfg = type("Cfg", (), {"rebalance_emergency_local_ratio": 0.20})()
 
-        assert FeeController._depleted_inventory_reprice_reason(
+        assert FeeController._extreme_inventory_reprice_reason(
             {"capacity": 1_000_000, "spendable_msat": "30000000msat"}, cfg
         ) == "depleted_inventory"
-        assert FeeController._depleted_inventory_reprice_reason(
+        assert FeeController._extreme_inventory_reprice_reason(
             {"capacity": 1_000_000, "spendable_msat": "300000000msat"}, cfg
         ) is None
+
+    def test_saturated_inventory_reprice_reason_uses_live_ratio(self):
+        cfg = type("Cfg", (), {"rebalance_emergency_local_ratio": 0.20})()
+
+        assert FeeController._extreme_inventory_reprice_reason(
+            {"capacity": 1_000_000, "spendable_msat": "900000000msat"}, cfg
+        ) == "saturated_inventory"
 
     @pytest.mark.parametrize(
         "channel_info",
@@ -82,7 +89,7 @@ class TestPIDState:
         self, channel_info
     ):
         cfg = type("Cfg", (), {"rebalance_emergency_local_ratio": 0.20})()
-        assert FeeController._depleted_inventory_reprice_reason(
+        assert FeeController._extreme_inventory_reprice_reason(
             channel_info, cfg
         ) is None
 

@@ -3105,6 +3105,99 @@ class FeeController:
     # the controller already computes.
     SATURATED_OUTBOUND_RATIO = 0.85
 
+    # Inventory-aware normal-path price rails. PID remains the smooth
+    # controller around ordinary balances; these rails close the extreme-
+    # inventory gap where the earning-evidence ceiling can otherwise pin a
+    # nearly empty channel too cheaply, or leave a nearly full channel too
+    # expensive to drain. At zero local balance, the depleted floor reaches
+    # half of the configured fee range. The saturated ceiling tapers from
+    # the ordinary configured minimum to min_fee_ppm_saturated. Existing
+    # economic/policy bounds always win.
+    DEPLETED_INVENTORY_MAX_FEE_RANGE_SHARE = 0.50
+
+    @classmethod
+    def _inventory_fee_rails(
+        cls,
+        cfg: Any,
+        *,
+        outbound_ratio: Any,
+        floor_ppm: Any,
+        ceiling_ppm: Any,
+        flow_balanced_router: bool = False,
+    ) -> Tuple[int, int, str]:
+        """Return normal DTS bounds adjusted for extreme inventory.
+
+        Missing, malformed, or contradictory inputs are neutral. This is a
+        target rail, not a replacement for the configured/policy/economic
+        bounds passed by the caller: depleted prices never exceed the
+        existing ceiling and saturated discounts never cross the existing
+        floor. High-local channels with evidence of balanced, self-refilling
+        flow are exempt because discounting them cannot improve inventory.
+        """
+        try:
+            if isinstance(outbound_ratio, bool):
+                raise ValueError("boolean outbound ratio")
+            ratio = float(outbound_ratio)
+            low = float(getattr(cfg, "rebalance_emergency_local_ratio", 0.20))
+            base_min = int(getattr(cfg, "min_fee_ppm"))
+            sat_min = int(getattr(cfg, "min_fee_ppm_saturated", base_min))
+            max_fee = int(getattr(cfg, "max_fee_ppm"))
+            lower = int(floor_ppm)
+            upper = int(ceiling_ppm)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return floor_ppm, ceiling_ppm, "none"
+
+        if (
+            not math.isfinite(ratio)
+            or not math.isfinite(low)
+            or ratio < 0.0
+            or ratio > 1.0
+            or low <= 0.0
+            or low >= cls.SATURATED_OUTBOUND_RATIO
+            or base_min < 0
+            or sat_min < 0
+            or max_fee < base_min
+            or lower < 0
+            or upper <= lower
+        ):
+            return floor_ppm, ceiling_ppm, "none"
+
+        if ratio < low:
+            severity = min(1.0, max(0.0, (low - ratio) / low))
+            # React early once the emergency reserve is crossed. A square-
+            # root curve matches the broad live fee spread without requiring
+            # the channel to reach effectively zero local liquidity first.
+            severity = math.sqrt(severity)
+            peak_floor = base_min + (
+                (max_fee - base_min)
+                * cls.DEPLETED_INVENTORY_MAX_FEE_RANGE_SHARE
+            )
+            inventory_floor = int(round(
+                base_min + severity * (peak_floor - base_min)
+            ))
+            adjusted_floor = min(upper, max(lower, inventory_floor))
+            return adjusted_floor, upper, "depleted_inventory_floor"
+
+        if ratio > cls.SATURATED_OUTBOUND_RATIO and not flow_balanced_router:
+            severity = min(
+                1.0,
+                max(
+                    0.0,
+                    (ratio - cls.SATURATED_OUTBOUND_RATIO)
+                    / (1.0 - cls.SATURATED_OUTBOUND_RATIO),
+                ),
+            )
+            severity = math.sqrt(severity)
+            configured_saturated_min = min(base_min, sat_min)
+            inventory_ceiling = int(round(
+                base_min
+                - severity * (base_min - configured_saturated_min)
+            ))
+            adjusted_ceiling = max(lower, min(upper, inventory_ceiling))
+            return lower, adjusted_ceiling, "saturated_inventory_ceiling"
+
+        return lower, upper, "none"
+
     # Flow-aware exemption from the saturated carve-out (2026-07-11, live
     # finding on lnnode): a channel can sit at 94-97% local while turning
     # over multiples of its capacity per week with in ~= out. That is a
@@ -6305,7 +6398,9 @@ class FeeController:
                 force_reprice_reason = (
                     "acquisition_experiment"
                     if channel_id in self._acquisition_cycle_experiments
-                    else self._depleted_inventory_reprice_reason(channel_info, cfg)
+                    else self._inventory_reprice_reason(
+                        channel_id, channel_info, cfg
+                    )
                 )
 
                 adjustment = self._adjust_channel_fee(
@@ -6399,11 +6494,11 @@ class FeeController:
         return "fee_unchanged"
 
     @staticmethod
-    def _depleted_inventory_reprice_reason(
+    def _extreme_inventory_reprice_reason(
         channel_info: Any,
         cfg: Optional[Any],
     ) -> Optional[str]:
-        """Wake fee decisioning when live outbound is below emergency reserve.
+        """Wake fee decisioning when live outbound inventory is extreme.
 
         Missing or malformed live/config data is neutral: normal observation
         windows remain authoritative instead of manufacturing urgency.
@@ -6447,11 +6542,30 @@ class FeeController:
             or threshold > 1.0
         ):
             return None
-        return (
-            "depleted_inventory"
-            if (spendable / capacity) < threshold
-            else None
-        )
+        outbound_ratio = spendable / capacity
+        if outbound_ratio < threshold:
+            return "depleted_inventory"
+        if outbound_ratio > FeeController.SATURATED_OUTBOUND_RATIO:
+            return "saturated_inventory"
+        return None
+
+    def _inventory_reprice_reason(
+        self,
+        channel_id: str,
+        channel_info: Any,
+        cfg: Optional[Any],
+    ) -> Optional[str]:
+        """Return an urgent inventory reason, exempting proven routers."""
+        reason = self._extreme_inventory_reprice_reason(channel_info, cfg)
+        if reason != "saturated_inventory":
+            return reason
+        try:
+            capacity = int(channel_info.get("capacity") or 0)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        if self._is_flow_balanced_router(channel_id, capacity):
+            return None
+        return reason
 
     @classmethod
     def _effective_min_observation_hours(
@@ -7157,6 +7271,9 @@ class FeeController:
         supported_cap_ppm = None
         competitive_cheap_quartile_ppm = None
         profitable_conversion_ceiling_ppm = None
+        inventory_floor_ppm = None
+        inventory_ceiling_ppm = None
+        inventory_rail_reason = "none"
         upward_probe_pre_cap_ppm = None  # L1: set when a probe stretch is granted
         bound_reason = "none"
         delta_cap_reason = "none"
@@ -8782,9 +8899,46 @@ class FeeController:
                 )
                 post_pid_target_ppm = supported_cap_ppm
 
-            bounded_target_ppm = max(floor_ppm, min(ceiling_ppm, post_pid_target_ppm))
+            # Extreme inventory needs a wider price curve than the smooth PID
+            # response alone provides. Apply this only to the ordinary DTS
+            # path: congestion, bounded acquisition, and explicit exploration
+            # retain their higher-priority, independently bounded semantics.
+            flow_balanced_router = False
+            if outbound_ratio > self.SATURATED_OUTBOUND_RATIO:
+                flow_balanced_router = self._is_flow_balanced_router(
+                    channel_id, capacity
+                )
+            (
+                inventory_floor_ppm,
+                inventory_ceiling_ppm,
+                inventory_rail_reason,
+            ) = self._inventory_fee_rails(
+                cfg,
+                outbound_ratio=outbound_ratio,
+                floor_ppm=floor_ppm,
+                ceiling_ppm=ceiling_ppm,
+                flow_balanced_router=flow_balanced_router,
+            )
+            if inventory_rail_reason != "none":
+                self.plugin.log(
+                    f"INVENTORY_RAIL: {channel_id[:12]}... "
+                    f"ratio={outbound_ratio:.3f}, "
+                    f"bounds={floor_ppm}-{ceiling_ppm} -> "
+                    f"{inventory_floor_ppm}-{inventory_ceiling_ppm}ppm "
+                    f"({inventory_rail_reason})",
+                    level="debug",
+                )
+
+            bounded_target_ppm = max(
+                inventory_floor_ppm,
+                min(inventory_ceiling_ppm, post_pid_target_ppm),
+            )
             if bounded_target_ppm != post_pid_target_ppm:
-                bound_reason = "floor" if post_pid_target_ppm < floor_ppm else "ceiling"
+                bound_reason = (
+                    "floor"
+                    if post_pid_target_ppm < inventory_floor_ppm
+                    else "ceiling"
+                )
 
             blend_posterior_std = ts_state.thompson.posterior_std
             if observation_count < GaussianThompsonState.MIN_OBSERVATIONS:
@@ -8811,7 +8965,10 @@ class FeeController:
                     and abs(bounded_target_ppm - gate_ref_ppm)
                     <= gate_ref_ppm * self.GOSSIP_GATE_SUPPRESSION_RATIO
                 )
-                anchor_candidate = max(floor_ppm, min(ceiling_ppm, pending_target_ppm))
+                anchor_candidate = max(
+                    inventory_floor_ppm,
+                    min(inventory_ceiling_ppm, pending_target_ppm),
+                )
                 anchor_on_path = (
                     min(current_fee_ppm, bounded_target_ppm)
                     <= anchor_candidate
@@ -8884,16 +9041,22 @@ class FeeController:
                     f"current={current_fee_ppm}ppm, floor={floor_ppm}ppm",
                     level='debug',
                 )
-            blended_target_ppm, profitable_downshift_guard_reason = (
-                self._cap_profitable_window_downshift(
-                    current_fee_ppm=current_fee_ppm,
-                    target_fee_ppm=blended_target_ppm,
-                    forward_count=forward_count,
-                    revenue_rate=adjusted_revenue_rate,
-                    profitability_positive=profitability_positive,
-                    rate_is_meaningful=rate_is_meaningful,
+            # A non-self-refilling saturated channel must be allowed to sell
+            # excess inventory. The ordinary profitable-window guard protects
+            # a proven quote from abrupt abandonment, but applying it here
+            # defeats the inventory ceiling and recreates the narrow curve
+            # this rail exists to correct. All other paths retain the guard.
+            if inventory_rail_reason != "saturated_inventory_ceiling":
+                blended_target_ppm, profitable_downshift_guard_reason = (
+                    self._cap_profitable_window_downshift(
+                        current_fee_ppm=current_fee_ppm,
+                        target_fee_ppm=blended_target_ppm,
+                        forward_count=forward_count,
+                        revenue_rate=adjusted_revenue_rate,
+                        profitability_positive=profitability_positive,
+                        rate_is_meaningful=rate_is_meaningful,
+                    )
                 )
-            )
             if profitable_downshift_guard_reason:
                 profitable_downshift_guard_target_ppm = blended_target_ppm
                 self.plugin.log(
@@ -9465,6 +9628,9 @@ class FeeController:
                     "supported_fee_ceiling_ppm": supported_cap_ppm,
                     "competitive_cheap_quartile_ppm": competitive_cheap_quartile_ppm,
                     "profitable_conversion_ceiling_ppm": profitable_conversion_ceiling_ppm,
+                    "inventory_floor_ppm": inventory_floor_ppm,
+                    "inventory_ceiling_ppm": inventory_ceiling_ppm,
+                    "inventory_rail_reason": inventory_rail_reason,
                     "bounded_target_ppm": bounded_target_ppm,
                     "blended_target_ppm": blended_target_ppm if blended_target_ppm is not None else bounded_target_ppm,
                     "applied_target_ppm": applied_target_ppm if applied_target_ppm is not None else new_fee_ppm,
