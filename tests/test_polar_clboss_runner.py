@@ -1645,6 +1645,9 @@ def test_seeded_traffic_schedule_is_deterministic_distinct_and_reserve_safe():
     assert sorted(first) == sorted(runner.traffic_schedule(
         4, 999, amount_profile="realistic",
     ))
+    assert {first[0][0], first[2][0]} == {"cln", "lnd"}
+    assert first[0][2] > first[1][2]
+    assert first[2][2] > first[3][2]
     for index in range(0, len(first), 2):
         forward, reverse = first[index:index + 2]
         assert forward[0] == reverse[0]

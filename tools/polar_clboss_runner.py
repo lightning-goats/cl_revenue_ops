@@ -3308,9 +3308,10 @@ def traffic_schedule(
 
     A supplied seed shuffles the recorded workload without risking a reverse
     payment before its matching forward has supplied liquidity.  Balanced
-    traffic is therefore shuffled as complete forward/reverse pairs, while
-    one-way pressure traffic is shuffled entry-by-entry.  ``None`` preserves
-    historical fixture order.
+    traffic is therefore shuffled as complete forward/reverse pairs.  Each
+    family's buffered seed pair runs first so later equal-sized pairs can pay
+    reverse routing fees from that reserve.  One-way pressure traffic is
+    shuffled entry-by-entry.  ``None`` preserves historical fixture order.
     """
     if rounds <= 0 or amount_sats <= 0:
         raise RunnerError("traffic rounds and amount must be positive")
@@ -3349,8 +3350,17 @@ def traffic_schedule(
         rng = random.Random(traffic_seed)
         if pattern == "balanced":
             pairs = [schedule[index:index + 2] for index in range(0, len(schedule), 2)]
-            rng.shuffle(pairs)
-            schedule = [row for pair in pairs for row in pair]
+            reserve_pairs = [
+                pair for pair in pairs
+                if pair[0][2] > pair[1][2]
+            ]
+            tail_pairs = [
+                pair for pair in pairs
+                if pair[0][2] == pair[1][2]
+            ]
+            rng.shuffle(reserve_pairs)
+            rng.shuffle(tail_pairs)
+            schedule = [row for pair in [*reserve_pairs, *tail_pairs] for row in pair]
         else:
             rng.shuffle(schedule)
     return tuple(schedule)
