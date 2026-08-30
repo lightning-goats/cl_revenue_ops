@@ -338,6 +338,40 @@ def test_start_revenue_uses_accelerated_tournament_cadences(monkeypatch):
         assert f"{key}={runner.TOURNAMENT_CYCLE_SECONDS}" in start_args
 
 
+def test_wait_clboss_status_retries_rpc_and_partial_startup(monkeypatch):
+    runner = load_runner()
+    replies = iter((
+        runner.RunnerError("command returned non-JSON"),
+        {"rebalance_mode": {"mode": "off"}},
+        {"rebalance_mode": {"mode": "off"}, "unmanaged": {}},
+    ))
+    sleeps = []
+
+    def rpc(*_args):
+        reply = next(replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+
+    status = runner.wait_clboss_status(
+        "clboss", attempts=3, poll_seconds=0.25
+    )
+
+    assert status["unmanaged"] == {}
+    assert sleeps == [0.25, 0.25]
+
+
+def test_wait_clboss_status_fails_closed_on_malformed_readback(monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner, "cln_rpc", lambda *_args: {})
+
+    with pytest.raises(runner.RunnerError, match="did not become status-ready"):
+        runner.wait_clboss_status("clboss", attempts=1, poll_seconds=0)
+
+
 def test_market_profiles_seed_explicit_realistic_and_acquisition_fees(monkeypatch):
     runner = load_runner()
     calls = []

@@ -2799,10 +2799,11 @@ def start_clboss(container: str, peer_ids: list[str]) -> dict[str, Any]:
         container, "-k", "plugin", "subcommand=start", f"plugin={CLBOSS_PLUGIN}",
         "clboss-auto-close=false", "clboss-rebalance-mode=off",
     )
+    wait_clboss_status(container)
     cln_rpc(container, "clboss-ignore-onchain", 96)
     for peer_id in sorted(peer_ids):
         cln_rpc(container, "clboss-unmanage", peer_id, "open,close")
-    status = cln_rpc(container, "clboss-status")
+    status = wait_clboss_status(container)
     unmanaged = status.get("unmanaged")
     if not isinstance(unmanaged, dict):
         raise RunnerError("CLBOSS status lacks unmanaged safety readback")
@@ -2811,6 +2812,30 @@ def start_clboss(container: str, peer_ids: list[str]) -> dict[str, Any]:
         if "open" not in tags or "close" not in tags:
             raise RunnerError(f"CLBOSS peer safety tags missing for {peer_id}")
     return status
+
+
+def wait_clboss_status(
+    container: str,
+    *,
+    attempts: int = 31,
+    poll_seconds: float = 1.0,
+) -> dict[str, Any]:
+    """Wait for CLBOSS RPC registration and initialized safety readback."""
+    attempts = positive_int(attempts)
+    if poll_seconds < 0:
+        raise RunnerError("CLBOSS status poll seconds must be nonnegative")
+    last = "status not ready"
+    for attempt in range(attempts):
+        try:
+            status = cln_rpc(container, "clboss-status")
+            if isinstance(status.get("unmanaged"), dict):
+                return status
+            last = "CLBOSS status lacks unmanaged safety readback"
+        except RunnerError as exc:
+            last = str(exc)
+        if attempt + 1 < attempts:
+            time.sleep(poll_seconds)
+    raise RunnerError(f"CLBOSS did not become status-ready: {last}")
 
 
 def setup(
