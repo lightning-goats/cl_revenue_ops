@@ -125,6 +125,16 @@
       "replica": "replica-102",
       "block": "smoke-1788040269",
       "reason": "Protocol invocation used two payments instead of two repetitions of the four-amount realistic profile; retained as a guard smoke but excluded from the valid eight-payment crossed treatment."
+    },
+    {
+      "replica": "replica-172",
+      "block": "smoke-1788125154",
+      "reason": "Final-revision identity-B validation contained 15,015,451 msat of unattributed multipart contender volume; replaced by exact-attribution seed 172102."
+    },
+    {
+      "replica": "replica-173",
+      "block": "smoke-1788127779",
+      "reason": "Final-revision identity-A validation contained 15,018,335 msat of unattributed multipart contender volume; replaced by exact-attribution seed 173106."
     }
   ]
 }
