@@ -247,6 +247,36 @@ def cln_rpc(container: str, *arguments: object) -> dict[str, Any]:
     )
 
 
+def clboss_status_rpc(container: str) -> dict[str, Any]:
+    """Read CLBOSS status while normalizing its invalid bare NaN numbers.
+
+    CLBOSS can emit ``-nan`` for size multipliers on very small graphs. CLN's
+    CLI prints that token even though RFC 8259 JSON has no non-finite numbers.
+    Keep the exception local to this diagnostic RPC and preserve strict JSON
+    parsing everywhere else in the tournament.
+    """
+    if not CONTAINER_RE.fullmatch(container):
+        raise RunnerError(f"refusing unsafe CLBOSS target {container!r}")
+    command = [
+        "docker", "exec", container, "lightning-cli", "--network=regtest",
+        "clboss-status",
+    ]
+    completed = _run(command)
+    normalized = re.sub(
+        r"([:\[,]\s*)[-+]?nan(?=\s*[,}\]])",
+        r"\1null",
+        completed.stdout,
+        flags=re.IGNORECASE,
+    )
+    try:
+        payload = json.loads(normalized)
+    except json.JSONDecodeError as exc:
+        raise RunnerError(f"command returned non-JSON: {command!r}") from exc
+    if not isinstance(payload, dict):
+        raise RunnerError(f"command returned a non-object: {command!r}")
+    return payload
+
+
 def lnd_rpc(container: str, *arguments: object) -> dict[str, Any]:
     allowed = {
         f"polar-n{NETWORK_ID}-lnd-payer",
@@ -2827,7 +2857,7 @@ def wait_clboss_status(
     last = "status not ready"
     for attempt in range(attempts):
         try:
-            status = cln_rpc(container, "clboss-status")
+            status = clboss_status_rpc(container)
             if isinstance(status.get("unmanaged"), dict):
                 return status
             last = "CLBOSS status lacks unmanaged safety readback"

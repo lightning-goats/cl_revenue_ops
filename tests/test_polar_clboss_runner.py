@@ -353,7 +353,7 @@ def test_wait_clboss_status_retries_rpc_and_partial_startup(monkeypatch):
             raise reply
         return reply
 
-    monkeypatch.setattr(runner, "cln_rpc", rpc)
+    monkeypatch.setattr(runner, "clboss_status_rpc", rpc)
     monkeypatch.setattr(runner.time, "sleep", sleeps.append)
 
     status = runner.wait_clboss_status(
@@ -366,10 +366,36 @@ def test_wait_clboss_status_retries_rpc_and_partial_startup(monkeypatch):
 
 def test_wait_clboss_status_fails_closed_on_malformed_readback(monkeypatch):
     runner = load_runner()
-    monkeypatch.setattr(runner, "cln_rpc", lambda *_args: {})
+    monkeypatch.setattr(runner, "clboss_status_rpc", lambda *_args: {})
 
     with pytest.raises(runner.RunnerError, match="did not become status-ready"):
         runner.wait_clboss_status("clboss", attempts=1, poll_seconds=0)
+
+
+def test_clboss_status_normalizes_only_bare_nonfinite_numbers(monkeypatch):
+    runner = load_runner()
+    stdout = json.dumps({
+        "unmanaged": {},
+        "description": "keep -nan text",
+    }).replace('"unmanaged": {}', '"multiplier": -nan, "unmanaged": {}')
+    completed = type("Result", (), {"stdout": stdout})()
+    monkeypatch.setattr(runner, "_run", lambda *_args, **_kwargs: completed)
+
+    status = runner.clboss_status_rpc(
+        "polar-n4-clboss-r147-identity-b"
+    )
+
+    assert status["multiplier"] is None
+    assert status["description"] == "keep -nan text"
+
+
+def test_clboss_status_rejects_malformed_payload(monkeypatch):
+    runner = load_runner()
+    completed = type("Result", (), {"stdout": "not json"})()
+    monkeypatch.setattr(runner, "_run", lambda *_args, **_kwargs: completed)
+
+    with pytest.raises(runner.RunnerError, match="returned non-JSON"):
+        runner.clboss_status_rpc("polar-n4-clboss-r147-identity-b")
 
 
 def test_market_profiles_seed_explicit_realistic_and_acquisition_fees(monkeypatch):
