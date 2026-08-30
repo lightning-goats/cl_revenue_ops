@@ -2430,7 +2430,7 @@ def test_prime_forced_paths_covers_both_controllers_families_and_directions(
     assert state["forced_path_readiness"]["forward_amount_sats"] == 100_000
     assert state["forced_path_readiness"]["reverse_amount_sats"] == 5_000
     assert state["forced_path_readiness"]["scored"] is False
-    assert acquisition_calls == ["acquisition", "retention"]
+    assert acquisition_calls == ["acquisition", "retention_or_completed"]
     assert {
         row["family"]
         for row in state["forced_path_readiness"]["acquisition_after"]
@@ -2494,6 +2494,50 @@ def test_wait_for_native_acquisition_markets_is_read_only_and_family_complete(
     assert [(row["family"], row["fee_base_msat"]) for row in rows] == [
         ("cln", 4), ("lnd", 7)
     ]
+
+
+def test_acquisition_readiness_accepts_verified_completed_restoration(monkeypatch):
+    runner = load_runner()
+    state = {
+        "assignment": {"revenue_ops": "identity-a"},
+        "contenders": {"identity-a": {"container": "revenue-container"}},
+        "lane_map": {"identity-a": {
+            "10x1x0": {"family": "cln", "side": "sink"},
+            "11x1x0": {"family": "lnd", "side": "sink"},
+        }},
+    }
+    monkeypatch.setattr(runner, "_acquisition_rows", lambda _container: [
+        {
+            "id": 1, "channel_id": "10x1x0", "state": "completed",
+            "phase": "acquisition", "exit_reason": "volume_cap",
+            "restored_fee_ppm": 150, "restored_base_fee_msat": 500,
+        },
+        {
+            "id": 2, "channel_id": "11x1x0", "state": "completed",
+            "phase": "acquisition", "exit_reason": "opportunity_cost_cap",
+            "restored_fee_ppm": 150, "restored_base_fee_msat": 500,
+        },
+    ])
+    monkeypatch.setattr(runner, "active_channels", lambda _container: [
+        {
+            "short_channel_id": scid,
+            "updates": {"local": {
+                "fee_proportional_millionths": 150,
+                "fee_base_msat": 500,
+            }},
+        }
+        for scid in ("10x1x0", "11x1x0")
+    ])
+
+    rows = runner.wait_for_native_acquisition_markets(
+        state, expected_phase="retention_or_completed", attempts=1,
+        poll_seconds=0,
+    )
+
+    assert [row["phase"] for row in rows] == ["completed", "completed"]
+    assert {row["exit_reason"] for row in rows} == {
+        "volume_cap", "opportunity_cost_cap",
+    }
 
 
 def test_wait_for_native_acquisition_markets_fails_closed_on_malformed_rows(

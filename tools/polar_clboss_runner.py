@@ -1898,7 +1898,7 @@ def prime_forced_paths(
         "payments": payments,
         "acquisition_before": acquisition_before,
         "acquisition_after": wait_for_native_acquisition_markets(
-            state, expected_phase="retention"
+            state, expected_phase="retention_or_completed"
         ),
     }
     _checkpoint(path, state, "forced_paths_primed", readiness=state["forced_path_readiness"])
@@ -1914,14 +1914,17 @@ def wait_for_native_acquisition_markets(
 ) -> list[dict[str, Any]]:
     """Await two native, paid-lifecycle acquisition markets read-only.
 
-    Formal readiness itself supplies the first 50k-sat demand observation on
-    each sink lane. Waiting for acquisition before those forwards prevents the
-    fixture from suppressing cold-start eligibility; waiting for retention
-    afterwards prevents free readiness traffic from leaking into scoring.
+    Formal readiness itself supplies the first demand observation on each sink
+    lane. Waiting for acquisition before those forwards prevents the fixture
+    from suppressing cold-start eligibility. Afterwards, require either paid
+    retention or a terminal episode whose exact baseline policy was restored;
+    both states prevent free readiness traffic from leaking into scoring.
     No fee/action RPC is used here: the product's native timer and forward wake
     remain the only decision triggers.
     """
-    if expected_phase not in {"acquisition", "retention"}:
+    if expected_phase not in {
+        "acquisition", "retention", "retention_or_completed"
+    }:
         raise RunnerError(f"invalid acquisition readiness phase: {expected_phase!r}")
     if attempts <= 0 or poll_seconds < 0:
         raise RunnerError("invalid acquisition readiness polling bounds")
@@ -1953,24 +1956,54 @@ def wait_for_native_acquisition_markets(
             str(row.get("short_channel_id")): row
             for row in active_channels(container)
         }
-        for episode in active:
+        raw_candidates = (
+            last_rows if expected_phase == "retention_or_completed" else active
+        )
+        latest_by_scid: dict[str, dict[str, Any]] = {}
+        for episode in raw_candidates:
+            scid = str(episode.get("channel_id") or "")
+            if scid not in expected_by_scid:
+                continue
+            prior = latest_by_scid.get(scid)
+            if prior is None or nonnegative_int(
+                episode.get("id", 0), "acquisition experiment id"
+            ) >= nonnegative_int(
+                prior.get("id", 0), "acquisition experiment id"
+            ):
+                latest_by_scid[scid] = episode
+        candidates = list(latest_by_scid.values())
+        for episode in candidates:
             scid = str(episode.get("channel_id") or "")
             family = expected_by_scid.get(scid)
-            if family is None or episode.get("phase") != expected_phase:
+            episode_state = str(episode.get("state") or "")
+            episode_phase = str(episode.get("phase") or "")
+            settled_phase = expected_phase
+            if expected_phase == "retention_or_completed":
+                if episode_state == "active" and episode_phase == "retention":
+                    settled_phase = "retention"
+                elif episode_state == "completed":
+                    settled_phase = "completed"
+                else:
+                    continue
+            elif episode_phase != expected_phase:
+                continue
+            if family is None:
                 continue
             live = live_by_scid.get(scid)
             updates = live.get("updates") if isinstance(live, dict) else None
             local = updates.get("local") if isinstance(updates, dict) else None
-            if expected_phase == "acquisition":
+            if settled_phase == "acquisition":
                 ppm_key, base_key = "target_fee_ppm", "target_base_fee_msat"
-            else:
+            elif settled_phase == "retention":
                 ppm_key, base_key = "retention_fee_ppm", "retention_base_fee_msat"
+            else:
+                ppm_key, base_key = "restored_fee_ppm", "restored_base_fee_msat"
             try:
                 expected_ppm = nonnegative_int(
-                    episode.get(ppm_key), f"{family} {expected_phase} ppm"
+                    episode.get(ppm_key), f"{family} {settled_phase} ppm"
                 )
                 expected_base = nonnegative_int(
-                    episode.get(base_key), f"{family} {expected_phase} base fee"
+                    episode.get(base_key), f"{family} {settled_phase} base fee"
                 )
                 live_ppm = nonnegative_int(
                     local.get("fee_proportional_millionths")
@@ -1989,13 +2022,18 @@ def wait_for_native_acquisition_markets(
                 "family": family,
                 "channel_id": scid,
                 "experiment_id": episode.get("id"),
-                "phase": expected_phase,
+                "phase": settled_phase,
+                "exit_reason": (
+                    episode.get("exit_reason")
+                    if settled_phase == "completed" else None
+                ),
                 "fee_ppm": live_ppm,
                 "fee_base_msat": live_base,
             })
         if (
-            len(active) == EXPECTED_ACQUISITION_MARKETS
-            and len(selected) == EXPECTED_ACQUISITION_MARKETS
+            len(selected) == EXPECTED_ACQUISITION_MARKETS
+            and len({row["channel_id"] for row in selected})
+            == EXPECTED_ACQUISITION_MARKETS
             and {row["family"] for row in selected} == {"cln", "lnd"}
         ):
             return sorted(selected, key=lambda row: row["family"])
