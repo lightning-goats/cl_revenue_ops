@@ -3118,8 +3118,40 @@ class FeeController:
     # away from a saturated egress and toward a depleted ingress. Credit only
     # a tiny, bounded share of that avoided rebalance value, and retain a
     # realistic non-zero quote even when min_fee_ppm_saturated is zero.
-    ACQUISITION_ORGANIC_REBALANCE_CREDIT_PPM = 5
+    ACQUISITION_ORGANIC_REBALANCE_BASE_CREDIT_PPM = 5
+    ACQUISITION_ORGANIC_REBALANCE_MAX_CREDIT_PPM = 25
     ACQUISITION_ORGANIC_REBALANCE_MIN_PPM = 5
+
+    @classmethod
+    def _acquisition_inventory_credit(
+        cls, floor_ppm: Any, cheap_quartile_ppm: Any
+    ) -> int:
+        """Return a bounded organic-rebalance credit backed by live market data."""
+        try:
+            floor = int(floor_ppm)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        base_credit = min(
+            cls.ACQUISITION_ORGANIC_REBALANCE_BASE_CREDIT_PPM,
+            max(0, floor - cls.ACQUISITION_ORGANIC_REBALANCE_MIN_PPM),
+        )
+        try:
+            if isinstance(cheap_quartile_ppm, bool):
+                raise ValueError("boolean market fee")
+            market = int(cheap_quartile_ppm)
+        except (TypeError, ValueError, OverflowError):
+            return base_credit
+        if market < 0:
+            return base_credit
+        market_target = max(
+            cls.ACQUISITION_ORGANIC_REBALANCE_MIN_PPM,
+            market - 1,
+        )
+        market_credit = min(
+            cls.ACQUISITION_ORGANIC_REBALANCE_MAX_CREDIT_PPM,
+            max(0, floor - market_target),
+        )
+        return max(base_credit, market_credit)
 
     @classmethod
     def _inventory_fee_rails(
@@ -8966,13 +8998,19 @@ class FeeController:
                 and channel_id in self._acquisition_tainted_flow_channels
             )
             if acquisition_inventory_immediate:
-                acquisition_inventory_credit_ppm = min(
-                    self.ACQUISITION_ORGANIC_REBALANCE_CREDIT_PPM,
-                    max(
-                        0,
-                        inventory_floor_ppm
-                        - self.ACQUISITION_ORGANIC_REBALANCE_MIN_PPM,
-                    ),
+                try:
+                    transition_market_p25 = self._get_neighbor_fee_percentile(
+                        peer_id, 0.25, cfg=cfg, force_refresh=True
+                    )
+                except Exception:
+                    transition_market_p25 = None
+                if transition_market_p25 is not None:
+                    competitive_cheap_quartile_ppm = transition_market_p25
+                acquisition_inventory_credit_ppm = (
+                    self._acquisition_inventory_credit(
+                        inventory_floor_ppm,
+                        transition_market_p25,
+                    )
                 )
                 inventory_floor_ppm -= acquisition_inventory_credit_ppm
                 inventory_ceiling_ppm = max(

@@ -496,6 +496,7 @@ class TestExtremeInventoryPriceRails:
         fc._get_rebalance_cost_floor = lambda *a, **k: None
         fc._get_channel_rebalance_cost_ppm = lambda *a, **k: 0
         fc._get_neighbor_fee_median = lambda *a, **k: None
+        fc._get_neighbor_fee_percentile = lambda *a, **k: 10
         chain = {"fee": 150}
         _stub_broadcasts(fc, chain)
         ts_state = _prepare_dts_stubs(fc, chain_fee=150, sampled_fee=1450)
@@ -515,16 +516,25 @@ class TestExtremeInventoryPriceRails:
         assert result.algorithm_values["inventory_rail_reason"] == (
             "saturated_inventory_ceiling"
         )
-        assert result.algorithm_values["acquisition_inventory_credit_ppm"] == 5
+        assert result.algorithm_values["acquisition_inventory_credit_ppm"] == 12
         assert result.algorithm_values["acquisition_inventory_immediate"] is True
-        assert result.algorithm_values["inventory_floor_ppm"] == 16
-        assert result.algorithm_values["inventory_ceiling_ppm"] == 16
-        assert result.algorithm_values["bounded_target_ppm"] == 16
+        assert result.algorithm_values["inventory_floor_ppm"] == 9
+        assert result.algorithm_values["inventory_ceiling_ppm"] == 9
+        assert result.algorithm_values["bounded_target_ppm"] == 9
         assert result.algorithm_values["target_blend_ratio"] == 1.0
         assert result.algorithm_values["delta_cap_reason"] == (
             "acquisition_inventory_transition"
         )
-        assert result.new_fee_ppm == 16
+        assert result.new_fee_ppm == 9
+
+    @pytest.mark.parametrize("market", [None, "bad", True, -1, object()])
+    def test_missing_or_malformed_market_keeps_base_organic_credit(self, market):
+        assert FeeController._acquisition_inventory_credit(21, market) == 5
+
+    def test_market_organic_credit_is_capped_and_keeps_realistic_minimum(self):
+        assert FeeController._acquisition_inventory_credit(38, 10) == 25
+        assert FeeController._acquisition_inventory_credit(20, 0) == 15
+        assert FeeController._acquisition_inventory_credit(5, 0) == 0
 
 # =============================================================================
 # P5: Kalman demand divisor clamp
