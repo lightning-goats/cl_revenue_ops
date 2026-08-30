@@ -2381,6 +2381,35 @@ class Database:
         """, (int(since), int(since))).fetchall()
         return [str(row["channel_id"]) for row in rows if row["channel_id"]]
 
+    def get_acquisition_channel_evidence_since(
+        self, since: int
+    ) -> list[Dict[str, Any]]:
+        """Return the newest route-specific evidence for recent acquisitions.
+
+        Fee-cycle consumers use the captured competitor floor only while the
+        episode overlaps their recent-flow window.  Returning one newest row
+        per channel prevents an older episode from overriding fresher evidence.
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT channel_id, competitor_floor_ppm, state, started_at,
+                   completed_at, id
+            FROM acquisition_experiments
+            WHERE state = 'active'
+               OR started_at >= ?
+               OR COALESCE(completed_at, 0) >= ?
+            ORDER BY channel_id,
+                     CASE WHEN state = 'active' THEN 0 ELSE 1 END,
+                     COALESCE(completed_at, started_at) DESC,
+                     id DESC
+        """, (int(since), int(since))).fetchall()
+        newest: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            channel_id = str(row["channel_id"] or "")
+            if channel_id and channel_id not in newest:
+                newest[channel_id] = dict(row)
+        return list(newest.values())
+
     def transition_acquisition_to_retention(
         self,
         experiment_id: int,

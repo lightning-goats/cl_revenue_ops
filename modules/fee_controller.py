@@ -3120,11 +3120,19 @@ class FeeController:
     # realistic non-zero quote even when min_fee_ppm_saturated is zero.
     ACQUISITION_ORGANIC_REBALANCE_BASE_CREDIT_PPM = 5
     ACQUISITION_ORGANIC_REBALANCE_MAX_CREDIT_PPM = 25
+    # A route-specific competitor floor captured by a bounded acquisition
+    # episode is stronger evidence than a graph-wide cheap quartile.  Permit a
+    # wider, still-bounded credit so a saturated lane can actually undercut the
+    # proven route instead of losing all flow a few ppm above it.
+    ACQUISITION_ROUTE_EVIDENCE_MAX_CREDIT_PPM = 50
     ACQUISITION_ORGANIC_REBALANCE_MIN_PPM = 5
 
     @classmethod
     def _acquisition_inventory_credit(
-        cls, floor_ppm: Any, cheap_quartile_ppm: Any
+        cls,
+        floor_ppm: Any,
+        cheap_quartile_ppm: Any,
+        route_competitor_floor_ppm: Any = None,
     ) -> int:
         """Return a bounded organic-rebalance credit backed by live market data."""
         try:
@@ -3135,6 +3143,25 @@ class FeeController:
             cls.ACQUISITION_ORGANIC_REBALANCE_BASE_CREDIT_PPM,
             max(0, floor - cls.ACQUISITION_ORGANIC_REBALANCE_MIN_PPM),
         )
+        route_floor = None
+        try:
+            if isinstance(route_competitor_floor_ppm, bool):
+                raise ValueError("boolean route fee")
+            candidate = int(route_competitor_floor_ppm)
+            if cls._acquisition_competitor_floor_qualifies(candidate):
+                route_floor = candidate
+        except (TypeError, ValueError, OverflowError):
+            pass
+        if route_floor is not None:
+            route_target = max(
+                cls.ACQUISITION_ORGANIC_REBALANCE_MIN_PPM,
+                route_floor - 1,
+            )
+            route_credit = min(
+                cls.ACQUISITION_ROUTE_EVIDENCE_MAX_CREDIT_PPM,
+                max(0, floor - route_target),
+            )
+            return max(base_credit, route_credit)
         try:
             if isinstance(cheap_quartile_ppm, bool):
                 raise ValueError("boolean market fee")
@@ -3312,6 +3339,37 @@ class FeeController:
             for channel_id in rows
             if isinstance(channel_id, str) and channel_id
         }
+
+    def _load_acquisition_competitor_floors(self, now: int) -> Dict[str, int]:
+        """Load recent route-specific acquisition floors, failing neutrally."""
+        get_evidence = getattr(
+            self.database, "get_acquisition_channel_evidence_since", None
+        )
+        if not callable(get_evidence):
+            return {}
+        try:
+            rows = get_evidence(int(now) - self.FLOW_BALANCED_WINDOW_SECONDS)
+        except Exception as exc:
+            self.plugin.log(
+                f"ACQUISITION: route-evidence read failed: {exc}",
+                level="debug",
+            )
+            return {}
+        if not isinstance(rows, (list, tuple)):
+            return {}
+        floors: Dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            channel_id = row.get("channel_id")
+            floor = row.get("competitor_floor_ppm")
+            if (
+                isinstance(channel_id, str)
+                and channel_id
+                and self._acquisition_competitor_floor_qualifies(floor)
+            ):
+                floors[channel_id] = int(floor)
+        return floors
 
     def _effective_min_fee_ppm(
         self,
@@ -4103,6 +4161,7 @@ class FeeController:
         # Acquisition quotes contaminate flow evidence: zero/sub-economic
         # traffic does not prove a lane self-refills at ordinary prices.
         self._acquisition_tainted_flow_channels: set[str] = set()
+        self._acquisition_competitor_floors: Dict[str, int] = {}
         # Compact active-episode state survives between fee cycles so settled
         # evidence can wake the governed loop.  It performs no CLN RPCs or fee
         # writes and uses its own lock rather than the cycle-wide state lock.
@@ -6148,6 +6207,9 @@ class FeeController:
         self._acquisition_tainted_flow_channels = (
             self._load_acquisition_tainted_flow_channels(acquisition_now)
         )
+        self._acquisition_competitor_floors = (
+            self._load_acquisition_competitor_floors(acquisition_now)
+        )
         self._acquisition_cycle_experiments = self._prepare_acquisition_experiments(
             channel_states, channels, cfg, acquisition_now
         )
@@ -7348,6 +7410,7 @@ class FeeController:
         inventory_rail_reason = "none"
         acquisition_inventory_credit_ppm = 0
         acquisition_inventory_immediate = False
+        acquisition_route_competitor_floor_ppm = None
         upward_probe_pre_cap_ppm = None  # L1: set when a probe stretch is granted
         bound_reason = "none"
         delta_cap_reason = "none"
@@ -8998,6 +9061,9 @@ class FeeController:
                 and channel_id in self._acquisition_tainted_flow_channels
             )
             if acquisition_inventory_immediate:
+                acquisition_route_competitor_floor_ppm = (
+                    self._acquisition_competitor_floors.get(channel_id)
+                )
                 try:
                     transition_market_p25 = self._get_neighbor_fee_percentile(
                         peer_id, 0.25, cfg=cfg, force_refresh=True
@@ -9010,6 +9076,7 @@ class FeeController:
                     self._acquisition_inventory_credit(
                         inventory_floor_ppm,
                         transition_market_p25,
+                        acquisition_route_competitor_floor_ppm,
                     )
                 )
                 inventory_floor_ppm -= acquisition_inventory_credit_ppm
@@ -9752,6 +9819,7 @@ class FeeController:
                     "inventory_rail_reason": inventory_rail_reason,
                     "acquisition_inventory_credit_ppm": acquisition_inventory_credit_ppm,
                     "acquisition_inventory_immediate": acquisition_inventory_immediate,
+                    "acquisition_route_competitor_floor_ppm": acquisition_route_competitor_floor_ppm,
                     "bounded_target_ppm": bounded_target_ppm,
                     "blended_target_ppm": blended_target_ppm if blended_target_ppm is not None else bounded_target_ppm,
                     "applied_target_ppm": applied_target_ppm if applied_target_ppm is not None else new_fee_ppm,

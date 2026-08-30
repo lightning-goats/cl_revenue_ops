@@ -358,6 +358,43 @@ class TestExtremeInventoryPriceRails:
 
         assert fc._load_acquisition_tainted_flow_channels(1_000_000) == set()
 
+    @pytest.mark.parametrize(
+        "rows",
+        [None, "bad", {"channel_id": CHANNEL_ID}, 7, [None, "bad", {}]],
+    )
+    def test_malformed_acquisition_route_evidence_is_neutral(
+        self, mock_plugin, mock_database, rows
+    ):
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_acquisition_channel_evidence_since.return_value = rows
+
+        assert fc._load_acquisition_competitor_floors(1_000_000) == {}
+
+    def test_acquisition_route_evidence_rpc_error_is_neutral(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_acquisition_channel_evidence_since.side_effect = (
+            RuntimeError("db")
+        )
+
+        assert fc._load_acquisition_competitor_floors(1_000_000) == {}
+
+    def test_acquisition_route_evidence_filters_invalid_rows(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_acquisition_channel_evidence_since.return_value = [
+            {"channel_id": CHANNEL_ID, "competitor_floor_ppm": 10},
+            {"channel_id": "2x1x0", "competitor_floor_ppm": True},
+            {"channel_id": "3x1x0", "competitor_floor_ppm": 11},
+            {"channel_id": "", "competitor_floor_ppm": 5},
+        ]
+
+        assert fc._load_acquisition_competitor_floors(1_000_000) == {
+            CHANNEL_ID: 10
+        }
+
     def test_flow_balanced_router_is_exempt_from_urgent_reprice(
         self, mock_plugin, mock_database
     ):
@@ -492,11 +529,12 @@ class TestExtremeInventoryPriceRails:
             rebalance_emergency_local_ratio=0.20,
         )
         fc._acquisition_tainted_flow_channels = {CHANNEL_ID}
-        fc._calculate_floor = lambda *a, **k: 21
+        fc._acquisition_competitor_floors = {CHANNEL_ID: 10}
+        fc._calculate_floor = lambda *a, **k: 53
         fc._get_rebalance_cost_floor = lambda *a, **k: None
         fc._get_channel_rebalance_cost_ppm = lambda *a, **k: 0
         fc._get_neighbor_fee_median = lambda *a, **k: None
-        fc._get_neighbor_fee_percentile = lambda *a, **k: 10
+        fc._get_neighbor_fee_percentile = lambda *a, **k: 10_000
         chain = {"fee": 150}
         _stub_broadcasts(fc, chain)
         ts_state = _prepare_dts_stubs(fc, chain_fee=150, sampled_fee=1450)
@@ -516,8 +554,11 @@ class TestExtremeInventoryPriceRails:
         assert result.algorithm_values["inventory_rail_reason"] == (
             "saturated_inventory_ceiling"
         )
-        assert result.algorithm_values["acquisition_inventory_credit_ppm"] == 12
+        assert result.algorithm_values["acquisition_inventory_credit_ppm"] == 44
         assert result.algorithm_values["acquisition_inventory_immediate"] is True
+        assert result.algorithm_values[
+            "acquisition_route_competitor_floor_ppm"
+        ] == 10
         assert result.algorithm_values["inventory_floor_ppm"] == 9
         assert result.algorithm_values["inventory_ceiling_ppm"] == 9
         assert result.algorithm_values["bounded_target_ppm"] == 9
@@ -535,6 +576,11 @@ class TestExtremeInventoryPriceRails:
         assert FeeController._acquisition_inventory_credit(38, 10) == 25
         assert FeeController._acquisition_inventory_credit(20, 0) == 15
         assert FeeController._acquisition_inventory_credit(5, 0) == 0
+
+    def test_route_specific_organic_credit_has_wider_bounded_undercut(self):
+        assert FeeController._acquisition_inventory_credit(53, 10_000, 10) == 44
+        assert FeeController._acquisition_inventory_credit(80, 10_000, 10) == 50
+        assert FeeController._acquisition_inventory_credit(53, 10_000, True) == 5
 
 # =============================================================================
 # P5: Kalman demand divisor clamp

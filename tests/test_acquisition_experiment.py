@@ -256,6 +256,24 @@ def test_database_enforces_two_distinct_active_markets_and_persists_exact_restor
         "2x1x0",
         "4x1x0",
     ]
+    assert restarted.get_acquisition_channel_evidence_since(2_001) == [
+        {
+            "channel_id": "2x1x0",
+            "competitor_floor_ppm": 1,
+            "state": "active",
+            "started_at": 1_001,
+            "completed_at": None,
+            "id": second["id"],
+        },
+        {
+            "channel_id": "4x1x0",
+            "competitor_floor_ppm": 1,
+            "state": "active",
+            "started_at": 2_001,
+            "completed_at": None,
+            "id": third["id"],
+        },
+    ]
     assert restarted.channel_acquisition_on_cooldown(
         "1x1x0", now=2_001, cooldown_seconds=100
     )
