@@ -37,6 +37,55 @@ class TestPIDState:
         m = pid.calculate_multiplier(0.1, capacity_sats=2_000_000)
         assert m > 1.0, f"Drained channel should raise fee, got {m}"
 
+    def test_emergency_depletion_has_immediate_bounded_inventory_floor(self):
+        pid = PIDState()
+        pid.last_update_time = int(time.time()) - 1
+
+        multiplier = pid.calculate_multiplier(
+            0.03,
+            capacity_sats=1_000_000,
+            emergency_outbound_ratio=0.20,
+        )
+
+        assert 1.84 <= multiplier <= 2.0
+
+    @pytest.mark.parametrize(
+        "bad_threshold", [None, "bad", object(), float("nan"), 0, -1]
+    )
+    def test_emergency_depletion_threshold_malformed_falls_back_safely(
+        self, bad_threshold
+    ):
+        pid = PIDState()
+        multiplier = pid.calculate_multiplier(
+            0.03,
+            capacity_sats=1_000_000,
+            emergency_outbound_ratio=bad_threshold,
+        )
+        assert 1.84 <= multiplier <= 2.0
+
+    def test_depleted_inventory_reprice_reason_uses_live_ratio(self):
+        cfg = type("Cfg", (), {"rebalance_emergency_local_ratio": 0.20})()
+
+        assert FeeController._depleted_inventory_reprice_reason(
+            {"capacity": 1_000_000, "spendable_msat": "30000000msat"}, cfg
+        ) == "depleted_inventory"
+        assert FeeController._depleted_inventory_reprice_reason(
+            {"capacity": 1_000_000, "spendable_msat": "300000000msat"}, cfg
+        ) is None
+
+    @pytest.mark.parametrize(
+        "channel_info",
+        [None, {}, {"capacity": "bad"},
+         {"capacity": 1_000_000, "spendable_msat": "bad"}],
+    )
+    def test_depleted_inventory_reprice_reason_malformed_is_neutral(
+        self, channel_info
+    ):
+        cfg = type("Cfg", (), {"rebalance_emergency_local_ratio": 0.20})()
+        assert FeeController._depleted_inventory_reprice_reason(
+            channel_info, cfg
+        ) is None
+
     def test_saturated_channel_lowers_fee(self):
         pid = PIDState()
         pid.last_update_time = int(time.time()) - 1800

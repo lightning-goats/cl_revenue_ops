@@ -2011,6 +2011,7 @@ class PIDState:
         current_outbound_ratio: float,
         capacity_sats: int,
         flow_state: str = "balanced",
+        emergency_outbound_ratio: float = 0.20,
     ) -> float:
         now = decision_now("pid.calculate")
         if self.last_update_time <= 0:
@@ -2024,6 +2025,18 @@ class PIDState:
         # Guard NaN/Inf
         if not math.isfinite(current_outbound_ratio):
             current_outbound_ratio = target
+        try:
+            if (
+                isinstance(emergency_outbound_ratio, bool)
+                or not isinstance(emergency_outbound_ratio, (int, float))
+            ):
+                raise TypeError("emergency ratio is not numeric")
+            emergency_ratio = float(emergency_outbound_ratio)
+        except (TypeError, ValueError, OverflowError):
+            emergency_ratio = 0.20
+        if not math.isfinite(emergency_ratio) or emergency_ratio <= 0.0:
+            emergency_ratio = 0.20
+        emergency_ratio = min(1.0, emergency_ratio)
         raw_error = target - current_outbound_ratio
 
         self.ewma_error = (
@@ -2049,6 +2062,17 @@ class PIDState:
 
         output = p_term + i_term + d_term
         multiplier = 1.5 ** output
+        # A deeply depleted channel cannot wait for the smoothed P/I terms to
+        # converge over several observation windows. Keep the existing 2x PID
+        # ceiling, but impose a continuous emergency minimum from 1x at the
+        # configured reserve boundary to 2x at zero outbound. Economic rails
+        # and market evidence still compose downstream.
+        if current_outbound_ratio < emergency_ratio:
+            emergency_floor = 1.0 + (
+                (emergency_ratio - max(0.0, current_outbound_ratio))
+                / emergency_ratio
+            )
+            multiplier = max(multiplier, emergency_floor)
         return max(0.5, min(2.0, multiplier))
 
     def to_dict(self) -> dict:
@@ -6281,7 +6305,7 @@ class FeeController:
                 force_reprice_reason = (
                     "acquisition_experiment"
                     if channel_id in self._acquisition_cycle_experiments
-                    else None
+                    else self._depleted_inventory_reprice_reason(channel_info, cfg)
                 )
 
                 adjustment = self._adjust_channel_fee(
@@ -6373,6 +6397,61 @@ class FeeController:
             return "alpha_guard"
 
         return "fee_unchanged"
+
+    @staticmethod
+    def _depleted_inventory_reprice_reason(
+        channel_info: Any,
+        cfg: Optional[Any],
+    ) -> Optional[str]:
+        """Wake fee decisioning when live outbound is below emergency reserve.
+
+        Missing or malformed live/config data is neutral: normal observation
+        windows remain authoritative instead of manufacturing urgency.
+        """
+        if not isinstance(channel_info, dict):
+            return None
+        try:
+            capacity = int(channel_info.get("capacity") or 0)
+            raw_spendable = channel_info.get("spendable_msat")
+            if isinstance(raw_spendable, str):
+                numeric = raw_spendable.strip().lower()
+                if numeric.endswith("msat"):
+                    numeric = numeric[:-4]
+                if not numeric.isdigit():
+                    return None
+            elif (
+                isinstance(raw_spendable, bool)
+                or not isinstance(raw_spendable, (int, float))
+                or not math.isfinite(float(raw_spendable))
+            ):
+                return None
+            spendable = base_to_sats_floor(
+                parse_msat(raw_spendable)
+            )
+            raw_threshold = getattr(
+                cfg, "rebalance_emergency_local_ratio", None
+            )
+            if (
+                isinstance(raw_threshold, bool)
+                or not isinstance(raw_threshold, (int, float))
+            ):
+                return None
+            threshold = float(raw_threshold)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        if (
+            capacity <= 0
+            or spendable < 0
+            or not math.isfinite(threshold)
+            or threshold <= 0.0
+            or threshold > 1.0
+        ):
+            return None
+        return (
+            "depleted_inventory"
+            if (spendable / capacity) < threshold
+            else None
+        )
 
     @classmethod
     def _effective_min_observation_hours(
@@ -8281,6 +8360,9 @@ class FeeController:
                 current_outbound_ratio=outbound_ratio,
                 capacity_sats=capacity,
                 flow_state=flow_state_str,
+                emergency_outbound_ratio=getattr(
+                    cfg, 'rebalance_emergency_local_ratio', 0.20
+                ),
             )
             raw_dts_target_ppm = int(dts_fee)
             post_pid_target_ppm = int(dts_fee * pid_multiplier)
