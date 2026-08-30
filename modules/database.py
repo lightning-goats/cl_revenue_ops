@@ -5862,9 +5862,10 @@ class Database:
         """Return coherent volume/count/minimum evidence for one episode.
 
         A single aggregate query prevents the acquisition transition from
-        mixing three different database moments.  The minimum, rather than
-        the average, anchors a positive base-fee quote that remains below the
-        observed proportional competitor for every acquired payment size.
+        mixing three different database moments. The minimum proves whether
+        any positive integer-msat retention quote can strictly undercut the
+        observed proportional competitor; the controller then uses the
+        smallest such quote so paid validation can generalize downward.
         """
         conn = self._get_connection()
         row = conn.execute("""

@@ -244,11 +244,11 @@ restart-safe, one-hour market-acquisition episodes at a time, on distinct peer
 markets. Each is restricted to a cold high-outbound channel with a peer-local
 1--10-ppm competing floor and a 0-ppm class-aware floor. After 50,000 acquired
 sats, the same episode may enter a one-hour paid-validation phase at 0 ppm plus
-a positive base fee. The
-base fee is one millisatoshi below the competitor's proportional charge at the
-smallest acquired payment (and capped at 1,000 msat), so it earns on every
-retained route while remaining strictly cheaper across the observed payment
-range. If no positive integer-millisatoshi undercut exists, the episode exits.
+a 1-msat base fee. The smallest acquired payment must prove that this positive
+quote strictly undercuts the competing proportional fee; using the minimum
+positive quote keeps paid validation competitive when later payments are
+smaller than the sparse acquisition sample. If no positive
+integer-millisatoshi undercut exists, the episode exits.
 Both phases share a per-episode 25-sat opportunity-cost and 70%
 outbound-liquidity stop; the free phase is additionally capped at 250,000
 routed sats and the paid phase at 250,000 additional sats. The two-market cap

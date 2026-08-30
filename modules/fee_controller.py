@@ -2604,10 +2604,13 @@ class FeeController:
     ACQUISITION_VOLUME_CAP_SATS = 250_000
     ACQUISITION_OPPORTUNITY_COST_CAP_SATS = 25.0
     # A free quote is only useful if it answers whether demand exists.  Once
-    # enough demand is observed, validate it with a positive base-fee quote
-    # that is strictly cheaper than the peer-local proportional floor at the
-    # smallest acquired payment.  This phase is part of the same default-on,
-    # one-lane loss budget and cannot outlive its own caps.
+    # enough demand is observed, validate it with the smallest positive
+    # integer-msat base-fee quote.  The acquired minimum proves that this
+    # quote strictly undercuts the peer-local proportional floor at least
+    # once; choosing 1 msat instead of maximizing against one sparse sample
+    # keeps the validation quote competitive for smaller future payments.
+    # This phase is part of the same default-on, one-lane loss budget and
+    # cannot outlive its own caps.
     ACQUISITION_RETENTION_MIN_VOLUME_SATS = 50_000
     # Wake the ordinary governed fee loop only after enough new evidence can
     # change a lifecycle decision.  The loss step is one fifth of the fixed
@@ -3358,12 +3361,16 @@ class FeeController:
     def _positive_retention_base_fee_msat(
         cls, minimum_out_msat: Any, competitor_fee_ppm: Any
     ) -> Optional[int]:
-        """Return a positive quote strictly below the proportional fee.
+        """Return the smallest positive quote below the proportional fee.
 
-        The minimum acquired payment is the conservative anchor: if the quote
-        undercuts there, it also undercuts the same proportional policy for
-        every larger observed payment.  There is no positive integer-msat
-        undercut when the competitor charge is at most one millisatoshi.
+        The minimum acquired payment is a viability check, not a price anchor:
+        it proves that a positive integer-msat undercut exists.  A 1-msat
+        quote then retains that proof while generalizing to every future
+        payment whose competing proportional charge exceeds one millisatoshi.
+        Maximizing the quote against one sparse acquisition sample can lose
+        all smaller demand before paid validation learns anything.  There is
+        no positive integer-msat undercut when the observed competitor charge
+        is at most one millisatoshi.
         """
         if (
             isinstance(minimum_out_msat, bool)
@@ -3390,10 +3397,7 @@ class FeeController:
         competitor_charge_msat = amount_msat * fee_ppm // 1_000_000
         if competitor_charge_msat <= 1:
             return None
-        return min(
-            cls.ACQUISITION_RETENTION_BASE_FEE_CAP_MSAT,
-            competitor_charge_msat - 1,
-        )
+        return 1
 
     def _sync_acquisition_monitor_episodes(
         self,
