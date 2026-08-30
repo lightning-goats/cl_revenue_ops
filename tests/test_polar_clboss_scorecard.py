@@ -166,7 +166,7 @@ def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming()
     assert "## Current functional comparison" in rendered
     assert "| Fee setting | 100 msat net at 2000.0 ppm yield" in rendered
     assert "| Route acquisition / breadth | 60000 msat, 60.0% share" in rendered
-    assert "CLBOSS (diagnostic)" in rendered
+    assert "Revenue Ops (diagnostic)" in rendered
     assert "| Reliability | Strict safety-gated blocks only; shared traffic settled 10/10 payments" in rendered
     assert "| Channel open / close management | Intentionally absent" in rendered
     assert "### acquisition" in rendered

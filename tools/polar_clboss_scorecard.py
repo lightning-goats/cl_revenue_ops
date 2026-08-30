@@ -756,6 +756,13 @@ def markdown(scorecard: dict[str, Any]) -> str:
         "",
         "This table describes observed lab outcomes; it does not treat historical smoke blocks as decisive evidence.",
         "",
+        (
+            "The final-revision crossed results, production-scale balance fix, "
+            "and next hypotheses are recorded in the "
+            "[selective displacement strategy]"
+            "(plans/2026-08-30-selective-displacement.md)."
+        ),
+        "",
         "## Current functional comparison",
         "",
         "| Comparable functional area | Revenue Ops evidence | CLBOSS evidence | Current result |",
@@ -772,7 +779,12 @@ def markdown(scorecard: dict[str, Any]) -> str:
             f"{overall['revenue_ops']['volume_msat']} msat, "
             f"{overall['revenue_ops']['volume_share_pct']}% share | "
             f"{overall['clboss']['volume_msat']} msat, "
-            f"{overall['clboss']['volume_share_pct']}% share | CLBOSS (diagnostic) |"
+            f"{overall['clboss']['volume_share_pct']}% share | "
+            + (
+                "Revenue Ops (diagnostic) |"
+                if scorecard["area_leaders"]["routing_volume"] == "revenue_ops"
+                else "CLBOSS (diagnostic) |"
+            )
         ),
     ])
     if post_rebalance is not None:

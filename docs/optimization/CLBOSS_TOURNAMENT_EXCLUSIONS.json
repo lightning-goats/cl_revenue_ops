@@ -135,6 +135,16 @@
       "replica": "replica-173",
       "block": "smoke-1788127779",
       "reason": "Final-revision identity-A validation contained 15,018,335 msat of unattributed multipart contender volume; replaced by exact-attribution seed 173106."
+    },
+    {
+      "replica": "replica-178",
+      "block": "smoke-1788131164",
+      "reason": "First 20M full-stack block stopped after a terminal LND reverse timeout (91 of 92 attempts settled); retained as diagnostic evidence and replaced by a fresh seed."
+    },
+    {
+      "replica": "replica-178",
+      "block": "smoke-1788131698",
+      "reason": "Replacement began from the already-degraded 20M topology, stopped after a terminal LND payment, and included 40,000,000 msat of fallback traffic; excluded from scored evidence."
     }
   ]
 }
