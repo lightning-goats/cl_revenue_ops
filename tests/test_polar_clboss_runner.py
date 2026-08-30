@@ -2269,9 +2269,8 @@ def test_prime_forced_paths_covers_both_controllers_families_and_directions(
     def acquisition_readiness(_state, *, expected_phase, **_kwargs):
         acquisition_calls.append(expected_phase)
         return [
-            {"family": family, "side": side, "phase": expected_phase}
+            {"family": family, "phase": expected_phase}
             for family in ("cln", "lnd")
-            for side in ("payer", "sink")
         ]
 
     monkeypatch.setattr(
@@ -2296,12 +2295,9 @@ def test_prime_forced_paths_covers_both_controllers_families_and_directions(
     assert state["forced_path_readiness"]["scored"] is False
     assert acquisition_calls == ["acquisition", "retention"]
     assert {
-        (row["family"], row["side"])
+        row["family"]
         for row in state["forced_path_readiness"]["acquisition_after"]
-    } == {
-        ("cln", "payer"), ("cln", "sink"),
-        ("lnd", "payer"), ("lnd", "sink"),
-    }
+    } == {"cln", "lnd"}
 
 
 def test_wait_for_native_acquisition_markets_is_read_only_and_family_complete(
@@ -2316,7 +2312,6 @@ def test_wait_for_native_acquisition_markets_is_read_only_and_family_complete(
                 "10x1x0": {"family": "cln", "side": "sink"},
                 "11x1x0": {"family": "lnd", "side": "sink"},
                 "12x1x0": {"family": "cln", "side": "payer"},
-                "13x1x0": {"family": "lnd", "side": "payer"},
             }
         },
     }
@@ -2337,22 +2332,6 @@ def test_wait_for_native_acquisition_markets_is_read_only_and_family_complete(
             "retention_fee_ppm": 0,
             "retention_base_fee_msat": 7,
         },
-        {
-            "id": 3,
-            "channel_id": "12x1x0",
-            "state": "active",
-            "phase": "retention",
-            "retention_fee_ppm": 0,
-            "retention_base_fee_msat": 5,
-        },
-        {
-            "id": 4,
-            "channel_id": "13x1x0",
-            "state": "active",
-            "phase": "retention",
-            "retention_fee_ppm": 0,
-            "retention_base_fee_msat": 6,
-        },
     ])
     monkeypatch.setattr(runner, "active_channels", lambda _container: [
         {
@@ -2369,29 +2348,14 @@ def test_wait_for_native_acquisition_markets_is_read_only_and_family_complete(
                 "fee_base_msat": 7,
             }},
         },
-        {
-            "short_channel_id": "12x1x0",
-            "updates": {"local": {
-                "fee_proportional_millionths": 0,
-                "fee_base_msat": 5,
-            }},
-        },
-        {
-            "short_channel_id": "13x1x0",
-            "updates": {"local": {
-                "fee_proportional_millionths": 0,
-                "fee_base_msat": 6,
-            }},
-        },
     ])
 
     rows = runner.wait_for_native_acquisition_markets(
         state, expected_phase="retention", attempts=1, poll_seconds=0
     )
 
-    assert [(row["family"], row["side"], row["fee_base_msat"]) for row in rows] == [
-        ("cln", "payer", 5), ("cln", "sink", 4),
-        ("lnd", "payer", 6), ("lnd", "sink", 7),
+    assert [(row["family"], row["fee_base_msat"]) for row in rows] == [
+        ("cln", 4), ("lnd", 7)
     ]
 
 
@@ -2405,15 +2369,11 @@ def test_wait_for_native_acquisition_markets_fails_closed_on_malformed_rows(
         "lane_map": {"identity-a": {
             "10x1x0": {"family": "cln", "side": "sink"},
             "11x1x0": {"family": "lnd", "side": "sink"},
-            "12x1x0": {"family": "cln", "side": "payer"},
-            "13x1x0": {"family": "lnd", "side": "payer"},
         }},
     }
     monkeypatch.setattr(runner, "_acquisition_rows", lambda _container: [
         {"channel_id": "10x1x0", "state": "active", "phase": "acquisition"},
         {"channel_id": "11x1x0", "state": "active", "phase": "acquisition"},
-        {"channel_id": "12x1x0", "state": "active", "phase": "acquisition"},
-        {"channel_id": "13x1x0", "state": "active", "phase": "acquisition"},
     ])
     monkeypatch.setattr(runner, "active_channels", lambda _container: [])
 

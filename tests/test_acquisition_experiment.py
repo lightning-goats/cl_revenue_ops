@@ -138,7 +138,7 @@ def test_acquisition_monitor_restart_read_failure_does_not_crash_or_storm(
     assert mock_database.get_active_acquisition_experiments.call_count == 1
 
 
-def test_database_enforces_four_distinct_active_markets_and_persists_exact_restore(
+def test_database_enforces_two_distinct_active_markets_and_persists_exact_restore(
     tmp_path,
 ):
     db_path = str(tmp_path / "acquisition.db")
@@ -178,7 +178,8 @@ def test_database_enforces_four_distinct_active_markets_and_persists_exact_resto
         started_at=1_001,
     )
     assert second is not None
-    # A duplicate peer cannot consume another bounded slot.
+    # A duplicate peer cannot consume both bounded slots, and a third distinct
+    # market cannot exceed the node-wide two-episode cap.
     assert db.start_acquisition_experiment(
         channel_id="3x1x0",
         peer_id="02b",
@@ -188,7 +189,7 @@ def test_database_enforces_four_distinct_active_markets_and_persists_exact_resto
         competitor_floor_ppm=1,
         started_at=1_002,
     ) is None
-    third = db.start_acquisition_experiment(
+    assert db.start_acquisition_experiment(
         channel_id="4x1x0",
         peer_id="02c",
         baseline_fee_ppm=46,
@@ -196,36 +197,15 @@ def test_database_enforces_four_distinct_active_markets_and_persists_exact_resto
         starting_outbound_ratio=0.94,
         competitor_floor_ppm=1,
         started_at=1_003,
-    )
-    assert third is not None
-    fourth = db.start_acquisition_experiment(
-        channel_id="5x1x0",
-        peer_id="02d",
-        baseline_fee_ppm=47,
-        target_fee_ppm=0,
-        starting_outbound_ratio=0.95,
-        competitor_floor_ppm=1,
-        started_at=1_004,
-    )
-    assert fourth is not None
-    # A fifth distinct market cannot exceed the node-wide four-episode cap.
-    assert db.start_acquisition_experiment(
-        channel_id="6x1x0",
-        peer_id="02e",
-        baseline_fee_ppm=48,
-        target_fee_ppm=0,
-        starting_outbound_ratio=0.96,
-        competitor_floor_ppm=1,
-        started_at=1_005,
     ) is None
 
-    # A new Database instance sees all active rows: restart does not orphan
-    # any sub-economic quote.
+    # A new Database instance sees both active rows: restart does not orphan
+    # either sub-economic quote.
     restarted = Database(db_path, MagicMock())
     restarted.initialize()
     assert {
         row["id"] for row in restarted.get_active_acquisition_experiments()
-    } == {first["id"], second["id"], third["id"], fourth["id"]}
+    } == {first["id"], second["id"]}
     retained = restarted.transition_acquisition_to_retention(
         first["id"],
         retention_fee_ppm=2,
@@ -254,19 +234,19 @@ def test_database_enforces_four_distinct_active_markets_and_persists_exact_resto
     assert completed["state"] == "completed"
     assert completed["restored_fee_ppm"] == 37
     assert completed["restored_base_fee_msat"] == 23
-    fifth = restarted.start_acquisition_experiment(
-        channel_id="6x1x0",
-        peer_id="02e",
-        baseline_fee_ppm=48,
+    third = restarted.start_acquisition_experiment(
+        channel_id="4x1x0",
+        peer_id="02c",
+        baseline_fee_ppm=46,
         target_fee_ppm=0,
-        starting_outbound_ratio=0.96,
+        starting_outbound_ratio=0.94,
         competitor_floor_ppm=1,
         started_at=2_001,
     )
-    assert fifth is not None
+    assert third is not None
     assert {
         row["id"] for row in restarted.get_active_acquisition_experiments()
-    } == {second["id"], third["id"], fourth["id"], fifth["id"]}
+    } == {second["id"], third["id"]}
     assert restarted.channel_acquisition_on_cooldown(
         "1x1x0", now=2_001, cooldown_seconds=100
     )
@@ -660,7 +640,7 @@ def test_malformed_retention_state_fails_closed_without_crashing(
     assert complete["restored_fee_ppm"] == 100
 
 
-def test_prepare_is_default_off_then_selects_four_distinct_best_markets(
+def test_prepare_is_default_off_then_selects_two_distinct_best_markets(
     mock_plugin, mock_database
 ):
     fc, cfg = _make_fc(mock_plugin, mock_database)
@@ -668,23 +648,18 @@ def test_prepare_is_default_off_then_selects_four_distinct_best_markets(
     states = [
         {"channel_id": "1x1x0", "peer_id": "02a", "state": "source"},
         {"channel_id": "2x1x0", "peer_id": "02b", "state": "source"},
-        {"channel_id": "3x1x0", "peer_id": "02c", "state": "source"},
-        {"channel_id": "4x1x0", "peer_id": "02d", "state": "source"},
-        {"channel_id": "5x1x0", "peer_id": "02e", "state": "source"},
     ]
     channels = {
-        channel_id: {
+        "1x1x0": {
             "capacity": 1_000_000,
-            "spendable_msat": spendable_msat,
-            "fee_proportional_millionths": fee_ppm,
-        }
-        for channel_id, spendable_msat, fee_ppm in (
-            ("1x1x0", 910_000_000, 50),
-            ("2x1x0", 950_000_000, 75),
-            ("3x1x0", 940_000_000, 70),
-            ("4x1x0", 930_000_000, 65),
-            ("5x1x0", 920_000_000, 60),
-        )
+            "spendable_msat": 900_000_000,
+            "fee_proportional_millionths": 50,
+        },
+        "2x1x0": {
+            "capacity": 1_000_000,
+            "spendable_msat": 950_000_000,
+            "fee_proportional_millionths": 75,
+        },
     }
     mock_database.get_active_acquisition_experiments.return_value = []
     mock_database.channel_acquisition_on_cooldown.return_value = False
@@ -700,17 +675,17 @@ def test_prepare_is_default_off_then_selects_four_distinct_best_markets(
     cfg.acquisition_experiment_enabled = True
     cfg.min_fee_ppm_saturated = 0
     mock_database.start_acquisition_experiment.side_effect = lambda **kwargs: {
-        "id": int(kwargs["channel_id"].split("x", 1)[0]),
+        "id": 1 if kwargs["channel_id"] == "2x1x0" else 2,
         "channel_id": kwargs["channel_id"],
         "peer_id": kwargs["peer_id"],
     }
     active = fc._prepare_acquisition_experiments(states, channels, cfg, now)
-    assert set(active) == {"2x1x0", "3x1x0", "4x1x0", "5x1x0"}
-    assert mock_database.start_acquisition_experiment.call_count == 4
+    assert set(active) == {"1x1x0", "2x1x0"}
+    assert mock_database.start_acquisition_experiment.call_count == 2
     assert [
         call.kwargs["baseline_fee_ppm"]
         for call in mock_database.start_acquisition_experiment.call_args_list
-    ] == [75, 70, 65, 60]
+    ] == [75, 50]
 
 
 def test_prepare_adds_second_market_but_not_second_channel_to_active_peer(

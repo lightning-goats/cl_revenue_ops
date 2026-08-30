@@ -2586,13 +2586,11 @@ class FeeController:
 
     # Default-on market-acquisition rollout. These are fixed safety rails,
     # not tuning knobs: the production surface exposes only enable/off. Two
-    # different peer markets may be tested concurrently so one direction or
-    # client family cannot monopolize acquisition learning. Four bounded
-    # peer markets cover both sides of two client-family corridors in the
-    # crossed tournament. The per-episode rails therefore imply hard
-    # node-wide maxima of 1M sats observed free-phase volume and 100 sats
-    # opportunity cost.
-    ACQUISITION_MAX_ACTIVE_EXPERIMENTS = 4
+    # different peer markets may be tested concurrently so a single cheap
+    # market cannot monopolize acquisition learning. The per-episode rails
+    # therefore imply hard node-wide maxima of 500k sats observed volume and
+    # 50 sats opportunity cost.
+    ACQUISITION_MAX_ACTIVE_EXPERIMENTS = 2
     ACQUISITION_TARGET_FEE_PPM = 0
     ACQUISITION_TARGET_BASE_FEE_MSAT = 0
     # Public routing markets frequently cluster at a few ppm on the cheapest
