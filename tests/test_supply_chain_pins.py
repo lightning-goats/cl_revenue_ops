@@ -4,7 +4,7 @@ Covers the three Phase 3C deliverables that live in-tree:
   * requirements.txt is fully, exactly pinned and matches the environment
     (via tools/audit/check_pins.py, the CI gate).
   * tools/audit/gen_sbom.py emits a well-formed CycloneDX 1.5 document.
-  * the plugin's non-fatal version-floor helpers behave.
+  * the plugin's mandatory version-floor helpers behave.
 """
 import importlib.util
 import json
@@ -213,7 +213,7 @@ def test_committed_sbom_parses_and_covers_runtime_deps():
 
 
 # --------------------------------------------------------------------------
-# version-floor helpers (non-fatal probes)
+# mandatory version-floor helpers
 # --------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
@@ -241,5 +241,17 @@ def test_version_below_floor(plugin_mod):
     assert f("garbage", "24.11.1") is None
 
 
+def test_required_cln_version_accepts_floor_and_newer(plugin_mod):
+    require = plugin_mod._require_cln_version
+    assert require("v26.06.7") == (26, 6, 7)
+    assert require("v26.09.1") == (26, 9, 1)
+
+
+@pytest.mark.parametrize("observed", ["v26.06.6", "", None, "garbage"])
+def test_required_cln_version_rejects_old_or_unknown(plugin_mod, observed):
+    with pytest.raises(RuntimeError, match="requires"):
+        plugin_mod._require_cln_version(observed)
+
+
 def test_floor_constants_match_compat_doc(plugin_mod):
-    assert plugin_mod.CLN_VERSION_FLOOR == "24.11.1"
+    assert plugin_mod.CLN_VERSION_FLOOR == "26.06.7"

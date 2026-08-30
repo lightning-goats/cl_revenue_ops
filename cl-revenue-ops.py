@@ -186,10 +186,11 @@ from modules.forward_archive_sync import ForwardArchiveSynchronizer
 # v2.0.0: DTS+PID Fee Controller
 PLUGIN_VERSION = "3.0.0"
 
-# Supply-chain / runtime version floors (Phase 3C).
-# These drive NON-FATAL startup probes: a version below floor logs a warning but
-# never blocks init, so a running production node is not bricked by a skew.
-CLN_VERSION_FLOOR = "24.11.1"   # CORE_LIGHTNING_COMPATIBILITY.md minimum
+# Supply-chain / runtime version floor.  v26.06.7 is an embargoed security
+# release, so an older or unidentified runtime must not load this plugin.
+# Failing plugin init leaves lightningd itself running and makes the required
+# operator upgrade explicit instead of silently operating on a vulnerable CLN.
+CLN_VERSION_FLOOR = "26.06.7"
 
 
 def _parse_version_tuple(raw: Optional[str]):
@@ -216,6 +217,29 @@ def _version_below_floor(observed: Optional[str], floor: str) -> Optional[bool]:
     if not obs or not flr:
         return None
     return obs < flr
+
+
+def _require_cln_version(observed: Optional[str], floor: str = CLN_VERSION_FLOOR):
+    """Return the parsed version or reject an old/unknown CLN runtime.
+
+    Unknown input fails closed because a version string is the only portable
+    startup evidence available to a Python plugin.  This gate does not attest
+    binary provenance; operators must still use a maintainer-verified release
+    artifact, especially where a container tag has been republished.
+    """
+    parsed = _parse_version_tuple(observed)
+    below = _version_below_floor(observed, floor)
+    if below is None:
+        raise RuntimeError(
+            "cl-revenue-ops requires a verifiable Core Lightning version "
+            f">= v{floor}; getinfo returned {observed!r}"
+        )
+    if below:
+        raise RuntimeError(
+            f"cl-revenue-ops requires Core Lightning >= v{floor}; "
+            f"observed {observed!r}"
+        )
+    return parsed
 
 
 # =============================================================================
@@ -2006,35 +2030,22 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     data_service = DataService(safe_plugin)
 
     # =========================================================================
-    # STARTUP VERSION PROBES (Phase 3C supply-chain)
-    # NON-FATAL: a version below floor logs a warning but never aborts init.
-    # Hard-failing here would brick a running node on a benign version skew.
+    # STARTUP VERSION GATE
+    # A plugin-init failure does not stop lightningd; it refuses only this
+    # plugin until the security runtime requirement is met.
     # =========================================================================
     try:
-        cln_version = None
-        try:
-            cln_version = data_service._ensure_getinfo().get("version")
-        except Exception:
-            cln_version = None
-        below = _version_below_floor(cln_version, CLN_VERSION_FLOOR)
-        if below is True:
-            plugin.log(
-                f"Core Lightning version {cln_version} is BELOW the supported "
-                f"floor v{CLN_VERSION_FLOOR}. The askrene layer lifecycle this "
-                f"plugin depends on may be missing or partial; behavior is "
-                f"unsupported. Upgrade Core Lightning. Continuing anyway.",
-                level='warn'
-            )
-        elif below is None:
-            plugin.log(
-                f"Could not determine Core Lightning version (got {cln_version!r}); "
-                f"skipping the v{CLN_VERSION_FLOOR} floor check.",
-                level='debug'
-            )
-        else:
-            plugin.log(f"Core Lightning version check OK ({cln_version} >= v{CLN_VERSION_FLOOR})")
-    except Exception as e:
-        plugin.log(f"Core Lightning version probe failed (non-fatal): {e}", level='warn')
+        cln_version = data_service._ensure_getinfo().get("version")
+    except Exception as exc:
+        raise RuntimeError(
+            "cl-revenue-ops could not determine the Core Lightning version; "
+            f"v{CLN_VERSION_FLOOR}+ is required"
+        ) from exc
+    _require_cln_version(cln_version)
+    plugin.log(
+        f"Core Lightning version check OK "
+        f"({cln_version} >= v{CLN_VERSION_FLOOR})"
+    )
 
     # =========================================================================
     # STARTUP DEPENDENCY CHECKS (Stability)

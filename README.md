@@ -125,7 +125,7 @@ Core Lightning
 
 ### Requirements
 
-- Core Lightning `v24.11.1+` with askrene layer RPC support
+- Core Lightning `v26.06.7+` from a maintainer-verified release artifact
 - Python `3.10+`
 - bookkeeper plugin: recommended for cleaner P&L and cost accounting
 

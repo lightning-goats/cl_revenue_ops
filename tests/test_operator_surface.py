@@ -196,6 +196,7 @@ def _run_init_with_stubbed_dependencies(
     fake_rpc.listforwards.return_value = {"forwards": []}
     fake_rpc.listpeers.return_value = {"peers": []}
     fake_rpc.listconfigs.return_value = listconfigs_payload or {"configs": {}}
+    fake_rpc.getinfo.return_value = {"version": "v26.06.7"}
     if rpc_mutator is not None:
         rpc_mutator(fake_rpc)
 
@@ -230,6 +231,38 @@ def _run_init_with_stubbed_dependencies(
 
     mod.init(options, {}, mod.plugin)
     return mod.config
+
+
+def test_init_rejects_cln_below_security_floor_before_database_init(monkeypatch):
+    mod = load_plugin_module()
+
+    with pytest.raises(RuntimeError, match=r"requires Core Lightning >= v26\.06\.7"):
+        _run_init_with_stubbed_dependencies(
+            mod,
+            monkeypatch,
+            rpc_mutator=lambda rpc: setattr(
+                rpc.getinfo, "return_value", {"version": "v26.06.6"}
+            ),
+        )
+
+    mod._test_fake_db.initialize.assert_not_called()
+    mod._test_fake_rpc.plugin.assert_not_called()
+
+
+def test_init_rejects_unavailable_cln_version_without_other_rpc_actions(monkeypatch):
+    mod = load_plugin_module()
+
+    with pytest.raises(RuntimeError, match="could not determine"):
+        _run_init_with_stubbed_dependencies(
+            mod,
+            monkeypatch,
+            rpc_mutator=lambda rpc: setattr(
+                rpc.getinfo, "side_effect", RuntimeError("rpc unavailable")
+            ),
+        )
+
+    mod._test_fake_db.initialize.assert_not_called()
+    mod._test_fake_rpc.plugin.assert_not_called()
 
 
 def test_fee_authority_option_is_parsed_during_init_and_initializes_gate(monkeypatch):

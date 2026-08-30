@@ -104,14 +104,14 @@ def test_plugin_listing_entrypoint_and_dependency_contract():
 
     assert plugin_path.exists()
     assert plugin_path.stat().st_mode & stat.S_IXUSR
-    assert "Core Lightning `v24.11.1+`" in readme
-    assert "Core Lightning v24.11.1+" in requirements
+    assert "Core Lightning `v26.06.7+`" in readme
+    assert "Core Lightning v26.06.7+" in requirements
     # Phase 3C: requirements.txt is now EXACTLY pinned (supply-chain). The
-    # v24.11.1 floor is preserved in prose/comments, but pyln-client is pinned
+    # v26.06.7 floor is preserved in prose/comments, but pyln-client is pinned
     # to the installed version rather than declared with a `>=` range.
     assert "pyln-client==" in requirements
-    assert "v24.11.1" in requirements
-    assert "Minimum supported Core Lightning: `v24.11.1+`" in compatibility
+    assert "v26.06.7" in requirements
+    assert "Minimum supported Core Lightning: `v26.06.7+`" in compatibility
     assert "`v24.08.1` | Not supported" in compatibility
     assert "askrene-create-layer" in compatibility
 
