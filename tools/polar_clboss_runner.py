@@ -3495,13 +3495,26 @@ def run_smoke(
     native_rebalance_completed_count = sum(
         delta["rebalance_completed_count"] for delta in contender_deltas.values()
     )
-    # A completed self-payment can either traverse the opposing contender
-    # exactly once or use a non-contender return path. Accept those two
-    # observable shapes only. A partial/excess match remains unsafe because it
-    # could hide fallback traffic or unrelated forwards behind net volume.
-    attributable_native_rebalance = raw_extra_volume_msat in {
-        0, native_rebalance_volume_msat,
-    }
+    native_rebalance_cost_msat = sum(
+        delta["rebalance_cost_msat"] for delta in contender_deltas.values()
+    )
+    native_rebalance_sent_msat = (
+        native_rebalance_volume_msat + native_rebalance_cost_msat
+    )
+    # A completed self-payment can use a non-contender return path (zero extra
+    # volume) or traverse the opposing contender once. At an intermediate hop,
+    # out_msat is bounded by the payment's delivered and sent amounts because
+    # it may still include downstream fees. A value below delivered or above
+    # sent could hide fallback traffic or unrelated forwards and fails closed.
+    attributable_native_rebalance = (
+        raw_extra_volume_msat == 0
+        or (
+            native_rebalance_volume_msat > 0
+            and native_rebalance_volume_msat
+            <= raw_extra_volume_msat
+            <= native_rebalance_sent_msat
+        )
+    )
     attributed_native_rebalance_volume_msat = (
         raw_extra_volume_msat if attributable_native_rebalance else 0
     )
@@ -3543,6 +3556,7 @@ def run_smoke(
             "fallback_volume_msat": fallback_volume_msat,
             "raw_extra_volume_msat": raw_extra_volume_msat,
             "native_rebalance_volume_msat": native_rebalance_volume_msat,
+            "native_rebalance_sent_msat": native_rebalance_sent_msat,
             "native_rebalance_completed_count": native_rebalance_completed_count,
             "attributed_native_rebalance_volume_msat": (
                 attributed_native_rebalance_volume_msat

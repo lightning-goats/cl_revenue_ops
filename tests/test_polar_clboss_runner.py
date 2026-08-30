@@ -1382,6 +1382,7 @@ def test_completed_smoke_accepts_multipart_htlcs_at_exact_traffic_volume(
         "fallback_volume_msat": 0,
         "raw_extra_volume_msat": 0,
         "native_rebalance_volume_msat": 0,
+        "native_rebalance_sent_msat": 0,
         "native_rebalance_completed_count": 0,
         "attributed_native_rebalance_volume_msat": 0,
         "extra_volume_msat": 0,
@@ -1393,15 +1394,17 @@ def test_completed_smoke_accepts_multipart_htlcs_at_exact_traffic_volume(
 
 @pytest.mark.parametrize(
     (
-        "clboss_volume_msat", "native_delivered_msat", "expected_safety",
-        "expected_attributed_msat",
+        "clboss_volume_msat", "native_delivered_msat", "rebalance_cost_msat",
+        "expected_safety", "expected_attributed_msat",
     ),
     (
-        (100_000_000, 50_000_000, [], 50_000_000),
-        (50_000_000, 50_000_000, [], 0),
+        (100_000_000, 50_000_000, 5_957, [], 50_000_000),
+        (50_000_000, 50_000_000, 5_957, [], 0),
+        (100_000_000, 49_000_000, 2_000_000, [], 50_000_000),
         (
             100_000_000,
             49_000_000,
+            5_957,
             [
                 "unattributed_extra_contender_volume",
                 "native_rebalance_volume_mismatch",
@@ -1410,9 +1413,9 @@ def test_completed_smoke_accepts_multipart_htlcs_at_exact_traffic_volume(
         ),
     ),
 )
-def test_completed_smoke_attributes_only_exact_native_rebalance_volume(
+def test_completed_smoke_attributes_only_bounded_native_rebalance_volume(
     monkeypatch, tmp_path, clboss_volume_msat, native_delivered_msat,
-    expected_safety, expected_attributed_msat,
+    rebalance_cost_msat, expected_safety, expected_attributed_msat,
 ):
     runner = load_runner()
     path = runner.state_path(tmp_path, 95)
@@ -1442,7 +1445,7 @@ def test_completed_smoke_attributes_only_exact_native_rebalance_volume(
             runner.Totals(0, 0, 0, 500_000, revenue_policy),
             runner.Totals(
                 0, 0, 0, 500_000, revenue_policy,
-                rebalance_cost_msat=5_957,
+                rebalance_cost_msat=rebalance_cost_msat,
                 rebalance_delivered_msat=native_delivered_msat,
                 rebalance_completed_count=1,
             ),
@@ -1476,6 +1479,9 @@ def test_completed_smoke_attributes_only_exact_native_rebalance_volume(
     expected_raw_extra_msat = max(0, clboss_volume_msat - 50_000_000)
     assert block["traffic"]["raw_extra_volume_msat"] == expected_raw_extra_msat
     assert block["traffic"]["native_rebalance_volume_msat"] == native_delivered_msat
+    assert block["traffic"]["native_rebalance_sent_msat"] == (
+        native_delivered_msat + rebalance_cost_msat
+    )
     assert (
         block["traffic"]["attributed_native_rebalance_volume_msat"]
         == expected_attributed_msat
@@ -1484,7 +1490,10 @@ def test_completed_smoke_attributes_only_exact_native_rebalance_volume(
         expected_raw_extra_msat if expected_safety else 0
     )
     assert block["traffic"]["multipart_forward_splits"] == 0
-    assert block["contenders"]["revenue_ops"]["rebalance_cost_msat"] == 5_957
+    assert (
+        block["contenders"]["revenue_ops"]["rebalance_cost_msat"]
+        == rebalance_cost_msat
+    )
     assert block["contenders"]["clboss"]["routing_fee_msat"] == 8_000
 
 
