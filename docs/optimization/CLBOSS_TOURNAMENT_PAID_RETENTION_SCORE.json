@@ -1,0 +1,181 @@
+{
+  "evidence_run_id": "paid-retention-budget-393e353-20260830",
+  "frozen_runner_evidence": {
+    "image_id": "sha256:73cb441c11d21b3f8d301ef4a94f79f43781653c64f928367fc8e0350a4183fd",
+    "replicas": [
+      "replica-133",
+      "replica-134",
+      "replica-135"
+    ],
+    "revenue_ops_revision": "393e3530294c450659e8d0b9b1c8c4e3eb1f00fd"
+  },
+  "generated_at": 1788098801,
+  "leagues": {
+    "fee_only": {
+      "blocks": 18,
+      "blocks_per_replica": {
+        "replica-133": 6,
+        "replica-134": 6,
+        "replica-135": 6
+      },
+      "common_gates": {
+        "coverage": true,
+        "fallback_share": true,
+        "fee_only_zero_rebalance_cost": true,
+        "payment_success": true,
+        "safety": true,
+        "spend_cap": true
+      },
+      "controller_totals": {
+        "clboss": {
+          "capital_hours_sats": 64342.841,
+          "forward_count": 40,
+          "net_msat": 7025,
+          "net_msat_per_million_sat_hour": 109180.756236,
+          "policy_changes": 0,
+          "rebalance_cost_msat": 0,
+          "routing_fee_msat": 7025,
+          "volume_msat": 460000000
+        },
+        "revenue_ops": {
+          "capital_hours_sats": 64343.005,
+          "forward_count": 104,
+          "net_msat": 58686,
+          "net_msat_per_million_sat_hour": 912080.498524,
+          "policy_changes": 8,
+          "rebalance_cost_msat": 0,
+          "routing_fee_msat": 58686,
+          "volume_msat": 1880000000
+        }
+      },
+      "coverage": {
+        "both_client_families": true,
+        "cold_and_warm": true,
+        "identity_crossover": true,
+        "six_blocks_each": true,
+        "three_fresh_replicas": true
+      },
+      "fallback_share": 0.0,
+      "family_gates": {
+        "cln": {
+          "clboss_not_worse_by_more_than_5pct": false,
+          "revenue_ops_not_worse_by_more_than_5pct": true,
+          "routing_fee_msat": {
+            "clboss": 5531,
+            "revenue_ops": 19850
+          }
+        },
+        "lnd": {
+          "clboss_not_worse_by_more_than_5pct": false,
+          "revenue_ops_not_worse_by_more_than_5pct": true,
+          "routing_fee_msat": {
+            "clboss": 1494,
+            "revenue_ops": 38836
+          }
+        }
+      },
+      "league": "fee_only",
+      "paired_rate_difference_ci95": [
+        490202.655978,
+        1106997.431066
+      ],
+      "payment_success_rate": 1.0,
+      "revenue_ops_improvement_candidates": [
+        {
+          "finding": "No scored regression or safety gap was detected in this league.",
+          "module": "all",
+          "next_experiment": "Repeat with a new traffic seed before considering any default change.",
+          "priority": "observe",
+          "promotion_gate": "The win remains after an additional frozen-configuration replication."
+        }
+      ],
+      "revenue_ops_relative_margin": 7.353858,
+      "safety_violations": [],
+      "verdict": "revenue_ops_wins"
+    },
+    "full_stack": {
+      "blocks": 18,
+      "blocks_per_replica": {
+        "replica-133": 6,
+        "replica-134": 6,
+        "replica-135": 6
+      },
+      "common_gates": {
+        "coverage": true,
+        "fallback_share": true,
+        "fee_only_zero_rebalance_cost": true,
+        "payment_success": true,
+        "safety": true,
+        "spend_cap": true
+      },
+      "controller_totals": {
+        "clboss": {
+          "capital_hours_sats": 64638.927,
+          "forward_count": 83,
+          "net_msat": 10084,
+          "net_msat_per_million_sat_hour": 156005.064224,
+          "policy_changes": 0,
+          "rebalance_cost_msat": 0,
+          "routing_fee_msat": 10084,
+          "volume_msat": 1285000000
+        },
+        "revenue_ops": {
+          "capital_hours_sats": 64639.795,
+          "forward_count": 61,
+          "net_msat": 56220,
+          "net_msat_per_million_sat_hour": 869742.852861,
+          "policy_changes": 3,
+          "rebalance_cost_msat": 0,
+          "routing_fee_msat": 56220,
+          "volume_msat": 1055000000
+        }
+      },
+      "coverage": {
+        "both_client_families": true,
+        "cold_and_warm": true,
+        "identity_crossover": true,
+        "six_blocks_each": true,
+        "three_fresh_replicas": true
+      },
+      "fallback_share": 0.0,
+      "family_gates": {
+        "cln": {
+          "clboss_not_worse_by_more_than_5pct": false,
+          "revenue_ops_not_worse_by_more_than_5pct": true,
+          "routing_fee_msat": {
+            "clboss": 6354,
+            "revenue_ops": 32144
+          }
+        },
+        "lnd": {
+          "clboss_not_worse_by_more_than_5pct": false,
+          "revenue_ops_not_worse_by_more_than_5pct": true,
+          "routing_fee_msat": {
+            "clboss": 3730,
+            "revenue_ops": 24076
+          }
+        }
+      },
+      "league": "full_stack",
+      "paired_rate_difference_ci95": [
+        353292.419681,
+        1062826.381274
+      ],
+      "payment_success_rate": 1.0,
+      "revenue_ops_improvement_candidates": [
+        {
+          "finding": "No scored regression or safety gap was detected in this league.",
+          "module": "all",
+          "next_experiment": "Repeat with a new traffic seed before considering any default change.",
+          "priority": "observe",
+          "promotion_gate": "The win remains after an additional frozen-configuration replication."
+        }
+      ],
+      "revenue_ops_relative_margin": 4.575094,
+      "safety_violations": [],
+      "verdict": "revenue_ops_wins"
+    }
+  },
+  "schema": "polar-clboss-competition-score-v1",
+  "verdict": "revenue_ops_wins"
+}

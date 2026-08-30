@@ -1,30 +1,30 @@
 # CLBOSS tournament scorecard
 
-Coverage: 70 replicas, 228 blocks, 4329 attempted / 4326 settled payments. Enhanced strict-schema blocks: 211; safety-eligible: 192; diagnostic exclusions: 25.
+Coverage: 79 replicas, 305 blocks, 4945 attempted / 4942 settled payments. Enhanced strict-schema blocks: 288; safety-eligible: 269; diagnostic exclusions: 25.
 
 | Comparable area | Revenue Ops | CLBOSS | Current leader |
 |---|---:|---:|---|
-| Routing volume (msat) | 25594581928 | 59152684890 | clboss |
-| Forward count | 1316 | 2885 | clboss |
-| Gross routing fees (msat) | 4005366 | 1697549 | revenue_ops |
+| Routing volume (msat) | 29974581928 | 64782684890 | clboss |
+| Forward count | 1553 | 3264 | clboss |
+| Gross routing fees (msat) | 4184886 | 1757807 | revenue_ops |
 | Rebalance cost (msat) | 145849 | 61924 | clboss |
-| Net routing profit (msat) | 3859517 | 1635625 | revenue_ops |
-| Gross yield (ppm) | 156.493 | 28.698 | revenue_ops |
-| Volume share (%) | 30.201 | 69.799 | clboss |
-| Mean worst imbalance (ppm; lower is better) | 871132.5 | 791924.4 | clboss |
+| Net routing profit (msat) | 4039037 | 1695883 | revenue_ops |
+| Gross yield (ppm) | 139.614 | 27.134 | revenue_ops |
+| Volume share (%) | 31.633 | 68.367 | clboss |
+| Mean worst imbalance (ppm; lower is better) | 817636.6 | 816128.0 | clboss |
 
-Formal verdict: **Inconclusive** from frozen crossed series `cadence-666048e-20260829`. All common coverage, reliability, budget, and safety gates passed.
+Formal verdict: **Revenue Ops wins** from frozen crossed series `paid-retention-budget-393e353-20260830`. All common coverage, reliability, budget, and safety gates passed.
 
 ## Formal frozen-series result
 
-This formal result controls tournament promotion; the larger historical aggregate below remains diagnostic. Frozen Revenue Ops revision: `666048e173fe66c7addcb55868f35d5f585d43e6`; image: `sha256:c55fc79d3802297cd932cdffd15f8ae9c11854440583aebfccebdba34d80784e`; replicas: replica-122, replica-123, replica-124.
+This formal result controls tournament promotion; the larger historical aggregate below remains diagnostic. Frozen Revenue Ops revision: `393e3530294c450659e8d0b9b1c8c4e3eb1f00fd`; image: `sha256:73cb441c11d21b3f8d301ef4a94f79f43781653c64f928367fc8e0350a4183fd`; replicas: replica-133, replica-134, replica-135.
 
 | League | Revenue Ops normalized net | CLBOSS normalized net | Revenue margin | Paired 95% CI | Verdict |
 |---|---:|---:|---:|---:|---|
-| fee_only | 172590.21187 | 291239.132678 | -40.739% | [-284702.085751, 105360.560473] | Inconclusive |
-| full_stack | 176563.712897 | 367987.982671 | -52.019% | [-834069.402934, 292972.468213] | Inconclusive |
+| fee_only | 912080.498524 | 109180.756236 | 735.386% | [490202.655978, 1106997.431066] | Revenue Ops wins |
+| full_stack | 869742.852861 | 156005.064224 | 457.509% | [353292.419681, 1062826.381274] | Revenue Ops wins |
 
-Historical aggregate economic standing: **Revenue Ops leads the primary net-profit objective** at 2.36x CLBOSS net profit. Raw volume and forward count are diagnostics, not objectives; they matter only when the incremental traffic is profitable.
+Historical aggregate economic standing: **Revenue Ops leads the primary net-profit objective** at 2.382x CLBOSS net profit. Raw volume and forward count are diagnostics, not objectives; they matter only when the incremental traffic is profitable.
 
 This table describes observed lab outcomes; it does not treat historical smoke blocks as decisive evidence.
 
@@ -32,12 +32,12 @@ This table describes observed lab outcomes; it does not treat historical smoke b
 
 | Comparable functional area | Revenue Ops evidence | CLBOSS evidence | Current result |
 |---|---|---|---|
-| Fee setting | 3859517 msat net at 156.493 ppm yield | 1635625 msat net at 28.698 ppm yield | Inconclusive (formal) |
-| Route acquisition / breadth | 25594581928 msat, 30.201% share | 59152684890 msat, 69.799% share | CLBOSS (diagnostic) |
+| Fee setting | 4039037 msat net at 139.614 ppm yield | 1695883 msat net at 27.134 ppm yield | Revenue Ops wins (formal) |
+| Route acquisition / breadth | 29974581928 msat, 31.633% share | 64782684890 msat, 68.367% share | CLBOSS (diagnostic) |
 | Rebalancing and post-refill conversion | 5960000000 msat / 1724570 msat linked net | 4890000000 msat / 1078223 msat linked net | Revenue Ops |
 | Selective rebalance economics | 150/120 ppm: 0/2 replicas, 0 sats delivered / 0.000 sats cost; 800/120 ppm: 11/11 replicas, 549580 sats delivered / 79.166 sats cost | 150/120 ppm: 0/2 replicas, 0 sats delivered / 0.000 sats cost; 800/120 ppm: 0/11 replicas, 0 sats delivered / 0.000 sats cost | revenue_ops |
-| Liquidity balance | Mean worst imbalance 871132.5 ppm | Mean worst imbalance 791924.4 ppm | clboss |
-| Reliability | Strict safety-gated blocks only; shared traffic settled 4326/4329 payments | The same shared traffic and safety gate applies | Not attributable per controller |
+| Liquidity balance | Mean worst imbalance 817636.6 ppm | Mean worst imbalance 816128.0 ppm | clboss |
+| Reliability | Strict safety-gated blocks only; shared traffic settled 4942/4945 payments | The same shared traffic and safety gate applies | Not attributable per controller |
 | Channel open / close management | Intentionally absent from this standalone plugin | Disabled in the comparable harness | Not comparable |
 
 ## Controlled payer-refill economics
@@ -75,9 +75,9 @@ Only enhanced blocks with no block-level or contender-level safety violations ap
 
 | Metric | Revenue Ops | CLBOSS |
 |---|---:|---:|
-| Routing volume (msat) | 19206619123 | 37632125772 |
-| Net routing profit (msat) | 3498262 | 1297178 |
-| Gross yield (ppm) | 188.103 | 34.864 |
+| Routing volume (msat) | 23586619123 | 43262125772 |
+| Net routing profit (msat) | 3677782 | 1357436 |
+| Gross yield (ppm) | 160.783 | 31.72 |
 
 ## Eligible results by phase
 
@@ -103,9 +103,9 @@ This view isolates treatments and post-rebalance demand from historical baseline
 
 | Metric | Revenue Ops | CLBOSS |
 |---|---:|---:|
-| Routing volume (msat) | 13216619123 | 32827125772 |
-| Net routing profit (msat) | 1772948 | 223118 |
-| Gross yield (ppm) | 135.06 | 6.797 |
+| Routing volume (msat) | 17596619123 | 38457125772 |
+| Net routing profit (msat) | 1952468 | 283376 |
+| Gross yield (ppm) | 111.644 | 7.369 |
 
 ### manual_acquisition
 

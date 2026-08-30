@@ -1,5 +1,8 @@
 # Fast-cadence treatment: LND acquisition remains the blocker
 
+> Resolved by the separated paid-retention evidence budget. See
+> `2026-08-30-paid-retention-budget-win.md` for the frozen formal win.
+
 ## Frozen treatment
 
 Revenue Ops revision `666048e173fe66c7addcb55868f35d5f585d43e6` ran from
