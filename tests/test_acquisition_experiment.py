@@ -381,6 +381,62 @@ def test_positive_acquisition_transitions_to_bounded_paid_retention(
     mock_database.complete_acquisition_experiment.assert_not_called()
 
 
+def test_large_first_forward_at_free_caps_transitions_to_paid_retention(
+    mock_plugin, mock_database
+):
+    """Cap attainment stops the free quote without discarding proven demand."""
+    fc, cfg = _make_fc(
+        mock_plugin,
+        mock_database,
+        min_fee_ppm=10,
+        min_fee_ppm_saturated=0,
+        acquisition_experiment_enabled=True,
+    )
+    now = int(time.time())
+    episode = _episode(started_at=now - 10)
+    fc._acquisition_cycle_experiments = {CHANNEL_ID: episode}
+    fc._get_neighbor_fee_percentile = MagicMock(return_value=2)
+    fc._calculate_floor = MagicMock(return_value=10)
+    _set_acquisition_evidence(
+        mock_database,
+        volume_sats=fc.ACQUISITION_VOLUME_CAP_SATS,
+        forward_count=1,
+        min_out_msat=5_000_000,
+    )
+    mock_database.transition_acquisition_to_retention.return_value = {
+        **episode,
+        "phase": "retention",
+        "phase_started_at": now,
+        "phase_start_volume_sats": fc.ACQUISITION_VOLUME_CAP_SATS,
+        "phase_start_forward_count": 1,
+        "retention_fee_ppm": 0,
+        "retention_base_fee_msat": 1,
+    }
+    fc.set_channel_fee = MagicMock(
+        return_value={"success": True, "fee_ppm": 0, "base_fee_msat": 1}
+    )
+    info = _channel_info(0)
+    info["spendable_msat"] = "1900000000msat"
+
+    result = fc._adjust_channel_fee(
+        CHANNEL_ID,
+        PEER_ID,
+        {"state": "source"},
+        info,
+        cfg=cfg,
+        force_reprice_reason="acquisition_experiment",
+    )
+
+    assert result is not None
+    assert result.reason_code == FeeReasonCode.ACQUISITION_RETENTION.value
+    assert result.new_fee_ppm == 0
+    assert result.algorithm_values["acquisition_phase"] == "retention"
+    transition = mock_database.transition_acquisition_to_retention.call_args.kwargs
+    assert transition["phase_start_volume_sats"] == fc.ACQUISITION_VOLUME_CAP_SATS
+    assert transition["phase_start_forward_count"] == 1
+    mock_database.complete_acquisition_experiment.assert_not_called()
+
+
 def test_retention_requires_a_positive_strict_undercut(
     mock_plugin, mock_database
 ):

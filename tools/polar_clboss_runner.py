@@ -4587,7 +4587,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--depletion-sats", type=positive_int,
-        help="controlled depletion amount; defaults to 75% of channel capacity",
+        help="controlled depletion amount; defaults to 75%% of channel capacity",
     )
     parser.add_argument(
         "--depletion-family", choices=("cln", "lnd"), default="cln",

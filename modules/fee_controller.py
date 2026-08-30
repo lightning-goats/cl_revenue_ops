@@ -7799,18 +7799,19 @@ class FeeController:
                         acquisition_exit_reason = "duration_cap"
                     elif (
                         acquisition_volume_sats
-                        >= self.ACQUISITION_VOLUME_CAP_SATS
-                    ):
-                        acquisition_exit_reason = "volume_cap"
-                    elif (
-                        acquisition_opportunity_cost_sats
-                        >= self.ACQUISITION_OPPORTUNITY_COST_CAP_SATS
-                    ):
-                        acquisition_exit_reason = "opportunity_cost_cap"
-                    elif (
-                        acquisition_volume_sats
                         >= self.ACQUISITION_RETENTION_MIN_VOLUME_SATS
+                        and acquisition_forward_count > 0
                     ):
+                        # A large first forward can simultaneously satisfy the
+                        # paid-validation threshold and exhaust the bounded
+                        # free-acquisition allowance.  Preserve that positive
+                        # demand signal by ending the free quote and moving to
+                        # paid retention; restoring the baseline here throws
+                        # away the only observation and creates a capacity-
+                        # dependent cold-start cliff.  Duration, congestion,
+                        # liquidity, and competitor-evidence exits above still
+                        # fail closed.  Malformed aggregate volume without a
+                        # settled forward falls through to the hard caps below.
                         if not callable(
                             getattr(
                                 self.database,
@@ -7837,6 +7838,16 @@ class FeeController:
                                 acquisition_transition_requested = True
                                 acquisition_phase_volume_sats = 0
                                 acquisition_phase_forward_count = 0
+                    elif (
+                        acquisition_volume_sats
+                        >= self.ACQUISITION_VOLUME_CAP_SATS
+                    ):
+                        acquisition_exit_reason = "volume_cap"
+                    elif (
+                        acquisition_opportunity_cost_sats
+                        >= self.ACQUISITION_OPPORTUNITY_COST_CAP_SATS
+                    ):
+                        acquisition_exit_reason = "opportunity_cost_cap"
             except Exception as exc:
                 # A malformed row or stale/unavailable evidence must never
                 # leave a 0-ppm quote running indefinitely.
