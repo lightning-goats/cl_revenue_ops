@@ -1,0 +1,225 @@
+{
+  "evidence_run_id": "cadence-666048e-20260829",
+  "frozen_runner_evidence": {
+    "image_id": "sha256:c55fc79d3802297cd932cdffd15f8ae9c11854440583aebfccebdba34d80784e",
+    "replicas": [
+      "replica-122",
+      "replica-123",
+      "replica-124"
+    ],
+    "revenue_ops_revision": "666048e173fe66c7addcb55868f35d5f585d43e6"
+  },
+  "generated_at": 1788053134,
+  "leagues": {
+    "fee_only": {
+      "blocks": 18,
+      "blocks_per_replica": {
+        "replica-122": 6,
+        "replica-123": 6,
+        "replica-124": 6
+      },
+      "common_gates": {
+        "coverage": true,
+        "fallback_share": true,
+        "fee_only_zero_rebalance_cost": true,
+        "payment_success": true,
+        "safety": true,
+        "spend_cap": true
+      },
+      "controller_totals": {
+        "clboss": {
+          "capital_hours_sats": 65993.879,
+          "forward_count": 139,
+          "net_msat": 19220,
+          "net_msat_per_million_sat_hour": 291239.132678,
+          "policy_changes": 0,
+          "rebalance_cost_msat": 0,
+          "routing_fee_msat": 19220,
+          "volume_msat": 2260000000
+        },
+        "revenue_ops": {
+          "capital_hours_sats": 65994.473,
+          "forward_count": 5,
+          "net_msat": 11390,
+          "net_msat_per_million_sat_hour": 172590.21187,
+          "policy_changes": 2,
+          "rebalance_cost_msat": 0,
+          "routing_fee_msat": 11390,
+          "volume_msat": 80000000
+        }
+      },
+      "coverage": {
+        "both_client_families": true,
+        "cold_and_warm": true,
+        "identity_crossover": true,
+        "six_blocks_each": true,
+        "three_fresh_replicas": true
+      },
+      "fallback_share": 0.0,
+      "family_gates": {
+        "cln": {
+          "clboss_not_worse_by_more_than_5pct": true,
+          "revenue_ops_not_worse_by_more_than_5pct": true,
+          "routing_fee_msat": {
+            "clboss": 11378,
+            "revenue_ops": 11390
+          }
+        },
+        "lnd": {
+          "clboss_not_worse_by_more_than_5pct": true,
+          "revenue_ops_not_worse_by_more_than_5pct": false,
+          "routing_fee_msat": {
+            "clboss": 7842,
+            "revenue_ops": 0
+          }
+        }
+      },
+      "league": "fee_only",
+      "paired_rate_difference_ci95": [
+        -284702.085751,
+        105360.560473
+      ],
+      "payment_success_rate": 1.0,
+      "revenue_ops_improvement_candidates": [
+        {
+          "finding": "Gross fee capture regressed for: lnd.",
+          "module": "fee_controller",
+          "next_experiment": "Replay fee decisions and route choices separately for the affected clients; compare realized clearing ppm, competitor median, liquidity modifier, and cache state before changing rails or gains.",
+          "priority": "high",
+          "promotion_gate": "Neither client family trails CLBOSS gross fee capture by more than 5%."
+        },
+        {
+          "evidence": {
+            "clboss_volume_msat": 2260000000,
+            "clboss_yield_ppm": 8.504,
+            "revenue_ops_volume_msat": 80000000,
+            "revenue_ops_yield_ppm": 142.375
+          },
+          "finding": "Revenue-ops priced comparably but captured less routed volume.",
+          "module": "fee_controller",
+          "next_experiment": "Test faster demand/liquidity response and lower policy hysteresis one change at a time; measure route share, clearing ppm, and policy age in the crossed topology.",
+          "priority": "high",
+          "promotion_gate": "At least 10% net advantage with no client-family regression."
+        }
+      ],
+      "revenue_ops_relative_margin": -0.407393,
+      "safety_violations": [],
+      "verdict": "inconclusive"
+    },
+    "full_stack": {
+      "blocks": 18,
+      "blocks_per_replica": {
+        "replica-122": 6,
+        "replica-123": 6,
+        "replica-124": 6
+      },
+      "common_gates": {
+        "coverage": true,
+        "fallback_share": true,
+        "fee_only_zero_rebalance_cost": true,
+        "payment_success": true,
+        "safety": true,
+        "spend_cap": true
+      },
+      "controller_totals": {
+        "clboss": {
+          "capital_hours_sats": 66021.178,
+          "forward_count": 137,
+          "net_msat": 24295,
+          "net_msat_per_million_sat_hour": 367987.982671,
+          "policy_changes": 0,
+          "rebalance_cost_msat": 0,
+          "routing_fee_msat": 24295,
+          "volume_msat": 2493744895
+        },
+        "revenue_ops": {
+          "capital_hours_sats": 66021.493,
+          "forward_count": 10,
+          "net_msat": 11657,
+          "net_msat_per_million_sat_hour": 176563.712897,
+          "policy_changes": 3,
+          "rebalance_cost_msat": 12088,
+          "routing_fee_msat": 23745,
+          "volume_msat": 165000000
+        }
+      },
+      "coverage": {
+        "both_client_families": true,
+        "cold_and_warm": true,
+        "identity_crossover": true,
+        "six_blocks_each": true,
+        "three_fresh_replicas": true
+      },
+      "fallback_share": 0.0,
+      "family_gates": {
+        "cln": {
+          "clboss_not_worse_by_more_than_5pct": false,
+          "revenue_ops_not_worse_by_more_than_5pct": true,
+          "routing_fee_msat": {
+            "clboss": 12113,
+            "revenue_ops": 23745
+          }
+        },
+        "lnd": {
+          "clboss_not_worse_by_more_than_5pct": true,
+          "revenue_ops_not_worse_by_more_than_5pct": false,
+          "routing_fee_msat": {
+            "clboss": 12182,
+            "revenue_ops": 0
+          }
+        }
+      },
+      "league": "full_stack",
+      "paired_rate_difference_ci95": [
+        -834069.402934,
+        292972.468213
+      ],
+      "payment_success_rate": 1.0,
+      "revenue_ops_improvement_candidates": [
+        {
+          "finding": "Gross fee capture regressed for: lnd.",
+          "module": "fee_controller",
+          "next_experiment": "Replay fee decisions and route choices separately for the affected clients; compare realized clearing ppm, competitor median, liquidity modifier, and cache state before changing rails or gains.",
+          "priority": "high",
+          "promotion_gate": "Neither client family trails CLBOSS gross fee capture by more than 5%."
+        },
+        {
+          "evidence": {
+            "clboss_volume_msat": 2493744895,
+            "clboss_yield_ppm": 9.742,
+            "revenue_ops_volume_msat": 165000000,
+            "revenue_ops_yield_ppm": 143.909
+          },
+          "finding": "Revenue-ops priced comparably but captured less routed volume.",
+          "module": "fee_controller",
+          "next_experiment": "Test faster demand/liquidity response and lower policy hysteresis one change at a time; measure route share, clearing ppm, and policy age in the crossed topology.",
+          "priority": "high",
+          "promotion_gate": "At least 10% net advantage with no client-family regression."
+        },
+        {
+          "evidence": {
+            "clboss_cost_msat": 0,
+            "revenue_ops_cost_msat": 12088
+          },
+          "finding": "Revenue-ops spent more on rebalancing than CLBOSS in the same league.",
+          "module": "rebalance_engine_v2",
+          "next_experiment": "Stratify useful liquidity restored and subsequent earned fees by pair, quote ppm, EV margin, route parts, and retry outcome; tune the hold margin or pair budget only where the measured post-rebalance payback is inferior.",
+          "priority": "high",
+          "promotion_gate": "Higher net revenue with equal cap and clean reservation reconciliation."
+        },
+        {
+          "finding": "Revenue-ops changed policies over twice as often without a winning net margin.",
+          "module": "fee_controller_damping",
+          "next_experiment": "Increase one damping or deadband control in replay first, then verify lower churn does not reduce client-stratified fee capture in the live crossed tournament.",
+          "priority": "medium",
+          "promotion_gate": "Lower policy churn with non-inferior net revenue and reliability."
+        }
+      ],
+      "revenue_ops_relative_margin": -0.520192,
+      "safety_violations": [],
+      "verdict": "inconclusive"
+    }
+  },
+  "schema": "polar-clboss-competition-score-v1",
+  "verdict": "inconclusive"
+}
