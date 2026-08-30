@@ -73,7 +73,7 @@ GOSSIP_POLICY_POLL_SECONDS = 1.0
 GOSSIP_POLICY_POLL_ATTEMPTS = 31
 NATIVE_CYCLE_POLL_SECONDS = 5.0
 NATIVE_CYCLE_POLL_ATTEMPTS = 37
-EXPECTED_ACQUISITION_MARKETS = 2
+EXPECTED_ACQUISITION_MARKETS = 4
 # Polar's UI-facing payment call can time out while the underlying CLN/LND
 # payment is still resolving.  Wait long enough to observe an authoritative
 # payer-side terminal state, but never dispatch the same invoice again.
@@ -1872,14 +1872,17 @@ def wait_for_native_acquisition_markets(
     if not isinstance(container, str) or not isinstance(identity_lanes, dict):
         raise RunnerError("acquisition readiness lacks Revenue contender lanes")
     expected_by_scid = {
-        str(scid): str(row.get("family"))
+        str(scid): (str(row.get("family")), str(row.get("side")))
         for scid, row in identity_lanes.items()
         if isinstance(row, dict)
-        and row.get("side") == "sink"
+        and row.get("side") in {"payer", "sink"}
         and row.get("family") in {"cln", "lnd"}
     }
-    if set(expected_by_scid.values()) != {"cln", "lnd"}:
-        raise RunnerError("acquisition readiness lacks both sink client families")
+    if set(expected_by_scid.values()) != {
+        ("cln", "payer"), ("cln", "sink"),
+        ("lnd", "payer"), ("lnd", "sink"),
+    }:
+        raise RunnerError("acquisition readiness lacks both sides of both client families")
 
     last_rows: list[dict[str, Any]] = []
     for attempt in range(attempts):
@@ -1892,9 +1895,10 @@ def wait_for_native_acquisition_markets(
         }
         for episode in active:
             scid = str(episode.get("channel_id") or "")
-            family = expected_by_scid.get(scid)
-            if family is None or episode.get("phase") != expected_phase:
+            market = expected_by_scid.get(scid)
+            if market is None or episode.get("phase") != expected_phase:
                 continue
+            family, side = market
             live = live_by_scid.get(scid)
             updates = live.get("updates") if isinstance(live, dict) else None
             local = updates.get("local") if isinstance(updates, dict) else None
@@ -1924,6 +1928,7 @@ def wait_for_native_acquisition_markets(
                 continue
             selected.append({
                 "family": family,
+                "side": side,
                 "channel_id": scid,
                 "experiment_id": episode.get("id"),
                 "phase": expected_phase,
@@ -1933,14 +1938,15 @@ def wait_for_native_acquisition_markets(
         if (
             len(active) == EXPECTED_ACQUISITION_MARKETS
             and len(selected) == EXPECTED_ACQUISITION_MARKETS
-            and {row["family"] for row in selected} == {"cln", "lnd"}
+            and {(row["family"], row["side"]) for row in selected}
+            == set(expected_by_scid.values())
         ):
-            return sorted(selected, key=lambda row: row["family"])
+            return sorted(selected, key=lambda row: (row["family"], row["side"]))
         if attempt + 1 < attempts:
             time.sleep(poll_seconds)
     raise RunnerError(
-        f"native acquisition did not reach {expected_phase} on both client "
-        f"markets before timeout: {last_rows}"
+        f"native acquisition did not reach {expected_phase} on both sides of "
+        f"both client families before timeout: {last_rows}"
     )
 
 

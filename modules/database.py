@@ -866,9 +866,9 @@ class Database:
         """)
 
         # Restart-safe, auditable market-acquisition episodes. SQLite enforces
-        # no duplicate active channel/peer and no more than two active rows;
-        # this keeps the bounded two-market rollout safe across restarts and
-        # concurrent fee-cycle attempts.
+        # no duplicate active channel/peer and no more than four active rows;
+        # this keeps bidirectional, two-client-family learning bounded across
+        # restarts and concurrent fee-cycle attempts.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS acquisition_experiments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -898,8 +898,8 @@ class Database:
             )
         """)
         # Migrate the former global one-active index before installing the
-        # bounded two-active invariant. Existing databases can have at most
-        # one active row here, so the new unique indexes are conflict-free.
+        # bounded four-active invariant. Existing databases can have at most
+        # two active rows here, so the new unique indexes are conflict-free.
         conn.execute("DROP INDEX IF EXISTS idx_acquisition_one_active")
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_acquisition_one_active_channel
@@ -909,22 +909,30 @@ class Database:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_acquisition_one_active_peer
             ON acquisition_experiments(peer_id) WHERE state = 'active'
         """)
+        # Replace the former two-active triggers on every existing database.
+        for trigger_name in (
+            "trg_acquisition_max_two_insert",
+            "trg_acquisition_max_two_update",
+            "trg_acquisition_max_four_insert",
+            "trg_acquisition_max_four_update",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
         conn.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_acquisition_max_two_insert
+            CREATE TRIGGER trg_acquisition_max_four_insert
             BEFORE INSERT ON acquisition_experiments
             WHEN NEW.state = 'active'
              AND (SELECT COUNT(*) FROM acquisition_experiments
-                  WHERE state = 'active') >= 2
+                  WHERE state = 'active') >= 4
             BEGIN
                 SELECT RAISE(ABORT, 'maximum active acquisition experiments');
             END
         """)
         conn.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_acquisition_max_two_update
+            CREATE TRIGGER trg_acquisition_max_four_update
             BEFORE UPDATE OF state ON acquisition_experiments
             WHEN NEW.state = 'active' AND OLD.state != 'active'
              AND (SELECT COUNT(*) FROM acquisition_experiments
-                  WHERE state = 'active') >= 2
+                  WHERE state = 'active') >= 4
             BEGIN
                 SELECT RAISE(ABORT, 'maximum active acquisition experiments');
             END
@@ -2317,7 +2325,7 @@ class Database:
         baseline_base_fee_msat: int = 0,
         target_base_fee_msat: int = 0,
     ) -> Optional[Dict[str, Any]]:
-        """Persist an episode, or None when the two-market safety cap blocks it."""
+        """Persist an episode, or None when the four-market safety cap blocks it."""
         conn = self._get_connection()
         now = int(time.time()) if started_at is None else int(started_at)
         try:

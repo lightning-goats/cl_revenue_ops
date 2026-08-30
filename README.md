@@ -239,7 +239,7 @@ method-not-found.
 - `revenue-config reset <key>` removes the DB override, the escape hatch that lets `setconfig`/config-file values govern the field again (some fields apply immediately; others require a plugin restart to re-adopt the file default — the RPC response says which).
 - `revenue-config list-mutable` returns the current set of public runtime keys; only keys in this list can be `set` or `reset` (all others return `"not a public runtime control"`).
 
-The default-on `acquisition_experiment_enabled` control permits at most two
+The default-on `acquisition_experiment_enabled` control permits at most four
 restart-safe, one-hour market-acquisition episodes at a time, on distinct peer
 markets. Each is restricted to a cold high-outbound channel with a peer-local
 1--10-ppm competing floor and a 0-ppm class-aware floor. After 50,000 acquired
@@ -251,9 +251,9 @@ smaller than the sparse acquisition sample. If no positive
 integer-millisatoshi undercut exists, the episode exits.
 Both phases share a per-episode 25-sat opportunity-cost and 70%
 outbound-liquidity stop; the free phase is additionally capped at 250,000
-routed sats and the paid phase at 250,000 additional sats. The two-market cap
-therefore bounds concurrent node-wide exposure to 50 sats of opportunity cost
-and 500,000 sats of free-phase routed volume. Congestion and changed, missing,
+routed sats and the paid phase at 250,000 additional sats. The four-market cap
+therefore bounds concurrent node-wide exposure to 100 sats of opportunity cost
+and 1,000,000 sats of free-phase routed volume. Congestion and changed, missing,
 or malformed
 evidence fail closed. The controller always restores the exact captured base
 and proportional fees, and `revenue-status.acquisition_experiments` exposes the
