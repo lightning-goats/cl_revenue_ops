@@ -2368,6 +2368,19 @@ class Database:
         """, (max(1, min(100, int(limit))),)).fetchall()
         return [dict(row) for row in rows]
 
+    def get_acquisition_channel_ids_since(self, since: int) -> list[str]:
+        """Return channels whose recent flow may include acquisition traffic."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT DISTINCT channel_id
+            FROM acquisition_experiments
+            WHERE state = 'active'
+               OR started_at >= ?
+               OR COALESCE(completed_at, 0) >= ?
+            ORDER BY channel_id
+        """, (int(since), int(since))).fetchall()
+        return [str(row["channel_id"]) for row in rows if row["channel_id"]]
+
     def transition_acquisition_to_retention(
         self,
         experiment_id: int,

@@ -329,6 +329,35 @@ class TestExtremeInventoryPriceRails:
             flow_balanced_router=True,
         ) == (50, 2000, "none")
 
+    def test_recent_acquisition_flow_cannot_claim_balanced_router_exemption(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+        fc._acquisition_tainted_flow_channels = {CHANNEL_ID}
+        fc._get_flow_window_map = MagicMock(
+            return_value={CHANNEL_ID: (600_000, 500_000, 20)}
+        )
+
+        assert fc._is_flow_balanced_router(CHANNEL_ID, 1_000_000) is False
+        fc._get_flow_window_map.assert_not_called()
+
+    @pytest.mark.parametrize("rows", [None, "bad", {"channel": "1x1x0"}, 7])
+    def test_malformed_acquisition_flow_provenance_is_neutral(
+        self, mock_plugin, mock_database, rows
+    ):
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_acquisition_channel_ids_since.return_value = rows
+
+        assert fc._load_acquisition_tainted_flow_channels(1_000_000) == set()
+
+    def test_acquisition_flow_provenance_rpc_error_is_neutral(
+        self, mock_plugin, mock_database
+    ):
+        fc, _cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_acquisition_channel_ids_since.side_effect = RuntimeError("db")
+
+        assert fc._load_acquisition_tainted_flow_channels(1_000_000) == set()
+
     def test_flow_balanced_router_is_exempt_from_urgent_reprice(
         self, mock_plugin, mock_database
     ):

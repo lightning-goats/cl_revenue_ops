@@ -3234,6 +3234,8 @@ class FeeController:
         """True when recent flow shows this channel self-balances at volume."""
         if not channel_id or capacity_sats <= 0:
             return False
+        if channel_id in getattr(self, "_acquisition_tainted_flow_channels", set()):
+            return False
         window_map = self._get_flow_window_map()
         flow_window = window_map.get(channel_id) if window_map else None
         record_effective_evidence_result("flow_window", [channel_id], flow_window)
@@ -3247,6 +3249,31 @@ class FeeController:
             return False
         net_ratio = abs(out_sats - in_sats) / gross
         return net_ratio <= self.FLOW_BALANCED_MAX_NET_RATIO
+
+    def _load_acquisition_tainted_flow_channels(self, now: int) -> set[str]:
+        """Load channels whose flow window overlaps an acquisition episode.
+
+        Missing database support, query failures, and malformed results are
+        neutral so an upgrade cannot break the governed fee cycle.
+        """
+        get_ids = getattr(self.database, "get_acquisition_channel_ids_since", None)
+        if not callable(get_ids):
+            return set()
+        try:
+            rows = get_ids(int(now) - self.FLOW_BALANCED_WINDOW_SECONDS)
+        except Exception as exc:
+            self.plugin.log(
+                f"ACQUISITION: flow-provenance read failed: {exc}",
+                level="debug",
+            )
+            return set()
+        if not isinstance(rows, (list, tuple, set)):
+            return set()
+        return {
+            channel_id
+            for channel_id in rows
+            if isinstance(channel_id, str) and channel_id
+        }
 
     def _effective_min_fee_ppm(
         self,
@@ -4035,6 +4062,9 @@ class FeeController:
         # Neighbor fee median cache: peer_id -> {"value": int|None, "ts": float}
         self._neighbor_fee_cache: Dict[str, Dict] = {}
         self._acquisition_cycle_experiments: Dict[str, Dict[str, Any]] = {}
+        # Acquisition quotes contaminate flow evidence: zero/sub-economic
+        # traffic does not prove a lane self-refills at ordinary prices.
+        self._acquisition_tainted_flow_channels: set[str] = set()
         # Compact active-episode state survives between fee cycles so settled
         # evidence can wake the governed loop.  It performs no CLN RPCs or fee
         # writes and uses its own lock rather than the cycle-wide state lock.
@@ -6076,8 +6106,12 @@ class FeeController:
         self._cycle_batch_active = True
         self._pending_fee_strategy_rows.clear()
         self._cycle_peer_latency_memo.clear()
+        acquisition_now = decision_now("acquisition.prepare")
+        self._acquisition_tainted_flow_channels = (
+            self._load_acquisition_tainted_flow_channels(acquisition_now)
+        )
         self._acquisition_cycle_experiments = self._prepare_acquisition_experiments(
-            channel_states, channels, cfg, decision_now("acquisition.prepare")
+            channel_states, channels, cfg, acquisition_now
         )
         self._sync_acquisition_monitor_episodes(
             self._acquisition_cycle_experiments,

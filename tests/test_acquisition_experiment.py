@@ -247,6 +247,15 @@ def test_database_enforces_two_distinct_active_markets_and_persists_exact_restor
     assert {
         row["id"] for row in restarted.get_active_acquisition_experiments()
     } == {second["id"], third["id"]}
+    assert restarted.get_acquisition_channel_ids_since(2_001) == [
+        "2x1x0",
+        "4x1x0",
+    ]
+    assert restarted.get_acquisition_channel_ids_since(1_999) == [
+        "1x1x0",
+        "2x1x0",
+        "4x1x0",
+    ]
     assert restarted.channel_acquisition_on_cooldown(
         "1x1x0", now=2_001, cooldown_seconds=100
     )
