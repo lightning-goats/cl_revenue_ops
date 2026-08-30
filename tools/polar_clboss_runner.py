@@ -44,17 +44,17 @@ REVENUE_PLUGIN = "/opt/cl_revenue_ops/cl-revenue-ops-polar-wrapper"
 CLBOSS_PLUGIN = "/usr/local/libexec/clboss"
 XREBALANCE_PLUGIN = "/usr/local/libexec/xrebalance"
 IDENTITIES = ("identity-a", "identity-b")
-CHANNEL_CAPACITY_SATS = 2_000_000
-RETURN_PATH_CAPACITY_SATS = 2_000_000
-CONTROLLED_DEPLETION_SATS = 1_500_000
+CHANNEL_CAPACITY_SATS = 5_000_000
+RETURN_PATH_CAPACITY_SATS = CHANNEL_CAPACITY_SATS
+CONTROLLED_DEPLETION_SATS = 3_750_000
 RETURN_PATH_FUNDING_BUFFER_SATS = 100_000
 # Synthetic return liquidity participates in the same public gossip pool that
 # Revenue Ops uses for market pricing.  Keep it in the controlled corridor's
 # realistic band instead of advertising an artificial 1-ppm outlier.
 RETURN_PATH_FEE_BASE_MSAT = 500
 RETURN_PATH_FEE_PPM = 120
-FUNDING_UTXO_SATS = 2_100_000
-# Covers the 1% reserve on a 2M channel plus route fees.  A smaller fee-only
+FUNDING_UTXO_SATS = CHANNEL_CAPACITY_SATS + RETURN_PATH_FUNDING_BUFFER_SATS
+# Covers the 1% reserve on a production-median channel plus route fees. A smaller fee-only
 # buffer still leaves the sink unable to spend the newly received balance.
 REVERSE_FEE_BUFFER_SATS = 25_000
 TOURNAMENT_CYCLE_SECONDS = 15
@@ -176,6 +176,15 @@ def read_state(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         raise RunnerError(f"invalid runner state schema in {path}")
     return payload
+
+
+def state_channel_capacity_sats(state: dict[str, Any]) -> int:
+    """Return the recorded matched channel capacity, with legacy compatibility."""
+    value = state.get("channel_capacity_sats", CHANNEL_CAPACITY_SATS)
+    try:
+        return positive_int(value)
+    except argparse.ArgumentTypeError as exc:
+        raise RunnerError("runner state has invalid channel capacity") from exc
 
 
 def _run(
@@ -393,6 +402,19 @@ def onchain_address(payload: dict[str, Any]) -> str:
 
 
 def _fund_wallet(container: str, bridge: PolarMcp, network_id: int) -> str:
+    return _fund_wallet_sized(
+        container, bridge, network_id, funding_utxo_sats=FUNDING_UTXO_SATS
+    )
+
+
+def _fund_wallet_sized(
+    container: str,
+    bridge: PolarMcp,
+    network_id: int,
+    *,
+    funding_utxo_sats: int,
+) -> str:
+    funding_utxo_sats = positive_int(funding_utxo_sats)
     addresses = [onchain_address(cln_rpc(container, "newaddr")) for _ in range(2)]
     # Two independent confirmed UTXOs let the contender fund its two outbound
     # channels without relying on unconfirmed transaction change.
@@ -401,7 +423,7 @@ def _fund_wallet(container: str, bridge: PolarMcp, network_id: int) -> str:
             [
                 "docker", "exec", f"polar-n{network_id}-backend1",
                 "bitcoin-cli", "-regtest", "-rpcuser=polaruser", "-rpcpassword=polarpass",
-                "sendtoaddress", address, f"{FUNDING_UTXO_SATS / 100_000_000:.8f}",
+                "sendtoaddress", address, f"{funding_utxo_sats / 100_000_000:.8f}",
             ]
         )
     _mine(bridge, network_id, 6)
@@ -452,8 +474,11 @@ def _open_channels(
     bridge: PolarMcp,
     network_id: int,
     contenders: dict[str, dict[str, str]],
+    *,
+    capacity_sats: int = CHANNEL_CAPACITY_SATS,
     on_open: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
+    capacity_sats = positive_int(capacity_sats)
     cln_payer = f"polar-n{network_id}-cln-payer"
     lnd_payer = f"polar-n{network_id}-lnd-payer"
     cln_sink = f"polar-n{network_id}-cln-sink"
@@ -478,23 +503,23 @@ def _open_channels(
         node_id = contender["node_id"]
         name = contender["container"]
         _connect_cln(cln_payer, node_id, identity)
-        cln_open = cln_rpc(cln_payer, "fundchannel", node_id, CHANNEL_CAPACITY_SATS)
+        cln_open = cln_rpc(cln_payer, "fundchannel", node_id, capacity_sats)
         record({"funder": "cln-payer", "identity": identity, "result": cln_open})
 
         _connect_lnd(lnd_payer, node_id, identity)
         lnd_open = lnd_rpc(
             lnd_payer, "openchannel", "--node_key", node_id,
-            "--local_amt", CHANNEL_CAPACITY_SATS,
+            "--local_amt", capacity_sats,
         )
         record({"funder": "lnd-payer", "identity": identity, "result": lnd_open})
 
         _connect_cln(name, peers["cln_sink"], "cln-sink")
-        cln_sink_open = cln_rpc(name, "fundchannel", peers["cln_sink"], CHANNEL_CAPACITY_SATS)
+        cln_sink_open = cln_rpc(name, "fundchannel", peers["cln_sink"], capacity_sats)
         record({"funder": identity, "sink": "cln-sink", "result": cln_sink_open})
-        wait_wallet_funds(name, minimum_sats=CHANNEL_CAPACITY_SATS)
+        wait_wallet_funds(name, minimum_sats=capacity_sats)
 
         _connect_cln(name, peers["lnd_sink"], "lnd-sink")
-        lnd_sink_open = cln_rpc(name, "fundchannel", peers["lnd_sink"], CHANNEL_CAPACITY_SATS)
+        lnd_sink_open = cln_rpc(name, "fundchannel", peers["lnd_sink"], capacity_sats)
         record({"funder": identity, "sink": "lnd-sink", "result": lnd_sink_open})
     return opened
 
@@ -949,7 +974,7 @@ def prepare_controlled_depletion(
     *,
     replica: int,
     results_dir: Path,
-    amount_sats: int = CONTROLLED_DEPLETION_SATS,
+    amount_sats: int | None = None,
     fixture_fee_ppm: int | None = None,
     family: str = "cln",
     depleted_side: str = "sink",
@@ -968,10 +993,13 @@ def prepare_controlled_depletion(
         raise RunnerError(f"unknown controlled depletion family: {family!r}")
     if depleted_side not in {"payer", "sink"}:
         raise RunnerError(f"unknown controlled depleted side: {depleted_side!r}")
+    channel_capacity_sats = state_channel_capacity_sats(state)
+    if amount_sats is None:
+        amount_sats = channel_capacity_sats * 3 // 4
     amount_sats = nonnegative_int(amount_sats, "controlled depletion amount")
     if (
-        amount_sats <= CHANNEL_CAPACITY_SATS // 2
-        or amount_sats >= CHANNEL_CAPACITY_SATS
+        amount_sats <= channel_capacity_sats // 2
+        or amount_sats >= channel_capacity_sats
     ):
         raise RunnerError(
             "controlled depletion amount must be above half and below channel capacity"
@@ -1056,7 +1084,7 @@ def prepare_controlled_depletion(
     counterflow_admission = []
     counterflow_parts_sats: list[int] = []
     if depleted_side == "payer":
-        counterflow_amount_sats = 2 * amount_sats - CHANNEL_CAPACITY_SATS
+        counterflow_amount_sats = 2 * amount_sats - channel_capacity_sats
         # The controller's active profile deliberately requires three settled
         # forwards before closing a sub-15-minute observation window.  Split
         # the fixed counterflow total into exactly three payments so the
@@ -1172,7 +1200,7 @@ def apply_equal_targeted_pressure(
                 )
             )
     after = controlled_depletion_snapshot(state, family="lnd")
-    minimum_drop_ppm = total_sats * 900_000 // CHANNEL_CAPACITY_SATS
+    minimum_drop_ppm = total_sats * 900_000 // state_channel_capacity_sats(state)
     for controller in ("revenue_ops", "clboss"):
         drop_ppm = (
             before[controller]["depleted"]["local_balance_ppm"]
@@ -1208,7 +1236,7 @@ def provision_return_paths(
     *,
     replica: int,
     results_dir: Path,
-    capacity_sats: int = RETURN_PATH_CAPACITY_SATS,
+    capacity_sats: int | None = None,
     fee_ppm: int = RETURN_PATH_FEE_PPM,
 ) -> dict[str, Any]:
     """Open fresh return liquidity toward the controlled depleted lane.
@@ -1261,6 +1289,8 @@ def provision_return_paths(
         treatment = state.get(key)
         if isinstance(treatment, dict) and treatment.get("status") == "active":
             raise RunnerError(f"return paths require restored treatment: {key}")
+    if capacity_sats is None:
+        capacity_sats = state_channel_capacity_sats(state)
     capacity_sats = nonnegative_int(capacity_sats, "return-path capacity")
     if capacity_sats == 0:
         raise RunnerError("return-path capacity must be positive")
@@ -1785,10 +1815,12 @@ def prime_forced_paths(
     # Payer-funded contender channels start with zero local balance. A reverse
     # proof needs the 1% channel reserve plus the probe amount to be present
     # first; otherwise the route is correctly unavailable despite healthy
-    # gossip. The 1M-sat formal topology has a 10k-sat reserve plus variable
+    # gossip. Every capacity band has a proportional reserve plus variable
     # anchor/commitment-fee headroom. Seed 5% of capacity so the proof remains
     # valid across the lab's live feerate range.
-    forward_amount_sats = max(amount_sats, CHANNEL_CAPACITY_SATS // 20)
+    forward_amount_sats = max(
+        amount_sats, state_channel_capacity_sats(state) // 20
+    )
     lane_map = state.get("lane_map")
     assignment = state.get("assignment")
     if not isinstance(lane_map, dict) or not isinstance(assignment, dict):
@@ -2789,6 +2821,7 @@ def setup(
     image: str,
     results_dir: Path,
     market_profile: str = "realistic",
+    channel_capacity_sats: int = CHANNEL_CAPACITY_SATS,
 ) -> dict[str, Any]:
     path = state_path(results_dir, replica)
     if path.exists():
@@ -2797,6 +2830,11 @@ def setup(
     market_seed = MARKET_PROFILES.get(market_profile)
     if market_seed is None:
         raise RunnerError(f"unknown market profile: {market_profile}")
+    channel_capacity_sats = positive_int(channel_capacity_sats)
+    if channel_capacity_sats < 1_000_000:
+        raise RunnerError(
+            "tournament channel capacity must be at least 1000000 sats"
+        )
     assignment = assignment_for(replica)
     state: dict[str, Any] = {
         "schema": SCHEMA,
@@ -2807,6 +2845,7 @@ def setup(
         "preflight": preflight_result,
         "market_profile": market_profile,
         "market_seed": dict(market_seed),
+        "channel_capacity_sats": channel_capacity_sats,
         "events": [],
         "contenders": {},
         "channels": [],
@@ -2833,11 +2872,24 @@ def setup(
             _checkpoint(path, state, "container_ready", identity=identity)
 
         for identity in IDENTITIES:
-            _fund_wallet(state["contenders"][identity]["container"], bridge, network_id)
-            wait_wallet_funds(state["contenders"][identity]["container"])
+            funding_utxo_sats = (
+                channel_capacity_sats + RETURN_PATH_FUNDING_BUFFER_SATS
+            )
+            _fund_wallet_sized(
+                state["contenders"][identity]["container"], bridge, network_id,
+                funding_utxo_sats=funding_utxo_sats,
+            )
+            wait_wallet_funds(
+                state["contenders"][identity]["container"],
+                minimum_sats=2 * funding_utxo_sats,
+            )
             _checkpoint(path, state, "wallet_funded", identity=identity)
 
-        state["payer_wallet_topups"] = ensure_payer_wallet_funds(bridge, network_id)
+        state["payer_wallet_topups"] = ensure_payer_wallet_funds(
+            bridge, network_id,
+            minimum_sats=(2 * channel_capacity_sats)
+            + RETURN_PATH_FUNDING_BUFFER_SATS,
+        )
         _checkpoint(
             path, state, "payer_wallets_ready", balances=state["payer_wallet_topups"]
         )
@@ -2847,7 +2899,9 @@ def setup(
             _checkpoint(path, state, "channel_open_dispatched", channel=row)
 
         _open_channels(
-            bridge, network_id, state["contenders"], on_open=checkpoint_channel
+            bridge, network_id, state["contenders"],
+            capacity_sats=channel_capacity_sats,
+            on_open=checkpoint_channel,
         )
         _checkpoint(path, state, "channels_open_dispatched", count=len(state["channels"]))
         wait_channels(state["contenders"])
@@ -3462,6 +3516,7 @@ def run_smoke(
         "traffic_pattern": traffic_pattern,
         "traffic_family": traffic_family,
         "market_profile": str(state.get("market_profile") or "legacy_low_fee"),
+        "channel_capacity_sats": state_channel_capacity_sats(state),
         "amount_profile": effective_amount_profile,
         "traffic_seed": traffic_seed,
         "before": {
@@ -3683,6 +3738,7 @@ def run_smoke(
         "replica": f"replica-{replica}",
         "league": current_league,
         "market_profile": str(state.get("market_profile") or "legacy_low_fee"),
+        "channel_capacity_sats": state_channel_capacity_sats(state),
         "block": block_id,
         "duration_seconds": max(1.0, time.time() - started),
         "cache_mode": cache_mode,
@@ -4379,6 +4435,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--replica", type=positive_int, default=1)
     parser.add_argument("--image", default=IMAGE)
     parser.add_argument("--results-dir", type=Path, default=Path("results/polar-clboss"))
+    parser.add_argument(
+        "--channel-capacity-sats", type=positive_int,
+        default=CHANNEL_CAPACITY_SATS,
+        help=(
+            "matched contender channel capacity recorded at setup; use 2000000, "
+            "5000000, and 20000000 for the production-shaped matrix"
+        ),
+    )
     parser.add_argument("--rounds", type=positive_int, default=2)
     parser.add_argument("--amount-sats", type=positive_int, default=5_000)
     parser.add_argument(
@@ -4418,7 +4482,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--return-capacity-sats", type=positive_int,
-        default=RETURN_PATH_CAPACITY_SATS,
+        help="synthetic return capacity; defaults to the replica channel capacity",
     )
     parser.add_argument(
         "--return-fee-ppm", type=positive_int, default=RETURN_PATH_FEE_PPM,
@@ -4429,7 +4493,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--depletion-sats", type=positive_int, default=CONTROLLED_DEPLETION_SATS,
+        "--depletion-sats", type=positive_int,
+        help="controlled depletion amount; defaults to 75% of channel capacity",
     )
     parser.add_argument(
         "--depletion-family", choices=("cln", "lnd"), default="cln",
@@ -4477,6 +4542,7 @@ def main() -> int:
                 bridge, network_id=args.network_id, replica=args.replica,
                 image=args.image, results_dir=args.results_dir,
                 market_profile=args.market_profile,
+                channel_capacity_sats=args.channel_capacity_sats,
             )
         elif args.command == "isolate":
             result = isolate_background(

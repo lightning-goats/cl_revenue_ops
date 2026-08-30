@@ -351,6 +351,8 @@ def summarize(
     ] = {}
     market_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
     eligible_market_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
+    capacity_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
+    eligible_capacity_profiles: dict[str, dict[str, defaultdict[str, int]]] = {}
     attempted = settled = fallback = 0
     enhanced = eligible_blocks = excluded_blocks = 0
     replicas = set()
@@ -381,6 +383,14 @@ def summarize(
         profile_rows = market_profiles.setdefault(
             market_profile, {name: defaultdict(int) for name in CONTROLLERS}
         )
+        capacity_value = block.get("channel_capacity_sats")
+        capacity_key = (
+            str(_integer(capacity_value, "channel_capacity_sats"))
+            if capacity_value is not None else "legacy_unspecified"
+        )
+        capacity_rows = capacity_profiles.setdefault(
+            capacity_key, {name: defaultdict(int) for name in CONTROLLERS}
+        )
         block_violations = block.get("safety_violations")
         contender_safety = [
             block["contenders"][name].get("safety_violations")
@@ -404,6 +414,7 @@ def summarize(
         )
         eligible_rows = None
         eligible_phase_rows = None
+        eligible_capacity_rows = None
         if eligible:
             eligible_blocks += 1
             eligible_rows = eligible_market_profiles.setdefault(
@@ -411,6 +422,9 @@ def summarize(
             )
             eligible_phase_rows = eligible_phases.setdefault(
                 phase, {name: defaultdict(int) for name in CONTROLLERS}
+            )
+            eligible_capacity_rows = eligible_capacity_profiles.setdefault(
+                capacity_key, {name: defaultdict(int) for name in CONTROLLERS}
             )
 
         def metric_value(name: str, row: dict[str, Any], metric: str) -> int:
@@ -437,9 +451,11 @@ def summarize(
                 totals[name][metric] += value
                 phase_rows[name][metric] += value
                 profile_rows[name][metric] += value
+                capacity_rows[name][metric] += value
                 if eligible_rows is not None:
                     eligible_rows[name][metric] += value
                     eligible_phase_rows[name][metric] += value
+                    eligible_capacity_rows[name][metric] += value
             worst = _integer(
                 row.get("ending_worst_channel_imbalance_ppm", 0),
                 f"{name}.ending_worst_channel_imbalance_ppm",
@@ -450,11 +466,15 @@ def summarize(
             phase_rows[name]["worst_imbalance_samples"] += 1
             profile_rows[name]["worst_imbalance_sum_ppm"] += worst
             profile_rows[name]["worst_imbalance_samples"] += 1
+            capacity_rows[name]["worst_imbalance_sum_ppm"] += worst
+            capacity_rows[name]["worst_imbalance_samples"] += 1
             if eligible_rows is not None:
                 eligible_rows[name]["worst_imbalance_sum_ppm"] += worst
                 eligible_rows[name]["worst_imbalance_samples"] += 1
                 eligible_phase_rows[name]["worst_imbalance_sum_ppm"] += worst
                 eligible_phase_rows[name]["worst_imbalance_samples"] += 1
+                eligible_capacity_rows[name]["worst_imbalance_sum_ppm"] += worst
+                eligible_capacity_rows[name]["worst_imbalance_samples"] += 1
 
         family_scope = traffic.get("family_scope")
         families = block.get("families")
@@ -548,6 +568,13 @@ def summarize(
             "attempted": attempted, "settled": settled,
             "fallback_settled_in_enhanced_blocks": fallback,
             "market_profiles": sorted(market_profiles),
+            "channel_capacity_profiles_sats": sorted(
+                capacity_profiles,
+                key=lambda value: (
+                    value == "legacy_unspecified",
+                    int(value) if value != "legacy_unspecified" else 0,
+                ),
+            ),
             "formal_verdict_ready": formal_ready,
             "formal_verdict_blocker": formal_blocker,
         },
@@ -570,6 +597,26 @@ def summarize(
         "eligible_by_market_profile": {
             profile: finalize(rows)
             for profile, rows in sorted(eligible_market_profiles.items())
+        },
+        "by_channel_capacity_sats": {
+            capacity: finalize(capacity_profiles[capacity])
+            for capacity in sorted(
+                capacity_profiles,
+                key=lambda value: (
+                    value == "legacy_unspecified",
+                    int(value) if value != "legacy_unspecified" else 0,
+                ),
+            )
+        },
+        "eligible_by_channel_capacity_sats": {
+            capacity: finalize(eligible_capacity_profiles[capacity])
+            for capacity in sorted(
+                eligible_capacity_profiles,
+                key=lambda value: (
+                    value == "legacy_unspecified",
+                    int(value) if value != "legacy_unspecified" else 0,
+                ),
+            )
         },
         "area_leaders": areas,
         "tournament_priority": {
@@ -823,6 +870,32 @@ def markdown(scorecard: dict[str, Any]) -> str:
             f"| Routing volume (msat) | {rows['revenue_ops']['volume_msat']} | {rows['clboss']['volume_msat']} |",
             f"| Net routing profit (msat) | {rows['revenue_ops']['net_profit_msat']} | {rows['clboss']['net_profit_msat']} |",
             f"| Gross yield (ppm) | {rows['revenue_ops']['gross_yield_ppm']} | {rows['clboss']['gross_yield_ppm']} |",
+            "",
+        ])
+    lines.extend([
+        "## Eligible results by channel capacity",
+        "",
+        (
+            "Capacity is matched between contenders inside every replica. "
+            "Legacy artifacts without an explicit capacity remain separately labeled."
+        ),
+        "",
+    ])
+    for capacity, rows in scorecard["eligible_by_channel_capacity_sats"].items():
+        label = (
+            capacity
+            if capacity == "legacy_unspecified"
+            else f"{int(capacity):,} sats"
+        )
+        lines.extend([
+            f"### {label}",
+            "",
+            "| Metric | Revenue Ops | CLBOSS |",
+            "|---|---:|---:|",
+            f"| Routing volume (msat) | {rows['revenue_ops']['volume_msat']} | {rows['clboss']['volume_msat']} |",
+            f"| Net routing profit (msat) | {rows['revenue_ops']['net_profit_msat']} | {rows['clboss']['net_profit_msat']} |",
+            f"| Gross yield (ppm) | {rows['revenue_ops']['gross_yield_ppm']} | {rows['clboss']['gross_yield_ppm']} |",
+            f"| Mean worst imbalance (ppm) | {rows['revenue_ops']['mean_ending_worst_imbalance_ppm']} | {rows['clboss']['mean_ending_worst_imbalance_ppm']} |",
             "",
         ])
     lines.extend([

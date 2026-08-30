@@ -66,7 +66,8 @@ the existing `polar-network-4_default` Docker network. Give each a fresh wallet
 and plugin database for every replica. Never copy an existing node's HSM secret,
 wallet, gossip store, or controller database.
 
-Each contender gets these four public one-million-sat channels:
+Each contender gets four public channels of the same recorded capacity within
+a replica:
 
 ```text
 lnd-payer ─────┐                 ┌───── lnd-sink
@@ -74,13 +75,22 @@ lnd-payer ─────┐                 ┌───── lnd-sink
 cln-payer ─────┘                 └───── cln-sink
 ```
 
-The payer-funded channels begin as inbound capacity to the contender. The
-contender-funded sink channels give it exactly two million sats of starting
-local routing capital. Require capacities and directional balances to match
-within one percent before traffic starts. Mine six blocks through Polar MCP,
-wait for every public edge in both payer graphs, and prove one deliberately
-forced payment through each contender and client family before releasing path
-selection.
+The payer-funded channels begin as inbound capacity to the contender. The two
+contender-funded sink channels give it exactly twice the recorded channel
+capacity in starting local routing capital. Require capacities and directional
+balances to match within one percent before traffic starts. Mine six blocks
+through Polar MCP, wait for every public edge in both payer graphs, and prove
+one deliberately forced payment through each contender and client family
+before releasing path selection.
+
+The 2026-08-30 read-only production snapshot contained 45 active channels:
+1.83M sats at p25, 5.0M median, 7.0M p75, and 20.15M maximum. The next frozen
+series therefore uses matched 2M, 5M, and 20M capacity replicas. Capacity is a
+first-class state and smoke-artifact field. Wallet funding, unscored readiness
+seeding, controlled depletion, and synthetic return liquidity scale from that
+field; no contender receives a different capacity inside a replica. This
+tests the small-channel tail, production median, and largest-channel regime
+without pretending that every production channel is 20M sats.
 
 Capture every directed policy on the original three routers and set their
 outbound proportional fee to 10,000 ppm for the scored windows. Their routes are
@@ -97,6 +107,12 @@ Run three fresh replicas. Cross the controller-to-identity assignment:
 | R1 | `cl_revenue_ops` | CLBOSS |
 | R2 | CLBOSS | `cl_revenue_ops` |
 | R3 | `cl_revenue_ops` | CLBOSS |
+
+For the production-shaped capacity series, assign R1=2M, R2=5M, and R3=20M
+sats. The economic comparison remains paired within each replica, so capacity
+does not favor either controller. If the response differs materially by band,
+follow with three fresh replicas per band before promoting a capacity-specific
+change.
 
 Fresh wallets and channels matter more than merely restarting plugins: route
 memory, channel age, short-channel IDs, and initial gossip order can otherwise

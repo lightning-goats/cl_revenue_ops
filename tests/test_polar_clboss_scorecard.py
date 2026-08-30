@@ -25,6 +25,7 @@ def block():
         "replica": "replica-1",
         "phase": "paid_retention",
         "market_profile": "acquisition",
+        "channel_capacity_sats": 5_000_000,
         "safety_violations": [],
         "traffic": {"attempted": 10, "settled": 10, "fallback_settled": 0},
         "contenders": {
@@ -124,6 +125,7 @@ def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming()
     assert result["coverage"]["eligible_blocks"] == 1
     assert result["coverage"]["formal_verdict_ready"] is False
     assert result["coverage"]["market_profiles"] == ["acquisition"]
+    assert result["coverage"]["channel_capacity_profiles_sats"] == ["5000000"]
     assert result["tournament_priority"] == {
         "primary_metric": "net_profit_msat",
         "economic_leader": "revenue_ops",
@@ -145,6 +147,9 @@ def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming()
         ]
         == 100
     )
+    assert result["eligible_by_channel_capacity_sats"]["5000000"][
+        "revenue_ops"
+    ]["net_profit_msat"] == 100
     assert (
         result["by_phase"]["paid_retention"]["revenue_ops"][
             "mean_ending_worst_imbalance_ppm"
@@ -165,6 +170,8 @@ def test_scorecard_tracks_profit_share_yield_and_coverage_without_overclaiming()
     assert "| Reliability | Strict safety-gated blocks only; shared traffic settled 10/10 payments" in rendered
     assert "| Channel open / close management | Intentionally absent" in rendered
     assert "### acquisition" in rendered
+    assert "## Eligible results by channel capacity" in rendered
+    assert "### 5,000,000 sats" in rendered
     assert "## Eligible results by phase" in rendered
     assert "### paid_retention" in rendered
 
