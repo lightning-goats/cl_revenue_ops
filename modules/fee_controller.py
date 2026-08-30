@@ -7411,6 +7411,7 @@ class FeeController:
         acquisition_inventory_credit_ppm = 0
         acquisition_inventory_immediate = False
         acquisition_route_competitor_floor_ppm = None
+        acquisition_route_target_ppm = None
         upward_probe_pre_cap_ppm = None  # L1: set when a probe stretch is granted
         bound_reason = "none"
         delta_cap_reason = "none"
@@ -9080,10 +9081,29 @@ class FeeController:
                     )
                 )
                 inventory_floor_ppm -= acquisition_inventory_credit_ppm
-                inventory_ceiling_ppm = max(
-                    inventory_floor_ppm,
-                    inventory_ceiling_ppm - acquisition_inventory_credit_ppm,
-                )
+                if self._acquisition_competitor_floor_qualifies(
+                    acquisition_route_competitor_floor_ppm
+                ):
+                    acquisition_route_target_ppm = max(
+                        self.ACQUISITION_ORGANIC_REBALANCE_MIN_PPM,
+                        int(acquisition_route_competitor_floor_ppm) - 1,
+                    )
+                if (
+                    acquisition_route_target_ppm is not None
+                    and inventory_floor_ppm <= acquisition_route_target_ppm
+                ):
+                    # Once the bounded credit can reach the route-specific
+                    # undercut, pin the entire rail there.  Merely shifting a
+                    # wider ceiling lets PID drift back above the proven
+                    # competitor and lose the inventory-relief traffic.
+                    inventory_floor_ppm = acquisition_route_target_ppm
+                    inventory_ceiling_ppm = acquisition_route_target_ppm
+                else:
+                    inventory_ceiling_ppm = max(
+                        inventory_floor_ppm,
+                        inventory_ceiling_ppm
+                        - acquisition_inventory_credit_ppm,
+                    )
             if inventory_rail_reason != "none":
                 self.plugin.log(
                     f"INVENTORY_RAIL: {channel_id[:12]}... "
@@ -9820,6 +9840,7 @@ class FeeController:
                     "acquisition_inventory_credit_ppm": acquisition_inventory_credit_ppm,
                     "acquisition_inventory_immediate": acquisition_inventory_immediate,
                     "acquisition_route_competitor_floor_ppm": acquisition_route_competitor_floor_ppm,
+                    "acquisition_route_target_ppm": acquisition_route_target_ppm,
                     "bounded_target_ppm": bounded_target_ppm,
                     "blended_target_ppm": blended_target_ppm if blended_target_ppm is not None else bounded_target_ppm,
                     "applied_target_ppm": applied_target_ppm if applied_target_ppm is not None else new_fee_ppm,

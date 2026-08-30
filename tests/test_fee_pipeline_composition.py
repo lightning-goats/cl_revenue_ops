@@ -559,6 +559,7 @@ class TestExtremeInventoryPriceRails:
         assert result.algorithm_values[
             "acquisition_route_competitor_floor_ppm"
         ] == 10
+        assert result.algorithm_values["acquisition_route_target_ppm"] == 9
         assert result.algorithm_values["inventory_floor_ppm"] == 9
         assert result.algorithm_values["inventory_ceiling_ppm"] == 9
         assert result.algorithm_values["bounded_target_ppm"] == 9
@@ -581,6 +582,47 @@ class TestExtremeInventoryPriceRails:
         assert FeeController._acquisition_inventory_credit(53, 10_000, 10) == 44
         assert FeeController._acquisition_inventory_credit(80, 10_000, 10) == 50
         assert FeeController._acquisition_inventory_credit(53, 10_000, True) == 5
+
+    def test_route_target_does_not_bypass_wider_credit_cap(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(
+            mock_plugin,
+            mock_database,
+            min_fee_ppm=100,
+            min_fee_ppm_saturated=80,
+            max_fee_ppm=2000,
+            rebalance_emergency_local_ratio=0.20,
+        )
+        fc._acquisition_tainted_flow_channels = {CHANNEL_ID}
+        fc._acquisition_competitor_floors = {CHANNEL_ID: 10}
+        fc._calculate_floor = lambda *a, **k: 100
+        fc._get_rebalance_cost_floor = lambda *a, **k: None
+        fc._get_channel_rebalance_cost_ppm = lambda *a, **k: 0
+        fc._get_neighbor_fee_median = lambda *a, **k: None
+        fc._get_neighbor_fee_percentile = lambda *a, **k: 10_000
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+        ts_state = _prepare_dts_stubs(fc, chain_fee=150, sampled_fee=1450)
+        ts_state.thompson.supported_fee_ceiling = lambda **k: 187
+        info = _channel_info(150, capacity=5_000_000)
+        info["spendable_msat"] = "4300000000msat"
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID,
+            PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            info,
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.algorithm_values["acquisition_inventory_credit_ppm"] == 50
+        assert result.algorithm_values["acquisition_route_target_ppm"] == 9
+        assert result.algorithm_values["inventory_floor_ppm"] > 9
+        assert result.algorithm_values["inventory_ceiling_ppm"] >= result.algorithm_values[
+            "inventory_floor_ppm"
+        ]
 
 # =============================================================================
 # P5: Kalman demand divisor clamp
