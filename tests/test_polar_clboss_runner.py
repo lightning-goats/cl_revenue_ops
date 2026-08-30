@@ -152,6 +152,8 @@ def test_totals_delta_counts_policy_change_without_inventing_rebalance_cost():
         "channels": {},
         "policy_changes": 1,
         "rebalance_cost_msat": 0,
+        "rebalance_delivered_msat": 0,
+        "rebalance_completed_count": 0,
     }
 
 
@@ -1197,6 +1199,8 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
             "channels": {},
             "policy_changes": 0,
             "rebalance_cost_msat": 0,
+            "rebalance_delivered_msat": 0,
+            "rebalance_completed_count": 0,
         },
         "clboss": {
             "forward_count": 0,
@@ -1209,6 +1213,8 @@ def test_smoke_checkpoints_prior_schedule_progress_on_unknown_payment(monkeypatc
             "channels": {},
             "policy_changes": 0,
             "rebalance_cost_msat": 0,
+            "rebalance_delivered_msat": 0,
+            "rebalance_completed_count": 0,
         },
     }
     progress = json.loads(Path(result["progress_file"]).read_text(encoding="utf-8"))
@@ -1374,11 +1380,106 @@ def test_completed_smoke_accepts_multipart_htlcs_at_exact_traffic_volume(
         "settled_volume_msat": 50_000_000,
         "contender_volume_msat": 50_000_000,
         "fallback_volume_msat": 0,
+        "raw_extra_volume_msat": 0,
+        "native_rebalance_volume_msat": 0,
+        "native_rebalance_completed_count": 0,
+        "attributed_native_rebalance_volume_msat": 0,
         "extra_volume_msat": 0,
         "contender_forward_count": 2,
         "multipart_forward_splits": 1,
-        "attribution_method": "exact_family_volume",
+        "attribution_method": "exact_family_volume_plus_native_rebalance",
     }
+
+
+@pytest.mark.parametrize(
+    ("native_delivered_msat", "expected_safety", "expected_attributed_msat"),
+    (
+        (50_000_000, [], 50_000_000),
+        (
+            49_000_000,
+            [
+                "unattributed_extra_contender_volume",
+                "native_rebalance_volume_mismatch",
+            ],
+            0,
+        ),
+    ),
+)
+def test_completed_smoke_attributes_only_exact_native_rebalance_volume(
+    monkeypatch, tmp_path, native_delivered_msat, expected_safety,
+    expected_attributed_msat,
+):
+    runner = load_runner()
+    path = runner.state_path(tmp_path, 95)
+    roles = (("cln", "payer"), ("cln", "sink"), ("lnd", "payer"), ("lnd", "sink"))
+    runner.write_json_atomic(path, {
+        "schema": runner.SCHEMA,
+        "status": "isolated_full_stack_ready",
+        "league": "full_stack",
+        "events": [],
+        "assignment": {"revenue_ops": "identity-a", "clboss": "identity-b"},
+        "contenders": {
+            "identity-a": {"container": "revenue"},
+            "identity-b": {"container": "clboss"},
+        },
+        "lane_map": {
+            identity: {
+                f"{prefix}x1x{index}": {"family": family, "side": side}
+                for index, (family, side) in enumerate(roles)
+            }
+            for identity, prefix in (("identity-a", 1), ("identity-b", 2))
+        },
+    })
+    revenue_policy = tuple((f"1x1x{i}", 0, 150) for i in range(4))
+    clboss_policy = tuple((f"2x1x{i}", 0, 1) for i in range(4))
+    samples = {
+        "revenue": iter((
+            runner.Totals(0, 0, 0, 500_000, revenue_policy),
+            runner.Totals(
+                0, 0, 0, 500_000, revenue_policy,
+                rebalance_cost_msat=5_957,
+                rebalance_delivered_msat=native_delivered_msat,
+                rebalance_completed_count=1,
+            ),
+        )),
+        "clboss": iter((
+            runner.Totals(0, 0, 0, 500_000, clboss_policy),
+            runner.Totals(
+                2, 100_000_000, 8_000, 500_000, clboss_policy,
+                channel_metrics=(("2x1x3", 2, 100_000_000, 8_000),),
+            ),
+        )),
+    }
+    monkeypatch.setattr(
+        runner, "contender_totals", lambda container: next(samples[container])
+    )
+    monkeypatch.setattr(
+        runner, "run_reconciled_traffic", lambda *_args, **_kwargs: [{
+            "family": "lnd", "payer": "payer", "sink": "sink",
+            "amount_sats": 50_000, "payment_hash": "hash",
+            "payment": {"success": True},
+        }]
+    )
+
+    block = runner.run_smoke(
+        object(), replica=95, results_dir=tmp_path, rounds=1,
+        amount_sats=50_000, pause_seconds=0,
+        traffic_pattern="forward-pressure", traffic_family="lnd",
+    )
+
+    assert block["safety_violations"] == expected_safety
+    assert block["traffic"]["raw_extra_volume_msat"] == 50_000_000
+    assert block["traffic"]["native_rebalance_volume_msat"] == native_delivered_msat
+    assert (
+        block["traffic"]["attributed_native_rebalance_volume_msat"]
+        == expected_attributed_msat
+    )
+    assert block["traffic"]["extra_volume_msat"] == (
+        0 if expected_attributed_msat else 50_000_000
+    )
+    assert block["traffic"]["multipart_forward_splits"] == 0
+    assert block["contenders"]["revenue_ops"]["rebalance_cost_msat"] == 5_957
+    assert block["contenders"]["clboss"]["routing_fee_msat"] == 8_000
 
 
 @pytest.mark.parametrize(

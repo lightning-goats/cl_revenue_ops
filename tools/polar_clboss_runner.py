@@ -2775,6 +2775,8 @@ class Totals:
     mean_local_liquidity_sats: int
     policy_fingerprint: tuple[tuple[str, int, int], ...]
     rebalance_cost_msat: int = 0
+    rebalance_delivered_msat: int = 0
+    rebalance_completed_count: int = 0
     min_local_balance_ppm: int = 0
     max_local_balance_ppm: int = 0
     worst_channel_imbalance_ppm: int = 0
@@ -2891,13 +2893,16 @@ def contender_totals(container: str) -> Totals:
         metrics[0] += 1
         metrics[1] += msat_value(row.get("out_msat", 0))
         metrics[2] += msat_value(row.get("fee_msat", 0))
+    native_rebalances = rebalance_totals(container)
     return Totals(
         forward_count=len(settled),
         volume_msat=sum(msat_value(row.get("out_msat", 0)) for row in settled),
         routing_fee_msat=sum(msat_value(row.get("fee_msat", 0)) for row in settled),
         mean_local_liquidity_sats=sum(local_sats) // len(local_sats),
         policy_fingerprint=tuple(sorted(policies)),
-        rebalance_cost_msat=rebalance_cost_msat(container),
+        rebalance_cost_msat=native_rebalances["cost_msat"],
+        rebalance_delivered_msat=native_rebalances["delivered_msat"],
+        rebalance_completed_count=native_rebalances["completed_count"],
         min_local_balance_ppm=min(local_balance_ppm),
         max_local_balance_ppm=max(local_balance_ppm),
         worst_channel_imbalance_ppm=max(
@@ -2916,6 +2921,12 @@ def totals_delta(before: Totals, after: Totals) -> dict[str, Any]:
         "volume_msat": after.volume_msat - before.volume_msat,
         "routing_fee_msat": after.routing_fee_msat - before.routing_fee_msat,
         "rebalance_cost_msat": after.rebalance_cost_msat - before.rebalance_cost_msat,
+        "rebalance_delivered_msat": (
+            after.rebalance_delivered_msat - before.rebalance_delivered_msat
+        ),
+        "rebalance_completed_count": (
+            after.rebalance_completed_count - before.rebalance_completed_count
+        ),
     }
     if any(value < 0 for value in values.values()):
         raise RunnerError("contender cumulative counters regressed")
@@ -3474,9 +3485,24 @@ def run_smoke(
         max(0, row["settled_volume_msat"] - row["contender_volume_msat"])
         for row in family_rows.values()
     )
-    extra_volume_msat = sum(
+    raw_extra_volume_msat = sum(
         max(0, row["contender_volume_msat"] - row["settled_volume_msat"])
         for row in family_rows.values()
+    )
+    native_rebalance_volume_msat = sum(
+        delta["rebalance_delivered_msat"] for delta in contender_deltas.values()
+    )
+    native_rebalance_completed_count = sum(
+        delta["rebalance_completed_count"] for delta in contender_deltas.values()
+    )
+    attributable_native_rebalance = (
+        raw_extra_volume_msat == native_rebalance_volume_msat
+    )
+    attributed_native_rebalance_volume_msat = (
+        native_rebalance_volume_msat if attributable_native_rebalance else 0
+    )
+    extra_volume_msat = (
+        0 if attributable_native_rebalance else raw_extra_volume_msat
     )
     # A single Lightning payment may settle through multiple HTLCs. Count
     # equality therefore rejects valid MPP traffic; exact per-family outgoing
@@ -3490,6 +3516,8 @@ def run_smoke(
         safety_violations.append("fallback_settled")
     if extra_volume_msat:
         safety_violations.append("unattributed_extra_contender_volume")
+    if native_rebalance_volume_msat and not attributable_native_rebalance:
+        safety_violations.append("native_rebalance_volume_mismatch")
     block = {
         "schema": "polar-clboss-smoke-v1",
         "replica": f"replica-{replica}",
@@ -3509,12 +3537,21 @@ def run_smoke(
             "settled_volume_msat": settled_volume_msat,
             "contender_volume_msat": contender_volume_msat,
             "fallback_volume_msat": fallback_volume_msat,
+            "raw_extra_volume_msat": raw_extra_volume_msat,
+            "native_rebalance_volume_msat": native_rebalance_volume_msat,
+            "native_rebalance_completed_count": native_rebalance_completed_count,
+            "attributed_native_rebalance_volume_msat": (
+                attributed_native_rebalance_volume_msat
+            ),
             "extra_volume_msat": extra_volume_msat,
             "contender_forward_count": contender_forward_count,
             "multipart_forward_splits": max(
-                0, contender_forward_count - settled_count
+                0,
+                contender_forward_count
+                - settled_count
+                - native_rebalance_completed_count,
             ),
-            "attribution_method": "exact_family_volume",
+            "attribution_method": "exact_family_volume_plus_native_rebalance",
         },
         "families": family_rows,
         "contenders": contender_deltas,
