@@ -2588,8 +2588,10 @@ class FeeController:
     # not tuning knobs: the production surface exposes only enable/off. Two
     # different peer markets may be tested concurrently so a single cheap
     # market cannot monopolize acquisition learning. The per-episode rails
-    # therefore imply hard node-wide maxima of 500k sats observed volume and
-    # 50 sats opportunity cost.
+    # therefore imply hard node-wide free-acquisition maxima of 500k sats
+    # observed volume and 50 sats opportunity cost.  A lane that converts to
+    # a positive paid quote gets a separate, still-bounded validation budget
+    # below; do not let the free-probe budget terminate proven demand.
     ACQUISITION_MAX_ACTIVE_EXPERIMENTS = 2
     ACQUISITION_TARGET_FEE_PPM = 0
     ACQUISITION_TARGET_BASE_FEE_MSAT = 0
@@ -2609,8 +2611,10 @@ class FeeController:
     # quote strictly undercuts the peer-local proportional floor at least
     # once; choosing 1 msat instead of maximizing against one sparse sample
     # keeps the validation quote competitive for smaller future payments.
-    # This phase is part of the same default-on, one-lane loss budget and
-    # cannot outlive its own caps.
+    # This phase remains bounded, but uses a larger evidence budget than the
+    # free probe. Tournament evidence showed that treating an unserved
+    # baseline quote as realizable revenue terminated paid validation before
+    # its first ordinary governed cycle.
     ACQUISITION_RETENTION_MIN_VOLUME_SATS = 50_000
     # Wake the ordinary governed fee loop only after enough new evidence can
     # change a lifecycle decision.  The loss step is one fifth of the fixed
@@ -2621,7 +2625,8 @@ class FeeController:
     )
     ACQUISITION_MONITOR_WAKE_OPPORTUNITY_COST_MSAT = 5_000
     ACQUISITION_RETENTION_DURATION_SECONDS = 3600
-    ACQUISITION_RETENTION_VOLUME_CAP_SATS = 250_000
+    ACQUISITION_RETENTION_VOLUME_CAP_SATS = 1_000_000
+    ACQUISITION_RETENTION_OPPORTUNITY_COST_CAP_SATS = 250.0
     ACQUISITION_RETENTION_BASE_FEE_CAP_MSAT = 1_000
     ACQUISITION_START_OUTBOUND_RATIO = 0.85
     ACQUISITION_EXIT_OUTBOUND_RATIO = 0.70
@@ -7694,7 +7699,7 @@ class FeeController:
                 elif acquisition_phase == "retention":
                     if (
                         acquisition_opportunity_cost_sats
-                        >= self.ACQUISITION_OPPORTUNITY_COST_CAP_SATS
+                        >= self.ACQUISITION_RETENTION_OPPORTUNITY_COST_CAP_SATS
                     ):
                         acquisition_exit_reason = "opportunity_cost_cap"
                     elif (

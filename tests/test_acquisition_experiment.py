@@ -550,6 +550,81 @@ def test_paid_retention_duration_restores_baseline_with_exact_cost(
     assert complete["restored_base_fee_msat"] == 10
 
 
+def test_paid_retention_has_separate_bounded_evidence_budget(
+    mock_plugin, mock_database
+):
+    fc, cfg = _make_fc(
+        mock_plugin,
+        mock_database,
+        min_fee_ppm=10,
+        min_fee_ppm_saturated=0,
+        acquisition_experiment_enabled=True,
+    )
+    now = int(time.time())
+    episode = {
+        **_episode(started_at=now - 100, baseline=150),
+        "phase": "retention",
+        "phase_started_at": now - 50,
+        "phase_start_volume_sats": 50_000,
+        "phase_start_forward_count": 1,
+        "retention_fee_ppm": 0,
+        "retention_base_fee_msat": 1,
+    }
+    fc._acquisition_cycle_experiments = {CHANNEL_ID: episode}
+    fc._get_neighbor_fee_percentile = MagicMock(return_value=1)
+    fc._calculate_floor = MagicMock(return_value=10)
+    # 200k sats at the hypothetical baseline exceeds the free probe's 25-sat
+    # budget, but is below the distinct paid-validation rails.
+    _set_acquisition_evidence(
+        mock_database,
+        volume_sats=200_000,
+        forward_count=8,
+        min_out_msat=5_000_000,
+    )
+    fc.set_channel_fee = MagicMock(
+        return_value={"success": True, "fee_ppm": 0, "base_fee_msat": 1}
+    )
+    info = _channel_info(0)
+    info["fee_base_msat"] = 1
+    info["spendable_msat"] = "1900000000msat"
+
+    result = fc._adjust_channel_fee(
+        CHANNEL_ID,
+        PEER_ID,
+        {"state": "source"},
+        info,
+        cfg=cfg,
+        force_reprice_reason="acquisition_experiment",
+    )
+
+    assert result is None
+    mock_database.complete_acquisition_experiment.assert_not_called()
+
+    _set_acquisition_evidence(
+        mock_database,
+        volume_sats=(
+            50_000 + fc.ACQUISITION_RETENTION_VOLUME_CAP_SATS
+        ),
+        forward_count=20,
+        min_out_msat=5_000_000,
+    )
+    fc.set_channel_fee = MagicMock(
+        return_value={"success": True, "fee_ppm": 150, "base_fee_msat": 0}
+    )
+    result = fc._adjust_channel_fee(
+        CHANNEL_ID,
+        PEER_ID,
+        {"state": "source"},
+        info,
+        cfg=cfg,
+        force_reprice_reason="acquisition_experiment",
+    )
+
+    assert result.new_fee_ppm == 150
+    complete = mock_database.complete_acquisition_experiment.call_args.kwargs
+    assert complete["exit_reason"] == "retention_volume_cap"
+
+
 def test_retention_transition_without_persistence_restores_baseline(
     mock_plugin, mock_database
 ):

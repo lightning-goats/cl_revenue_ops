@@ -249,15 +249,16 @@ quote strictly undercuts the competing proportional fee; using the minimum
 positive quote keeps paid validation competitive when later payments are
 smaller than the sparse acquisition sample. If no positive
 integer-millisatoshi undercut exists, the episode exits.
-Both phases share a per-episode 25-sat opportunity-cost and 70%
-outbound-liquidity stop; the free phase is additionally capped at 250,000
-routed sats and the paid phase at 250,000 additional sats. The two-market cap
-therefore bounds concurrent node-wide exposure to 50 sats of opportunity cost
-and 500,000 sats of free-phase routed volume. Congestion and changed, missing,
-or malformed
-evidence fail closed. The controller always restores the exact captured base
-and proportional fees, and `revenue-status.acquisition_experiments` exposes the
-phase and audit trail.
+Both phases share a 70% outbound-liquidity stop. The free phase is capped at
+25 sats of opportunity cost and 250,000 routed sats. A lane that has already
+proved demand and converted to a positive quote gets a separate one-hour,
+1,000,000-sat paid-validation cap and a 250-sat opportunity-cost cap. This
+prevents an unserved baseline quote from ending paid validation before it has
+enough evidence, while the two-market limit still bounds concurrent node-wide
+paid-validation exposure to 500 sats. Congestion and changed, missing, or
+malformed evidence fail closed. The controller always restores the exact
+captured base and proportional fees, and
+`revenue-status.acquisition_experiments` exposes the phase and audit trail.
 Settled forwards on the active lane coalesce into fixed 50,000-sat or 5-sat
 opportunity-cost evidence steps that wake the existing governed fee loop for a
 prompt lifecycle check. This does not change the normal production fee cadence
