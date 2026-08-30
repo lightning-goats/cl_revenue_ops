@@ -44,17 +44,17 @@ REVENUE_PLUGIN = "/opt/cl_revenue_ops/cl-revenue-ops-polar-wrapper"
 CLBOSS_PLUGIN = "/usr/local/libexec/clboss"
 XREBALANCE_PLUGIN = "/usr/local/libexec/xrebalance"
 IDENTITIES = ("identity-a", "identity-b")
-CHANNEL_CAPACITY_SATS = 1_000_000
+CHANNEL_CAPACITY_SATS = 2_000_000
 RETURN_PATH_CAPACITY_SATS = 2_000_000
-CONTROLLED_DEPLETION_SATS = 750_000
+CONTROLLED_DEPLETION_SATS = 1_500_000
 RETURN_PATH_FUNDING_BUFFER_SATS = 100_000
 # Synthetic return liquidity participates in the same public gossip pool that
 # Revenue Ops uses for market pricing.  Keep it in the controlled corridor's
 # realistic band instead of advertising an artificial 1-ppm outlier.
 RETURN_PATH_FEE_BASE_MSAT = 500
 RETURN_PATH_FEE_PPM = 120
-FUNDING_UTXO_SATS = 1_100_000
-# Covers the 1% reserve on a 1M channel plus route fees.  A smaller fee-only
+FUNDING_UTXO_SATS = 2_100_000
+# Covers the 1% reserve on a 2M channel plus route fees.  A smaller fee-only
 # buffer still leaves the sink unable to spend the newly received balance.
 REVERSE_FEE_BUFFER_SATS = 25_000
 TOURNAMENT_CYCLE_SECONDS = 15
@@ -468,7 +468,7 @@ def _open_channels(
         opened.append(row)
         if on_open is not None:
             on_open(row)
-        # CLN will not spend the unconfirmed change from the first 1M channel
+        # CLN will not spend the unconfirmed change from the first channel
         # into the second.  Confirmation here also removes mixed-client
         # funding races before the next mutation is dispatched.
         _mine(bridge, network_id, 6)
@@ -491,7 +491,7 @@ def _open_channels(
         _connect_cln(name, peers["cln_sink"], "cln-sink")
         cln_sink_open = cln_rpc(name, "fundchannel", peers["cln_sink"], CHANNEL_CAPACITY_SATS)
         record({"funder": identity, "sink": "cln-sink", "result": cln_sink_open})
-        wait_wallet_funds(name, minimum_sats=1_000_000)
+        wait_wallet_funds(name, minimum_sats=CHANNEL_CAPACITY_SATS)
 
         _connect_cln(name, peers["lnd_sink"], "lnd-sink")
         lnd_sink_open = cln_rpc(name, "fundchannel", peers["lnd_sink"], CHANNEL_CAPACITY_SATS)

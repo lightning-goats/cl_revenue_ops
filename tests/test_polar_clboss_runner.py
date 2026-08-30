@@ -97,7 +97,7 @@ def test_wait_wallet_funds_handles_v26_amount_encoding(monkeypatch):
     calls = iter(
         [
             {"outputs": []},
-            {"outputs": [{"status": "confirmed", "amount_msat": "2200000000msat"}]},
+            {"outputs": [{"status": "confirmed", "amount_msat": "4200000000msat"}]},
         ]
     )
     monkeypatch.setattr(runner, "cln_rpc", lambda *_args: next(calls))
@@ -122,7 +122,7 @@ def test_wallet_funding_leaves_emergency_reserve_and_fee_headroom(monkeypatch):
     runner._fund_wallet("polar-n4-clboss-r1-identity-a", object(), 4)
 
     funded = [command[-1] for command in commands if "sendtoaddress" in command]
-    assert funded == ["0.01100000", "0.01100000"]
+    assert funded == ["0.02100000", "0.02100000"]
     assert runner.FUNDING_UTXO_SATS - runner.CHANNEL_CAPACITY_SATS >= 100_000
 
 
@@ -1911,7 +1911,8 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
     )
 
     state = runner.prepare_controlled_depletion(
-        object(), replica=9, results_dir=tmp_path, amount_sats=750_000,
+        object(), replica=9, results_dir=tmp_path,
+        amount_sats=runner.CONTROLLED_DEPLETION_SATS,
         fixture_fee_ppm=120,
     )
 
@@ -1920,7 +1921,10 @@ def test_controlled_depletion_holds_both_controllers_and_routes_equal_pressure(
     assert state["controlled_depletion"]["family"] == "cln"
     assert [row["label"] for row in routed] == ["revenue_ops", "clboss"]
     assert [row["target_scid"] for row in routed] == ["1x1x0", "3x1x0"]
-    assert all(row["amount_sats"] == 750_000 for row in routed)
+    assert all(
+        row["amount_sats"] == runner.CONTROLLED_DEPLETION_SATS
+        for row in routed
+    )
     assert state["controlled_depletion"]["fixture_fee_ppm"] == 120
     assert gossip[0][1] == [
         {"short_channel_id": "2x1x0", "source": "revenue-id", "fee_ppm": 120},
@@ -2006,14 +2010,18 @@ def test_controlled_lnd_depletion_uses_exact_lnd_first_hops(monkeypatch, tmp_pat
     )
 
     state = runner.prepare_controlled_depletion(
-        object(), replica=10, results_dir=tmp_path, amount_sats=750_000,
+        object(), replica=10, results_dir=tmp_path,
+        amount_sats=runner.CONTROLLED_DEPLETION_SATS,
         family="lnd",
     )
 
     assert snapshot_families == ["lnd", "lnd"]
     assert state["controlled_depletion"]["family"] == "lnd"
     assert [row["target_scid"] for row in routed] == ["11x1x0", "13x1x0"]
-    assert all(row["amount_sats"] == 750_000 for row in routed)
+    assert all(
+        row["amount_sats"] == runner.CONTROLLED_DEPLETION_SATS
+        for row in routed
+    )
 
 
 def test_controlled_payer_depletion_adds_equal_reverse_earning_traffic(
@@ -2091,7 +2099,8 @@ def test_controlled_payer_depletion_adds_equal_reverse_earning_traffic(
     )
 
     state = runner.prepare_controlled_depletion(
-        object(), replica=11, results_dir=tmp_path, amount_sats=750_000,
+        object(), replica=11, results_dir=tmp_path,
+        amount_sats=runner.CONTROLLED_DEPLETION_SATS,
         family="lnd", depleted_side="payer",
     )
 
@@ -2110,16 +2119,16 @@ def test_controlled_payer_depletion_adds_equal_reverse_earning_traffic(
         "reverse", "reverse", "reverse",
     ]
     assert [row["amount_sats"] for row in routed] == [
-        750_000, 750_000,
-        166_667, 166_667, 166_666,
-        166_667, 166_667, 166_666,
+        1_500_000, 1_500_000,
+        333_334, 333_333, 333_333,
+        333_334, 333_333, 333_333,
     ]
-    assert admissions == [{"amount_sats": 166_667}]
+    assert admissions == [{"amount_sats": 333_334}]
     fixture = state["controlled_depletion"]
     assert fixture["depleted_side"] == "payer"
-    assert fixture["counterflow_amount_sats_per_controller"] == 500_000
+    assert fixture["counterflow_amount_sats_per_controller"] == 1_000_000
     assert fixture["counterflow_parts_sats_per_controller"] == [
-        166_667, 166_667, 166_666,
+        333_334, 333_333, 333_333,
     ]
     assert fixture["counterflow_admission"] == [
         {"controller": "revenue_ops"}, {"controller": "clboss"},
@@ -2332,10 +2341,10 @@ def test_prime_forced_paths_covers_both_controllers_families_and_directions(
         ("clboss", "forward"), ("clboss", "reverse"),
     }
     assert [row["amount_sats"] for row in routed] == [
-        50_000, 5_000, 50_000, 5_000,
-        50_000, 5_000, 50_000, 5_000,
+        100_000, 5_000, 100_000, 5_000,
+        100_000, 5_000, 100_000, 5_000,
     ]
-    assert state["forced_path_readiness"]["forward_amount_sats"] == 50_000
+    assert state["forced_path_readiness"]["forward_amount_sats"] == 100_000
     assert state["forced_path_readiness"]["reverse_amount_sats"] == 5_000
     assert state["forced_path_readiness"]["scored"] is False
     assert acquisition_calls == ["acquisition", "retention"]
@@ -2802,6 +2811,8 @@ def test_payer_wallet_topup_is_bounded_to_confirmed_shortfall(monkeypatch):
                 {"status": "confirmed", "amount_msat": 2_500_000_000},
                 {"status": "unconfirmed", "amount_msat": 9_000_000_000},
             ]}
+        if method == "newaddr":
+            return {"p2tr": "bcrt1pcln"}
         raise AssertionError(method)
 
     def lnd(_container, method, *_args):
@@ -2821,10 +2832,13 @@ def test_payer_wallet_topup_is_bounded_to_confirmed_shortfall(monkeypatch):
     result = runner.ensure_payer_wallet_funds(object(), 4)
 
     assert result == {
-        "cln": {"before_sats": 2_500_000, "topup_sats": 0},
-        "lnd": {"before_sats": 300_000, "topup_sats": 1_800_000},
+        "cln": {"before_sats": 2_500_000, "topup_sats": 1_600_000},
+        "lnd": {"before_sats": 300_000, "topup_sats": 3_800_000},
     }
-    assert funded == [("bcrt1plnd", 1_800_000)]
+    assert funded == [
+        ("bcrt1pcln", 1_600_000),
+        ("bcrt1plnd", 3_800_000),
+    ]
 
 
 def test_payer_wallet_topup_fails_closed_on_malformed_lnd_balance(monkeypatch):
