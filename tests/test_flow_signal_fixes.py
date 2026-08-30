@@ -544,7 +544,7 @@ class TestFix4BalancedActive:
 # =========================================================================
 
 class TestFix5NoHTLCDoubleDeduction:
-    """Tests that CLN's spendable_msat is used directly without HTLC double-deduction."""
+    """Tests that CLN balances are not reduced by pending HTLCs twice."""
 
     def test_no_htlc_extraction_in_channels(self):
         """_get_channels() should NOT extract pending_outbound_htlc_msat."""
@@ -575,13 +575,16 @@ class TestFix5NoHTLCDoubleDeduction:
         # pending_outbound_htlc_msat should NOT be extracted (CLN handles it)
         assert "pending_outbound_htlc_msat" not in channels[0]
 
-    def test_spendable_msat_used_directly(self):
-        """Balance should come directly from spendable_msat without HTLC deduction."""
-        # CLN's spendable_msat already accounts for pending HTLCs and reserve.
-        # our_balance should be spendable_msat // 1000, nothing subtracted.
-        spendable_msat = 500_000_000  # 500k sats
-        our_balance = spendable_msat // 1000
-        assert our_balance == 500_000
+    def test_true_commitment_balance_used_without_htlc_deduction(self):
+        """Inventory should use to_us_msat directly without HTLC deduction."""
+        from modules.utils import channel_local_balance_msat
+
+        channel = {
+            "total_msat": 1_000_000_000,
+            "to_us_msat": 600_000_000,
+            "spendable_msat": 500_000_000,
+        }
+        assert channel_local_balance_msat(channel) // 1000 == 600_000
 
     def test_active_htlc_count_still_tracked(self):
         """Active HTLC count should still be tracked for congestion detection."""

@@ -75,6 +75,34 @@ class TestAnalyzeChannelKalmanReclassification:
         assert result.state == ChannelState.SOURCE
         assert result.kalman_flow_ratio == 0.6
 
+    def test_large_idle_channel_classifies_from_true_commitment_balance(self):
+        """A peer HTLC ceiling must not make full inventory look balanced."""
+        from modules.flow_analysis import ChannelState
+
+        analyzer, _database = self._make_analyzer()
+        channel_info = {
+            "short_channel_id": "100x1x0",
+            "peer_id": "02" + "a" * 64,
+            "total_msat": 16_777_215_000,
+            "to_us_msat": 16_777_215_000,
+            "spendable_msat": 4_294_967_295,
+            "receivable_msat": 0,
+            "state": "CHANNELD_NORMAL",
+            "max_accepted_htlcs": 483,
+            "htlcs": [],
+        }
+
+        with patch.object(analyzer, "_get_channel", return_value=channel_info), \
+             patch.object(analyzer, "_get_daily_flow_from_db", return_value={"100x1x0": []}), \
+             patch.object(analyzer, "_calculate_ema_flow", return_value=(0, 0, 0, 0, 0, 0)), \
+             patch.object(analyzer, "_calculate_adaptive_decay", return_value=0.8), \
+             patch.object(analyzer, "_apply_kalman_reclassification", return_value=None):
+            result = analyzer.analyze_channel("100x1x0")
+
+        assert result is not None
+        assert result.capacity == 16_777_215
+        assert result.state == ChannelState.SINK
+
     def test_kalman_reclassifies_to_sink(self):
         """analyze_channel() should re-classify to SINK when Kalman ratio is below sink_threshold."""
         from modules.flow_analysis import ChannelState

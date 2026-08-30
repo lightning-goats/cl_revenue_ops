@@ -53,7 +53,7 @@ from modules.policy_manager import (
 from modules.capex_budget import CapexBudgetEngine
 from modules.capital_efficiency import CapitalEfficiencyAnalyzer
 from modules.segment_observations import SegmentObservationStore
-from modules.utils import normalize_scid, parse_msat
+from modules.utils import normalize_scid, parse_msat, channel_local_balance_msat
 from modules.econ_shadow import EconShadow, fail_open_fee_evidence_guard
 from modules.forward_archive import ForwardArchiveError
 from modules.forward_archive_sync import ForwardArchiveSynchronizer
@@ -7217,10 +7217,11 @@ def _node_receivable_status() -> Dict[str, Any]:
         total_cap = 0
         total_recv = 0
         for ch in channels.values():
-            spend = max(0, parse_msat(ch.get("spendable_msat", 0)) // 1000)
-            recv = max(0, parse_msat(ch.get("receivable_msat", 0)) // 1000)
-            total_cap += spend + recv
-            total_recv += recv
+            capacity = max(0, int(ch.get("capacity") or 0))
+            local = max(0, channel_local_balance_msat(ch) // 1000)
+            local = min(local, capacity)
+            total_cap += capacity
+            total_recv += max(0, capacity - local)
         if total_cap <= 0:
             return safe
         ratio = total_recv / total_cap

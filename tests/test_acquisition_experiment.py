@@ -846,6 +846,50 @@ def test_prepare_is_default_off_then_selects_two_distinct_best_markets(
     ] == [75, 50]
 
 
+def test_prepare_large_channel_uses_true_balance_not_spendable_htlc_cap(
+    mock_plugin, mock_database
+):
+    fc, cfg = _make_fc(
+        mock_plugin,
+        mock_database,
+        min_fee_ppm_saturated=0,
+        acquisition_experiment_enabled=True,
+    )
+    now = int(time.time())
+    states = [{"channel_id": CHANNEL_ID, "peer_id": PEER_ID, "state": "source"}]
+    channels = {
+        CHANNEL_ID: {
+            "capacity": 16_777_215,
+            "to_us_msat": 16_777_215_000,
+            # LND-family policy can cap a single HTLC near uint32 msat even
+            # while the channel's full local inventory remains available.
+            "spendable_msat": 4_294_967_295,
+            "fee_proportional_millionths": 150,
+        }
+    }
+    mock_database.get_active_acquisition_experiments.return_value = []
+    mock_database.channel_acquisition_on_cooldown.return_value = False
+    mock_database.get_channel_probe.return_value = None
+    mock_database.get_forward_count_since.return_value = 0
+    mock_database.start_acquisition_experiment.return_value = {
+        "id": 1,
+        "channel_id": CHANNEL_ID,
+        "peer_id": PEER_ID,
+    }
+    fc._effective_min_fee_ppm = MagicMock(return_value=0)
+    fc._get_neighbor_fee_percentile = MagicMock(return_value=10)
+
+    active = fc._prepare_acquisition_experiments(states, channels, cfg, now)
+
+    assert set(active) == {CHANNEL_ID}
+    assert (
+        mock_database.start_acquisition_experiment.call_args.kwargs[
+            "starting_outbound_ratio"
+        ]
+        == 1.0
+    )
+
+
 def test_prepare_adds_second_market_but_not_second_channel_to_active_peer(
     mock_plugin, mock_database
 ):

@@ -5,6 +5,8 @@ Keep this module dependency-light to avoid import cycles.
 """
 
 import logging
+import math
+import re
 from typing import Any, Optional
 
 _log = logging.getLogger("cl-revenue-ops.utils")
@@ -59,6 +61,64 @@ def parse_msat(msat_val: Any) -> int:
     except Exception as e:
         _log.debug("parse_msat: failed to convert %r (type %s): %s", msat_val, type(msat_val).__name__, e)
         return 0
+
+
+_NONNEGATIVE_MSAT_RE = re.compile(r"^[0-9]+(?:msat)?$")
+
+
+def _optional_nonnegative_msat(value: Any) -> Optional[int]:
+    """Strict optional parser used when zero and malformed mean different things."""
+    if value is None or isinstance(value, bool):
+        return None
+    if hasattr(value, "millisatoshis"):
+        value = value.millisatoshis
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not _NONNEGATIVE_MSAT_RE.fullmatch(value):
+            return None
+        if value.endswith("msat"):
+            value = value[:-4]
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def optional_channel_local_balance_msat(channel: Any) -> Optional[int]:
+    """Return true local channel balance, or ``None`` when no valid value exists.
+
+    ``spendable_msat`` is the maximum currently sendable amount and may be
+    limited by reserves, HTLC policy, or the peer's single-HTLC ceiling.  It is
+    therefore not a reliable inventory balance on large channels.  Modern CLN
+    exposes the commitment balance as ``to_us_msat``; listfunds-compatible
+    inputs use ``our_amount_msat``.
+    """
+    if not isinstance(channel, dict):
+        return None
+    total = _optional_nonnegative_msat(
+        channel.get("total_msat", channel.get("capacity_msat"))
+    )
+    for key in ("our_amount_msat", "to_us_msat"):
+        if key not in channel:
+            continue
+        local = _optional_nonnegative_msat(channel.get(key))
+        if local is not None and (total is None or total == 0 or local <= total):
+            return local
+    spendable = _optional_nonnegative_msat(channel.get("spendable_msat"))
+    if spendable is None:
+        return None
+    if total is not None and total > 0:
+        return min(spendable, total)
+    return spendable
+
+
+def channel_local_balance_msat(channel: Any) -> int:
+    """Neutral-zero wrapper around :func:`optional_channel_local_balance_msat`."""
+    value = optional_channel_local_balance_msat(channel)
+    return 0 if value is None else value
 
 
 # ---------------------------------------------------------------------------

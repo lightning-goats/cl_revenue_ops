@@ -85,7 +85,15 @@ from .fee_cycle_capture import (
     record_effective_evidence_result,
 )
 from .policy_manager import PolicyManager, FeeStrategy, PeerPolicy
-from .utils import normalize_scid, parse_msat, base_to_sats_floor, base_to_sats_ceil, sats_to_base
+from .utils import (
+    normalize_scid,
+    parse_msat,
+    base_to_sats_floor,
+    base_to_sats_ceil,
+    sats_to_base,
+    channel_local_balance_msat,
+    optional_channel_local_balance_msat,
+)
 
 if TYPE_CHECKING:
     from .profitability_analyzer import ChannelProfitabilityAnalyzer
@@ -3473,8 +3481,8 @@ class FeeController:
                 continue
             try:
                 capacity = int(info.get("capacity") or 0)
-                spendable = base_to_sats_floor(parse_msat(info.get("spendable_msat", 0)))
-                ratio = spendable / capacity if capacity > 0 else 0.0
+                local_balance = base_to_sats_floor(channel_local_balance_msat(info))
+                ratio = local_balance / capacity if capacity > 0 else 0.0
                 baseline_fee = int(info.get("fee_proportional_millionths", 0) or 0)
                 baseline_base_fee = parse_msat(info.get("fee_base_msat", 0))
             except (TypeError, ValueError, OverflowError):
@@ -6415,10 +6423,12 @@ class FeeController:
                         current_fee = channel_info.get("fee_proportional_millionths", 0)
                         requested_static_fee = int(policy.fee_ppm_target)
                         capacity = int(channel_info.get("capacity") or 2_000_000)
-                        spendable = base_to_sats_floor(
-                            parse_msat(channel_info.get("spendable_msat", 0))
+                        local_balance = base_to_sats_floor(
+                            channel_local_balance_msat(channel_info)
                         )
-                        outbound_ratio = spendable / capacity if capacity > 0 else 0.5
+                        outbound_ratio = (
+                            local_balance / capacity if capacity > 0 else 0.5
+                        )
                         effective_static_min = self._effective_min_fee_ppm(
                             cfg,
                             flow_state=state.get("state", "balanced"),
@@ -6641,22 +6651,10 @@ class FeeController:
             return None
         try:
             capacity = int(channel_info.get("capacity") or 0)
-            raw_spendable = channel_info.get("spendable_msat")
-            if isinstance(raw_spendable, str):
-                numeric = raw_spendable.strip().lower()
-                if numeric.endswith("msat"):
-                    numeric = numeric[:-4]
-                if not numeric.isdigit():
-                    return None
-            elif (
-                isinstance(raw_spendable, bool)
-                or not isinstance(raw_spendable, (int, float))
-                or not math.isfinite(float(raw_spendable))
-            ):
+            local_balance_msat = optional_channel_local_balance_msat(channel_info)
+            if local_balance_msat is None:
                 return None
-            spendable = base_to_sats_floor(
-                parse_msat(raw_spendable)
-            )
+            local_balance = base_to_sats_floor(local_balance_msat)
             raw_threshold = getattr(
                 cfg, "rebalance_emergency_local_ratio", None
             )
@@ -6670,13 +6668,13 @@ class FeeController:
             return None
         if (
             capacity <= 0
-            or spendable < 0
+            or local_balance < 0
             or not math.isfinite(threshold)
             or threshold <= 0.0
             or threshold > 1.0
         ):
             return None
-        outbound_ratio = spendable / capacity
+        outbound_ratio = local_balance / capacity
         if outbound_ratio < threshold:
             return "depleted_inventory"
         if outbound_ratio > FeeController.SATURATED_OUTBOUND_RATIO:
@@ -7725,8 +7723,13 @@ class FeeController:
 
         # Get capacity and balance for liquidity adjustments
         capacity = channel_info.get("capacity") or 2_000_000
-        spendable = base_to_sats_floor(parse_msat(channel_info.get("spendable_msat", 0)))
-        outbound_ratio = spendable / capacity if capacity > 0 else 0.5
+        # Keep the execution limit for routability/censoring checks; inventory
+        # ratios below use the true commitment balance instead.
+        spendable = base_to_sats_floor(
+            parse_msat(channel_info.get("spendable_msat", 0))
+        )
+        local_balance = base_to_sats_floor(channel_local_balance_msat(channel_info))
+        outbound_ratio = local_balance / capacity if capacity > 0 else 0.5
         
         bucket = LiquidityBuckets.get_bucket(outbound_ratio)
         
@@ -8635,8 +8638,8 @@ class FeeController:
             # Drain pressure: bounded discount for stagnant over-local channels
             # ("sell what you're long"). Bias only — min_fee_ppm rails still
             # clamp downstream. Off by default (drain_fee_discount_max=0.0).
-            # outbound_ratio (spendable/capacity) is deliberately used here:
-            # conservative vs spendable/(spendable+receivable).
+            # outbound_ratio uses the true commitment balance over total
+            # capacity; spendable_msat can be capped by a peer HTLC limit.
             # node_drain_bias_effective_cap (Task 3, default off): a cycle-level
             # node-liquidity-aware discount cap computed ONCE per cycle by
             # _adjust_all_fees_inner (see effective_drain_discount_max /
@@ -10744,8 +10747,8 @@ class FeeController:
             # Build channel_info dict matching _get_channels_info() shape
             updates = target_ch.get('updates', {})
             local_updates = updates.get('local', {})
-            spendable_msat = int(target_ch.get('spendable_msat', 0) or 0)
-            receivable_msat = int(target_ch.get('receivable_msat', 0) or 0)
+            spendable_msat = parse_msat(target_ch.get('spendable_msat', 0) or 0)
+            receivable_msat = parse_msat(target_ch.get('receivable_msat', 0) or 0)
             total_msat = (
                 target_ch.get('total_msat')
                 or target_ch.get('capacity_msat')
@@ -10766,6 +10769,10 @@ class FeeController:
                 'capacity': base_to_sats_floor(int(total_msat)) if total_msat else 0,
                 'spendable_msat': spendable_msat,
                 'receivable_msat': receivable_msat,
+                'to_us_msat': (
+                    parse_msat(target_ch.get('to_us_msat'))
+                    if 'to_us_msat' in target_ch else None
+                ),
                 'fee_base_msat': fee_base,
                 'fee_proportional_millionths': fee_ppm,
                 'htlc_minimum_msat': htlc_minimum_msat,
@@ -11226,6 +11233,10 @@ class FeeController:
                         "capacity": base_to_sats_floor(int(total_msat)) if total_msat else 0,
                         "spendable_msat": spendable_msat,
                         "receivable_msat": receivable_msat,
+                        "to_us_msat": (
+                            parse_msat(channel.get("to_us_msat"))
+                            if "to_us_msat" in channel else None
+                        ),
                         "fee_base_msat": fee_base,
                         "fee_proportional_millionths": fee_ppm,
                         "htlc_minimum_msat": htlc_minimum_msat,

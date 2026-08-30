@@ -37,7 +37,12 @@ from enum import Enum
 from . import classification as _classification
 from typing import Dict, List, Optional, Any, Tuple
 from pyln.client import Plugin, RpcError
-from .utils import normalize_scid, parse_msat, base_to_sats_floor
+from .utils import (
+    normalize_scid,
+    parse_msat,
+    base_to_sats_floor,
+    channel_local_balance_msat,
+)
 
 try:
     import numpy as np
@@ -1457,8 +1462,9 @@ class FlowAnalyzer:
             else:
                 capacity = base_to_sats_floor(parse_msat(capacity_msat))
 
-            # CLN's spendable_msat already accounts for pending HTLCs and channel reserve.
-            our_balance = base_to_sats_floor(spendable_msat)
+            # Inventory classification uses the true commitment balance. CLN's
+            # spendable_msat can be capped by a peer HTLC limit on large channels.
+            our_balance = base_to_sats_floor(channel_local_balance_msat(channel))
 
             # Get daily buckets for this channel
             channel_daily = flow_data_daily.get(channel_id, [])
@@ -1805,8 +1811,9 @@ class FlowAnalyzer:
         if capacity == 0:
             capacity = int(channel.get("capacity", 0))
 
-        # CLN's spendable_msat already accounts for pending HTLCs and channel reserve.
-        our_balance = base_to_sats_floor(spendable_msat)
+        # Inventory classification uses the true commitment balance. CLN's
+        # spendable_msat remains available separately for execution safety.
+        our_balance = base_to_sats_floor(channel_local_balance_msat(channel))
 
         # Get daily flow data
         flow_data_daily = self._get_daily_flow_from_db(channel_id)

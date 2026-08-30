@@ -717,6 +717,7 @@ class TestAuditRound8Regressions:
                 "peer_id": "02" + "a" * 64,
                 "spendable_msat": "500000000msat",
                 "receivable_msat": "500000000msat",
+                "to_us_msat": "510000000msat",
                 "total_msat": "1000000000msat",
                 "opener": "local",
                 "updates": {"local": {"fee_base_msat": 1000, "fee_proportional_millionths": 100}},
@@ -729,6 +730,7 @@ class TestAuditRound8Regressions:
         assert info["capacity"] == 1_000_000  # 1B msat = 1M sats
         assert info["spendable_msat"] == 500_000_000
         assert info["receivable_msat"] == 500_000_000
+        assert info["to_us_msat"] == 510_000_000
 
 
 class TestCalculateFloorOpener:

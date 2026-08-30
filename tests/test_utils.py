@@ -18,6 +18,7 @@ from modules.utils import (
     msat_to_sats_floor,
     sats_to_msat,
     parse_msat,
+    channel_local_balance_msat,
 )
 
 
@@ -123,3 +124,37 @@ class TestParseBaseUnit:
 
     def test_alias_is_same_function(self):
         assert parse_msat is parse_base_unit
+
+
+class TestChannelLocalBalance:
+    def test_prefers_true_balance_over_single_htlc_spendable_cap(self):
+        assert channel_local_balance_msat({
+            "total_msat": "16777215000msat",
+            "to_us_msat": "16777215000msat",
+            "spendable_msat": 4_294_967_295,
+        }) == 16_777_215_000
+
+    def test_supports_listfunds_balance_and_legacy_fallback(self):
+        assert channel_local_balance_msat({
+            "total_msat": 20_000_000_000,
+            "our_amount_msat": 19_900_000_000,
+            "spendable_msat": 4_294_967_295,
+        }) == 19_900_000_000
+        assert channel_local_balance_msat({
+            "total_msat": 1_000_000_000,
+            "spendable_msat": "900000000msat",
+        }) == 900_000_000
+
+    @pytest.mark.parametrize(
+        "channel",
+        [None, [], {"to_us_msat": "bad", "spendable_msat": "also-bad"}],
+    )
+    def test_malformed_input_is_neutral_and_does_not_crash(self, channel):
+        assert channel_local_balance_msat(channel) == 0
+
+    def test_malformed_true_balance_falls_back_without_exceeding_capacity(self):
+        assert channel_local_balance_msat({
+            "total_msat": 1_000_000,
+            "to_us_msat": "not-msat",
+            "spendable_msat": 2_000_000,
+        }) == 1_000_000
