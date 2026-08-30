@@ -480,6 +480,52 @@ class TestExtremeInventoryPriceRails:
         assert result.algorithm_values["profitable_downshift_guard_reason"] is None
         assert result.new_fee_ppm == 121
 
+    def test_recent_acquisition_applies_bounded_inventory_credit_immediately(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(
+            mock_plugin,
+            mock_database,
+            min_fee_ppm=50,
+            min_fee_ppm_saturated=0,
+            max_fee_ppm=2000,
+            rebalance_emergency_local_ratio=0.20,
+        )
+        fc._acquisition_tainted_flow_channels = {CHANNEL_ID}
+        fc._calculate_floor = lambda *a, **k: 21
+        fc._get_rebalance_cost_floor = lambda *a, **k: None
+        fc._get_channel_rebalance_cost_ppm = lambda *a, **k: 0
+        fc._get_neighbor_fee_median = lambda *a, **k: None
+        chain = {"fee": 150}
+        _stub_broadcasts(fc, chain)
+        ts_state = _prepare_dts_stubs(fc, chain_fee=150, sampled_fee=1450)
+        ts_state.thompson.supported_fee_ceiling = lambda **k: 187
+        info = _channel_info(150, capacity=5_000_000)
+        info["spendable_msat"] = "4600000000msat"
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID,
+            PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            info,
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert result.algorithm_values["inventory_rail_reason"] == (
+            "saturated_inventory_ceiling"
+        )
+        assert result.algorithm_values["acquisition_inventory_credit_ppm"] == 5
+        assert result.algorithm_values["acquisition_inventory_immediate"] is True
+        assert result.algorithm_values["inventory_floor_ppm"] == 16
+        assert result.algorithm_values["inventory_ceiling_ppm"] == 16
+        assert result.algorithm_values["bounded_target_ppm"] == 16
+        assert result.algorithm_values["target_blend_ratio"] == 1.0
+        assert result.algorithm_values["delta_cap_reason"] == (
+            "acquisition_inventory_transition"
+        )
+        assert result.new_fee_ppm == 16
+
 # =============================================================================
 # P5: Kalman demand divisor clamp
 # =============================================================================

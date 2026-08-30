@@ -3114,6 +3114,12 @@ class FeeController:
     # the ordinary configured minimum to min_fee_ppm_saturated. Existing
     # economic/policy bounds always win.
     DEPLETED_INVENTORY_MAX_FEE_RANGE_SHARE = 0.50
+    # Organic flow after a successful acquisition episode moves liquidity
+    # away from a saturated egress and toward a depleted ingress. Credit only
+    # a tiny, bounded share of that avoided rebalance value, and retain a
+    # realistic non-zero quote even when min_fee_ppm_saturated is zero.
+    ACQUISITION_ORGANIC_REBALANCE_CREDIT_PPM = 5
+    ACQUISITION_ORGANIC_REBALANCE_MIN_PPM = 5
 
     @classmethod
     def _inventory_fee_rails(
@@ -7308,6 +7314,8 @@ class FeeController:
         inventory_floor_ppm = None
         inventory_ceiling_ppm = None
         inventory_rail_reason = "none"
+        acquisition_inventory_credit_ppm = 0
+        acquisition_inventory_immediate = False
         upward_probe_pre_cap_ppm = None  # L1: set when a probe stretch is granted
         bound_reason = "none"
         delta_cap_reason = "none"
@@ -8953,6 +8961,24 @@ class FeeController:
                 ceiling_ppm=ceiling_ppm,
                 flow_balanced_router=flow_balanced_router,
             )
+            acquisition_inventory_immediate = (
+                inventory_rail_reason == "saturated_inventory_ceiling"
+                and channel_id in self._acquisition_tainted_flow_channels
+            )
+            if acquisition_inventory_immediate:
+                acquisition_inventory_credit_ppm = min(
+                    self.ACQUISITION_ORGANIC_REBALANCE_CREDIT_PPM,
+                    max(
+                        0,
+                        inventory_floor_ppm
+                        - self.ACQUISITION_ORGANIC_REBALANCE_MIN_PPM,
+                    ),
+                )
+                inventory_floor_ppm -= acquisition_inventory_credit_ppm
+                inventory_ceiling_ppm = max(
+                    inventory_floor_ppm,
+                    inventory_ceiling_ppm - acquisition_inventory_credit_ppm,
+                )
             if inventory_rail_reason != "none":
                 self.plugin.log(
                     f"INVENTORY_RAIL: {channel_id[:12]}... "
@@ -9100,14 +9126,35 @@ class FeeController:
                     f"rate={adjusted_revenue_rate:.2f}sats/hr",
                     level='debug',
                 )
+            if acquisition_inventory_immediate:
+                # Restoring the pre-experiment quote and then walking through
+                # sparse-data blend/damping loses the route before the
+                # controller can value the newly acquired flow.  The bounded
+                # inventory target is already known, so apply it atomically.
+                blended_target_ppm = bounded_target_ppm
+                target_blend_ratio = 1.0
+                zero_flow_guard_reason = None
+                zero_flow_guard_target_ppm = None
             new_fee_ppm, damping_info = self._apply_damped_fee_target(
                 current_fee_ppm=current_fee_ppm,
                 target_fee_ppm=blended_target_ppm,
                 woke_from_sleep=woke_from_sleep,
                 cfg=cfg,
             )
+            if acquisition_inventory_immediate:
+                new_fee_ppm = bounded_target_ppm
+                damping_info = {
+                    "cap_reason": "acquisition_inventory_transition",
+                    "max_delta_ppm": abs(current_fee_ppm - bounded_target_ppm),
+                    "cap_applied": False,
+                }
+            hard_floor_ppm = (
+                inventory_floor_ppm
+                if acquisition_inventory_immediate
+                else floor_ppm
+            )
             new_fee_ppm = self._apply_hard_fee_rails(
-                new_fee_ppm, floor_ppm, ceiling_ppm,
+                new_fee_ppm, hard_floor_ppm, ceiling_ppm,
             )
             applied_target_ppm = new_fee_ppm
             delta_cap_reason = damping_info["cap_reason"]
@@ -9665,6 +9712,8 @@ class FeeController:
                     "inventory_floor_ppm": inventory_floor_ppm,
                     "inventory_ceiling_ppm": inventory_ceiling_ppm,
                     "inventory_rail_reason": inventory_rail_reason,
+                    "acquisition_inventory_credit_ppm": acquisition_inventory_credit_ppm,
+                    "acquisition_inventory_immediate": acquisition_inventory_immediate,
                     "bounded_target_ppm": bounded_target_ppm,
                     "blended_target_ppm": blended_target_ppm if blended_target_ppm is not None else bounded_target_ppm,
                     "applied_target_ppm": applied_target_ppm if applied_target_ppm is not None else new_fee_ppm,
