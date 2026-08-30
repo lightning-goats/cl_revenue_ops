@@ -31,7 +31,7 @@ from polar_mixed_client_lab import (  # noqa: E402
 
 
 SCHEMA = "polar-clboss-runner-state-v1"
-EXPECTED_REVENUE_REVISION = "9c46aaf3dd67b936555fe714faba29cd29c96562"
+EXPECTED_REVENUE_REVISION = "2987608d525075ec974ace6e17ee93986c1d0ba5"
 IMAGE = f"cl-revenue-ops-polar-clboss:{EXPECTED_REVENUE_REVISION[:7]}"
 EXPECTED_CLN_VERSION = "v26.06.7"
 EXPECTED_CLN_ARTIFACT_DIGEST = (
@@ -45,6 +45,11 @@ CLBOSS_PLUGIN = "/usr/local/libexec/clboss"
 XREBALANCE_PLUGIN = "/usr/local/libexec/xrebalance"
 IDENTITIES = ("identity-a", "identity-b")
 CHANNEL_CAPACITY_SATS = 5_000_000
+# LND rejects larger channels unless the node was launched with wumbo enabled.
+# Polar's original mixed-client nodes are deliberately preserved, so large-capacity
+# tournament replicas cap both contenders' LND-family lanes at the protocol default
+# while retaining the requested capacity on their CLN-family lanes.
+LND_NON_WUMBO_MAX_CHANNEL_SATS = 16_777_215
 RETURN_PATH_CAPACITY_SATS = CHANNEL_CAPACITY_SATS
 CONTROLLED_DEPLETION_SATS = 3_750_000
 RETURN_PATH_FUNDING_BUFFER_SATS = 100_000
@@ -178,9 +183,28 @@ def read_state(path: Path) -> dict[str, Any]:
     return payload
 
 
-def state_channel_capacity_sats(state: dict[str, Any]) -> int:
-    """Return the recorded matched channel capacity, with legacy compatibility."""
-    value = state.get("channel_capacity_sats", CHANNEL_CAPACITY_SATS)
+def effective_family_channel_capacities(capacity_sats: int) -> dict[str, int]:
+    """Return equal contender capacities that respect each client family's limit."""
+    requested = positive_int(capacity_sats)
+    return {
+        "cln": requested,
+        "lnd": min(requested, LND_NON_WUMBO_MAX_CHANNEL_SATS),
+    }
+
+
+def state_channel_capacity_sats(
+    state: dict[str, Any], family: str | None = None
+) -> int:
+    """Return recorded channel capacity, with legacy-state compatibility."""
+    if family not in {None, "cln", "lnd"}:
+        raise RunnerError(f"unknown channel family: {family!r}")
+    capacities = state.get("channel_capacity_sats_by_family")
+    if family is not None and capacities is not None:
+        if not isinstance(capacities, dict) or family not in capacities:
+            raise RunnerError("runner state has invalid family channel capacities")
+        value = capacities[family]
+    else:
+        value = state.get("channel_capacity_sats", CHANNEL_CAPACITY_SATS)
     try:
         return positive_int(value)
     except argparse.ArgumentTypeError as exc:
@@ -506,9 +530,13 @@ def _open_channels(
     contenders: dict[str, dict[str, str]],
     *,
     capacity_sats: int = CHANNEL_CAPACITY_SATS,
+    lnd_capacity_sats: int | None = None,
     on_open: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     capacity_sats = positive_int(capacity_sats)
+    lnd_capacity_sats = positive_int(
+        capacity_sats if lnd_capacity_sats is None else lnd_capacity_sats
+    )
     cln_payer = f"polar-n{network_id}-cln-payer"
     lnd_payer = f"polar-n{network_id}-lnd-payer"
     cln_sink = f"polar-n{network_id}-cln-sink"
@@ -534,23 +562,37 @@ def _open_channels(
         name = contender["container"]
         _connect_cln(cln_payer, node_id, identity)
         cln_open = cln_rpc(cln_payer, "fundchannel", node_id, capacity_sats)
-        record({"funder": "cln-payer", "identity": identity, "result": cln_open})
+        record({
+            "funder": "cln-payer", "identity": identity,
+            "capacity_sats": capacity_sats, "result": cln_open,
+        })
 
         _connect_lnd(lnd_payer, node_id, identity)
         lnd_open = lnd_rpc(
             lnd_payer, "openchannel", "--node_key", node_id,
-            "--local_amt", capacity_sats,
+            "--local_amt", lnd_capacity_sats,
         )
-        record({"funder": "lnd-payer", "identity": identity, "result": lnd_open})
+        record({
+            "funder": "lnd-payer", "identity": identity,
+            "capacity_sats": lnd_capacity_sats, "result": lnd_open,
+        })
 
         _connect_cln(name, peers["cln_sink"], "cln-sink")
         cln_sink_open = cln_rpc(name, "fundchannel", peers["cln_sink"], capacity_sats)
-        record({"funder": identity, "sink": "cln-sink", "result": cln_sink_open})
-        wait_wallet_funds(name, minimum_sats=capacity_sats)
+        record({
+            "funder": identity, "sink": "cln-sink",
+            "capacity_sats": capacity_sats, "result": cln_sink_open,
+        })
+        wait_wallet_funds(name, minimum_sats=lnd_capacity_sats)
 
         _connect_cln(name, peers["lnd_sink"], "lnd-sink")
-        lnd_sink_open = cln_rpc(name, "fundchannel", peers["lnd_sink"], capacity_sats)
-        record({"funder": identity, "sink": "lnd-sink", "result": lnd_sink_open})
+        lnd_sink_open = cln_rpc(
+            name, "fundchannel", peers["lnd_sink"], lnd_capacity_sats
+        )
+        record({
+            "funder": identity, "sink": "lnd-sink",
+            "capacity_sats": lnd_capacity_sats, "result": lnd_sink_open,
+        })
     return opened
 
 
@@ -1023,7 +1065,7 @@ def prepare_controlled_depletion(
         raise RunnerError(f"unknown controlled depletion family: {family!r}")
     if depleted_side not in {"payer", "sink"}:
         raise RunnerError(f"unknown controlled depleted side: {depleted_side!r}")
-    channel_capacity_sats = state_channel_capacity_sats(state)
+    channel_capacity_sats = state_channel_capacity_sats(state, family)
     if amount_sats is None:
         amount_sats = channel_capacity_sats * 3 // 4
     amount_sats = nonnegative_int(amount_sats, "controlled depletion amount")
@@ -1230,7 +1272,9 @@ def apply_equal_targeted_pressure(
                 )
             )
     after = controlled_depletion_snapshot(state, family="lnd")
-    minimum_drop_ppm = total_sats * 900_000 // state_channel_capacity_sats(state)
+    minimum_drop_ppm = (
+        total_sats * 900_000 // state_channel_capacity_sats(state, "lnd")
+    )
     for controller in ("revenue_ops", "clboss"):
         drop_ppm = (
             before[controller]["depleted"]["local_balance_ppm"]
@@ -1320,9 +1364,14 @@ def provision_return_paths(
         if isinstance(treatment, dict) and treatment.get("status") == "active":
             raise RunnerError(f"return paths require restored treatment: {key}")
     if capacity_sats is None:
-        capacity_sats = state_channel_capacity_sats(state)
-    capacity_sats = nonnegative_int(capacity_sats, "return-path capacity")
-    if capacity_sats == 0:
+        capacity_by_family = {
+            family: state_channel_capacity_sats(state, family)
+            for family in ("cln", "lnd")
+        }
+    else:
+        explicit_capacity = nonnegative_int(capacity_sats, "return-path capacity")
+        capacity_by_family = {"cln": explicit_capacity, "lnd": explicit_capacity}
+    if any(value == 0 for value in capacity_by_family.values()):
         raise RunnerError("return-path capacity must be positive")
     fee_ppm = nonnegative_int(fee_ppm, "return-path fee")
     if fee_ppm == 0:
@@ -1378,17 +1427,30 @@ def provision_return_paths(
         ):
             raise RunnerError("LND return source already has an active destination channel")
 
-        funding_sats = capacity_sats + RETURN_PATH_FUNDING_BUFFER_SATS
+        funding_by_family = {
+            family: family_capacity + RETURN_PATH_FUNDING_BUFFER_SATS
+            for family, family_capacity in capacity_by_family.items()
+        }
         cln_address = onchain_address(cln_rpc(cln_source, "newaddr"))
         lnd_address = lnd_rpc(lnd_source, "newaddress", "p2tr").get("address")
-        _send_fake_onchain_funds(bridge, network_id, cln_address, funding_sats)
-        _checkpoint(path, state, "return_path_cln_wallet_funded", amount_sats=funding_sats)
-        _send_fake_onchain_funds(bridge, network_id, str(lnd_address or ""), funding_sats)
-        _checkpoint(path, state, "return_path_lnd_wallet_funded", amount_sats=funding_sats)
+        _send_fake_onchain_funds(
+            bridge, network_id, cln_address, funding_by_family["cln"]
+        )
+        _checkpoint(
+            path, state, "return_path_cln_wallet_funded",
+            amount_sats=funding_by_family["cln"],
+        )
+        _send_fake_onchain_funds(
+            bridge, network_id, str(lnd_address or ""), funding_by_family["lnd"]
+        )
+        _checkpoint(
+            path, state, "return_path_lnd_wallet_funded",
+            amount_sats=funding_by_family["lnd"],
+        )
 
         _connect_cln(cln_source, cln_destination_id, cln_destination_alias)
         cln_open = cln_rpc(
-            cln_source, "fundchannel", cln_destination_id, capacity_sats
+            cln_source, "fundchannel", cln_destination_id, capacity_by_family["cln"]
         )
         cln_channel_id = cln_open.get("channel_id")
         if not isinstance(cln_channel_id, str) or not cln_channel_id:
@@ -1396,7 +1458,8 @@ def provision_return_paths(
         state["return_paths"] = [{
             "family": "cln", "source_container": cln_source,
             "sink_container": cln_destination, "peer_id": cln_destination_id,
-            "channel_id": cln_channel_id, "capacity_sats": capacity_sats,
+            "channel_id": cln_channel_id,
+            "capacity_sats": capacity_by_family["cln"],
         }]
         _checkpoint(path, state, "return_path_open_dispatched", family="cln")
         _mine(bridge, network_id, 6)
@@ -1404,13 +1467,13 @@ def provision_return_paths(
         _connect_lnd(lnd_source, lnd_destination_id, lnd_destination_alias)
         lnd_open = lnd_rpc(
             lnd_source, "openchannel", "--node_key", lnd_destination_id,
-            "--local_amt", capacity_sats,
+            "--local_amt", capacity_by_family["lnd"],
         )
         state["return_paths"].append({
             "family": "lnd", "source_container": lnd_source,
             "sink_container": lnd_destination, "peer_id": lnd_destination_id,
             "funding_txid": lnd_open.get("funding_txid"),
-            "capacity_sats": capacity_sats,
+            "capacity_sats": capacity_by_family["lnd"],
         })
         _checkpoint(path, state, "return_path_open_dispatched", family="lnd")
         _mine(bridge, network_id, 6)
@@ -2928,6 +2991,14 @@ def setup(
         raise RunnerError(
             "tournament channel capacity must be at least 1000000 sats"
         )
+    capacities_by_family = effective_family_channel_capacities(channel_capacity_sats)
+    capacity_constraints = {}
+    if capacities_by_family["lnd"] != channel_capacity_sats:
+        capacity_constraints["lnd"] = {
+            "requested_sats": channel_capacity_sats,
+            "applied_sats": capacities_by_family["lnd"],
+            "reason": "original Polar LND node uses the non-wumbo channel limit",
+        }
     assignment = assignment_for(replica)
     state: dict[str, Any] = {
         "schema": SCHEMA,
@@ -2939,6 +3010,8 @@ def setup(
         "market_profile": market_profile,
         "market_seed": dict(market_seed),
         "channel_capacity_sats": channel_capacity_sats,
+        "channel_capacity_sats_by_family": capacities_by_family,
+        "channel_capacity_constraints": capacity_constraints,
         "events": [],
         "contenders": {},
         "channels": [],
@@ -2980,7 +3053,7 @@ def setup(
 
         state["payer_wallet_topups"] = ensure_payer_wallet_funds(
             bridge, network_id,
-            minimum_sats=(2 * channel_capacity_sats)
+            minimum_sats=(2 * max(capacities_by_family.values()))
             + RETURN_PATH_FUNDING_BUFFER_SATS,
         )
         _checkpoint(
@@ -2993,7 +3066,8 @@ def setup(
 
         _open_channels(
             bridge, network_id, state["contenders"],
-            capacity_sats=channel_capacity_sats,
+            capacity_sats=capacities_by_family["cln"],
+            lnd_capacity_sats=capacities_by_family["lnd"],
             on_open=checkpoint_channel,
         )
         _checkpoint(path, state, "channels_open_dispatched", count=len(state["channels"]))
@@ -3610,6 +3684,10 @@ def run_smoke(
         "traffic_family": traffic_family,
         "market_profile": str(state.get("market_profile") or "legacy_low_fee"),
         "channel_capacity_sats": state_channel_capacity_sats(state),
+        "channel_capacity_sats_by_family": {
+            family: state_channel_capacity_sats(state, family)
+            for family in ("cln", "lnd")
+        },
         "amount_profile": effective_amount_profile,
         "traffic_seed": traffic_seed,
         "before": {
@@ -3832,6 +3910,10 @@ def run_smoke(
         "league": current_league,
         "market_profile": str(state.get("market_profile") or "legacy_low_fee"),
         "channel_capacity_sats": state_channel_capacity_sats(state),
+        "channel_capacity_sats_by_family": {
+            family: state_channel_capacity_sats(state, family)
+            for family in ("cln", "lnd")
+        },
         "block": block_id,
         "duration_seconds": max(1.0, time.time() - started),
         "cache_mode": cache_mode,

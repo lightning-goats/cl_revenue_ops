@@ -48,9 +48,98 @@ def test_channel_capacity_is_recorded_and_legacy_state_has_safe_default():
     assert runner.state_channel_capacity_sats({
         "channel_capacity_sats": 20_000_000,
     }) == 20_000_000
+    state = {
+        "channel_capacity_sats": 20_000_000,
+        "channel_capacity_sats_by_family": {
+            "cln": 20_000_000,
+            "lnd": runner.LND_NON_WUMBO_MAX_CHANNEL_SATS,
+        },
+    }
+    assert runner.state_channel_capacity_sats(state, "cln") == 20_000_000
+    assert runner.state_channel_capacity_sats(state, "lnd") == 16_777_215
+    assert runner.effective_family_channel_capacities(20_000_000) == {
+        "cln": 20_000_000,
+        "lnd": 16_777_215,
+    }
+    assert runner.effective_family_channel_capacities(5_000_000) == {
+        "cln": 5_000_000,
+        "lnd": 5_000_000,
+    }
 
     with pytest.raises(runner.RunnerError, match="invalid channel capacity"):
         runner.state_channel_capacity_sats({"channel_capacity_sats": "malformed"})
+    with pytest.raises(runner.RunnerError, match="invalid family channel capacities"):
+        runner.state_channel_capacity_sats(
+            {"channel_capacity_sats_by_family": {"cln": 20_000_000}}, "lnd"
+        )
+    with pytest.raises(runner.RunnerError, match="unknown channel family"):
+        runner.state_channel_capacity_sats(state, "eclair")
+
+
+def test_open_channels_uses_recorded_family_capacities_symmetrically(monkeypatch):
+    runner = load_runner()
+    calls = []
+    mined = []
+    waited = []
+
+    def cln(container, method, *args):
+        calls.append((container, method, args))
+        if method == "getinfo":
+            return {"id": "cln-sink-id"}
+        if method == "fundchannel":
+            return {"channel_id": f"{container}-channel"}
+        return {}
+
+    def lnd(container, method, *args):
+        calls.append((container, method, args))
+        if method == "getinfo":
+            return {"identity_pubkey": "lnd-sink-id"}
+        if method == "openchannel":
+            return {"funding_txid": f"{container}-funding"}
+        return {}
+
+    monkeypatch.setattr(runner, "cln_rpc", cln)
+    monkeypatch.setattr(runner, "lnd_rpc", lnd)
+    monkeypatch.setattr(runner, "_connect_cln", lambda *_args: None)
+    monkeypatch.setattr(runner, "_connect_lnd", lambda *_args: None)
+    monkeypatch.setattr(runner, "_mine", lambda *_args: mined.append(True))
+    monkeypatch.setattr(
+        runner, "wait_wallet_funds",
+        lambda container, minimum_sats: waited.append((container, minimum_sats)),
+    )
+    contenders = {
+        identity: {"container": identity, "node_id": f"{identity}-id"}
+        for identity in runner.IDENTITIES
+    }
+
+    opened = runner._open_channels(
+        object(), 4, contenders,
+        capacity_sats=20_000_000,
+        lnd_capacity_sats=runner.LND_NON_WUMBO_MAX_CHANNEL_SATS,
+    )
+
+    assert len(opened) == 8
+    assert len(mined) == 8
+    assert waited == [
+        (identity, runner.LND_NON_WUMBO_MAX_CHANNEL_SATS)
+        for identity in runner.IDENTITIES
+    ]
+    assert [row["capacity_sats"] for row in opened] == [
+        20_000_000, 16_777_215, 20_000_000, 16_777_215,
+        20_000_000, 16_777_215, 20_000_000, 16_777_215,
+    ]
+    assert sum(
+        method == "openchannel" and args[-1] == 16_777_215
+        for _container, method, args in calls
+    ) == 2
+    assert sum(
+        method == "fundchannel" and args[-1] == 20_000_000
+        for _container, method, args in calls
+    ) == 4
+    assert sum(
+        method == "fundchannel" and args[-1] == 16_777_215
+        for _container, method, args in calls
+    ) == 2
 
 
 def test_runner_parser_exposes_production_shaped_capacity_defaults():
@@ -3530,8 +3619,8 @@ def test_competition_image_pins_all_source_revisions():
     runner = load_runner()
     dockerfile = (ROOT / "tools" / "polar-clboss" / "Dockerfile").read_text(encoding="utf-8")
 
-    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:9c46aaf"
-    assert runner.EXPECTED_REVENUE_REVISION.startswith("9c46aaf")
+    assert runner.IMAGE == "cl-revenue-ops-polar-clboss:2987608"
+    assert runner.EXPECTED_REVENUE_REVISION.startswith("2987608")
     assert "elementsproject/lightningd:v26.06.6" in dockerfile
     assert "clightning-v26.06.7-Ubuntu-22.04-amd64.tar.xz" in dockerfile
     assert runner.EXPECTED_CLN_ARTIFACT_DIGEST in dockerfile
