@@ -3495,11 +3495,15 @@ def run_smoke(
     native_rebalance_completed_count = sum(
         delta["rebalance_completed_count"] for delta in contender_deltas.values()
     )
-    attributable_native_rebalance = (
-        raw_extra_volume_msat == native_rebalance_volume_msat
-    )
+    # A completed self-payment can either traverse the opposing contender
+    # exactly once or use a non-contender return path. Accept those two
+    # observable shapes only. A partial/excess match remains unsafe because it
+    # could hide fallback traffic or unrelated forwards behind net volume.
+    attributable_native_rebalance = raw_extra_volume_msat in {
+        0, native_rebalance_volume_msat,
+    }
     attributed_native_rebalance_volume_msat = (
-        native_rebalance_volume_msat if attributable_native_rebalance else 0
+        raw_extra_volume_msat if attributable_native_rebalance else 0
     )
     extra_volume_msat = (
         0 if attributable_native_rebalance else raw_extra_volume_msat
