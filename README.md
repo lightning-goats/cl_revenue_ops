@@ -144,6 +144,7 @@ The SQLite database is kept outside the repository by default at
 
 ## Reference
 
+- [v3.0.0 release notes](docs/releases/v3.0.0.md)
 - [Public telemetry contracts](docs/contracts/README.md)
 - [Action RPC inventory](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md)
 - [Repository maintenance](docs/maintenance.md)
