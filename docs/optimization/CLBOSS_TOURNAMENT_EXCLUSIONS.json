@@ -145,6 +145,16 @@
       "replica": "replica-178",
       "block": "smoke-1788131698",
       "reason": "Replacement began from the already-degraded 20M topology, stopped after a terminal LND payment, and included 40,000,000 msat of fallback traffic; excluded from scored evidence."
+    },
+    {
+      "replica": "replica-185",
+      "block": "smoke-1788135741",
+      "reason": "Fixed-revision crossed 5M validation contained 35,022,516 msat of unattributed extra contender volume from one split/crossed hop; replaced by a fresh seed."
+    },
+    {
+      "replica": "replica-187",
+      "block": "smoke-1788136523",
+      "reason": "Fresh fixed-revision crossed 5M replacement reproduced one 35,041,295-msat split/crossed contender hop; all payments settled, but strict attribution failed."
     }
   ]
 }

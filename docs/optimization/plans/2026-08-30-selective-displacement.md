@@ -58,6 +58,30 @@ earned on that circular flow while its own economic gate correctly held at
 `no_route`, avoiding an uneconomic spend. This is evidence for a tournament
 hypothesis, not permission to infer private payment purpose on production.
 
+## Fixed-revision capacity matrix closure
+
+The same revision then ran fresh crossed full-stack pairs at 2M and 5M sats.
+Together with the 20M pair above, the accepted fixed-revision matrix contains
+six blocks and 768/768 settled payments. Every accepted block had exact
+attribution, zero fallback, no multipart contamination, and no safety
+violation. Attribution-contaminated artifacts remained excluded and were not
+counted as wins.
+
+| Capacity | Accepted replicas | Revenue Ops net profit (msat) | CLBOSS net profit (msat) | Revenue Ops volume (msat) | CLBOSS volume (msat) | Mean worst imbalance, Revenue / CLBOSS (ppm) |
+|---:|---|---:|---:|---:|---:|---:|
+| 2M | 182 / 183 | 4,730,126 | 2,188 | 7,920,000,000 | 2,186,876,623 | 867,362 / 977,814 |
+| 5M | 184 / 187 | 6,769,035 | 1,049,002 | 8,540,000,000 | 1,480,000,000 | 842,995 / 959,995 |
+| 20M requested | 180 / 181 | 7,731,452 | -812,464 | 10,137,197,870 | 605,000,000 | 964,209 / 870,250 |
+| Combined | six blocks | 19,230,613 | 238,726 | 26,597,197,870 | 4,271,876,623 | 891,522 / 936,020 |
+
+Revenue Ops therefore won the primary net-profit objective, routing volume,
+and mean worst-channel balance over the fixed-revision matrix. At 20M it
+accepted much more profitable flow and ended farther from midpoint than
+CLBOSS, but retained 100% payment settlement; midpoint balance is not promoted
+above realized profit or availability. Revenue spent 3,334 msat on two
+completed rebalances across the matrix, while CLBOSS spent 1,000,800 msat and
+finished with only 238,726 msat total net profit across all six blocks.
+
 ## Expansion backlog
 
 Implement and tournament-test these independently, in priority order. Promote
