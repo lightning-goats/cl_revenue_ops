@@ -111,3 +111,8 @@ xrebalance's route search/scheduling/retry behavior into the native rebalancer
 and the alternative of using xrebalance as an execution backend under Revenue
 Ops' economic policy. Revenue Ops must retain budget ownership, settlement
 safety, and the selective-profit gate in either design.
+
+The pre-execution brainstorm is now recorded in the
+[xrebalance tournament draft](2026-08-30-xrebalance-tournament-brainstorm.md).
+Its status remains draft: no xrebalance comparison run or backend
+implementation is authorized until the protocol is reviewed and frozen.
