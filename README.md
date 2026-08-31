@@ -5,8 +5,7 @@ fees, plans and executes circular rebalances, enforces spend limits, and reports
 channel profitability.
 
 It is fully standalone: decisions use only this node's forwards, gossip, and
-state. It has no Sling dependency and does not open or close channels, execute
-swaps, or withdraw funds.
+state. It does not open or close channels, execute swaps, or withdraw funds.
 
 ## Requirements
 
