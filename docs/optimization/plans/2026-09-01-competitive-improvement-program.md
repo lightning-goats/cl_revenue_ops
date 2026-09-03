@@ -109,14 +109,32 @@ revenue. The unqualified v11 probe was therefore removed from the deployable
 tree. Three forwards are evidence that a quote clears, but not evidence that
 doubling it improves marginal revenue.
 
-V12 must use paired price windows. An upward move is admissible only after a
-minimum-volume baseline, and may continue only when the next window preserves
-settled volume and improves fee revenue (or when explicit insufficient-balance
-drops prove stocked-out demand). A losing probe rolls back and enters a
-cooldown. Missing, malformed, sparse, or identity-asymmetric evidence remains
-neutral. This combines the useful slow-ratchet/stock-out distinction found in
-LN Operator with Revenue Ops' stronger market, inventory, profitability, and
-global safety rails; no competitor implementation code is imported.
+V12 tested paired price windows. An upward move was admissible only after a
+minimum-volume baseline and could continue only when the adjacent window
+preserved settled volume and improved fee revenue. A losing probe rolled back
+and entered cooldown. Missing, malformed, sparse, or identity-asymmetric
+evidence remained neutral. This combined the useful slow-ratchet/stock-out
+distinction found in LN Operator with Revenue Ops' market, inventory,
+profitability, and global safety rails; no competitor implementation code was
+imported.
+
+The experiment was rejected. Initial Docker replica r58 (Revenue Ops on
+identity B) earned 83,697,637 msat versus CLBOSS's 42,958,964 msat and carried
+38.759B versus 11.046B msat, but only 230/240 payments settled, failing the
+delivery gate. Its logs also exposed an accepted-price oscillation. The
+corrected v12.1 implementation chained an accepted step directly from its
+adjacent observation window and held a verified market-ceiling price for
+revalidation. Focused tests passed, and the live trace demonstrated the
+intended accept, chain, reject, and rollback lifecycle.
+
+Corrected crossed replica r59 (Revenue Ops on identity A) nevertheless lost
+decisively: Revenue Ops earned 83,296,865 msat versus CLBOSS's 136,418,678
+msat, despite carrying 28.212B versus 24.449B msat and settling all 240
+payments. The cell-retention gate also failed. The result shows that locally
+validated marginal price increases can still cede more valuable network-wide
+traffic to a competitor than their sampled channel revenue captures. V12 and
+v12.1 were removed from the deployable tree; neither was deployed or enabled
+in production.
 
 ### Docker-only execution
 
