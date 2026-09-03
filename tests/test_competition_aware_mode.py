@@ -141,6 +141,10 @@ class TestYieldAwareBalanceWake:
         assert fc.should_wake_yield_inventory_cycle("1x1x0", 1)
         # A different channel has independent volume and cooldown state.
         assert fc.should_wake_yield_inventory_cycle("2x2x0", 50_000_000)
+        assert fc._claim_yield_inventory_wake_channels() == {
+            "1x1x0", "2x2x0",
+        }
+        assert fc._claim_yield_inventory_wake_channels() == set()
 
     @pytest.mark.parametrize(
         "channel_id,out_msat",

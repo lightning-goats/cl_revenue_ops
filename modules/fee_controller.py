@@ -3881,7 +3881,15 @@ class FeeController:
                 return False
             self._yield_inventory_pending_msat[normalized_channel_id] = 0
             self._yield_inventory_last_wake[normalized_channel_id] = now
+            self._yield_inventory_wake_channels.add(normalized_channel_id)
             return True
+
+    def _claim_yield_inventory_wake_channels(self) -> set[str]:
+        """Atomically move notification wake markers into one fee cycle."""
+        with self._yield_inventory_wake_lock:
+            claimed = set(self._yield_inventory_wake_channels)
+            self._yield_inventory_wake_channels.clear()
+            return claimed
 
     def _complete_acquisition_experiment(
         self,
@@ -4261,6 +4269,8 @@ class FeeController:
         self._yield_inventory_wake_lock = threading.Lock()
         self._yield_inventory_pending_msat: Dict[str, int] = {}
         self._yield_inventory_last_wake: Dict[str, int] = {}
+        self._yield_inventory_wake_channels: set[str] = set()
+        self._yield_inventory_cycle_channels: set[str] = set()
         # A settled-forward contradiction may trigger one expensive canonical
         # profitability refresh. Back off failures/concurrent-cache returns so
         # compressed fee cycles cannot create a refresh storm.
@@ -6666,6 +6676,9 @@ class FeeController:
             self._acquisition_cycle_experiments,
             reset_pending=True,
         )
+        self._yield_inventory_cycle_channels = (
+            self._claim_yield_inventory_wake_channels()
+        )
         try:
             self._adjust_all_fees_channel_loop(
                 channel_states=channel_states,
@@ -6680,6 +6693,7 @@ class FeeController:
             )
         finally:
             self._acquisition_cycle_experiments = {}
+            self._yield_inventory_cycle_channels = set()
             self._cycle_batch_active = False
             self._flush_pending_fee_strategy_rows()
 
@@ -6983,8 +6997,12 @@ class FeeController:
                 force_reprice_reason = (
                     "acquisition_experiment"
                     if channel_id in self._acquisition_cycle_experiments
-                    else self._inventory_reprice_reason(
-                        channel_id, channel_info, cfg
+                    else (
+                        "yield_inventory_change"
+                        if channel_id in self._yield_inventory_cycle_channels
+                        else self._inventory_reprice_reason(
+                            channel_id, channel_info, cfg
+                        )
                     )
                 )
 
