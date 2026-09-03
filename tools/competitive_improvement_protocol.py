@@ -264,7 +264,7 @@ def validate_research_catalog(catalog: Any) -> dict[str, Any]:
         if _string(arm["class"], f"{identifier}.baseline_arm.class") != comparison_class:
             raise ProtocolError(f"{identifier} baseline class does not match card")
         if _string(arm["status"], f"{identifier}.baseline_arm.status") not in {
-            "executed", "spec_frozen", "not_admitted",
+            "executed", "model_executed", "spec_frozen", "not_admitted",
         }:
             raise ProtocolError(f"{identifier} baseline status is unsupported")
         _string(arm["implementation"], f"{identifier}.baseline_arm.implementation")
@@ -272,6 +272,8 @@ def validate_research_catalog(catalog: Any) -> dict[str, Any]:
         _bool(arm["clean_room"], f"{identifier}.baseline_arm.clean_room")
         if direct_status == "blocked" and arm["status"] == "executed":
             raise ProtocolError(f"{identifier} blocked direct runtime cannot be executed")
+        if comparison_class == "direct_runtime" and arm["status"] == "model_executed":
+            raise ProtocolError(f"{identifier} direct runtime cannot be labeled model-executed")
 
         classes[identifier] = comparison_class
         statuses[identifier] = direct_status

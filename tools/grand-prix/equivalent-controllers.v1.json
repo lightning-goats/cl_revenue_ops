@@ -1,0 +1,59 @@
+{
+  "schema": "competitive-equivalent-controllers-v1",
+  "frozen_at_utc": "2026-09-03T18:00:00Z",
+  "research_catalog_digest": "sha256:c4b9950d0a6bc92dffd0686c500317fca33ced896c7f4478f44b569de1711b31",
+  "models": {
+    "ln_operator": {
+      "comparison_class": "algorithm_equivalent",
+      "source_revision": "0822adc135caf60a7e64234b567a3b7f400008bd",
+      "claim_scope": "Clean-room fee-policy response model; not an LN Operator runtime or rebalance comparison",
+      "trigger": {
+        "kind": "interval",
+        "seconds": 7200,
+        "minimum_balance_change_sats": 0
+      },
+      "formula": {
+        "kind": "inventory_sigmoid",
+        "minimum_ppm": 25,
+        "maximum_ppm": 750,
+        "steepness": 8.0,
+        "midpoint": 0.5,
+        "market_multiplier": 0.0,
+        "refill_floor_ppm": 0,
+        "hard_ceiling_ppm": 5000,
+        "base_fee_msat": 0
+      },
+      "broadcast": {
+        "absolute_deadband_ppm": 25,
+        "relative_deadband": 0.1
+      },
+      "rebalance_mode": "off_for_fee_only_comparison"
+    },
+    "torq": {
+      "comparison_class": "workflow_equivalent",
+      "source_revision": "982138ba7af4d6a3898a7b25f3924dff5fc9f172",
+      "claim_scope": "Frozen strongest-plausible Torq-style fee workflow; not a Torq product runtime or canonical Torq algorithm",
+      "trigger": {
+        "kind": "balance_change",
+        "seconds": 0,
+        "minimum_balance_change_sats": 50000
+      },
+      "formula": {
+        "kind": "inventory_sigmoid",
+        "minimum_ppm": 25,
+        "maximum_ppm": 2000,
+        "steepness": 10.0,
+        "midpoint": 0.5,
+        "market_multiplier": 0.0,
+        "refill_floor_ppm": 0,
+        "hard_ceiling_ppm": 5000,
+        "base_fee_msat": 0
+      },
+      "broadcast": {
+        "absolute_deadband_ppm": 25,
+        "relative_deadband": 0.1
+      },
+      "rebalance_mode": "off_for_fee_only_comparison"
+    }
+  }
+}

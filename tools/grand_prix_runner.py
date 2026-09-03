@@ -25,6 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from grand_prix_manifest import validate_topology  # noqa: E402
 from docker_grand_prix_lab import DockerGrandPrixLab, DockerLabError  # noqa: E402
+from equivalent_competitor_controller import (  # noqa: E402
+    EquivalentControllerError,
+    load_models,
+    policy_intents,
+    validate_models,
+)
 
 
 # Retain the v1 identifier so completed Polar-era replicas remain scoreable.
@@ -42,6 +48,10 @@ CLBOSS_PLUGIN = "/usr/local/libexec/clboss"
 XREBALANCE_PLUGIN = "/usr/local/libexec/xrebalance"
 CONTROLLER_CYCLE_SECONDS = 15
 CONTROLLER_WARMUP_SECONDS = 75
+EQUIVALENT_CONTROLLER_CONFIG = (
+    Path(__file__).resolve().parent / "grand-prix" / "equivalent-controllers.v1.json"
+)
+COMPETITOR_CONTROLLERS = frozenset({"clboss", "ln_operator", "torq"})
 MUTATING_COMMANDS = {
     "create-base", "start-base", "wire-background", "launch-contenders",
     "wire-contenders", "shape-liquidity", "seed-fees", "start-controllers",
@@ -1374,6 +1384,43 @@ def _wait_clboss(container: str) -> dict[str, Any]:
     raise RunnerError(f"CLBOSS did not become ready: {last}")
 
 
+def _apply_equivalent_competitor_policy(
+    container: str, model: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply one pure model response and retain only anonymous evidence."""
+    channels = _cln_rpc(container, "listpeerchannels").get("channels")
+    intents = policy_intents(model, channels)
+    targets: list[int] = []
+    for intent in intents:
+        _cln_rpc(
+            container, "setchannel", intent["peer_id"],
+            intent["fee_base_msat"], intent["fee_ppm"],
+        )
+        targets.append(int(intent["fee_ppm"]))
+    return {
+        "eligible_channels": len(channels) if isinstance(channels, list) else 0,
+        "changed_channels": len(intents),
+        "target_fee_ppm": {
+            "min": min(targets) if targets else None,
+            "max": max(targets) if targets else None,
+        },
+    }
+
+
+def _equivalent_model_context(
+    competitor_controller: str, config_path: Path
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        catalog = load_models(config_path)
+        validation = validate_models(catalog)
+    except (OSError, EquivalentControllerError) as exc:
+        raise RunnerError(f"invalid equivalent-controller configuration: {exc}") from exc
+    model = catalog["models"].get(competitor_controller)
+    if not isinstance(model, dict):
+        raise RunnerError(f"equivalent-controller model {competitor_controller!r} is absent")
+    return model, validation
+
+
 def start_controllers(
     topology: dict[str, Any],
     *,
@@ -1381,8 +1428,10 @@ def start_controllers(
     revenue_market_mode: str = "undercut",
     revenue_max_fee_ppm: int = 2000,
     revenue_dynamic_htlcmax: bool = True,
+    competitor_controller: str = "clboss",
+    equivalent_controller_config: Path = EQUIVALENT_CONTROLLER_CONFIG,
 ) -> dict[str, Any]:
-    """Start the fee-only CLBOSS-first crossed league with explicit safety controls."""
+    """Start a fee-only crossed league with explicit comparator claim scope."""
     allowed_modes = {
         "undercut", "match", "premium", "competition_aware", "yield_aware"
     }
@@ -1396,6 +1445,14 @@ def start_controllers(
         raise RunnerError("Revenue Ops max fee must be an integer from 1 to 100000 ppm")
     if not isinstance(revenue_dynamic_htlcmax, bool):
         raise RunnerError("Revenue Ops dynamic htlcmax arm must be boolean")
+    if competitor_controller not in COMPETITOR_CONTROLLERS:
+        raise RunnerError(f"unsupported competitor controller {competitor_controller!r}")
+    model = None
+    model_validation = None
+    if competitor_controller != "clboss":
+        model, model_validation = _equivalent_model_context(
+            competitor_controller, equivalent_controller_config
+        )
     state = _read_state(state_path, topology)
     if state.get("status") != "fees_ready":
         raise RunnerError("initial fee policies must be ready before controllers start")
@@ -1404,31 +1461,64 @@ def start_controllers(
     if not isinstance(contenders, dict) or not isinstance(assignment, dict):
         raise RunnerError("runner state has no crossed contender assignment")
 
-    clboss_identity = str(assignment["clboss"])
-    clboss_container = str(contenders[clboss_identity]["container"])
-    _cln_rpc(clboss_container, "plugin", "start", XREBALANCE_PLUGIN)
-    _cln_rpc(
-        clboss_container, "-k", "plugin", "subcommand=start", f"plugin={CLBOSS_PLUGIN}",
-        "clboss-auto-close=false", "clboss-rebalance-mode=off",
+    competitor_identity = str(assignment["clboss"])
+    competitor_container = str(contenders[competitor_identity]["container"])
+    competitor_readback: dict[str, Any]
+    if competitor_controller == "clboss":
+        _cln_rpc(competitor_container, "plugin", "start", XREBALANCE_PLUGIN)
+        _cln_rpc(
+            competitor_container, "-k", "plugin", "subcommand=start",
+            f"plugin={CLBOSS_PLUGIN}", "clboss-auto-close=false",
+            "clboss-rebalance-mode=off",
+        )
+        _wait_clboss(competitor_container)
+        _cln_rpc(competitor_container, "clboss-ignore-onchain", 96)
+        peer_rows = _cln_rpc(competitor_container, "listpeerchannels").get("channels")
+        peer_ids = sorted({str(row.get("peer_id")) for row in peer_rows or []
+                           if isinstance(row, dict) and row.get("peer_id")})
+        if len(peer_ids) != 16:
+            raise RunnerError(f"CLBOSS contender has {len(peer_ids)}/16 peers")
+        for peer_id in peer_ids:
+            _cln_rpc(competitor_container, "clboss-unmanage", peer_id, "open,close")
+        clboss_status = _wait_clboss(competitor_container)
+        unmanaged = clboss_status.get("unmanaged")
+        if not isinstance(unmanaged, dict) or any(
+            "open" not in str(unmanaged.get(peer_id, ""))
+            or "close" not in str(unmanaged.get(peer_id, ""))
+            for peer_id in peer_ids
+        ):
+            raise RunnerError("CLBOSS open/close safety tags failed readback")
+        competitor_readback = {
+            "id": "clboss", "comparison_class": "direct_runtime",
+            "direct_runtime": True, "identity": competitor_identity,
+            "peer_safety_count": len(peer_ids), "auto_close": False,
+            "rebalance_mode": "off",
+        }
+    else:
+        assert model is not None and model_validation is not None
+        initial_response = _apply_equivalent_competitor_policy(
+            competitor_container, model
+        )
+        competitor_readback = {
+            "id": competitor_controller,
+            "comparison_class": model["comparison_class"],
+            "direct_runtime": False,
+            "identity": competitor_identity,
+            "configuration_digest": model_validation["catalog_digest"],
+            "model_digest": _digest(model),
+            "source_revision": model["source_revision"],
+            "claim_scope": model["claim_scope"],
+            "model": model,
+            "trigger": model["trigger"],
+            "rebalance_mode": "off",
+            "initial_response": initial_response,
+            "refresh_count": 1,
+        }
+    state["competitor_controller"] = competitor_controller
+    _checkpoint(
+        state_path, state, "competitor_started",
+        identity=competitor_identity, controller=competitor_controller,
     )
-    _wait_clboss(clboss_container)
-    _cln_rpc(clboss_container, "clboss-ignore-onchain", 96)
-    peer_rows = _cln_rpc(clboss_container, "listpeerchannels").get("channels")
-    peer_ids = sorted({str(row.get("peer_id")) for row in peer_rows or []
-                       if isinstance(row, dict) and row.get("peer_id")})
-    if len(peer_ids) != 16:
-        raise RunnerError(f"CLBOSS contender has {len(peer_ids)}/16 peers")
-    for peer_id in peer_ids:
-        _cln_rpc(clboss_container, "clboss-unmanage", peer_id, "open,close")
-    clboss_status = _wait_clboss(clboss_container)
-    unmanaged = clboss_status.get("unmanaged")
-    if not isinstance(unmanaged, dict) or any(
-        "open" not in str(unmanaged.get(peer_id, ""))
-        or "close" not in str(unmanaged.get(peer_id, ""))
-        for peer_id in peer_ids
-    ):
-        raise RunnerError("CLBOSS open/close safety tags failed readback")
-    _checkpoint(state_path, state, "clboss_started", identity=clboss_identity)
 
     revenue_identity = str(assignment["revenue_ops"])
     revenue_container = str(contenders[revenue_identity]["container"])
@@ -1471,10 +1561,9 @@ def start_controllers(
         raise RunnerError("Revenue Ops failed active zero-budget safety readback")
     _checkpoint(state_path, state, "revenue_ops_started", identity=revenue_identity)
 
-    # CLBOSS publishes its initial market surface on an approximately
-    # one-minute cadence while Revenue Ops runs every 15 seconds. Give both
-    # controllers a complete cold-start observation window before traffic so
-    # startup order cannot decide route share.
+    # Give every controller a complete cold-start observation window before
+    # traffic so startup order cannot decide route share. This also covers
+    # CLBOSS's approximately one-minute initial publication cadence.
     time.sleep(CONTROLLER_WARMUP_SECONDS)
     warm_policies = {
         identity: _channel_policy_snapshot(str(contenders[identity]["container"]))
@@ -1484,13 +1573,8 @@ def start_controllers(
         raise RunnerError("controller warm-up lost an active contender channel")
 
     state["controller_readback"] = {
-        "order": ["clboss", "revenue_ops"],
-        "clboss": {
-            "identity": clboss_identity,
-            "peer_safety_count": len(peer_ids),
-            "auto_close": False,
-            "rebalance_mode": "off",
-        },
+        "order": [competitor_controller, "revenue_ops"],
+        "competitor": competitor_readback,
         "revenue_ops": {
             "identity": revenue_identity,
             "paused": False,
@@ -1503,9 +1587,55 @@ def start_controllers(
         "warmup_seconds": CONTROLLER_WARMUP_SECONDS,
         "warm_policies": warm_policies,
     }
+    if competitor_controller == "clboss":
+        # Frozen pre-expansion states and scorers used this exact key.
+        state["controller_readback"]["clboss"] = competitor_readback
     state["status"] = "controllers_ready"
-    _checkpoint(state_path, state, "controllers_ready", league="fee_only")
+    _checkpoint(
+        state_path, state, "controllers_ready", league="fee_only",
+        competitor=competitor_controller,
+    )
     return state
+
+
+def _refresh_equivalent_competitor(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Re-evaluate an admitted event-driven model from its frozen state copy."""
+    controls = state.get("controller_readback")
+    contenders = state.get("contenders")
+    assignment = state.get("assignment")
+    if not all(isinstance(value, dict) for value in (controls, contenders, assignment)):
+        raise RunnerError("runner state lacks controller refresh context")
+    competitor = controls.get("competitor")
+    if not isinstance(competitor, dict) or competitor.get("id") != "torq":
+        return None
+    model = competitor.get("model")
+    if not isinstance(model, dict):
+        raise RunnerError("equivalent competitor lacks its frozen model")
+    identity = str(assignment["clboss"])
+    container = str(contenders[identity]["container"])
+    response = _apply_equivalent_competitor_policy(container, model)
+    competitor["refresh_count"] = int(competitor.get("refresh_count", 0)) + 1
+    competitor["last_response"] = response
+    return response
+
+
+def _equivalent_refresh_due(state: dict[str, Any], record: dict[str, Any]) -> bool:
+    """Return whether a Torq-style managed channel actually changed enough."""
+    try:
+        controls = state["controller_readback"]
+        competitor = controls["competitor"]
+        if competitor.get("id") != "torq" or record.get("outcome") != "settled":
+            return False
+        threshold_msat = int(
+            competitor["trigger"]["minimum_balance_change_sats"]
+        ) * 1000
+        competitor_identity = state["assignment"]["clboss"]
+        changed_msat = int(
+            record["contender_delta"][competitor_identity]["volume_msat"]
+        )
+        return threshold_msat >= 0 and changed_msat >= threshold_msat
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
 
 
 def _forward_totals(container: str) -> dict[str, int]:
@@ -1748,6 +1878,12 @@ def run_public_traffic(
         run["per_payment_attribution_complete"] = True
     state["status"] = "public_traffic_running"
     _checkpoint(state_path, state, "public_traffic_started", target=target)
+    initial_refresh = _refresh_equivalent_competitor(state)
+    if initial_refresh is not None:
+        _checkpoint(
+            state_path, state, "equivalent_competitor_refreshed",
+            changed_channels=initial_refresh["changed_channels"],
+        )
     pauses = {"lt_1": 0.01, "1_10": 0.03, "10_60": 0.05,
               "60_300": 0.08, "gte_300": 0.12}
     for item in traffic[:target]:
@@ -1804,6 +1940,13 @@ def run_public_traffic(
         run["records"].append(record)
         completed.add(sequence)
         _checkpoint(state_path, state, "public_payment_complete", record=record)
+        if _equivalent_refresh_due(state, record):
+            response = _refresh_equivalent_competitor(state)
+            assert response is not None
+            _checkpoint(
+                state_path, state, "equivalent_competitor_refreshed",
+                sequence=sequence, changed_channels=response["changed_channels"],
+            )
         time.sleep(pauses[str(item["interarrival_bucket"])])
     run["after"] = _contender_metric_snapshot(state)
     run["contender_delta"] = _metric_delta(run["before"], run["after"])
@@ -2000,6 +2143,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--revenue-max-fee-ppm", type=int, default=2000)
     parser.add_argument(
+        "--competitor-controller", choices=sorted(COMPETITOR_CONTROLLERS),
+        default="clboss",
+    )
+    parser.add_argument(
+        "--equivalent-controller-config", type=Path,
+        default=EQUIVALENT_CONTROLLER_CONFIG,
+    )
+    parser.add_argument(
         "--revenue-dynamic-htlcmax", choices=("on", "off"), default="on"
     )
     parser.add_argument("--apply", action="store_true")
@@ -2063,6 +2214,8 @@ def main(arguments: list[str] | None = None) -> int:
                     revenue_market_mode=args.revenue_market_mode,
                     revenue_max_fee_ppm=args.revenue_max_fee_ppm,
                     revenue_dynamic_htlcmax=(args.revenue_dynamic_htlcmax == "on"),
+                    competitor_controller=args.competitor_controller,
+                    equivalent_controller_config=args.equivalent_controller_config,
                 )
             elif args.command == "run-public":
                 result = run_public_traffic(

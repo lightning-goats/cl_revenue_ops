@@ -89,6 +89,9 @@ def test_research_catalog_distinguishes_direct_and_equivalent_comparisons():
     assert result["direct_runtime_statuses"] == {
         "clboss": "admitted", "ln_operator": "blocked", "torq": "blocked",
     }
+    assert [card["baseline_arm"]["status"] for card in catalog["cards"]] == [
+        "executed", "model_executed", "model_executed",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -105,6 +108,12 @@ def test_research_catalog_distinguishes_direct_and_equivalent_comparisons():
                 status="executed"
             ),
             "blocked direct runtime cannot be executed",
+        ),
+        (
+            lambda value: value["cards"][0]["baseline_arm"].update(
+                status="model_executed"
+            ),
+            "direct runtime cannot be labeled model-executed",
         ),
         (
             lambda value: value["cards"][0]["source_and_license"].update(

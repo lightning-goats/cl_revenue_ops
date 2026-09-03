@@ -26,6 +26,10 @@ ARMS = {"revenue_incumbent", "competitor_equivalent", "revenue_enhanced"}
 STAGES = {"public", "holdout"}
 CONTROLLERS = ("revenue_ops", "clboss")
 IDENTITIES = ("identity-a", "identity-b")
+EQUIVALENT_COMPARISON_CLASSES = {
+    "ln_operator": "algorithm_equivalent",
+    "torq": "workflow_equivalent",
+}
 CAPITAL_SATS = 130_000_000
 BOOTSTRAP_ITERATIONS = 20_000
 
@@ -160,16 +164,59 @@ def validate_state(
     if not isinstance(controls, dict):
         raise ScorecardError(f"{source} lacks controller safety readback")
     revenue = controls.get("revenue_ops")
-    clboss = controls.get("clboss")
+    competitor = controls.get("competitor")
+    if not isinstance(competitor, dict):
+        # Backward compatibility for frozen CLBOSS-only runner states.
+        competitor = controls.get("clboss")
+    competitor_id = competitor.get("id", "clboss") if isinstance(competitor, dict) else None
+    competitor_class = (
+        competitor.get("comparison_class", "direct_runtime")
+        if isinstance(competitor, dict) else None
+    )
+    if competitor_id == "clboss":
+        competitor_ok = (
+            competitor_class == "direct_runtime"
+            and competitor.get("auto_close") is False
+            and competitor.get("rebalance_mode") == "off"
+        ) if isinstance(competitor, dict) else False
+        competitor_digest = "direct-runtime"
+        claim_scope = "Pinned direct CLBOSS runtime"
+    else:
+        competitor_digest = (
+            competitor.get("configuration_digest")
+            if isinstance(competitor, dict) else None
+        )
+        model_digest = (
+            competitor.get("model_digest")
+            if isinstance(competitor, dict) else None
+        )
+        claim_scope = competitor.get("claim_scope") if isinstance(competitor, dict) else None
+        model = competitor.get("model") if isinstance(competitor, dict) else None
+        competitor_ok = bool(
+            isinstance(competitor, dict)
+            and competitor_id in EQUIVALENT_COMPARISON_CLASSES
+            and competitor_class == EQUIVALENT_COMPARISON_CLASSES[competitor_id]
+            and competitor.get("direct_runtime") is False
+            and competitor.get("rebalance_mode") == "off"
+            and isinstance(competitor_digest, str)
+            and len(competitor_digest) == 71
+            and competitor_digest.startswith("sha256:")
+            and isinstance(model_digest, str)
+            and len(model_digest) == 71
+            and model_digest == _digest(model)
+            and isinstance(claim_scope, str)
+            and "not " in claim_scope.casefold()
+            and isinstance(model, dict)
+        )
+    if competitor_id == "clboss":
+        model_digest = "direct-runtime"
     warm = controls.get("warm_policies")
     safety_ok = (
         isinstance(revenue, dict)
         and revenue.get("daily_budget_sats") == 0
         and revenue.get("paused") is False
         and revenue.get("market_fee_mode") == "yield_aware"
-        and isinstance(clboss, dict)
-        and clboss.get("auto_close") is False
-        and clboss.get("rebalance_mode") == "off"
+        and competitor_ok
         and controls.get("warmup_seconds", 0) >= 75
         and isinstance(warm, dict)
         and all(
@@ -272,6 +319,13 @@ def validate_state(
         "source": source,
         "replica": replica,
         "revenue_identity": assignment["revenue_ops"],
+        "competitor": {
+            "id": competitor_id,
+            "comparison_class": competitor_class,
+            "configuration_digest": competitor_digest,
+            "model_digest": model_digest,
+            "claim_scope": claim_scope,
+        },
         "image_id": image_id,
         "patch_digest": patch_digest,
         "safety_ok": safety_ok,
@@ -345,6 +399,19 @@ def score_states(
     patch_digests = {row["patch_digest"] for row in rows}
     if len(image_ids) > 1 or len(patch_digests) > 1:
         raise ScorecardError("all scored replicas must use one frozen image and patch")
+    competitor_specs = {
+        (
+            row["competitor"]["id"],
+            row["competitor"]["comparison_class"],
+            row["competitor"]["configuration_digest"],
+            row["competitor"]["model_digest"],
+            row["competitor"]["claim_scope"],
+        )
+        for row in rows
+    }
+    if len(competitor_specs) > 1:
+        raise ScorecardError("all scored replicas must use one frozen competitor")
+    competitor_spec = next(iter(competitor_specs), None)
 
     required = int(protocol["tournament"]["replicas_per_assignment"])
     coverage = {
@@ -427,6 +494,17 @@ def score_states(
         "promotion_eligible": verdict == "revenue_ops_wins" and stage == "holdout",
         "frozen_image_id": next(iter(image_ids), None),
         "frozen_patch_digest": next(iter(patch_digests), None),
+        "competitor": (
+            {
+                "id": competitor_spec[0],
+                "comparison_class": competitor_spec[1],
+                "configuration_digest": competitor_spec[2],
+                "model_digest": competitor_spec[3],
+                "claim_scope": competitor_spec[4],
+                "direct_product_claim": competitor_spec[1] == "direct_runtime",
+            }
+            if competitor_spec else None
+        ),
         "coverage": {"required_per_assignment": required, "observed": coverage},
         "gates": gates,
         "minimum_cell_volume_retention_ratio": minimum_cell_retention,

@@ -234,3 +234,74 @@ def test_per_payment_totals_must_reconcile():
     state["public_traffic"]["contender_delta"][identity]["fee_msat"] += 1
     with pytest.raises(module.ScorecardError, match="does not reconcile"):
         module.validate_state(state, topology, source="bad")
+
+
+def _as_equivalent(state, identifier, comparison_class):
+    controls = state["controller_readback"]
+    controls.pop("clboss", None)
+    model = {"frozen": True}
+    controls["competitor"] = {
+        "id": identifier,
+        "comparison_class": comparison_class,
+        "direct_runtime": False,
+        "configuration_digest": "sha256:" + "d" * 64,
+        "model_digest": _module()._digest(model),
+        "claim_scope": f"Clean-room {identifier} model; not a product runtime",
+        "rebalance_mode": "off",
+        "model": model,
+    }
+    return state
+
+
+@pytest.mark.parametrize(
+    ("identifier", "comparison_class"),
+    [("ln_operator", "algorithm_equivalent"), ("torq", "workflow_equivalent")],
+)
+def test_equivalent_comparator_claim_scope_is_preserved(identifier, comparison_class):
+    module = _module()
+    topology = _topology()
+    states = [
+        (f"r{replica}", _as_equivalent(
+            _state(module, topology, replica), identifier, comparison_class
+        ))
+        for replica in range(1, 7)
+    ]
+    result = module.score_states(
+        topology, _protocol(), states, arm="competitor_equivalent", stage="public"
+    )
+    assert result["competitor"] == {
+        "id": identifier,
+        "comparison_class": comparison_class,
+        "configuration_digest": "sha256:" + "d" * 64,
+        "model_digest": module._digest({"frozen": True}),
+        "claim_scope": f"Clean-room {identifier} model; not a product runtime",
+        "direct_product_claim": False,
+    }
+    assert result["gates"]["safety"] is True
+
+
+def test_mixed_equivalent_comparators_cannot_share_one_score():
+    module = _module()
+    topology = _topology()
+    first = _as_equivalent(
+        _state(module, topology, 1), "ln_operator", "algorithm_equivalent"
+    )
+    second = _as_equivalent(
+        _state(module, topology, 2), "torq", "workflow_equivalent"
+    )
+    with pytest.raises(module.ScorecardError, match="one frozen competitor"):
+        module.score_states(
+            topology, _protocol(), [("r1", first), ("r2", second)],
+            arm="competitor_equivalent", stage="public",
+        )
+
+
+def test_tampered_equivalent_model_fails_safety_gate():
+    module = _module()
+    topology = _topology()
+    state = _as_equivalent(
+        _state(module, topology, 1), "torq", "workflow_equivalent"
+    )
+    state["controller_readback"]["competitor"]["model"]["changed"] = True
+    row = module.validate_state(state, topology, source="tampered")
+    assert row["safety_ok"] is False

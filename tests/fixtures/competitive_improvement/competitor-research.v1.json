@@ -104,7 +104,7 @@
       ],
       "baseline_arm": {
         "class": "algorithm_equivalent",
-        "status": "spec_frozen",
+        "status": "model_executed",
         "implementation": "Independent response-model specification derived from public documentation",
         "limitations": [
           "LN Operator requires LND while Revenue Ops and the current external contenders run on CLN",
@@ -168,7 +168,7 @@
       ],
       "baseline_arm": {
         "class": "workflow_equivalent",
-        "status": "spec_frozen",
+        "status": "model_executed",
         "implementation": "Independent strongest-plausible workflow specification from public automation documentation",
         "limitations": [
           "The public repository contains deployment material rather than the controller implementation",

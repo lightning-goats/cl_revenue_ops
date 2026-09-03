@@ -524,6 +524,107 @@ def test_controller_arm_rejects_malformed_tuning_before_mutation(
         )
 
 
+def test_equivalent_controller_catalog_is_frozen_and_loadable():
+    runner = _module()
+    model, validation = runner._equivalent_model_context(
+        "ln_operator", runner.EQUIVALENT_CONTROLLER_CONFIG
+    )
+    assert model["comparison_class"] == "algorithm_equivalent"
+    assert model["rebalance_mode"] == "off_for_fee_only_comparison"
+    assert validation["catalog_digest"].startswith("sha256:")
+
+
+def test_equivalent_policy_application_uses_only_returned_intents(monkeypatch):
+    runner = _module()
+    model, _validation = runner._equivalent_model_context(
+        "ln_operator", runner.EQUIVALENT_CONTROLLER_CONFIG
+    )
+    calls = []
+
+    def fake_rpc(_container, *arguments):
+        calls.append(arguments)
+        if arguments == ("listpeerchannels",):
+            return {"channels": [{
+                "peer_connected": True, "peer_id": "fake-peer",
+                "fee_proportional_millionths": 100,
+                "total_msat": 1_000_000, "to_us_msat": 100_000,
+            }]}
+        return {}
+
+    monkeypatch.setattr(runner, "_cln_rpc", fake_rpc)
+    result = runner._apply_equivalent_competitor_policy("safe-container", model)
+    assert result == {
+        "eligible_channels": 1,
+        "changed_channels": 1,
+        "target_fee_ppm": {"min": 722, "max": 722},
+    }
+    assert calls == [
+        ("listpeerchannels",),
+        ("setchannel", "fake-peer", 0, 722),
+    ]
+
+
+def test_equivalent_refresh_is_noop_for_clboss_and_pinned_for_torq(monkeypatch):
+    runner = _module()
+    assert runner._refresh_equivalent_competitor({
+        "controller_readback": {"competitor": {"id": "clboss"}},
+        "contenders": {}, "assignment": {},
+    }) is None
+    model, _validation = runner._equivalent_model_context(
+        "torq", runner.EQUIVALENT_CONTROLLER_CONFIG
+    )
+    state = {
+        "controller_readback": {"competitor": {
+            "id": "torq", "model": model, "refresh_count": 1,
+        }},
+        "contenders": {"identity-b": {"container": "safe-container"}},
+        "assignment": {"clboss": "identity-b"},
+    }
+    monkeypatch.setattr(
+        runner, "_apply_equivalent_competitor_policy",
+        lambda container, frozen: {
+            "eligible_channels": 16, "changed_channels": 2,
+            "target_fee_ppm": {"min": 50, "max": 500},
+        },
+    )
+    response = runner._refresh_equivalent_competitor(state)
+    assert response["changed_channels"] == 2
+    assert state["controller_readback"]["competitor"]["refresh_count"] == 2
+
+
+def test_torq_refresh_requires_managed_channel_balance_change():
+    runner = _module()
+    state = {
+        "controller_readback": {"competitor": {
+            "id": "torq",
+            "trigger": {"minimum_balance_change_sats": 50_000},
+        }},
+        "assignment": {"clboss": "identity-a"},
+    }
+    record = {
+        "outcome": "settled",
+        "contender_delta": {
+            "identity-a": {"volume_msat": 0},
+            "identity-b": {"volume_msat": 750_000_000},
+        },
+    }
+    assert runner._equivalent_refresh_due(state, record) is False
+    record["contender_delta"]["identity-a"]["volume_msat"] = 49_999_000
+    assert runner._equivalent_refresh_due(state, record) is False
+    record["contender_delta"]["identity-a"]["volume_msat"] = 50_000_000
+    assert runner._equivalent_refresh_due(state, record) is True
+    assert runner._equivalent_refresh_due(state, {"malformed": True}) is False
+
+
+def test_unknown_competitor_is_rejected_before_state_or_rpc(tmp_path):
+    runner = _module()
+    with pytest.raises(runner.RunnerError, match="unsupported competitor"):
+        runner.start_controllers(
+            _topology(), state_path=tmp_path / "missing.json",
+            competitor_controller="not-a-product",
+        )
+
+
 def test_controller_arm_is_pinned_in_plugin_start_and_readback_source():
     source = TOOL.read_text(encoding="utf-8")
     assert 'f"revenue-ops-market-fee-mode={revenue_market_mode}"' in source
@@ -533,6 +634,8 @@ def test_controller_arm_is_pinned_in_plugin_start_and_readback_source():
     assert '"revenue-config", "get", "enable_dynamic_htlcmax"' in source
     assert "time.sleep(CONTROLLER_WARMUP_SECONDS)" in source
     assert '"warmup_seconds": CONTROLLER_WARMUP_SECONDS' in source
+    assert 'state["competitor_controller"] = competitor_controller' in source
+    assert '"equivalent_competitor_refreshed"' in source
 
 
 def test_custom_image_requires_experiment_patch_attestation_source():

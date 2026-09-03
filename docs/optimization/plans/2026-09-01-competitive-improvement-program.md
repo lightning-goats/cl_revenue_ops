@@ -199,9 +199,48 @@ it removes only resources bearing the Grand Prix label and preserves the JSON
 state and score. A stopped Docker state is scoreable only when its last durable
 event proves that exact cleanup completed.
 
-Reproducible Torq and LN Operator executable arms remain required before any
-claim against those products; their clean-room strongest-plausible algorithm
-cards are frozen in `competitor-research.v1.json` without importing their code.
+### Clean-room LN Operator and Torq expansion arms
+
+The non-runtime expansion layer is now executable through
+`tools/equivalent_competitor_controller.py` and the immutable
+`tools/grand-prix/equivalent-controllers.v1.json` configuration. It imports no
+competitor implementation code and has no dispatch surface of its own. The
+Docker runner applies its policy intents only behind the existing explicit
+`--apply` gate.
+
+- `ln_operator` reproduces the documented default 25--750 ppm, `k=8`
+  inventory sigmoid with a two-hour cadence, zero initial market multiplier,
+  no refill floor, and rebalancing disabled for the comparable fee-only
+  league. It is an `algorithm_equivalent` fee-policy response model, not an
+  LN Operator runtime or rebalance comparison.
+- `torq` freezes a deliberately aggressive operator workflow: a 25--2000 ppm,
+  `k=10` inventory sigmoid, 50,000-sat balance-change triggers, and 25 ppm / 10%
+  deadband. Torq publishes workflow mechanics rather than a canonical fee
+  algorithm, so this is a `workflow_equivalent` strongest-plausible Torq-style
+  configuration, not a Torq product runtime or canonical Torq strategy.
+
+Admission smoke replicas r67 and r68 used the v9 contender image and the public
+Docker topology. Both settled 24/24 payments. Revenue Ops captured 24/24
+contender forwards in each: 954,200 versus 0 msat against the LN Operator model
+and 1,650,386 versus 0 msat against the Torq workflow. The Torq arm completed
+its initial policy application without a CLN failure; no later refresh was due
+because its managed lane carried no smoke traffic. These results prove
+executable integration and attribution only; they are not formal
+superiority evidence. Formal claims still require three replicas per crossed
+assignment, nested-bootstrap and cell-retention gates, followed by the sealed
+holdout. Direct-product claims remain prohibited until exact product runtimes
+and immutable operator configurations are admitted.
+
+Example controller selection:
+
+```bash
+python3 tools/grand_prix_runner.py start-controllers \
+  --topology results/grand-prix/topology-public.json \
+  --state results/grand-prix/runner-state-r1.json \
+  --competitor-controller ln_operator \
+  --revenue-market-mode yield_aware \
+  --revenue-max-fee-ppm 50000 --apply
+```
 
 ## Initial research queue
 
