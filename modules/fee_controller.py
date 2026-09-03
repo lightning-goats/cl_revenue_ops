@@ -3135,7 +3135,12 @@ class FeeController:
     # cheaper.  On those lanes, bridge toward the capacity-weighted p25 and
     # stay just below the closest comparable-capacity quote.  This preserves
     # a competitive route without turning every channel into a low-fee lane.
-    YIELD_SCARCE_FRONTIER_MIN_OUTBOUND_RATIO = 0.10
+    # Below the normal 10% scarcity frontier, the existing admission valve
+    # still limits one HTLC to 85% of executable spendable liquidity and the
+    # inventory wake refreshes it after material flow.  Verified market relief
+    # can therefore continue to 5% without an abrupt price cliff or a second,
+    # redundant reserve that censors otherwise routable large payments.
+    YIELD_SCARCE_FRONTIER_MIN_OUTBOUND_RATIO = 0.05
     YIELD_SCARCE_FRONTIER_MAX_OUTBOUND_RATIO = 0.35
     YIELD_SUBSTITUTE_CAPACITY_MIN_RATIO = 0.80
     YIELD_SUBSTITUTE_CAPACITY_MAX_RATIO = 1.25

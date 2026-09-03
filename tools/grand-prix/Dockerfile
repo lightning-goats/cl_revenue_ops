@@ -10,6 +10,7 @@ RUN test -n "${EXPERIMENT_PATCH_DIGEST}"
 COPY cl-revenue-ops.py /opt/cl_revenue_ops/cl-revenue-ops.py
 COPY modules/config.py /opt/cl_revenue_ops/modules/config.py
 COPY modules/fee_controller.py /opt/cl_revenue_ops/modules/fee_controller.py
+COPY modules/admission_policy.py /opt/cl_revenue_ops/modules/admission_policy.py
 
 LABEL org.opencontainers.image.experiment.name="${EXPERIMENT_NAME}"
 LABEL org.opencontainers.image.experiment.patch_digest="${EXPERIMENT_PATCH_DIGEST}"

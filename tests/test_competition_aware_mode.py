@@ -273,10 +273,11 @@ class TestYieldScarceInventoryFloor:
         assert self._floor(outbound_ratio=0.50) == 14_000
 
     def test_survival_reserve_preserves_inventory_floor(self):
-        assert self._floor(outbound_ratio=0.09) == 14_000
+        assert self._floor(outbound_ratio=0.049) == 14_000
 
-    def test_survival_reserve_boundary_still_allows_market_relief(self):
-        assert self._floor(outbound_ratio=0.10) == 1_800
+    @pytest.mark.parametrize("outbound_ratio", [0.05, 0.097, 0.10])
+    def test_reserve_aware_admission_allows_market_relief(self, outbound_ratio):
+        assert self._floor(outbound_ratio=outbound_ratio) == 1_800
 
     def test_broad_anchor_without_frontier_discount_preserves_floor(self):
         assert self._floor(yield_market_anchor_ppm=9_000) == 14_000

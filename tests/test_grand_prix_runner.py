@@ -645,6 +645,7 @@ def test_custom_image_requires_experiment_patch_attestation_source():
     body = dockerfile.read_text(encoding="utf-8")
     assert "ARG EXPERIMENT_PATCH_DIGEST" in body
     assert "COPY modules/fee_controller.py" in body
+    assert "COPY modules/admission_policy.py" in body
 
 
 def test_metric_delta_is_capital_normalized_and_handles_zero_volume():
