@@ -1,5 +1,10 @@
 # Polar test, bug-fix, and hardening program
 
+> Historical record (retired 2026-09-03). The executable Polar harnesses named
+> below were removed after Docker crossed-equivalence passed. Use
+> `tools/grand_prix_runner.py` and the current competitive-improvement program
+> for maintained tournament execution.
+
 ## Objective
 
 Turn the mixed-client smoke lab into a repeatable acceptance program for fee

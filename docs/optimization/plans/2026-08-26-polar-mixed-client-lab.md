@@ -1,5 +1,10 @@
 # Polar mixed-client revenue-ops laboratory
 
+> Historical record (retired 2026-09-03). The executable Polar harnesses named
+> below were removed after Docker crossed-equivalence passed. Use
+> `tools/grand_prix_runner.py` and the current competitive-improvement program
+> for maintained tournament execution.
+
 **Status:** local test plan; no production authority or deployment implied.
 
 ## Purpose

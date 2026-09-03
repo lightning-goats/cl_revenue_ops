@@ -1,0 +1,196 @@
+{
+  "schema": "competitive-research-catalog-v1",
+  "frozen_at_utc": "2026-09-02T18:00:00Z",
+  "cards": [
+    {
+      "id": "clboss",
+      "revision": "8cb4e9215eba58b049375f234f5f073d0c7fc622",
+      "comparison_class": "direct_runtime",
+      "direct_runtime_status": "admitted",
+      "source_and_license": {
+        "source_url": "https://github.com/ksedgwic/clboss",
+        "revision": "8cb4e9215eba58b049375f234f5f073d0c7fc622",
+        "license": "MIT",
+        "license_evidence": "Upstream COPYING file and GitHub repository metadata at the pinned public source"
+      },
+      "observable_behavior": [
+        "CLN-native autonomous fee controller using local gossip and node state",
+        "External xrebalance integration in full-stack mode",
+        "Poisson-clock and low-liquidity-triggered rebalance scheduling"
+      ],
+      "independent_specification": [
+        "Run the exact pinned binary beside Revenue Ops in the same CLN v26.06.7 image",
+        "Cross matched contender identities and preserve natural payer pathfinding",
+        "Disable channel creation, closure, and swaps while leaving fee control uncapped"
+      ],
+      "competitor_omitted_variable": [
+        "No explicit route-level realized marginal-profit objective in the comparable fee surface",
+        "Low quoted fees can win volume that does not maximize settled net profit"
+      ],
+      "revenue_enhancement_hypothesis": [
+        "Capacity-weighted clearing prices plus paid-demand and inventory evidence can retain route share at higher yield",
+        "Selective displacement should stop when incremental profit or useful-volume retention fails"
+      ],
+      "safety_invariants": [
+        "No open, close, swap, or on-chain action",
+        "Exact payment attribution and settled fee accounting",
+        "Zero reservation or ledger divergence"
+      ],
+      "baseline_arm": {
+        "class": "direct_runtime",
+        "status": "executed",
+        "implementation": "Pinned CLBOSS binary in the equal-runtime Polar contender image",
+        "limitations": [
+          "The Grand Prix v9 league is fee-only",
+          "Full-stack economics are corroborated by the earlier frozen crossed three-replica series"
+        ],
+        "clean_room": true
+      },
+      "promotion_measure": [
+        "Settled capital-normalized incremental net profit",
+        "At least 95 percent useful settled-volume retention in every declared cell",
+        "Strictly positive crossed-replica bootstrap confidence interval"
+      ],
+      "rollback_rule": [
+        "Revert to the prior fee mode after any safety, attribution, or accounting failure",
+        "Revert after negative incremental net or a declared cell falls below the retention floor"
+      ],
+      "evidence": [
+        "results/polar-grand-prix/score-public-formal-v9.json",
+        "results/polar-grand-prix/score-holdout-formal-v9.json",
+        "docs/optimization/CLBOSS_TOURNAMENT_FORMAL_SCORE.json"
+      ]
+    },
+    {
+      "id": "ln_operator",
+      "revision": "0822adc135caf60a7e64234b567a3b7f400008bd",
+      "comparison_class": "algorithm_equivalent",
+      "direct_runtime_status": "blocked",
+      "source_and_license": {
+        "source_url": "https://github.com/lnbright/ln-operator",
+        "revision": "0822adc135caf60a7e64234b567a3b7f400008bd",
+        "license": "MIT declared in README; no standalone license file observed at this revision",
+        "license_evidence": "Pinned public README license declaration"
+      },
+      "observable_behavior": [
+        "LND-only two-hour rebalance-then-fee pipeline",
+        "Rebalances from channels above 80 percent local to channels below 20 percent local",
+        "Profit-capped refill budget with live full-circular-route price probes and early no-route exit",
+        "Failed amounts are halved to 100000 sats and alternate source-target pairs are tried",
+        "Sigmoid inventory fee, slow market multiplier, dropped-forward bump, soft refill-cost floor, and hysteresis",
+        "Dropped forwards are retained as explicit lost-demand evidence"
+      ],
+      "independent_specification": [
+        "Model the documented response functions from prose and published constants without importing competitor implementation code",
+        "Feed identical anonymized channel ratios, paid forwards, dropped-forward signals, route quotes, and refill costs to every arm",
+        "Keep the algorithm-equivalent result separate from any direct LND runtime claim"
+      ],
+      "competitor_omitted_variable": [
+        "Fixed 20/80 pairing does not rank all liquidity moves by marginal portfolio profit",
+        "Amount halving is not a marginal-EV allocator across concurrent parts",
+        "A two-hour cadence can miss short-lived demand and route-price regimes"
+      ],
+      "revenue_enhancement_hypothesis": [
+        "Add locally observed failed-forward demand as confidence-weighted censored demand, never as guaranteed revenue",
+        "Probe complete circular-route cost before spend but combine it with source opportunity cost and post-refill conversion probability",
+        "Allocate bounded parts by descending marginal EV with durable per-part reservations and stop at non-positive EV",
+        "Use adaptive evidence expiry and event-triggered repricing inside existing gossip-rate rails"
+      ],
+      "safety_invariants": [
+        "Missing or malformed failure telemetry is neutral",
+        "A route quote cannot authorize spend without the Revenue governor and reservation",
+        "Failure evidence expires and cannot permanently blacklist a route",
+        "Read-only surfaces never dispatch a payment or policy mutation"
+      ],
+      "baseline_arm": {
+        "class": "algorithm_equivalent",
+        "status": "spec_frozen",
+        "implementation": "Independent response-model specification derived from public documentation",
+        "limitations": [
+          "LN Operator requires LND while Revenue Ops and the current external contenders run on CLN",
+          "Implementation-specific LND routing behavior is not reproduced by a response model",
+          "No direct-product superiority claim is permitted from this arm"
+        ],
+        "clean_room": true
+      },
+      "promotion_measure": [
+        "Higher realized net profit than both incumbent and documented response model",
+        "Lower paid refill cost per subsequently converted routed sat",
+        "No worse useful-volume retention or failed-forward service rate"
+      ],
+      "rollback_rule": [
+        "Disable failed-forward demand weighting if censored-demand calibration overpredicts realized revenue",
+        "Disable marginal part allocation on ledger mismatch, excess fragmentation, or worse realized payback"
+      ],
+      "evidence": [
+        "Pinned upstream README, configuration, fee-engine, and rebalance-budget documentation",
+        "Direct runtime admission requires a new crossed CLN-versus-LND topology and frozen environment"
+      ]
+    },
+    {
+      "id": "torq",
+      "revision": "982138ba7af4d6a3898a7b25f3924dff5fc9f172",
+      "comparison_class": "workflow_equivalent",
+      "direct_runtime_status": "blocked",
+      "source_and_license": {
+        "source_url": "https://github.com/lncapital/torq",
+        "revision": "982138ba7af4d6a3898a7b25f3924dff5fc9f172",
+        "license": "No license declaration observed in the public deployment repository",
+        "license_evidence": "Pinned repository tree and metadata expose deployment files but no license file"
+      },
+      "observable_behavior": [
+        "User-configurable automation workflows manage channel policies, rebalances, and tags",
+        "Interval and balance-change triggers can evaluate formulas and workflow variables",
+        "Rebalance actions select source and destination criteria, amount, maximum cost, and focus",
+        "Dynamic criteria are re-evaluated after exhausted pairs and focus controls parallel routines",
+        "The public product documentation describes up to 100 concurrent routines and a two-hour routine lifetime"
+      ],
+      "independent_specification": [
+        "Freeze an explicit strongest-plausible workflow before evaluation; Torq has no single canonical fee algorithm",
+        "Represent each trigger, filter, formula, source/destination criterion, amount, cost ceiling, concurrency, and cooldown",
+        "Evaluate that immutable workflow on the same evidence and traffic while labeling it workflow-equivalent"
+      ],
+      "competitor_omitted_variable": [
+        "Generic workflow composition does not itself optimize global marginal net profit",
+        "High parallelism can race on shared liquidity without a common reservation and opportunity-cost ledger",
+        "A user-defined policy cannot be compared until every formula and trigger is exported and pinned"
+      ],
+      "revenue_enhancement_hypothesis": [
+        "Use event-driven candidate recomputation but rank all eligible jobs by conservative marginal portfolio EV",
+        "Share durable liquidity and spend reservations across fee and rebalance decisions",
+        "Adapt concurrency to disjoint route and channel resources instead of a fixed routine count"
+      ],
+      "safety_invariants": [
+        "No mutable latest image or unexported workflow may enter a scored arm",
+        "Concurrent jobs must reserve shared channel liquidity and budget before dispatch",
+        "Malformed formulas, missing variables, and stale channel state fail closed",
+        "Read-only collection remains non-dispatching"
+      ],
+      "baseline_arm": {
+        "class": "workflow_equivalent",
+        "status": "spec_frozen",
+        "implementation": "Independent strongest-plausible workflow specification from public automation documentation",
+        "limitations": [
+          "The public repository contains deployment material rather than the controller implementation",
+          "The published container reference is mutable and no operator workflow export was supplied",
+          "No direct-product superiority claim is permitted from this arm"
+        ],
+        "clean_room": true
+      },
+      "promotion_measure": [
+        "Higher realized net profit than incumbent and frozen strongest-plausible workflow",
+        "At least equal settled liquidity delivery within the same route-cost and time budget",
+        "Fewer reservation conflicts and no increase in stale-state actions"
+      ],
+      "rollback_rule": [
+        "Return to serial dispatch if adaptive concurrency causes any resource collision or stale-state action",
+        "Disable event-triggered recomputation if action churn rises without positive incremental net"
+      ],
+      "evidence": [
+        "Pinned upstream deployment README and compose configuration",
+        "Official Torq automation and rebalancing documentation",
+        "Direct runtime admission requires a digest-pinned image and complete immutable workflow export"
+      ]
+    }
+  ]
+}

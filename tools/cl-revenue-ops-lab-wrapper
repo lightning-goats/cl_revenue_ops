@@ -1,8 +1,8 @@
 #!/bin/sh
 # Launch cl_revenue_ops from the isolated Python environment installed in a
-# Polar CLN container.  Polar's stock CLN image deliberately has no system
-# Python, so relying on /usr/bin/env python3 makes fresh-network runs differ
-# from the pinned test environment.
+# Grand Prix CLN container. The pinned lab image has no compatible system
+# Python environment, so relying on /usr/bin/env python3 would make fresh runs
+# differ from the frozen contender environment.
 set -eu
 
 PLUGIN_ROOT="${CL_REVENUE_OPS_ROOT:-/opt/cl_revenue_ops}"

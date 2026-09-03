@@ -72,14 +72,14 @@ RUN python3 -m venv /opt/cl_revenue_ops/.venv \
     && /opt/cl_revenue_ops/.venv/bin/pip install \
         --disable-pip-version-check --no-index --find-links=/opt/cl_revenue_ops/wheels \
         -r /opt/cl_revenue_ops/requirements.txt \
-    && cp /opt/cl_revenue_ops/tools/cl-revenue-ops-polar-wrapper \
-        /opt/cl_revenue_ops/cl-revenue-ops-polar-wrapper \
+    && cp /opt/cl_revenue_ops/tools/cl-revenue-ops-lab-wrapper \
+        /opt/cl_revenue_ops/cl-revenue-ops-lab-wrapper \
     && chmod 755 \
-        /opt/cl_revenue_ops/cl-revenue-ops-polar-wrapper \
+        /opt/cl_revenue_ops/cl-revenue-ops-lab-wrapper \
         /usr/local/libexec/clboss \
         /usr/local/libexec/xrebalance \
     && rm -rf /opt/cl_revenue_ops/wheels
-LABEL org.opencontainers.image.title="Polar CLBOSS competition contender"
+LABEL org.opencontainers.image.title="Grand Prix competition contender"
 LABEL org.opencontainers.image.description="Equal CLN runtime containing pinned cl_revenue_ops, CLBOSS, and xrebalance contenders"
 LABEL org.opencontainers.image.version.cln="v26.06.7"
 LABEL org.opencontainers.image.source.cln="https://github.com/ElementsProject/lightning/releases/download/v26.06.7/clightning-v26.06.7-Ubuntu-22.04-amd64.tar.xz"

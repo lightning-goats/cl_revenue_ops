@@ -1,11 +1,11 @@
-"""Polar runbook acceptance suite for the post-remediation rebalancer.
+"""Acceptance suite for the post-remediation rebalancer.
 
 Phase 6 Steps 1, 2, 4 of docs/superpowers/plans/2026-04-18-rebalancer-post-polar-remediation.md.
 
-These tests encode the Polar scenarios that drove the remediation and pin
+These tests encode the lab scenarios that drove the remediation and pin
 the acceptance criteria in the plan against the unit-testable surface.
 
-Step 3 (live Polar reruns) is operator-only and not covered here.
+Step 3 (live lab reruns) is operator-only and not covered here.
 """
 
 from modules.capex_budget import CapexAllocations, ChannelCapexBudget

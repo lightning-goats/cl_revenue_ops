@@ -1,0 +1,30 @@
+{
+  "schema": "polar-grand-prix-calibration-v1",
+  "observed_date_utc": "2026-09-01",
+  "source": "production_read_only_remote_aggregation",
+  "privacy": {"aggregated_on_production_host": true, "raw_identifiers_exported": false, "raw_payment_records_exported": false},
+  "channels": {
+    "channel_count": 10,
+    "active_count": 8,
+    "capacity_histogram_sats": {"lt_2m": 2, "2m_5m": 2, "5m_10m": 3, "10m_20m": 2, "gte_20m": 1},
+    "local_balance_ratio_distribution": {"0_10pct": 2, "10_30pct": 2, "30_70pct": 2, "70_90pct": 2, "90_100pct": 2},
+    "fee_distribution_ppm": {"0_49": 2, "50_99": 2, "100_249": 2, "250_499": 2, "gte_500": 2},
+    "channel_age_blocks": {"lt_4320": 2, "4320_12960": 2, "12960_52560": 2, "gte_52560": 2},
+    "peer_degree": {"observed_peer_count": 9, "buckets": {"lt_10": 2, "10_49": 2, "50_199": 2, "200_499": 2, "gte_500": 1}}
+  },
+  "traffic_30d": {
+    "window_days": 30,
+    "settled_count": 10,
+    "failed_count": 3,
+    "forward_size_distribution_sats": {"lt_5k": 2, "5k_20k": 2, "20k_100k": 2, "100k_500k": 2, "gte_500k": 2},
+    "interarrival_distribution_seconds": {"lt_1": 2, "1_10": 2, "10_60": 2, "60_300": 2, "gte_300": 1},
+    "time_of_day_distribution_utc": {"00_06": 3, "06_12": 3, "12_18": 2, "18_24": 2},
+    "forward_direction_distribution": {"inbound_dominant": 2, "balanced": 3, "outbound_dominant": 3},
+    "revenue_concentration_pct": {"top_5": 70.0, "top_10": 100.0}
+  },
+  "unavailable": {
+    "route_length_distribution": "unavailable",
+    "failure_code_distribution": "unavailable",
+    "rebalance_cost_distribution": "unavailable"
+  }
+}
