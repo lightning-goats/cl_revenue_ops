@@ -94,6 +94,25 @@ msat versus 30,799,832 msat. A conservative repeat-paid-demand probe improved
 r51 revenue to 15,025,471 msat but still could not overcome CLBOSS's
 55,383,318 msat under the same ceiling.
 
+A Docker-only mainline-v9 cap sweep then tested whether a modest production
+increase could close that gap safely. At 3,000 ppm, r64 carried 40.136B msat
+versus CLBOSS's 9.675B but earned only 49,956,041 versus 65,286,275 msat; only
+233/240 payments settled, so both the revenue objective and delivery gate
+failed. At 5,000 ppm, two fresh Revenue-B replicas independently left native
+CLN multipart payments unresolved beyond xpay's five-second retry horizon and
+the harness's 120-second RPC bound (r60 payment 171 and r62 payment 143). The
+r60 timeout advance eventually forced two payer channels on-chain. A 10,000
+ppm repeat, r66, produced the same unresolved-payment failure at payment 206.
+
+These results are non-monotonic with the successful 50,000-ppm v9 tournament
+because fee surfaces change native route and multipart composition; the high
+ceiling result cannot be interpolated into a safe production setting. No cap
+increase or yield-aware activation is approved from this sweep. Production
+remains in the healthy default `undercut` mode with its 1,200-ppm maximum.
+The runner now marks an unresolved replica `public_traffic_invalid` as soon as
+timeout handling puts a payer channel on-chain, preventing a damaged graph
+from being resumed or scored.
+
 V11 tested a faster repeat-paid-demand probe. At a 5,000-ppm rail in r53,
 Revenue Ops retained 1.86x the volume and 3.07x the route count but earned only
 80% of CLBOSS revenue. At a 10,000-ppm rail in crossed r54, it won all three
