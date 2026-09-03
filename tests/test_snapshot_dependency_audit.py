@@ -50,10 +50,10 @@ PINNED_COUNTS = {
     # one atomic episode volume/count/minimum aggregate. All are
     # replay-captured evidence.
     ("fee", "database"): 30,
-    # Fee replay clock seam: 27 effective reads now use decision_now(),
-    # 10 cache-TTL reads remain raw, and one dead contextual read was removed.
-    # +1 replay-clock read establishes a common acquisition admission time.
-    ("fee", "wall_clock"): 38,
+    # Fee replay clock seam: 30 effective reads now use decision_now(),
+    # including one notification-safe yield-inventory wake cooldown; 10
+    # cache-TTL reads remain raw and one dead contextual read was removed.
+    ("fee", "wall_clock"): 39,
     ("rebalance", "analyzer_cache"): 0,
     ("rebalance", "live_rpc"): 14,
     # 18 -> 20 (audit 2026-08-01 wave2): _recover_missing_pending_row

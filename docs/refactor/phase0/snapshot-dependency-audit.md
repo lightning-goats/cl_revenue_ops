@@ -30,7 +30,7 @@ read during decision generation — must migrate).
 | admission_policy | 0 | 0 | 0 | 0 | **none — already pure** |
 | treasury (capex_budget) | 0 | 0 | 3 | 0 | none (budget-state reads = historical/state) |
 | rebalance_engine_v2 | 0 | 14 | 20 | 13 | none in decision path (planning input is pre-collected; RPC/db reads are execution/reconciliation) |
-| fee_controller | 1 | 9 | 30 | 38 | **market/gossip + chain-cost reads mid-decision** |
+| fee_controller | 1 | 9 | 30 | 39 | **market/gossip + chain-cost reads mid-decision** |
 | profitability_analyzer | 0 | 5 | 27 | 23 | n/a — it IS a construction source |
 
 ## Per-module classification
@@ -78,7 +78,7 @@ Decision-generation reads of mutable sources:
 | `_get_canonical_profitability`:2829 | `analyzer.get_profitability` plus one guarded `refresh` on settled-flow contradiction | construction — canonical profitability input; the analyzer output remains the sole value source, while settled flow only signals that its real 30-day zero-forward snapshot is stale |
 | DB reads (`_get_rebalance_cost_floor`:4048, `_get_channel_rebalance_cost_ppm`:3516, fee-strategy rows :3579/:3966) | rebalance-cost history, DTS/PID controller state | historical + controller_state — allowed by the Phase C contract (`fee_controller(snapshot, controller_state, config)`) |
 | `set_initial_fee`:7893 | live channel lookup | event-driven (new-channel hook), outside the cycle — document as event-path exception, evaluate against latest snapshot + freshness gate |
-| 38 effective wall-clock sites (DTS sampling, posterior updates, cache TTLs) | `decision_now()` for 28 decision/state reads; `time.time()` for 10 cache/observation reads | replay clock seam complete for effective decision and mutating-state reads; cache TTL clocks remain construction mechanics whose materialized evidence is captured. The bounded acquisition admission pass uses one replay-clock timestamp for all lane comparisons. |
+| 39 effective wall-clock sites (DTS sampling, posterior updates, cache TTLs, yield-inventory wake cooldown) | `decision_now()` for 30 decision/state/cadence reads; `time.time()` for 10 cache/observation reads, with one source line containing two replay-clock calls | replay clock seam complete for effective decision and mutating-state reads; cache TTL clocks remain construction mechanics whose materialized evidence is captured. The bounded acquisition admission pass uses one replay-clock timestamp for all lane comparisons. The yield-inventory notification monitor uses one replay-clock read only to coalesce wake cadence; it performs no policy decision, database read, CLN RPC, or fee mutation. |
 | Acquisition qualification/lifecycle reads (`get_channel_probe`, idle `get_forward_count_since`, `get_acquisition_forward_evidence_since`) | cold-lane eligibility plus one atomic episode volume/count/minimum-payment aggregate for loss caps and the paid base-fee undercut | controller_state — allowed and captured through the replay evidence seam; persisted episode base/proportional baseline and phase state are restart-safe. These three sites raise the database pin 27→30. |
 
 

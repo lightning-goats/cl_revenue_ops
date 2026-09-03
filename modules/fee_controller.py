@@ -3140,6 +3140,12 @@ class FeeController:
     YIELD_SUBSTITUTE_CAPACITY_MIN_RATIO = 0.80
     YIELD_SUBSTITUTE_CAPACITY_MAX_RATIO = 1.25
     YIELD_SUBSTITUTE_UNDERCUT_RATIO = 0.99
+    # A settled-forward notification may wake the existing governed fee loop
+    # after a material yield-aware inventory move.  The notification itself
+    # performs no fee mutation or CLN RPC.  Coalescing and cooldown keep burst
+    # traffic from turning a balance trigger into a fee-cycle storm.
+    YIELD_BALANCE_WAKE_VOLUME_MSAT = 50_000_000
+    YIELD_BALANCE_WAKE_MIN_INTERVAL_SECONDS = 5
     # Organic flow after a successful acquisition episode moves liquidity
     # away from a saturated egress and toward a depleted ingress. Credit only
     # a tiny, bounded share of that avoided rebalance value, and retain a
@@ -3820,6 +3826,63 @@ class FeeController:
             )
             return should_wake
 
+    def should_wake_yield_inventory_cycle(
+        self, channel_id: Any, out_msat: Any
+    ) -> bool:
+        """Coalesce material balance changes for yield-aware repricing.
+
+        Notification-safe: there is no database or CLN RPC and no channel
+        policy mutation.  A true result only asks the already-authorized fee
+        loop to re-evaluate durable evidence.  Missing or malformed inputs,
+        configuration failures, and non-yield modes fail neutral.
+        """
+        try:
+            if isinstance(out_msat, bool):
+                return False
+            amount_msat = int(out_msat)
+            if amount_msat <= 0 or float(out_msat) != amount_msat:
+                return False
+            normalized_channel_id = str(channel_id or "")
+            if not normalized_channel_id:
+                return False
+            try:
+                cfg = (
+                    self.config.snapshot()
+                    if hasattr(self.config, "snapshot")
+                    else self.config
+                )
+            except Exception:
+                return False
+            if getattr(cfg, "market_fee_mode", "undercut") != "yield_aware":
+                return False
+            try:
+                now = int(decision_now("yield_inventory_wake"))
+            except Exception:
+                return False
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+
+        threshold = self.YIELD_BALANCE_WAKE_VOLUME_MSAT
+        cooldown = self.YIELD_BALANCE_WAKE_MIN_INTERVAL_SECONDS
+        with self._yield_inventory_wake_lock:
+            pending = min(
+                threshold * 2,
+                self._yield_inventory_pending_msat.get(
+                    normalized_channel_id, 0
+                ) + amount_msat,
+            )
+            self._yield_inventory_pending_msat[normalized_channel_id] = pending
+            if pending < threshold:
+                return False
+            last_wake = self._yield_inventory_last_wake.get(
+                normalized_channel_id, 0
+            )
+            if last_wake and now - last_wake < cooldown:
+                return False
+            self._yield_inventory_pending_msat[normalized_channel_id] = 0
+            self._yield_inventory_last_wake[normalized_channel_id] = now
+            return True
+
     def _complete_acquisition_experiment(
         self,
         episode: Dict[str, Any],
@@ -4195,6 +4258,9 @@ class FeeController:
         self._acquisition_monitor_episodes: Dict[str, Dict[str, Any]] = {}
         self._acquisition_monitor_pending: Dict[str, Tuple[int, int]] = {}
         self._acquisition_monitor_initialized = False
+        self._yield_inventory_wake_lock = threading.Lock()
+        self._yield_inventory_pending_msat: Dict[str, int] = {}
+        self._yield_inventory_last_wake: Dict[str, int] = {}
         # A settled-forward contradiction may trigger one expensive canonical
         # profitability refresh. Back off failures/concurrent-cache returns so
         # compressed fee cycles cannot create a refresh storm.

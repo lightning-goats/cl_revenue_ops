@@ -6126,19 +6126,25 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
 
         # Persist evidence before requesting evaluation.  The notification
         # handler never mutates fees; it only wakes the existing governed loop
-        # after a fixed active-experiment volume/loss step.
+        # after a fixed active-experiment or yield-inventory volume step.
         if fee_controller is not None:
             try:
-                if (
-                    _fee_authority_denial("acquisition_monitor_trigger") is None
-                    and fee_controller.should_wake_acquisition_cycle(
+                wake_requested = False
+                if _fee_authority_denial("acquisition_monitor_trigger") is None:
+                    wake_requested = fee_controller.should_wake_acquisition_cycle(
                         out_channel, out_msat
                     )
-                ):
+                    if not wake_requested:
+                        wake_requested = (
+                            fee_controller.should_wake_yield_inventory_cycle(
+                                out_channel, out_msat
+                            )
+                        )
+                if wake_requested:
                     _request_fee_adjustment_wake()
             except Exception as exc:
                 plugin.log(
-                    f"ACQUISITION_MONITOR: settled evidence ignored: {exc}",
+                    f"FEE_WAKE_MONITOR: settled evidence ignored: {exc}",
                     level="debug",
                 )
 

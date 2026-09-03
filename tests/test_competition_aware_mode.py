@@ -115,6 +115,88 @@ class TestYieldAwareDemandTarget:
         assert self._target(outbound_ratio=0.90) < self._target(outbound_ratio=0.5)
 
 
+class TestYieldAwareBalanceWake:
+    def _controller(self, mock_plugin, mock_config, mock_database):
+        mock_config.market_fee_mode = "yield_aware"
+        return FeeController(
+            mock_plugin,
+            mock_config,
+            mock_database,
+            fee_authority_gate=FeeAuthorityGate(enabled=True),
+        )
+
+    def test_material_volume_wakes_with_per_channel_cooldown(
+        self, mock_plugin, mock_config, mock_database, monkeypatch
+    ):
+        now = [100]
+        monkeypatch.setattr(
+            "modules.fee_controller.decision_now", lambda _label: now[0]
+        )
+        fc = self._controller(mock_plugin, mock_config, mock_database)
+
+        assert not fc.should_wake_yield_inventory_cycle("1x1x0", 25_000_000)
+        assert fc.should_wake_yield_inventory_cycle("1x1x0", 25_000_000)
+        assert not fc.should_wake_yield_inventory_cycle("1x1x0", 50_000_000)
+        now[0] += fc.YIELD_BALANCE_WAKE_MIN_INTERVAL_SECONDS
+        assert fc.should_wake_yield_inventory_cycle("1x1x0", 1)
+        # A different channel has independent volume and cooldown state.
+        assert fc.should_wake_yield_inventory_cycle("2x2x0", 50_000_000)
+
+    @pytest.mark.parametrize(
+        "channel_id,out_msat",
+        [
+            (None, 50_000_000),
+            ("1x1x0", "malformed"),
+            ("1x1x0", True),
+            ("1x1x0", 0),
+            ("1x1x0", float("nan")),
+        ],
+    )
+    def test_absent_or_malformed_evidence_is_neutral(
+        self, mock_plugin, mock_config, mock_database, channel_id, out_msat
+    ):
+        fc = self._controller(mock_plugin, mock_config, mock_database)
+        assert not fc.should_wake_yield_inventory_cycle(channel_id, out_msat)
+
+    def test_non_yield_mode_is_neutral_and_performs_no_io(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        mock_config.market_fee_mode = "undercut"
+        fc = FeeController(
+            mock_plugin,
+            mock_config,
+            mock_database,
+            fee_authority_gate=FeeAuthorityGate(enabled=True),
+        )
+
+        assert not fc.should_wake_yield_inventory_cycle(
+            "1x1x0", 50_000_000
+        )
+        mock_plugin.rpc.assert_not_called()
+        mock_database.assert_not_called()
+
+    def test_snapshot_failure_is_neutral(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        fc = self._controller(mock_plugin, mock_config, mock_database)
+        mock_config.snapshot.side_effect = RuntimeError("config unavailable")
+        assert not fc.should_wake_yield_inventory_cycle(
+            "1x1x0", 50_000_000
+        )
+
+    def test_clock_failure_is_neutral(
+        self, mock_plugin, mock_config, mock_database, monkeypatch
+    ):
+        fc = self._controller(mock_plugin, mock_config, mock_database)
+        monkeypatch.setattr(
+            "modules.fee_controller.decision_now",
+            MagicMock(side_effect=RuntimeError("clock unavailable")),
+        )
+        assert not fc.should_wake_yield_inventory_cycle(
+            "1x1x0", 50_000_000
+        )
+
+
 class TestYieldScarceMarketAnchor:
     def test_healthy_inventory_keeps_broad_yield_anchor(self):
         assert FeeController._yield_scarce_market_anchor(

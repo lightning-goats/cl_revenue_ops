@@ -145,6 +145,34 @@ class TestForwardWriteCoalescing:
         db.record_forward_and_reputation.assert_called_once()
         mod._request_fee_adjustment_wake.assert_not_called()
 
+    def test_settled_forward_can_wake_yield_inventory_after_persist(self):
+        mod = _module()
+        order = []
+        db = MagicMock(spec=[
+            "record_forward_and_reputation", "record_forward",
+            "update_peer_reputation",
+        ])
+        db.record_forward_and_reputation.side_effect = (
+            lambda *args: order.append("persist")
+        )
+        mod.database = db
+        mod._resolve_scid_to_peer = MagicMock(return_value=PEER)
+        mod.fee_controller = MagicMock()
+        mod.fee_controller.should_wake_acquisition_cycle.side_effect = (
+            lambda *args: order.append("acquisition") or False
+        )
+        mod.fee_controller.should_wake_yield_inventory_cycle.side_effect = (
+            lambda *args: order.append("yield") or True
+        )
+        mod._request_fee_adjustment_wake = lambda: order.append("wake")
+
+        mod._on_forward_event_impl(_settled_event(), mod.plugin)
+
+        assert order == ["persist", "acquisition", "yield", "wake"]
+        mod.fee_controller.should_wake_yield_inventory_cycle.assert_called_once_with(
+            "200x2x0", 999_000
+        )
+
     def test_disabled_authority_does_not_wake_acquisition_monitor(self):
         mod = _module()
         _disable_fee_authority(mod)
@@ -161,6 +189,7 @@ class TestForwardWriteCoalescing:
 
         db.record_forward_and_reputation.assert_called_once()
         mod.fee_controller.should_wake_acquisition_cycle.assert_not_called()
+        mod.fee_controller.should_wake_yield_inventory_cycle.assert_not_called()
         mod._request_fee_adjustment_wake.assert_not_called()
 
     def test_failed_forward_still_penalizes_reputation_immediately(self):

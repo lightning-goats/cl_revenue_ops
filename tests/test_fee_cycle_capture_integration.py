@@ -89,6 +89,7 @@ DECISION_CALL_CONTRACT = {
             "'fee.apply'": 1,
             "'fee.state_sync'": 1,
             "'failed_forward.record'": 1,
+            "'yield_inventory_wake'": 1,
             "'cycle.started_at'": 1,
             "'acquisition.prepare'": 1,
         }
@@ -122,7 +123,7 @@ def _decision_call_inventory(source):
 def _assert_decision_call_contract(source):
     actual = _decision_call_inventory(source)
     assert {name: sum(counts.values()) for name, counts in actual.items()} == {
-        "decision_now": 29,
+        "decision_now": 30,
         "decision_gauss": 4,
         "decision_random": 1,
     }
