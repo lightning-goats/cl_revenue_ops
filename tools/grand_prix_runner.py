@@ -1644,6 +1644,39 @@ def _native_invoice_state(
     return "unknown"
 
 
+def _native_payer_has_onchain_channel(
+    network_id: int, topology: dict[str, Any], payer: str
+) -> bool:
+    """Return whether timeout resolution has destroyed graph comparability."""
+    implementations = {
+        str(row["name"]): str(row["implementation"])
+        for row in base_nodes(topology)
+    }
+    if implementations.get(payer) == "cln":
+        rows = _cln_rpc(
+            _base_container_name(network_id, payer), "listpeerchannels",
+            base_managed=True,
+        ).get("channels")
+        return any(
+            isinstance(row, dict)
+            and str(row.get("state", "")).casefold() == "onchain"
+            for row in rows or []
+        )
+    if implementations.get(payer) == "lnd":
+        pending = _lnd_node_rpc(
+            network_id, payer, topology, "pendingchannels"
+        )
+        return any(
+            isinstance(pending.get(key), list) and bool(pending[key])
+            for key in (
+                "pending_force_closing_channels",
+                "waiting_close_channels",
+                "pending_closing_channels",
+            )
+        )
+    raise RunnerError(f"unsupported traffic payer {payer}")
+
+
 def _pay_native(
     network_id: int,
     topology: dict[str, Any],
@@ -1842,6 +1875,22 @@ def reconcile_public_unknown(
         outcome = "settled"
     elif invoice_state in {"open", "unpaid", "canceled", "cancelled"} and not inflight:
         outcome = "failed"
+    elif inflight and _native_payer_has_onchain_channel(
+        network_id, topology, payer
+    ):
+        # Once timeout handling closes a channel, later traffic no longer sees
+        # the frozen graph. Preserve the ambiguous checkpoint, but make the
+        # whole replica explicitly non-scoreable instead of inviting further
+        # block advances or a misleading resume.
+        state["status"] = "public_traffic_invalid"
+        _checkpoint(
+            state_path,
+            state,
+            "public_reconciliation_invalidated",
+            sequence=sequence,
+            reason="payer_channel_onchain",
+        )
+        return state
     else:
         raise RunnerError(
             f"payment {sequence} remains unresolved (invoice={invoice_state}, inflight={inflight})"

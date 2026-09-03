@@ -666,6 +666,52 @@ def test_reverse_unknown_payment_reconciliation_is_read_only(
     assert all(call[2][0] in {"listinvoices", "listsendpays", "listpayments"} for call in calls)
 
 
+def test_reconciliation_invalidates_replica_after_payer_channel_goes_onchain(
+    tmp_path, monkeypatch
+):
+    runner = _module()
+    topology = _topology()
+    topology["traffic"][0].update({
+        "payer": "cln-payer",
+        "sink": "cln-sink",
+    })
+    state_path = tmp_path / "state.json"
+    state = {
+        "schema": runner.SCHEMA,
+        "network_id": 9,
+        "network_name": runner.DEFAULT_NAME,
+        "topology_digest": runner._digest(topology),
+        "replica": 1,
+        "status": "public_traffic_unknown",
+        "public_traffic": {"records": []},
+        "events": [
+            {"event": "public_payment_unknown", "sequence": 0},
+            {"event": "public_timeout_blocks_mined", "blocks": 144},
+        ],
+    }
+    runner._write_json_atomic(state_path, state)
+
+    def fake_cln(_container, *arguments, **_kwargs):
+        if arguments[0] == "listinvoices":
+            return {"invoices": [{"status": "open"}]}
+        if arguments[0] == "listsendpays":
+            return {"payments": [{"status": "pending"}]}
+        if arguments[0] == "listpeerchannels":
+            return {"channels": [{"state": "ONCHAIN"}]}
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(runner, "_cln_rpc", fake_cln)
+    result = runner.reconcile_public_unknown(topology, state_path=state_path)
+
+    assert result["status"] == "public_traffic_invalid"
+    assert result["public_traffic"]["records"] == []
+    event = result["events"][-1]
+    assert event["event"] == "public_reconciliation_invalidated"
+    assert event["sequence"] == 0
+    assert event["reason"] == "payer_channel_onchain"
+    assert isinstance(event["at"], int)
+
+
 def test_timeout_advance_is_unknown_state_only_bounded_and_checkpointed(tmp_path):
     runner = _module()
     topology = _topology()
