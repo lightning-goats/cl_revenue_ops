@@ -44,6 +44,9 @@ EVIDENCE_OPERATION_CONTRACT = {
     "gossip_channels",
     "neighbor_fee_median",
     "neighbor_fee_percentile",
+    "yield_market_anchor",
+    "yield_market_frontier",
+    "yield_substitute_quote",
     "peer_latency",
     "channel_cost_history",
     "peer_fee_history",
@@ -739,6 +742,51 @@ def test_neighbor_cache_effective_values_are_recorded_once_at_first_use(
             "op": "neighbor_fee_percentile",
             "args": [PEER_ID, 0.25],
             "result": None,
+        },
+    ]
+
+
+def test_yield_market_effective_values_are_frozen_and_recorded_once(
+    tmp_path, monkeypatch, capture_session
+):
+    controller, _manager = _capture_controller(tmp_path)
+    controller._cycle_observations = {}
+    anchor_live = MagicMock(return_value=9000)
+    frontier_live = MagicMock(return_value=360)
+    substitute_live = MagicMock(return_value=2400)
+    monkeypatch.setattr(controller, "_get_yield_market_anchor_live", anchor_live)
+    monkeypatch.setattr(controller, "_get_yield_market_frontier_live", frontier_live)
+    monkeypatch.setattr(controller, "_get_yield_substitute_quote_live", substitute_live)
+
+    with bind_capture(capture_session):
+        assert controller._get_yield_market_anchor(PEER_ID) == 9000
+        assert controller._get_yield_market_anchor(PEER_ID) == 9000
+        assert controller._get_yield_market_frontier(PEER_ID) == 360
+        assert controller._get_yield_market_frontier(PEER_ID) == 360
+        assert controller._get_yield_substitute_quote(PEER_ID, 15_000_000) == 2400
+        assert controller._get_yield_substitute_quote(PEER_ID, 15_000_000) == 2400
+
+    anchor_live.assert_called_once_with(PEER_ID, None)
+    frontier_live.assert_called_once_with(PEER_ID, None)
+    substitute_live.assert_called_once_with(PEER_ID, 15_000_000, None)
+    assert capture_session.observations["evidence"] == [
+        {
+            "ordinal": 0,
+            "op": "yield_market_anchor",
+            "args": [PEER_ID],
+            "result": 9000,
+        },
+        {
+            "ordinal": 1,
+            "op": "yield_market_frontier",
+            "args": [PEER_ID],
+            "result": 360,
+        },
+        {
+            "ordinal": 2,
+            "op": "yield_substitute_quote",
+            "args": [PEER_ID, 15_000_000],
+            "result": 2400,
         },
     ]
 

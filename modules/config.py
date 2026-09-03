@@ -365,7 +365,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
     'fee_profile': ('active', 'conservative'),
     'rebalance_router': ('v3',),
-    'market_fee_mode': ('undercut', 'match', 'premium', 'competition_aware'),
+    'market_fee_mode': (
+        'undercut', 'match', 'premium', 'competition_aware', 'yield_aware'
+    ),
     'risk_profile': ('preserve', 'conservative', 'balanced', 'growth',
                      'custom'),
 }

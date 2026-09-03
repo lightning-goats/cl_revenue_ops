@@ -1303,6 +1303,9 @@ plugin.add_option(
         '"premium": price above the median using the same per-corridor '
         'weight that would otherwise undercut. Use "premium" in '
         'inelastic-demand markets to maximize revenue per forward. '
+        '"yield_aware": ratchet upward only after paid demand, combining '
+        'capacity-weighted market power with inventory scarcity while '
+        'retaining configured fee rails and a bounded yield-discovery step. '
         '"competition_aware": apply the median-undercut ONLY when a '
         "competitor is priced at or below DTS's target; preserve DTS when "
         "we're already below every competitor (undercut would otherwise "

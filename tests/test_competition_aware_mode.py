@@ -50,6 +50,259 @@ class TestMarketFeeModeEnum:
         assert 'match' in valid
         assert 'premium' in valid
 
+    def test_yield_aware_is_valid_value(self):
+        assert 'yield_aware' in STRING_ENUM_VALID_VALUES['market_fee_mode']
+
+
+class TestYieldAwareDemandTarget:
+    def test_yield_market_multiplier_is_explicitly_bounded(self):
+        assert FeeController.YIELD_MARKET_MIN_MULTIPLIER == 0.88
+        assert FeeController.YIELD_MARKET_MAX_MULTIPLIER == 1.0
+        assert FeeController.YIELD_DEMAND_MAX_PREMIUM == 0.02
+
+    def _target(self, **overrides):
+        values = {
+            "current_fee_ppm": 200,
+            "neighbor_median_ppm": 300,
+            "outbound_ratio": 0.5,
+            "forwards_since_update": 2,
+            "market_power_weight": 0.10,
+            "max_fee_ppm": 50_000,
+        }
+        values.update(overrides)
+        return FeeController._yield_aware_demand_target(**values)
+
+    def test_paid_demand_targets_above_current_but_below_market(self):
+        assert 200 < self._target() < 300
+
+    def test_scarce_inventory_accelerates_yield_target(self):
+        assert self._target(outbound_ratio=0.1) > self._target(outbound_ratio=0.5)
+
+    def test_more_paid_demand_increases_but_ceiling_bounds_target(self):
+        low = self._target(forwards_since_update=1)
+        high = self._target(forwards_since_update=100)
+        assert high > low
+        assert self._target(
+            current_fee_ppm=40_000,
+            neighbor_median_ppm=80_000,
+            forwards_since_update=100,
+        ) == 50_000
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"forwards_since_update": "malformed"},
+            {"outbound_ratio": float("nan")},
+            {"outbound_ratio": True},
+            {"max_fee_ppm": 0},
+        ],
+    )
+    def test_absent_malformed_or_saturated_evidence_is_neutral(self, overrides):
+        assert self._target(**overrides) is None
+
+    def test_missing_neighbor_median_still_uses_paid_local_demand(self):
+        assert self._target(neighbor_median_ppm=None) > 200
+
+    def test_market_quote_initializes_before_paid_demand(self):
+        assert 200 < self._target(forwards_since_update=0) < 300
+
+    def test_absent_market_and_demand_is_neutral(self):
+        assert self._target(
+            neighbor_median_ppm=None, forwards_since_update=0
+        ) is None
+
+    def test_saturated_inventory_undercuts_more_aggressively(self):
+        assert self._target(outbound_ratio=0.90) < self._target(outbound_ratio=0.5)
+
+
+class TestYieldScarceMarketAnchor:
+    def test_healthy_inventory_keeps_broad_yield_anchor(self):
+        assert FeeController._yield_scarce_market_anchor(
+            yield_anchor_ppm=10_000,
+            frontier_ppm=400,
+            substitute_ppm=2_500,
+            outbound_ratio=0.50,
+        ) == 10_000
+
+    def test_scarce_inventory_bridges_to_frontier(self):
+        assert FeeController._yield_scarce_market_anchor(
+            yield_anchor_ppm=10_000,
+            frontier_ppm=400,
+            substitute_ppm=None,
+            outbound_ratio=0.20,
+        ) == 2_000
+
+    def test_comparable_substitute_is_an_undercut_ceiling(self):
+        assert FeeController._yield_scarce_market_anchor(
+            yield_anchor_ppm=10_000,
+            frontier_ppm=2_500,
+            substitute_ppm=3_000,
+            outbound_ratio=0.20,
+        ) == 2_970
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"yield_anchor_ppm": None},
+            {"frontier_ppm": "bad"},
+            {"frontier_ppm": 20_000},
+            {"outbound_ratio": float("nan")},
+            {"outbound_ratio": True},
+        ],
+    )
+    def test_absent_or_malformed_required_evidence_is_neutral(self, overrides):
+        values = {
+            "yield_anchor_ppm": 10_000,
+            "frontier_ppm": 400,
+            "substitute_ppm": 2_500,
+            "outbound_ratio": 0.20,
+        }
+        values.update(overrides)
+        assert FeeController._yield_scarce_market_anchor(**values) is None
+
+
+class TestYieldScarceInventoryFloor:
+    def _floor(self, **overrides):
+        values = {
+            "inventory_floor_ppm": 14_000,
+            "policy_floor_ppm": 60,
+            "yield_market_anchor_ppm": 1_800,
+            "yield_broad_market_anchor_ppm": 9_000,
+            "frontier_ppm": 360,
+            "outbound_ratio": 0.15,
+        }
+        values.update(overrides)
+        return FeeController._yield_scarce_inventory_floor(**values)
+
+    def test_valid_scarce_frontier_constrains_depleted_inventory_floor(self):
+        assert self._floor() == 1_800
+
+    def test_policy_floor_remains_hard(self):
+        assert self._floor(
+            policy_floor_ppm=2_000,
+            yield_market_anchor_ppm=1_800,
+        ) == 2_000
+
+    def test_healthy_inventory_preserves_inventory_floor(self):
+        assert self._floor(outbound_ratio=0.50) == 14_000
+
+    def test_survival_reserve_preserves_inventory_floor(self):
+        assert self._floor(outbound_ratio=0.09) == 14_000
+
+    def test_survival_reserve_boundary_still_allows_market_relief(self):
+        assert self._floor(outbound_ratio=0.10) == 1_800
+
+    def test_broad_anchor_without_frontier_discount_preserves_floor(self):
+        assert self._floor(yield_market_anchor_ppm=9_000) == 14_000
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"yield_market_anchor_ppm": None},
+            {"yield_broad_market_anchor_ppm": "bad"},
+            {"frontier_ppm": None},
+            {"frontier_ppm": 10_000},
+            {"outbound_ratio": float("nan")},
+            {"outbound_ratio": True},
+        ],
+    )
+    def test_absent_or_malformed_evidence_preserves_floor(self, overrides):
+        assert self._floor(**overrides) == 14_000
+
+
+class TestYieldMarketAnchor:
+    def _controller(self, mock_plugin, mock_config, mock_database, channels):
+        mock_config.fee_interval = 15
+        mock_config.max_fee_ppm = 50_000
+        controller = FeeController(
+            mock_plugin, mock_config, mock_database,
+            fee_authority_gate=FeeAuthorityGate(),
+        )
+        controller._our_node_id = "02ourid"
+        controller.data_service = MagicMock()
+        controller.data_service.get_channels.return_value = {"channels": channels}
+        controller._neighbor_fee_cache = {}
+        return controller
+
+    def test_capacity_weighted_p75_retains_high_feasible_quotes(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        channels = [
+            {"source": "02a", "active": True, "fee_per_millionth": 100,
+             "fee_base_msat": 0, "satoshis": 1_000_000},
+            {"source": "02b", "active": True, "fee_per_millionth": 1_000,
+             "fee_base_msat": 0, "satoshis": 1_000_000},
+            {"source": "02c", "active": True, "fee_per_millionth": 20_000,
+             "fee_base_msat": 0, "satoshis": 10_000_000},
+            {"source": "02d", "active": True, "fee_per_millionth": 90_000,
+             "fee_base_msat": 0, "satoshis": 100_000_000},
+        ]
+        controller = self._controller(
+            mock_plugin, mock_config, mock_database, channels
+        )
+        assert controller._get_yield_market_anchor_live("02peer", mock_config) == 20_000
+
+    def test_missing_or_malformed_market_is_neutral(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        controller = self._controller(
+            mock_plugin, mock_config, mock_database,
+            [{"source": "02a", "active": True, "fee_per_millionth": "bad"}],
+        )
+        assert controller._get_yield_market_anchor_live("02peer", mock_config) is None
+
+    def test_frontier_uses_capacity_weighted_p25(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        channels = [
+            {"source": "02a", "active": True, "fee_per_millionth": 120,
+             "fee_base_msat": 0, "satoshis": 1_500_000},
+            {"source": "02b", "active": True, "fee_per_millionth": 180,
+             "fee_base_msat": 0, "satoshis": 2_000_000},
+            {"source": "02c", "active": True, "fee_per_millionth": 360,
+             "fee_base_msat": 0, "satoshis": 5_000_000},
+            {"source": "02d", "active": True, "fee_per_millionth": 11_000,
+             "fee_base_msat": 0, "satoshis": 15_000_000},
+        ]
+        controller = self._controller(
+            mock_plugin, mock_config, mock_database, channels
+        )
+        assert controller._get_yield_market_frontier_live(
+            "02peer", mock_config
+        ) == 360
+
+    def test_substitute_quote_uses_only_comparable_capacity(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        channels = [
+            {"source": "02small", "active": True, "fee_per_millionth": 100,
+             "fee_base_msat": 0, "satoshis": 2_000_000},
+            {"source": "02peer1", "active": True, "fee_per_millionth": 2_400,
+             "fee_base_msat": 0, "satoshis": 15_000_000},
+            {"source": "02peer2", "active": True, "fee_per_millionth": 3_000,
+             "fee_base_msat": 0, "satoshis": 14_000_000},
+        ]
+        controller = self._controller(
+            mock_plugin, mock_config, mock_database, channels
+        )
+        assert controller._get_yield_substitute_quote_live(
+            "02peer", 15_000_000, mock_config
+        ) == 2_400
+
+    def test_substitute_quote_requires_broader_market_corroboration(
+        self, mock_plugin, mock_config, mock_database
+    ):
+        controller = self._controller(
+            mock_plugin,
+            mock_config,
+            mock_database,
+            [{"source": "02only", "active": True, "fee_per_millionth": 10,
+              "fee_base_msat": 0, "satoshis": 15_000_000}],
+        )
+        assert controller._get_yield_substitute_quote_live(
+            "02peer", 15_000_000, mock_config
+        ) is None
+
 
 class TestClnDefaultFeeFilter:
     """Phase B.1 (2026-04-23): dormant CLN-default competitors must not

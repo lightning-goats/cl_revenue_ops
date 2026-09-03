@@ -3122,6 +3122,24 @@ class FeeController:
     # the ordinary configured minimum to min_fee_ppm_saturated. Existing
     # economic/policy bounds always win.
     DEPLETED_INVENTORY_MAX_FEE_RANGE_SHARE = 0.50
+    # Yield-aware pricing shadows a capacity-weighted live market quote.  It
+    # always remains at or below that quote: capacity strength, scarce
+    # inventory, and paid demand reduce the undercut, while saturated
+    # inventory increases it.  These rails prevent the multiplicative
+    # demand/scarcity overshoot that can price a productive channel out.
+    YIELD_MARKET_MIN_MULTIPLIER = 0.88
+    YIELD_MARKET_MAX_MULTIPLIER = 1.00
+    YIELD_DEMAND_MAX_PREMIUM = 0.02
+    # A broad p75 is a strong yield anchor while inventory is healthy, but it
+    # can overprice a depleted lane whose closest substitutes are materially
+    # cheaper.  On those lanes, bridge toward the capacity-weighted p25 and
+    # stay just below the closest comparable-capacity quote.  This preserves
+    # a competitive route without turning every channel into a low-fee lane.
+    YIELD_SCARCE_FRONTIER_MIN_OUTBOUND_RATIO = 0.10
+    YIELD_SCARCE_FRONTIER_MAX_OUTBOUND_RATIO = 0.35
+    YIELD_SUBSTITUTE_CAPACITY_MIN_RATIO = 0.80
+    YIELD_SUBSTITUTE_CAPACITY_MAX_RATIO = 1.25
+    YIELD_SUBSTITUTE_UNDERCUT_RATIO = 0.99
     # Organic flow after a successful acquisition episode moves liquidity
     # away from a saturated egress and toward a depleted ingress. Credit only
     # a tiny, bounded share of that avoided rebalance value, and retain a
@@ -4559,6 +4577,42 @@ class FeeController:
                 ),
             ))
 
+    def _get_yield_market_anchor(self, peer_id: str,
+                                 cfg: Optional[Any] = None) -> int | None:
+        return self._frozen_observation(
+            ("yield_market_anchor", str(peer_id)),
+            lambda: record_effective_evidence(
+                "yield_market_anchor", [peer_id],
+                lambda: self._get_yield_market_anchor_live(peer_id, cfg),
+            ),
+        )
+
+    def _get_yield_market_frontier(self, peer_id: str,
+                                   cfg: Optional[Any] = None) -> int | None:
+        return self._frozen_observation(
+            ("yield_market_frontier", str(peer_id)),
+            lambda: record_effective_evidence(
+                "yield_market_frontier", [peer_id],
+                lambda: self._get_yield_market_frontier_live(peer_id, cfg),
+            ),
+        )
+
+    def _get_yield_substitute_quote(self, peer_id: str, our_capacity: Any,
+                                    cfg: Optional[Any] = None) -> int | None:
+        try:
+            capacity_key = int(our_capacity)
+        except (TypeError, ValueError, OverflowError):
+            capacity_key = 0
+        return self._frozen_observation(
+            ("yield_substitute_quote", str(peer_id), capacity_key),
+            lambda: record_effective_evidence(
+                "yield_substitute_quote", [peer_id, capacity_key],
+                lambda: self._get_yield_substitute_quote_live(
+                    peer_id, capacity_key, cfg
+                ),
+            ),
+        )
+
     def _get_dynamic_chain_costs(self) -> Optional[Dict[str, int]]:
         return self._frozen_observation(
             ("chain_costs",),
@@ -4795,6 +4849,159 @@ class FeeController:
         except Exception:
             return None
 
+    def _get_yield_market_anchor_live(
+        self, peer_id: str, cfg: Optional[Any] = None
+    ) -> int | None:
+        """Return a short-cache, capacity-weighted p75 for yield discovery."""
+        try:
+            if cfg is None:
+                cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+            ceiling = int(getattr(cfg, 'max_fee_ppm'))
+            interval = int(getattr(cfg, 'fee_interval', 0) or 0)
+            ttl = max(30, interval * 2) if interval > 0 else 60
+            our_id = self._get_our_id()
+            channels = self._get_peer_inbound_channels(
+                peer_id, ttl_seconds=ttl
+            )
+            weighted = []
+            for channel in channels:
+                if not isinstance(channel, dict):
+                    continue
+                if channel.get('source') == our_id or not channel.get('active', False):
+                    continue
+                fee = channel.get('fee_per_millionth')
+                if isinstance(fee, bool) or not isinstance(fee, int):
+                    continue
+                if not 1 <= fee <= ceiling or self._is_cln_default_fee(channel):
+                    continue
+                capacity = channel.get(
+                    'satoshis', base_to_sats_floor(channel.get('amount_msat', 0))
+                )
+                try:
+                    capacity = int(capacity)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if capacity > 0:
+                    weighted.append((fee, capacity))
+            if len(weighted) < 2:
+                return None
+            weighted.sort(key=lambda row: row[0])
+            threshold = sum(weight for _, weight in weighted) * 0.75
+            cumulative = 0
+            for fee, weight in weighted:
+                cumulative += weight
+                if cumulative >= threshold:
+                    return fee
+            return weighted[-1][0]
+        except Exception:
+            return None
+
+    def _get_yield_market_frontier_live(
+        self, peer_id: str, cfg: Optional[Any] = None
+    ) -> int | None:
+        """Return a short-cache, capacity-weighted p25 market frontier."""
+        try:
+            if cfg is None:
+                cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+            ceiling = int(getattr(cfg, 'max_fee_ppm'))
+            interval = int(getattr(cfg, 'fee_interval', 0) or 0)
+            ttl = max(30, interval * 2) if interval > 0 else 60
+            our_id = self._get_our_id()
+            channels = self._get_peer_inbound_channels(peer_id, ttl_seconds=ttl)
+            weighted = []
+            for channel in channels:
+                if not isinstance(channel, dict):
+                    continue
+                if channel.get('source') == our_id or not channel.get('active', False):
+                    continue
+                fee = channel.get('fee_per_millionth')
+                if isinstance(fee, bool) or not isinstance(fee, int):
+                    continue
+                if not 1 <= fee <= ceiling or self._is_cln_default_fee(channel):
+                    continue
+                capacity = channel.get(
+                    'satoshis', base_to_sats_floor(channel.get('amount_msat', 0))
+                )
+                try:
+                    capacity = int(capacity)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if capacity > 0:
+                    weighted.append((fee, capacity))
+            if len(weighted) < 2:
+                return None
+            weighted.sort(key=lambda row: row[0])
+            threshold = sum(weight for _, weight in weighted) * 0.25
+            cumulative = 0
+            for fee, weight in weighted:
+                cumulative += weight
+                if cumulative >= threshold:
+                    return fee
+            return weighted[-1][0]
+        except Exception:
+            return None
+
+    def _get_yield_substitute_quote_live(
+        self, peer_id: str, our_capacity: Any, cfg: Optional[Any] = None
+    ) -> int | None:
+        """Return the weighted median quote of comparable-capacity substitutes."""
+        try:
+            if isinstance(our_capacity, bool):
+                return None
+            capacity_reference = int(our_capacity)
+            if capacity_reference <= 0:
+                return None
+            if cfg is None:
+                cfg = self.config.snapshot() if hasattr(self.config, 'snapshot') else self.config
+            ceiling = int(getattr(cfg, 'max_fee_ppm'))
+            interval = int(getattr(cfg, 'fee_interval', 0) or 0)
+            ttl = max(30, interval * 2) if interval > 0 else 60
+            our_id = self._get_our_id()
+            channels = self._get_peer_inbound_channels(peer_id, ttl_seconds=ttl)
+            valid_market_count = 0
+            comparable = []
+            for channel in channels:
+                if not isinstance(channel, dict):
+                    continue
+                if channel.get('source') == our_id or not channel.get('active', False):
+                    continue
+                fee = channel.get('fee_per_millionth')
+                if isinstance(fee, bool) or not isinstance(fee, int):
+                    continue
+                if not 1 <= fee <= ceiling or self._is_cln_default_fee(channel):
+                    continue
+                capacity = channel.get(
+                    'satoshis', base_to_sats_floor(channel.get('amount_msat', 0))
+                )
+                try:
+                    capacity = int(capacity)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if capacity <= 0:
+                    continue
+                valid_market_count += 1
+                ratio = capacity / capacity_reference
+                if (
+                    self.YIELD_SUBSTITUTE_CAPACITY_MIN_RATIO
+                    <= ratio
+                    <= self.YIELD_SUBSTITUTE_CAPACITY_MAX_RATIO
+                ):
+                    comparable.append((fee, capacity))
+            # A single comparable quote is useful only when a broader live
+            # market corroborates that the peer actually has alternatives.
+            if valid_market_count < 2 or not comparable:
+                return None
+            comparable.sort(key=lambda row: row[0])
+            threshold = sum(weight for _, weight in comparable) * 0.50
+            cumulative = 0
+            for fee, weight in comparable:
+                cumulative += weight
+                if cumulative >= threshold:
+                    return fee
+            return comparable[-1][0]
+        except Exception:
+            return None
+
     @staticmethod
     def _is_cln_default_fee(ch: dict) -> bool:
         """Return True if the gossip channel looks like an untouched CLN default.
@@ -4959,6 +5166,174 @@ class FeeController:
 
         except Exception:
             return 0.10  # Default on error
+
+    @classmethod
+    def _yield_aware_demand_target(
+        cls,
+        *,
+        current_fee_ppm: Any,
+        neighbor_median_ppm: Any,
+        outbound_ratio: Any,
+        forwards_since_update: Any,
+        market_power_weight: Any,
+        max_fee_ppm: Any,
+    ) -> Optional[int]:
+        """Return an inventory-aware target at or below the live market quote.
+
+        The market anchor supplies a useful cold-start price before the first
+        forward. Paid demand and scarce inventory narrow the undercut without
+        ever compounding above the observed quote. If the market is absent,
+        paid local demand permits only a small bounded probe; absent market and
+        absent demand is neutral.
+        """
+        try:
+            if any(isinstance(value, bool) for value in (
+                current_fee_ppm, outbound_ratio, forwards_since_update,
+                market_power_weight, max_fee_ppm,
+            )):
+                return None
+            current = int(current_fee_ppm)
+            ratio = float(outbound_ratio)
+            forwards = int(forwards_since_update)
+            power = float(market_power_weight)
+            ceiling = int(max_fee_ppm)
+            market = None if neighbor_median_ppm is None else int(neighbor_median_ppm)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            current < 0 or forwards < 0 or ceiling <= 0
+            or not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0
+            or not math.isfinite(power) or power < 0.0
+            or (market is not None and market < 0)
+        ):
+            return None
+        demand_premium = min(
+            cls.YIELD_DEMAND_MAX_PREMIUM,
+            0.005 * math.log2(1.0 + forwards),
+        )
+        if market is None:
+            if forwards <= 0:
+                return None
+            candidate = int(round(current * (1.0 + demand_premium)))
+        else:
+            # Stronger-capacity channels need less of an undercut to win.
+            multiplier = 0.94 + min(0.04, power * 0.20)
+            if ratio < 0.15:
+                multiplier += 0.02
+            elif ratio < 0.30:
+                multiplier += 0.01
+            elif ratio >= cls.SATURATED_OUTBOUND_RATIO:
+                multiplier -= 0.04
+            multiplier += demand_premium
+            multiplier = max(
+                cls.YIELD_MARKET_MIN_MULTIPLIER,
+                min(cls.YIELD_MARKET_MAX_MULTIPLIER, multiplier),
+            )
+            candidate = int(round(max(1, market) * multiplier))
+        candidate = min(ceiling, max(0, candidate))
+        if candidate == current:
+            return None
+        return candidate
+
+    @classmethod
+    def _yield_scarce_market_anchor(
+        cls,
+        *,
+        yield_anchor_ppm: Any,
+        frontier_ppm: Any,
+        substitute_ppm: Any,
+        outbound_ratio: Any,
+    ) -> Optional[int]:
+        """Return a coverage-preserving scarce-lane market anchor.
+
+        The normal yield anchor is deliberately left untouched unless all
+        required scarcity/frontier evidence is finite and coherent.  A
+        comparable-capacity quote is optional and may only lower the result.
+        """
+        try:
+            if isinstance(outbound_ratio, bool):
+                return None
+            ratio = float(outbound_ratio)
+            anchor = int(yield_anchor_ppm)
+            frontier = int(frontier_ppm)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            not math.isfinite(ratio)
+            or not 0.0 <= ratio <= 1.0
+            or anchor <= 0
+            or frontier <= 0
+            or frontier > anchor
+        ):
+            return None
+        if ratio > cls.YIELD_SCARCE_FRONTIER_MAX_OUTBOUND_RATIO:
+            return anchor
+
+        candidate = int(round(math.sqrt(anchor * frontier)))
+        try:
+            if isinstance(substitute_ppm, bool):
+                raise ValueError("boolean substitute quote")
+            substitute = int(substitute_ppm)
+            if substitute > 0:
+                candidate = min(
+                    candidate,
+                    int(math.floor(
+                        substitute * cls.YIELD_SUBSTITUTE_UNDERCUT_RATIO
+                    )),
+                )
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return max(1, min(anchor, candidate))
+
+    @classmethod
+    def _yield_scarce_inventory_floor(
+        cls,
+        *,
+        inventory_floor_ppm: Any,
+        policy_floor_ppm: Any,
+        yield_market_anchor_ppm: Any,
+        yield_broad_market_anchor_ppm: Any,
+        frontier_ppm: Any,
+        outbound_ratio: Any,
+    ) -> int:
+        """Let a validated scarce-market anchor constrain inventory pricing.
+
+        The ordinary depleted-inventory rail protects scarce liquidity, but
+        it must not erase stronger live evidence that the lane loses all
+        price-sensitive routing at that floor. Relaxation is therefore
+        available only when the scarce-frontier path produced an anchor
+        strictly below the broad market quote. Missing, malformed, healthy,
+        or internally inconsistent evidence leaves the original rail intact.
+        """
+        try:
+            if isinstance(outbound_ratio, bool):
+                raise ValueError("boolean outbound ratio")
+            inventory_floor = int(inventory_floor_ppm)
+            policy_floor = int(policy_floor_ppm)
+            market_anchor = int(yield_market_anchor_ppm)
+            broad_anchor = int(yield_broad_market_anchor_ppm)
+            frontier = int(frontier_ppm)
+            ratio = float(outbound_ratio)
+        except (TypeError, ValueError, OverflowError):
+            try:
+                return int(inventory_floor_ppm)
+            except (TypeError, ValueError, OverflowError):
+                return 0
+        if (
+            inventory_floor < 0
+            or policy_floor < 0
+            or market_anchor <= 0
+            or broad_anchor <= 0
+            or frontier <= 0
+            or frontier > broad_anchor
+            or market_anchor >= broad_anchor
+            or not math.isfinite(ratio)
+            or not cls.YIELD_SCARCE_FRONTIER_MIN_OUTBOUND_RATIO
+            <= ratio
+            <= cls.YIELD_SCARCE_FRONTIER_MAX_OUTBOUND_RATIO
+        ):
+            return inventory_floor
+        return min(inventory_floor, max(policy_floor, market_anchor))
 
     def _get_channel_rebalance_cost_ppm(
         self, channel_id: str, flow_state: str = ""
@@ -7411,6 +7786,12 @@ class FeeController:
         acquisition_route_competitor_floor_ppm = None
         acquisition_route_target_ppm = None
         upward_probe_pre_cap_ppm = None  # L1: set when a probe stretch is granted
+        yield_demand_target_ppm = None
+        yield_demand_step_ppm = None
+        yield_market_anchor_ppm = None
+        yield_broad_market_anchor_ppm = None
+        yield_market_frontier_ppm = None
+        yield_substitute_quote_ppm = None
         bound_reason = "none"
         delta_cap_reason = "none"
         delta_cap_ppm = 0
@@ -8831,6 +9212,10 @@ class FeeController:
                             f"{pre}->{target}ppm (market={neighbor_median})",
                             level='debug'
                         )
+                elif mode == 'yield_aware':
+                    # Applied below even when this peer has too little gossip
+                    # for a neighbor median; paid local demand remains usable.
+                    pass
                 elif mode == 'competition_aware':
                     # Apply the median-based undercut ONLY when we're NOT
                     # already priced in the cheap quartile. Being in the
@@ -8953,6 +9338,63 @@ class FeeController:
                             # Durable nudge; survives the next posterior recompute.
                             ts.record_posterior_nudge(float(undercut_target), 0.10)
 
+            if mode == 'yield_aware':
+                yield_broad_market_anchor_ppm = self._get_yield_market_anchor(
+                    peer_id, cfg=cfg
+                )
+                yield_market_anchor_ppm = yield_broad_market_anchor_ppm
+                if (
+                    yield_broad_market_anchor_ppm is not None
+                    and outbound_ratio
+                    <= self.YIELD_SCARCE_FRONTIER_MAX_OUTBOUND_RATIO
+                ):
+                    yield_market_frontier_ppm = self._get_yield_market_frontier(
+                        peer_id, cfg=cfg
+                    )
+                    yield_substitute_quote_ppm = self._get_yield_substitute_quote(
+                        peer_id, capacity, cfg=cfg
+                    )
+                    scarce_anchor = self._yield_scarce_market_anchor(
+                        yield_anchor_ppm=yield_broad_market_anchor_ppm,
+                        frontier_ppm=yield_market_frontier_ppm,
+                        substitute_ppm=yield_substitute_quote_ppm,
+                        outbound_ratio=outbound_ratio,
+                    )
+                    if scarce_anchor is not None:
+                        yield_market_anchor_ppm = scarce_anchor
+                market_power_weight = self._get_competitive_undercut_pct(
+                    peer_id, channel_id, neighbor_median, cfg=cfg,
+                    invert_rank=True,
+                )
+                yield_demand_target_ppm = self._yield_aware_demand_target(
+                    current_fee_ppm=current_fee_ppm,
+                    neighbor_median_ppm=(
+                        yield_market_anchor_ppm
+                        if yield_market_anchor_ppm is not None
+                        else neighbor_median if neighbor_market_usable else None
+                    ),
+                    outbound_ratio=outbound_ratio,
+                    forwards_since_update=forward_count,
+                    market_power_weight=market_power_weight,
+                    max_fee_ppm=getattr(
+                        cfg, 'max_fee_ppm', self.config.max_fee_ppm
+                    ),
+                )
+                if yield_demand_target_ppm is not None:
+                    pre = post_pid_target_ppm
+                    post_pid_target_ppm = yield_demand_target_ppm
+                    self.plugin.log(
+                        f"FEE: {channel_id[:16]}... yield-aware market target: "
+                        f"{pre}->{yield_demand_target_ppm}ppm "
+                        f"(market={yield_market_anchor_ppm or neighbor_median}, "
+                        f"broad={yield_broad_market_anchor_ppm}, "
+                        f"frontier={yield_market_frontier_ppm}, "
+                        f"substitute={yield_substitute_quote_ppm}, "
+                        f"power={market_power_weight:.0%}, "
+                        f"forwards={forward_count}, outbound={outbound_ratio:.2f})",
+                        level='debug'
+                    )
+
             # Rebalance cost awareness: routing-value-scaled nudge toward cost recovery
             # Applied BEFORE bounding so the nudge actually reaches the blending step.
             # Channels with real routing revenue get a stronger nudge because the
@@ -9002,6 +9444,13 @@ class FeeController:
             except Exception:
                 supported_cap = None
             if supported_cap is not None and post_pid_target_ppm > supported_cap:
+                if (
+                    yield_demand_target_ppm is not None
+                ):
+                    # A live market quote is stronger support than a
+                    # prior-only DTS region. Ordinary modes retain the
+                    # earning-evidence ceiling.
+                    supported_cap = max(supported_cap, yield_demand_target_ppm)
                 # Bounded upward exploration (2026-07-03 floor-pinning fix):
                 # when the proven-region cap clips an uncertain high belief
                 # on an actively-earning channel, grant one rate-limited
@@ -9060,6 +9509,32 @@ class FeeController:
                 ceiling_ppm=ceiling_ppm,
                 flow_balanced_router=flow_balanced_router,
             )
+            if (
+                mode == "yield_aware"
+                and inventory_rail_reason == "depleted_inventory_floor"
+            ):
+                unrelaxed_inventory_floor_ppm = inventory_floor_ppm
+                inventory_floor_ppm = self._yield_scarce_inventory_floor(
+                    inventory_floor_ppm=inventory_floor_ppm,
+                    policy_floor_ppm=floor_ppm,
+                    yield_market_anchor_ppm=yield_market_anchor_ppm,
+                    yield_broad_market_anchor_ppm=(
+                        yield_broad_market_anchor_ppm
+                    ),
+                    frontier_ppm=yield_market_frontier_ppm,
+                    outbound_ratio=outbound_ratio,
+                )
+                if inventory_floor_ppm < unrelaxed_inventory_floor_ppm:
+                    self.plugin.log(
+                        f"YIELD_INVENTORY_FRONTIER: {channel_id[:12]}... "
+                        f"depleted floor {unrelaxed_inventory_floor_ppm}"
+                        f"->{inventory_floor_ppm}ppm "
+                        f"(market={yield_market_anchor_ppm}, "
+                        f"broad={yield_broad_market_anchor_ppm}, "
+                        f"frontier={yield_market_frontier_ppm}, "
+                        f"outbound={outbound_ratio:.2f})",
+                        level="debug",
+                    )
             acquisition_inventory_immediate = (
                 inventory_rail_reason == "saturated_inventory_ceiling"
                 and channel_id in self._acquisition_tainted_flow_channels
@@ -9263,12 +9738,28 @@ class FeeController:
                 target_blend_ratio = 1.0
                 zero_flow_guard_reason = None
                 zero_flow_guard_target_ppm = None
+            if yield_demand_target_ppm is not None:
+                # The target is grounded in current gossip rather than a
+                # prior-only estimate, so apply it atomically just as CLBOSS
+                # publishes its market surface. Economic hard rails below
+                # remain authoritative.
+                blended_target_ppm = bounded_target_ppm
+                target_blend_ratio = 1.0
+                zero_flow_guard_reason = None
+                zero_flow_guard_target_ppm = None
             new_fee_ppm, damping_info = self._apply_damped_fee_target(
                 current_fee_ppm=current_fee_ppm,
                 target_fee_ppm=blended_target_ppm,
                 woke_from_sleep=woke_from_sleep,
                 cfg=cfg,
             )
+            if yield_demand_target_ppm is not None:
+                new_fee_ppm = bounded_target_ppm
+                damping_info = {
+                    "cap_reason": "yield_market_anchor",
+                    "max_delta_ppm": abs(current_fee_ppm - bounded_target_ppm),
+                    "cap_applied": False,
+                }
             if acquisition_inventory_immediate:
                 new_fee_ppm = bounded_target_ppm
                 damping_info = {
