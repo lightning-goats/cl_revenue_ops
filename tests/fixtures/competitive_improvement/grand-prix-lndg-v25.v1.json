@@ -1,0 +1,58 @@
+{
+  "schema": "docker-competitive-improvement-program-v1",
+  "status": "frozen",
+  "scope": {
+    "docker_local_only": true,
+    "production_read_only_calibration": true,
+    "production_actions_authorized": false,
+    "xrebalance_series_1_unchanged": true,
+    "standalone_no_sling": true
+  },
+  "calibration": {
+    "allowed_aggregate_fields": ["channel_count", "capacity_histogram", "local_balance_ratio_distribution", "peer_degree_buckets", "channel_age_buckets", "fee_distribution", "forward_size_distribution", "forward_direction_distribution", "interarrival_distribution", "time_of_day_distribution", "revenue_concentration", "route_length_distribution", "failure_code_distribution", "rebalance_cost_distribution"],
+    "forbidden_production_data": ["node_ids", "peer_ids", "short_channel_ids", "channel_ids", "exact_balances", "payment_records", "payment_hashes", "invoices", "raw_forwards"],
+    "tolerance_required": true
+  },
+  "topology": {
+    "minimum_nodes": 24,
+    "maximum_nodes": 32,
+    "client_families": ["cln", "lnd"],
+    "eclair_excluded": true,
+    "crossed_contender_identities": true,
+    "alternative_paths_per_important_corridor": 2,
+    "competitive_lateral_peers": 6,
+    "specialist_corridors": 4
+  },
+  "traffic": {
+    "classes": ["baseline_retail", "merchant_directional", "exchange_burst", "competitive_displacement", "shock_fault"],
+    "non_uniform_amounts": true,
+    "diurnal_and_burst_arrivals": true,
+    "public_seed_policy": "recorded_deterministic",
+    "sealed_holdout_seed_commitment": "sha256:613e602c6c98088c2fce20e272b44eaf423d4232580f6c9480c1086d20fedbf2",
+    "natural_pathfinding": true
+  },
+  "tournament": {
+    "initial_controllers": ["revenue_ops", "clboss"],
+    "expansion_admission_requires_frozen_configuration": true,
+    "replicas_per_assignment": 3,
+    "nested_bootstrap": true,
+    "primary_metric": "settled_capital_normalized_incremental_net_profit_msat",
+    "minimum_volume_retention_ratio": 0.95,
+    "zero_safety_or_accounting_failures": true
+  },
+  "improvement_loop": {
+    "algorithm_arms": ["revenue_incumbent", "competitor_equivalent", "revenue_enhanced"],
+    "research_card_required_fields": ["source_and_license", "observable_behavior", "independent_specification", "competitor_omitted_variable", "revenue_enhancement_hypothesis", "safety_invariants", "baseline_arm", "promotion_measure", "rollback_rule"],
+    "promotion_requires_beating_incumbent_and_baseline": true,
+    "public_seed_ablation": true,
+    "sealed_holdout_required": true,
+    "default_off_until_promoted": true
+  },
+  "evidence": {
+    "reject_conditions": ["unknown_payment_attribution", "unpriced_settled_fee", "ledger_mismatch", "safety_breach", "fallback_contamination"],
+    "exact_payment_attribution": true,
+    "settled_fee_pricing": true,
+    "reservation_and_ledger_reconciliation": true,
+    "no_live_action_from_read_only_surfaces": true
+  }
+}

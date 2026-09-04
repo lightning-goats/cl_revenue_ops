@@ -127,7 +127,7 @@ def test_cleanup_removes_only_resolved_run_label_resources(tmp_path, monkeypatch
     result = lab.call("stop_network", {"networkId": network_id})
 
     assert commands == [
-        ["docker", "rm", "-f", resolved["container"][0]],
+        ["docker", "rm", "-f", "-v", resolved["container"][0]],
         ["docker", "network", "rm", resolved["network"][0]],
         ["docker", "volume", "rm", resolved["volume"][0]],
     ]

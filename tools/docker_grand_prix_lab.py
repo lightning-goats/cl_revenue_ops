@@ -665,7 +665,7 @@ class DockerGrandPrixLab:
         metadata, network_id = self._require_id(arguments)
         containers = self._labeled_names("container", network_id)
         if containers:
-            _run(["docker", "rm", "-f", *containers])
+            _run(["docker", "rm", "-f", "-v", *containers])
         networks = self._labeled_names("network", network_id)
         if networks:
             _run(["docker", "network", "rm", *networks])

@@ -2159,7 +2159,7 @@ def stop_lab(
         for identity in ("identity-a", "identity-b"):
             container = contender_container(network_id, replica, identity)
             if _docker_exists(container):
-                _run(["docker", "rm", "-f", container])
+                _run(["docker", "rm", "-f", "-v", container])
     bridge.call("stop_network", {"networkId": network_id})
     state["status"] = "stopped"
     _checkpoint(state_path, state, "lab_stopped", backend=ACTIVE_BACKEND)

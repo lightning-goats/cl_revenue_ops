@@ -18,6 +18,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from competitive_improvement_protocol import validate_protocol  # noqa: E402
 from grand_prix_manifest import validate_topology  # noqa: E402
+from grand_prix_holdout import (  # noqa: E402
+    HoldoutError,
+    SCHEMA as HOLDOUT_SCHEMA,
+    commitment as holdout_commitment,
+    reveal as reveal_holdout,
+)
 
 
 SCHEMA = "polar-grand-prix-score-v1"
@@ -389,6 +395,40 @@ def _nested_bootstrap(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _validate_holdout_binding(
+    topology: dict[str, Any],
+    protocol: dict[str, Any],
+    holdout_reveal: dict[str, Any] | None,
+    *,
+    stage: str,
+) -> str | None:
+    """Bind holdout scoring to the precommitted secret and topology seed."""
+    if stage == "public":
+        if holdout_reveal is not None:
+            raise ScorecardError("public scoring must not receive a holdout reveal")
+        return None
+    if not isinstance(holdout_reveal, dict):
+        raise ScorecardError("holdout scoring requires a verified holdout reveal")
+    if (
+        holdout_reveal.get("schema") != HOLDOUT_SCHEMA
+        or holdout_reveal.get("verified") is not True
+    ):
+        raise ScorecardError("holdout reveal is not verified")
+    seed = holdout_reveal.get("seed")
+    salt = holdout_reveal.get("salt")
+    supplied = holdout_reveal.get("commitment")
+    try:
+        computed = holdout_commitment(seed, salt)
+    except HoldoutError as exc:
+        raise ScorecardError("holdout reveal is malformed") from exc
+    expected = protocol["traffic"]["sealed_holdout_seed_commitment"]
+    if supplied != computed or computed != expected:
+        raise ScorecardError("holdout reveal does not match the frozen commitment")
+    if topology.get("public_seed") != seed:
+        raise ScorecardError("holdout topology does not match the committed seed")
+    return computed
+
+
 def score_states(
     topology: dict[str, Any],
     protocol: dict[str, Any],
@@ -396,6 +436,7 @@ def score_states(
     *,
     arm: str,
     stage: str,
+    holdout_reveal: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_topology(topology)
     validate_protocol(protocol)
@@ -403,6 +444,9 @@ def score_states(
         raise ScorecardError(f"unsupported arm {arm!r}")
     if stage not in STAGES:
         raise ScorecardError(f"unsupported stage {stage!r}")
+    verified_holdout_commitment = _validate_holdout_binding(
+        topology, protocol, holdout_reveal, stage=stage
+    )
     rows = [validate_state(state, topology, source=source) for source, state in states]
     replicas = [row["replica"] for row in rows]
     if len(replicas) != len(set(replicas)):
@@ -507,6 +551,7 @@ def score_states(
         "schema": SCHEMA,
         "arm": arm,
         "stage": stage,
+        "holdout_commitment": verified_holdout_commitment,
         "verdict": verdict,
         "promotion_eligible": verdict == "revenue_ops_wins" and stage == "holdout",
         "frozen_image_id": next(iter(image_ids), None),
@@ -540,20 +585,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arm", choices=sorted(ARMS), required=True)
     parser.add_argument("--stage", choices=sorted(STAGES), required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--holdout-secret", type=Path)
     return parser
 
 
 def main(arguments: list[str] | None = None) -> int:
     args = build_parser().parse_args(arguments)
     try:
+        protocol = _load(args.protocol)
+        holdout = (
+            reveal_holdout(
+                args.holdout_secret,
+                protocol["traffic"]["sealed_holdout_seed_commitment"],
+            )
+            if args.holdout_secret is not None
+            else None
+        )
         result = score_states(
             _load(args.topology),
-            _load(args.protocol),
+            protocol,
             [(str(path), _load(path)) for path in args.state],
             arm=args.arm,
             stage=args.stage,
+            holdout_reveal=holdout,
         )
-    except (ScorecardError, TypeError, ValueError) as exc:
+    except (HoldoutError, ScorecardError, TypeError, ValueError) as exc:
         sys.stderr.write(f"Grand Prix scorecard error: {exc}\n")
         return 2
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"

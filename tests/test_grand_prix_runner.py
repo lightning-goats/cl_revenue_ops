@@ -727,6 +727,11 @@ def test_custom_image_requires_experiment_patch_attestation_source():
     assert "COPY modules/admission_policy.py" in body
 
 
+def test_scoped_stop_removes_contender_anonymous_volumes():
+    source = TOOL.read_text(encoding="utf-8")
+    assert '["docker", "rm", "-f", "-v", container]' in source
+
+
 def test_metric_delta_is_capital_normalized_and_handles_zero_volume():
     runner = _module()
     before = {identity: {"settled_count": 1, "volume_msat": 10, "fee_msat": 2}

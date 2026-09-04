@@ -164,6 +164,67 @@ def test_six_crossed_replicas_with_positive_nested_ci_win():
     }
     assert result["nested_bootstrap"]["ci95_msat"][0] > 0
     assert result["revenue_market_mode"] == "yield_aware"
+    assert result["holdout_commitment"] is None
+
+
+def test_holdout_requires_verified_commitment_and_topology_binding():
+    module = _module()
+    topology = _topology()
+    protocol = _protocol()
+    states = [(f"r{replica}", _state(module, topology, replica))
+              for replica in range(1, 7)]
+
+    with pytest.raises(module.ScorecardError, match="verified holdout reveal"):
+        module.score_states(
+            topology, protocol, states,
+            arm="revenue_enhanced", stage="holdout",
+        )
+
+    salt = "b" * 64
+    digest = module.holdout_commitment(topology["public_seed"], salt)
+    protocol["traffic"]["sealed_holdout_seed_commitment"] = digest
+    reveal = {
+        "schema": module.HOLDOUT_SCHEMA,
+        "seed": topology["public_seed"],
+        "salt": salt,
+        "commitment": digest,
+        "verified": True,
+    }
+    result = module.score_states(
+        topology, protocol, states,
+        arm="revenue_enhanced", stage="holdout", holdout_reveal=reveal,
+    )
+
+    assert result["verdict"] == "revenue_ops_wins"
+    assert result["promotion_eligible"] is True
+    assert result["holdout_commitment"] == digest
+
+
+def test_holdout_rejects_topology_seed_drift():
+    module = _module()
+    topology = _topology()
+    protocol = _protocol()
+    seed = topology["public_seed"] + 1
+    salt = "c" * 64
+    digest = module.holdout_commitment(seed, salt)
+    protocol["traffic"]["sealed_holdout_seed_commitment"] = digest
+    reveal = {
+        "schema": module.HOLDOUT_SCHEMA,
+        "seed": seed,
+        "salt": salt,
+        "commitment": digest,
+        "verified": True,
+    }
+
+    with pytest.raises(module.ScorecardError, match="topology"):
+        module.score_states(
+            topology,
+            protocol,
+            [("r1", _state(module, topology, 1))],
+            arm="revenue_enhanced",
+            stage="holdout",
+            holdout_reveal=reveal,
+        )
 
 
 @pytest.mark.parametrize(
