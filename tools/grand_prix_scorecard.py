@@ -31,6 +31,13 @@ EQUIVALENT_COMPARISON_CLASSES = {
     "ln_operator": "algorithm_equivalent",
     "torq": "workflow_equivalent",
 }
+REVENUE_MARKET_MODES = {
+    "undercut",
+    "match",
+    "premium",
+    "competition_aware",
+    "yield_aware",
+}
 CAPITAL_SATS = 130_000_000
 BOOTSTRAP_ITERATIONS = 20_000
 
@@ -212,11 +219,14 @@ def validate_state(
     if competitor_id == "clboss":
         model_digest = "direct-runtime"
     warm = controls.get("warm_policies")
+    revenue_market_mode = (
+        revenue.get("market_fee_mode") if isinstance(revenue, dict) else None
+    )
     safety_ok = (
         isinstance(revenue, dict)
         and revenue.get("daily_budget_sats") == 0
         and revenue.get("paused") is False
-        and revenue.get("market_fee_mode") == "yield_aware"
+        and revenue_market_mode in REVENUE_MARKET_MODES
         and competitor_ok
         and controls.get("warmup_seconds", 0) >= 75
         and isinstance(warm, dict)
@@ -329,6 +339,7 @@ def validate_state(
         },
         "image_id": image_id,
         "patch_digest": patch_digest,
+        "revenue_market_mode": revenue_market_mode,
         "safety_ok": safety_ok,
         "cell_attribution_complete": cell_attribution,
         "delivery_ratio": delivery_ratio,
@@ -400,6 +411,11 @@ def score_states(
     patch_digests = {row["patch_digest"] for row in rows}
     if len(image_ids) > 1 or len(patch_digests) > 1:
         raise ScorecardError("all scored replicas must use one frozen image and patch")
+    revenue_market_modes = {row["revenue_market_mode"] for row in rows}
+    if len(revenue_market_modes) > 1:
+        raise ScorecardError(
+            "all scored replicas must use one frozen Revenue market mode"
+        )
     competitor_specs = {
         (
             row["competitor"]["id"],
@@ -495,6 +511,7 @@ def score_states(
         "promotion_eligible": verdict == "revenue_ops_wins" and stage == "holdout",
         "frozen_image_id": next(iter(image_ids), None),
         "frozen_patch_digest": next(iter(patch_digests), None),
+        "revenue_market_mode": next(iter(revenue_market_modes), None),
         "competitor": (
             {
                 "id": competitor_spec[0],

@@ -55,7 +55,15 @@ def _delta(module, count, volume, fee):
     return result
 
 
-def _state(module, topology, replica, *, revenue_volume=2_000, clboss_volume=1_000):
+def _state(
+    module,
+    topology,
+    replica,
+    *,
+    revenue_volume=2_000,
+    clboss_volume=1_000,
+    revenue_market_mode="yield_aware",
+):
     assignment = (
         {"revenue_ops": "identity-a", "clboss": "identity-b"}
         if replica % 2 else
@@ -113,7 +121,7 @@ def _state(module, topology, replica, *, revenue_volume=2_000, clboss_volume=1_0
         "controller_readback": {
             "revenue_ops": {
                 "daily_budget_sats": 0, "paused": False,
-                "market_fee_mode": "yield_aware",
+                "market_fee_mode": revenue_market_mode,
             },
             "clboss": {"auto_close": False, "rebalance_mode": "off"},
             "warmup_seconds": 75,
@@ -155,6 +163,50 @@ def test_six_crossed_replicas_with_positive_nested_ci_win():
         "nested_bootstrap_positive": True,
     }
     assert result["nested_bootstrap"]["ci95_msat"][0] > 0
+    assert result["revenue_market_mode"] == "yield_aware"
+
+
+@pytest.mark.parametrize(
+    "market_mode",
+    ["undercut", "match", "premium", "competition_aware", "yield_aware"],
+)
+def test_supported_revenue_market_modes_pass_safety(market_mode):
+    module = _module()
+    topology = _topology()
+    state = _state(module, topology, 1, revenue_market_mode=market_mode)
+
+    row = module.validate_state(state, topology, source=market_mode)
+
+    assert row["revenue_market_mode"] == market_mode
+    assert row["safety_ok"] is True
+
+
+def test_unknown_revenue_market_mode_fails_safety_gate():
+    module = _module()
+    topology = _topology()
+    state = _state(module, topology, 1, revenue_market_mode="not-a-mode")
+
+    row = module.validate_state(state, topology, source="unknown")
+
+    assert row["safety_ok"] is False
+
+
+def test_mixed_revenue_market_modes_cannot_share_one_score():
+    module = _module()
+    topology = _topology()
+    yield_state = _state(
+        module, topology, 1, revenue_market_mode="yield_aware"
+    )
+    match_state = _state(module, topology, 2, revenue_market_mode="match")
+
+    with pytest.raises(module.ScorecardError, match="one frozen Revenue market mode"):
+        module.score_states(
+            topology,
+            _protocol(),
+            [("yield", yield_state), ("match", match_state)],
+            arm="revenue_enhanced",
+            stage="public",
+        )
 
 
 def test_old_aggregate_only_state_is_insufficient_not_promoted():
