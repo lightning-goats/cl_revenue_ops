@@ -143,6 +143,30 @@ def test_lnd_readiness_probe_rejects_action_rpc():
         )
 
 
+def test_lnd_base_node_readiness_uses_topology_validated_wrapper(monkeypatch):
+    runner = _module()
+    topology = _topology()
+    calls = []
+
+    def fake_rpc(network_id, node_name, received_topology, command, *, timeout):
+        calls.append(
+            (network_id, node_name, received_topology, command, timeout)
+        )
+        return {"identity_pubkey": "02sink"}
+
+    monkeypatch.setattr(runner, "_lnd_node_rpc", fake_rpc)
+    assert runner._wait_lnd_node_read_rpc(
+        1_788_000_001, "lnd-sink", topology, "getinfo"
+    ) == {"identity_pubkey": "02sink"}
+    assert calls == [
+        (1_788_000_001, "lnd-sink", topology, "getinfo", 10)
+    ]
+    with pytest.raises(runner.RunnerError, match="non-read-only"):
+        runner._wait_lnd_node_read_rpc(
+            1_788_000_001, "lnd-sink", topology, "openchannel"
+        )
+
+
 def test_cln_wallet_output_totals_exclude_reserved_and_channels(monkeypatch):
     runner = _module()
     monkeypatch.setattr(runner, "_cln_rpc", lambda *_args: {
