@@ -15,9 +15,11 @@ commitment was verified before the sealed v9 holdout was scored.
 
 Establish a production-calibrated, highly competitive local Docker market in
 which Revenue Ops can be measured and improved against reproducible competitor
-controllers. The first admission pair is Revenue Ops versus CLBOSS. Torq and
-LN Operator are admitted only after their exact versions and complete
-controller configurations can be frozen and reproduced.
+controllers. The first admission pair is Revenue Ops versus CLBOSS. Later arms
+must pin an exact product revision and complete controller configuration. When
+the product runtime cannot be made symmetric with the CLN contender topology,
+only a source-derived clean-room model may be admitted, and every result must
+remain explicitly scoped as algorithm- or workflow-equivalent.
 
 The primary objective is settled capital-normalized incremental net profit. A
 candidate must also retain at least 95% of the best controller's useful settled
@@ -230,6 +232,65 @@ superiority evidence. Formal claims still require three replicas per crossed
 assignment, nested-bootstrap and cell-retention gates, followed by the sealed
 holdout. Direct-product claims remain prohibited until exact product runtimes
 and immutable operator configurations are admitted.
+
+The LN Operator algorithm-equivalent public block (r69--r74) subsequently
+passed every protocol, attribution, delivery, safety, bootstrap, and
+cell-retention gate. Revenue Ops earned 94,533,286 msat versus 16,050,376 msat
+(5.89x) and carried 149.726B versus 26.122B msat (5.73x). This is strong public
+algorithm-equivalent evidence, but no sealed holdout was run and it remains
+explicitly narrower than a claim against the LN Operator product runtime.
+
+The Torq workflow-equivalent arm exposed a stricter per-cell retention problem:
+v16 won aggregate economics but retained only 68.3% of the competitor's best
+cell volume. V17 lowered the already admission-protected scarce-inventory
+market-relief boundary from 10% to 5%; the existing 85% per-HTLC executable
+liquidity limit and balance-change wake remain the safety rails. The formal
+public block (r96, r103, r119--r122) passed every gate and earned 138,038,262
+msat versus 57,545,814 msat (2.40x), while carrying 139.142B versus 36.710B
+msat (3.79x). Minimum crossed-cell retention was 100%.
+
+Only after freezing that candidate, the sealed Torq holdout block (r123--r125,
+r127, r128, r130) also passed every gate and was promotion-eligible. Revenue
+Ops earned 123,093,237 msat versus 26,169,295 msat (4.70x), carried 139.132B
+versus 16.990B msat (8.19x), and recorded 1,278 versus 170 forwards. Minimum
+cell retention was again 100%, and the nested bootstrap result was p=1.0 with
+a 95% revenue-difference interval of [11,096,581, 18,434,620] msat. Replica
+r126 was excluded before traffic after its competitor-side contender stopped
+during readiness, so it contributes no outcomes to the frozen block.
+
+V17 is therefore promoted over the strongest-plausible clean-room Torq-style
+workflow comparator for the local Docker protocol. It does not establish that
+Torq itself ships or would select that policy. The production code change is
+safe to deploy dormant, but activating yield-aware pricing in production is
+still prohibited: all qualifying blocks used the predeclared 50,000-ppm
+tournament ceiling, while the separate 1,200--10,000-ppm production-cap sweep
+did not establish a safe profitable activation point. Production remains
+`undercut` with `max_fee_ppm=1200`.
+
+### LNDg admission and next loop
+
+LNDg is next in the tournament queue at the operator's request. Admission is
+pinned to the signed `v1.11.0` tag,
+`0fe400029240fc59431b56b6ce47e24b764396b1`; the similarly named branch points
+at a different later commit and must not be substituted. Its source is MIT
+licensed. LNDg is LND-native while Revenue Ops is CLN-native, so an actual
+runtime match would introduce a node-implementation confounder in the current
+crossed topology. Series 1 will therefore begin with an algorithm-equivalent
+fee-only arm derived from `af.py`, not a claim against the whole LNDg product.
+
+The frozen model must reproduce LNDg's peer-aggregated seven-day flow and
+assisted-revenue signals, 24-hour per-channel cooldown, 15%/95% liquidity
+zones, failed-liquidity HTLC threshold, 5-ppm rounding, and 0--2,500 ppm
+default rails. Rebalancing stays off in the fee-only league. A later separate
+rebalance league may model LNDg's profitable-outflow refill selection,
+inbound target, source threshold, cooldown, and the lower of its absolute
+max-fee rail and 65% target-channel revenue-rate budget.
+
+The execution sequence is the same as the prior arms: independent algorithm
+card and source fixtures, malformed/absent-data neutrality tests, crossed
+public ablation, Revenue improvement only when evidence identifies a gap,
+three replicas per assignment, then a previously committed sealed holdout.
+Promotion and production activation remain separate decisions.
 
 Example controller selection:
 
