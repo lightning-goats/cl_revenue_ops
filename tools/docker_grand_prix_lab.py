@@ -407,11 +407,17 @@ class DockerGrandPrixLab:
             "lightning-cli", "--network=regtest", "--notifications=none", *arguments,
         ])
 
-    def _lnd(self, network_id: int, node: str, *arguments: str) -> dict[str, Any]:
+    def _lnd(
+        self,
+        network_id: int,
+        node: str,
+        *arguments: str,
+        timeout: float = 180,
+    ) -> dict[str, Any]:
         return _json_command([
             "docker", "exec", "-u", "lnd", self.container_name(network_id, node),
             "lncli", "--network=regtest", *arguments,
-        ])
+        ], timeout=timeout)
 
     def _wait_node(self, network_id: int, row: dict[str, Any]) -> dict[str, Any]:
         deadline = time.monotonic() + 180
@@ -423,7 +429,12 @@ class DockerGrandPrixLab:
                     if result.get("id"):
                         return result
                 else:
-                    result = self._lnd(network_id, row["name"], "getinfo")
+                    # A wedged lncli process must not consume the entire node
+                    # readiness budget. Short probes let this existing loop
+                    # retry while lnd finishes startup.
+                    result = self._lnd(
+                        network_id, row["name"], "getinfo", timeout=10
+                    )
                     if result.get("identity_pubkey"):
                         return result
                 last = "RPC returned no node id"

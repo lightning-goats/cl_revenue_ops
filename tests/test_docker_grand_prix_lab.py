@@ -78,6 +78,25 @@ def test_reported_started_state_is_derived_from_all_expected_containers(tmp_path
     assert lab._network_payload(metadata)["status"] == "Started"
 
 
+def test_lnd_readiness_uses_short_retryable_probe(tmp_path, monkeypatch):
+    docker = _module()
+    lab = docker.DockerGrandPrixLab(tmp_path / "state.json")
+    calls = []
+
+    def fake_lnd(network_id, node, *arguments, timeout):
+        calls.append((network_id, node, arguments, timeout))
+        return {"identity_pubkey": "02node"}
+
+    monkeypatch.setattr(lab, "_lnd", fake_lnd)
+    result = lab._wait_node(
+        1_788_000_001, {"name": "lnd-sink", "implementation": "LND"}
+    )
+    assert result == {"identity_pubkey": "02node"}
+    assert calls == [
+        (1_788_000_001, "lnd-sink", ("getinfo",), 10)
+    ]
+
+
 def test_cleanup_removes_only_resolved_run_label_resources(tmp_path, monkeypatch):
     docker = _module()
     lab = docker.DockerGrandPrixLab(tmp_path / "state.json")

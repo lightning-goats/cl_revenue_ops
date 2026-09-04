@@ -215,13 +215,33 @@ def _cln_rpc(container: str, *arguments: Any, base_managed: bool = False) -> dic
     )
 
 
-def _lnd_rpc(container: str, *arguments: Any) -> dict[str, Any]:
+def _lnd_rpc(
+    container: str, *arguments: Any, timeout: float = 120
+) -> dict[str, Any]:
     if not re.fullmatch(r"revenue-gp-n[1-9][0-9]*-lnd-payer", container):
         raise RunnerError(f"refusing unsafe LND RPC target {container!r}")
     return _json_command(
         ["docker", "exec", "-u", "lnd", container, "lncli", "--network=regtest"]
-        + [str(value) for value in arguments]
+        + [str(value) for value in arguments],
+        timeout=timeout,
     )
+
+
+def _wait_lnd_read_rpc(
+    container: str, command: str, *, deadline_seconds: float = 120
+) -> dict[str, Any]:
+    """Retry a bounded, read-only LND readiness probe."""
+    if command not in {"getinfo", "walletbalance"}:
+        raise RunnerError(f"refusing non-read-only LND readiness RPC {command!r}")
+    deadline = time.monotonic() + deadline_seconds
+    last = "not probed"
+    while time.monotonic() < deadline:
+        try:
+            return _lnd_rpc(container, command, timeout=10)
+        except RunnerError as exc:
+            last = str(exc)
+            time.sleep(1)
+    raise RunnerError(f"LND {command} did not become ready: {last}")
 
 
 def _image_attestation(image: str) -> dict[str, Any]:
@@ -519,7 +539,8 @@ def _native_base_pubkey(
         )
         value = payload.get("id")
     elif implementation == "lnd":
-        payload = _lnd_node_rpc(network_id, node_name, topology, "getinfo")
+        container = _base_container_name(network_id, node_name)
+        payload = _wait_lnd_read_rpc(container, "getinfo")
         value = payload.get("identity_pubkey")
     else:
         raise RunnerError(f"unknown base node implementation for {node_name!r}")
@@ -914,7 +935,7 @@ def launch_contenders(
     deadline = time.monotonic() + 120
     lnd_confirmed = 0
     while time.monotonic() < deadline:
-        balance = _lnd_rpc(lnd_payer, "walletbalance")
+        balance = _wait_lnd_read_rpc(lnd_payer, "walletbalance")
         try:
             lnd_confirmed = int(balance.get("confirmed_balance", 0))
         except (TypeError, ValueError):
@@ -969,7 +990,9 @@ def top_up_payers(
     while time.monotonic() < deadline:
         try:
             confirmed = int(
-                _lnd_rpc(lnd_payer, "walletbalance").get("confirmed_balance", 0)
+                _wait_lnd_read_rpc(lnd_payer, "walletbalance").get(
+                    "confirmed_balance", 0
+                )
             )
         except (TypeError, ValueError):
             confirmed = 0

@@ -114,6 +114,35 @@ def test_msat_normalizes_supported_cln_encodings():
         runner._msat("malformed")
 
 
+def test_lnd_readiness_probe_retries_short_timeouts(monkeypatch):
+    runner = _module()
+    calls = []
+
+    def fake_rpc(container, command, *, timeout):
+        calls.append((container, command, timeout))
+        if len(calls) == 1:
+            raise runner.RunnerError("command timed out")
+        return {"confirmed_balance": "1"}
+
+    monkeypatch.setattr(runner, "_lnd_rpc", fake_rpc)
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+    assert runner._wait_lnd_read_rpc(
+        "revenue-gp-n5-lnd-payer", "walletbalance"
+    ) == {"confirmed_balance": "1"}
+    assert calls == [
+        ("revenue-gp-n5-lnd-payer", "walletbalance", 10),
+        ("revenue-gp-n5-lnd-payer", "walletbalance", 10),
+    ]
+
+
+def test_lnd_readiness_probe_rejects_action_rpc():
+    runner = _module()
+    with pytest.raises(runner.RunnerError, match="non-read-only"):
+        runner._wait_lnd_read_rpc(
+            "revenue-gp-n5-lnd-payer", "openchannel"
+        )
+
+
 def test_cln_wallet_output_totals_exclude_reserved_and_channels(monkeypatch):
     runner = _module()
     monkeypatch.setattr(runner, "_cln_rpc", lambda *_args: {
