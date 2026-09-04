@@ -51,7 +51,7 @@ CONTROLLER_WARMUP_SECONDS = 75
 EQUIVALENT_CONTROLLER_CONFIG = (
     Path(__file__).resolve().parent / "grand-prix" / "equivalent-controllers.v1.json"
 )
-COMPETITOR_CONTROLLERS = frozenset({"clboss", "ln_operator", "torq"})
+COMPETITOR_CONTROLLERS = frozenset({"clboss", "lndg", "ln_operator", "torq"})
 MUTATING_COMMANDS = {
     "create-base", "start-base", "wire-background", "launch-contenders",
     "wire-contenders", "shape-liquidity", "seed-fees", "start-controllers",

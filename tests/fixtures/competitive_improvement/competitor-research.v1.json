@@ -191,6 +191,76 @@
         "Official Torq automation and rebalancing documentation",
         "Direct runtime admission requires a digest-pinned image and complete immutable workflow export"
       ]
+    },
+    {
+      "id": "lndg",
+      "revision": "0fe400029240fc59431b56b6ce47e24b764396b1",
+      "comparison_class": "algorithm_equivalent",
+      "direct_runtime_status": "blocked",
+      "source_and_license": {
+        "source_url": "https://github.com/cryptosharks131/lndg",
+        "revision": "0fe400029240fc59431b56b6ce47e24b764396b1",
+        "license": "MIT",
+        "license_evidence": "LICENSE at the signed v1.11.0 tag"
+      },
+      "observable_behavior": [
+        "LND-native AutoFees aggregates channels by remote peer before making a response",
+        "Seven-day inbound and outbound flow normalized by peer capacity identifies persistent drains",
+        "Liquidity-failure HTLCs can raise low-inventory prices when recent inbound refill flow is absent",
+        "Stagnant middle- and excess-liquidity peers receive bounded fee reductions",
+        "Assisted revenue can lower excess-liquidity fees when it materially exceeds direct revenue",
+        "A 24-hour per-channel cooldown, 5-ppm rounding, and 0--2500 ppm default rails bound churn"
+      ],
+      "independent_specification": [
+        "Reproduce the branch conditions and default constants from pinned af.py without importing pandas, Django, LNDg code, or an LND dependency",
+        "Aggregate anonymous channel balances, settled forwards, fees, and eligible liquidity failures by peer",
+        "Use a compressed local clock only when separately frozen; retain the source 24-hour semantics in the algorithm card",
+        "Keep algorithm-equivalent results separate from any direct LND runtime or full-product claim"
+      ],
+      "competitor_omitted_variable": [
+        "Fixed additive steps do not estimate a route-specific demand curve or marginal revenue optimum",
+        "A seven-day window and 24-hour cooldown react slowly to bursts and sudden competitive displacement",
+        "Failed HTLC counts are thresholded rather than calibrated as uncertain censored demand",
+        "Fee decisions do not jointly price source opportunity cost and portfolio rebalance allocation"
+      ],
+      "revenue_enhancement_hypothesis": [
+        "Pool sparse evidence by peer while retaining channel-level capacity, route, and profitability distinctions",
+        "Treat liquidity failures as confidence-weighted censored demand with decay and counterfactual settlement checks",
+        "Credit assisted revenue in portfolio marginal EV rather than using a fixed ten-times branch",
+        "Adapt response cadence to statistically material balance or demand changes under gossip and churn budgets"
+      ],
+      "safety_invariants": [
+        "Missing or malformed flow, failure, balance, and fee inputs are neutral skips",
+        "Failure evidence cannot authorize a payment, rebalance, or policy mutation from a read-only surface",
+        "Every fee remains inside the frozen floor and ceiling and preserves the existing base fee",
+        "Rebalancing is disabled in the fee-only league"
+      ],
+      "baseline_arm": {
+        "class": "algorithm_equivalent",
+        "status": "model_executed",
+        "implementation": "Independent peer-aggregated response model derived from the signed v1.11.0 af.py source",
+        "limitations": [
+          "LNDg requires LND while Revenue Ops requires CLN, so the current crossed topology cannot host both runtimes symmetrically",
+          "The initial fee-only block does not reproduce LND pathfinding or the Django persistence scheduler",
+          "No direct-product or LNDg rebalancer superiority claim is permitted from this arm"
+        ],
+        "clean_room": true
+      },
+      "promotion_measure": [
+        "Higher settled capital-normalized net profit than incumbent and the LNDg response model",
+        "At least 95 percent useful settled-volume retention in every declared cell",
+        "Positive crossed-replica bootstrap confidence interval with all safety and attribution gates"
+      ],
+      "rollback_rule": [
+        "Disable peer evidence pooling if it hides channel-specific loss or reduces cell retention",
+        "Disable failed-HTLC demand weighting if predicted conversion is not realized or fee churn rises",
+        "Return to the prior promoted controller after any safety, accounting, or attribution failure"
+      ],
+      "evidence": [
+        "Signed upstream v1.11.0 tag and MIT license",
+        "Pinned af.py sha256:4f86d17f5ac854274b06f46159e3d0a912128e68cc53071ff7a40009b19b910b",
+        "Pinned rebalancer.py sha256:cc15480b1d3ad72475ad1f5f0d954133df9fd3f1d951242c42ab7d8aa7abe9b2"
+      ]
     }
   ]
 }

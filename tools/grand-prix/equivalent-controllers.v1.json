@@ -1,7 +1,7 @@
 {
   "schema": "competitive-equivalent-controllers-v1",
   "frozen_at_utc": "2026-09-03T18:00:00Z",
-  "research_catalog_digest": "sha256:c4b9950d0a6bc92dffd0686c500317fca33ced896c7f4478f44b569de1711b31",
+  "research_catalog_digest": "sha256:9668d1da4b0d9cace0ad1a47842b22263f3ceb25a38130e86ca9252d2f6160c1",
   "models": {
     "ln_operator": {
       "comparison_class": "algorithm_equivalent",
@@ -52,6 +52,32 @@
       "broadcast": {
         "absolute_deadband_ppm": 25,
         "relative_deadband": 0.1
+      },
+      "rebalance_mode": "off_for_fee_only_comparison"
+    },
+    "lndg": {
+      "comparison_class": "algorithm_equivalent",
+      "source_revision": "0fe400029240fc59431b56b6ce47e24b764396b1",
+      "claim_scope": "Clean-room source-derived AutoFees response model; not an LNDg runtime, scheduler, pathfinder, or rebalance comparison",
+      "trigger": {
+        "kind": "interval",
+        "seconds": 86400,
+        "minimum_balance_change_sats": 0
+      },
+      "formula": {
+        "kind": "lndg_autofees_v1",
+        "minimum_ppm": 0,
+        "maximum_ppm": 2500,
+        "increment_ppm": 5,
+        "multiplier": 5,
+        "failed_htlc_limit": 25,
+        "low_liquidity_percent": 15,
+        "excess_liquidity_percent": 95,
+        "base_fee_policy": "preserve"
+      },
+      "broadcast": {
+        "absolute_deadband_ppm": 0,
+        "relative_deadband": 0.0
       },
       "rebalance_mode": "off_for_fee_only_comparison"
     }

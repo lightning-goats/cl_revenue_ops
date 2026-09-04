@@ -34,7 +34,7 @@ def _fixture():
 def test_frozen_models_are_valid_and_claims_are_limited():
     result = _module().validate_models(_fixture())
     assert result["valid"] is True
-    assert result["models"] == ["ln_operator", "torq"]
+    assert result["models"] == ["ln_operator", "lndg", "torq"]
     assert result["catalog_digest"].startswith("sha256:")
 
 
@@ -65,6 +65,144 @@ def test_torq_workflow_is_aggressive_but_bounded_and_monotone():
     assert 25 <= fees[-1] < fees[0] <= 2000
 
 
+def test_lndg_source_branches_are_peer_aggregated_and_preserve_base_fee():
+    module = _module()
+    model = _fixture()["models"]["lndg"]
+    rows = [
+        {
+            "peer_connected": True,
+            "peer_id": "multi",
+            "fee_proportional_millionths": 100,
+            "fee_base_msat": "1000msat",
+            "total_msat": "1000000msat",
+            "to_us_msat": "400000msat",
+        },
+        {
+            "peer_connected": True,
+            "peer_id": "multi",
+            "fee_proportional_millionths": 200,
+            "fee_base_msat": 0,
+            "total_msat": 1000000,
+            "to_us_msat": 400000,
+        },
+        {
+            "peer_connected": True,
+            "peer_id": "scarce-demand",
+            "fee_proportional_millionths": 100,
+            "fee_base_msat": 0,
+            "total_msat": 1000000,
+            "to_us_msat": 100000,
+            "failed_out_count": 26,
+        },
+        {
+            "peer_connected": True,
+            "peer_id": "excess",
+            "fee_proportional_millionths": 100,
+            "fee_base_msat": 0,
+            "total_msat": 1000000,
+            "to_us_msat": 960000,
+        },
+    ]
+    assert module.policy_intents(model, rows) == [
+        {
+            "peer_id": "multi",
+            "fee_base_msat": 1000,
+            "fee_ppm": 85,
+            "previous_fee_ppm": 100,
+        },
+        {
+            "peer_id": "multi",
+            "fee_base_msat": 0,
+            "fee_ppm": 185,
+            "previous_fee_ppm": 200,
+        },
+        {
+            "peer_id": "scarce-demand",
+            "fee_base_msat": 0,
+            "fee_ppm": 125,
+            "previous_fee_ppm": 100,
+        },
+        {
+            "peer_id": "excess",
+            "fee_base_msat": 0,
+            "fee_ppm": 75,
+            "previous_fee_ppm": 100,
+        },
+    ]
+
+
+def test_lndg_flow_and_assisted_revenue_branches_match_pinned_source():
+    module = _module()
+    model = _fixture()["models"]["lndg"]
+    rows = [
+        {
+            "peer_connected": True,
+            "peer_id": "drain",
+            "fee_proportional_millionths": 100,
+            "fee_base_msat": 0,
+            "total_msat": 1000000,
+            "to_us_msat": 500000,
+            "amt_routed_out_7day_msat": 2500000,
+        },
+        {
+            "peer_connected": True,
+            "peer_id": "assist",
+            "fee_proportional_millionths": 100,
+            "fee_base_msat": 0,
+            "total_msat": 1000000,
+            "to_us_msat": 960000,
+            "amt_routed_in_7day_msat": 100000,
+            "revenue_7day_msat": 100,
+            "revenue_assist_7day_msat": 1001,
+        },
+    ]
+    assert module.policy_intents(model, rows) == [
+        {
+            "peer_id": "drain",
+            "fee_base_msat": 0,
+            "fee_ppm": 135,
+            "previous_fee_ppm": 100,
+        },
+        {
+            "peer_id": "assist",
+            "fee_base_msat": 0,
+            "fee_ppm": 75,
+            "previous_fee_ppm": 100,
+        },
+    ]
+
+
+def test_lndg_malformed_evidence_is_a_neutral_skip():
+    module = _module()
+    model = _fixture()["models"]["lndg"]
+    assert module.policy_intents(model, [{
+        "peer_connected": True,
+        "peer_id": "bad",
+        "fee_proportional_millionths": 100,
+        "fee_base_msat": 0,
+        "total_msat": 1000000,
+        "to_us_msat": 500000,
+        "amt_routed_out_7day_msat": "not-a-number",
+    }]) == []
+
+
+def test_model_ids_cannot_exchange_formula_kinds():
+    module = _module()
+    lndg_with_sigmoid = _fixture()
+    lndg_with_sigmoid["models"]["lndg"]["formula"] = dict(
+        lndg_with_sigmoid["models"]["ln_operator"]["formula"]
+    )
+    with pytest.raises(module.EquivalentControllerError, match="formula kind"):
+        module.validate_models(lndg_with_sigmoid)
+
+    operator_with_lndg = _fixture()
+    operator_with_lndg["models"]["ln_operator"]["formula"] = dict(
+        operator_with_lndg["models"]["lndg"]["formula"]
+    )
+    with pytest.raises(module.EquivalentControllerError, match="formula kind"):
+        module.validate_models(operator_with_lndg)
+
+
 def test_policy_intents_skip_malformed_offline_and_deadband_rows():
     module = _module()
     model = _fixture()["models"]["ln_operator"]
@@ -91,7 +229,7 @@ def test_policy_intents_skip_malformed_offline_and_deadband_rows():
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
-        (lambda value: value["models"].pop("torq"), "LN Operator and Torq"),
+        (lambda value: value["models"].pop("torq"), "LNDg, LN Operator, and Torq"),
         (
             lambda value: value["models"]["torq"].update(
                 comparison_class="direct_runtime"

@@ -587,6 +587,32 @@ def test_equivalent_controller_catalog_is_frozen_and_loadable():
     assert validation["catalog_digest"].startswith("sha256:")
 
 
+def test_lndg_controller_catalog_is_source_pinned_and_claim_limited():
+    runner = _module()
+    model, validation = runner._equivalent_model_context(
+        "lndg", runner.EQUIVALENT_CONTROLLER_CONFIG
+    )
+    assert model["source_revision"] == "0fe400029240fc59431b56b6ce47e24b764396b1"
+    assert model["formula"] == {
+        "kind": "lndg_autofees_v1",
+        "minimum_ppm": 0,
+        "maximum_ppm": 2500,
+        "increment_ppm": 5,
+        "multiplier": 5,
+        "failed_htlc_limit": 25,
+        "low_liquidity_percent": 15,
+        "excess_liquidity_percent": 95,
+        "base_fee_policy": "preserve",
+    }
+    assert model["trigger"] == {
+        "kind": "interval",
+        "seconds": 86400,
+        "minimum_balance_change_sats": 0,
+    }
+    assert "not an LNDg runtime" in model["claim_scope"]
+    assert validation["catalog_digest"].startswith("sha256:")
+
+
 def test_equivalent_policy_application_uses_only_returned_intents(monkeypatch):
     runner = _module()
     model, _validation = runner._equivalent_model_context(

@@ -20,7 +20,7 @@ from typing import Any
 
 SCHEMA = "competitive-equivalent-controllers-v1"
 MAX_BYTES = 64 * 1024
-MODEL_IDS = frozenset({"ln_operator", "torq"})
+MODEL_IDS = frozenset({"lndg", "ln_operator", "torq"})
 
 
 class EquivalentControllerError(ValueError):
@@ -68,9 +68,13 @@ def validate_models(payload: Any) -> dict[str, Any]:
         raise EquivalentControllerError("research_catalog_digest must be complete")
     models = payload["models"]
     if not isinstance(models, dict) or set(models) != MODEL_IDS:
-        raise EquivalentControllerError("catalog must define LN Operator and Torq models")
+        raise EquivalentControllerError(
+            "catalog must define LNDg, LN Operator, and Torq models"
+        )
     expected_classes = {
-        "ln_operator": "algorithm_equivalent", "torq": "workflow_equivalent"
+        "lndg": "algorithm_equivalent",
+        "ln_operator": "algorithm_equivalent",
+        "torq": "workflow_equivalent",
     }
     for identifier, model in models.items():
         if not isinstance(model, dict) or set(model) != {
@@ -99,30 +103,85 @@ def validate_models(payload: Any) -> dict[str, Any]:
             f"{identifier}.trigger.minimum_balance_change_sats",
         )
         formula = model["formula"]
-        if not isinstance(formula, dict) or set(formula) != {
-            "kind", "minimum_ppm", "maximum_ppm", "steepness", "midpoint",
-            "market_multiplier", "refill_floor_ppm", "hard_ceiling_ppm",
-            "base_fee_msat",
-        }:
+        if not isinstance(formula, dict):
             raise EquivalentControllerError(f"{identifier}.formula is malformed")
-        if formula["kind"] != "inventory_sigmoid":
+        if identifier != "lndg" and formula.get("kind") == "inventory_sigmoid":
+            if set(formula) != {
+                "kind", "minimum_ppm", "maximum_ppm", "steepness", "midpoint",
+                "market_multiplier", "refill_floor_ppm", "hard_ceiling_ppm",
+                "base_fee_msat",
+            }:
+                raise EquivalentControllerError(f"{identifier}.formula is malformed")
+            minimum = _integer(
+                formula["minimum_ppm"], f"{identifier}.minimum_ppm"
+            )
+            maximum = _integer(
+                formula["maximum_ppm"], f"{identifier}.maximum_ppm"
+            )
+            ceiling = _integer(
+                formula["hard_ceiling_ppm"], f"{identifier}.hard_ceiling_ppm"
+            )
+            if not minimum <= maximum <= ceiling:
+                raise EquivalentControllerError(f"{identifier} fee rails are unordered")
+            _number(
+                formula["steepness"], f"{identifier}.steepness", minimum=0.001
+            )
+            midpoint = _number(formula["midpoint"], f"{identifier}.midpoint")
+            if midpoint > 1:
+                raise EquivalentControllerError(
+                    f"{identifier}.midpoint must be <= 1"
+                )
+            multiplier = _number(
+                formula["market_multiplier"], f"{identifier}.market_multiplier"
+            )
+            if multiplier > 1:
+                raise EquivalentControllerError(
+                    f"{identifier}.market_multiplier must be <= 1"
+                )
+            _integer(
+                formula["refill_floor_ppm"], f"{identifier}.refill_floor_ppm"
+            )
+            _integer(formula["base_fee_msat"], f"{identifier}.base_fee_msat")
+        elif identifier == "lndg" and formula.get("kind") == "lndg_autofees_v1":
+            if set(formula) != {
+                "kind", "minimum_ppm", "maximum_ppm", "increment_ppm",
+                "multiplier", "failed_htlc_limit", "low_liquidity_percent",
+                "excess_liquidity_percent", "base_fee_policy",
+            }:
+                raise EquivalentControllerError(f"{identifier}.formula is malformed")
+            minimum = _integer(
+                formula["minimum_ppm"], f"{identifier}.minimum_ppm"
+            )
+            maximum = _integer(
+                formula["maximum_ppm"], f"{identifier}.maximum_ppm"
+            )
+            if minimum > maximum:
+                raise EquivalentControllerError(f"{identifier} fee rails are unordered")
+            _integer(
+                formula["increment_ppm"], f"{identifier}.increment_ppm", minimum=1
+            )
+            _integer(formula["multiplier"], f"{identifier}.multiplier", minimum=1)
+            _integer(
+                formula["failed_htlc_limit"], f"{identifier}.failed_htlc_limit"
+            )
+            low = _number(
+                formula["low_liquidity_percent"],
+                f"{identifier}.low_liquidity_percent",
+            )
+            excess = _number(
+                formula["excess_liquidity_percent"],
+                f"{identifier}.excess_liquidity_percent",
+            )
+            if not 0 <= low < excess <= 100:
+                raise EquivalentControllerError(
+                    f"{identifier} liquidity thresholds are unordered"
+                )
+            if formula["base_fee_policy"] != "preserve":
+                raise EquivalentControllerError(
+                    f"{identifier}.base_fee_policy must preserve"
+                )
+        else:
             raise EquivalentControllerError(f"{identifier}.formula kind is invalid")
-        minimum = _integer(formula["minimum_ppm"], f"{identifier}.minimum_ppm")
-        maximum = _integer(formula["maximum_ppm"], f"{identifier}.maximum_ppm")
-        ceiling = _integer(formula["hard_ceiling_ppm"], f"{identifier}.hard_ceiling_ppm")
-        if not minimum <= maximum <= ceiling:
-            raise EquivalentControllerError(f"{identifier} fee rails are unordered")
-        _number(formula["steepness"], f"{identifier}.steepness", minimum=0.001)
-        midpoint = _number(formula["midpoint"], f"{identifier}.midpoint")
-        if midpoint > 1:
-            raise EquivalentControllerError(f"{identifier}.midpoint must be <= 1")
-        multiplier = _number(
-            formula["market_multiplier"], f"{identifier}.market_multiplier"
-        )
-        if multiplier > 1:
-            raise EquivalentControllerError(f"{identifier}.market_multiplier must be <= 1")
-        _integer(formula["refill_floor_ppm"], f"{identifier}.refill_floor_ppm")
-        _integer(formula["base_fee_msat"], f"{identifier}.base_fee_msat")
         broadcast = model["broadcast"]
         if not isinstance(broadcast, dict) or set(broadcast) != {
             "absolute_deadband_ppm", "relative_deadband"
@@ -188,6 +247,8 @@ def target_fee_ppm(model: dict[str, Any], local_ratio: float) -> int:
     if ratio > 1:
         raise EquivalentControllerError("local_ratio must be <= 1")
     formula = model["formula"]
+    if formula.get("kind") != "inventory_sigmoid":
+        raise EquivalentControllerError("target_fee_ppm requires inventory_sigmoid")
     minimum = int(formula["minimum_ppm"])
     maximum = int(formula["maximum_ppm"])
     steepness = float(formula["steepness"])
@@ -200,10 +261,118 @@ def target_fee_ppm(model: dict[str, Any], local_ratio: float) -> int:
     return max(0, min(int(formula["hard_ceiling_ppm"]), int(round(target))))
 
 
+def _evidence(row: dict[str, Any], key: str) -> float:
+    """Match LNDg's empty-query zero while rejecting malformed supplied data."""
+    if key not in row:
+        return 0.0
+    return _number(row[key], key)
+
+
+def _lndg_policy_intents(
+    model: dict[str, Any], channels: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Reproduce pinned LNDg AutoFees peer aggregation and outbound branches."""
+    normalized: list[dict[str, Any]] = []
+    for row in channels:
+        try:
+            if not isinstance(row, dict) or not row.get("peer_connected"):
+                continue
+            peer_id = row.get("peer_id")
+            current = row.get("fee_proportional_millionths")
+            if not isinstance(peer_id, str) or not peer_id or isinstance(current, bool):
+                continue
+            current = int(current)
+            total = _msat(row.get("total_msat"))
+            local = _msat(row.get("to_us_msat"))
+            base = _msat(row.get("fee_base_msat", 0))
+            if total <= 0 or local < 0 or local > total or current < 0 or base < 0:
+                continue
+            normalized.append({
+                "peer_id": peer_id,
+                "current": current,
+                "base": base,
+                "total": total,
+                "local": local,
+                "failed": _evidence(row, "failed_out_count"),
+                "in_1d": _evidence(row, "amt_routed_in_1day_msat"),
+                "in_7d": _evidence(row, "amt_routed_in_7day_msat"),
+                "out_7d": _evidence(row, "amt_routed_out_7day_msat"),
+                "revenue": _evidence(row, "revenue_7day_msat"),
+                "assisted": _evidence(row, "revenue_assist_7day_msat"),
+            })
+        except (EquivalentControllerError, TypeError, ValueError, OverflowError):
+            continue
+
+    groups: dict[str, dict[str, float]] = {}
+    for row in normalized:
+        group = groups.setdefault(row["peer_id"], {
+            "total": 0.0,
+            "local": 0.0,
+            "failed": 0.0,
+            "in_1d": 0.0,
+            "in_7d": 0.0,
+            "out_7d": 0.0,
+            "revenue": 0.0,
+            "assisted": 0.0,
+        })
+        for key in group:
+            group[key] += float(row[key])
+
+    formula = model["formula"]
+    low = float(formula["low_liquidity_percent"])
+    excess = float(formula["excess_liquidity_percent"])
+    failed_limit = int(formula["failed_htlc_limit"])
+    multiplier = int(formula["multiplier"])
+    increment = int(formula["increment_ppm"])
+    minimum = int(formula["minimum_ppm"])
+    maximum = int(formula["maximum_ppm"])
+    adjustments: dict[str, float] = {}
+    for peer_id, group in groups.items():
+        outbound_percent = group["local"] * 100.0 / group["total"]
+        routed = group["in_7d"] + group["out_7d"]
+        net_routed = (group["out_7d"] - group["in_7d"]) / group["total"]
+        if outbound_percent <= low:
+            adjustment = (
+                5 * multiplier
+                if group["failed"] > failed_limit and group["in_1d"] == 0
+                else 0
+            )
+        elif outbound_percent < excess:
+            if routed == 0:
+                adjustment = -3 * multiplier
+            elif net_routed > 1:
+                adjustment = (2 * multiplier) * (1 + net_routed)
+            else:
+                adjustment = 0
+        elif routed == 0:
+            adjustment = -5 * multiplier
+        elif net_routed < 0 and group["assisted"] > group["revenue"] * 10:
+            adjustment = -5 * multiplier
+        else:
+            adjustment = 0
+        adjustments[peer_id] = adjustment
+
+    intents: list[dict[str, Any]] = []
+    for row in normalized:
+        unrounded = max(minimum, min(maximum, row["current"] + adjustments[row["peer_id"]]))
+        target = int(round(unrounded / increment) * increment)
+        if target == row["current"]:
+            continue
+        intents.append({
+            "peer_id": row["peer_id"],
+            "fee_base_msat": row["base"],
+            "fee_ppm": target,
+            "previous_fee_ppm": row["current"],
+        })
+    return intents
+
+
 def policy_intents(model: dict[str, Any], channels: Any) -> list[dict[str, Any]]:
     """Return safe policy intents; malformed/offline rows are neutral skips."""
     if not isinstance(channels, list):
         return []
+    if model.get("formula", {}).get("kind") == "lndg_autofees_v1":
+        return _lndg_policy_intents(model, channels)
     intents: list[dict[str, Any]] = []
     absolute = int(model["broadcast"]["absolute_deadband_ppm"])
     relative = float(model["broadcast"]["relative_deadband"])

@@ -84,13 +84,17 @@ def test_research_catalog_distinguishes_direct_and_equivalent_comparisons():
     assert result["comparison_classes"] == {
         "clboss": "direct_runtime",
         "ln_operator": "algorithm_equivalent",
+        "lndg": "algorithm_equivalent",
         "torq": "workflow_equivalent",
     }
     assert result["direct_runtime_statuses"] == {
-        "clboss": "admitted", "ln_operator": "blocked", "torq": "blocked",
+        "clboss": "admitted",
+        "ln_operator": "blocked",
+        "lndg": "blocked",
+        "torq": "blocked",
     }
     assert [card["baseline_arm"]["status"] for card in catalog["cards"]] == [
-        "executed", "model_executed", "model_executed",
+        "executed", "model_executed", "model_executed", "model_executed",
     ]
 
 
@@ -146,4 +150,4 @@ def test_cli_validates_research_catalog_without_dispatching_actions():
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
-    assert payload["cards"] == ["clboss", "ln_operator", "torq"]
+    assert payload["cards"] == ["clboss", "ln_operator", "lndg", "torq"]

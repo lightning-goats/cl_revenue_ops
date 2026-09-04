@@ -292,6 +292,17 @@ public ablation, Revenue improvement only when evidence identifies a gap,
 three replicas per assignment, then a previously committed sealed holdout.
 Promotion and production activation remain separate decisions.
 
+Admission smoke replica r131 executed the clean-room LNDg model on the public
+Docker topology with Revenue Ops v17. The model changed 12 of 16 eligible
+channels, with resulting targets from 25 to 285 ppm; this verifies that the
+pinned response is executable rather than a paper specification. All 24 smoke
+payments settled. Revenue Ops carried 2.424M sats and earned 567.444 sats while
+the LNDg lane carried no contender traffic. This is deliberately not formal
+superiority evidence: the fresh lab supplied no seven-day forwarding or
+eligible-liquidity-failure history, and a short smoke must not silently
+compress LNDg's source 24-hour cooldown. A formal history-aware arm must freeze
+its simulated clock and evidence window before the crossed public block.
+
 Example controller selection:
 
 ```bash

@@ -278,9 +278,11 @@ def validate_research_catalog(catalog: Any) -> dict[str, Any]:
         classes[identifier] = comparison_class
         statuses[identifier] = direct_status
 
-    required = {"clboss", "ln_operator", "torq"}
+    required = {"clboss", "lndg", "ln_operator", "torq"}
     if not required.issubset(seen):
-        raise ProtocolError("catalog must include CLBOSS, LN Operator, and Torq")
+        raise ProtocolError(
+            "catalog must include CLBOSS, LNDg, LN Operator, and Torq"
+        )
     return {
         "schema": RESEARCH_CATALOG_SCHEMA,
         "valid": True,
