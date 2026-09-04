@@ -27,6 +27,7 @@ STAGES = {"public", "holdout"}
 CONTROLLERS = ("revenue_ops", "clboss")
 IDENTITIES = ("identity-a", "identity-b")
 EQUIVALENT_COMPARISON_CLASSES = {
+    "lndg": "algorithm_equivalent",
     "ln_operator": "algorithm_equivalent",
     "torq": "workflow_equivalent",
 }

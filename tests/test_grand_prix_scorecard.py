@@ -255,7 +255,11 @@ def _as_equivalent(state, identifier, comparison_class):
 
 @pytest.mark.parametrize(
     ("identifier", "comparison_class"),
-    [("ln_operator", "algorithm_equivalent"), ("torq", "workflow_equivalent")],
+    [
+        ("lndg", "algorithm_equivalent"),
+        ("ln_operator", "algorithm_equivalent"),
+        ("torq", "workflow_equivalent"),
+    ],
 )
 def test_equivalent_comparator_claim_scope_is_preserved(identifier, comparison_class):
     module = _module()
