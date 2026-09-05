@@ -228,3 +228,8 @@ production remains on verified `5d3242b`. The v30 reservation-price experiment
 remains separate and unqualified. The r227 lab was stopped and removed after
 read-only diagnostics; its result artifacts are retained. No production action
 RPC, Sling dependency, or competitor/environment change was introduced.
+
+The subsequent [v33 flow-reserve experiment](2026-09-05-yield-flow-reserve-experiment.md)
+completed both crossed assignments but failed volume-retention gates in each.
+Its forecast code was removed, with exact source and native evidence archived.
+It is not a promotion or production release.
