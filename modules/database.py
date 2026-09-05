@@ -704,9 +704,13 @@ class Database:
                 new_fee_ppm INTEGER NOT NULL,
                 reason TEXT,
                 manual INTEGER NOT NULL DEFAULT 0,
-                timestamp INTEGER NOT NULL
+                timestamp INTEGER NOT NULL,
+                execution_evidence TEXT
             )
         """)
+        fee_columns = {row[1] for row in conn.execute("PRAGMA table_info(fee_changes)")}
+        if "execution_evidence" not in fee_columns:
+            conn.execute("ALTER TABLE fee_changes ADD COLUMN execution_evidence TEXT")
         
         # Rebalance history
         conn.execute("""
@@ -2700,7 +2704,8 @@ class Database:
     def record_fee_change(self, channel_id: str, peer_id: str, old_fee_ppm: int,
                           new_fee_ppm: int, reason: str, manual: bool = False,
                           reason_code: Optional[str] = None,
-                          heuristic_modifiers: Optional[str] = None):
+                          heuristic_modifiers: Optional[str] = None,
+                          execution_evidence: Optional[Dict[str, Any]] = None):
         """
         Record a fee change for audit purposes.
 
@@ -2713,17 +2718,28 @@ class Database:
             manual: True if this was a manual change (not algorithmic)
             reason_code: Structured FeeReasonCode value (for explainability)
             heuristic_modifiers: JSON string of HeuristicModifiers (for explainability)
+            execution_evidence: Optional structured request/readback context.
+                Missing historical evidence stays NULL, never reconstructed
+                from today's policy. The row ID is its local action identity.
         """
+        evidence_json = None
+        if execution_evidence is not None:
+            if not isinstance(execution_evidence, dict):
+                raise ValueError("execution_evidence must be an object")
+            evidence_json = json.dumps(execution_evidence, sort_keys=True,
+                                       separators=(",", ":"), allow_nan=False)
+            if len(evidence_json.encode("utf-8")) > 16384:
+                raise ValueError("execution_evidence exceeds 16 KiB")
         conn = self._get_connection()
         now = int(time.time())
 
         conn.execute("""
             INSERT INTO fee_changes
             (channel_id, peer_id, old_fee_ppm, new_fee_ppm, reason, manual, timestamp,
-             reason_code, heuristic_modifiers)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             reason_code, heuristic_modifiers, execution_evidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (channel_id, peer_id, old_fee_ppm, new_fee_ppm, reason, 1 if manual else 0, now,
-              reason_code, heuristic_modifiers))
+              reason_code, heuristic_modifiers, evidence_json))
     
     def get_fee_changes_between(
         self, since_timestamp: int, until_timestamp: int

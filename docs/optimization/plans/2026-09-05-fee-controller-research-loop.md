@@ -290,6 +290,70 @@ Keep inference bounded and explainable, model failure neutral, and execution
 authority and accounting outside learned control. No hive, external service,
 or inter-node coordination is implied by centralizing learning inside this node.
 
+## Historical bootstrap and continuous learning
+
+The operator requires the plugin to learn from retained historical data, not
+only events observed after a new model starts. Production reportedly has nine
+months of data. Verify actual coverage and granularity read-only before choosing
+training inputs; this is not confirmation of nine months of complete raw events.
+Historical learning is part of the correctness/shared-learning track above,
+not an optional reporting exercise or a separate victory criterion.
+
+1. **Inventory evidence before training.** On production, report source, earliest
+   and latest times, coverage gaps, channel identities, units, schema/policy
+   versions, and overlap. Check retained CLN forwards, the canonical archive,
+   operational forwards, daily inbound/outbound rollups, fee changes, reconciled
+   rebalance costs and existing learned state. The operational table has roughly
+   eight-day retention and existing fee/rebalance audit cleanup keeps 90 days;
+   long-run accounting is therefore not necessarily long-run action exposure.
+   The archive's retention allowance does not prove it
+   was collecting throughout the preceding nine months. Do not initialize or
+   migrate a production database merely to inspect it. Keep raw history local.
+2. **Match the learning question to the evidence.** Exact event records can
+   support amounts, earned fees and incoming/outgoing pairs where present.
+   Daily aggregates can inform long-run channel flow and realized profitability,
+   but cannot recover lost route pairs, intraday timing, pre-action liquidity,
+   fee exposure or unsuccessful demand. Old ppm-only fee history does not
+   reconstruct old base fees. Missing periods are unknown, not zero demand;
+   genuine observed zero-traffic exposure remains informative. Demand response
+   requires policy exposure, not simply dividing fees by successful volume.
+3. **Build conservative historical priors.** Replay chronologically with only
+   information available at each decision time. Use age weighting, bounded
+   effective sample size, regime/change detection and hierarchical pooling;
+   compare their calibration rather than fixing a universal decay horizon.
+   Keep stable behavioral information without letting old topology, balances
+   or fee regimes overpower recent evidence. Nine months can inform repeated
+   weekday patterns, but does not establish annual seasonality. Preserve closed
+   or replaced channel identities; never attach old events to today's channel
+   merely because it has the same peer. Unknown action-selection probabilities
+   and observational policy bias limit causal/off-policy conclusions.
+4. **Join backfill to online updates exactly once.** Freeze source generation,
+   watermark, coverage and model version. Process bounded resumable batches;
+   atomically checkpoint model state and consumed evidence, with interruption,
+   restore and late-update recovery tests. Reconcile overlapping operational
+   and archived observations before promotion: disjoint IDs are not disjoint
+   events. Never sum raw events with the rollups representing those same events.
+   Rebuilding a prior must not count evidence already absorbed into a persisted
+   posterior. Respect ADR-002 until an explicit operational-learning decision
+   supersedes its archive boundary. Rate-limit scans so live routing is unaffected.
+5. **Prove usefulness without leakage.** Use rolling, time-ordered train/validation
+   windows, with outcome-maturation gaps where needed. Fit preprocessing and
+   priors only on each training prefix; evaluate the next unseen interval.
+   Compare historical warm start, recent-only and neutral cold start for
+   prediction calibration, uncertainty, downstream action quality and runtime
+   cost. Historical replay alone cannot prove increased live earnings because
+   alternative prices would change traffic. Qualify policies in the unchanged
+   native tournament and then the approved staged production path. Declare and
+   freeze any Revenue-only learned artifact as part of the candidate; do not
+   alter competitor history, clocks, workload or scoring to favor it, and do not
+   claim that a warm-start advantage establishes a superior controller algorithm.
+
+Exit evidence must include a verified production coverage report, source-aware
+historical reader/replay, idempotent restart tests, measured downstream effects,
+chronological validation and bounded-resource tests. Shadow the bootstrap and
+retain the existing model as fallback before promoting a learned state. A
+successful backfill or richer audit log alone does not satisfy this requirement.
+
 ## Invariants, production, and completion
 
 Keep the frozen Docker topology, traffic, payer state, timing, native competitor

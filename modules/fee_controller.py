@@ -63,6 +63,7 @@ from typing import Callable, ClassVar, Dict, List, Optional, Any, Set, Tuple, Un
 from enum import Enum
 
 from pyln.client import Plugin, RpcError
+from .fee_policy_evidence import capture_fee_request, complete_fee_execution
 
 from .config import Config, ChainCostDefaults, LiquidityBuckets
 from . import admission_policy as _admission_policy
@@ -11210,6 +11211,13 @@ class FeeController:
                         level='info')
                     return result
 
+            # Freeze observational context before the RPC; evidence must not
+            # change the action or turn missing readback into requested facts.
+            request_evidence = None
+            try:
+                request_evidence = capture_fee_request(channel_info, rpc_params)
+            except Exception as exc:
+                result.setdefault("warnings", {})["fee_evidence_unavailable"] = str(exc)
             try:
                 rpc_result = self.data_service.set_channel(**rpc_params)
             finally:
@@ -11234,7 +11242,7 @@ class FeeController:
             if applied_htlcmax_msat is not None:
                 result["applied_htlcmax_msat"] = applied_htlcmax_msat
             if rpc_warnings:
-                result["warnings"] = rpc_warnings
+                result.setdefault("warnings", {}).update(rpc_warnings)
 
             # The fee is now LIVE on-chain (setchannel succeeded and the
             # read-back was recorded). Mark success here: everything after
@@ -11256,6 +11264,15 @@ class FeeController:
 
             # Step 3: Record the change with explainability data.
             # Post-RPC bookkeeping failures are warnings, not failures.
+            execution_evidence = None
+            if request_evidence is not None:
+                try:
+                    execution_evidence = complete_fee_execution(
+                        request_evidence, rpc_result, resolved_channel_id,
+                        self._last_fee_apply_ts[resolved_channel_id],
+                    )
+                except Exception as exc:
+                    result.setdefault("warnings", {})["fee_evidence_unavailable"] = str(exc)
             try:
                 self.database.record_fee_change(
                     channel_id=resolved_channel_id,
@@ -11265,6 +11282,7 @@ class FeeController:
                     reason=reason,
                     manual=manual,
                     reason_code=reason_code,
+                    execution_evidence=execution_evidence,
                 )
             except Exception as e:
                 result.setdefault("warnings", {})["record_fee_change_failed"] = str(e)
