@@ -7,6 +7,10 @@ channel profitability.
 It is fully standalone: decisions use only this node's forwards, gossip, and
 state. It does not open or close channels, execute swaps, or withdraw funds.
 
+Use the `v3.0.1` tag for the fixes-only maintenance release. Development `main`
+also contains optional yield-aware work that is not included in that release
+and has not qualified for production activation.
+
 ## Requirements
 
 - Core Lightning `v26.06.7+` from a maintainer-verified release artifact
@@ -20,7 +24,7 @@ version floor and smoke-test notes.
 
 ```bash
 cd ~/.lightning/plugins
-git clone https://github.com/lightning-goats/cl_revenue_ops.git
+git clone --branch v3.0.1 https://github.com/lightning-goats/cl_revenue_ops.git
 cd cl_revenue_ops
 python3 -m pip install -r requirements.txt
 chmod +x cl-revenue-ops.py
@@ -133,9 +137,16 @@ entries before restarting or changing controls.
 
 ## Upgrade
 
+Back up the database and configuration first, and confirm there are no active
+rebalance jobs. For the fixes-only maintenance release, use the explicit tag
+instead of pulling the development branch. Preserve any local changes before
+switching revisions. Nodes already following a newer development revision
+should not downgrade simply to obtain a release label.
+
 ```bash
-lightning-cli plugin stop cl-revenue-ops
-git -C ~/.lightning/plugins/cl_revenue_ops pull --ff-only
+git -C ~/.lightning/plugins/cl_revenue_ops fetch origin tag v3.0.1
+lightning-cli plugin stop ~/.lightning/plugins/cl_revenue_ops/cl-revenue-ops.py
+git -C ~/.lightning/plugins/cl_revenue_ops switch --detach v3.0.1
 lightning-cli plugin start ~/.lightning/plugins/cl_revenue_ops/cl-revenue-ops.py
 ```
 
@@ -144,6 +155,7 @@ The SQLite database is kept outside the repository by default at
 
 ## Reference
 
+- [v3.0.1 maintenance release notes](docs/releases/v3.0.1.md)
 - [v3.0.0 release notes](docs/releases/v3.0.0.md)
 - [Public telemetry contracts](docs/contracts/README.md)
 - [Action RPC inventory](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md)

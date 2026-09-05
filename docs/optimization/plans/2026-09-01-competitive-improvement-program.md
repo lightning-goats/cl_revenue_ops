@@ -2,12 +2,21 @@
 
 **Status:** active local-only improvement program. The operator approved
 regtest mutations and fake-sat action RPCs for this program. Production was
-updated to `5d3242b` on 2026-09-05 after native admission compatibility and
-4,145 clean-release tests passed. Its normal fee cycle verified the corrected
-liquidity-backed HTLC limits. Production still uses `undercut` with the existing
+updated to `aa79eba` on 2026-09-05 after 4,169 clean-release tests passed.
+This isolated maintenance release adds fresh decision evidence and separates
+fee deadbands from admission updates, retaining the previously verified
+liquidity-backed HTLC correction. Native competitive diagnostics still failed
+their gates; the experimental pricing candidate was not deployed.
+Production still uses `undercut` with the existing
 1,200-ppm maximum; yield-aware remains inactive. Only the plugin was restarted;
 no manual fee/rebalance cycle or fund transfer was issued. See the
-[native diagnostic and deployment record](../validation/2026-09-05-native-admission-diagnostic.md).
+[admission-floor deployment record](../validation/2026-09-05-native-admission-diagnostic.md)
+and [maintenance rollout and native diagnostics](../validation/2026-09-05-admission-fee-deadbands.md).
+
+The separately approved public [v3.0.1 maintenance release](../validation/2026-09-05-v3.0.1-maintenance-release.md)
+backports the applicable fixes onto v3.0.0 and excludes yield-aware development.
+Its exact commit passed 4,154 tests. It is not the production revision and does
+not establish the competitive goal; production was not downgraded for tagging.
 
 The machine-readable protocol is frozen with holdout commitment
 `sha256:28f431477a4fcbb431a6b4e23485cab1bbfd8536e191def91f1c5c4639b1f4cf`.

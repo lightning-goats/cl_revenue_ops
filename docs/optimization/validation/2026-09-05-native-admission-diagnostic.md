@@ -233,3 +233,11 @@ The subsequent [v33 flow-reserve experiment](2026-09-05-yield-flow-reserve-exper
 completed both crossed assignments but failed volume-retention gates in each.
 Its forecast code was removed, with exact source and native evidence archived.
 It is not a promotion or production release.
+
+Subsequently, the isolated [admission/fee-deadband maintenance release](2026-09-05-admission-fee-deadbands.md)
+`aa79eba` passed 4,169 clean-release tests and was deployed with verified
+backups and unchanged production configuration. It includes the fresh-evidence
+and two-sided inventory-wake changes described above, but not v30 experimental
+pricing or the rejected v33 reserve. Native v34 crossed diagnostics still failed
+competitive gates; neither this deployment nor their absence of recorded local
+fee-insufficient failures establishes superiority or increased earnings.

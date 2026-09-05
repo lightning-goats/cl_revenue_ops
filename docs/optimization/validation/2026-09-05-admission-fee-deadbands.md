@@ -94,3 +94,96 @@ The v34 four-source digest is
 `sha256:f8d57e434a6607aff83e2f7aca6feee58231ecd75f5114ec657cde54fdf244cf`;
 the frozen image identity is
 `sha256:023576e2ade16108aef3039963863986ca84fc52f34c88d2dbeb15eeaa438f24`.
+
+## Completed native crossed diagnostic
+
+Both preregistered assignments settled all 240 payments. Neither qualified:
+
+| Replica | Revenue Ops fees (sats) | Native CLBOSS fees (sats) | Minimum cell retention |
+| --- | ---: | ---: | ---: |
+| 230 (Revenue B) | 24,726.988 | 30,815.269 | 0.75 |
+| 231 (Revenue A) | 23,332.534 | 39,397.809 | 0.75 |
+
+Each unchanged scorecard returned `insufficient_evidence`: economic bootstrap,
+retention and required crossed-replica coverage gates failed; delivery,
+attribution, frozen-protocol and safety gates passed. These losses remain
+failures and do not justify yield-aware activation or a ceiling increase.
+
+Neither Revenue Ops node recorded a local fee-insufficient failure (4108).
+Each did record one temporary channel failure (4103) on its LND-sink channel,
+and four downstream failed forwards without a reported local failure code.
+The CLN payer again retained a 260,249,999-msat maximum constraint on that
+Revenue Ops outgoing direction. Thus this correction alone does not solve the
+liquidity/learned-limit problem. The absence of recorded local fee failures is
+encouraging but, with two exploratory runs and other runtime variability, is
+not proof of the correction's causal effect or a production earnings gain.
+
+The unmodified topology, traffic, timing flags, native CLBOSS behavior and
+1,200-ppm rail were used throughout. Post-traffic diagnostics were read-only.
+Both labs were removed through the existing scoped cleanup; Docker readback
+confirmed no remaining tournament containers, volumes or networks. No broad
+prune was used. Raw states, scores, phase logs and native diagnostics remain
+under `results/polar-grand-prix/` with the `v34` and `r230`/`r231` prefixes.
+
+The next competitive hypothesis may combine liquidity protection with fee
+stability, since their separate diagnostics address different failure modes.
+That would be a new Revenue-only candidate; it cannot retrospectively rescue
+v33 or v34, nor change their failed cells or the frozen benchmark.
+
+## Isolated maintenance release
+
+Commit `aa79eba64eac474d56920a80cdb4782e25f7a522` contains this correction,
+tests and report, but excludes the uncommitted v30 reservation-price experiment.
+Relative to production's `5d3242b`, only `cl-revenue-ops.py` and
+`modules/fee_controller.py` change at runtime: the earlier fresh-evidence and
+two-sided inventory-wake corrections plus this deadband correction. No schema,
+dependency, option, fee rail or public RPC change is required.
+
+Read-only production prechecks confirmed a clean `main` at `5d3242b`, all loops
+alive, 46 managed channels and zero active rebalance jobs. Production remained
+unpaused in `undercut` mode with a 1,200-ppm maximum, dynamic HTLC management
+enabled, and configuration version 103. These checks did not deploy code or
+trigger an action RPC. Full exact-release validation is required before rollout.
+
+### Exact-release validation and completed production rollout
+
+The clean isolated checkout of `aa79eba` passed 4,169 tests, with five skips
+and two expected failures, in 162.32 seconds. It included Git history required
+by migration tests and excluded all uncommitted pricing/operator work. Four
+live-router tests remained deliberately disabled; the fifth skip lacked the
+optional `pyln.testing` package. Native runtime evidence above is separate from
+this unit/regression suite. No test gate was relaxed.
+
+Under the existing operator deployment authorization, fresh prechecks again
+required clean production `main` at `5d3242b`, healthy loops, zero active
+rebalance jobs, and the unchanged mode/configuration. A consistent SQLite
+backup passed `PRAGMA quick_check`; the old tracked source was archived.
+The private recovery directory is
+`/data/lightningd/.lightning/revenue-ops-backup-deadband-1k8ocw`.
+
+Only the Revenue Ops plugin was stopped, the repository was fast-forwarded to
+`aa79eba64eac474d56920a80cdb4782e25f7a522`, and the plugin was restarted.
+Both runtime file hashes were checked against the exact validated release.
+A guarded source-only recovery path was prepared but was not needed. The live
+database was never restored or replaced, and no schema migration was introduced.
+
+Independent post-rollout readback confirmed exact revision, a clean worktree,
+all monitored loops alive, no stalled loops, 46 managed channels, zero active
+rebalance jobs, and a fresh ordinary fee-loop heartbeat. Production remained
+unpaused in `undercut`, at 1,200 ppm, with dynamic HTLC management enabled and
+configuration version 103. No manual fee/rebalance cycle, channel operation,
+or fund transfer was issued. The only production action RPCs were plugin
+stop/start; normal authorized background execution resumed afterward.
+
+This is a verified maintenance deployment, not evidence of higher earnings or
+competitive superiority. The v30 pricing experiment and yield-aware activation
+remain unqualified and were not deployed. Monitor ordinary production behavior
+and subsequent earnings; lower fee churn alone does not establish an economic
+gain. Do not restore the old database over newer settled accounting merely to
+roll back code.
+
+The temporary validation checkout and launch/deployment scripts were removed
+after verification. The checkout is reproducible from `aa79eba`; source images,
+raw tournament evidence and private production backups remain intentionally
+available. Unrelated operator changes were preserved. No Sling, Archon DID or
+external coordinator was introduced.
