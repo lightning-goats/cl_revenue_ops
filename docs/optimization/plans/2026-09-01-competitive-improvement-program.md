@@ -30,11 +30,13 @@ artifacts are retained for audit only; the scorer rejects this competitor ID.
 Previously generated bounded score JSON files are superseded by this exclusion.
 No bounded result supports deployment, promotion, or product-superiority claims.
 
-Calibration changes must be justified by production observations and frozen
-before candidate comparison. Do not tune the topology or traffic to suppress
-a competitor's strengths or to rescue a failing cell. Realistic constraints
-apply to the environment and Revenue Ops experiments; native competitor
-responses remain observable outcomes.
+The operator further clarified that the test environment must not be manipulated
+to improve results either. Keep topology, traffic, competitor configuration,
+and scoring gates fixed during improvement loops. Only Revenue Ops may change
+to improve its result. A failed cell remains a failed cell. Production realism
+is a constraint, not justification for retrospectively changing a benchmark.
+Any discovered environment limitation must be reported as a limitation; it
+does not authorize changing the environment to rescue an unsuccessful candidate.
 
 Source-derived models remain research aids. Their results cannot replace
 evidence against the actual product or establish superiority over that product.
