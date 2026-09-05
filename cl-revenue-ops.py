@@ -184,7 +184,7 @@ from modules.forward_archive_sync import ForwardArchiveSynchronizer
 # v2.2.4: Stability + correctness fixes (DB rollups, policy precedence, rebalancer reliability)
 # v2.1.0: Kalman Filter for Flow State Estimation
 # v2.0.0: DTS+PID Fee Controller
-PLUGIN_VERSION = "3.0.0"
+PLUGIN_VERSION = "3.0.1"
 
 # Supply-chain / runtime version floor.  v26.06.7 is an embargoed security
 # release, so an older or unidentified runtime must not load this plugin.

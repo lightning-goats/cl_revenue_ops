@@ -7,9 +7,9 @@ delegates here) so admission control is a policy of its own rather than
 a branch of the fee formula — the spec's F3 requirement.
 
 Pure functions of (cfg, channel_info, flow_state): no RPC, no DB, no
-clock. The Phase 0 golden fixtures (tests/golden/fixtures/htlcmax/)
-pin these semantics; the FeeController shims keep that goldened seam
-byte-identical.
+clock. The golden fixtures (tests/golden/fixtures/htlcmax/) pin these
+semantics. The 2026-09 depletion correction makes the preferred floor
+subordinate to executable liquidity; the FeeController delegates here.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from .utils import sats_to_base
 
 # E-1 valve constants (moved from FeeController, values unchanged).
 DEPLETION_SPENDABLE_FRACTION = 0.85
-FLOOR_MSAT = 10_000_000  # 10k sats — existing valve floor
+FLOOR_MSAT = 10_000_000  # 10k sats — preferred floor, never a liquidity override
 UPDATE_DEADBAND_FRAC = 0.10
 
 
@@ -76,6 +76,14 @@ def compute_htlcmax_msat(cfg: Any, channel_info: Dict[str, Any],
     if not capacity_sats or spendable_msat is None:
         return None
     capacity_msat = sats_to_base(capacity_sats)
+    minimum_msat = _strict_nonnegative_int(
+        channel_info.get("htlc_minimum_msat", channel_info.get(
+            "htlc_min_msat", channel_info.get("minimum_htlc_out_msat", 0)
+        )),
+        msat_suffix=True,
+    )
+    if minimum_msat is None or minimum_msat > capacity_msat:
+        return None
     if flow_state == "source":
         fraction = _strict_fraction(getattr(cfg, "htlcmax_source_pct", None))
     elif flow_state == "sink":
@@ -89,10 +97,15 @@ def compute_htlcmax_msat(cfg: Any, channel_info: Dict[str, Any],
     # E-1: live-depletion cap — spendable outbound is what can actually
     # forward; advertising more invites doomed HTLCs.
     depletion_cap_msat = int(spendable_msat * DEPLETION_SPENDABLE_FRACTION)
-    target_msat = min(target_msat, depletion_cap_msat)
-
-    # Safety bounds: never below 10,000 sats or above capacity.
-    return max(FLOOR_MSAT, min(target_msat, capacity_msat))
+    # The preferred floor must not invent forwarding capacity. In particular,
+    # advertising 10k sats with less than 10k spendable invites a failed HTLC
+    # and can leave senders avoiding this channel after liquidity returns.
+    # Preserve the protocol's advertised minimum <= maximum invariant. At
+    # total exhaustion that minimum is the smallest valid range, not a claim
+    # that even the minimum is executable. With a zero minimum we can close
+    # the valve completely. Normal admission refresh reopens it on refill.
+    target_msat = min(capacity_msat, depletion_cap_msat, max(FLOOR_MSAT, target_msat))
+    return max(minimum_msat, target_msat)
 
 
 def delta_exceeds_deadband(new_msat: int, current_msat: int) -> bool:

@@ -1,5 +1,5 @@
 {
-  "htlcmax_msat": 10000000,
+  "htlcmax_msat": 850,
   "inputs": {
     "cfg_overrides": {},
     "channel_info": {

@@ -20,7 +20,7 @@ version floor and smoke-test notes.
 
 ```bash
 cd ~/.lightning/plugins
-git clone https://github.com/lightning-goats/cl_revenue_ops.git
+git clone --branch v3.0.1 https://github.com/lightning-goats/cl_revenue_ops.git
 cd cl_revenue_ops
 python3 -m pip install -r requirements.txt
 chmod +x cl-revenue-ops.py
@@ -133,9 +133,15 @@ entries before restarting or changing controls.
 
 ## Upgrade
 
+Back up the database and configuration first, and confirm there are no active
+rebalance jobs. For the fixes-only maintenance release, use the explicit tag
+instead of pulling the development branch. Preserve any local changes before
+switching revisions.
+
 ```bash
-lightning-cli plugin stop cl-revenue-ops
-git -C ~/.lightning/plugins/cl_revenue_ops pull --ff-only
+git -C ~/.lightning/plugins/cl_revenue_ops fetch origin tag v3.0.1
+lightning-cli plugin stop ~/.lightning/plugins/cl_revenue_ops/cl-revenue-ops.py
+git -C ~/.lightning/plugins/cl_revenue_ops switch --detach v3.0.1
 lightning-cli plugin start ~/.lightning/plugins/cl_revenue_ops/cl-revenue-ops.py
 ```
 
@@ -144,6 +150,7 @@ The SQLite database is kept outside the repository by default at
 
 ## Reference
 
+- [v3.0.1 maintenance release notes](docs/releases/v3.0.1.md)
 - [v3.0.0 release notes](docs/releases/v3.0.0.md)
 - [Public telemetry contracts](docs/contracts/README.md)
 - [Action RPC inventory](docs/audits/CL_REVENUE_OPS_ACTION_RPC_INVENTORY.md)

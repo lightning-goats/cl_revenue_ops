@@ -400,6 +400,51 @@ class TestFeeEvidenceGuard:
 
 
 class TestChannelInfoShaping:
+    @pytest.mark.parametrize("before,after", [(900_000_000, 1_000_000), (1_000_000, 900_000_000)])
+    def test_fee_evidence_refreshes_cached_liquidity_without_mutation(
+        self, mock_plugin, mock_database, before, after
+    ):
+        from modules.config import Config
+        from modules.data_service import DataService
+        from modules.fee_controller import FeeController
+
+        channel_id = "123x456x0"
+        peer_id = "02" + "a" * 64
+        old = _listpeerchannels_payload(channel_id, peer_id)
+        old["channels"][0]["spendable_msat"] = before
+        new = _listpeerchannels_payload(channel_id, peer_id)
+        new["channels"][0]["spendable_msat"] = after
+        mock_plugin.rpc.listpeerchannels.side_effect = [old, new]
+        data = DataService(mock_plugin)
+        data.get_peer_channels()  # A read-only report warmed the 30-second cache.
+        fc = FeeController(mock_plugin, Config(), mock_database, fee_authority_gate=FeeAuthorityGate())
+        fc.data_service = data
+
+        observed = fc._get_channels_info_live()[channel_id]
+
+        assert observed["spendable_msat"] == after
+        assert mock_plugin.rpc.listpeerchannels.call_count == 2
+        mock_plugin.rpc.setchannel.assert_not_called()
+
+    def test_failed_fresh_read_does_not_reuse_cached_execution_liquidity(
+        self, mock_plugin, mock_database
+    ):
+        from modules.config import Config
+        from modules.data_service import DataService
+        from modules.fee_controller import FeeController, RpcError
+
+        mock_plugin.rpc.listpeerchannels.return_value = _listpeerchannels_payload(
+            "123x456x0", "02" + "a" * 64
+        )
+        data = DataService(mock_plugin)
+        data.get_peer_channels()
+        fc = FeeController(mock_plugin, Config(), mock_database, fee_authority_gate=FeeAuthorityGate())
+        fc.data_service = data
+        mock_plugin.rpc.listpeerchannels.side_effect = RpcError("unavailable")
+
+        assert fc._get_channels_info_live() == {}
+        mock_plugin.rpc.setchannel.assert_not_called()
+
     def test_get_channels_info_preserves_htlc_minimum_and_maximum_msat(self, mock_plugin, mock_database):
         from modules.config import Config
         from modules.fee_controller import FeeController
@@ -1388,16 +1433,25 @@ class TestAdmissionRefreshWhileFeeWindowWaits:
             "opener": "local",
         }
 
+    @pytest.mark.parametrize(
+        "current_max_msat,spendable_msat,target_msat",
+        [
+            (10_000_000, 285_000_000, 242_250_000),
+            (10_000_000, 0, 0),
+            (0, 100_000_000, 85_000_000),
+        ],
+    )
     def test_waiting_fee_window_refreshes_htlcmax_without_repricing(
-        self, mock_plugin, mock_database
+        self, mock_plugin, mock_database,
+        current_max_msat, spendable_msat, target_msat,
     ):
         from modules.fee_controller import FeeReasonCode
 
         fc, cfg, original_cursor = self._make_controller(
             mock_plugin, mock_database
         )
-        channel_info = self._channel_info()
-        target_msat = 242_250_000
+        channel_info = self._channel_info(current_htlcmax_msat=current_max_msat)
+        channel_info["spendable_msat"] = spendable_msat
         mock_plugin.rpc.setchannel.return_value = {
             "channels": [{
                 "short_channel_id": self.CHANNEL_ID,

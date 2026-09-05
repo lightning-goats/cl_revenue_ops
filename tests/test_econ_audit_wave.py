@@ -644,12 +644,12 @@ class TestHtlcmaxDepletionValve:
         assert got == int(100_000_000 * 0.85)  # 85k sats in msat
         assert got < int(10_000_000_000 * 0.50), "class pct must not win on a depleted channel"
 
-    def test_zero_local_clamps_to_small_floor(self, mock_plugin, mock_database):
-        """The live incident: 0 sats local advertising ~4.95M htlc_max."""
+    def test_zero_local_advertises_no_forwarding_capacity(self, mock_plugin, mock_database):
+        """Neither the class cap nor the preferred floor may invent liquidity."""
         fc = _make_fc(mock_plugin, mock_database)
         got = fc._compute_dynamic_htlcmax_msat(
             self._cfg(), self._channel(10_000_000, 0), "source")
-        assert got == FeeController.HTLCMAX_FLOOR_MSAT  # 10k sats
+        assert got == 0
 
     def test_healthy_source_channel_unchanged_vs_class_keying(self, mock_plugin, mock_database):
         """80% outbound: depletion cap (68%) > class cap (50%) => class wins,
