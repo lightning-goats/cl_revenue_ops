@@ -43,6 +43,33 @@ def _set_acquisition_evidence(
     }
 
 
+def test_disabled_episode_restores_baseline_when_revenue_reader_fails(
+    mock_plugin, mock_database,
+):
+    fc, cfg = _make_fc(mock_plugin, mock_database, acquisition_experiment_enabled=False)
+    fc._acquisition_cycle_experiments = {
+        CHANNEL_ID: _episode(started_at=int(time.time()) - 10),
+    }
+    fc._get_neighbor_fee_percentile = MagicMock(return_value=1)
+    fc._calculate_floor = MagicMock(return_value=10)
+    _set_acquisition_evidence(mock_database, volume_sats=0, forward_count=0)
+    mock_database.get_forward_revenue_msat.side_effect = RuntimeError("unavailable")
+    fc.set_channel_fee = MagicMock(return_value={"success": True, "fee_ppm": 100})
+    ts = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=0)
+    ts.thompson.update_posterior = MagicMock()
+    ts.thompson.update_contextual = MagicMock()
+    info = _channel_info(0)
+    info["spendable_msat"] = "1900000000msat"
+    result = fc._adjust_channel_fee(
+        CHANNEL_ID, PEER_ID, {"state": "source"}, info, cfg=cfg,
+        force_reprice_reason="acquisition_experiment",
+    )
+    assert result.new_fee_ppm == 100
+    assert mock_database.complete_acquisition_experiment.call_args.kwargs["exit_reason"] == "disabled"
+    ts.thompson.update_posterior.assert_not_called()
+    ts.thompson.update_contextual.assert_not_called()
+
+
 def test_acquisition_monitor_wakes_on_bounded_opportunity_cost_step(
     mock_plugin, mock_database
 ):

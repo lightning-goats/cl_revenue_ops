@@ -632,6 +632,7 @@ class TestKalmanDemandFactorClamp:
 
     def _captured_observation(self, mock_plugin, mock_database, kalman_flow_ratio):
         fc, cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_forward_revenue_msat.return_value = 7_500
         chain = {"fee": 150}
         _stub_broadcasts(fc, chain)
         ts_state = _prepare_dts_stubs(fc, chain_fee=150, sampled_fee=400)
@@ -728,6 +729,76 @@ class TestKalmanDemandFactorContinuity:
 # =============================================================================
 
 class TestZeroFeeObservationAttribution:
+
+    def test_congestion_protection_survives_unknown_earnings_without_training(
+        self, mock_plugin, mock_database,
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_forward_revenue_msat.side_effect = RuntimeError("unavailable")
+        _stub_broadcasts(fc, {"fee": 150})
+        ts = _prepare_dts_stubs(fc, chain_fee=150, sampled_fee=400)
+        ts.thompson.update_posterior = MagicMock()
+        ts.thompson.update_contextual = MagicMock()
+        ts.thompson.sample_fee_contextual = MagicMock()
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, {"state": "congested", "forward_count": 10},
+            _channel_info(150), cfg=cfg,
+        )
+        assert result is not None and result.new_fee_ppm > 150
+        ts.thompson.update_posterior.assert_not_called()
+        ts.thompson.update_contextual.assert_not_called()
+        ts.thompson.sample_fee_contextual.assert_not_called()
+
+    def test_actual_earned_rate_reaches_posterior_without_repricing_volume(
+        self, mock_plugin, mock_database,
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_forward_revenue_msat.return_value = 193_750
+        mock_database.get_volume_since.return_value = 250_000
+        _stub_broadcasts(fc, {"fee": 856})
+        ts_state = _prepare_dts_stubs(fc, chain_fee=856, sampled_fee=856)
+        fc._kalman_demand_factor = lambda _: 1.0
+        observations = []
+        ts_state.thompson.update_posterior = lambda **kw: observations.append(kw)
+        fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, {"state": "balanced", "forward_count": 10},
+            _channel_info(856), cfg=cfg,
+        )
+        assert len(observations) == 1
+        sample = observations[0]
+        assert sample["revenue_rate"] * sample["hours"] == pytest.approx(193.75)
+        # This pins only corrected magnitude. Existing latest-price attribution
+        # remains unqualified and is deliberately not asserted as causal truth.
+
+    @pytest.mark.parametrize("sleeping", [False, True])
+    @pytest.mark.parametrize("unknown", [None, "missing", -1, float("nan")])
+    def test_unknown_earnings_do_not_update_or_sample_fee_model(
+        self, mock_plugin, mock_database, sleeping, unknown,
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_forward_revenue_msat.return_value = unknown
+        if sleeping:
+            mock_database.get_fee_strategy_state.return_value.update(
+                is_sleeping=1, sleep_until=int(time.time()) + 3600,
+            )
+        ts_state = _prepare_dts_stubs(fc, chain_fee=150, sampled_fee=400)
+        ts_state.thompson.update_posterior = MagicMock()
+        ts_state.thompson.update_contextual = MagicMock()
+        ts_state.thompson.sample_fee_contextual = MagicMock()
+        fc.set_channel_fee = MagicMock()
+        fc._refresh_dynamic_htlcmax_if_needed = MagicMock(return_value=None)
+        fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, {"state": "balanced", "forward_count": 10},
+            _channel_info(150), cfg=cfg,
+        )
+        ts_state.thompson.update_posterior.assert_not_called()
+        ts_state.thompson.update_contextual.assert_not_called()
+        ts_state.thompson.sample_fee_contextual.assert_not_called()
+        fc.set_channel_fee.assert_not_called()
+        fc._refresh_dynamic_htlcmax_if_needed.assert_called_once()
+        # Controller setup may read getinfo; no mutation RPC is permitted.
+        assert all(call[0] in ("getinfo", "getinfo().get")
+                   for call in mock_plugin.rpc.mock_calls)
 
     def test_zero_chain_fee_skips_observation(self, mock_plugin, mock_database):
         """raw_chain_fee == 0: no posterior observation at all (the seeded
@@ -972,6 +1043,7 @@ class TestUnroutableWindowGate:
         """Revenue proves the window was routable — record it regardless of
         the liquidity we happen to see at cycle time."""
         fc, cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_forward_revenue_msat.return_value = 7_500
         chain = {"fee": 150}
         _stub_broadcasts(fc, chain)
 
@@ -1326,6 +1398,7 @@ class TestProfitableConversionRetention:
         mock_database.get_fee_strategy_state.return_value = row
         mock_database.get_volume_since.return_value = 50_000
         mock_database.get_forward_count_since.return_value = 3
+        mock_database.get_forward_revenue_msat.return_value = 6_000
         fc.profitability = MagicMock()
         fc.profitability.get_profitability.return_value = MagicMock(
             marginal_roi_percent=100.0
@@ -1633,6 +1706,7 @@ class TestSleepEntryBurst:
         fc, cfg = _make_fc(mock_plugin, mock_database)
         mock_database.get_volume_since.return_value = 500_000
         chain = {"fee": 150}
+        mock_database.get_forward_revenue_msat.return_value = 75_000
         _stub_broadcasts(fc, chain)
 
         ts_state = fc._get_channel_fee_state(CHANNEL_ID, PEER_ID, actual_fee_ppm=150)
@@ -1891,6 +1965,10 @@ class TestCongestionDamping:
         assert r1 is not None
 
         _open_window(fc)
+        # Keep the second action deterministic; the real posterior below must
+        # learn the prior regime even when its random sample could hold fees.
+        ts_state.thompson.sample_fee_contextual = lambda *a, **k: 500
+        ts_state.thompson.sample_fee = lambda *a, **k: 500
         r2 = fc._adjust_channel_fee(
             CHANNEL_ID, PEER_ID,
             {"state": "balanced", "forward_count": 10},
@@ -2295,6 +2373,7 @@ class TestProfitableWindowDownshiftGuard:
         mock_database.get_fee_strategy_state.return_value = row
         mock_database.get_volume_since.return_value = 500_000
         mock_database.get_forward_count_since.return_value = 66
+        mock_database.get_forward_revenue_msat.return_value = 400_000
         fc.profitability = MagicMock()
         fc.profitability.get_profitability.return_value = MagicMock(
             window_30d_available=True,

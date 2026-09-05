@@ -753,7 +753,9 @@ def mock_plugin():
 
 @pytest.fixture
 def mock_database():
-    return MagicMock()
+    db = MagicMock()
+    db.get_forward_revenue_msat.return_value = 0
+    return db
 
 
 class TestCongestionEpisodeCap:

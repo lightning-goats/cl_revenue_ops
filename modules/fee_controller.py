@@ -7512,6 +7512,34 @@ class FeeController:
         scaled_delta = int(math.ceil(max(current_fee_ppm, 1) * ratio))
         return max(min_delta, scaled_delta)
 
+    def _get_settled_revenue_rate(
+        self, channel_id: str, since: int, until: int,
+    ) -> Optional[float]:
+        """Observed gross sats/hour, never repriced at today's advertised fee.
+
+        This fixes reward magnitude only. Existing window/policy attribution
+        and late-outcome limitations remain; this is not a causal price label.
+        Unavailable evidence is neutral: callers hold the fee decision rather
+        than teaching a zero or falling back to the old fabricated proxy.
+        """
+        try:
+            if (type(since) is not int or type(until) is not int
+                    or not 0 <= since < until <= 2**63 - 1):
+                raise ValueError("invalid revenue observation interval")
+            earned = record_effective_evidence(
+                "settled_revenue_msat", [channel_id, since, until],
+                lambda: self.database.get_forward_revenue_msat(channel_id, since, until),
+            )
+            if type(earned) is not int or not 0 <= earned <= 2**63 - 1:
+                raise ValueError("invalid settled fee amount")
+            return earned * 3.6 / (until - since)
+        except Exception as exc:
+            self.plugin.log(
+                f"FEE_REVENUE: observation unavailable ({type(exc).__name__}); hold fee",
+                level="debug",
+            )
+            return None
+
     def _is_sparse_data_channel(
         self,
         observation_count: int,
@@ -8098,26 +8126,26 @@ class FeeController:
                 )
             else:
                 # Still within sleep period - check for revenue spike that should wake us
-                # Calculate current revenue rate to detect significant changes
-                volume_since_sats = record_effective_evidence(
-                    "volume_since", [channel_id, _sleep_last_update],
-                    lambda: self.database.get_volume_since(
-                        channel_id, _sleep_last_update
-                    ),
+                sleep_cursor = _sleep_last_update
+                if sleep_cursor <= 0:
+                    sleep_cursor = now - int(getattr(cfg, "fee_interval", 1800) or 1800)
+                current_revenue_rate = self._get_settled_revenue_rate(
+                    channel_id, sleep_cursor, now,
                 )
-
-                hours_elapsed = (now - _sleep_last_update) / 3600.0 if _sleep_last_update > 0 else 1.0
-                hours_elapsed = max(hours_elapsed, 0.1)  # Prevent division by zero
-
-                # Match the normal observation path: use the actual on-chain fee
-                # rather than a seeded min-fee fallback when estimating revenue.
-                revenue_sats = (volume_since_sats * raw_chain_fee) / 1_000_000
-                current_revenue_rate = revenue_sats / hours_elapsed
+                if current_revenue_rate is None and not is_congested:
+                    return self._refresh_dynamic_htlcmax_if_needed(
+                        channel_id=channel_id, peer_id=peer_id, state=state,
+                        channel_info=channel_info, cfg=cfg,
+                    )
 
                 # Calculate percent change from last known rate
                 # When last rate was 0 (went to sleep with no revenue), any new
                 # revenue is a meaningful signal — treat as 100% change to trigger wake-up.
-                if _sleep_last_revenue_rate <= 0:
+                if current_revenue_rate is None:
+                    # Independent congestion protection must not wait for a
+                    # usable revenue observation; no reward is invented here.
+                    percent_change = 1.0
+                elif _sleep_last_revenue_rate <= 0:
                     percent_change = 1.0 if current_revenue_rate > 0 else 0.0
                 else:
                     delta = abs(current_revenue_rate - _sleep_last_revenue_rate)
@@ -8269,21 +8297,34 @@ class FeeController:
                     cfg=cfg,
                 )
 
-        # First run initialization
-        if hours_elapsed <= 0:
-            hours_elapsed = 1.0
-        
-        # Calculate REVENUE RATE (sats/hour) - this is our feedback signal
-        # Revenue = Volume * Fee_PPM / 1_000_000
-        # Use raw_chain_fee (actual on-chain fee), NOT current_fee_ppm (which may be
-        # inflated from 0 to min_fee_ppm). Using inflated fee creates phantom revenue
-        # that poisons the DTS posterior with false positive signals.
-        revenue_sats = (volume_since_sats * raw_chain_fee) / 1_000_000
-        raw_revenue_rate = revenue_sats / hours_elapsed if hours_elapsed > 0 else 0.0
-
-        # DTS posterior variance already handles observation noise —
-        # no additional EMA smoothing needed.
-        current_revenue_rate = raw_revenue_rate
+        # Match the denominator to the actual bounded observation interval,
+        # including first-run initialization. A zero/backward interval is
+        # unknown, not a manufactured one-hour sample.
+        current_revenue_rate = self._get_settled_revenue_rate(
+            channel_id, observation_cursor, now,
+        )
+        revenue_observation_available = current_revenue_rate is not None
+        if not revenue_observation_available and not (
+            is_congested or acquisition_episode is not None
+        ):
+            return self._refresh_dynamic_htlcmax_if_needed(
+                channel_id=channel_id, peer_id=peer_id, state=state,
+                channel_info=channel_info, cfg=cfg,
+            )
+        if not revenue_observation_available:
+            # Preserve independent congestion/acquisition controls, including
+            # restoring an experiment's baseline. Carry the prior diagnostic
+            # rate unchanged; it is NOT a new observation and must not train.
+            prior_rate = cycle.last_revenue_rate
+            current_revenue_rate = (
+                float(prior_rate)
+                if GaussianThompsonState._valid_learning_number(prior_rate) else 0.0
+            )
+            self.plugin.log(
+                "FEE_REVENUE: independent safety target only; no reward observation",
+                level="debug",
+            )
+        hours_elapsed = max(0.0, (now - observation_cursor) / 3600.0)
 
         # Get capacity and balance for liquidity adjustments
         capacity = channel_info.get("capacity") or 2_000_000
@@ -8737,7 +8778,7 @@ class FeeController:
             ts_state = self._get_channel_fee_state(
                 channel_id, peer_id, actual_fee_ppm=raw_chain_fee
             )
-            if raw_chain_fee > 0:  # P7: 0-fee windows carry no curve info
+            if raw_chain_fee > 0 and revenue_observation_available:
                 _, congestion_time_bucket, _ = self._get_context_with_values(
                     channel_id, peer_id, outbound_ratio, flow_state=flow_state
                 )

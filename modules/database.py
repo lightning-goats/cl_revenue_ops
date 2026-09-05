@@ -5938,6 +5938,45 @@ class Database:
             "events": events,
         }
 
+    def get_forward_revenue_msat(
+        self, channel_id: str, since: int, until: int,
+    ) -> int:
+        """Actual settled fees for received times in (since, until].
+
+        This is a read-only accounting observation, not a price-exposure label
+        or exactly-once learning cursor. Late insertions before ``since`` are
+        outside this window; get_fee_learning_events is the separate primitive
+        for discovering them. Unknown/malformed evidence raises, never earns 0.
+        No rollups are mixed into this short operational observation window.
+        ``until`` bounds received time, not when the row became known: this
+        method is not a historical as-of replay interface.
+        """
+        if not isinstance(channel_id, str) or not channel_id.strip():
+            raise ValueError("channel_id must be a nonempty string")
+        for value in (since, until):
+            if type(value) is not int or not 0 <= value <= 2**63 - 1:
+                raise ValueError("window bounds must be nonnegative SQLite integers")
+        if since >= until:
+            raise ValueError("revenue window must have positive duration")
+        row = self._get_connection().execute("""
+            WITH evidence AS (
+                SELECT fee_msat,
+                       (typeof(fee_msat) = 'integer' AND fee_msat >= 0
+                        AND typeof(in_msat) = 'integer' AND in_msat >= 0
+                        AND typeof(out_msat) = 'integer' AND out_msat >= 0
+                        AND in_msat >= out_msat
+                        AND in_msat - out_msat = fee_msat) AS valid
+                FROM forwards
+                WHERE out_channel = ? AND timestamp > ? AND timestamp <= ?
+            )
+            SELECT COALESCE(SUM(CASE WHEN valid THEN fee_msat ELSE 0 END), 0) AS earned,
+                   COUNT(*) - COUNT(CASE WHEN valid THEN 1 END) AS invalid
+            FROM evidence
+        """, (channel_id, since, until)).fetchone()
+        if row is None or row["invalid"]:
+            raise ValueError("unavailable or malformed settled revenue evidence")
+        return row["earned"]
+
     def get_volume_since(self, channel_id: str, timestamp: int) -> int:
         """
         Get total outbound volume for a channel since a specific timestamp.

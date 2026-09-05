@@ -2495,6 +2495,7 @@ class TestDTSPIDIntegration:
         ts_state.pid = PIDState()
         ts_state.pid.last_update_time = int(time.time()) - 1800
 
+        fc._cycle_states[ch_id].last_update = int(time.time()) - 1800
         result = fc._adjust_channel_fee(
             ch_id, peer_id, self._state(),
             self._channel_info(current_fee_ppm=500), cfg=cfg
@@ -2612,6 +2613,7 @@ class TestDTSPIDIntegration:
         ts_state.pid = PIDState()
         ts_state.pid.last_update_time = int(time.time()) - 1800
 
+        fc._cycle_states[ch_id].last_update = int(time.time()) - 1800
         result = fc._adjust_channel_fee(
             ch_id, peer_id, self._state(),
             self._channel_info(current_fee_ppm=500), cfg=cfg

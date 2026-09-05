@@ -82,6 +82,8 @@ def mock_database():
     db.get_channel_stats.return_value = {}
     db.get_peer_stats.return_value = {}
     db.get_channel_profitability.return_value = None
+    # Empty settled-fee evidence unless the test explicitly supplies earnings.
+    db.get_forward_revenue_msat.return_value = 0
 
     return db
 

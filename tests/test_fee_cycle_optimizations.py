@@ -81,6 +81,7 @@ def _setup_db(mock_database, now=None):
     mock_database.get_channel_probe.return_value = None
     mock_database.get_last_rebalance_cost.return_value = None
     mock_database.get_volume_since.return_value = 50_000
+    mock_database.get_forward_revenue_msat.return_value = 7_500
     mock_database.get_forward_count_since.return_value = 10
     mock_database.get_peer_uptime_percent.return_value = 99.5
     mock_database.get_fee_strategy_state.return_value = {
@@ -688,6 +689,11 @@ class TestSingleSerializationPerChannel:
     ):
         fc, _ = _make_cycle_fc(mock_plugin, mock_database)
         fc.adjust_all_fees()  # warm states (loads may dump during migration)
+
+        # A same-second repeat is not a valid revenue observation interval.
+        for cid in CHANNEL_IDS:
+            fc._cycle_states[cid].last_update = int(time.time()) - 7200
+            fc._channel_fee_states[cid].last_update = int(time.time()) - 7200
 
         calls = self._count_dumps(monkeypatch)
         fc.adjust_all_fees()

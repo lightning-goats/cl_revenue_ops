@@ -213,6 +213,7 @@ class TestSleepStatePersistence:
         mock_database.get_channel_probe.return_value = None
         mock_database.get_last_rebalance_cost.return_value = None
         mock_database.get_volume_since.return_value = volume
+        mock_database.get_forward_revenue_msat.return_value = 7_500
         mock_database.get_forward_count_since.return_value = 10
         mock_database.get_peer_uptime_percent.return_value = 99.5
         mock_database.get_channel_state.return_value = {
