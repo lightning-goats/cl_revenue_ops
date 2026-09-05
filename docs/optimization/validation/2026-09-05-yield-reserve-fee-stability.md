@@ -130,7 +130,7 @@ The retained v30 compressed-cap policy promotes every qualifying market-close
 anchor to the operator ceiling when outbound inventory is at most 75%,
 including these roughly balanced relay lanes. CLBOSS instead applies its
 capacity-binned exponential balance modifier to a market-derived price
-([pinned implementation](https://github.com/ZmnSCPxj/clboss/blob/8cb4e9215eba58b049375f234f5f073d0c7fc622/Boss/Mod/FeeModderByBalance.cpp)).
+([pinned implementation](https://github.com/ksedgwic/clboss/blob/8cb4e9215eba58b049375f234f5f073d0c7fc622/Boss/Mod/FeeModderByBalance.cpp)).
 This is a concrete alternative worth improving on: preserve scarce-lane value
 without a discontinuous flat ceiling across ordinary relay inventory. Research
 a continuous market-relative opportunity-cost curve using only local gossip,

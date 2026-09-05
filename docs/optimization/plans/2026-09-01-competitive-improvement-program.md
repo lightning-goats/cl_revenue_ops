@@ -70,6 +70,13 @@ recorded no failed forwards, so fixing failures alone does not close the
 economic gap. Next research targets our market-relative inventory pricing
 and admission's effect on native route allocation, with the environment fixed.
 
+The [v36 continuous-inventory-price diagnostic](../validation/2026-09-05-yield-continuous-inventory-price.md)
+also lost both crossed assignments: 17,387.126 sats combined versus CLBOSS's
+59,293.329, with zero retention in one predeclared cell in each assignment.
+It was rejected and rolled back after preserving evidence; 471 rollback tests
+passed. The next investigation follows the integrated controller track below,
+starting with measured reward, fee attribution and actual target ownership.
+
 Establish a production-calibrated, highly competitive local Docker market in
 which Revenue Ops can be measured and improved against reproducible competitor
 controllers. The first admission pair is Revenue Ops versus CLBOSS. Later arms
@@ -118,6 +125,34 @@ that the enhanced arm beat *both* alternatives in public-seed ablation and
 sealed-holdout crossed replicas, with the existing exact attribution,
 settled-cost, reservation, and read-only-surface gates. Until then it stays
 default-off.
+
+### Fee-controller research track (operator approved, 2026-09-05)
+
+The operator approved integrating controller correctness, tuning, component
+ablations, and alternative-controller research into this same improvement loop,
+including Lightning-specific fee/routing theory, deep competitor mechanism
+analysis, biological analogies, and Askrene/other local CLN API evidence.
+Follow the [fee-controller research and qualification plan](2026-09-05-fee-controller-research-loop.md).
+DTS+PI is the incumbent to beat, not a presumed optimum. Its existing single
+authority, safety rails, action ledger, and controller-neutral contract remain
+binding; experimental challengers are local/default-off until qualified.
+
+The next sequence is: close the frozen v36 pair and preserve its verdict;
+verify reward attribution and actual fee-target ownership; correct confirmed
+defects with regression tests; compare tuned incumbent and one-component
+ablations; then evaluate inventory-aware demand-learning challengers. Each
+native result must feed a specific diagnosis or rejection, not another
+unexplained multiplier adjustment. Successful ideas return through the same
+incumbent/competitor/enhanced comparison and held-out promotion gates.
+
+This track applies to CLBOSS, LN Operator, Torq, and LNDg research without
+changing any competitor's native behavior. Earlier high-ceiling results and
+model arms remain historical, narrowly scoped evidence, not production
+qualification or substitutes for native product comparisons. Existing text
+about simulated competitor clocks does not authorize compressing their
+cadence or synthesizing training history. Unmet native-runtime or observation
+horizons remain explicit coverage gaps. The frozen benchmark is unchanged;
+production-calibrated Revenue Ops experiments retain the 1,200-ppm ceiling.
 
 ## Controller-start fairness
 
