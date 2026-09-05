@@ -1,10 +1,13 @@
 # Competitive-improvement program
 
 **Status:** active local-only improvement program. The operator approved
-regtest mutations and fake-sat action RPCs for this program. The tested v9
-source was deployed to production at `994ffb3` on 2026-09-03, but its new mode
-remains default-off: production still uses `undercut` with the existing
-1,200-ppm maximum. No live-fund action RPC was used for the deployment.
+regtest mutations and fake-sat action RPCs for this program. Production was
+updated to `5d3242b` on 2026-09-05 after native admission compatibility and
+4,145 clean-release tests passed. Its normal fee cycle verified the corrected
+liquidity-backed HTLC limits. Production still uses `undercut` with the existing
+1,200-ppm maximum; yield-aware remains inactive. Only the plugin was restarted;
+no manual fee/rebalance cycle or fund transfer was issued. See the
+[native diagnostic and deployment record](../validation/2026-09-05-native-admission-diagnostic.md).
 
 The machine-readable protocol is frozen with holdout commitment
 `sha256:28f431477a4fcbb431a6b4e23485cab1bbfd8536e191def91f1c5c4639b1f4cf`.

@@ -75,7 +75,7 @@ hand-computed corrected expectation: 1,000 msat spendable yields 850 msat,
 not 10,000,000 msat. This changes a Revenue Ops unit-test contract for a proven
 defect; tournament fixtures and acceptance thresholds remain unchanged.
 
-## Verification and release status
+## Initial verification and release status (before native validation)
 
 362 targeted tests passed across admission policy, HTLC golden fixtures,
 economic-audit regressions, fee-setting execution, dynamic-HTLC configuration,
@@ -96,3 +96,68 @@ comparison. Production compatibility at zero/peer-minimum limits, gossip
 latency, recovery behavior, and current production health must be checked
 before deployment. The uncommitted v30 fee candidate remains separately
 unqualified and must not be bundled into an admission-only production release.
+
+## Subsequent native validation and production deployment
+
+The frozen v31 image added only the admission correction to v30's Revenue Ops
+sources. Native replica 225 completed all 240 payments under the same public
+topology, traffic and 1,200-ppm rail. Revenue Ops earned 24,234,089 msat versus
+CLBOSS's 38,728,079 msat, with minimum cell retention 0.75. Its unchanged scorer
+returned `insufficient_evidence`. A larger local temporary failure still left
+the payer's native xpay layer with a 260,249,999-msat maximum constraint on the
+LND-sink direction. The floor correction is therefore not sufficient to resolve
+the competitive failure; sender constraint persistence and admission freshness
+remain research leads, not established fixes.
+
+The opposite-assignment replica 224 failed during background channel setup:
+the LND-sink `getinfo` readiness command timed out. No contender traffic ran.
+Its failure artifact is retained, and its lab was stopped and removed. It is
+not silently replaced or counted as completed evidence.
+
+After replica 225's measured traffic and read-only diagnostics, a separate
+unscored Revenue-only compatibility probe set one zero-minimum channel's
+maximum to zero and one 1-msat-minimum channel's maximum to 1 msat. Native CLN
+accepted both, fees were unchanged, and each original maximum was restored.
+No payments ran during this probe; no competitor or payer was changed. The
+result is in `results/polar-grand-prix/admission-native-compat-r225.json`.
+Both temporary labs and the validation source snapshots were subsequently
+removed; raw result/diagnostic artifacts remain available.
+
+The exact committed release `5d3242bd2c122e01e375e7810fdcdfdf7aa692c1`
+passed 4,145 tests in a clean clone, with five skips and two expected failures.
+An earlier archive-only invocation passed 4,125 tests but failed 20 migration
+tests because it lacked the Git history those tests explicitly read. Repeating
+the unchanged suite with the required history resolved all 20 failures; no
+test or tournament acceptance gate was relaxed.
+
+Read-only production checks confirmed the old admission defect on three normal
+channels: each advertised a 10,000-sat maximum despite less spendable liquidity.
+Production was clean at `601d2af`, running CLN v26.06.7, healthy loops, and zero
+active rebalance jobs. Its 30-day dashboard reported 21,676 sats gross,
+20,428 sats net, and a 94.24% operating margin. These are a dated snapshot,
+not an estimate of the fix's effect.
+
+Under the existing deployment authorization, verified SQLite and source
+backups were created on the production host, the clean repository was
+fast-forwarded to `5d3242b`, and only the Revenue Ops plugin was restarted.
+The two runtime source files changed from the old production revision are
+`admission_policy.py` and `fee_controller.py`; the latter's committed changes
+are confined to yield-aware helpers/branches, which remain inactive. The
+uncommitted v30 reservation-price experiment was not deployed.
+
+Post-restart checks verified exact admission-file hash parity, a clean
+production worktree, `undercut` mode, a 1,200-ppm ceiling, and healthy loops.
+The ordinary scheduled fee cycle corrected all three previously overstated
+limits to the computed 85%-spendable bounds. A newly normal, zero-spendable
+channel advertised only its 1-sat protocol minimum. No forced fee or rebalance
+cycle, manual fee setting, channel open/close, or fund transfer was issued in
+production. Plugin stop/start were the deployment action RPCs; ordinary
+authorized background execution resumed afterward. No Sling or coordinator
+was introduced.
+
+The admission correction is now deployed and its immediate production behavior
+is verified. Higher earnings are not yet established. Yield-aware activation,
+the v30/v31 pricing candidate, and overall competitor superiority remain
+unqualified. Continue Revenue-only improvement against the unchanged benchmark;
+do not clear payer constraints, alter native competitor behavior, or relax
+failed cells to manufacture a win.
