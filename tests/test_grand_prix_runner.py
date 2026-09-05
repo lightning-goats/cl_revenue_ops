@@ -779,10 +779,27 @@ def test_channel_policy_snapshot_rejects_malformed_input(monkeypatch):
 def test_native_payment_attempts_have_bounded_retry_source():
     source = TOOL.read_text(encoding="utf-8")
     assert '"xpay"' in source
-    assert '"retry_for=5"' in source
+    assert '"retry_for=30"' in source
     assert 'f"maxfee={max_fee_msat}msat"' in source
-    assert '"--timeout", "5s"' in source
+    assert '"--timeout", "30s"' in source
     assert '"--fee_limit_percent", "10"' in source
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        ("command timed out", "native_payment_timeout"),
+        ("rpc error: deadline exceeded", "native_payment_timeout"),
+        ("unable to find a path to destination", "native_payment_no_route"),
+        ("insufficient balance", "native_payment_insufficient_balance"),
+        ("fee limit exceeded", "native_payment_fee_limit"),
+        ("TEMPORARY_CHANNEL_FAILURE", "native_payment_temporary_channel_failure"),
+        ("opaque native error", "native_payment_failed"),
+    ],
+)
+def test_native_payment_failure_diagnostics_are_stable(detail, expected):
+    runner = _module()
+    assert runner._native_payment_error_code(runner.RunnerError(detail)) == expected
 
 
 def test_public_traffic_persists_anonymous_per_payment_contender_deltas():

@@ -1878,14 +1878,30 @@ def _pay_native(
         max_fee_msat = max(10_000, amount_sats * 100)
         return _cln_rpc(
             _base_container_name(network_id, payer), "-k", "xpay", f"invstring={invoice}",
-            "retry_for=5", f"maxfee={max_fee_msat}msat", base_managed=True,
+            "retry_for=30", f"maxfee={max_fee_msat}msat", base_managed=True,
         )
     if implementations.get(payer) == "lnd":
         return _lnd_node_rpc(
-            network_id, payer, topology, "payinvoice", "--force", "--timeout", "5s",
+            network_id, payer, topology, "payinvoice", "--force", "--timeout", "30s",
             "--fee_limit_percent", "10", invoice
         )
     raise RunnerError(f"unsupported traffic payer {payer}")
+
+
+def _native_payment_error_code(exc: Exception) -> str:
+    """Map native payer errors to stable, non-sensitive diagnostics."""
+    detail = str(exc).casefold()
+    if "timed out" in detail or "timeout" in detail or "deadline exceeded" in detail:
+        return "native_payment_timeout"
+    if "no route" in detail or "unable to find a path" in detail:
+        return "native_payment_no_route"
+    if "insufficient" in detail and ("balance" in detail or "fund" in detail):
+        return "native_payment_insufficient_balance"
+    if "fee limit" in detail or "fee_limit" in detail:
+        return "native_payment_fee_limit"
+    if "temporary channel failure" in detail or "temporary_channel_failure" in detail:
+        return "native_payment_temporary_channel_failure"
+    return "native_payment_failed"
 
 
 def run_public_traffic(
@@ -1976,7 +1992,7 @@ def run_public_traffic(
             else:
                 outcome = "failed"
                 payment = {}
-                error = "native_payment_failed"
+                error = _native_payment_error_code(exc)
         record = {
             "sequence": sequence,
             "class": str(item["class"]),
