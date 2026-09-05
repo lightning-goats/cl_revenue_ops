@@ -10051,6 +10051,53 @@ class FeeController:
             min_change = 1
         else:
             min_change = max(5, (current_fee_ppm * 3 + 99) // 100)  # Ceiling of 3%
+
+        # Evaluate fee significance independently of a necessary HTLC update.
+        # Moving admission capacity must not turn the fee deadbands into a
+        # high-frequency repricer. CLN also keeps only one previous-policy
+        # grace snapshot, so gratuitous fee changes are not free just because
+        # another channel parameter already requires a gossip update.
+        delta_broadcast = abs(new_fee_ppm - cycle.last_broadcast_fee_ppm)
+        threshold = cycle.last_broadcast_fee_ppm * self.GOSSIP_GATE_SUPPRESSION_RATIO
+        last_state_category = (cycle.last_state or "").split(" (")[0]
+        current_state_category = decision_reason.split(" (")[0]
+        legacy_zero_fee_transition = (
+            cycle.last_broadcast_fee_ppm <= 0 or raw_chain_fee <= 0
+        )
+        significant_change = (delta_broadcast > threshold) or \
+                             legacy_zero_fee_transition or \
+                             (target_found and last_state_category != current_state_category) or \
+                             (not target_found and cycle.last_state == "CONGESTION")
+
+        admission_pending_target_ppm = 0
+        if (
+            htlcmax_policy_change
+            and not base_fee_policy_change
+            and not htlcmin_policy_change
+            and fee_change > 0
+            and not is_congested
+            and not is_under_exploration
+            and not raw_zero_fee_recovery
+            and acquisition_episode is None
+            and not acquisition_inventory_immediate
+            and raw_chain_fee == current_fee_ppm
+            and floor_ppm <= raw_chain_fee <= ceiling_ppm
+            and (fee_change < min_change or not significant_change)
+        ):
+            admission_pending_target_ppm = int(new_fee_ppm)
+            cycle.pending_target_ppm = admission_pending_target_ppm
+            new_fee_ppm = int(raw_chain_fee)
+            applied_target_ppm = new_fee_ppm
+            new_direction = 0
+            step_ppm = 0
+            delta_cap_reason = "admission_fee_deadband"
+            delta_cap_ppm = 0
+            delta_cap_applied = True
+            self.plugin.log(
+                f"ADMISSION_FEE_HOLD: {channel_id[:12]}... maintain {new_fee_ppm}ppm "
+                f"while updating HTLC capacity; pending={admission_pending_target_ppm}ppm",
+                level="debug",
+            )
             
         if (
             fee_change < min_change
@@ -10114,23 +10161,6 @@ class FeeController:
         # GOSSIP HYSTERESIS: The 5% Gate
         # Reduce network noise by only broadcasting significant changes.
         # =====================================================================
-        delta_broadcast = abs(new_fee_ppm - cycle.last_broadcast_fee_ppm)
-        threshold = cycle.last_broadcast_fee_ppm * self.GOSSIP_GATE_SUPPRESSION_RATIO
-        
-        # Override: Always broadcast if entering/exiting critical states
-        # or if we have never broadcasted before.
-        # Compare state CATEGORY only (strip parenthetical details) to avoid
-        # hysteresis bypass when balance bucket or modifier values change.
-        last_state_category = (cycle.last_state or "").split(" (")[0]
-        current_state_category = decision_reason.split(" (")[0]
-        legacy_zero_fee_transition = (
-            cycle.last_broadcast_fee_ppm <= 0 or raw_chain_fee <= 0
-        )
-        significant_change = (delta_broadcast > threshold) or \
-                             legacy_zero_fee_transition or \
-                             (target_found and last_state_category != current_state_category) or \
-                             (not target_found and cycle.last_state == "CONGESTION")
-
         if (
             not significant_change
             and not channel_policy_change
@@ -10437,7 +10467,11 @@ class FeeController:
             # A dry-run result is a proposal, not a broadcast. It still
             # consumes the observation window, but must not advance applied
             # policy evidence, gossip timestamps, or broadcast streaks.
-            cycle.pending_target_ppm = new_fee_ppm if dry_run_proposal else 0
+            cycle.pending_target_ppm = (
+                admission_pending_target_ppm
+                if admission_pending_target_ppm and admission_pending_target_ppm != new_fee_ppm
+                else (new_fee_ppm if dry_run_proposal else 0)
+            )
             cycle.last_revenue_rate = current_revenue_rate
             cycle.last_fee_ppm = current_fee_ppm
             if not dry_run_proposal:

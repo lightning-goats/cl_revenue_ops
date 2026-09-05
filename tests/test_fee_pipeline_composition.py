@@ -2017,6 +2017,106 @@ class TestGossipGatePendingTarget:
         assert broadcasts == []
         assert fc._cycle_states[CHANNEL_ID].pending_target_ppm == 425
 
+    @pytest.mark.parametrize("target,expected_pending", [(450, 415), (500, 425)])
+    @pytest.mark.parametrize("current_limit", [100_000_000, 2_000_000_000])
+    @pytest.mark.parametrize("execution", ["applied", "dry_run", "failed"])
+    def test_admission_update_does_not_bypass_fee_deadbands(
+        self, mock_plugin, mock_database, target, expected_pending, current_limit, execution
+    ):
+        fc, cfg, chain, broadcasts, ts_state = self._make_sim(
+            mock_plugin, mock_database, start_fee=406, target=target,
+        )
+        cfg.enable_dynamic_htlcmax = True
+        cfg.htlcmax_balanced_pct = 0.5
+        cfg.base_fee_msat = 0
+        requests = []
+
+        def fake_set(channel_id, fee_ppm, **kwargs):
+            requests.append((fee_ppm, kwargs))
+            if execution == "applied":
+                chain["fee"] = fee_ppm
+            return {"success": execution != "failed", "fee_ppm": fee_ppm,
+                    "dry_run": execution == "dry_run"}
+
+        fc.set_channel_fee = fake_set
+        _open_window(fc)
+        info = {**_channel_info(406), "fee_base_msat": 0,
+                "htlc_minimum_msat": 0, "htlc_maximum_msat": current_limit}
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, {"state": "balanced", "forward_count": 10}, info, cfg=cfg,
+        )
+
+        assert len(requests) == 1  # Admission maintenance must still execute.
+        assert requests[0][1]["htlcmax_msat"] == 850_000_000
+        assert requests[0][0] == 406  # Neither the 3% nor 5% fee gate is bypassed.
+        assert fc._cycle_states[CHANNEL_ID].pending_target_ppm == expected_pending
+        mock_plugin.rpc.setchannel.assert_not_called()
+        if execution == "failed":
+            assert result is None
+            return
+        assert result.new_fee_ppm == 406
+        assert result.algorithm_values["applied_target_ppm"] == 406
+        assert result.algorithm_values["step_ppm"] == 0
+        if execution == "dry_run":
+            assert fc._cycle_states[CHANNEL_ID].last_broadcast_fee_ppm == 406
+            return
+
+        # A necessary admission update must not erase the pending fee target:
+        # with repeated eligible evidence the ordinary fee gates can be crossed.
+        for _ in range(8):
+            _open_window(fc)
+            fc._adjust_channel_fee(
+                CHANNEL_ID, PEER_ID, {"state": "balanced", "forward_count": 10},
+                {**info, "fee_proportional_millionths": chain["fee"]}, cfg=cfg,
+            )
+            if chain["fee"] != 406:
+                break
+        assert chain["fee"] > 406
+
+    @pytest.mark.parametrize("floor,ceiling", [(420, 5000), (10, 400)])
+    def test_admission_companion_hold_never_preserves_fee_outside_rails(
+        self, mock_plugin, mock_database, floor, ceiling
+    ):
+        fc, cfg, chain, broadcasts, ts_state = self._make_sim(
+            mock_plugin, mock_database, start_fee=406, target=450,
+        )
+        cfg.enable_dynamic_htlcmax = True
+        cfg.htlcmax_balanced_pct = 0.5
+        cfg.base_fee_msat = 0
+        cfg.min_fee_ppm = floor
+        cfg.max_fee_ppm = ceiling
+        _open_window(fc)
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, {"state": "balanced", "forward_count": 10},
+            {**_channel_info(406), "fee_base_msat": 0,
+             "htlc_minimum_msat": 0, "htlc_maximum_msat": 2_000_000_000}, cfg=cfg,
+        )
+        assert result is not None
+        assert floor <= broadcasts[-1] <= ceiling
+        assert broadcasts[-1] != 406
+
+    @pytest.mark.parametrize("spendable", [None, "bad", -1, True, float("nan")])
+    def test_bad_admission_evidence_cannot_force_a_subthreshold_fee_write(
+        self, mock_plugin, mock_database, spendable
+    ):
+        fc, cfg, chain, broadcasts, ts_state = self._make_sim(
+            mock_plugin, mock_database, start_fee=406, target=450,
+        )
+        cfg.enable_dynamic_htlcmax = True
+        cfg.htlcmax_balanced_pct = 0.5
+        cfg.base_fee_msat = 0
+        _open_window(fc)
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID, {"state": "balanced", "forward_count": 10},
+            {**_channel_info(406), "fee_base_msat": 0, "spendable_msat": spendable,
+             "to_us_msat": 1_000_000_000,
+             "htlc_minimum_msat": 0, "htlc_maximum_msat": 2_000_000_000}, cfg=cfg,
+        )
+        assert result is None
+        assert broadcasts == []
+        assert fc._cycle_states[CHANNEL_ID].pending_target_ppm == 415
+        mock_plugin.rpc.setchannel.assert_not_called()
+
     def test_pending_round_trips_persistence(self, mock_plugin, mock_database):
         """pending_target_ppm must survive the fee strategy row round trip."""
         fc, _cfg = _make_fc(mock_plugin, mock_database)
