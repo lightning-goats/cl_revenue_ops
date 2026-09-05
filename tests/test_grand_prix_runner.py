@@ -818,6 +818,68 @@ def test_contender_launch_has_no_implicit_image_default():
     assert args.image is None
 
 
+def test_stop_lab_removes_only_exact_replica_bind_data(tmp_path, monkeypatch):
+    runner = _module()
+    topology = _topology()
+    state_path = tmp_path / "state.json"
+    replica = 7
+    data_root = tmp_path / f"replica-{replica}"
+    data_root.mkdir()
+    (data_root / "wallet-state").write_text("ephemeral", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep"
+    sentinel.write_text("durable", encoding="utf-8")
+    (data_root / "outside-link").symlink_to(outside, target_is_directory=True)
+    runner._write_json_atomic(state_path, {
+        "schema": runner.SCHEMA,
+        "network_id": 9,
+        "network_name": runner.DEFAULT_NAME,
+        "topology_digest": runner._digest(topology),
+        "replica": replica,
+        "status": "public_traffic_complete",
+        "events": [],
+    })
+    monkeypatch.setattr(runner, "_docker_exists", lambda _name: False)
+    bridge = FakeBridge({"stop_network": {"success": True}})
+
+    result = runner.stop_lab(bridge, topology, state_path=state_path)
+
+    assert result["status"] == "stopped"
+    assert not data_root.exists()
+    assert sentinel.read_text(encoding="utf-8") == "durable"
+    assert bridge.calls == [("stop_network", {"networkId": 9})]
+
+
+def test_stop_lab_rejects_symlink_replica_data_root(tmp_path, monkeypatch):
+    runner = _module()
+    topology = _topology()
+    state_path = tmp_path / "state.json"
+    replica = 7
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / f"replica-{replica}").symlink_to(
+        outside,
+        target_is_directory=True,
+    )
+    runner._write_json_atomic(state_path, {
+        "schema": runner.SCHEMA,
+        "network_id": 9,
+        "network_name": runner.DEFAULT_NAME,
+        "topology_digest": runner._digest(topology),
+        "replica": replica,
+        "status": "public_traffic_complete",
+        "events": [],
+    })
+    monkeypatch.setattr(runner, "_docker_exists", lambda _name: False)
+    bridge = FakeBridge({"stop_network": {"success": True}})
+
+    with pytest.raises(runner.RunnerError, match="unsafe contender data"):
+        runner.stop_lab(bridge, topology, state_path=state_path)
+
+    assert outside.is_dir()
+
+
 @pytest.mark.parametrize(
     ("payer", "sink", "family"),
     [

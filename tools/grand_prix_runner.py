@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import json
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -2177,6 +2178,14 @@ def stop_lab(
             if _docker_exists(container):
                 _run(["docker", "rm", "-f", "-v", container])
     bridge.call("stop_network", {"networkId": network_id})
+    if isinstance(replica, int) and replica > 0:
+        data_root = state_path.parent / f"replica-{replica}"
+        if data_root.is_symlink() or (data_root.exists() and not data_root.is_dir()):
+            raise RunnerError(
+                f"refusing unsafe contender data cleanup target: {data_root}"
+            )
+        if data_root.is_dir():
+            shutil.rmtree(data_root)
     state["status"] = "stopped"
     _checkpoint(state_path, state, "lab_stopped", backend=ACTIVE_BACKEND)
     return state
