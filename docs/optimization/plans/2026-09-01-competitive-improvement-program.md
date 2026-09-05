@@ -132,6 +132,9 @@ The operator approved integrating controller correctness, tuning, component
 ablations, and alternative-controller research into this same improvement loop,
 including Lightning-specific fee/routing theory, deep competitor mechanism
 analysis, biological analogies, and Askrene/other local CLN API evidence.
+Subsequent operator guidance adds route-context targeting and plugin-wide
+closed-loop learning: economic actions need traceable outcomes that can improve
+future decisions, with shared local evidence and independent safety controls.
 Follow the [fee-controller research and qualification plan](2026-09-05-fee-controller-research-loop.md).
 DTS+PI is the incumbent to beat, not a presumed optimum. Its existing single
 authority, safety rails, action ledger, and controller-neutral contract remain

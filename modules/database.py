@@ -5848,6 +5848,80 @@ class Database:
             'out_msat': row_out['total_out_msat'] if row_out else 0
         }
     
+    def get_fee_learning_events(
+        self, after_id: int, *, through_id: Optional[int] = None,
+        limit: int = 1000,
+    ) -> Dict[str, Any]:
+        """Read one bounded page of settled fee evidence in ingestion order.
+
+        This is an evidence primitive, NOT a price-attribution algorithm or
+        an automatic posterior update. Existing fee decisions do not use it.
+        Received-time queries can miss a forward inserted after their cursor
+        advances; immutable local row IDs let a consumer discover that late
+        settlement without pretending it occurred under today's fee policy.
+
+        The first page freezes an ID watermark in the same SQLite statement
+        as its rows. Pass that through_id to subsequent pages. sqlite_sequence
+        preserves the watermark across pruning and INSERT OR IGNORE gaps.
+        Events preserve exact msat amounts and both timestamps/channel sides;
+        consumers must validate records and resolve policy/exposure context.
+
+        No cursor is persisted here. A consumer must atomically persist its
+        learned state and next_after_id to obtain exactly-once consumption.
+        Retention pruning and database restore require a separate recovery
+        policy; this method cannot recover deleted events. Query errors and
+        invalid/ahead cursors raise, never masquerade as a zero-revenue page.
+        """
+        for name, value in (("after_id", after_id), ("through_id", through_id)):
+            if name == "through_id" and value is None:
+                continue
+            if type(value) is not int or not 0 <= value <= 2**63 - 1:
+                raise ValueError(f"{name} must be a nonnegative SQLite integer")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer from 1 to 1000")
+        if through_id is not None and after_id > through_id:
+            raise ValueError("after_id exceeds through_id")
+
+        rows = self._get_connection().execute("""
+            WITH watermark AS (
+                SELECT COALESCE(
+                    (SELECT seq FROM sqlite_sequence WHERE name = 'forwards'), 0
+                ) AS current_id
+            ), bounds AS (
+                SELECT current_id, COALESCE(?, current_id) AS through_id
+                FROM watermark
+            ), page AS (
+                SELECT f.id, f.in_channel, f.out_channel,
+                       f.in_msat, f.out_msat, f.fee_msat,
+                       f.timestamp AS received_at, f.resolved_time AS resolved_at
+                FROM forwards AS f, bounds AS b
+                WHERE f.id > ? AND f.id <= b.through_id
+                ORDER BY f.id LIMIT ?
+            )
+            SELECT b.current_id, b.through_id, p.*
+            FROM bounds AS b LEFT JOIN page AS p ON 1 = 1
+            ORDER BY p.id
+        """, (through_id, after_id, limit + 1)).fetchall()
+        watermark = int(rows[0]["current_id"])
+        frozen_id = int(rows[0]["through_id"])
+        if after_id > watermark or frozen_id > watermark:
+            raise ValueError("fee-learning cursor exceeds database watermark")
+        events = [
+            {key: row[key] for key in (
+                "id", "in_channel", "out_channel", "in_msat", "out_msat",
+                "fee_msat", "received_at", "resolved_at",
+            )}
+            for row in rows if row["id"] is not None
+        ]
+        complete = len(events) <= limit
+        events = events[:limit]
+        return {
+            "through_id": frozen_id,
+            "next_after_id": frozen_id if complete else events[-1]["id"],
+            "complete": complete,
+            "events": events,
+        }
+
     def get_volume_since(self, channel_id: str, timestamp: int) -> int:
         """
         Get total outbound volume for a channel since a specific timestamp.

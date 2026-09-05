@@ -211,6 +211,85 @@ is projected onto the fee controls CLN can actually advertise; do not assume
 arbitrary per-payer/per-route prices. Measure added predictive value and net
 earnings against simpler controllers, and reject complexity that does not help.
 
+## Route context and plugin-wide closed-loop learning
+
+The operator further directed research toward route-context targeting and a
+more central learning capability across the plugin. Every economic action
+should have an explicit path from its context and outcome to future decisions;
+this is a design requirement, not a claim that existing actions never learn.
+The current fee context is only balance bucket, time bucket and coarse role
+within a per-channel model (`_get_context_with_values`). Kalman flow estimates,
+fee posteriors, route-segment failure observations, and rebalance economics
+already exist, but their shared assumptions and feedback paths need auditing.
+
+Model the observed incoming/outgoing channel pair, amount, available inventory,
+time, policy exposure and locally observed outcomes. A forward increases local
+balance on its incoming channel while consuming it on the outgoing channel;
+the net future value can differ despite identical collected fees. Learn that
+coupled value without double-counting fee income or rebalance costs. Neither
+an incoming peer nor an outgoing peer identifies the payment origin or final
+destination: [BOLT 4](https://github.com/lightning/bolts/blob/master/04-onion-routing.md#overview)
+limits a forwarding node's route knowledge to adjacent hops. Absent traffic
+does not reveal payments that avoided us, and own failed rebalances are not
+observations of third-party routing demand.
+
+Compare a pooled model with hierarchical/shrinkage route-pair context and
+bounded richer features. Sparse pairs should borrow evidence from channel and
+node priors, not create confidently fitted empty models. Freeze contextual
+features at decision/forward time; do not attach today's balance or route
+beliefs to an old settled event. Per-outbound advertised fees must be chosen
+over the predicted mixture of incoming contexts. A standard channel fee does
+not let us quote an arbitrary distinct fee for every incoming pair; any
+additional native fee mechanism needs capability and interoperability review.
+
+Audit whether a shared LOCAL evidence/learning layer improves the following
+consumers before choosing a centralized implementation:
+
+- Fee decisions: demand response, uncertainty, actual earning policy and
+  channel-pair liquidity opportunity cost.
+- Rebalance planning/routing: probability, settled cost, depletion/refill need
+  and subsequent conversion of purchased liquidity into useful forwards.
+- Budget allocation: evidence-backed expected marginal net return and risk,
+  never permission to exceed the independent spend ledger or hard limits.
+- Reporting: realized accounting separately from predictions, confidence,
+  unresolved attribution and model calibration.
+
+Reuse canonical snapshots, intent/execution IDs, spend accounting and the
+existing forward archive; do not introduce a competing truth store. The
+archive already preserves CLN created/updated identities, nanosecond times,
+failure status and exact fees, but its current synchronizer runs every 15
+minutes and ADR-002 explicitly keeps it out of decision paths. Review latency,
+coverage and that architecture boundary before operational use. The operational
+notification table can supply low-latency provisional evidence, but its local
+IDs and second-resolution timestamps are not canonical CLN identities.
+
+For each fee set, fee hold, rebalance attempt/partial result, and budget
+allocation, define:
+
+1. Stable action and model-version identity, frozen local context, candidate
+   alternatives, chosen action, selection probability when known, expected
+   benefit and uncertainty, and constraints that changed the intended action.
+2. Applied policy/execution result, actual cost and settlement, subsequent
+   observations and explicit observation horizon. Failed broadcasts are not
+   price exposure; successful rebalances are not automatically profitable.
+3. Attribution state: pending, usable, censored, ambiguous or unavailable;
+   reasons for withholding an update. Correctly retain uncertainty instead of
+   forcing every outcome into a positive or negative reward.
+4. Durable, idempotent model update linked to the consumed evidence and action.
+   Persist cursor and learning state atomically; tolerate restart, duplicates,
+   late settlement, overlapping fee/rebalance actions and database recovery.
+5. A tested downstream effect: the same future context should respond
+   appropriately to favorable versus unfavorable evidence, or explicitly
+   remain unchanged when evidence is insufficient. Persisting logs alone does
+   not meet this condition. Use offline counterfactuals only where exposure
+   support exists; validate economic gains in the unchanged native tournament.
+
+The shared layer may contain several specialized models. Compare it to the
+current separated learners before assuming one monolithic model is better.
+Keep inference bounded and explainable, model failure neutral, and execution
+authority and accounting outside learned control. No hive, external service,
+or inter-node coordination is implied by centralizing learning inside this node.
+
 ## Invariants, production, and completion
 
 Keep the frozen Docker topology, traffic, payer state, timing, native competitor
