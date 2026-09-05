@@ -161,3 +161,52 @@ the v30/v31 pricing candidate, and overall competitor superiority remain
 unqualified. Continue Revenue-only improvement against the unchanged benchmark;
 do not clear payer constraints, alter native competitor behavior, or relax
 failed cells to manufacture a win.
+
+## Fresh-evidence/refill-wake follow-up (v32)
+
+Five regression cases reproduced two further Revenue Ops issues: a fee decision
+could consume the shared 30-second reporting cache after liquidity changed,
+and the settled-forward handler did not mark the refilled incoming channel for
+yield-aware repricing. An acquisition wake also short-circuited yield inventory
+registration. The correction refreshes the live decision snapshot and registers
+both affected channels before coalescing one governed-loop wake. Notifications
+still do not mutate fees, and a failed fresh read does not reuse stale execution
+liquidity. Existing authority, malformed-input and read-only tests remain intact.
+The final targeted run passed 437 tests, including fee capture/replay, pipeline
+composition, forward hot-path, operator-surface and architecture regressions.
+
+Native v32 replica 227 tested these changes on top of v31 at the same 1,200-ppm
+ceiling, topology and traffic. Its source digest was
+`sha256:52b50d58ca15bb3b50d06876363a587ca1cff7b1b1b6a5803cd409bfd61627a5`.
+All 240 payments settled, but Revenue Ops earned 24,364,706 msat versus
+CLBOSS's 38,637,930 msat, with minimum cell retention 0.75. The scorer returned
+`insufficient_evidence`; the fixes did not establish competitive improvement.
+
+The larger temporary failure recurred. At the end, the payer's native learned
+maximum on the LND-sink direction was still 260,249,999 msat, while both the
+payer's gossip view and Revenue Ops's local advertised maximum agreed at
+2,485,745,302 msat. This rules out a persistent final gossip-view mismatch in
+this replica, not a propagation delay at the time of failure. One fee-insufficient
+failure also occurred; all requested payments nevertheless settled after native
+pathfinding/retries. The final observations are retained in
+`results/polar-grand-prix/diagnostic-v32-cap1200-clboss-r227.json`.
+
+Inspection of the pinned CLN v26.06.7 source
+([gossip constants](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/common/gossip_constants.h))
+also confirms an important realism limitation: its development fast-gossip mode
+uses a 5-second minimum generation interval and 1-second flush interval, versus
+300 and 60 seconds normally. The benchmark's existing flags were not changed.
+Any future admission strategy must account for real propagation delay rather
+than depend on the development timings for production safety.
+
+The next investigation is failure-time inventory, outstanding HTLCs and
+advertised limits before the first temporary failure. The current evidence
+does not establish that additional wake frequency, arbitrary lower limits, or
+fee discounts would solve it. Do not modify the payer's learned constraints,
+shorten their expiry, or change the traffic to eliminate the symptom.
+
+These fresh-evidence/refill-wake changes are not deployed by this follow-up;
+production remains on verified `5d3242b`. The v30 reservation-price experiment
+remains separate and unqualified. The r227 lab was stopped and removed after
+read-only diagnostics; its result artifacts are retained. No production action
+RPC, Sling dependency, or competitor/environment change was introduced.

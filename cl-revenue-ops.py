@@ -6134,12 +6134,17 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
                     wake_requested = fee_controller.should_wake_acquisition_cycle(
                         out_channel, out_msat
                     )
-                    if not wake_requested:
-                        wake_requested = (
-                            fee_controller.should_wake_yield_inventory_cycle(
-                                out_channel, out_msat
-                            )
-                        )
+                    # A settled forward drains the outgoing lane AND refills
+                    # the incoming lane. Register both before coalescing the
+                    # loop wake; an acquisition wake must not hide either
+                    # inventory marker from the next governed fee cycle.
+                    for changed_channel, changed_msat in (
+                        (out_channel, out_msat), (in_channel, in_msat),
+                    ):
+                        if fee_controller.should_wake_yield_inventory_cycle(
+                            changed_channel, changed_msat
+                        ):
+                            wake_requested = True
                 if wake_requested:
                     _request_fee_adjustment_wake()
             except Exception as exc:

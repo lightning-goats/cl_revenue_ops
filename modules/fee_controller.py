@@ -11848,6 +11848,12 @@ class FeeController:
         channels = {}
         
         try:
+            # Monitoring may have populated the shared 30-second cache before
+            # a material forward/refill. A decision snapshot must observe
+            # current execution liquidity, not that older reporting view.
+            # The fee-cycle observation layer still freezes this one read for
+            # the cycle; no per-channel RPC or notification-thread RPC is added.
+            self.data_service.invalidate("listpeerchannels")
             result = self.data_service.get_peer_channels()
 
             for channel in result.get("channels", []):

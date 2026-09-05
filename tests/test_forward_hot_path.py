@@ -9,7 +9,7 @@
   falls back to the legacy full settled fetch on any error.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -168,10 +168,29 @@ class TestForwardWriteCoalescing:
 
         mod._on_forward_event_impl(_settled_event(), mod.plugin)
 
-        assert order == ["persist", "acquisition", "yield", "wake"]
-        mod.fee_controller.should_wake_yield_inventory_cycle.assert_called_once_with(
-            "200x2x0", 999_000
-        )
+        assert order == ["persist", "acquisition", "yield", "yield", "wake"]
+        assert mod.fee_controller.should_wake_yield_inventory_cycle.call_args_list == [
+            call("200x2x0", 999_000), call(SCID, 1_000_000),
+        ]
+
+    @pytest.mark.parametrize("acquisition_wake", [False, True])
+    def test_incoming_refill_is_evaluated_even_when_another_monitor_wakes(self, acquisition_wake):
+        mod = _module()
+        mod.database = MagicMock()
+        mod._resolve_scid_to_peer = MagicMock(return_value=PEER)
+        mod.fee_controller = MagicMock()
+        mod.fee_controller.should_wake_acquisition_cycle.return_value = acquisition_wake
+        mod.fee_controller.should_wake_yield_inventory_cycle.side_effect = [False, True]
+        mod._request_fee_adjustment_wake = MagicMock()
+        mod.plugin.rpc = MagicMock()
+
+        mod._on_forward_event_impl(_settled_event(), mod.plugin)
+
+        assert mod.fee_controller.should_wake_yield_inventory_cycle.call_args_list == [
+            call("200x2x0", 999_000), call(SCID, 1_000_000),
+        ]
+        mod._request_fee_adjustment_wake.assert_called_once()
+        mod.plugin.rpc.assert_not_called()
 
     def test_disabled_authority_does_not_wake_acquisition_monitor(self):
         mod = _module()
