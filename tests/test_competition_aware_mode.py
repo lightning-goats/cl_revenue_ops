@@ -115,6 +115,43 @@ class TestYieldAwareDemandTarget:
         assert self._target(outbound_ratio=0.90) < self._target(outbound_ratio=0.5)
 
 
+class TestYieldCoverageMarketAnchor:
+    def _anchor(self, **overrides):
+        values = {
+            "broad_anchor_ppm": 600,
+            "frontier_ppm": 300,
+            "substitute_ppm": 400,
+            "outbound_ratio": 0.50,
+        }
+        values.update(overrides)
+        return FeeController._yield_coverage_market_anchor(**values)
+
+    def test_healthy_inventory_stays_below_frontier(self):
+        assert self._anchor() == 240
+
+    def test_comparable_substitute_can_set_lower_entry_quote(self):
+        assert self._anchor(substitute_ppm=250) == 200
+
+    def test_scarce_inventory_preserves_existing_scarcity_path(self):
+        assert self._anchor(outbound_ratio=0.30) == 600
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"frontier_ppm": None, "substitute_ppm": None},
+            {"frontier_ppm": "malformed", "substitute_ppm": float("nan")},
+            {"outbound_ratio": float("nan")},
+            {"outbound_ratio": True},
+        ],
+    )
+    def test_absent_or_malformed_evidence_is_neutral(self, overrides):
+        assert self._anchor(**overrides) == 600
+
+    @pytest.mark.parametrize("broad_anchor", [None, "malformed", True, -1])
+    def test_malformed_broad_anchor_is_neutral(self, broad_anchor):
+        assert self._anchor(broad_anchor_ppm=broad_anchor) is None
+
+
 class TestYieldAwareBalanceWake:
     def _controller(self, mock_plugin, mock_config, mock_database):
         mock_config.market_fee_mode = "yield_aware"
@@ -210,13 +247,13 @@ class TestYieldScarceMarketAnchor:
             outbound_ratio=0.50,
         ) == 10_000
 
-    def test_scarce_inventory_bridges_to_frontier(self):
+    def test_scarce_inventory_stays_below_frontier(self):
         assert FeeController._yield_scarce_market_anchor(
             yield_anchor_ppm=10_000,
             frontier_ppm=400,
             substitute_ppm=None,
             outbound_ratio=0.20,
-        ) == 2_000
+        ) == 320
 
     def test_comparable_substitute_is_an_undercut_ceiling(self):
         assert FeeController._yield_scarce_market_anchor(
@@ -224,7 +261,7 @@ class TestYieldScarceMarketAnchor:
             frontier_ppm=2_500,
             substitute_ppm=3_000,
             outbound_ratio=0.20,
-        ) == 2_970
+        ) == 2_000
 
     @pytest.mark.parametrize(
         "overrides",

@@ -1108,6 +1108,40 @@ class TestMedianPullModeGating:
         )
 
 
+class TestYieldCoverageFrontierWiring:
+    def test_paid_demand_healthy_channel_keeps_frontier_anchor(
+        self, mock_plugin, mock_database
+    ):
+        fc, cfg = _make_fc(
+            mock_plugin, mock_database, market_fee_mode="yield_aware"
+        )
+        chain = {"fee": 500}
+        _stub_broadcasts(fc, chain)
+        _prepare_dts_stubs(fc, chain_fee=500, sampled_fee=500, posterior_std=50.0)
+        fc._get_neighbor_fee_median = MagicMock(return_value=300)
+        fc._get_yield_market_anchor = MagicMock(return_value=600)
+        fc._get_yield_market_frontier = MagicMock(return_value=300)
+        fc._get_yield_substitute_quote = MagicMock(return_value=400)
+        coverage_anchor = fc._yield_coverage_market_anchor
+        fc._yield_coverage_market_anchor = MagicMock(wraps=coverage_anchor)
+
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID,
+            PEER_ID,
+            {"state": "balanced", "forward_count": 10},
+            _channel_info(500),
+            cfg=cfg,
+        )
+
+        assert result is not None
+        assert fc._yield_coverage_market_anchor.call_count == 1, result.reason
+        fc._yield_coverage_market_anchor.assert_called_once_with(
+            broad_anchor_ppm=600,
+            frontier_ppm=300,
+            substitute_ppm=400,
+            outbound_ratio=0.5,
+        )
+
 class TestProfitableConversionRetention:
     """Tournament regression: keep an earned corridor edge without a low floor."""
 

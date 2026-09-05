@@ -3145,6 +3145,13 @@ class FeeController:
     YIELD_SUBSTITUTE_CAPACITY_MIN_RATIO = 0.80
     YIELD_SUBSTITUTE_CAPACITY_MAX_RATIO = 1.25
     YIELD_SUBSTITUTE_UNDERCUT_RATIO = 0.99
+    # The p75 discovers yield only while the quote still clears the route.
+    # Keep a yield-aware lane just below the corroborated p25/comparable-
+    # capacity frontier so deterministic pathfinders do not move the entire
+    # route over a few ppm.  Paid demand still adjusts within this ceiling;
+    # it cannot be used as evidence for a quote that subsequently loses the
+    # route.  This is a market-relative coverage rail, not a fixed fee cut.
+    YIELD_COVERAGE_FRONTIER_UNDERCUT_RATIO = 0.80
     # A settled-forward notification may wake the existing governed fee loop
     # after a material yield-aware inventory move.  The notification itself
     # performs no fee mutation or CLN RPC.  Coalescing and cooldown keep burst
@@ -5317,6 +5324,66 @@ class FeeController:
         return candidate
 
     @classmethod
+    def _yield_coverage_market_anchor(
+        cls,
+        *,
+        broad_anchor_ppm: Any,
+        frontier_ppm: Any,
+        substitute_ppm: Any,
+        outbound_ratio: Any,
+    ) -> Optional[int]:
+        """Return a coverage-seeking anchor for a healthy-inventory lane.
+
+        A corroborated p25 or comparable-capacity quote may pull the broad p75
+        anchor down by one bounded tick.  Paid demand then optimizes below the
+        clearing ceiling instead of causing an immediate route-losing jump.
+        Scarce inventory retains its separately governed path.  Missing or
+        malformed evidence leaves the broad anchor unchanged.
+        """
+        try:
+            if isinstance(broad_anchor_ppm, bool):
+                return None
+            broad = int(broad_anchor_ppm)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if broad < 0:
+            return None
+        try:
+            if isinstance(outbound_ratio, bool):
+                return broad
+            ratio = float(outbound_ratio)
+        except (TypeError, ValueError, OverflowError):
+            return broad
+        if (
+            not math.isfinite(ratio)
+            or not 0.0 <= ratio <= 1.0
+            or ratio <= cls.YIELD_SCARCE_FRONTIER_MAX_OUTBOUND_RATIO
+        ):
+            return broad
+
+        candidates = [broad]
+        for quote in (frontier_ppm, substitute_ppm):
+            try:
+                if isinstance(quote, bool):
+                    continue
+                parsed = int(quote)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if parsed > 0:
+                candidates.append(
+                    max(
+                        1,
+                        int(
+                            math.floor(
+                                parsed
+                                * cls.YIELD_COVERAGE_FRONTIER_UNDERCUT_RATIO
+                            )
+                        ),
+                    )
+                )
+        return min(candidates)
+
+    @classmethod
     def _yield_scarce_market_anchor(
         cls,
         *,
@@ -5350,7 +5417,15 @@ class FeeController:
         if ratio > cls.YIELD_SCARCE_FRONTIER_MAX_OUTBOUND_RATIO:
             return anchor
 
-        candidate = int(round(math.sqrt(anchor * frontier)))
+        candidate = min(
+            int(round(math.sqrt(anchor * frontier))),
+            max(
+                1,
+                int(math.floor(
+                    frontier * cls.YIELD_COVERAGE_FRONTIER_UNDERCUT_RATIO
+                )),
+            ),
+        )
         try:
             if isinstance(substitute_ppm, bool):
                 raise ValueError("boolean substitute quote")
@@ -9434,8 +9509,6 @@ class FeeController:
                 yield_market_anchor_ppm = yield_broad_market_anchor_ppm
                 if (
                     yield_broad_market_anchor_ppm is not None
-                    and outbound_ratio
-                    <= self.YIELD_SCARCE_FRONTIER_MAX_OUTBOUND_RATIO
                 ):
                     yield_market_frontier_ppm = self._get_yield_market_frontier(
                         peer_id, cfg=cfg
@@ -9443,14 +9516,27 @@ class FeeController:
                     yield_substitute_quote_ppm = self._get_yield_substitute_quote(
                         peer_id, capacity, cfg=cfg
                     )
-                    scarce_anchor = self._yield_scarce_market_anchor(
-                        yield_anchor_ppm=yield_broad_market_anchor_ppm,
-                        frontier_ppm=yield_market_frontier_ppm,
-                        substitute_ppm=yield_substitute_quote_ppm,
-                        outbound_ratio=outbound_ratio,
-                    )
-                    if scarce_anchor is not None:
-                        yield_market_anchor_ppm = scarce_anchor
+                    if (
+                        outbound_ratio
+                        <= self.YIELD_SCARCE_FRONTIER_MAX_OUTBOUND_RATIO
+                    ):
+                        scarce_anchor = self._yield_scarce_market_anchor(
+                            yield_anchor_ppm=yield_broad_market_anchor_ppm,
+                            frontier_ppm=yield_market_frontier_ppm,
+                            substitute_ppm=yield_substitute_quote_ppm,
+                            outbound_ratio=outbound_ratio,
+                        )
+                        if scarce_anchor is not None:
+                            yield_market_anchor_ppm = scarce_anchor
+                    else:
+                        yield_market_anchor_ppm = (
+                            self._yield_coverage_market_anchor(
+                                broad_anchor_ppm=yield_broad_market_anchor_ppm,
+                                frontier_ppm=yield_market_frontier_ppm,
+                                substitute_ppm=yield_substitute_quote_ppm,
+                                outbound_ratio=outbound_ratio,
+                            )
+                        )
                 market_power_weight = self._get_competitive_undercut_pct(
                     peer_id, channel_id, neighbor_median, cfg=cfg,
                     invert_rank=True,
