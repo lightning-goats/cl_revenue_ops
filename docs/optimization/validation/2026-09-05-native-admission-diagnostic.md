@@ -191,13 +191,31 @@ failure also occurred; all requested payments nevertheless settled after native
 pathfinding/retries. The final observations are retained in
 `results/polar-grand-prix/diagnostic-v32-cap1200-clboss-r227.json`.
 
-Inspection of the pinned CLN v26.06.7 source
-([gossip constants](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/common/gossip_constants.h))
-also confirms an important realism limitation: its development fast-gossip mode
-uses a 5-second minimum generation interval and 1-second flush interval, versus
-300 and 60 seconds normally. The benchmark's existing flags were not changed.
-Any future admission strategy must account for real propagation delay rather
-than depend on the development timings for production safety.
+Inspection of the pinned CLN v26.06.7
+[gossip streaming code](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/connectd/multiplex.c)
+confirms an important realism limitation: its development fast-gossip mode
+uses a 1-second periodic flush interval, versus 60 seconds normally. These are
+timer settings, not measured end-to-end propagation delays. The benchmark's
+existing flags were not changed. Any future admission strategy must account
+for real propagation delay rather than depend on development timings for
+production safety.
+
+Correction to the earlier interpretation: although `GOSSIP_MIN_INTERVAL` is
+defined as 5/300 seconds, that definition alone does not establish a minimum
+generation interval for channel-policy updates. The inspected
+[channel-update path](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/lightningd/channel_gossip.c)
+broadcasts changed announced-channel policies without referencing that constant.
+Do not use the earlier minimum-generation claim as evidence for a controller
+change.
+
+The pinned native Askrene
+[flow solver](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/plugins/askrene/child/mcf.c)
+also bounds allocated channel flow by the advertised HTLC maximum in
+`linearize_channel`, and validates per-hop amounts in `check_htlc_max_limits`.
+Consequently a more conservative Revenue Ops admission policy may reduce
+usable routing volume as well as failures; it is an improvement hypothesis,
+not a free safety gain or an established competitive fix. Neither the native
+solver nor its learned constraints may be modified to improve our result.
 
 The next investigation is failure-time inventory, outstanding HTLCs and
 advertised limits before the first temporary failure. The current evidence
