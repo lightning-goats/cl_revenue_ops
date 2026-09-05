@@ -307,6 +307,13 @@ models lost to pooling in all three chronological suffixes; they are not
 qualified for runtime use. Retain the gaps and losses when designing the next
 historical prior, rather than assuming richer context automatically helps.
 
+The [pinned fee-policy mechanics preflight](../validation/2026-09-05-fee-policy-credit-assignment.md)
+also shows why historical earnings cannot simply be credited to the latest fee:
+CLN retains one previous policy, and restrictive HTLC requests can replace that
+slot independently of price changes. Requested fields and effective readback
+both matter. The pure replay model is not yet a runtime reward correction or
+historical bootstrap; incomplete policy timelines remain unknown.
+
 1. **Inventory evidence before training.** On production, report source, earliest
    and latest times, coverage gaps, channel identities, units, schema/policy
    versions, and overlap. Check retained CLN forwards, the canonical archive,
