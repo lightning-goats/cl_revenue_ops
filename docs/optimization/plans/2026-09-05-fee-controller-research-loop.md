@@ -299,6 +299,14 @@ training inputs; this is not confirmation of nine months of complete raw events.
 Historical learning is part of the correctness/shared-learning track above,
 not an optional reporting exercise or a separate victory criterion.
 
+The first [production coverage and historical-context preflight](../validation/2026-09-05-historical-learning-preflight.md)
+found raw archive evidence back to January 2, but a missing January 3 coverage
+row and unresolved archive/operational discrepancies. Checked canonical-only
+periods supported offline replay. Fixed outgoing/amount-conditioned historical
+models lost to pooling in all three chronological suffixes; they are not
+qualified for runtime use. Retain the gaps and losses when designing the next
+historical prior, rather than assuming richer context automatically helps.
+
 1. **Inventory evidence before training.** On production, report source, earliest
    and latest times, coverage gaps, channel identities, units, schema/policy
    versions, and overlap. Check retained CLN forwards, the canonical archive,
