@@ -704,6 +704,18 @@ def test_unknown_competitor_is_rejected_before_state_or_rpc(tmp_path):
         )
 
 
+def test_modified_clboss_mode_cannot_start(tmp_path, monkeypatch):
+    runner = _module()
+    calls = []
+    monkeypatch.setattr(runner, "_cln_rpc", lambda *args: calls.append(args))
+    with pytest.raises(runner.RunnerError, match="unsupported competitor"):
+        runner.start_controllers(
+            _topology(), state_path=tmp_path / "missing.json",
+            competitor_controller="clboss_bounded",
+        )
+    assert calls == []
+
+
 def test_controller_arm_is_pinned_in_plugin_start_and_readback_source():
     source = TOOL.read_text(encoding="utf-8")
     assert 'f"revenue-ops-market-fee-mode={revenue_market_mode}"' in source

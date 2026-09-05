@@ -13,6 +13,41 @@ commitment was verified before the sealed v9 holdout was scored.
 
 ## Objective
 
+### Native competitor behavior (operator correction, 2026-09-05)
+
+Only Revenue Ops may be adjusted for competitiveness. Competitors must retain
+their native decision algorithms, price outputs, learning, and update cadence.
+Do not clip competitor ppm/base fees, freeze their fee management, or alter
+their configuration to improve Revenue Ops's ranking. High native quotes are
+evidence to explain, not outputs the harness may correct.
+
+The `clboss_bounded` experiment violated this requirement: it froze CLBOSS fee
+management after warm-up and clipped its selected policies while Revenue Ops
+continued adapting. Replicas 216--221 are excluded from competitive evidence;
+replica 222 was stopped and cleaned up following the operator correction. The
+bounded runner mode and temporary launch script were removed. Archived raw
+artifacts are retained for audit only; the scorer rejects this competitor ID.
+Previously generated bounded score JSON files are superseded by this exclusion.
+No bounded result supports deployment, promotion, or product-superiority claims.
+
+Calibration changes must be justified by production observations and frozen
+before candidate comparison. Do not tune the topology or traffic to suppress
+a competitor's strengths or to rescue a failing cell. Realistic constraints
+apply to the environment and Revenue Ops experiments; native competitor
+responses remain observable outcomes.
+
+Source-derived models remain research aids. Their results cannot replace
+evidence against the actual product or establish superiority over that product.
+Fee-only tests with rebalance/open/close execution disabled establish only
+fee-policy behavior; full-product claims require the corresponding native
+functions under matched capital and workload conditions.
+
+The uncommitted v30 Revenue Ops candidate is not production-qualified. It still
+requires comparison with native competitors and the production incumbent under
+realistic conditions, followed by fresh held-out validation. The retained scorer
+hardening prevents pooling runs with different Revenue Ops fee ceilings,
+dynamic HTLC settings, or update intervals.
+
 Establish a production-calibrated, highly competitive local Docker market in
 which Revenue Ops can be measured and improved against reproducible competitor
 controllers. The first admission pair is Revenue Ops versus CLBOSS. Later arms

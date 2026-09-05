@@ -183,6 +183,11 @@ def validate_state(
         # Backward compatibility for frozen CLBOSS-only runner states.
         competitor = controls.get("clboss")
     competitor_id = competitor.get("id", "clboss") if isinstance(competitor, dict) else None
+    if competitor_id == "clboss_bounded":
+        raise ScorecardError(
+            f"{source} modified CLBOSS's native policy; bounded/frozen competitor "
+            "runs are excluded from competitive evidence"
+        )
     competitor_class = (
         competitor.get("comparison_class", "direct_runtime")
         if isinstance(competitor, dict) else None
@@ -346,6 +351,10 @@ def validate_state(
         "image_id": image_id,
         "patch_digest": patch_digest,
         "revenue_market_mode": revenue_market_mode,
+        "revenue_settings_digest": _digest({
+            key: revenue.get(key) if isinstance(revenue, dict) else None
+            for key in ("max_fee_ppm", "dynamic_htlcmax", "cycle_seconds")
+        }),
         "safety_ok": safety_ok,
         "cell_attribution_complete": cell_attribution,
         "delivery_ratio": delivery_ratio,
@@ -470,6 +479,8 @@ def score_states(
         )
         for row in rows
     }
+    if len({row["revenue_settings_digest"] for row in rows}) > 1:
+        raise ScorecardError("all scored replicas must use one frozen Revenue configuration")
     if len(competitor_specs) > 1:
         raise ScorecardError("all scored replicas must use one frozen competitor")
     competitor_spec = next(iter(competitor_specs), None)

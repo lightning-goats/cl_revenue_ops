@@ -422,3 +422,32 @@ def test_tampered_equivalent_model_fails_safety_gate():
     state["controller_readback"]["competitor"]["model"]["changed"] = True
     row = module.validate_state(state, topology, source="tampered")
     assert row["safety_ok"] is False
+
+
+def test_modified_clboss_runs_are_excluded_from_competitive_evidence():
+    module = _module()
+    topology = _topology()
+    state = _state(module, topology, 1)
+    state["controller_readback"]["competitor"] = {
+        "id": "clboss_bounded", "comparison_class": "bounded_direct_runtime",
+        "direct_runtime": True, "auto_close": False, "rebalance_mode": "off",
+    }
+    with pytest.raises(module.ScorecardError, match="modified CLBOSS's native policy"):
+        module.validate_state(state, topology, source="excluded")
+
+
+@pytest.mark.parametrize("field,first,second", [
+    ("max_fee_ppm", 1200, 1500),
+    ("dynamic_htlcmax", True, False),
+    ("cycle_seconds", 15, 3600),
+    ("max_fee_ppm", None, 1200),
+])
+def test_different_revenue_configurations_cannot_be_pooled(field, first, second):
+    module = _module()
+    topology = _topology()
+    states = [_state(module, topology, replica) for replica in (1, 2)]
+    for state, value in zip(states, (first, second)):
+        state["controller_readback"]["revenue_ops"][field] = value
+    with pytest.raises(module.ScorecardError, match="one frozen Revenue configuration"):
+        module.score_states(topology, _protocol(), list(zip(("a", "b"), states)),
+                            arm="revenue_enhanced", stage="public")
