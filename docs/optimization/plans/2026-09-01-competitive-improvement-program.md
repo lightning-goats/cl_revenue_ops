@@ -62,6 +62,14 @@ realistic conditions, followed by fresh held-out validation. The retained scorer
 hardening prevents pooling runs with different Revenue Ops fee ceilings,
 dynamic HTLC settings, or update intervals.
 
+The [v35 reserve-plus-fee-stability diagnostic](../validation/2026-09-05-yield-reserve-fee-stability.md)
+settled both native crossed assignments and passed cell retention, but lost
+net fees in both (48,010.119 sats combined versus CLBOSS's 84,303.393).
+Its reserve was removed after preserving the exact experiment. One assignment
+recorded no failed forwards, so fixing failures alone does not close the
+economic gap. Next research targets our market-relative inventory pricing
+and admission's effect on native route allocation, with the environment fixed.
+
 Establish a production-calibrated, highly competitive local Docker market in
 which Revenue Ops can be measured and improved against reproducible competitor
 controllers. The first admission pair is Revenue Ops versus CLBOSS. Later arms
