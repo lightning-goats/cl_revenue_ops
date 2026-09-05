@@ -323,7 +323,7 @@ class TestContextualPosteriorUpdates:
         ts.update_contextual(
             context_key="balanced:peak:S",
             fee=200,
-            revenue_rate=-1.0,
+            revenue_rate=0.0,
             time_bucket="peak",
         )
 
@@ -331,10 +331,11 @@ class TestContextualPosteriorUpdates:
         assert len(ctx) == 4
         assert ctx[0] > 0
         # Hierarchical init from the global posterior (with the secondary
-        # exploration boost), then one per-update precision decay step.
+        # exploration boost), then decay plus a valid zero-revenue update.
         expected_precision = (
             1.0 / max((80.0 * ts.SECONDARY_EXPLORE_BOOST) ** 2, ts.MIN_STD ** 2)
         ) * ts.CTX_PRECISION_DECAY
+        expected_precision += (0.01 * 1.3) / max(ts.MIN_STD ** 2, 80.0 ** 2)
         assert ctx[1] == pytest.approx(expected_precision, rel=1e-9)
         assert ctx[2] >= 1
 

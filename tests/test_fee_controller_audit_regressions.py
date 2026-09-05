@@ -148,12 +148,12 @@ class TestNaNGuardUpdatePosterior:
         state.update_posterior(fee=100, revenue_rate=10.0, hours=float('inf'))
         assert math.isfinite(state.posterior_mean)
 
-    def test_negative_hours_sanitized(self):
-        """Negative hours should be treated as 1.0."""
+    def test_negative_hours_skipped(self):
+        """Negative hours are unknown exposure, not one invented hour."""
         state = GaussianThompsonState()
         state.update_posterior(fee=100, revenue_rate=10.0, hours=-5.0)
         assert math.isfinite(state.posterior_mean)
-        assert len(state.observations) == 1
+        assert len(state.observations) == 0
 
     def test_nan_revenue_rate_sanitized(self):
         """NaN revenue rate should be treated as 0."""

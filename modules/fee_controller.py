@@ -764,6 +764,16 @@ class GaussianThompsonState:
             # Non-concave sample: fall back to Gaussian
             return None
 
+    @staticmethod
+    def _valid_learning_number(value: Any, *, positive: bool = False) -> bool:
+        """Unknown/malformed measurements are not zero-valued evidence."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        try:
+            return math.isfinite(value) and (value > 0 if positive else value >= 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
     def update_posterior(
         self,
         fee: int,
@@ -790,15 +800,17 @@ class GaussianThompsonState:
                 flagged so the supported-fee ceiling ignores it: congestion
                 pricing is slot protection, not a market test.
         """
+        # Validate before any mutation, clock capture, or related update.
+        # Fabricating zero revenue creates a false demand failure; fabricating
+        # one hour grants confidence to an interval that was never observed.
+        # Genuine zero revenue remains valid evidence with positive exposure.
+        if not (
+            self._valid_learning_number(hours, positive=True)
+            and self._valid_learning_number(revenue_rate)
+            and self._valid_learning_number(fee)
+        ):
+            return
         now = decision_now("thompson.posterior.update")
-
-        # Guard against NaN/Inf inputs that would corrupt the posterior
-        if not math.isfinite(hours) or hours <= 0:
-            hours = 1.0
-        if not math.isfinite(revenue_rate) or revenue_rate < 0:
-            revenue_rate = 0.0
-        if not math.isfinite(fee) or fee < 0:
-            return  # Skip corrupt observation entirely
 
         weight = min(1.0, hours / 6.0)
 
@@ -1068,6 +1080,12 @@ class GaussianThompsonState:
             revenue_rate: Observed revenue rate (demand-adjusted)
             time_bucket: Current time bucket ("low", "normal", "peak")
         """
+        if (
+            not isinstance(context_key, str) or not context_key.strip()
+            or not self._valid_learning_number(fee)
+            or not self._valid_learning_number(revenue_rate)
+        ):
+            return
         now = decision_now("thompson.contextual.update")
 
         if context_key not in self.contextual_posteriors:
