@@ -2,7 +2,14 @@
 
 **Status:** active local-only improvement program. The operator approved
 regtest mutations and fake-sat action RPCs for this program. Production was
-updated to `aa79eba` on 2026-09-05 after 4,169 clean-release tests passed.
+subsequently updated to `294e649` on 2026-09-05 after 4,316 clean-release tests
+passed. It rejects invalid fee-learning observations without fabricating zero
+revenue or exposure, and adds observational fee-execution evidence. See the
+[learning-neutrality rollout](../validation/2026-09-05-learning-input-neutrality.md).
+This does not correct settled-fee/window attribution, activate historical
+models, or qualify yield-aware pricing. Existing operating controls were preserved.
+
+The earlier update to `aa79eba` on 2026-09-05 followed 4,169 clean-release tests.
 This isolated maintenance release adds fresh decision evidence and separates
 fee deadbands from admission updates, retaining the previously verified
 liquidity-backed HTLC correction. Native competitive diagnostics still failed
