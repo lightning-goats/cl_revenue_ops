@@ -5,6 +5,8 @@ parity oracle; these tests exercise the extracted module directly and
 pin the extraction pattern."""
 from types import SimpleNamespace
 
+import pytest
+
 from modules import admission_policy
 
 
@@ -99,3 +101,47 @@ def test_missing_or_malformed_admission_evidence_is_neutral():
         assert admission_policy.compute_htlcmax_msat(
             _cfg(htlcmax_sink_pct=bad), good, "sink"
         ) is None
+
+
+@pytest.mark.parametrize("state", ["source", "sink", "balanced"])
+@pytest.mark.parametrize("spendable_msat", [0, 1, 1_000, 9_000_000, 10_000_000, 11_764_706])
+def test_preferred_floor_never_overrides_executable_liquidity(state, spendable_msat):
+    result = admission_policy.compute_htlcmax_msat(
+        _cfg(), {"capacity": 15_000_000, "spendable_msat": spendable_msat}, state
+    )
+    assert result == int(spendable_msat * admission_policy.DEPLETION_SPENDABLE_FRACTION)
+    assert 0 <= result <= spendable_msat
+
+
+def test_admission_reopens_from_zero_when_liquidity_returns():
+    empty = admission_policy.compute_htlcmax_msat(
+        _cfg(), {"capacity": 2_000_000, "spendable_msat": 0}, "source"
+    )
+    refilled = admission_policy.compute_htlcmax_msat(
+        _cfg(), {"capacity": 2_000_000, "spendable_msat": 100_000_000}, "source"
+    )
+    assert empty == 0
+    assert refilled == 85_000_000
+    assert admission_policy.delta_exceeds_deadband(refilled, empty)
+
+
+def test_preferred_floor_never_exceeds_channel_capacity():
+    result = admission_policy.compute_htlcmax_msat(
+        _cfg(), {"capacity": 5_000, "spendable_msat": 5_000_000}, "source"
+    )
+    assert result == 4_250_000
+
+
+@pytest.mark.parametrize("minimum_key", ["htlc_minimum_msat", "htlc_min_msat", "minimum_htlc_out_msat"])
+def test_depletion_preserves_protocol_minimum_maximum_order(minimum_key):
+    result = admission_policy.compute_htlcmax_msat(
+        _cfg(), {"capacity": 15_000_000, "spendable_msat": 0, minimum_key: "1msat"}, "sink"
+    )
+    assert result == 1  # Protocol minimum, not the old 10k-sat preferred floor.
+
+
+@pytest.mark.parametrize("minimum", [None, True, -1, "bad", 2_000_000_001])
+def test_invalid_protocol_minimum_is_neutral(minimum):
+    assert admission_policy.compute_htlcmax_msat(
+        _cfg(), {"capacity": 2_000_000, "spendable_msat": 0, "htlc_minimum_msat": minimum}, "sink"
+    ) is None

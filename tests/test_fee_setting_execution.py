@@ -1388,16 +1388,25 @@ class TestAdmissionRefreshWhileFeeWindowWaits:
             "opener": "local",
         }
 
+    @pytest.mark.parametrize(
+        "current_max_msat,spendable_msat,target_msat",
+        [
+            (10_000_000, 285_000_000, 242_250_000),
+            (10_000_000, 0, 0),
+            (0, 100_000_000, 85_000_000),
+        ],
+    )
     def test_waiting_fee_window_refreshes_htlcmax_without_repricing(
-        self, mock_plugin, mock_database
+        self, mock_plugin, mock_database,
+        current_max_msat, spendable_msat, target_msat,
     ):
         from modules.fee_controller import FeeReasonCode
 
         fc, cfg, original_cursor = self._make_controller(
             mock_plugin, mock_database
         )
-        channel_info = self._channel_info()
-        target_msat = 242_250_000
+        channel_info = self._channel_info(current_htlcmax_msat=current_max_msat)
+        channel_info["spendable_msat"] = spendable_msat
         mock_plugin.rpc.setchannel.return_value = {
             "channels": [{
                 "short_channel_id": self.CHANNEL_ID,

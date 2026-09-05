@@ -42,7 +42,7 @@ SCENARIOS = [
      {"capacity": 2_000_000, "spendable_msat": 1_900_000_000}, "balanced"),
     ("depletion_caps_target", {},
      {"capacity": 2_000_000, "spendable_msat": 50_000_000}, "source"),
-    ("floor_wins_when_depleted", {},
+    ("depletion_overrides_preferred_floor", {},
      {"capacity": 2_000_000, "spendable_msat": 1_000}, "source"),
     ("zero_capacity_none", {}, {"capacity": 0, "spendable_msat": 0}, "source"),
 ]
