@@ -452,3 +452,10 @@ not qualify a deployment: four current-window forwards cannot establish safety
 when 8,845 persisted observations and existing contextual/reference state remain.
 Prioritize matched, isolated incumbent/candidate transition checks without
 resetting that history or changing the native tournament protocol.
+
+The follow-up [saved-model reward-boundary probe](../validation/2026-09-06-saved-model-reward-transition.md)
+passed real-state model serialization/incumbent-readback and 1,472 paired bounded
+DTS samples across 46 production channels. It used the unchanged model classes;
+one positive-rate reference changed, no samples did. This clears that component
+check, not full fee-path integration or deployment. Preserve this evidence while
+finishing the exact-candidate maintenance release assessment and native loop.
