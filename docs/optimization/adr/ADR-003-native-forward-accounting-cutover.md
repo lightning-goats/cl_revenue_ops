@@ -90,6 +90,10 @@ Before this can become an accepted production cutover:
   now stages bounded atomic replay and resume against receipt-verified archive
   payloads, including after operational pruning. It does not admit a source,
   activate a runtime model or replace the remaining consumers' qualification.
+  [Durable pre-settlement forecasts](../validation/2026-09-06-durable-forward-forecasts.md)
+  now link delayed feedback atomically to model/cursor updates. Receipt-order
+  versus settlement-order differences and failed-forecast retirement still
+  prevent claiming full adaptive-model or runtime qualification.
 - Rehearse migration and source/database rollback with late and post-upgrade
   settlements. An old binary on the new database is unsupported. Restoring an
   old backup alone would omit subsequent settlements and is not a complete
