@@ -25,6 +25,10 @@ from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
 from .forward_archive import ForwardArchiveStore
+from .forward_identity import (
+    ForwardIdentityError, ForwardReceiptLedger, ForwardSource,
+    observe_settled_identity,
+)
 from .utils import (
     normalize_scid,
     base_to_sats_floor,
@@ -632,12 +636,14 @@ class Database:
     def initialize(self):
         """Create database tables if they don't exist."""
         conn = self._get_connection()
+        if self._native_forward_mode(conn):
+            self._verify_native_forward_schema(conn)
 
         # Schema version tracking for migrations.
         #
         # DD9/MIG-3 (operator ruling 2026-07-02): schema_version is WRITE-ONLY by
         # design today — we record a version but do NOT gate on it. Every
-        # migration in this file is additive and idempotent (CREATE TABLE IF NOT
+        # ordinary migration in this file is additive and idempotent (CREATE TABLE IF NOT
         # EXISTS / ADD COLUMN guards), so a database written by a NEWER code
         # version opens without refusal: the newer code only added columns/tables
         # this older code simply ignores, and re-running the older init is a
@@ -648,6 +654,9 @@ class Database:
         # migration first becomes DESTRUCTIVE or RENAMING — i.e. when opening a
         # newer DB with older code could misread or corrupt data. Until then,
         # gating would only add false-positive refusals with no safety benefit.
+        # EXCEPTION: explicit native-forward cutover below is NOT additive-
+        # compatible. It has separate persisted guards, is not auto-enabled,
+        # and requires a source/database rollback plan before live activation.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1582,6 +1591,11 @@ class Database:
         - Deduplicates existing rows prior to enforcing uniqueness
         - Creates a UNIQUE index so INSERT OR IGNORE can safely skip duplicates
         """
+        # Native receipts replace the coarse uniqueness rule. Never run the
+        # legacy destructive GROUP BY migration on native operational rows.
+        if self._native_forward_mode(conn):
+            return
+
         # D4 FIX: Wrap migration in transaction for atomicity
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -5420,7 +5434,195 @@ class Database:
         return row['max_ts'] if row and row['max_ts'] else None
     
     
-    def bulk_insert_forwards(self, forwards: list) -> int:
+    @staticmethod
+    def _native_forward_mode(conn: sqlite3.Connection) -> bool:
+        # Inspect persisted state, not a per-object cache: another connection
+        # may have performed the explicit cutover since this object opened.
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='forward_ingestion_v1'"
+        ).fetchone() is not None
+
+    @staticmethod
+    def _verify_native_forward_schema(conn: sqlite3.Connection) -> str:
+        """Refuse an incomplete cutover rather than repairing away provenance."""
+        try:
+            versions = conn.execute("SELECT version FROM forward_ingestion_v1").fetchall()
+            if [r[0] for r in versions] != [1]:
+                raise ForwardIdentityError("unsupported native ingestion version")
+            bindings = conn.execute("SELECT source_key FROM forward_receipt_source_v1").fetchall()
+            if len(bindings) != 1:
+                raise ForwardIdentityError("missing source binding requires reconciliation")
+            binding = bindings[0][0]
+            network, node, generation = json.loads(binding)
+            if ForwardSource(node, network, generation).key() != binding:
+                raise ForwardIdentityError("invalid source binding")
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(forwards)")}
+            if not {"forward_receipt_id", "received_time_ns", "resolved_time_ns"} <= cols:
+                raise ForwardIdentityError("incomplete native projection schema")
+            receipt_cols = {r[1] for r in conn.execute("PRAGMA table_info(forward_receipts_v1)")}
+            if "accounting_pruned" not in receipt_cols:
+                raise ForwardIdentityError("incomplete native receipt schema")
+            guards = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE tbl_name='forwards' "
+                "AND type IN ('index','trigger')"
+            )}
+            if not {"idx_forwards_receipt", "forwards_native_insert",
+                    "forwards_native_update", "forwards_native_delete"} <= guards:
+                raise ForwardIdentityError("missing native ingestion guard")
+            if "idx_forwards_unique" in guards:
+                raise ForwardIdentityError("legacy uniqueness requires reconciliation")
+            return binding
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            raise ForwardIdentityError("native schema/source requires reconciliation") from exc
+
+    def initialize_native_forward_ingestion(self, source: ForwardSource) -> None:
+        """Explicit fresh-accounting cutover; NEVER called by initialize().
+
+        The caller must verify wallet/source and channel-alias continuity.
+        Existing raw rows, rollups, or a previously used ingestion sequence
+        require a separate legacy reconciliation, not an inferred match to
+        native events. This is not a production migration/activation API.
+        """
+        if not isinstance(source, ForwardSource):
+            raise ForwardIdentityError("verified source binding required")
+        source.key()
+        conn = self._get_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            ledger = ForwardReceiptLedger(conn)
+            if self._native_forward_mode(conn):
+                if self._verify_native_forward_schema(conn) != source.key():
+                    raise ForwardIdentityError("source continuity requires explicit reconciliation")
+                conn.execute("COMMIT")
+                return
+            for table in ("forwards", "daily_forwarding_stats",
+                          "daily_forwarding_stats_inbound"):
+                if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                    raise ForwardIdentityError("legacy accounting requires reconciliation")
+            if conn.execute(
+                "SELECT 1 FROM sqlite_sequence WHERE name IN "
+                "('forwards', 'forward_receipts_v1') AND seq > 0 LIMIT 1"
+            ).fetchone():
+                raise ForwardIdentityError("prior ingestion requires reconciliation")
+            ledger.initialize(source)
+            conn.execute("ALTER TABLE forward_receipts_v1 ADD COLUMN "
+                         "accounting_pruned INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE forwards ADD COLUMN forward_receipt_id INTEGER")
+            conn.execute("ALTER TABLE forwards ADD COLUMN received_time_ns INTEGER")
+            conn.execute("ALTER TABLE forwards ADD COLUMN resolved_time_ns INTEGER")
+            conn.execute("DROP INDEX IF EXISTS idx_forwards_unique")
+            conn.execute("CREATE UNIQUE INDEX idx_forwards_receipt "
+                         "ON forwards(forward_receipt_id)")
+            # An old caller cannot silently write identity-less rows after the
+            # cutover. These guards also stop the known old initializer's
+            # destructive dedupe and uncoordinated old prune from deleting data.
+            # They do NOT make running an old binary on this schema supported.
+            conn.execute("""
+                CREATE TRIGGER forwards_native_insert BEFORE INSERT ON forwards
+                WHEN NEW.forward_receipt_id IS NULL
+                  OR NEW.received_time_ns IS NULL OR NEW.resolved_time_ns IS NULL
+                  OR NOT EXISTS (SELECT 1 FROM forward_receipts_v1
+                     WHERE id = NEW.forward_receipt_id AND accounting_pruned = 0)
+                BEGIN SELECT RAISE(ABORT, 'native forward receipt required'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER forwards_native_update BEFORE UPDATE ON forwards
+                BEGIN SELECT RAISE(ABORT, 'native forwards are immutable'); END
+            """)
+            conn.execute("""
+                CREATE TRIGGER forwards_native_delete BEFORE DELETE ON forwards
+                WHEN NOT EXISTS (SELECT 1 FROM forward_receipts_v1
+                     WHERE id = OLD.forward_receipt_id AND accounting_pruned = 1)
+                BEGIN SELECT RAISE(ABORT, 'native forward requires atomic rollup'); END
+            """)
+            conn.execute("CREATE TABLE forward_ingestion_v1 "
+                         "(version INTEGER PRIMARY KEY CHECK(version=1))")
+            conn.execute("INSERT INTO forward_ingestion_v1 VALUES (1)")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _insert_native_forward(conn, observation) -> bool:
+        """Claim and project one settlement inside the caller's transaction.
+
+        Do not catch insertion failures here: a claimed receipt without its
+        accounting effect must never be committed, including in bulk hydration.
+        """
+        claim = ForwardReceiptLedger(conn).claim(observation)
+        if not claim.inserted:
+            return False
+        record = observation.record
+        conn.execute("""
+            INSERT INTO forwards
+            (in_channel, out_channel, in_msat, out_msat, fee_msat,
+             resolution_time, timestamp, resolved_time, forward_receipt_id,
+             received_time_ns, resolved_time_ns)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (record.in_channel, record.out_channel, record.in_msat,
+              record.out_msat, record.fee_msat,
+              (record.resolved_time_ns - record.received_time_ns) / 1_000_000_000,
+              record.received_time_ns // 1_000_000_000,
+              record.resolved_time_ns // 1_000_000_000, claim.receipt_id,
+              record.received_time_ns, record.resolved_time_ns))
+        return True
+
+    def _record_native_forward(self, payload, source, *, peer_id=None,
+                               success=True) -> bool:
+        observation = observe_settled_identity(payload, source)
+        if observation.status != "usable":
+            self.plugin.log("native forward skipped: " + observation.status, level="debug")
+            return False
+        # A settled event cannot authorize a failure reputation increment.
+        if success is not True:
+            raise ForwardIdentityError("settled forward requires success outcome")
+        if peer_id is not None and (not isinstance(peer_id, str) or not peer_id):
+            raise ForwardIdentityError("invalid reputation target")
+        conn = self._get_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not self._native_forward_mode(conn):
+                raise ForwardIdentityError("native ingestion requires explicit cutover")
+            inserted = self._insert_native_forward(conn, observation)
+            if inserted and peer_id is not None:
+                conn.execute("""
+                    INSERT INTO peer_reputation (peer_id, success_count, failure_count, last_update)
+                    VALUES (?, 1, 0, ?)
+                    ON CONFLICT(peer_id) DO UPDATE SET
+                        success_count = success_count + 1,
+                        last_update = excluded.last_update
+                """, (peer_id, int(time.time())))
+            conn.execute("COMMIT")
+            return inserted
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def _bulk_insert_native_forwards(self, forwards, source) -> int:
+        conn = self._get_connection()
+        inserted = 0
+        for start in range(0, len(forwards), self.BULK_WRITE_BATCH_SIZE):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if not self._native_forward_mode(conn):
+                    raise ForwardIdentityError("native ingestion requires explicit cutover")
+                for payload in forwards[start:start + self.BULK_WRITE_BATCH_SIZE]:
+                    observation = observe_settled_identity(payload, source)
+                    if observation.status != "usable":
+                        self.plugin.log("native forward skipped: " + observation.status,
+                                        level="debug")
+                        continue
+                    inserted += self._insert_native_forward(conn, observation)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return inserted
+
+    def bulk_insert_forwards(self, forwards: list, *,
+                             native_source: Optional[ForwardSource] = None) -> int:
             """
             Bulk insert forwards from RPC hydration.
 
@@ -5438,6 +5640,8 @@ class Database:
                 Number of forwards inserted (best-effort count)
             """
             conn = self._get_connection()
+            if native_source is not None or self._native_forward_mode(conn):
+                return self._bulk_insert_native_forwards(forwards, native_source)
             inserted = 0
 
             # P2-002: Chunk into bounded BEGIN IMMEDIATE transactions (commit per
@@ -5682,7 +5886,9 @@ class Database:
 
     
     def record_forward(self, in_channel: str, out_channel: str,
-                       in_msat: int, out_msat: int, fee_msat: int, *args) -> None:
+                       in_msat: int, out_msat: int, fee_msat: int, *args,
+                       native_source: Optional[ForwardSource] = None,
+                       in_htlc_id=None, created_index=None, updated_index=None):
         """
         Record a completed forward for real-time tracking.
 
@@ -5694,6 +5900,17 @@ class Database:
           - Canonical call: record_forward(in_channel, out_channel, in_msat, out_msat, fee_msat,
                                          received_time, resolved_time[, resolution_time])
         """
+        if native_source is not None or self._native_forward_mode(self._get_connection()):
+            return self._record_native_forward({
+                "status": "settled", "in_channel": in_channel,
+                "out_channel": out_channel, "in_msat": in_msat,
+                "out_msat": out_msat, "fee_msat": fee_msat,
+                "received_time": args[0] if len(args) >= 2 else None,
+                "resolved_time": args[1] if len(args) >= 2 else None,
+                "in_htlc_id": in_htlc_id, "created_index": created_index,
+                "updated_index": updated_index,
+            }, native_source)
+
         # Parse legacy vs canonical call patterns
         received_time: int = 0
         resolved_time: int = 0
@@ -5759,7 +5976,8 @@ class Database:
             )
 
     def record_forward_and_reputation(self, forward: Dict[str, Any],
-                                      peer_id: str, success: bool) -> None:
+                                      peer_id: str, success: bool, *,
+                                      native_source: Optional[ForwardSource] = None):
         """Record a forward and update peer reputation in ONE transaction.
 
         Per-forward hot path: combines record_forward(**forward) and the
@@ -5773,6 +5991,10 @@ class Database:
             peer_id: The peer's node ID (reputation upsert target)
             success: True if forward settled, False if failed
         """
+        if native_source is not None or self._native_forward_mode(self._get_connection()):
+            return self._record_native_forward(forward, native_source,
+                                               peer_id=peer_id, success=success)
+
         # --- Same derivation logic as record_forward() (canonical path) ---
         in_channel = (forward.get("in_channel") or "").replace(":", "x")
         out_channel = (forward.get("out_channel") or "").replace(":", "x")
@@ -7735,6 +7957,15 @@ class Database:
                                 forward_count = forward_count + excluded.forward_count
                         """, (in_channel, day_ts, s_in, s_fee, cnt))
 
+                    if self._native_forward_mode(conn):
+                        # The durable receipt survives raw pruning. Mark its
+                        # accounting disposition in the SAME transaction as
+                        # both rollups and deletion; replay must not re-credit it.
+                        conn.executemany("""
+                            UPDATE forward_receipts_v1 SET accounting_pruned = 1
+                            WHERE id = (SELECT forward_receipt_id FROM forwards
+                                        WHERE rowid = ?)
+                        """, [(rid,) for rid in rowids])
                     conn.executemany(
                         "DELETE FROM forwards WHERE rowid = ?",
                         [(rid,) for rid in rowids],

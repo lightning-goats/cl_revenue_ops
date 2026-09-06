@@ -1,7 +1,8 @@
 """Native settled-forward identity and transactional replay receipts.
 
-Not wired into operational ingestion yet. This module has no RPC, clock,
-learning, or migration authority. Callers must verify source continuity and
+Used by Database's explicitly enabled native ingestion path, not activated
+by the live plugin. This module has no RPC, clock, learning, or migration
+authority. Callers must verify source continuity and
 reconcile legacy accounting before admitting events to a receipt ledger.
 Receipts are idempotency metadata, not another revenue/accounting source.
 """
@@ -191,7 +192,7 @@ class ReceiptClaim:
 
 
 class ForwardReceiptLedger:
-    """A caller-transaction-owned replay ledger, intentionally not auto-wired.
+    """A caller-transaction-owned replay ledger, never auto-activated.
 
     Claim AND operational/reputation writes must commit in the SAME SQLite
     transaction on this connection. An insertion failure must roll back the

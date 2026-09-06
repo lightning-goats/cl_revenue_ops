@@ -8,10 +8,12 @@ before historical learning can consume those events reliably.
 ## Implemented component
 
 `modules/forward_identity.py` provides strict settled-event normalization and
-a caller-transaction-owned SQLite receipt ledger. It is **not imported by the
-entry point, database, fee controller or a live ingestion adapter**. No schema
-migration, archive-backed learning activation or production fix occurs merely
-by adding this component.
+a caller-transaction-owned SQLite receipt ledger. The initial component was
+unwired; the subsequent [database integration](2026-09-06-native-forward-database-integration.md)
+uses it in all three database writers under an explicit fresh-accounting
+cutover. The entry point and live ingestion adapters still do not activate it.
+No archive-backed learning activation or production fix occurs merely by
+adding either component.
 
 Identity uses a caller-verified source scope (network, node and wallet
 generation), incoming channel and incoming HTLC ID. HTLC ID zero is valid.
@@ -48,8 +50,10 @@ operational row, reputation and any related consumer effect. On error it must
 roll back all of them. The component never commits on its caller's behalf.
 Raw pruning must not delete receipts. Tests exercise competing immediate
 transactions, consumer rollback, process-style connection reopen, and raw
-deletion followed by replay. They do not claim to test the current operational
-writers, which still contain the demonstrated defects.
+deletion followed by replay. These original primitive tests do not claim to
+test operational writers. The subsequent database integration has its own
+writer/prune/restart tests; the unchanged default live path still contains the
+demonstrated defects.
 
 ## Integration work still required
 
@@ -64,6 +68,9 @@ writers, which still contain the demonstrated defects.
 3. Wire notifications, hydration and both individual database writers together,
    including atomic reputation and idempotent loop-wake semantics. Replace the
    old coarse unique index and unconditional initializer deduplication safely.
+   The database-only portion now has an explicit native mode; notification,
+   hydration adapter and loop-wake integration are still outstanding. Refusing
+   nonempty legacy cutover is a guard, not implementation of that migration.
 4. Qualify raw/rollup/receipt retention and storage budgets. The primitive does
    not yet implement a safe receipt-retention frontier; deleting receipts by
    raw-event age would reintroduce the replay defect.
