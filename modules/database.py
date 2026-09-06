@@ -312,6 +312,10 @@ class Database:
         """
         self.db_path = os.path.expanduser(db_path)
         self.plugin = plugin
+        # Process-local admission, never reconstructed from the stored label.
+        # A caller must verify continuity before each new Database instance is
+        # admitted to native ingestion. Ordinary initialize() does not do so.
+        self._native_forward_source = None
         # Phase 0.6: observational CLN forward evidence.  This store owns only
         # additive archive tables and is not consumed by economic decisions.
         self.forward_archive = ForwardArchiveStore(
@@ -5484,6 +5488,7 @@ class Database:
         require a separate legacy reconciliation, not an inferred match to
         native events. This is not a production migration/activation API.
         """
+        self._native_forward_source = None
         if not isinstance(source, ForwardSource):
             raise ForwardIdentityError("verified source binding required")
         source.key()
@@ -5495,6 +5500,7 @@ class Database:
                 if self._verify_native_forward_schema(conn) != source.key():
                     raise ForwardIdentityError("source continuity requires explicit reconciliation")
                 conn.execute("COMMIT")
+                self._native_forward_source = source
                 return
             for table in ("forwards", "daily_forwarding_stats",
                           "daily_forwarding_stats_inbound"):
@@ -5540,9 +5546,23 @@ class Database:
                          "(version INTEGER PRIMARY KEY CHECK(version=1))")
             conn.execute("INSERT INTO forward_ingestion_v1 VALUES (1)")
             conn.execute("COMMIT")
+            self._native_forward_source = source
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    def get_native_forward_source(self) -> Optional[ForwardSource]:
+        """Read process-local admission; persisted scope is not continuity proof.
+
+        Native mode without explicit admission raises rather than returning
+        None, which adapters reserve for ordinary legacy ingestion. No RPC,
+        schema creation, migration or automatic source binding occurs here.
+        """
+        if self._native_forward_source is not None:
+            return self._native_forward_source
+        if self._native_forward_mode(self._get_connection()):
+            raise ForwardIdentityError("native source continuity must be verified before ingestion")
+        return None
 
     @staticmethod
     def _insert_native_forward(conn, observation) -> bool:

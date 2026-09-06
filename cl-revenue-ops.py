@@ -55,8 +55,9 @@ from modules.capital_efficiency import CapitalEfficiencyAnalyzer
 from modules.segment_observations import SegmentObservationStore
 from modules.utils import normalize_scid, parse_msat, channel_local_balance_msat
 from modules.econ_shadow import EconShadow, fail_open_fee_evidence_guard
-from modules.forward_archive import ForwardArchiveError
+from modules.forward_archive import ForwardArchiveError, parse_cln_time_ns
 from modules.forward_archive_sync import ForwardArchiveSynchronizer
+from modules.forward_identity import ForwardSource, observe_settled_identity
 
 
 # =============================================================================
@@ -640,6 +641,51 @@ _HYDRATION_PAGE_LIMIT = 1000
 _HYDRATION_MAX_PAGES = 10_000  # Hard stop: 10M forwards, prevents runaway paging
 
 
+def _native_forward_ingestion_source() -> Optional[ForwardSource]:
+    # Older Database implementations do not have this explicit admission API.
+    # Require an implemented method, not a synthesized dynamic attribute.
+    if not callable(getattr(type(database), "get_native_forward_source", None)):
+        return None
+    return database.get_native_forward_source()
+
+
+def _hydration_received_after(forward, start_time: int) -> bool:
+    if not isinstance(forward, dict):
+        return False
+    try:
+        received_ns = parse_cln_time_ns(forward.get("received_time"))
+        return received_ns is not None and received_ns > start_time * 1_000_000_000
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _hydrate_settled_forward_rows(start_time: int) -> Tuple[int, int]:
+    """Actual startup adapter; retain native payload before any lossy parsing.
+
+    A new process must obtain explicit source admission before a native-mode
+    DB can ingest. This function does not verify a wallet, bind a source,
+    activate a schema or read the archive for decisions.
+    """
+    source = _native_forward_ingestion_source()
+    forwards = _hydration_fetch_settled_forwards(start_time)
+    if source is not None:
+        return database.bulk_insert_forwards(forwards, native_source=source), len(forwards)
+    rows = []
+    for fwd in forwards:
+        received_time = int(fwd.get("received_time", 0) or 0)
+        resolved_time = int(fwd.get("resolved_time", 0) or 0)
+        rows.append({
+            'in_channel': fwd.get("in_channel", ""),
+            'out_channel': fwd.get("out_channel", ""),
+            'in_msat': _parse_msat(fwd.get("in_msat", fwd.get("in_msatoshi", 0))),
+            'out_msat': _parse_msat(fwd.get("out_msat", fwd.get("out_msatoshi", 0))),
+            'fee_msat': _parse_msat(fwd.get("fee_msat", fwd.get("fee_msatoshi", 0))),
+            'resolution_time': max(0, resolved_time - received_time) if resolved_time > 0 else 0,
+            'received_time': received_time, 'resolved_time': resolved_time,
+        })
+    return (database.bulk_insert_forwards(rows) if rows else 0), len(rows)
+
+
 def _hydration_fetch_settled_forwards(start_time: int) -> List[Dict[str, Any]]:
     """Fetch settled forwards newer than start_time for startup hydration.
 
@@ -647,8 +693,8 @@ def _hydration_fetch_settled_forwards(start_time: int) -> List[Dict[str, Any]]:
     the node's entire settled-forward history is never materialized in a
     single RPC response. Any error (older CLN without index paging, mocked or
     unexpected response shapes, RPC failures) falls back to the legacy full
-    settled fetch. The unique-index dedup in bulk_insert_forwards remains the
-    correctness backstop on both paths.
+    settled fetch. Native mode uses durable receipts in bulk_insert_forwards;
+    the legacy coarse uniqueness path remains unqualified for historical replay.
     """
     start_time = int(start_time)
     try:
@@ -665,7 +711,7 @@ def _hydration_fetch_settled_forwards(start_time: int) -> List[Dict[str, Any]]:
             if not isinstance(forwards, list):
                 raise TypeError("listforwards returned non-list forwards")
             for fwd in forwards:
-                if int(fwd.get("received_time", 0) or 0) > start_time:
+                if _hydration_received_after(fwd, start_time):
                     collected.append(fwd)
             if len(forwards) < _HYDRATION_PAGE_LIMIT:
                 return collected
@@ -690,7 +736,7 @@ def _hydration_fetch_settled_forwards(start_time: int) -> List[Dict[str, Any]]:
                    f"Flow analysis will use existing database data only.", level='warn')
         return []
     forwards = result.get("forwards", []) or []
-    return [f for f in forwards if int(f.get("received_time", 0) or 0) > start_time]
+    return [f for f in forwards if _hydration_received_after(f, start_time)]
 
 
 # Initialize the plugin
@@ -2080,6 +2126,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize database
     database = Database(config.db_path, safe_plugin)
     database.initialize()
+    # A persisted native scope is not proof that this process is attached to
+    # the same wallet. Do not downgrade this admission failure to a hydration
+    # warning and then run decision loops on silently stale evidence. A live
+    # continuity verifier/migration is still required before native activation.
+    _native_forward_ingestion_source()
     # Keep the advisory total-cost memo coherent with committed spend-ledger
     # mutations.  Database callbacks are best-effort and run only after a
     # successful commit, so cache maintenance can never affect authorization.
@@ -2123,9 +2174,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # =========================================================================
     # The forwards table is populated in real-time by forward_event hook.
     # Startup hydration backfills empty tables and bounded overlap gaps.
-    # Hook and hydration overlap is safe: both insert paths use
-    # INSERT OR IGNORE under idx_forwards_unique with the same SCID and
-    # timestamp normalization (see TestForwardDoubleDipPrevention).
+    # Explicitly admitted native mode preserves identities across both paths.
+    # The unchanged default legacy mode still has coarse-collision/prune-replay
+    # limitations; do not use it as proof of safe historical model bootstrap.
     # The RPC fetch prefers a paged listforwards(index="created") loop with a
     # full-fetch fallback; the local insert window below bounds what gets written.
     # =========================================================================
@@ -2173,27 +2224,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 max_hydration_days = max(config.flow_window_days + 1, 15)
                 hydration_floor = now - (max_hydration_days * 86400)
                 start_time = max(start_time, hydration_floor)
-            forwards_to_insert = []
-            for fwd in _hydration_fetch_settled_forwards(start_time):
-                received_time = int(fwd.get("received_time", 0) or 0)
-                resolved_time = int(fwd.get("resolved_time", 0) or 0)
-                forwards_to_insert.append({
-                    'in_channel': fwd.get("in_channel", ""),
-                    'out_channel': fwd.get("out_channel", ""),
-                    'in_msat': _parse_msat(fwd.get("in_msat", fwd.get("in_msatoshi", 0))),
-                    'out_msat': _parse_msat(fwd.get("out_msat", fwd.get("out_msatoshi", 0))),
-                    'fee_msat': _parse_msat(fwd.get("fee_msat", fwd.get("fee_msatoshi", 0))),
-                    'resolution_time': max(0, resolved_time - received_time) if resolved_time > 0 else 0,
-                    'received_time': received_time,
-                    'resolved_time': resolved_time
-                })
-
-            if forwards_to_insert:
-                inserted = database.bulk_insert_forwards(forwards_to_insert)
+            inserted, observed = _hydrate_settled_forward_rows(start_time)
+            if observed:
                 if inserted > 0:
                     plugin.log(f"Hydration complete: inserted {inserted} forwards into local database")
                 else:
-                    plugin.log(f"Hydration: {len(forwards_to_insert)} forwards already in database", level='debug')
+                    plugin.log(f"Hydration: {observed} observations, no new admitted settlements "
+                               "(replayed or unusable evidence)", level='debug')
             else:
                 plugin.log("Hydration complete: no new forwards to insert", level='debug')
 
@@ -6003,9 +6040,22 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
 def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
     if database is None:
         return
+    if not isinstance(forward_event, dict):
+        plugin.log("forward_event: malformed event ignored", level="debug")
+        return
 
     status = forward_event.get("status")
+    native_source = _native_forward_ingestion_source() if status == "settled" else None
+    native_observation = None
+    if native_source is not None:
+        native_observation = observe_settled_identity(forward_event, native_source)
+        if native_observation.status != "usable":
+            plugin.log("forward_event: native evidence " + native_observation.status,
+                       level="debug")
+            return
     in_channel = normalize_scid(forward_event.get("in_channel")) if forward_event.get("in_channel") else None
+    if native_observation is not None:
+        in_channel = native_observation.record.in_channel
 
     # Per-forward write coalescing: when the database exposes the combined
     # single-transaction method, settled forwards record the forward row AND
@@ -6014,6 +6064,8 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
 
     # Track peer reputation for all forward outcomes
     peer_id = _resolve_scid_to_peer(in_channel) if in_channel else None
+    if native_source is not None and peer_id and not callable(record_combined):
+        raise ValueError("native ingestion requires atomic forward/reputation writer")
     if peer_id:
         if status == "settled":
             if not callable(record_combined):
@@ -6088,17 +6140,27 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
         out_channel = normalize_scid(out_channel) if out_channel else None
 
         # CLN v23.05+ uses in_msat/out_msat/fee_msat; older versions used *_msatoshi
-        in_msat = _parse_msat(forward_event.get("in_msat", forward_event.get("in_msatoshi", 0)))
-        out_msat = _parse_msat(forward_event.get("out_msat", forward_event.get("out_msatoshi", 0)))
-        fee_msat = _parse_msat(forward_event.get("fee_msat", forward_event.get("fee_msatoshi", 0)))
+        if native_observation is not None:
+            record = native_observation.record
+            out_channel = record.out_channel
+            in_msat, out_msat, fee_msat = record.in_msat, record.out_msat, record.fee_msat
+            # Keep the actual transport values; integer-second projection is
+            # the Database's job, after it has claimed the native identity.
+            received_time = forward_event["received_time"]
+            resolved_time = forward_event["resolved_time"]
+            resolution_duration = (record.resolved_time_ns - record.received_time_ns) / 1e9
+        else:
+            in_msat = _parse_msat(forward_event.get("in_msat", forward_event.get("in_msatoshi", 0)))
+            out_msat = _parse_msat(forward_event.get("out_msat", forward_event.get("out_msatoshi", 0)))
+            fee_msat = _parse_msat(forward_event.get("fee_msat", forward_event.get("fee_msatoshi", 0)))
+            received_time = int(forward_event.get("received_time", 0) or 0)
+            resolved_time = int(forward_event.get("resolved_time", 0) or 0)
+            resolution_duration = max(0, resolved_time - received_time) if resolved_time > 0 else 0
 
-        # Calculate resolution duration (Risk Premium tracking)
-        received_time = int(forward_event.get("received_time", 0) or 0)
-        resolved_time = int(forward_event.get("resolved_time", 0) or 0)
-        resolution_duration = max(0, resolved_time - received_time) if resolved_time > 0 else 0
-
-        if callable(record_combined) and peer_id:
-            record_combined(
+        if native_source is not None and peer_id:
+            inserted = record_combined(forward_event, peer_id, True, native_source=native_source)
+        elif callable(record_combined) and peer_id:
+            inserted = record_combined(
                 {
                     "in_channel": in_channel or "",
                     "out_channel": out_channel or "",
@@ -6113,7 +6175,13 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
                 True,
             )
         else:
-            database.record_forward(
+            native_kwargs = {} if native_source is None else {
+                "native_source": native_source,
+                "in_htlc_id": forward_event.get("in_htlc_id"),
+                "created_index": forward_event.get("created_index"),
+                "updated_index": forward_event.get("updated_index"),
+            }
+            inserted = database.record_forward(
                 in_channel or "",
                 out_channel or "",
                 in_msat,
@@ -6122,7 +6190,14 @@ def _on_forward_event_impl(forward_event: Dict, plugin: Plugin, **kwargs):
                 received_time,
                 resolved_time,
                 resolution_duration,
+                **native_kwargs,
             )
+
+        # Only newly committed native evidence can move the wake monitors.
+        # Legacy writers historically return None, which remains compatible;
+        # their existing coarse deduplication is not upgraded by this gate.
+        if inserted is False or (native_source is not None and inserted is not True):
+            return
 
         # Persist evidence before requesting evaluation.  The notification
         # handler never mutates fees; it only wakes the existing governed loop

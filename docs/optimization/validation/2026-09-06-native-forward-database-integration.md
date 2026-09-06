@@ -1,5 +1,11 @@
 # Native forward database integration — live activation pending
 
+Subsequent step: [notification/hydration adapter integration](2026-09-06-native-forward-adapters.md)
+now preserves native payloads and suppresses duplicate wake effects under
+explicit process admission. Live continuity verification, legacy reconciliation
+and production activation are still pending. The evidence below describes the
+database-only step at `54ab711`.
+
 ## Scope and boundary
 
 This implements the database portion of the receipt integration, not the

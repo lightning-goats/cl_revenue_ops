@@ -68,9 +68,10 @@ demonstrated defects.
 3. Wire notifications, hydration and both individual database writers together,
    including atomic reputation and idempotent loop-wake semantics. Replace the
    old coarse unique index and unconditional initializer deduplication safely.
-   The database-only portion now has an explicit native mode; notification,
-   hydration adapter and loop-wake integration are still outstanding. Refusing
-   nonempty legacy cutover is a guard, not implementation of that migration.
+   Database writers and the subsequent [notification/hydration adapters](2026-09-06-native-forward-adapters.md)
+   now support explicit native admission, including duplicate-wake suppression.
+   Live continuity verification and legacy reconciliation remain outstanding.
+   Refusing nonempty legacy cutover is a guard, not implementation of that migration.
 4. Qualify raw/rollup/receipt retention and storage budgets. The primitive does
    not yet implement a safe receipt-retention frontier; deleting receipts by
    raw-event age would reintroduce the replay defect.
