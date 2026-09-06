@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
+import json
 import sqlite3
 import threading
 from unittest.mock import patch
@@ -74,6 +75,26 @@ def test_notification_without_created_index_then_backfill_is_one_receipt(ledger)
     assert claim(ledger, observe()) == replace(a, inserted=False)
     assert claim(ledger, notification) == replace(a, inserted=False)
     assert ledger.connection.execute("SELECT created_index FROM forward_receipts_v1").fetchone()[0] == "86"
+
+
+def test_matching_native_json_decoders_agree_without_inventing_lost_precision(ledger):
+    wire = json.dumps(event()).replace('"1788657630.1243427"', '1788657630.124342739')
+    notification = json.loads(wire)
+    notification.pop("created_index")
+    history = json.loads(wire)
+    first = observe_settled_identity(notification, SOURCE)
+    second = observe_settled_identity(history, SOURCE)
+    # Nanosecond units do not restore precision already lost in JSON float decoding.
+    assert first.record.received_time_ns != 1788657630124342739
+    assert first.record.payload_digest() == second.record.payload_digest()
+    assert claim(ledger, first).inserted
+    assert not claim(ledger, second).inserted
+
+
+def test_mixed_precision_timestamps_are_not_silently_assumed_equivalent(ledger):
+    claim(ledger, observe(received_time="1788657630.124342739"))
+    with pytest.raises(ForwardIdentityError, match="conflicting"):
+        claim(ledger, observe(received_time=float("1788657630.124342739")))
 
 
 def test_hydration_then_notification_and_late_update_are_not_new_rewards(ledger):

@@ -24,6 +24,17 @@ decision boundary. Missing source/identity/time is unknown, not a fabricated
 event. Malformed data yields an invalid observation without a raw-data error
 dump, clock read, RPC or database operation.
 
+Pinned CLN [timestamp bindings](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/db/bindings.c#L214)
+store/recover integer nanoseconds, and its
+[JSON serializer](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/common/json_stream.c#L350)
+emits nine fractional digits. The Python JSON transport can already have
+rounded that value to a float before normalization. Nanosecond units do not
+recover those lost bits. Matching native JSON decoders agree in the added
+transport regression; mixing an exact decimal timestamp and its rounded float
+is conservatively a conflict, not silently assumed equivalence. Consistent
+decoder provenance or an explicitly verified precision-reconciliation rule
+is therefore another integration requirement before consuming mixed history.
+
 Receipts contain identity, optional indices and an immutable payload digest,
 not fee totals or a second accounting history. A replay returns the original
 receipt ID and `inserted=False`; late index enrichment does not issue another
@@ -67,3 +78,14 @@ writers, which still contain the demonstrated defects.
 No production or Docker state is changed. No action RPC, dependency, external
 coordinator, Sling integration or Archon DID is introduced. Unrelated local
 Revenue/xrebalance edits are excluded from this component's changes.
+
+## Verification
+
+The initial focused identity/archive/architecture/RPC run passed 194 tests.
+Exact committed runtime source `b85865e` then passed an isolated full suite:
+**4,522 passed, five skipped, two existing expected failures** in 179.92
+seconds. The skips are four opt-in live-router tests and unavailable optional
+`pyln.testing`; no live RPC was enabled. Two subsequent decoder-precision
+regressions bring the identity-specific suite to **74 passing tests** without
+changing runtime source. No full production migration, native integration or
+economic qualification is asserted by these component results.
