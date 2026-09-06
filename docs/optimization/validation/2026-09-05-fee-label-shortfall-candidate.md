@@ -127,3 +127,47 @@ BuildKit initially rejected a raw local image ID in `FROM`; rebuilding with the
 readback-verified local tag used the exact intended base. Neither failed
 packaging check started a node or tournament payment. No native result exists
 yet for this candidate, and its production promotion remains unqualified.
+
+## First native control result
+
+R240 (settled-reward-only control, Revenue B) completed 240/240 payments with
+zero terminal payment failures. Revenue earned 5,222,275 msat on 25,196,354,160 forwarded msat;
+native CLBOSS earned 38,492,397 msat on 4,112,000,000 forwarded msat. Both
+rebalance costs are zero. Delivery, attribution, frozen protocol and scorer
+safety checks pass; retention, replication and positive bootstrap do not.
+The result is `insufficient_evidence`, not a candidate result or promotion.
+The native forward history also retains four failed and one locally failed
+attempt; zero terminal payment failures does not mean there were no retries.
+
+Post-run reconciliation found a separate [operational ingestion collision](2026-09-05-operational-forward-identity-collision.md):
+two distinct native HTLCs collapse into one coarse-time database key, omitting
+18,300 msat from operational evidence. The scorer uses native fees and remains
+unchanged. Its passing safety check does not exonerate this independently
+demonstrated accounting-input defect. Native records, fee history, forwards
+and corrected learner-state export are retained; the completed lab was removed.
+No code or frozen image was changed during the run. R241–r243 remain pending.
+The runner/scorer/architecture/RPC suite passed 116 tests in 2.53 seconds.
+
+## Research during the frozen comparison: LN Operator
+
+Read-only review of pinned [LN Operator `engine/fees.py`](https://github.com/lnbright/ln-operator/blob/0822adc135caf60a7e64234b567a3b7f400008bd/engine/fees.py)
+confirms separate slow activity and faster inventory-control loops. Its nightly
+multiplier uses time since the last forward, not a fitted net-revenue response.
+A depleted channel's recent liquidity failures can trigger an upward bump.
+The refill-cost floor decays during silence, holds with forwarding/failure
+activity and re-arms on a new refill. This helps distinguish lack of inventory
+from a price that attracts no attempts; it is not a causal demand estimate.
+
+Two source-level cautions matter for Revenue's learning design. A dropped
+attempt does not by itself prove fresh demand at the latest advertised policy.
+Also, after a failed policy-update RPC, this source still writes fee-update
+history and advances its last-update timestamp. That is a source observation,
+not a tested runtime failure or permission to modify the competitor.
+
+Revenue-only improvement hypothesis: preserve separate adaptation timescales,
+but couple them through explicit evidence age, acknowledged execution and
+uncertain attribution. Retain unsuccessful intent separately from applied
+policy; learn from failures without declaring them guaranteed revenue or
+independent new payments. Historical backfill must respect that distinction.
+No frozen candidate, comparator, environment or scoring change follows from
+this research; existing algorithm-equivalent results remain non-native claims.

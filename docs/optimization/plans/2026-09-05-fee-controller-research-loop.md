@@ -348,6 +348,11 @@ historical bootstrap; incomplete policy timelines remain unknown.
    restore and late-update recovery tests. Reconcile overlapping operational
    and archived observations before promotion: disjoint IDs are not disjoint
    events. Never sum raw events with the rollups representing those same events.
+   The [native r240 identity collision](../validation/2026-09-05-operational-forward-identity-collision.md)
+   demonstrates the converse too: distinct HTLCs can share the current coarse
+   operational deduplication key and be discarded. Fix notifications, hydration
+   and atomic reputation ingestion together with an explicit legacy/source
+   migration contract; a local row ID cannot identify an event never inserted.
    Rebuilding a prior must not count evidence already absorbed into a persisted
    posterior. Respect ADR-002 until an explicit operational-learning decision
    supersedes its archive boundary. Rate-limit scans so live routing is unaffected.
