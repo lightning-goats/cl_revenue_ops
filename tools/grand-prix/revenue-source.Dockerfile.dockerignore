@@ -1,0 +1,7 @@
+**
+!cl-revenue-ops.py
+!modules/
+!modules/**
+**/__pycache__
+**/*.pyc
+**/*.pyo
