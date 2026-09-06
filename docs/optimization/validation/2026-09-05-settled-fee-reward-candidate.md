@@ -125,3 +125,132 @@ This is a losing incumbent-control observation, not a candidate result, and
 does not establish that changing the reward fixes the competitive deficit.
 The recorded state and score are retained under the `reward-control-r236`
 prefix in `results/polar-grand-prix/`.
+
+Control r237 (Revenue A) likewise settled all 240 payments with zero failures.
+Revenue earned 4,836,799 msat on 25,196,339,160 forwarded msat; CLBOSS earned
+30,768,512 msat on 4,112,000,000 forwarded msat. Paired control totals are
+9,970,901 versus 86,196,080 fee msat. Both assignments fail retention in
+`baseline_retail|cln|large`: Revenue routes 1,500,000,000 msat versus CLBOSS's
+2,000,000,000, below the unchanged 0.95 ratio requirement. Other passing gates
+do not erase this failure or supply the missing replication/holdout evidence.
+
+After r237 traffic completed, one read-only SQLite transaction retained 57 fee
+changes, 222 settled forwards and 16 fee-state rows in
+`reward-control-r237-postrun-evidence.json`. These are synthetic local lab
+records, not exported production data. R236 did not receive this additional
+post-run export; its scorer/state evidence remains available. Both completed
+control replicas' disposable chain state was removed after scoring; result
+artifacts and the reusable pinned images were preserved.
+
+Candidate r238 (Revenue B) settled all 240 payments with no failures. Revenue
+earned 5,137,688 msat on 25,196,206,160 forwarded msat; CLBOSS earned
+38,492,397 msat on 4,112,000,000 forwarded msat. Revenue's fee difference from
+same-assignment control r236 is only +3,586 msat (about +0.070%). This is not
+an established improvement: native competitor randomness and independent run
+timing remain, and the candidate still loses economically and fails the same
+large-CLN baseline retention cell. Safety, delivery and attribution pass;
+coverage and bootstrap gates do not. Both rebalance costs remain zero.
+
+The post-run read-only export retained 63 fee changes, 222 forwards and 16 fee
+states. A separate native CLBOSS status snapshot retained its price-card and
+composed-quote diagnostics. Every reported active card still had its initial
+288 intervals remaining; the earning peer's card recorded exactly 38,492,397
+msat, matching the scorer. This directly corroborates that this run did not
+complete CLBOSS's long-horizon price search. Its post-run quotes are not proof
+of the exact policy accepted for each earlier payment. R238's disposable lab
+was removed after these exports and scoring; the evidence and images remain.
+
+Candidate r239 (Revenue A) settled all 240 payments with no failures. Revenue
+earned 5,089,854 msat on 25,196,206,160 forwarded msat; CLBOSS earned
+24,634,473 msat on 4,112,000,000 forwarded msat. Its post-run export retained
+62 fee changes, 222 forwards and 16 fee states, plus a separate read-only
+CLBOSS status snapshot. The same retention cell fails with the same volume
+ratio; passing safety/delivery/attribution does not override this.
+
+### Completed diagnostic comparison and disposition
+
+| Crossed pair | Revenue fees (msat) | Native CLBOSS fees (msat) | Scheduled payments settled |
+| --- | ---: | ---: | ---: |
+| Control r236/r237 | 9,970,901 | 86,196,080 | 480/480 |
+| Candidate r238/r239 | 10,227,542 | 63,126,870 | 480/480 |
+
+The candidate's observed Revenue gain over the control is 256,641 msat
+(2.574%). This small, unreplicated development difference is not a causal
+estimate or confirmed improvement. The native competitor's substantial
+between-run variation is not a Revenue gain and must not be credited to the
+patch. All four runs used the same Revenue settings digest and the predeclared
+exact control/candidate images. No candidate retuning occurred between runs.
+Both paired scorecards report `insufficient_evidence`: cell retention,
+required crossed-replica coverage and positive nested bootstrap fail. Neither
+pair supplies sealed-holdout, other native competitor or full-product evidence.
+
+Disposition: retain the correctness candidate and its negative competitive
+result, but do not promote it to production or declare competitive superiority.
+Changing gross reward arithmetic alone does not close the observed gap. The
+next Revenue-only work must resolve price/exposure and late-outcome credit
+assignment and test which applied pricing mechanisms explain the deficit;
+historical warm starts remain required but unimplemented. A historical forward
+is not automatically an independent price experiment or a valid observation
+window for the existing posterior.
+
+The runner, scorer, architecture guard and RPC-surface suite passed 116 tests
+in 1.49 seconds after these documentation/diagnostic changes. The earlier
+4,418-test clean candidate result remains the source qualification, not a claim
+that unrelated dirty work was tested or packaged. Native actions were confined
+to the explicitly scoped regtest runs; all post-run diagnostics were read-only.
+No production action RPC, deployment, configuration change, Sling dependency or
+external coordinator was introduced. Candidate schema/dependencies remain
+unchanged. All four completed disposable labs were removed after retaining
+their evidence; reusable images and result artifacts remain.
+
+## Competitor mechanism research during the frozen comparison
+
+No candidate or competitor was changed as a result of this inspection.
+Pinned CLBOSS `8cb4e9215eba58b049375f234f5f073d0c7fc622` sources show:
+
+- [`FeeModderByPriceTheory`](https://github.com/ksedgwic/clboss/blob/8cb4e9215eba58b049375f234f5f073d0c7fc622/Boss/Mod/FeeModderByPriceTheory.cpp)
+  shuffles five nearby price levels, initially centered at zero. The first
+  level can multiply the baseline by 0.64, 0.8, 1, 1.2 or 1.44. Each card starts
+  with 288 connected ten-minute observations (roughly two connected days).
+  Actual forward fees accumulate on the in-play card; after exhausting a deck,
+  its highest-earning discarded card determines the next center, unless all
+  earnings are zero. This credits receipt-time card membership, not a proven
+  payer-exposure identity.
+- [`ChannelFeeManager`](https://github.com/ksedgwic/clboss/blob/8cb4e9215eba58b049375f234f5f073d0c7fc622/Boss/Mod/ChannelFeeManager.cpp)
+  multiplies its peer-median base/proportional quotes by the supplied modifiers.
+  [`FeeModderBySize`](https://github.com/ksedgwic/clboss/blob/8cb4e9215eba58b049375f234f5f073d0c7fc622/Boss/Mod/FeeModderBySize.cpp)
+  compares this node's total gossip capacity with the peer's other neighbors;
+  a high-ranked node can receive a substantial markup rather than an undercut.
+- [`ChannelFeeSetter`](https://github.com/ksedgwic/clboss/blob/8cb4e9215eba58b049375f234f5f073d0c7fc622/Boss/Mod/ChannelFeeSetter.cpp)
+  submits base and proportional fees without an explicit enforcement-delay
+  override. Do not explain its success by an assumed zero-delay override.
+
+Implication, not an economic proof: these short cold-start runs primarily test
+initial policy composition and native routing interactions, not completion of
+CLBOSS's multi-day price search. Its randomized initial card is also a source
+of between-replica variability. Preserve that native variability and the
+replication gates; never pin its random choices to manufacture comparability.
+Subsequent Revenue-only research should separate graph/inventory priors from
+learning speed and correct credit assignment, rather than copying a long
+card lifetime or claiming the static modifiers caused every observed gain.
+
+### LNDg historical-signal comparison
+
+Read-only inspection of pinned [LNDg `af.py`](https://github.com/cryptosharks131/lndg/blob/0fe400029240fc59431b56b6ce47e24b764396b1/af.py)
+confirms seven-day forward flow and actual earned/assisted fees, one-day
+incoming flow, recent liquidity failures, and peer-level aggregation across
+open channels. It excludes forwards below 1,000 sats. Fee adjustments respond
+to inventory zones, capacity-normalized net flow, inactivity and assisted
+revenue; eligibility uses a default 24-hour cooldown. These are historical
+feedback heuristics, not an estimated causal price-response curve or a
+nine-month learned prior. No native LNDg result is established by inspecting
+its source, and its existing model arm is not the full product.
+
+Revenue-only improvement hypothesis: retain the useful distinction between
+outbound earnings and incoming contribution, while testing uncertainty-aware,
+age-weighted pooling and coupled inventory value instead of fixed thresholds.
+Never count assisted revenue again as additional collected income. Preserve
+channel identity even when pooling peers; historical context loss and source
+overlap still need explicit handling. Do not copy its window length, filter,
+cooldown or inbound-fee mechanism without evidence and CLN capability checks.
+This comparison changes neither frozen native run nor competitor behavior.
