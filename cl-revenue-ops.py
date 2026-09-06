@@ -1447,6 +1447,12 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='revenue-ops-rebalance-value-model',
+    default='legacy_sum',
+    description='Startup-only rebalance valuation: legacy_sum (default) or experimental joint_lower_bound. The latter is not production-qualified.',
+)
+
+plugin.add_option(
     name='revenue-ops-pair-fee-cap-ppm',
     default='1000',
     description='Per-pair fee budget = max(dest capex, ceil(amount * ppm / 1M)). Decouples per-rebalance fee from capex bootstrap (Iter1, default: 1000 = 0.1% of amount; 0 disables)',
@@ -1965,6 +1971,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rebalance_hold_margin=_safe_float_opt(
             'revenue-ops-rebalance-hold-margin', '0.0'
         ),
+        rebalance_value_model=options.get('revenue-ops-rebalance-value-model', 'legacy_sum'),
         pair_fee_cap_ppm=_safe_int_opt(
             'revenue-ops-pair-fee-cap-ppm', '1000'
         ),

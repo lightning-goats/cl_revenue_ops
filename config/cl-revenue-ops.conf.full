@@ -135,6 +135,10 @@
 # Minimum final_score in SATS of expected net value a priced pair must clear,
 # or it is rejected as below_hold_margin.
 #revenue-ops-rebalance-hold-margin=0.0
+# Startup-only, default-off research candidate; not production-qualified.
+# Unknown overlap uses a conservative joint-credit lower bound, which can
+# suppress genuinely disjoint benefits. Keep legacy_sum until qualification.
+#revenue-ops-rebalance-value-model=legacy_sum
 
 # Per-pair fee budget = max(dest capex, ceil(amount * ppm / 1M)). Decouples
 # per-rebalance fee from capex bootstrap (0 disables).

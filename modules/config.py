@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 IMMUTABLE_CONFIG_KEYS: FrozenSet[str] = frozenset({
     'db_path',
     'dry_run',  # Safety: don't allow enabling dry_run to hide actions
+    'rebalance_value_model',  # Experimental gate selection is startup-only.
 })
 
 PUBLIC_RUNTIME_KEYS = (
@@ -365,6 +366,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 STRING_ENUM_VALID_VALUES: Dict[str, tuple] = {
     'fee_profile': ('active', 'conservative'),
     'rebalance_router': ('v3',),
+    'rebalance_value_model': ('legacy_sum', 'joint_lower_bound'),
     'market_fee_mode': (
         'undercut', 'match', 'premium', 'competition_aware', 'yield_aware'
     ),
@@ -550,6 +552,9 @@ class Config:
     # score" behavior; a small positive value requires pairs to clear a
     # meaningful EV bar before executing.
     rebalance_hold_margin: float = 0.0
+    # Default-off research candidate. Unknown overlap uses the conservative
+    # joint-credit lower bound; no learned disjointness is assumed.
+    rebalance_value_model: str = 'legacy_sum'
     # Iter1 pair fee budget: layered on top of the destination's capex
     # bootstrap budget so a small/new channel can still pay enough route
     # fee for the selected route. pair_budget_sats =
@@ -709,6 +714,10 @@ class Config:
                 "rebalance_router only supports 'v3'; legacy 'v2' routing was removed"
             )
         self.rebalance_router = router
+        model = self.rebalance_value_model
+        if not isinstance(model, str) or model.lower() not in STRING_ENUM_VALID_VALUES['rebalance_value_model']:
+            raise ValueError("rebalance_value_model must be legacy_sum or joint_lower_bound")
+        self.rebalance_value_model = model.lower()
     
     def snapshot(self) -> 'ConfigSnapshot':
         """
@@ -1181,6 +1190,7 @@ class ConfigSnapshot:
     # V3 rebalance router (askrene getroutes)
     rebalance_router: str = 'v3'
     askrene_layers: str = 'standalone'
+    rebalance_value_model: str = 'legacy_sum'
 
     # Weekly budget cap (hard ceiling over daily burst)
     weekly_budget_sats: int = 35000

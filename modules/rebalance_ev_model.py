@@ -17,6 +17,7 @@ import math
 from typing import Any, Mapping
 
 MODEL_VERSION = "v2-sats-ev"
+JOINT_MODEL_VERSION = "v3-joint-lower-bound"
 BINARY64_TAG_KEY = "__f64__"
 
 _FAILURE_COST_RATE = 0.25
@@ -59,7 +60,7 @@ def _require_inputs(decomposition: Mapping[str, Any]) -> Mapping[str, Any]:
     for field in _REQUIRED_TOP_LEVEL:
         if field not in decomposition:
             raise ValueError(f"score_decomposition.{field} is required")
-    if decomposition["model_version"] != MODEL_VERSION:
+    if decomposition["model_version"] not in (MODEL_VERSION, JOINT_MODEL_VERSION):
         raise ValueError(
             f"unsupported score model {decomposition['model_version']!r}"
         )
@@ -145,6 +146,15 @@ def recompute_gate(decomposition: Mapping[str, Any], *, amount_sats: int) -> dic
     expected_future_value_sats = (
         destination_refill_value_sats + source_drain_value_sats
     )
+    if decomposition["model_version"] == JOINT_MODEL_VERSION:
+        # Independent arithmetic, not a call to the live candidate helper.
+        # Never reinterpret a v2 record as a joint-value decision.
+        if any(not math.isfinite(value) or value < 0 for value in (
+            destination_refill_value_sats, source_drain_value_sats,
+            destination_refill_value_sats + source_drain_value_sats,
+        )):
+            raise ValueError("joint credits must be nonnegative")
+        expected_future_value_sats = max(destination_refill_value_sats, source_drain_value_sats)
     source_opportunity_sats = (
         amount * source_opportunity_fee_ppm / 1_000_000.0
         * source_u * source_discount
@@ -167,7 +177,7 @@ def recompute_gate(decomposition: Mapping[str, Any], *, amount_sats: int) -> dic
     )
 
     return {
-        "model_version": MODEL_VERSION,
+        "model_version": decomposition["model_version"],
         "destination_refill_value_sats": round(
             destination_refill_value_sats, 6
         ),

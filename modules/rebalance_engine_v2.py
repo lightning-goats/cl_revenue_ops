@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .rebalance_audit_v2 import RebalanceAudit
 from .rebalance_execution import ExecutionResult
 from .rebalance_flow_facts import ChannelFlowFacts, compute_channel_flow_facts
+from .rebalance_joint_value import MODEL_VERSION as JOINT_VALUE_MODEL, joint_credit_bounds
 from .rebalance_native_executor_v2 import NativeRouteExecutor
 from .rebalance_planner_v2 import RebalancePlanner
 from .rebalance_route_policy import (
@@ -565,6 +566,7 @@ class RebalanceEngine:
         """
         cfg = self.config if not hasattr(self.config, "snapshot") else self.config.snapshot()
         high_threshold = float(getattr(cfg, "high_liquidity_threshold", 0.65) or 0.65)
+        joint_model = getattr(cfg, "rebalance_value_model", "legacy_sum") == "joint_lower_bound"
         low_threshold = float(getattr(cfg, "low_liquidity_threshold", 0.35) or 0.35)
         historical_fee_cap_ppm = _nonnegative_float(getattr(cfg, "max_fee_ppm", 0) or 0)
 
@@ -678,6 +680,17 @@ class RebalanceEngine:
         expected_future_value_sats = (
             destination_refill_value_sats + source_drain_value_sats
         )
+        # Keep the incumbent activity-penalty cap unchanged to isolate this
+        # candidate's joint-credit aggregation from other control components.
+        unadjusted_future_value_sats = expected_future_value_sats
+        joint_bounds = None
+        if joint_model:
+            joint_bounds = joint_credit_bounds(destination_refill_value_sats, source_drain_value_sats)
+            if joint_bounds is None:
+                rejection_reason = rejection_reason or "invalid_joint_value"
+                expected_future_value_sats = 0.0
+            else:
+                expected_future_value_sats = joint_bounds["lower_sats"]
         source_opportunity_sats = (
             amount_sats
             * source_opportunity_fee_ppm
@@ -701,7 +714,7 @@ class RebalanceEngine:
         helpful_flow_sats = int(getattr(pair, "source_activity_out_sats", 0) or 0) + \
                             int(getattr(pair, "dest_activity_in_sats", 0) or 0)
         raw_activity_penalty = activity_coeff * helpful_flow_sats * dest_value_fee_ppm / 1_000_000.0
-        activity_penalty_cap = activity_cap_frac * max(0.0, expected_future_value_sats)
+        activity_penalty_cap = activity_cap_frac * max(0.0, unadjusted_future_value_sats)
         activity_penalty_sats = round(min(raw_activity_penalty, activity_penalty_cap), 6)
 
         final_score_sats = round(
@@ -731,7 +744,8 @@ class RebalanceEngine:
         )
 
         return {
-            "model_version": "v2-sats-ev",
+            "model_version": JOINT_VALUE_MODEL if joint_model else "v2-sats-ev",
+            **({"joint_credit": joint_bounds} if joint_model else {}),
             "score_units": "planner_score_minus_budget_share",
             "gate_units": "sats",
             "stage": route_status,
@@ -1806,8 +1820,12 @@ class RebalanceEngine:
                             )
                             if (
                                 final_score_present
-                                and int(route_result.route_cost_sats or 0) > 0
-                                and final_score < hold_margin
+                                and (
+                                    (int(route_result.route_cost_sats or 0) > 0
+                                     and final_score < hold_margin)
+                                    or (decomp.get("model_version") == JOINT_VALUE_MODEL
+                                        and decomp.get("rejection_reason") == "invalid_joint_value")
+                                )
                             ):
                                 self._update_pair_score_decomposition(
                                     pair,

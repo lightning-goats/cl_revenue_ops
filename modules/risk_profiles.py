@@ -94,6 +94,7 @@ FIELD_CLASSIFICATION: Dict[str, str] = {
     # --- deprecated / transition ---------------------------------------
     "rebalance_min_profit": "deprecated_transition",
     # --- advanced expert overrides --------------------------------------
+    "rebalance_value_model": "advanced_expert",  # Startup-only, never profile-bundled.
     "hot_channel_protection_enabled": "advanced_expert",
     "hot_channel_protection_override_peers": "advanced_expert",
     "hot_channel_protection_min_velocity": "advanced_expert",

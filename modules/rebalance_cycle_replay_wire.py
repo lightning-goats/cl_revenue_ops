@@ -601,7 +601,7 @@ def _validate_ev_decomposition(value: Any, label: str) -> None:
         decomposition["model_version"]
     ):
         raise ValueError(f"{label}.model_version must be a non-empty string")
-    if decomposition["model_version"] != "v2-sats-ev":
+    if decomposition["model_version"] not in ("v2-sats-ev", "v3-joint-lower-bound"):
         raise ValueError(
             f"{label}.model_version {decomposition['model_version']!r} "
             "is not a supported gate model"
