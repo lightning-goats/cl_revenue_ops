@@ -79,6 +79,11 @@ Before this can become an accepted production cutover:
 
 - Implement the live source/coverage driver and compare its source view with
   the reviewed production residuals without exporting raw history.
+  The [retained-view concordance checker](../validation/2026-09-06-native-source-concordance.md)
+  now compares both native cursor views and raw/daily coverage read-only; it
+  found timestamp precision loss despite identical retained monetary records.
+  It does not issue source admission. Exact forward decoding and a reviewed
+  precision repair are additional prerequisites for native receipt migration.
 - Qualify all historical learned-state consumers, epoch/cursor lineage,
   bootstrap and tail catch-up; new learning must not consume old evidence twice.
 - Rehearse migration and source/database rollback with late and post-upgrade

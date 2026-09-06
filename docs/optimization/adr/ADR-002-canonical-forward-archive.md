@@ -10,6 +10,14 @@ The [proposed ADR-003](ADR-003-native-forward-accounting-cutover.md) describes
 an offline replacement contract; its production gates remain unmet and this
 ADR's runtime archive/decision boundary is not silently superseded.
 
+The [2026-09-06 live-source comparison](../validation/2026-09-06-native-source-concordance.md)
+also found that the production RPC decoder rounds timestamps through binary
+float before archive normalization. Monetary fields and retained identities
+matched, but the lossless timestamp requirement below is not satisfied. Keep
+that requirement: an exact decoder and reviewed historical repair still need
+qualification; do not replace it with a tolerance or silently overwrite
+same-version payload conflicts.
+
 ## Context
 
 The final production evaluation initially concluded that exact full-window
