@@ -882,8 +882,15 @@ class ForwardArchiveStore:
         self,
         date_epochs: Sequence[int],
         checked_at_ns: int,
+        *,
+        _caller_transaction: bool = False,
     ) -> None:
-        """Replace daily/channel aggregates from canonical archive rows."""
+        """Replace aggregates; offline repair may own the enclosing transaction.
+
+        With _caller_transaction=True the caller MUST roll back any failure;
+        this method never commits partial repaired evidence on its behalf.
+        Normal synchronization retains its existing per-day transactions.
+        """
         checked_at = _nonnegative_int(
             checked_at_ns, "checked_at_ns", optional=False
         )
@@ -907,10 +914,13 @@ class ForwardArchiveStore:
                 "rebuild day cannot be after current UTC day"
             )
         connection = self._connection_provider()
+        if type(_caller_transaction) is not bool or (_caller_transaction and not connection.in_transaction):
+            raise ForwardArchiveError("caller-owned rebuild requires an active transaction")
         for day in days:
             start_ns = day * 1_000_000_000
             end_ns = (day + 86400) * 1_000_000_000
-            connection.execute("BEGIN IMMEDIATE")
+            if not _caller_transaction:
+                connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute(
                     """
@@ -994,9 +1004,11 @@ class ForwardArchiveStore:
                         end_ns,
                     ),
                 )
-                connection.execute("COMMIT")
+                if not _caller_transaction:
+                    connection.execute("COMMIT")
             except Exception:
-                connection.execute("ROLLBACK")
+                if not _caller_transaction:
+                    connection.execute("ROLLBACK")
                 raise
         self.refresh_coverage(days, checked_at)
 

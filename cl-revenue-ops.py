@@ -58,6 +58,7 @@ from modules.econ_shadow import EconShadow, fail_open_fee_evidence_guard
 from modules.forward_archive import ForwardArchiveError, parse_cln_time_ns
 from modules.forward_archive_sync import ForwardArchiveSynchronizer
 from modules.forward_identity import ForwardSource, observe_settled_identity
+from modules.forward_precision import ForwardPrecisionPluginMixin, configure_forward_precision
 
 
 # =============================================================================
@@ -739,8 +740,17 @@ def _hydration_fetch_settled_forwards(start_time: int) -> List[Dict[str, Any]]:
     return [f for f in forwards if _hydration_received_after(f, start_time)]
 
 
-# Initialize the plugin
-plugin = Plugin()
+# Initialize the plugin. Default dispatch remains pyln's original behavior.
+class RevenuePlugin(ForwardPrecisionPluginMixin, Plugin):
+    pass
+
+
+plugin = RevenuePlugin()
+
+plugin.add_option(
+    name='revenue-ops-exact-forward-times', default=False, opt_type='bool',
+    description='Startup-only exact forward JSON timestamps; disabled until precision repair and compatibility qualification.',
+)
 
 # =============================================================================
 # GRACEFUL SHUTDOWN SUPPORT (Plugin Lifecycle Management)
@@ -1806,6 +1816,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global flow_analyzer, fee_controller, rebalancer, database, config, profitability_analyzer, safe_plugin, policy_manager, capex_engine, data_service, econ_shadow, forward_archive_sync
 
     plugin.log("Initializing cl-revenue-ops plugin...")
+    configure_forward_precision(plugin, options.get('revenue-ops-exact-forward-times', False))
 
     # M-10: Register SIGTERM handler early, before component initialization.
     # The handler checks `if rebalancer` and `if database` with None guards, so it's safe.

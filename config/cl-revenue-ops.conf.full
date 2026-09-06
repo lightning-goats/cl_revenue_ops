@@ -139,6 +139,9 @@
 # Unknown overlap uses a conservative joint-credit lower bound, which can
 # suppress genuinely disjoint benefits. Keep legacy_sum until qualification.
 #revenue-ops-rebalance-value-model=legacy_sum
+# Startup-only forward-evidence decoder candidate. Does not repair old rows
+# or enable historical learning. Keep disabled until repair/rollout qualifies.
+#revenue-ops-exact-forward-times=false
 
 # Per-pair fee budget = max(dest capex, ceil(amount * ppm / 1M)). Decouples
 # per-rebalance fee from capex bootstrap (0 disables).

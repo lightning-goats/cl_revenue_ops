@@ -39,6 +39,12 @@ The full generated field table below is the baseline enumeration
 (regenerate with `dataclasses.fields(Config)` if it drifts; the
 dataclass is normative).
 
+`revenue-ops-exact-forward-times` is a separate startup-only CLN boolean
+option, default false. It selects forward-evidence JSON decoding, is not an
+economic Config field or runtime override, and does not enable historical
+learning or repair existing records. Keep it disabled until precision
+repair/compatibility and rollout qualification are complete.
+
 ## Datastore telemetry contracts (current, tested)
 
 - `["revenue","profitability-summary"]`, `["revenue","capex-summary"]`
