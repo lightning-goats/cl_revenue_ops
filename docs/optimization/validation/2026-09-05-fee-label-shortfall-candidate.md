@@ -145,8 +145,53 @@ two distinct native HTLCs collapse into one coarse-time database key, omitting
 unchanged. Its passing safety check does not exonerate this independently
 demonstrated accounting-input defect. Native records, fee history, forwards
 and corrected learner-state export are retained; the completed lab was removed.
-No code or frozen image was changed during the run. R241–r243 remain pending.
+No code or frozen image was changed during the run. R241 subsequently completed
+as recorded below; r242–r243 remain pending.
 The runner/scorer/architecture/RPC suite passed 116 tests in 2.53 seconds.
+
+## Opposite-assignment native control result, 2026-09-06
+
+R241 used the same frozen settled-reward image with Revenue A, unchanged
+native CLBOSS, topology, workload, cadence, fee rails and scoring. All 240
+scheduled payments settled with zero terminal payment failures. Revenue earned
+5,432,075 msat on 25,196,358,160 forwarded msat (222 native settlements);
+CLBOSS earned 30,768,512 msat on 4,112,000,000 forwarded msat (18 settlements).
+Rebalance costs are zero. The retained Revenue native history also includes
+four failed and one locally failed attempts, not failed terminal payments.
+
+The r240/r241 control pair earned Revenue 10,654,350 msat versus CLBOSS
+69,260,909 msat. Delivery, attribution, frozen protocol and scorer safety pass;
+retention, required replication and positive nested bootstrap fail. The
+`baseline_retail|cln|large` cell again retains 0.75 of comparator volume rather
+than the required 0.95. The verdict remains `insufficient_evidence`. This pair
+is the control half of the frozen shortfall comparison, not an evaluation of
+the unrun shortfall candidate or a production-promotion result.
+
+R241 operational accounting again has 221 rows rather than 222 native events,
+with 5,411,425 fee msat rather than 5,432,075. The exact 20,650 msat difference
+is one of two separate same-second HTLCs: created indices 86/87, incoming HTLC
+IDs 23/24, incoming `576x1x0`, outgoing `594x1x0`, outgoing 50,000,000 msat,
+received during second 1788699608. Full coarse-projection multiset comparison
+finds exactly this missing row and no extra row. Scoring still uses native
+earnings; the accounting defect was not concealed by changing the scorer.
+
+Retained artifacts under `results/polar-grand-prix/` are
+`runner-state-shortfall-control-r241.json`, `score-shortfall-control-r241.json`,
+`score-shortfall-control-r240-r241.json`,
+`shortfall-control-r241-native-evidence.json`, and
+`shortfall-control-r241-postrun-evidence-v2.json`. The last snapshot contains
+60 fee changes, 221 operational forwards and 16 fee states with 267 persisted
+learner observations. As with r240, post-run ordinary loops were not stopped
+before collection; this is not an exact traffic-end replay checkpoint.
+After collection, scoped cleanup completed and readback found no r241
+containers, labeled volumes or network. Result artifacts and reusable frozen
+images remain; no unrelated Docker resources were removed.
+
+The existing runner, scorer, Docker lifecycle, architecture, RPC, forward hot
+path, reputation-dedup and hydration suites passed **156 tests** in 1.73 seconds.
+These do not test remediation of the newly documented collision; its third
+bulk-writer reproduction still demonstrates the unfixed failure. No Revenue
+source, frozen image, competitor, production setting or runtime was changed.
 
 ## Research during the frozen comparison: LN Operator
 

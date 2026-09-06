@@ -29,10 +29,16 @@ coverage contract, or a stable CLN identity for every stored forward.
 
 Core Lightning's
 [`listforwards` contract](https://docs.corelightning.org/reference/listforwards)
-provides `created_index` and optional `updated_index` cursors. Its
-[`forward_event` notification](https://docs.corelightning.org/reference/notification-forward_event)
-does not provide those indexes. Therefore notification-only archival cannot
-produce a canonical, restart-safe event identity.
+provides `created_index` and optional `updated_index` cursors. Correction from
+the pinned CLN v26.06.7 implementation: `forward_event` can carry these indices,
+but they are not both present on every notification. An existing forward's
+update supplies `updated_index` and sets the notification's created index to
+zero, which serialization omits. It retains `in_channel` and `in_htlc_id`.
+See pinned [wallet update/notification handling](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/wallet/wallet.c#L5355)
+and [shared serialization](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/lightningd/forwards.c#L89).
+Notifications alone still do not provide historical bootstrap, replay after a
+missed notification, or the archive's complete created/updated cursor coverage.
+This correction does not authorize archive reads in runtime decision paths.
 
 ## Decision
 
@@ -376,8 +382,11 @@ measurement retention to fee/rebalance query performance.
 
 ### Archive notifications directly
 
-`forward_event` lacks `created_index` and `updated_index`, so notification
-rows cannot be canonically reconciled with paginated CLN history across restart.
+Notifications have partial index availability, including no created index on
+the usual existing-row terminal update. A source-scoped incoming-channel/HTLC
+identity can support reconciliation, but notification-only collection cannot
+recover missing history or establish paginated source coverage. The archive
+therefore retains its read-only paginated synchronization design.
 
 ### External collector-only archive
 

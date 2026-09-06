@@ -55,16 +55,46 @@ each writer independently reproduces one row / 18,300 msat instead of two rows
 also guards reputation updates on insertion, so a mistaken duplicate is not
 just a diagnostic-row omission. No live database was changed to repair it.
 
-Pinned [CLN notification serialization](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/lightningd/notification.c)
-already carries the incoming HTLC ID, created/updated indices and native times.
-Those identities can distinguish the pair; increasing timestamp precision alone
-is not a complete exactly-once ingestion or migration design.
+Pinned [CLN notification construction](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/lightningd/notification.c)
+retains the incoming HTLC ID and native times. Index availability is conditional:
+the [wallet's existing-row update](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/wallet/wallet.c#L5355)
+sets the notification's created index to zero, and
+[shared serialization](https://github.com/ElementsProject/lightning/blob/9f7baf66e1e6b421c0c81a3c3f7c307f8e78a911/lightningd/forwards.c#L89)
+omits it. Requiring `created_index` on every settlement notification would
+therefore reject ordinary valid settlements. CLN itself updates by incoming
+channel and incoming HTLC ID. These fields distinguish the pair, subject to
+source continuity; timestamps alone are not an exactly-once identity.
+
+A third independent in-memory reproduction on 2026-09-06 confirms that
+`bulk_insert_forwards` also stores only one row / 18,300 msat for this pair.
+It discards the supplied native IDs and truncates both timestamps internally.
+Changing the notification writer alone would leave restart hydration broken.
+All three writer reproductions are evidence of the existing failure, not
+passing remediation regressions; none calls an RPC.
+
+## Production impact check, 2026-09-06
+
+Two bounded read-only SQLite snapshots checked seven closed UTC days,
+2026-08-30 inclusive through 2026-09-06 exclusive, on production revision
+`294e649783d0aadc1df40fe035d4acd39e1ca35e`. Only aggregates left the node.
+The archive has 783 settlements / 4,698,197 fee msat; operational raw rows
+have 774 settlements / 4,675,790 fee msat. Nine coarse-key groups each contain
+two distinct native incoming HTLC IDs and distinct original received times,
+but one operational row. Their combined omission is exactly nine events /
+22,407 fee msat, explaining the aggregate count and fee difference in this
+specific window (about 0.48% of archived fees).
+
+These fees were collected; this is operational undermeasurement. The queries
+do not measure downstream policy changes, lost opportunities, full historical
+coverage, or reconcile the older full-history residual. They do not repair
+production, change its settings, or promote either candidate.
 
 ## Consequences and next Revenue-only work
 
 Operational revenue, flow, fee rewards and reputation can omit genuine events.
 The native scoreboard was not changed and neither fee candidate is promoted by
-this discovery. Production occurrence and total impact are not quantified here.
+this discovery. Production occurrence is confirmed in the bounded check above;
+lifetime accounting and economic decision impact remain unquantified.
 This example also does not explain or resolve the full previously observed
 canonical-archive/operational discrepancy.
 
@@ -83,6 +113,32 @@ not silently train certainty; old rollups/raw overlap is not summed twice;
 read-only readers remain non-mutating. Qualify the fix as a separate Revenue
 revision, never silently replace a frozen contender image or alter native
 competitors, workload or scorer to conceal this failure.
+
+The source review narrows the implementation contract further:
+
+- Use a source-scoped incoming-channel/HTLC identity shared by notification and
+  hydration adapters. Preserve created/updated indices when supplied, but do
+  not substitute `updated_index` for event identity or require a created index
+  on an existing-row settlement notification. Treat HTLC ID zero as valid.
+- Reject conflicting payloads for one identity as inconsistent evidence;
+  a second arrival is not permission to overwrite an earned amount or issue
+  another reputation/reward update. Preserve original timestamp precision as
+  evidence, not as a manufactured identity.
+- Migrate all three writers and the startup deduplication transaction together.
+  The old unconditional coarse-key migration must never run over native-identity
+  rows, and existing local ingestion IDs must not be renumbered.
+- Keep identity-less legacy accounting distinct from canonical replacements.
+  Reconciliation must prove the selected interval's coverage and replace its
+  accounting contribution atomically, not append a second historical total or
+  arbitrarily attach an old row to the first native match. Pruned raw/rollup
+  overlap and reputation provenance need their own explicit treatment.
+- Source continuity and restore must be checked before accepting cursor/model
+  state. Node identity alone does not establish database-generation continuity;
+  no automatic generation reset may silently replay old earnings as new ones.
+
+These are implementation requirements, not an implemented migration or a
+decision to activate archive-backed runtime learning. That activation still
+requires an explicit successor to ADR-002 and its own verification.
 
 No implementation fix or production deployment occurs in this finding note.
 No Sling, Archon DID or external coordinator is introduced. Completed r240
