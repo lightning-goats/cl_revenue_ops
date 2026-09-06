@@ -104,3 +104,26 @@ These unit results do not establish native conformance or economic benefit.
   sealed-holdout, incumbent-production or full-product qualification. Historical
   learning and native Torq, LN Operator and LNDg remain in the full program.
   A failure rejects promotion, not permission to alter the competition or lab.
+
+## Frozen package
+
+- Candidate source: `0a807e896cc10846546d887538896429c30bdb96`.
+- Runtime source archive SHA-256 (`cl-revenue-ops.py modules`):
+  `22e57119ca71e48ff5f2a94b5ce061840cce6cef0bea728a366590e58c513eb7`.
+- Image tag: `cl-revenue-ops-grand-prix:fee-shortfall-0a807e8`.
+- Immutable image identity:
+  `sha256:a7fd65b72751cb278499659499d3fe414d7275ff62e6f9fba50400afca719219`.
+- Base readback:
+  `sha256:dd7e5fa57f07df6ae8c488ad570216c5e9a7fec1a10fad5b06eb2e02ed41deba`;
+  the build log and inherited CLN/CLBOSS/xrebalance labels match the unchanged
+  pinned base. Only the Revenue source is replaced.
+
+All packaged Revenue module files and the entry point matched the isolated
+tested source byte-for-byte (excluding Python caches). Imports passed using
+the existing plugin virtualenv in a disposable network-disabled container.
+An initial smoke invocation used system Python, which lacks `pyln`; the
+correct wrapper interpreter passed without installing or changing dependencies.
+BuildKit initially rejected a raw local image ID in `FROM`; rebuilding with the
+readback-verified local tag used the exact intended base. Neither failed
+packaging check started a node or tournament payment. No native result exists
+yet for this candidate, and its production promotion remains unqualified.
