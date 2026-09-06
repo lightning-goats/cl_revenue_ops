@@ -86,6 +86,10 @@ Before this can become an accepted production cutover:
   precision repair are additional prerequisites for native receipt migration.
 - Qualify all historical learned-state consumers, epoch/cursor lineage,
   bootstrap and tail catch-up; new learning must not consume old evidence twice.
+  The [native receipt-to-model handoff](../validation/2026-09-06-native-learning-handoff.md)
+  now stages bounded atomic replay and resume against receipt-verified archive
+  payloads, including after operational pruning. It does not admit a source,
+  activate a runtime model or replace the remaining consumers' qualification.
 - Rehearse migration and source/database rollback with late and post-upgrade
   settlements. An old binary on the new database is unsupported. Restoring an
   old backup alone would omit subsequent settlements and is not a complete
