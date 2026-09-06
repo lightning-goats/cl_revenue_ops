@@ -109,3 +109,19 @@ The candidate imported successfully in a disposable network-disabled container;
 all seven changed/new Revenue runtime files matched the tested checkout by
 SHA-256. Build context filtering excludes caches and all non-runtime files.
 Both images preserve the pinned native competitor and CLN labels/base.
+
+## Native results retained so far
+
+Control r236 (Revenue B) completed all 240 scheduled payments with no payment
+failures. Revenue earned 5,134,102 msat on 25,196,206,160 forwarded msat;
+native CLBOSS earned 55,427,568 msat on 4,112,000,000 forwarded msat. Both
+recorded zero rebalance cost in this frozen fee-only league. These amounts
+are actual scorer totals, not modeled revenue at current quotes.
+
+Safety, delivery and per-payment attribution passed. Cell-volume retention
+failed; crossed coverage and bootstrap requirements are not satisfied by this
+single development replica. The unchanged scorer reports insufficient evidence.
+This is a losing incumbent-control observation, not a candidate result, and
+does not establish that changing the reward fixes the competitive deficit.
+The recorded state and score are retained under the `reward-control-r236`
+prefix in `results/polar-grand-prix/`.
