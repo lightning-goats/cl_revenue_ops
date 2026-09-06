@@ -445,3 +445,10 @@ The full objective still requires native evidence against all four requested
 products and the incumbent, realistic net-profit improvement with useful-volume
 retention, and the relevant rebalance/full-product behavior. Fee-only and
 algorithm-equivalent results cannot satisfy that broader completion audit.
+
+The [settled-reward transition audit](../validation/2026-09-06-settled-reward-transition-audit.md)
+now quantifies the production saved-state boundary. Its read-only snapshot does
+not qualify a deployment: four current-window forwards cannot establish safety
+when 8,845 persisted observations and existing contextual/reference state remain.
+Prioritize matched, isolated incumbent/candidate transition checks without
+resetting that history or changing the native tournament protocol.
