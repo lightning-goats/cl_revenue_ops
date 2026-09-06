@@ -4,6 +4,12 @@
 **Date:** 2026-08-13
 **Scope:** Phase 0.6 measurement integrity only
 
+Later qualification: native collision and prune/replay evidence shows that
+raw-to-rollup preservation does not itself prove unique native-event accounting.
+The [proposed ADR-003](ADR-003-native-forward-accounting-cutover.md) describes
+an offline replacement contract; its production gates remain unmet and this
+ADR's runtime archive/decision boundary is not silently superseded.
+
 ## Context
 
 The final production evaluation initially concluded that exact full-window

@@ -5495,7 +5495,6 @@ class Database:
         conn = self._get_connection()
         conn.execute("BEGIN IMMEDIATE")
         try:
-            ledger = ForwardReceiptLedger(conn)
             if self._native_forward_mode(conn):
                 if self._verify_native_forward_schema(conn) != source.key():
                     raise ForwardIdentityError("source continuity requires explicit reconciliation")
@@ -5511,45 +5510,50 @@ class Database:
                 "('forwards', 'forward_receipts_v1') AND seq > 0 LIMIT 1"
             ).fetchone():
                 raise ForwardIdentityError("prior ingestion requires reconciliation")
-            ledger.initialize(source)
-            conn.execute("ALTER TABLE forward_receipts_v1 ADD COLUMN "
-                         "accounting_pruned INTEGER NOT NULL DEFAULT 0")
-            conn.execute("ALTER TABLE forwards ADD COLUMN forward_receipt_id INTEGER")
-            conn.execute("ALTER TABLE forwards ADD COLUMN received_time_ns INTEGER")
-            conn.execute("ALTER TABLE forwards ADD COLUMN resolved_time_ns INTEGER")
-            conn.execute("DROP INDEX IF EXISTS idx_forwards_unique")
-            conn.execute("CREATE UNIQUE INDEX idx_forwards_receipt "
-                         "ON forwards(forward_receipt_id)")
-            # An old caller cannot silently write identity-less rows after the
-            # cutover. These guards also stop the known old initializer's
-            # destructive dedupe and uncoordinated old prune from deleting data.
-            # They do NOT make running an old binary on this schema supported.
-            conn.execute("""
-                CREATE TRIGGER forwards_native_insert BEFORE INSERT ON forwards
-                WHEN NEW.forward_receipt_id IS NULL
-                  OR NEW.received_time_ns IS NULL OR NEW.resolved_time_ns IS NULL
-                  OR NOT EXISTS (SELECT 1 FROM forward_receipts_v1
-                     WHERE id = NEW.forward_receipt_id AND accounting_pruned = 0)
-                BEGIN SELECT RAISE(ABORT, 'native forward receipt required'); END
-            """)
-            conn.execute("""
-                CREATE TRIGGER forwards_native_update BEFORE UPDATE ON forwards
-                BEGIN SELECT RAISE(ABORT, 'native forwards are immutable'); END
-            """)
-            conn.execute("""
-                CREATE TRIGGER forwards_native_delete BEFORE DELETE ON forwards
-                WHEN NOT EXISTS (SELECT 1 FROM forward_receipts_v1
-                     WHERE id = OLD.forward_receipt_id AND accounting_pruned = 1)
-                BEGIN SELECT RAISE(ABORT, 'native forward requires atomic rollup'); END
-            """)
-            conn.execute("CREATE TABLE forward_ingestion_v1 "
-                         "(version INTEGER PRIMARY KEY CHECK(version=1))")
-            conn.execute("INSERT INTO forward_ingestion_v1 VALUES (1)")
+            self._install_native_forward_schema(conn, source)
             conn.execute("COMMIT")
             self._native_forward_source = source
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    @staticmethod
+    def _install_native_forward_schema(conn, source: ForwardSource) -> None:
+        """Install after caller-verified empty/reconciled accounting, in its transaction."""
+        ForwardReceiptLedger(conn).initialize(source)
+        conn.execute("ALTER TABLE forward_receipts_v1 ADD COLUMN "
+                     "accounting_pruned INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE forwards ADD COLUMN forward_receipt_id INTEGER")
+        conn.execute("ALTER TABLE forwards ADD COLUMN received_time_ns INTEGER")
+        conn.execute("ALTER TABLE forwards ADD COLUMN resolved_time_ns INTEGER")
+        conn.execute("DROP INDEX IF EXISTS idx_forwards_unique")
+        conn.execute("CREATE UNIQUE INDEX idx_forwards_receipt "
+                     "ON forwards(forward_receipt_id)")
+        # An old caller cannot silently write identity-less rows after the
+        # cutover. These guards also stop the known old initializer's
+        # destructive dedupe and uncoordinated old prune from deleting data.
+        # They do NOT make running an old binary on this schema supported.
+        conn.execute("""
+            CREATE TRIGGER forwards_native_insert BEFORE INSERT ON forwards
+            WHEN NEW.forward_receipt_id IS NULL
+              OR NEW.received_time_ns IS NULL OR NEW.resolved_time_ns IS NULL
+              OR NOT EXISTS (SELECT 1 FROM forward_receipts_v1
+                 WHERE id = NEW.forward_receipt_id AND accounting_pruned = 0)
+            BEGIN SELECT RAISE(ABORT, 'native forward receipt required'); END
+        """)
+        conn.execute("""
+            CREATE TRIGGER forwards_native_update BEFORE UPDATE ON forwards
+            BEGIN SELECT RAISE(ABORT, 'native forwards are immutable'); END
+        """)
+        conn.execute("""
+            CREATE TRIGGER forwards_native_delete BEFORE DELETE ON forwards
+            WHEN NOT EXISTS (SELECT 1 FROM forward_receipts_v1
+                 WHERE id = OLD.forward_receipt_id AND accounting_pruned = 1)
+            BEGIN SELECT RAISE(ABORT, 'native forward requires atomic rollup'); END
+        """)
+        conn.execute("CREATE TABLE forward_ingestion_v1 "
+                     "(version INTEGER PRIMARY KEY CHECK(version=1))")
+        conn.execute("INSERT INTO forward_ingestion_v1 VALUES (1)")
 
     def get_native_forward_source(self) -> Optional[ForwardSource]:
         """Read process-local admission; persisted scope is not continuity proof.
@@ -5558,9 +5562,16 @@ class Database:
         None, which adapters reserve for ordinary legacy ingestion. No RPC,
         schema creation, migration or automatic source binding occurs here.
         """
+        conn = self._get_connection()
+        native = self._native_forward_source is not None or self._native_forward_mode(conn)
+        if native and conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='forward_accounting_cutover_v1'"
+        ).fetchone():
+            raise ForwardIdentityError("historical cutover requires model/source admission")
         if self._native_forward_source is not None:
             return self._native_forward_source
-        if self._native_forward_mode(self._get_connection()):
+        if native:
             raise ForwardIdentityError("native source continuity must be verified before ingestion")
         return None
 
@@ -6156,10 +6167,14 @@ class Database:
                 WHERE f.id > ? AND f.id <= b.through_id
                 ORDER BY f.id LIMIT ?
             )
-            SELECT b.current_id, b.through_id, p.*
+            SELECT b.current_id, b.through_id, p.*,
+                   EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
+                          AND name='forward_accounting_cutover_v1') AS cutover_pending
             FROM bounds AS b LEFT JOIN page AS p ON 1 = 1
             ORDER BY p.id
         """, (through_id, after_id, limit + 1)).fetchall()
+        if rows[0]["cutover_pending"]:
+            raise ValueError("historical cutover requires source-aware learning admission")
         watermark = int(rows[0]["current_id"])
         frozen_id = int(rows[0]["through_id"])
         if after_id > watermark or frozen_id > watermark:

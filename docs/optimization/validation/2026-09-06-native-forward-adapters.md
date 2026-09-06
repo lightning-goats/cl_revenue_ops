@@ -1,5 +1,10 @@
 # Native notification and hydration adapters — continuity gate pending
 
+Subsequent step: the [legacy cutover prototype](2026-09-06-legacy-accounting-cutover.md)
+implements nonempty accounting replacement against caller-verified snapshots,
+with preserved original records and explicit historical-admission blocking.
+Source verification, model admission and production migration remain pending.
+
 ## Implemented step
 
 Following the [database integration](2026-09-06-native-forward-database-integration.md),
