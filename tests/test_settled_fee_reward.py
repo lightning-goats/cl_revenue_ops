@@ -122,3 +122,100 @@ def test_single_readonly_query_and_no_action_rpc(db):
     assert conn.total_changes == before
     assert len(queries) == 1
     assert db.plugin.rpc.mock_calls == []
+
+
+def test_shortfall_rejects_latest_ppm_without_repricing_earnings(db):
+    insert(db)  # 775 ppm, less than the later 856-ppm quote requires.
+    evidence = db.get_forward_revenue_observation("2x1x0", 0, 3600, 856)
+    assert evidence == {"earned_msat": 193_750, "forward_count": 1,
+                        "ppm_shortfall_count": 1}
+    assert reader(db)._get_settled_fee_observation("2x1x0", 0, 3600, 856) == (193.75, False)
+
+
+def test_overpayment_does_not_cancel_another_forward_shortfall(db):
+    insert(db)
+    insert(db, received=101, fee=300_000)
+    evidence = db.get_forward_revenue_observation("2x1x0", 0, 3600, 856)
+    assert evidence["earned_msat"] == 493_750  # Above aggregate 856-ppm proxy.
+    assert evidence["ppm_shortfall_count"] == 1  # Still a contradicted label.
+
+
+@pytest.mark.parametrize("amount,ppm", [(999_999, 1), (1_000_001, 775),
+                                        (10**16, 1200)])
+def test_shortfall_uses_exact_per_forward_floor_without_product_overflow(db, amount, ppm):
+    fee = amount * ppm // 1_000_000
+    insert(db, amount=amount, fee=fee)
+    assert db.get_forward_revenue_observation("2x1x0", 0, 200, ppm)["ppm_shortfall_count"] == 0
+    if fee:
+        insert(db, received=101, amount=amount, fee=fee - 1)
+        assert db.get_forward_revenue_observation("2x1x0", 0, 200, ppm)["ppm_shortfall_count"] == 1
+
+
+def test_unknown_or_unrepresentable_quote_is_not_learning_permission(db):
+    insert(db, amount=2**63 - 1, fee=0)
+    for ppm in (None, 2**32 - 1):
+        evidence = db.get_forward_revenue_observation("2x1x0", 0, 200, ppm)
+        assert evidence["earned_msat"] == 0
+        assert evidence["ppm_shortfall_count"] is None
+
+
+def test_empty_valid_quote_is_not_contradicted_but_not_proof_of_demand(db):
+    assert reader(db)._get_settled_fee_observation("2x1x0", 0, 3600, 856) == (0.0, True)
+    insert(db, fee=300_000)  # Accepted overpayment cannot identify quote exposure.
+    assert reader(db)._get_settled_fee_observation("2x1x0", 0, 3600, 856) == (300.0, True)
+
+
+@pytest.mark.parametrize("shortfalls", [None, True, -1, 2, "0", 0.0])
+def test_malformed_quote_check_preserves_accounting_not_learning(shortfalls):
+    database = MagicMock()
+    database.get_forward_revenue_observation.return_value = {
+        "earned_msat": 193_750, "forward_count": 1, "ppm_shortfall_count": shortfalls,
+    }
+    assert reader(database)._get_settled_fee_observation("2x1x0", 0, 3600, 856) == (193.75, False)
+
+
+@pytest.mark.parametrize("ppm", [True, -1, "856", 1.2, 2**32])
+def test_invalid_quote_never_queries_or_trains(ppm):
+    database = MagicMock()
+    assert reader(database)._get_settled_fee_observation("2x1x0", 0, 3600, ppm) == (None, False)
+    database.get_forward_revenue_observation.assert_not_called()
+
+
+def test_quote_check_is_one_indexed_readonly_snapshot(db):
+    insert(db)
+    conn = db._get_connection()
+    conn.execute("PRAGMA query_only=ON")
+    queries = []
+    before = conn.total_changes
+    conn.set_trace_callback(queries.append)
+    try:
+        assert reader(db)._get_settled_fee_observation("2x1x0", 0, 3600, 856) == (193.75, False)
+    finally:
+        conn.set_trace_callback(None)
+        conn.execute("PRAGMA query_only=OFF")
+    assert conn.total_changes == before
+    assert len(queries) == 1
+    plan = conn.execute("EXPLAIN QUERY PLAN " + queries[0]).fetchall()
+    assert any("idx_forwards_out_channel_time" in str(tuple(row)) for row in plan)
+    assert db.plugin.rpc.mock_calls == []
+
+
+@pytest.mark.parametrize("evidence", [None, {}, {"earned_msat": 1},
+    {"earned_msat": 1, "forward_count": 0, "ppm_shortfall_count": 0},
+    {"earned_msat": True, "forward_count": 1, "ppm_shortfall_count": 0},
+    {"earned_msat": 1, "forward_count": "1", "ppm_shortfall_count": 0}])
+def test_malformed_coherent_observation_is_unknown(evidence):
+    database = MagicMock()
+    database.get_forward_revenue_observation.return_value = evidence
+    controller = reader(database)
+    assert controller._get_settled_fee_observation("2x1x0", 0, 3600, 856) == (None, False)
+    assert controller.plugin.rpc.mock_calls == []
+
+
+def test_coherent_reader_failure_does_not_fall_back_to_separate_accounting_read():
+    database = MagicMock()
+    database.get_forward_revenue_observation.side_effect = RuntimeError("missing")
+    controller = reader(database)
+    assert controller._get_settled_fee_observation("2x1x0", 0, 3600, 856) == (None, False)
+    database.get_forward_revenue_msat.assert_not_called()
+    assert controller.plugin.rpc.mock_calls == []

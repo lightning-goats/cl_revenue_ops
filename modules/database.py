@@ -5951,6 +5951,24 @@ class Database:
         ``until`` bounds received time, not when the row became known: this
         method is not a historical as-of replay interface.
         """
+        return self.get_forward_revenue_observation(channel_id, since, until)["earned_msat"]
+
+    def get_forward_revenue_observation(
+        self, channel_id: str, since: int, until: int, fee_ppm: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Coherent earnings and a one-sided rejection check for a price label.
+
+        A paid fee below floor(out_msat * ppm / 1e6) cannot support that
+        proportional fee, even with a zero base. Matching/overpayment does NOT
+        prove policy exposure; base fees, grace, route choice and late outcomes
+        remain unresolved. No per-forward current-quote revenue is fabricated.
+        Missing ppm leaves the check unknown. Window semantics are identical
+        to get_forward_revenue_msat, not historical availability semantics.
+        """
+        if fee_ppm is not None and (
+            type(fee_ppm) is not int or not 0 <= fee_ppm <= 2**32 - 1
+        ):
+            raise ValueError("fee_ppm must be a uint32 or None")
         if not isinstance(channel_id, str) or not channel_id.strip():
             raise ValueError("channel_id must be a nonempty string")
         for value in (since, until):
@@ -5960,22 +5978,36 @@ class Database:
             raise ValueError("revenue window must have positive duration")
         row = self._get_connection().execute("""
             WITH evidence AS (
-                SELECT fee_msat,
+                SELECT fee_msat, out_msat,
                        (typeof(fee_msat) = 'integer' AND fee_msat >= 0
                         AND typeof(in_msat) = 'integer' AND in_msat >= 0
                         AND typeof(out_msat) = 'integer' AND out_msat >= 0
                         AND in_msat >= out_msat
                         AND in_msat - out_msat = fee_msat) AS valid
                 FROM forwards
-                WHERE out_channel = ? AND timestamp > ? AND timestamp <= ?
+                WHERE out_channel = :channel AND timestamp > :since AND timestamp <= :until
+            ), quoted AS (
+                SELECT *, ((out_msat / 1000000) * :ppm
+                           + ((out_msat % 1000000) * :ppm) / 1000000) AS minimum_fee
+                FROM evidence
             )
             SELECT COALESCE(SUM(CASE WHEN valid THEN fee_msat ELSE 0 END), 0) AS earned,
-                   COUNT(*) - COUNT(CASE WHEN valid THEN 1 END) AS invalid
-            FROM evidence
-        """, (channel_id, since, until)).fetchone()
+                   COUNT(*) - COUNT(CASE WHEN valid THEN 1 END) AS invalid,
+                   COUNT(*) AS forward_count,
+                   COUNT(CASE WHEN valid AND fee_msat < minimum_fee THEN 1 END) AS shortfalls,
+                   COUNT(CASE WHEN typeof(minimum_fee) != 'integer' THEN 1 END) AS quote_unknown
+            FROM quoted
+        """,
+            {"channel": channel_id, "since": since, "until": until, "ppm": fee_ppm}).fetchone()
         if row is None or row["invalid"]:
             raise ValueError("unavailable or malformed settled revenue evidence")
-        return row["earned"]
+        return {
+            "earned_msat": row["earned"],
+            "forward_count": row["forward_count"],
+            "ppm_shortfall_count": (
+                row["shortfalls"] if fee_ppm is not None and not row["quote_unknown"] else None
+            ),
+        }
 
     def get_volume_since(self, channel_id: str, timestamp: int) -> int:
         """

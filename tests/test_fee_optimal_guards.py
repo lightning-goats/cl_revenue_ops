@@ -755,6 +755,11 @@ def mock_plugin():
 def mock_database():
     db = MagicMock()
     db.get_forward_revenue_msat.return_value = 0
+    def settled_observation(channel, since, until, ppm):
+        earned = db.get_forward_revenue_msat(channel, since, until)
+        return {"earned_msat": earned, "forward_count": 10,
+                "ppm_shortfall_count": 0}
+    db.get_forward_revenue_observation.side_effect = settled_observation
     return db
 
 

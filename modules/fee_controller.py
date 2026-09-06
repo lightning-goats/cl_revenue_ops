@@ -7540,6 +7540,51 @@ class FeeController:
             )
             return None
 
+    def _get_settled_fee_observation(
+        self, channel_id: str, since: int, until: int, fee_ppm: int,
+    ) -> Tuple[Optional[float], bool]:
+        """Gross reward plus permission to retain the existing price label.
+
+        Reject a label contradicted by even one settled proportional shortfall.
+        Passing this one-sided check is NOT causal attribution: an older lower
+        quote can be overpaid, base fees can mask a shortfall, and unseen demand
+        and late arrivals remain unknown. Never relabel the reward to a paid
+        effective ppm. Gross accounting remains available on a contradiction.
+        """
+        try:
+            if (type(since) is not int or type(until) is not int
+                    or not 0 <= since < until <= 2**63 - 1
+                    or type(fee_ppm) is not int or not 0 <= fee_ppm <= 2**32 - 1):
+                raise ValueError("invalid fee observation inputs")
+            evidence = record_effective_evidence(
+                "settled_fee_observation", [channel_id, since, until, fee_ppm],
+                lambda: self.database.get_forward_revenue_observation(
+                    channel_id, since, until, fee_ppm,
+                ),
+            )
+            if not isinstance(evidence, dict):
+                raise ValueError("invalid settled fee observation")
+            earned = evidence.get("earned_msat")
+            count = evidence.get("forward_count")
+            shortfalls = evidence.get("ppm_shortfall_count")
+            if (type(earned) is not int or not 0 <= earned <= 2**63 - 1
+                    or type(count) is not int or not 0 <= count <= 2**63 - 1
+                    or (count == 0 and earned != 0)):
+                raise ValueError("invalid settled fee observation totals")
+            label_not_contradicted = type(shortfalls) is int and 0 <= shortfalls <= count and shortfalls == 0
+            if not label_not_contradicted:
+                self.plugin.log(
+                    "FEE_LEARNING: current ppm label contradicted or unknown; skip window update",
+                    level="debug",
+                )
+            return earned * 3.6 / (until - since), label_not_contradicted
+        except Exception as exc:
+            self.plugin.log(
+                f"FEE_REVENUE: observation unavailable ({type(exc).__name__}); hold fee",
+                level="debug",
+            )
+            return None, False
+
     def _is_sparse_data_channel(
         self,
         observation_count: int,
@@ -8300,8 +8345,8 @@ class FeeController:
         # Match the denominator to the actual bounded observation interval,
         # including first-run initialization. A zero/backward interval is
         # unknown, not a manufactured one-hour sample.
-        current_revenue_rate = self._get_settled_revenue_rate(
-            channel_id, observation_cursor, now,
+        current_revenue_rate, fee_label_not_contradicted = self._get_settled_fee_observation(
+            channel_id, observation_cursor, now, raw_chain_fee,
         )
         revenue_observation_available = current_revenue_rate is not None
         if not revenue_observation_available and not (
@@ -8778,7 +8823,7 @@ class FeeController:
             ts_state = self._get_channel_fee_state(
                 channel_id, peer_id, actual_fee_ppm=raw_chain_fee
             )
-            if raw_chain_fee > 0 and revenue_observation_available:
+            if raw_chain_fee > 0 and revenue_observation_available and fee_label_not_contradicted:
                 _, congestion_time_bucket, _ = self._get_context_with_values(
                     channel_id, peer_id, outbound_ratio, flow_state=flow_state
                 )
@@ -9080,13 +9125,15 @@ class FeeController:
 
                 Single recording site shared by the normal path and sleep
                 entry (E-4.2). Guards preserved verbatim:
-                P7: attribute to the TRUE on-chain fee; a 0-fee window has
-                no revenue-curve meaning and is skipped entirely.
+                P7: never label with the seeded min_fee instead of the current
+                local policy. Reject demonstrated proportional shortfalls;
+                passing that check is not proof of causal price exposure.
+                A 0-fee window is still skipped by the existing price model.
                 SL-1: unroutable zero windows are censored data — skipped.
                 M3: the window ran under the PREVIOUS cycle's regime; its
                 congestion flag reflects that regime (prev_congestion_active).
                 """
-                if raw_chain_fee > 0 and not self._is_unroutable_zero_window(
+                if raw_chain_fee > 0 and fee_label_not_contradicted and not self._is_unroutable_zero_window(
                     adjusted_revenue_rate, spendable
                 ):
                     ts_state.thompson.update_posterior(

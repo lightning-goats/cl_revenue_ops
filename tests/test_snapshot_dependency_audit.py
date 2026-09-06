@@ -49,7 +49,8 @@ PINNED_COUNTS = {
     # +3 bounded-acquisition reads: cold-lane probe/idle qualification and
     # one atomic episode volume/count/minimum aggregate. All are
     # replay-captured evidence.
-    ("fee", "database"): 30,
+    # +1 coherent earned-fee/label-shortfall read (captured historical window).
+    ("fee", "database"): 31,
     # Fee replay clock seam: 30 effective reads now use decision_now(),
     # including one notification-safe yield-inventory wake cooldown; 10
     # cache-TTL reads remain raw and one dead contextual read was removed.

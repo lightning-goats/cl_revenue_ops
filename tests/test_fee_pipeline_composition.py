@@ -755,20 +755,51 @@ class TestZeroFeeObservationAttribution:
         fc, cfg = _make_fc(mock_plugin, mock_database)
         mock_database.get_forward_revenue_msat.return_value = 193_750
         mock_database.get_volume_since.return_value = 250_000
-        _stub_broadcasts(fc, {"fee": 856})
-        ts_state = _prepare_dts_stubs(fc, chain_fee=856, sampled_fee=856)
+        _stub_broadcasts(fc, {"fee": 700})
+        ts_state = _prepare_dts_stubs(fc, chain_fee=700, sampled_fee=700)
         fc._kalman_demand_factor = lambda _: 1.0
         observations = []
         ts_state.thompson.update_posterior = lambda **kw: observations.append(kw)
         fc._adjust_channel_fee(
             CHANNEL_ID, PEER_ID, {"state": "balanced", "forward_count": 10},
-            _channel_info(856), cfg=cfg,
+            _channel_info(700), cfg=cfg,
         )
         assert len(observations) == 1
         sample = observations[0]
         assert sample["revenue_rate"] * sample["hours"] == pytest.approx(193.75)
         # This pins only corrected magnitude. Existing latest-price attribution
         # remains unqualified and is deliberately not asserted as causal truth.
+
+    @pytest.mark.parametrize("path", ["ordinary", "sleep_entry", "congestion"])
+    @pytest.mark.parametrize("shortfalls", [1, None])
+    def test_contradicted_or_unknown_label_cannot_train_either_posterior(
+        self, mock_plugin, mock_database, path, shortfalls,
+    ):
+        fc, cfg = _make_fc(mock_plugin, mock_database)
+        mock_database.get_forward_revenue_observation.side_effect = None
+        mock_database.get_forward_revenue_msat.return_value = 193_750
+        mock_database.get_forward_revenue_observation.return_value = {
+            "earned_msat": 193_750, "forward_count": 1,
+            "ppm_shortfall_count": shortfalls,
+        }
+        _stub_broadcasts(fc, {"fee": 856})
+        ts = _prepare_dts_stubs(fc, chain_fee=856, sampled_fee=900)
+        ts.thompson.update_posterior = MagicMock()
+        ts.thompson.update_contextual = MagicMock()
+        if path == "sleep_entry":
+            fc.STABILITY_THRESHOLD = fc.VOLATILITY_THRESHOLD = 1e9
+            ts.stable_cycles = fc.STABLE_CYCLES_REQUIRED
+        result = fc._adjust_channel_fee(
+            CHANNEL_ID, PEER_ID,
+            {"state": "congested" if path == "congestion" else "balanced",
+             "forward_count": 10}, _channel_info(856), cfg=cfg,
+        )
+        ts.thompson.update_posterior.assert_not_called()
+        ts.thompson.update_contextual.assert_not_called()
+        if path == "sleep_entry":
+            assert ts.is_sleeping is True
+        elif path == "congestion":
+            assert result is not None and result.new_fee_ppm > 856
 
     @pytest.mark.parametrize("sleeping", [False, True])
     @pytest.mark.parametrize("unknown", [None, "missing", -1, float("nan")])

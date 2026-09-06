@@ -84,6 +84,13 @@ def mock_database():
     db.get_channel_profitability.return_value = None
     # Empty settled-fee evidence unless the test explicitly supplies earnings.
     db.get_forward_revenue_msat.return_value = 0
+    # Existing synthetic controller fixtures explicitly assume an uncontradicted
+    # label. Real SQLite shortfall behavior is covered by dedicated tests.
+    def settled_observation(channel, since, until, ppm):
+        earned = db.get_forward_revenue_msat(channel, since, until)
+        return {"earned_msat": earned, "forward_count": 1 if earned else 0,
+                "ppm_shortfall_count": 0}
+    db.get_forward_revenue_observation.side_effect = settled_observation
 
     return db
 

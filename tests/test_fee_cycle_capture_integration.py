@@ -39,6 +39,7 @@ EVIDENCE_OPERATION_CONTRACT = {
     "chain_costs",
     "volume_since",
     "settled_revenue_msat",
+    "settled_fee_observation",
     "forward_count_since",
     "exploration_flag",
     "clear_exploration_flag",

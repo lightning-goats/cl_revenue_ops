@@ -30,7 +30,7 @@ read during decision generation — must migrate).
 | admission_policy | 0 | 0 | 0 | 0 | **none — already pure** |
 | treasury (capex_budget) | 0 | 0 | 3 | 0 | none (budget-state reads = historical/state) |
 | rebalance_engine_v2 | 0 | 14 | 20 | 13 | none in decision path (planning input is pre-collected; RPC/db reads are execution/reconciliation) |
-| fee_controller | 1 | 9 | 30 | 39 | **market/gossip + chain-cost reads mid-decision** |
+| fee_controller | 1 | 9 | 31 | 39 | **market/gossip + chain-cost reads mid-decision** |
 | profitability_analyzer | 0 | 5 | 27 | 23 | n/a — it IS a construction source |
 
 ## Per-module classification
@@ -82,6 +82,20 @@ Decision-generation reads of mutable sources:
 | Acquisition qualification/lifecycle reads (`get_channel_probe`, idle `get_forward_count_since`, `get_acquisition_forward_evidence_since`) | cold-lane eligibility plus one atomic episode volume/count/minimum-payment aggregate for loss caps and the paid base-fee undercut | controller_state — allowed and captured through the replay evidence seam; persisted episode base/proportional baseline and phase state are restart-safe. These three sites raise the database pin 27→30. |
 
 
+
+### Settled-fee label rejection (2026-09-05)
+
+`_get_settled_fee_observation` adds one captured database read site (30→31).
+Classification: bounded historical/controller-state evidence, not live RPC or
+archive access. `get_forward_revenue_observation(channel, since, until, ppm)`
+materializes exact earned fees and per-forward proportional shortfalls in one
+indexed SQLite statement. The explicit interval and quote, result or error
+are captured by `settled_fee_observation`; the controller consumes that value
+without a second quote-check query. Unknown evidence is neutral. This normal
+window path replaces the accounting-only reader at its caller; that reader
+remains for sleeping-channel gross-revenue wake detection. Neither reader is
+a historical availability-time API or proof of causal price exposure. Other
+cycle inputs are not made globally atomic by this per-observation snapshot.
 
 ## Migration work list (retained snapshot migrations)
 
