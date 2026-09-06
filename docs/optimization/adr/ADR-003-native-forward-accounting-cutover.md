@@ -93,6 +93,10 @@ Before this can become an accepted production cutover:
 - Verify memory, transaction duration, storage/receipt retention, current-day
   transitions and interruption/recovery at production scale. Existing row and
   serialized-byte ceilings are refusal limits, not a measured latency/RAM SLA.
+  The [actual archive-slice precision rehearsal](../validation/2026-09-06-production-precision-rehearsal.md)
+  now verifies exact repair and unchanged-state restoration in an on-node
+  in-memory copy of 192,140 archive rows. It does not rehearse operational
+  accounting/model tables, disk durability or post-upgrade tail recovery.
 - Run unchanged native correctness/economic qualification and the approved
   staged production path. No competitor, topology, traffic, payer history,
   timing or scorer may be adjusted to favor Revenue Ops.
