@@ -290,6 +290,54 @@ Keep inference bounded and explainable, model failure neutral, and execution
 authority and accounting outside learned control. No hive, external service,
 or inter-node coordination is implied by centralizing learning inside this node.
 
+## Additional controller audit, 2026-09-06
+
+The current `_get_neighbor_fee_median_live` uses inbound-to-peer gossip ppm,
+weighted by capacity and recency. The percentile helper uses the same broad
+peer pool without those weights. Neither query conditions on the incoming
+neighbor, payment amount, base fee, full bypass path, or payer reliability
+belief. These are market priors, not demonstrated substitute-route prices.
+Do not interpret a peer's cheap incoming channel as proof that our incoming
+traffic can reach and use it.
+
+An amount-conditioned counterexample uses ordinary fees: 100 ppm plus a
+1,000-msat base costs 1,100 msat for 1,000 sats, while 400 ppm with zero base
+costs 400 msat. At 250,000 sats the costs are 26,000 and 100,000 msat,
+respectively. Ppm ranking alone reverses the actual price ordering across
+amounts. This arithmetic is not a measured explanation of the tournament gap.
+
+For a proposed incoming-peer → our-node → outgoing-peer corridor model,
+compare complete quotes between the same endpoints. If `x` msat must reach
+the outgoing peer and our total fee is `r` msat, the incoming peer's advertised
+charge depends on `x+r`, not `x`. The through-us quote therefore includes
+`r + base_in + floor((x+r)*ppm_in/1,000,000)`. A bypass quote must include all
+its applicable hops and base fees. Apply HTLC limits at each hop's amount;
+explicitly distinguish a transit endpoint from a true originating payer.
+Do not erase transit-source fees with `auto.sourcefree`, or use a route that
+still crosses us as independent bypass evidence. Failed/budget-limited route
+search is unknown, not an infinite monopoly price. Keep any derived candidate
+within the existing Revenue rails.
+
+[Lightning Labs' pathfinding analysis](https://lightning.engineering/posts/2024-04-11-pathfinding-1/)
+describes the fee/reliability tradeoff using fee, timelock and attempt-cost
+terms; a cheap but uncertain path can be less attractive than a known path.
+This motivates bounded sensitivity to unknown payer preferences, not reading
+or modifying a payer's private mission-control state. A local Askrene
+probability is our model estimate, not that payer's learned belief. These
+ideas must be checked against the pinned native payer implementation before
+making runtime-conformance claims.
+
+One suspected source of fabricated demand was already corrected: flagged
+`zero_probe` entries are excluded from `_recompute_posterior_core`'s regression
+and charged-fee reference, and from supported-fee evidence. They remain in
+the explicit zero-regime descent anchor. Do not count persisted probe entries
+as independent observations or repeat the already-fixed regression claim.
+An eventual comparison of that descent heuristic with explicit bounded
+exploration is an algorithm ablation, not a demonstrated bug fix.
+
+No runtime, comparator, traffic, graph, or frozen candidate change follows
+from this audit. The historical-learning requirements below remain open.
+
 ## Historical bootstrap and continuous learning
 
 The operator requires the plugin to learn from retained historical data, not

@@ -147,10 +147,15 @@ DTS+PI is the incumbent to beat, not a presumed optimum. Its existing single
 authority, safety rails, action ledger, and controller-neutral contract remain
 binding; experimental challengers are local/default-off until qualified.
 
-The next sequence is: close the frozen v36 pair and preserve its verdict;
-verify reward attribution and actual fee-target ownership; correct confirmed
-defects with regression tests; compare tuned incumbent and one-component
-ablations; then evaluate inventory-aware demand-learning challengers. Each
+The v36 pair and subsequent settled-reward diagnostics are closed. The frozen
+[fee-label rejection comparison](../validation/2026-09-05-fee-label-shortfall-candidate.md)
+r240–r243 is also complete: candidate-pair Revenue fees were 1.442% below
+the control pair, with native CLBOSS losses and failed retention. This is not
+promotion evidence. Next, correct the confirmed
+[forward identity/replay defects](../validation/2026-09-05-operational-forward-identity-collision.md)
+with coordinated ingestion, pruning and recovery regressions; finish reward
+attribution and historical-learning qualification; compare tuned incumbent and
+one-component ablations; then evaluate demand-learning challengers. Each
 native result must feed a specific diagnosis or rejection, not another
 unexplained multiplier adjustment. Successful ideas return through the same
 incumbent/competitor/enhanced comparison and held-out promotion gates.

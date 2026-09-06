@@ -140,6 +140,46 @@ These are implementation requirements, not an implemented migration or a
 decision to activate archive-backed runtime learning. That activation still
 requires an explicit successor to ADR-002 and its own verification.
 
+### Rollback hazard verified on 2026-09-06
+
+`Database.initialize` currently describes migrations as additive/idempotent
+and deliberately does not reject a newer schema version. That assumption is
+unsafe for an identity fix that retains distinct native events in `forwards`:
+the existing initializer unconditionally deduplicates on the old coarse key.
+An in-memory future-shaped schema with an added incoming-HTLC identity column
+and native-key unique index retains both synthetic events before startup
+(two rows / 36,600 msat). Re-running the current initializer deletes one
+(one row / 18,300 msat), despite the separate native unique index. No RPC or
+production write occurred; this is an incompatibility reproduction, not a
+candidate migration test.
+
+The coordinated fix therefore also needs an explicit rollback compatibility
+contract. Merely adding nullable columns and replacing the uniqueness index
+does not make old binaries safe. Do not roll back by starting an old binary
+against the migrated live database. Qualify source/database recovery together,
+including how post-upgrade settlements are reconciled after restoring a
+backup; never silently discard those settlements or replay their rewards.
+
+### Pruning loses replay identity: independent reproduction
+
+A second in-memory lifecycle check on 2026-09-06 demonstrates overcounting,
+not the same-second omission: insert a 10,000-sat forward earning 1,000 msat
+nine days earlier, then run the normal eight-day cleanup. Its fee survives in
+the daily rollup and the raw table is empty. The actual startup helper now
+selects a fourteen-day hydration interval, which includes that event. Passing
+the event through the normal bulk writer inserts it again because the raw
+unique key was deleted during pruning. Raw plus rollup now totals 2,000 msat;
+the next cleanup adds the duplicate to the rollup, which also becomes 2,000
+msat instead of 1,000. No RPC was called, and no live history was changed.
+
+This sequence is reachable after a sufficiently quiet online period followed
+by restart. Production occurrence has not been checked, and it is not asserted
+to explain the previously observed production residual. It demonstrates why
+raw-row identity alone is insufficient: deduplication/reconciliation state
+must survive operational pruning for every accepted replay horizon. The fix
+must prevent both duplicate accounting and duplicate learning when a retained
+native event reappears after pruning; new local row IDs are not new events.
+
 No implementation fix or production deployment occurs in this finding note.
 No Sling, Archon DID or external coordinator is introduced. Completed r240
 resources were removed after retaining evidence; native actions were regtest

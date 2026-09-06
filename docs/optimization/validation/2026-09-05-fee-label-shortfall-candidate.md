@@ -125,8 +125,8 @@ An initial smoke invocation used system Python, which lacks `pyln`; the
 correct wrapper interpreter passed without installing or changing dependencies.
 BuildKit initially rejected a raw local image ID in `FROM`; rebuilding with the
 readback-verified local tag used the exact intended base. Neither failed
-packaging check started a node or tournament payment. No native result exists
-yet for this candidate, and its production promotion remains unqualified.
+packaging check started a node or tournament payment. At packaging time there
+was no native result; the subsequent comparison below does not qualify promotion.
 
 ## First native control result
 
@@ -145,8 +145,8 @@ two distinct native HTLCs collapse into one coarse-time database key, omitting
 unchanged. Its passing safety check does not exonerate this independently
 demonstrated accounting-input defect. Native records, fee history, forwards
 and corrected learner-state export are retained; the completed lab was removed.
-No code or frozen image was changed during the run. R241 subsequently completed
-as recorded below; r242–r243 remain pending.
+No code or frozen image was changed during the run. R241 and r242–r243
+subsequently completed as recorded below.
 The runner/scorer/architecture/RPC suite passed 116 tests in 2.53 seconds.
 
 ## Opposite-assignment native control result, 2026-09-06
@@ -192,6 +192,72 @@ path, reputation-dedup and hydration suites passed **156 tests** in 1.73 seconds
 These do not test remediation of the newly documented collision; its third
 bulk-writer reproduction still demonstrates the unfixed failure. No Revenue
 source, frozen image, competitor, production setting or runtime was changed.
+
+## Frozen candidate pair completed, 2026-09-06
+
+R242 and r243 used exact `0a807e8` / the recorded shortfall image, with no
+retuning between assignments. All four runs in this card settled all 240
+scheduled payments each. The unchanged native scores are:
+
+| Run | Revenue identity / arm | Revenue fee msat | CLBOSS fee msat |
+| --- | --- | ---: | ---: |
+| r240 | B / control | 5,222,275 | 38,492,397 |
+| r241 | A / control | 5,432,075 | 30,768,512 |
+| r242 | B / candidate | 5,262,557 | 46,154,824 |
+| r243 | A / candidate | 5,238,162 | 38,492,397 |
+
+All rebalance costs are zero. Candidate-pair Revenue fees total 10,500,719
+msat versus control-pair 10,654,350 msat: an observed **1.442% decrease**,
+not a causally isolated effect estimate. Native CLBOSS changed naturally
+between runs; its candidate-pair fees total 84,647,221 msat. Candidate-pair
+Revenue volume is 50,392,602,320 msat versus CLBOSS's 8,224,000,000 msat.
+Both candidate assignments again fail `baseline_retail|cln|large` retention
+at 0.75 versus 0.95. Delivery, per-payment attribution, frozen protocol and
+scorer safety pass; retention, replication and positive bootstrap fail.
+The pair verdict is `insufficient_evidence`, not a successful challenger.
+
+Each candidate's Revenue native history contains 222 settled, four failed
+and one locally failed forwards. In r242, operational rows and earned fees
+match the native 222 / 5,262,557. In r243, operational rows retain only 220 /
+5,203,512 versus native 222 / 5,238,162. Full coarse-key multiset comparison
+finds exactly two missing events totaling 34,650 msat, with no extras:
+created indices 86/87 (incoming HTLCs 23/24) collide for 18,050 msat, and
+211/212 (HTLCs 56/57) collide for 16,600 msat. The unchanged identity defect
+remains; one run without a collision is not remediation.
+
+R243's post-run debug-log snapshot contains three explicit
+`FEE_LEARNING: current ppm label contradicted or unknown; skip window update`
+entries. This establishes that the native candidate executed the rejection
+branch. The bounded retained log does not establish complete run coverage,
+identify each rejected window, or prove historical attribution. Both native
+CLBOSS post-run statuses still have all 16 channels on their first price-theory
+cards with 288 intervals remaining. No native learning horizon was accelerated
+or completed by this short diagnostic.
+
+Artifacts under `results/polar-grand-prix/` use prefixes
+`runner-state-shortfall-candidate-r242` / `r243`,
+`score-shortfall-candidate-r242` / `r243` / `r242-r243`, and
+`shortfall-candidate-r242` / `r243` for native and post-run v2 evidence.
+R242's database snapshot has 59 fee changes, 222 forwards and 16 fee states
+with 233 persisted observation entries (73 flagged zero probes); r243 has
+57 changes, 220 forwards and 16 states with 275 entries (94 zero probes).
+These are post-run snapshots with ordinary loops still active, not exact
+traffic-end replays or counts of independent demand observations.
+
+The targeted runner/scorer/Docker/architecture/RPC/settled-reward/acceptance
+suite passed 243 tests; the existing fee-optimal guard suite passed another
+51. Those tests and the native rejection log do not establish superiority.
+Neither candidate nor yield-aware mode was deployed. No Sling, Archon DID,
+external coordinator, competitor modification or production action RPC was
+introduced. All mutations were scoped to the regtest workflow.
+Both completed candidate labs were removed after evidence collection. Scoped
+readback found no remaining containers, labeled volumes or networks for either
+run; retained artifacts and reusable images were preserved.
+
+Next work is the coordinated ingestion/replay correction, including pruning
+and rollback safety, followed by qualified historical learning and controller
+ablations. The original production-incumbent, other native competitors,
+full-product, replication and fresh held-out requirements remain open.
 
 ## Research during the frozen comparison: LN Operator
 
